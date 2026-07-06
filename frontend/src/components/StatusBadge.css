@@ -1,0 +1,36 @@
+.status-badge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.status-badge__dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-badge__dot--checking {
+  background: var(--text-muted);
+}
+
+.status-badge__dot--ok {
+  background: var(--success);
+}
+
+.status-badge__dot--error {
+  background: var(--error);
+}
+
+.status-badge__label {
+  font-size: 0.85rem;
+}
+
+.status-badge__message {
+  width: 100%;
+  margin: 0.25rem 0 0 0;
+  font-size: 0.75rem;
+  color: var(--error);
+}

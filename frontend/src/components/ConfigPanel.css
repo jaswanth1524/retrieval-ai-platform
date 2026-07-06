@@ -1,0 +1,49 @@
+.config-panel__metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.config-panel__metric {
+  display: flex;
+  flex-direction: column;
+}
+
+.config-panel__metric-value {
+  font-size: 1rem;
+  color: var(--accent);
+}
+
+.config-panel__metric-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.config-panel__toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.config-panel__table {
+  width: 100%;
+  margin-top: 0.6rem;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+}
+
+.config-panel__table td {
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.config-panel__table td:first-child {
+  color: var(--text-muted);
+  padding-right: 0.5rem;
+  white-space: nowrap;
+}

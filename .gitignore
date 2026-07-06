@@ -1,0 +1,45 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# uv lockfiles are intentionally tracked for reproducible app installs.
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local app data
+data/
+storage/
+uploads/
+qdrant_storage/
+
+# Verification scratch space
+.verify-scratch/
+
+# Logs
+*.log

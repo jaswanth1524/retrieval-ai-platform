@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DocRAG — Architecture Review</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --ink: #e6e9ef;
+    --muted: #9aa4b2; --line: #2a2f3a; --accent: #6ea8fe; --accent2: #7ee0c0;
+    --red: #ff6b6b; --amber: #ffcf6b; --green: #7ee0a0; --code: #c9d4ff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --panel2: #f0f2f6; --ink: #1a1d24;
+      --muted: #5a6472; --line: #dfe3ea; --accent: #2f6fed; --accent2: #128a6a;
+      --red: #c0392b; --amber: #9a6b00; --green: #1c7c48; --code: #2740a6;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { display: grid; grid-template-columns: 240px 1fr; gap: 0; max-width: 1400px; margin: 0 auto; }
+  nav {
+    position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+    padding: 28px 18px; border-right: 1px solid var(--line); background: var(--panel);
+  }
+  nav h1 { font-size: 16px; margin: 0 0 4px; letter-spacing: .3px; }
+  nav .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  nav a { display: block; color: var(--muted); text-decoration: none; padding: 5px 8px; border-radius: 6px; font-size: 13.5px; }
+  nav a:hover { color: var(--ink); background: var(--panel2); }
+  main { padding: 36px 44px 120px; min-width: 0; }
+  section { margin-bottom: 56px; scroll-margin-top: 20px; }
+  h2 { font-size: 22px; border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-top: 0; }
+  h3 { font-size: 16px; margin: 26px 0 10px; }
+  p { color: var(--ink); }
+  .lead { color: var(--muted); font-size: 15px; }
+  code { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; color: var(--code); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; padding: 0; color: var(--ink); }
+  .diagram { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin: 14px 0; overflow-x: auto; }
+  .mermaid { display: flex; justify-content: center; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1000px) { .wrap { grid-template-columns: 1fr; } nav { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); } main { padding: 24px; } .grid2 { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin: 12px 0; }
+  .card h4 { margin: 0 0 6px; font-size: 15px; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; margin-left: 8px; vertical-align: middle; }
+  .t-crit { background: rgba(255,107,107,.15); color: var(--red); border: 1px solid var(--red); }
+  .t-eff { background: rgba(255,207,107,.13); color: var(--amber); border: 1px solid var(--amber); }
+  .t-arch { background: rgba(110,168,254,.14); color: var(--accent); border: 1px solid var(--accent); }
+  .t-note { background: rgba(126,224,160,.13); color: var(--green); border: 1px solid var(--green); }
+  .fileref { color: var(--accent); font-family: "SF Mono", ui-monospace, monospace; font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); }
+  .caption { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 6px; }
+  .banner { background: linear-gradient(135deg, rgba(110,168,254,.12), rgba(126,224,192,.08)); border: 1px solid var(--line); border-radius: 12px; padding: 20px 24px; margin-bottom: 30px; }
+  .banner h1 { margin: 0 0 6px; font-size: 26px; }
+  .fix { color: var(--green); }
+  ol.phase > li { margin-bottom: 10px; }
+  .legend { font-size: 12.5px; color: var(--muted); margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <h1>DocRAG</h1>
+  <div class="sub">Architecture Review &amp; Before / After</div>
+  <a href="#overview">1 · What DocRAG is</a>
+  <a href="#pipeline">2 · The RAG pipeline</a>
+  <a href="#before">3 · Module map (BEFORE)</a>
+  <a href="#findings">4 · Findings</a>
+  <a href="#after">5 · Proposed (AFTER)</a>
+  <a href="#seams">6 · Seams &amp; signatures</a>
+  <a href="#roadmap">7 · Phased roadmap</a>
+</nav>
+<main>
+
+<div class="banner">
+  <h1>DocRAG — Architecture Review</h1>
+  <p class="lead">Self-hostable hybrid-RAG document Q&amp;A: FastAPI · FastEmbed · Qdrant · LiteLLM/Ollama · Streamlit.
+  Current design is spec-complete and sound; this review proposes correctness fixes, efficiency wins, and one
+  new orchestration <strong>seam</strong> layer. Implementation is owner-gated — this is analysis + roadmap.</p>
+</div>
+
+<section id="overview">
+  <h2>1 · What DocRAG is</h2>
+  <p>DocRAG answers questions about uploaded documents with <strong>grounded, cited</strong> answers.
+  Everything required for upload, indexing, retrieval, and Q&amp;A is local and self-hostable; hosted LLM
+  APIs (OpenAI) are optional add-ons, never required. Two independent provider knobs: the
+  <strong>embedding</strong> provider (default local FastEmbed) and the <strong>generation</strong>
+  provider (default local Ollama via LiteLLM).</p>
+
+  <table>
+    <tr><th>Concern</th><th>Default</th><th>Where</th></tr>
+    <tr><td>Dense embedding</td><td><code>BAAI/bge-small-en-v1.5</code> (384-dim, cosine)</td><td class="fileref">api/embeddings.py</td></tr>
+    <tr><td>Sparse / BM25</td><td><code>Qdrant/BM25</code> (computed by FastEmbed)</td><td class="fileref">api/embeddings.py</td></tr>
+    <tr><td>Fusion</td><td>Reciprocal Rank Fusion, <code>k=60</code></td><td class="fileref">api/retrieval.py</td></tr>
+    <tr><td>Reranker</td><td><code>BAAI/bge-reranker-v2-m3</code> cross-encoder</td><td class="fileref">api/reranking.py</td></tr>
+    <tr><td>Generation</td><td>Ollama <code>llama3.1:8b</code> (or OpenAI)</td><td class="fileref">api/generation.py</td></tr>
+    <tr><td>Vector store</td><td>Qdrant, named <code>dense</code>+<code>sparse</code> vectors</td><td class="fileref">api/qdrant_schema.py</td></tr>
+    <tr><td>Index safety</td><td>embedding-model tag stored on collection; mismatch → HTTP&nbsp;409</td><td class="fileref">api/qdrant_schema.py</td></tr>
+  </table>
+</section>
+
+<section id="pipeline">
+  <h2>2 · The RAG pipeline (10 steps)</h2>
+  <div class="diagram"><div class="mermaid">
+flowchart LR
+  U([Upload]) --> P[Parse pdf/txt/md]
+  P --> C[Chunk + citation payload]
+  C --> E[Dense + Sparse embed]
+  E --> Q[(Qdrant<br/>named vectors)]
+  QN([Question]) --> QE[Embed query]
+  QE --> H[Hybrid search<br/>dense 50 + sparse 50]
+  Q --> H
+  H --> R[RRF fuse k=60<br/>top-N 50]
+  R --> RR[Cross-encoder rerank<br/>top-K 8]
+  RR --> G[Grounded generate<br/>context-only prompt]
+  G --> A([Answer + citations<br/>file · page · section · chunk_id])
+  </div></div>
+  <p class="caption">Ingest path (blue-ish, left) writes to Qdrant; query path (right) reads it. Both share the embedding models.</p>
+</section>
+
+<section id="before">
+  <h2>3 · Module map — BEFORE</h2>
+  <p class="lead">Handlers in <code>api/main.py</code> wire five loose functions ad-hoc. Ingestion and
+  retrieval talk to <code>qdrant_client</code> directly. There is no orchestration layer.</p>
+  <div class="diagram"><div class="mermaid">
+flowchart TD
+  subgraph HTTP["api/main.py — FastAPI handlers"]
+    UP["POST /documents<br/>async upload_document"]
+    QU["POST /questions<br/>answer_question"]
+  end
+  UP --> DOC[documents.py<br/>parse + chunk]
+  UP --> ING[ingestion.py<br/>ingest_chunks]
+  QU --> RET[retrieval.py<br/>retrieve_candidates]
+  QU --> RNK[reranking.py<br/>rerank_candidates]
+  QU --> GEN[generation.py<br/>generate_grounded_answer]
+  ING --> EMB[embeddings.py]
+  RET --> EMB
+  ING --> QD[(qdrant_client)]
+  RET --> QD
+  ING --> SCH[qdrant_schema.py<br/>ensure_collection]
+  RET --> SCH
+  SCH --> QD
+  RNK --> RM[[FastEmbed reranker]]
+  GEN --> LLM[[LiteLLM → Ollama/OpenAI]]
+  classDef hot fill:#3a1f22,stroke:#ff6b6b,color:#ffd;
+  class UP,RET,ING hot
+  </div></div>
+  <p class="caption">Red nodes carry the correctness/efficiency issues in §4. <code>ensure_collection</code> is
+  called from both write and read paths on <em>every</em> request.</p>
+</section>
+
+<section id="findings">
+  <h2>4 · Findings</h2>
+  <p class="lead">Grouped by kind, correctness first. Each item cites <span class="fileref">file:line</span>.</p>
+
+  <h3>A · Correctness</h3>
+
+  <div class="card">
+    <h4>A1 — Blocking work on the async event loop <span class="tag t-crit">critical</span></h4>
+    <p><code>upload_document</code> is <code>async def</code> (<span class="fileref">api/main.py:72</span>) but after
+    <code>await file.read()</code> it runs <code>parse_document_bytes</code>, <code>chunk_sections</code>,
+    <code>embed_texts</code> (FastEmbed, CPU-heavy) and <code>ingest_chunks</code> (<code>upsert(wait=True)</code>) —
+    all synchronous. A single upload stalls the whole server for every other client.</p>
+    <p class="fix">Fix: offload with <code>run_in_threadpool</code> (or make the handler plain <code>def</code>, as
+    <code>answer_question</code> already correctly is).</p>
+  </div>
+
+  <div class="card">
+    <h4>A2 — Bare <code>except Exception</code> hides real errors <span class="tag t-crit">critical</span></h4>
+    <p><span class="fileref">api/retrieval.py:59-62</span> falls back from server-side hybrid to manual RRF on
+    <em>any</em> exception — masking config errors, bugs, and Qdrant outages behind a silent second path.</p>
+    <p class="fix">Fix: catch only the specific "server-side hybrid unsupported" case; let real errors surface.</p>
+  </div>
+
+  <div class="card">
+    <h4>A3 — Orphaned points on re-ingest <span class="tag t-crit">correctness</span></h4>
+    <p><code>chunk_id</code> embeds a content hash, so an edited re-upload writes <em>new</em> points and leaves the
+    old ones behind (<span class="fileref">api/ingestion.py:82</span>). The index accumulates stale content.</p>
+    <p class="fix">Fix: delete-by-<code>filename</code> filter before upserting a document's chunks.</p>
+  </div>
+
+  <div class="card">
+    <h4>A4 — Embedding tag covers dense only <span class="tag t-crit">correctness</span></h4>
+    <p>Tag = <code>fastembed:BAAI/bge-small-en-v1.5</code> (<span class="fileref">settings.py:22</span>). Swapping the
+    <strong>sparse</strong> BM25 model changes stored vectors but does <em>not</em> trip the mismatch refusal.</p>
+    <p class="fix">Fix: fold the sparse model into the tag. <strong>Do not</strong> tag the reranker — it runs at query
+    time on already-retrieved candidates, stores nothing, so it never invalidates the index.</p>
+  </div>
+
+  <div class="card">
+    <h4>A5 — Sources not verified against the answer <span class="tag t-crit">correctness</span></h4>
+    <p>All context chunks are returned as citations regardless of whether the model actually referenced <code>[n]</code>
+    (<span class="fileref">api/generation.py:163</span> → <span class="fileref">main.py:119</span>). Users see "sources"
+    the answer never used.</p>
+    <p class="fix">Fix: parse <code>[n]</code> markers from the answer text; return only cited sources.</p>
+  </div>
+
+  <div class="card">
+    <h4>A6 — Embedding-tag round-trip <span class="tag t-note">verified — not a bug</span></h4>
+    <p>Metadata round-trips correctly on a real <code>QdrantClient(":memory:")</code>: <span class="fileref">tests/test_qdrant_schema.py</span>
+    asserts the tag reads back and passes; <code>qdrant-client 1.18</code> accepts <code>create_collection(metadata=…)</code>.
+    Only open item: validate parity against a live server-mode Qdrant (payload indexes already warn they are no-ops locally).</p>
+  </div>
+
+  <h3>B · Efficiency</h3>
+
+  <div class="card">
+    <h4>B1 — <code>ensure_collection</code> on every request <span class="tag t-eff">efficiency</span></h4>
+    <p>Called from both <span class="fileref">ingestion.py:43</span> and <span class="fileref">retrieval.py:56</span> — an
+    extra <code>collection_exists</code>/<code>get_collection</code> Qdrant round-trip on every upload and query.</p>
+    <p class="fix">Fix: cache the collection-ready + schema-validated state (bust on re-ingest).</p>
+  </div>
+
+  <div class="card">
+    <h4>B2 — Sync LLM, no streaming, no timeout <span class="tag t-eff">efficiency</span></h4>
+    <p><code>litellm.completion</code> (<span class="fileref">generation.py:66</span>). First token is fully buffered, and a
+    hung Ollama blocks the request indefinitely — no <code>request_timeout</code> is passed.</p>
+    <p class="fix">Fix: add <code>request_timeout</code>; adopt <code>acompletion</code> + streaming for first-token latency.</p>
+  </div>
+
+  <div class="card">
+    <h4>B3 — Dense &amp; sparse embed sequentially <span class="tag t-eff">minor</span></h4>
+    <p>Two sequential model passes over the text list (<span class="fileref">embeddings.py:76-83</span>). Both CPU-bound, so
+    parallelizing yields limited gain — noted for completeness.</p>
+  </div>
+
+  <div class="card">
+    <h4>B4 — Whitespace "token" chunking <span class="tag t-eff">limitation</span></h4>
+    <p><code>text.split()</code> words ≠ the embedding model's real token budget (<span class="fileref">documents.py:106</span>), so
+    500-"token" chunks can overflow or underflow the model window. Real-tokenizer fix is out of the chosen scope; flagged as a
+    known limitation.</p>
+  </div>
+</section>
+
+<section id="after">
+  <h2>5 · Proposed architecture — AFTER</h2>
+  <p class="lead">Introduce three seams so handlers depend on <em>one</em> interface each, Qdrant is hidden behind a
+  repository, and blocking ingest work is offloaded. Existing <code>Protocol</code> injection points
+  (<code>EmbeddingProvider</code>, <code>Reranker</code>, <code>ChatGenerator</code>) are kept.</p>
+
+  <div class="grid2">
+    <div>
+      <h3>BEFORE — ad-hoc wiring</h3>
+      <div class="diagram"><div class="mermaid">
+flowchart TD
+  M1["main.py handlers"] --> r1[retrieval.py]
+  M1 --> r2[reranking.py]
+  M1 --> r3[generation.py]
+  M1 --> r4[ingestion.py]
+  r1 --> qd1[(qdrant_client)]
+  r4 --> qd1
+  r1 --> sc1[ensure_collection<br/>every request]
+  r4 --> sc1
+      </div></div>
+    </div>
+    <div>
+      <h3>AFTER — seam layer</h3>
+      <div class="diagram"><div class="mermaid">
+flowchart TD
+  M2["main.py handlers<br/>thin"] --> RP{{RagPipeline<br/>answer}}
+  M2 --> IS{{IngestService<br/>ingest · threadpool}}
+  RP --> RT[Retriever]
+  RP --> RK[Reranker]
+  RP --> GN[Generator]
+  IS --> DOCS[documents parse/chunk]
+  RT --> VR[[VectorRepository]]
+  IS --> VR
+  VR --> qd2[(qdrant_client)]
+  VR -. cached .- CR[collection-ready]
+  classDef seam fill:#1f2b3a,stroke:#6ea8fe,color:#dbe8ff;
+  class RP,IS,VR seam
+      </div></div>
+    </div>
+  </div>
+  <p class="legend">Blue nodes are the new seams. <code>ensure_collection</code> moves inside <code>VectorRepository</code>
+  and is cached once, not per request.</p>
+
+  <h3>Query path after refactor</h3>
+  <div class="diagram"><div class="mermaid">
+sequenceDiagram
+  participant H as answer_question (handler)
+  participant P as RagPipeline
+  participant V as VectorRepository
+  participant K as Reranker
+  participant G as Generator (LiteLLM)
+  H->>P: answer(question)
+  P->>V: hybrid_search(query_emb)  %% cached collection-ready
+  V-->>P: candidates (RRF k=60, top-N)
+  P->>K: rerank(query, candidates) → top-K
+  K-->>P: reranked
+  P->>G: generate(query, context)  %% timeout + streaming
+  G-->>P: grounded answer
+  P->>P: verify [n] markers → cited sources only
+  P-->>H: QuestionResponse
+  </div></div>
+</section>
+
+<section id="seams">
+  <h2>6 · Seams &amp; signatures</h2>
+  <p class="lead">Proposed interfaces next to the current loose functions they compose. Signatures are illustrative
+  (owner-gated implementation).</p>
+
+  <h3>New orchestration seams</h3>
+  <pre><code>class VectorRepository(Protocol):
+    def ensure_ready(self) -> None: ...                      # cached; replaces per-request ensure_collection
+    def hybrid_search(self, emb: EmbeddedText) -> list[RetrievedChunk]: ...
+    def upsert(self, points: Sequence[PointStruct]) -> int: ...
+    def delete_by_filename(self, filename: str) -> None: ...  # fixes A3 orphans
+
+class RagPipeline:
+    def __init__(self, repo: VectorRepository, embedder: QueryEmbeddingProvider,
+                 reranker: Reranker, generator: ChatGenerator, settings: AppSettings) -> None: ...
+    def answer(self, question: str) -> QuestionResponse: ...  # retrieve → rerank → generate → cite+verify
+
+class IngestService:
+    def __init__(self, repo: VectorRepository, embedder: EmbeddingProvider,
+                 settings: AppSettings) -> None: ...
+    async def ingest(self, filename: str, content: bytes) -> IngestResult: ...  # offloaded, cleans first</code></pre>
+
+  <h3>Current functions folded into the seams</h3>
+  <table>
+    <tr><th>Current (loose)</th><th>Location</th><th>Folded into</th></tr>
+    <tr><td><code>retrieve_candidates(client, settings, query, provider)</code></td><td class="fileref">retrieval.py:44</td><td><code>VectorRepository.hybrid_search</code> + <code>RagPipeline.answer</code></td></tr>
+    <tr><td><code>rerank_candidates(query, candidates, reranker, settings)</code></td><td class="fileref">reranking.py:78</td><td><code>RagPipeline.answer</code> (Reranker seam kept)</td></tr>
+    <tr><td><code>generate_grounded_answer(query, chunks, generator, settings)</code></td><td class="fileref">generation.py:91</td><td><code>RagPipeline.answer</code> (+ <code>[n]</code> verify)</td></tr>
+    <tr><td><code>ingest_chunks(client, settings, chunks, provider)</code></td><td class="fileref">ingestion.py:32</td><td><code>IngestService.ingest</code> + <code>VectorRepository.upsert</code></td></tr>
+    <tr><td><code>ensure_collection(client, settings)</code></td><td class="fileref">qdrant_schema.py:91</td><td><code>VectorRepository.ensure_ready</code> (cached)</td></tr>
+  </table>
+  <p class="legend">Net effect: <code>main.py</code> handlers shrink to <em>call one seam and shape the response</em>;
+  Qdrant is no longer referenced from retrieval/ingestion; the per-request round-trip disappears.</p>
+</section>
+
+<section id="roadmap">
+  <h2>7 · Phased roadmap</h2>
+  <p class="lead">Ordered by risk / value. Each phase is independently shippable. Implementation stays gated behind
+  owner approval per <code>CLAUDE.md</code>.</p>
+
+  <ol class="phase">
+    <li><strong>Phase 1 — Correctness</strong> <span class="tag t-crit">do first</span>
+      <br/>A1 unblock ingest (threadpool), A2 narrow the retrieval except, A3 delete-by-filename, A4 sparse in tag,
+      A5 citation verification.
+      <br/><span class="legend">Touches: <code>main.py</code>, <code>retrieval.py</code>, <code>ingestion.py</code>,
+      <code>settings.py</code>, <code>generation.py</code>. Low risk, high value. Existing tests mostly hold; add tests for
+      cleanup + citation filtering.</span></li>
+
+    <li><strong>Phase 2 — Efficiency</strong> <span class="tag t-eff">next</span>
+      <br/>B1 cache collection-ready, B2 LLM timeout + streaming.
+      <br/><span class="legend">Touches: <code>qdrant_schema.py</code>/repo, <code>generation.py</code>, <code>ui</code>
+      (stream rendering optional). Medium risk (streaming changes response shape).</span></li>
+
+    <li><strong>Phase 3 — Seam refactor</strong> <span class="tag t-arch">structural</span>
+      <br/>Introduce <code>VectorRepository</code>, <code>RagPipeline</code>, <code>IngestService</code>; thin the handlers;
+      wire via <code>dependencies.py</code> <code>lru_cache</code> singletons.
+      <br/><span class="legend">Touches: new <code>api/pipeline.py</code>, <code>api/repository.py</code>,
+      <code>main.py</code>, <code>dependencies.py</code>. Larger diff but mostly mechanical; absorbs Phase 1–2 fixes cleanly
+      and makes both paths testable without in-memory-client gymnastics.</span></li>
+  </ol>
+</section>
+
+</main>
+</div>
+<script>
+  const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'default', securityLevel: 'loose', flowchart: { htmlLabels: true, curve: 'basis' } });
+</script>
+</body>
+</html>

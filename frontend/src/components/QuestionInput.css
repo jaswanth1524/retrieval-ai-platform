@@ -1,0 +1,32 @@
+.question-input {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-end;
+  border-top: 1px solid var(--border);
+  padding: 0.8rem;
+}
+
+.question-input__textarea {
+  flex: 1;
+  resize: none;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 0.5rem 0.7rem;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+
+.question-input__textarea:focus {
+  outline: 1px solid var(--accent);
+}
+
+.question-input__submit {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  font-weight: 600;
+}
