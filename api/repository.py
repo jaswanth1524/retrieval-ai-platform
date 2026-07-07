@@ -10,12 +10,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from qdrant_client import QdrantClient, models
-from qdrant_client.http.exceptions import ApiException
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.http.models.models import QueryResponse
 
 from api.embeddings import EmbeddedText
-from api.qdrant_schema import ensure_collection
+from api.qdrant_schema import VectorStoreUnavailableError, ensure_collection
 from api.settings import AppSettings
+
+# Status codes from a server-side RRF query that indicate "this Qdrant server/client
+# combination doesn't support prefetch+RRF" rather than a real query failure — only
+# these should trigger the manual-fusion fallback; anything else is a real error.
+_RRF_UNSUPPORTED_STATUS_CODES = frozenset({400, 404, 501})
 
 
 class VectorRepository:
@@ -38,10 +43,18 @@ class VectorRepository:
 
         self.ensure_ready(settings)
         try:
-            return self._server_side_hybrid_query(settings, query_embedding)
-        except ApiException:
-            # Older Qdrant servers may not support server-side prefetch + RRF.
-            return self._manual_hybrid_query(settings, query_embedding)
+            try:
+                return self._server_side_hybrid_query(settings, query_embedding)
+            except UnexpectedResponse as exc:
+                if exc.status_code not in _RRF_UNSUPPORTED_STATUS_CODES:
+                    # A real query error (auth, malformed request, server fault) —
+                    # falling back to manual fusion would only produce a second,
+                    # more confusing failure and hide the actual cause.
+                    raise
+                # Older Qdrant servers may not support server-side prefetch + RRF.
+                return self._manual_hybrid_query(settings, query_embedding)
+        except ResponseHandlingException as exc:
+            raise VectorStoreUnavailableError(f"Qdrant is unreachable: {exc}") from exc
 
     def upsert(self, settings: AppSettings, points: Sequence[models.PointStruct]) -> None:
         """Index points into the collection."""

@@ -58,4 +58,64 @@ describe('api client', () => {
 
     await expect(api.health()).rejects.toBeInstanceOf(ApiClientError);
   });
+
+  it('includes llm_provider in the body when a provider is passed', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestion('hi', 'openai');
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ question: 'hi', llm_provider: 'openai' });
+  });
+
+  it('omits llm_provider from the body when no provider is passed', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestion('hi');
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ question: 'hi' });
+    expect('llm_provider' in body).toBe(false);
+  });
+
+  it('aborts and reports a timeout when a request runs past its budget', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const promise = api.health();
+    const assertion = expect(promise).rejects.toMatchObject({
+      name: 'ApiClientError',
+      message: 'Request timed out or was cancelled.',
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await assertion;
+
+    vi.useRealTimers();
+  });
+
+  it('aborts the underlying fetch when a caller-provided signal is aborted', async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    const promise = api.health(controller.signal);
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: 'ApiClientError' });
+  });
 });

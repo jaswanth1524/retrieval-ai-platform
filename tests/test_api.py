@@ -17,7 +17,7 @@ from api.dependencies import (
     get_reranker,
 )
 from api.embeddings import EmbeddedText
-from api.generation import ChatMessage
+from api.generation import ChatMessage, LiteLLMGenerator
 from api.main import create_app
 from api.qdrant_schema import EMBEDDING_MODEL_TAG_KEY, dense_vectors_config, sparse_vectors_config
 from api.settings import AppSettings
@@ -51,9 +51,11 @@ class FakeGenerator:
     def __init__(self, answer: str = "Alpha is documented [1].") -> None:
         self.answer = answer
         self.messages: list[ChatMessage] = []
+        self.seen_provider: str | None = None
 
-    def complete(self, messages: Sequence[ChatMessage]) -> str:
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
         self.messages = list(messages)
+        self.seen_provider = settings.llm_provider
         return self.answer
 
 
@@ -137,9 +139,9 @@ def test_config_endpoint_exposes_non_secret_settings(api_context: ApiTestContext
     assert response.status_code == 200
     payload = response.json()
     assert payload["qdrant_collection"] == "api_documents"
-    assert payload["embedding_provider"] == "local"
     assert payload["dense_embedding_model"] == "BAAI/bge-small-en-v1.5"
     assert payload["llm_provider"] == "ollama"
+    assert payload["openai_available"] is False
     assert "openai_api_key" not in payload
 
 
@@ -165,6 +167,32 @@ def test_document_upload_ingests_chunks(api_context: ApiTestContext) -> None:
     assert records[0].payload is not None
     assert records[0].payload["filename"] == "guide.txt"
     assert records[0].payload["chunk_id"]
+
+
+def test_document_upload_rejects_file_over_size_limit() -> None:
+    """A single oversized upload must be rejected with 413 before it can OOM the
+    process — proven by capping the limit far below the test payload's size."""
+
+    clear_dependency_caches()
+    settings = make_settings(max_upload_bytes=10)
+    qdrant = QdrantClient(":memory:")
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    with TestClient(app) as client:
+        response = client.post(
+            "/documents",
+            files={
+                "file": ("guide.txt", b"this content is definitely over ten bytes", "text/plain")
+            },
+        )
+    clear_dependency_caches()
+
+    assert response.status_code == 413
+    assert "exceeds" in response.json()["detail"]
 
 
 def test_document_upload_rejects_unsupported_file(api_context: ApiTestContext) -> None:
@@ -208,6 +236,101 @@ def test_question_endpoint_rejects_blank_query(api_context: ApiTestContext) -> N
 
     assert response.status_code == 400
     assert "Query text is required" in response.json()["detail"]
+
+
+def test_config_reports_openai_available_when_key_present() -> None:
+    clear_dependency_caches()
+    settings = make_settings(openai_api_key="sk-test")
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    with TestClient(app) as client:
+        payload = client.get("/config").json()
+    clear_dependency_caches()
+
+    assert payload["openai_available"] is True
+    assert "openai_api_key" not in payload
+
+
+class CapturingCompletionClient:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, Any] | None = None
+
+    def __call__(self, **kwargs: Any) -> object:
+        self.kwargs = kwargs
+        return {"choices": [{"message": {"content": "Grounded answer [1]."}}]}
+
+
+def _ingested_client(
+    settings: AppSettings,
+    completion_client: CapturingCompletionClient,
+) -> tuple[TestClient, QdrantClient]:
+    """Build a TestClient wired with a real LiteLLMGenerator and one ingested doc.
+
+    Uses the real generator (not the fake) so provider routing actually flows through
+    ``completion_model_and_kwargs`` — the seam the per-request override drives.
+    """
+
+    qdrant = QdrantClient(":memory:")
+    embeddings = FakeEmbeddingProvider()
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: embeddings
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: generator
+    client = TestClient(app)
+    upload = client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
+    )
+    assert upload.status_code == 200
+    return client, qdrant
+
+
+def test_question_endpoint_routes_to_openai_when_selected() -> None:
+    clear_dependency_caches()
+    settings = make_settings(openai_api_key="sk-test", openai_model="gpt-test")
+    completion_client = CapturingCompletionClient()
+    client, _ = _ingested_client(settings, completion_client)
+
+    response = client.post("/questions", json={"question": "alpha", "llm_provider": "openai"})
+
+    assert response.status_code == 200
+    assert completion_client.kwargs is not None
+    assert completion_client.kwargs["model"] == "gpt-test"
+    assert completion_client.kwargs["api_key"] == "sk-test"
+    # Per-request override must not mutate the shared settings singleton.
+    assert settings.llm_provider == "ollama"
+    clear_dependency_caches()
+
+
+def test_question_endpoint_openai_selected_without_key_returns_400() -> None:
+    clear_dependency_caches()
+    settings = make_settings(openai_api_key=None)
+    completion_client = CapturingCompletionClient()
+    client, _ = _ingested_client(settings, completion_client)
+
+    response = client.post("/questions", json={"question": "alpha", "llm_provider": "openai"})
+
+    assert response.status_code == 400
+    assert "OPENAI_API_KEY" in response.json()["detail"]
+    # The provider never got called since routing rejected the request first.
+    assert completion_client.kwargs is None
+    clear_dependency_caches()
+
+
+def test_question_endpoint_rejects_unknown_provider() -> None:
+    clear_dependency_caches()
+    settings = make_settings()
+    completion_client = CapturingCompletionClient()
+    client, _ = _ingested_client(settings, completion_client)
+
+    response = client.post("/questions", json={"question": "alpha", "llm_provider": "anthropic"})
+
+    # Literal["ollama","openai"] rejects unknown values at the schema boundary.
+    assert response.status_code == 422
+    clear_dependency_caches()
 
 
 def test_question_endpoint_returns_conflict_for_embedding_mismatch(

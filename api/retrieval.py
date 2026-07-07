@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -10,6 +11,8 @@ from qdrant_client import models
 
 from api.embeddings import EmbeddedText, EmbeddingError
 from api.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 
 class RetrievalError(RuntimeError):
@@ -66,7 +69,26 @@ def retrieve_candidates(
     repository.ensure_ready(settings)
     query_embedding = embed_query(normalized_query, embedding_provider)
     points = repository.hybrid_search(settings, query_embedding)
-    return [scored_point_to_chunk(point) for point in points]
+    return points_to_chunks(points)
+
+
+def points_to_chunks(points: Sequence[models.ScoredPoint]) -> list[RetrievedChunk]:
+    """Convert fused points to chunks, skipping any with malformed payloads.
+
+    One legacy/malformed point (e.g. from an older schema) must not abort an entire
+    answer when dozens of other candidates are fine — only raise if literally every
+    candidate is unusable.
+    """
+
+    chunks: list[RetrievedChunk] = []
+    for point in points:
+        try:
+            chunks.append(scored_point_to_chunk(point))
+        except RetrievalPayloadError:
+            logger.warning("Skipping retrieval candidate with malformed payload: %s", point.id)
+    if points and not chunks:
+        raise RetrievalPayloadError("All retrieved points are missing required payload fields.")
+    return chunks
 
 
 def embed_query(query: str, embedding_provider: QueryEmbeddingProvider) -> EmbeddedText:

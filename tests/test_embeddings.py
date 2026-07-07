@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any
+
 import pytest
 
 from api.embeddings import (
     EmbeddingError,
+    LocalEmbeddingProvider,
     coerce_dense_vector,
     coerce_sequence,
     coerce_sparse_vector,
 )
+from api.settings import AppSettings
 
 
 class ArrayLike:
@@ -45,4 +50,39 @@ def test_sparse_vector_rejects_mismatched_indices_and_values() -> None:
 def test_coerce_sequence_rejects_strings() -> None:
     with pytest.raises(EmbeddingError, match="not iterable"):
         coerce_sequence("abc", label="bad vector")
+
+
+class RaisingDenseModel:
+    def embed(
+        self,
+        documents: str | Iterable[str],
+        batch_size: int = 256,
+        parallel: int | None = None,
+        **kwargs: Any,
+    ) -> Iterable[object]:
+        raise RuntimeError("model download failed")
+
+
+class EmptySparseModel:
+    def embed(
+        self,
+        documents: str | Iterable[str],
+        batch_size: int = 256,
+        parallel: int | None = None,
+        **kwargs: Any,
+    ) -> Iterable[object]:
+        return []
+
+
+def test_local_embedding_provider_wraps_model_failure_as_embedding_error() -> None:
+    """Both models are lazy_load=True, so a bad model name or failed download only
+    surfaces on this first call, not at construction — this call must translate it
+    into EmbeddingError rather than an unwrapped exception."""
+
+    provider = LocalEmbeddingProvider(
+        AppSettings(), dense_model=RaisingDenseModel(), sparse_model=EmptySparseModel()
+    )
+
+    with pytest.raises(EmbeddingError, match="model download failed"):
+        provider.embed_texts(["hello"])
 

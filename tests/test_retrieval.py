@@ -4,21 +4,30 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
+import httpx
 import pytest
 from qdrant_client import QdrantClient, models
-from qdrant_client.http.exceptions import ApiException
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from api.documents import DocumentChunk
 from api.embeddings import EmbeddedText
 from api.ingestion import ingest_chunks
+from api.qdrant_schema import VectorStoreUnavailableError
 from api.repository import VectorRepository
 from api.retrieval import (
     RetrievalError,
     RetrievalPayloadError,
+    points_to_chunks,
     retrieve_candidates,
     scored_point_to_chunk,
 )
 from api.settings import AppSettings
+
+
+def _unexpected_response(status_code: int) -> UnexpectedResponse:
+    return UnexpectedResponse(
+        status_code=status_code, reason_phrase="", content=b"", headers=httpx.Headers()
+    )
 
 
 class StaticEmbeddingProvider:
@@ -115,7 +124,9 @@ def test_retrieve_candidates_falls_back_to_manual_rrf(
         nonlocal hybrid_attempted
         if kwargs.get("prefetch") is not None:
             hybrid_attempted = True
-            raise ApiException("server-side fusion unavailable")
+            # A 400 signals "this server/client combination doesn't support
+            # prefetch+RRF" — the one case that should trigger manual fusion.
+            raise _unexpected_response(400)
         return original_query_points(*args, **kwargs)
 
     monkeypatch.setattr(client, "query_points", query_points)
@@ -126,6 +137,51 @@ def test_retrieve_candidates_falls_back_to_manual_rrf(
     assert hybrid_attempted is True
     assert [result.chunk_id for result in results] == ["c1", "c3", "c2"]
     assert results[0].score == pytest.approx(1 / 60 + 1 / 60)
+
+
+def test_retrieve_candidates_does_not_fall_back_on_real_query_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine server error (not an RRF-unsupported signal) must not be masked by a
+    confusing second failure from the manual-fusion fallback — it should propagate.
+    """
+
+    settings = make_settings()
+    client = seed_collection(settings)
+    repository = VectorRepository(client)
+    manual_fusion_attempted = False
+
+    def query_points(*args: Any, **kwargs: Any) -> object:
+        nonlocal manual_fusion_attempted
+        if kwargs.get("prefetch") is not None:
+            raise _unexpected_response(500)
+        manual_fusion_attempted = True
+        raise AssertionError("must not fall back to manual fusion for a real 500")
+
+    monkeypatch.setattr(client, "query_points", query_points)
+    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
+
+    with pytest.raises(UnexpectedResponse):
+        retrieve_candidates(repository, settings, "alpha", query_provider)
+
+    assert manual_fusion_attempted is False
+
+
+def test_retrieve_candidates_wraps_connection_failure_as_service_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    client = seed_collection(settings)
+    repository = VectorRepository(client)
+
+    def query_points(*args: Any, **kwargs: Any) -> object:
+        raise ResponseHandlingException(ConnectionError("connection refused"))
+
+    monkeypatch.setattr(client, "query_points", query_points)
+    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
+
+    with pytest.raises(VectorStoreUnavailableError, match="unreachable"):
+        retrieve_candidates(repository, settings, "alpha", query_provider)
 
 
 def test_retrieve_candidates_rejects_empty_query() -> None:
@@ -167,3 +223,47 @@ def test_scored_point_to_chunk_requires_citation_payload() -> None:
 
     with pytest.raises(RetrievalPayloadError, match="page"):
         scored_point_to_chunk(point)
+
+
+def _good_point(chunk_id: str) -> models.ScoredPoint:
+    return models.ScoredPoint(
+        id=str(uuid5(NAMESPACE_URL, chunk_id)),
+        version=0,
+        score=1.0,
+        payload={
+            "filename": "guide.md",
+            "page": 1,
+            "section": "Setup",
+            "chunk_id": chunk_id,
+            "text": "hi",
+        },
+    )
+
+
+def _malformed_point() -> models.ScoredPoint:
+    return models.ScoredPoint(
+        id=str(uuid5(NAMESPACE_URL, "malformed")),
+        version=0,
+        score=1.0,
+        payload={"filename": "guide.md"},
+    )
+
+
+def test_points_to_chunks_skips_malformed_points_when_others_are_valid() -> None:
+    """One legacy/malformed point among many good candidates must not abort the
+    whole query — only the malformed one is dropped."""
+
+    points = [_good_point("c1"), _malformed_point(), _good_point("c2")]
+
+    chunks = points_to_chunks(points)
+
+    assert [chunk.chunk_id for chunk in chunks] == ["c1", "c2"]
+
+
+def test_points_to_chunks_raises_only_when_all_points_are_malformed() -> None:
+    with pytest.raises(RetrievalPayloadError, match="missing required payload"):
+        points_to_chunks([_malformed_point(), _malformed_point()])
+
+
+def test_points_to_chunks_returns_empty_for_no_points() -> None:
+    assert points_to_chunks([]) == []

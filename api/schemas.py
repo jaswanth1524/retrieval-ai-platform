@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -15,7 +17,6 @@ class PublicConfigResponse(BaseModel):
     """Non-secret runtime configuration exposed to the UI."""
 
     qdrant_collection: str
-    embedding_provider: str
     dense_embedding_model: str
     sparse_embedding_model: str
     reranker_model: str
@@ -23,12 +24,14 @@ class PublicConfigResponse(BaseModel):
     llm_provider: str
     llm_model: str
     openai_model: str
+    openai_available: bool
     rrf_k: int
     dense_retrieval_limit: int
     sparse_retrieval_limit: int
     fused_top_n: int
     rerank_top_k: int
     max_context_chunks: int
+    max_upload_bytes: int
 
 
 class DocumentIngestResponse(BaseModel):
@@ -44,6 +47,7 @@ class QuestionRequest(BaseModel):
     """Question-answering request."""
 
     question: str = Field(min_length=1)
+    llm_provider: Literal["ollama", "openai"] | None = None
 
 
 class CitationResponse(BaseModel):

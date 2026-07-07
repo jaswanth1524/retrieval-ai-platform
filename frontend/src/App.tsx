@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { ApiClientError, api } from './api/client';
-import type { PublicConfigResponse } from './api/types';
+import type { LlmProvider, PublicConfigResponse } from './api/types';
 import ChatThread from './components/ChatThread';
+import ProviderSelector from './components/ProviderSelector';
 import QuestionInput from './components/QuestionInput';
 import Sidebar from './components/Sidebar';
 import type { ApiStatus } from './components/StatusBadge';
@@ -13,17 +14,23 @@ function App() {
   const [apiStatusMessage, setApiStatusMessage] = useState<string | undefined>();
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [uploadState, setUploadState] = useState<UploadState>({ status: 'idle' });
+  const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const { turns, pending, ask } = useChat();
 
   useEffect(() => {
+    const controller = new AbortController();
     let cancelled = false;
 
     async function checkHealth() {
       try {
-        await api.health();
-        const configResult = await api.config();
+        await api.health(controller.signal);
+        const configResult = await api.config(controller.signal);
         if (cancelled) return;
         setConfig(configResult);
+        // Sync the dropdown to the server's default provider once config loads.
+        if (configResult.llm_provider === 'openai' && configResult.openai_available) {
+          setSelectedProvider('openai');
+        }
         setApiStatus('ok');
       } catch (err) {
         if (cancelled) return;
@@ -35,6 +42,10 @@ function App() {
     void checkHealth();
     return () => {
       cancelled = true;
+      // Previously only the `cancelled` flag guarded setState — the underlying
+      // fetch kept running to completion regardless. Aborting it here actually
+      // releases the in-flight request instead of just ignoring its result.
+      controller.abort();
     };
   }, []);
 
@@ -69,8 +80,19 @@ function App() {
           </div>
         ) : (
           <>
+            {config && (
+              <ProviderSelector
+                config={config}
+                value={selectedProvider}
+                onChange={setSelectedProvider}
+                disabled={pending}
+              />
+            )}
             <ChatThread turns={turns} pending={pending} />
-            <QuestionInput onSubmit={ask} disabled={!apiReachable || pending} />
+            <QuestionInput
+              onSubmit={(question) => ask(question, selectedProvider)}
+              disabled={!apiReachable || pending}
+            />
           </>
         )}
       </main>

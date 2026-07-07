@@ -74,25 +74,38 @@ class LiteLLMGenerator:
         self.settings = settings
         self.completion_client = completion_client
 
-    def complete(self, messages: Sequence[ChatMessage]) -> str:
-        """Call the configured LiteLLM provider and return assistant text."""
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        """Call the LiteLLM provider selected by ``settings`` and return assistant text.
 
-        model, provider_kwargs = completion_model_and_kwargs(self.settings)
-        response = self.completion_client(
-            model=model,
-            messages=list(messages),
-            temperature=float(self.settings.llm_temperature),
-            max_tokens=int(self.settings.llm_max_tokens),
-            timeout=float(self.settings.llm_request_timeout_seconds),
-            **provider_kwargs,
-        )
+        Provider selection reads the *passed* settings (a per-request override may
+        differ from the ``settings`` captured at construction), so a single cached
+        generator instance can serve both the Ollama and OpenAI paths.
+        """
+
+        model, provider_kwargs = completion_model_and_kwargs(settings)
+        try:
+            response = self.completion_client(
+                model=model,
+                messages=list(messages),
+                temperature=float(settings.llm_temperature),
+                max_tokens=int(settings.llm_max_tokens),
+                timeout=float(settings.llm_request_timeout_seconds),
+                num_retries=int(settings.llm_num_retries),
+                **provider_kwargs,
+            )
+        except Exception as exc:
+            # LiteLLM/provider SDKs raise many distinct exception types (auth,
+            # connection, rate limit, ...); this boundary's job is translating all
+            # of them into our domain error so main.py maps them to a clean 502
+            # instead of an opaque 500.
+            raise GenerationError(f"Generation provider request failed: {exc}") from exc
         return extract_completion_text(response)
 
 
 class ChatGenerator(Protocol):
     """Generator surface used by the grounded answer pipeline."""
 
-    def complete(self, messages: Sequence[ChatMessage]) -> str: ...
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str: ...
 
 
 def generate_grounded_answer(
@@ -112,7 +125,7 @@ def generate_grounded_answer(
         return GroundedAnswer(answer=INSUFFICIENT_CONTEXT_ANSWER, sources=[])
 
     messages = build_grounded_messages(normalized_query, selected_chunks)
-    answer = generator.complete(messages).strip()
+    answer = generator.complete(messages, settings).strip()
     if not answer:
         raise GenerationError("Generation provider returned an empty answer.")
 

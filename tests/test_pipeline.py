@@ -35,9 +35,11 @@ class FakeGenerator:
     def __init__(self, answer: str) -> None:
         self.answer = answer
         self.messages: list[ChatMessage] = []
+        self.seen_provider: str | None = None
 
-    def complete(self, messages: Sequence[ChatMessage]) -> str:
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
         self.messages = list(messages)
+        self.seen_provider = settings.llm_provider
         return self.answer
 
 
@@ -103,3 +105,29 @@ def test_rag_pipeline_answers_from_ingested_document() -> None:
     assert [source.filename for source in grounded.sources] == ["guide.txt"]
     assert reranker.seen_documents == ["Intro alpha beta"]
     assert "Intro alpha beta" in generator.messages[1]["content"]
+    # No override → generation uses the base provider.
+    assert generator.seen_provider == "ollama"
+
+
+def test_rag_pipeline_provider_override_does_not_mutate_base_settings() -> None:
+    settings = make_settings()  # llm_provider defaults to "ollama"
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+
+    generator = FakeGenerator("Alpha is documented [1].")
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+    )
+
+    pipeline.answer("alpha", llm_provider="openai")
+
+    # The override reached generation, but the shared singleton is untouched.
+    assert generator.seen_provider == "openai"
+    assert settings.llm_provider == "ollama"

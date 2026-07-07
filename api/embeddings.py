@@ -73,14 +73,22 @@ class LocalEmbeddingProvider:
         if not texts:
             return []
 
-        dense_vectors = [
-            coerce_dense_vector(vector)
-            for vector in self.dense_model.embed(texts)
-        ]
-        sparse_vectors = [
-            coerce_sparse_vector(vector)
-            for vector in self.sparse_model.embed(texts)
-        ]
+        # Both models are constructed with lazy_load=True, so the actual model
+        # download/load happens on this first call, not at __init__ — this is the
+        # boundary that must translate a load failure into EmbeddingError.
+        try:
+            dense_vectors = [
+                coerce_dense_vector(vector)
+                for vector in self.dense_model.embed(texts)
+            ]
+            sparse_vectors = [
+                coerce_sparse_vector(vector)
+                for vector in self.sparse_model.embed(texts)
+            ]
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Embedding model failed: {exc}") from exc
 
         if len(dense_vectors) != len(texts):
             raise EmbeddingError(

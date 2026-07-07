@@ -16,7 +16,6 @@ class AppSettings(BaseSettings):
     qdrant_dense_vector_size: PositiveInt = 384
 
     dense_embedding_model: str = "BAAI/bge-small-en-v1.5"
-    embedding_provider: str = "local"
     sparse_embedding_model: str = "Qdrant/BM25"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     embedding_model_tag: str = "fastembed:BAAI/bge-small-en-v1.5"
@@ -34,12 +33,18 @@ class AppSettings(BaseSettings):
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_max_tokens: PositiveInt = 512
     llm_request_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    llm_num_retries: int = Field(default=0, ge=0)
     ollama_base_url: str = "http://localhost:11434"
     openai_api_key: str | None = Field(default=None)
     openai_model: str = "gpt-4o-mini"
 
-    upload_dir: str = "uploads"
-    chunk_size_tokens: PositiveInt = 500
+    max_upload_bytes: PositiveInt = 50 * 1024 * 1024
+    # Despite the name, this counts whitespace-delimited words (api/documents.py splits
+    # on str.split()), not the dense embedding model's subword tokens. bge-small hard-
+    # truncates at 512 subword tokens, and English words expand to ~1.3-1.8 subword
+    # tokens each, so 300 words stays safely under that limit after expansion; 500
+    # silently dropped the tail of most full-size chunks from the embedded vector.
+    chunk_size_tokens: PositiveInt = 300
     chunk_overlap_tokens: int = Field(default=75, ge=0)
 
     # Inert in the primary paths (dev uses the Vite proxy, prod serves the frontend

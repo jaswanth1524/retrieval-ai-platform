@@ -14,6 +14,18 @@ from api.embeddings import EmbeddedText, EmbeddingError
 from api.settings import AppSettings
 
 
+class IngestionError(RuntimeError):
+    """Raised when indexing chunks fails after prior points were already removed.
+
+    Deterministic point IDs are derived from filename (see ``point_id_for_chunk``),
+    so a re-ingest must delete a file's old points before writing its new ones —
+    otherwise the new upsert would collide with, rather than replace, the old data
+    for chunks that no longer exist in the new version. That ordering means a write
+    failure here leaves the document with zero indexed chunks; the caller must know
+    to retry rather than assume the previous version is still queryable.
+    """
+
+
 class EmbeddingProvider(Protocol):
     """Embedding provider surface used by ingestion."""
 
@@ -63,7 +75,15 @@ def ingest_chunks(
         for chunk, embedding in zip(chunks, embeddings, strict=True)
     ]
     repository.delete_by_filename(settings, [chunk.filename for chunk in chunks])
-    repository.upsert(settings, points)
+    try:
+        repository.upsert(settings, points)
+    except Exception as exc:
+        filenames = sorted({chunk.filename for chunk in chunks})
+        raise IngestionError(
+            f"Indexing failed after removing the previous version of "
+            f"{', '.join(filenames)}; the document is currently un-indexed. "
+            "Please retry the upload."
+        ) from exc
     return IngestResult(
         collection_name=settings.qdrant_collection,
         points_count=len(points),

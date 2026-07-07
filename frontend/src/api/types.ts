@@ -4,7 +4,6 @@ export interface HealthResponse {
 
 export interface PublicConfigResponse {
   qdrant_collection: string;
-  embedding_provider: string;
   dense_embedding_model: string;
   sparse_embedding_model: string;
   reranker_model: string;
@@ -12,12 +11,14 @@ export interface PublicConfigResponse {
   llm_provider: string;
   llm_model: string;
   openai_model: string;
+  openai_available: boolean;
   rrf_k: number;
   dense_retrieval_limit: number;
   sparse_retrieval_limit: number;
   fused_top_n: number;
   rerank_top_k: number;
   max_context_chunks: number;
+  max_upload_bytes: number;
 }
 
 export interface DocumentIngestResponse {
@@ -40,3 +41,5 @@ export interface QuestionResponse {
   answer: string;
   sources: CitationResponse[];
 }
+
+export type LlmProvider = 'ollama' | 'openai';

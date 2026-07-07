@@ -17,7 +17,7 @@ function Sidebar({ apiStatus, apiStatusMessage, config, onUpload, uploadState }:
     <aside className="sidebar">
       <h1 className="sidebar__title">DocRAG</h1>
       <StatusBadge status={apiStatus} message={apiStatusMessage} />
-      <UploadPanel onUpload={onUpload} state={uploadState} />
+      <UploadPanel onUpload={onUpload} state={uploadState} maxUploadBytes={config?.max_upload_bytes} />
       {config && <ConfigPanel config={config} />}
     </aside>
   );

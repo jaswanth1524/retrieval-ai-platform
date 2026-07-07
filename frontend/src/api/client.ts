@@ -2,6 +2,7 @@ import type {
   CitationResponse,
   DocumentIngestResponse,
   HealthResponse,
+  LlmProvider,
   PublicConfigResponse,
   QuestionResponse,
 } from './types';
@@ -18,12 +19,36 @@ export class ApiClientError extends Error {
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Without a timeout, a hung backend (a stalled Ollama call, a network blip) leaves
+// the UI stuck on its loading state for the browser's own default (~300s) with no
+// way to cancel. Question-answering routinely takes 70+ seconds, so it gets a much
+// longer budget than health/config.
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+interface RequestOptions extends RequestInit {
+  timeoutMs?: number;
+}
+
+async function request<T>(path: string, options?: RequestOptions): Promise<T> {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, ...init } = options ?? {};
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
+  // Let the caller's own signal (e.g. aborted on component unmount) cancel the
+  // request too, without losing the timeout's independent ability to cancel it.
+  const abortFromCaller = () => timeoutController.abort();
+  callerSignal?.addEventListener('abort', abortFromCaller);
+
   let response: Response;
   try {
-    response = await fetch(`${BASE_URL}${path}`, init);
+    response = await fetch(`${BASE_URL}${path}`, { ...init, signal: timeoutController.signal });
   } catch (err) {
+    if (timeoutController.signal.aborted) {
+      throw new ApiClientError('Request timed out or was cancelled.');
+    }
     throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+  } finally {
+    clearTimeout(timeoutId);
+    callerSignal?.removeEventListener('abort', abortFromCaller);
   }
   if (!response.ok) {
     throw new ApiClientError(await extractErrorDetail(response), response.status);
@@ -67,23 +92,36 @@ export async function extractErrorDetail(response: Response): Promise<string> {
   return `API returned HTTP ${response.status}.`;
 }
 
+// Question-answering and upload both run a full ingest/generation pipeline that
+// routinely takes 70+ seconds; health/config use the short DEFAULT_TIMEOUT_MS.
+const LONG_RUNNING_TIMEOUT_MS = 120_000;
+
 export const api = {
-  health: () => request<HealthResponse>('/health'),
+  health: (signal?: AbortSignal) => request<HealthResponse>('/health', { signal }),
 
-  config: () => request<PublicConfigResponse>('/config'),
+  config: (signal?: AbortSignal) => request<PublicConfigResponse>('/config', { signal }),
 
-  uploadDocument: (file: File) => {
+  uploadDocument: (file: File, signal?: AbortSignal) => {
     const form = new FormData();
     // Do NOT set Content-Type manually — the browser sets the multipart boundary.
     form.append('file', file);
-    return request<DocumentIngestResponse>('/documents', { method: 'POST', body: form });
+    return request<DocumentIngestResponse>('/documents', {
+      method: 'POST',
+      body: form,
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+    });
   },
 
-  askQuestion: (question: string) =>
+  askQuestion: (question: string, llmProvider?: LlmProvider, signal?: AbortSignal) =>
     request<QuestionResponse>('/questions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
+      // Only include llm_provider when chosen, so an unset selection exercises the
+      // backend's `| None` default (base provider) rather than pinning a value.
+      body: JSON.stringify(llmProvider ? { question, llm_provider: llmProvider } : { question }),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
     }),
 };
 

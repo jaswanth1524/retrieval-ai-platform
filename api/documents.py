@@ -34,6 +34,10 @@ class DocumentParseError(DocumentError):
     """Raised when a supported document cannot be parsed."""
 
 
+class ChunkConfigError(DocumentError):
+    """Raised when chunk-sizing configuration is invalid."""
+
+
 @dataclass(frozen=True)
 class DocumentSection:
     """Extracted text with source metadata before chunking."""
@@ -92,10 +96,15 @@ def chunk_sections(
     sections: list[DocumentSection],
     settings: AppSettings,
 ) -> list[DocumentChunk]:
-    """Split extracted sections into overlapping chunks."""
+    """Split extracted sections into overlapping chunks.
+
+    ``chunk_size_tokens``/``chunk_overlap_tokens`` count whitespace-delimited words
+    (this function splits on ``str.split()``), not the embedding model's subword
+    tokens — see the settings field's docstring for why the default is 300, not 500.
+    """
 
     if settings.chunk_overlap_tokens >= settings.chunk_size_tokens:
-        raise ValueError("CHUNK_OVERLAP_TOKENS must be smaller than CHUNK_SIZE_TOKENS.")
+        raise ChunkConfigError("CHUNK_OVERLAP_TOKENS must be smaller than CHUNK_SIZE_TOKENS.")
 
     chunks: list[DocumentChunk] = []
     chunk_size = int(settings.chunk_size_tokens)
@@ -158,13 +167,30 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
     return sections
 
 
-def decode_text_document(filename: str, content: bytes) -> str:
-    """Decode a UTF-8 text-like document and normalize whitespace."""
+_TEXT_DECODE_FALLBACKS: tuple[str, ...] = ("utf-8-sig", "cp1252", "latin-1")
 
-    try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise DocumentParseError(f"Could not decode text document '{filename}' as UTF-8.") from exc
+
+def decode_text_document(filename: str, content: bytes) -> str:
+    """Decode a text-like document, falling back across common encodings.
+
+    ``utf-8-sig`` only tolerates a BOM, not a different encoding — a `.txt`/`.md`
+    file saved as cp1252 or latin-1 (common from Windows tools) would otherwise be
+    rejected outright even though it decodes cleanly under one of these fallbacks.
+    latin-1 never raises (every byte maps to a codepoint), so it's the final,
+    always-succeeding fallback rather than a real "unsupported encoding" signal.
+    """
+
+    text: str | None = None
+    for encoding in _TEXT_DECODE_FALLBACKS:
+        try:
+            text = content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        else:
+            break
+
+    if text is None:
+        raise DocumentParseError(f"Could not decode text document '{filename}'.")
 
     text = normalize_text(text)
     if not text:

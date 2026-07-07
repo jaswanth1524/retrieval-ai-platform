@@ -33,8 +33,14 @@ class RagPipeline:
         self._generator = generator
         self._settings = settings
 
-    def answer(self, question: str) -> GroundedAnswer:
-        """Retrieve, rerank, and generate a grounded, cited answer."""
+    def answer(self, question: str, llm_provider: str | None = None) -> GroundedAnswer:
+        """Retrieve, rerank, and generate a grounded, cited answer.
+
+        ``llm_provider`` overrides the generation provider for this call only. It is
+        applied via ``model_copy`` — the shared settings singleton is never mutated,
+        so concurrent requests choosing different providers stay isolated. Retrieval
+        and reranking always use the base settings (embeddings stay local regardless).
+        """
 
         candidates = retrieve_candidates(
             repository=self._repository,
@@ -48,11 +54,16 @@ class RagPipeline:
             reranker=self._reranker,
             settings=self._settings,
         )
+        generation_settings = (
+            self._settings.model_copy(update={"llm_provider": llm_provider})
+            if llm_provider is not None
+            else self._settings
+        )
         return generate_grounded_answer(
             query=question,
             context_chunks=reranked,
             generator=self._generator,
-            settings=self._settings,
+            settings=generation_settings,
         )
 
 

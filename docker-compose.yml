@@ -18,8 +18,16 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env.example
+      # Optional local override — copy .env.example to .env and set real secrets
+      # (e.g. OPENAI_API_KEY) there; values here win over .env.example.
+      - path: .env
+        required: false
     environment:
       QDRANT_URL: http://qdrant:6333
+    extra_hosts:
+      # Lets OLLAMA_BASE_URL=http://host.docker.internal:... resolve on native Linux
+      # Docker (Docker Desktop on macOS/Windows already resolves this automatically).
+      - "host.docker.internal:host-gateway"
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:

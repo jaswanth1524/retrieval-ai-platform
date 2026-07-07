@@ -15,7 +15,6 @@ const METRICS: Array<[label: string, key: keyof PublicConfigResponse]> = [
 
 const IDENTIFIER_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
   ['Qdrant collection', 'qdrant_collection'],
-  ['Embedding provider', 'embedding_provider'],
   ['Dense embedding model', 'dense_embedding_model'],
   ['Sparse embedding model', 'sparse_embedding_model'],
   ['Reranker model', 'reranker_model'],

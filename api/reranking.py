@@ -59,14 +59,20 @@ class LocalCrossEncoderReranker:
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
         """Return cross-encoder scores for query-document pairs."""
 
-        return [
-            float(score)
-            for score in self.model.rerank(
-                query=query,
-                documents=documents,
-                batch_size=int(self.settings.reranker_batch_size),
+        try:
+            # The model is constructed with lazy_load=True, so the actual model
+            # download/load happens on this first call, not at __init__ — this is
+            # the boundary that must translate a load failure into RerankingError.
+            scores = list(
+                self.model.rerank(
+                    query=query,
+                    documents=documents,
+                    batch_size=int(self.settings.reranker_batch_size),
+                )
             )
-        ]
+        except Exception as exc:
+            raise RerankingError(f"Reranker model failed: {exc}") from exc
+        return [float(score) for score in scores]
 
 
 class Reranker(Protocol):

@@ -6,6 +6,7 @@ import pytest
 
 import api.documents as documents
 from api.documents import (
+    ChunkConfigError,
     DocumentSection,
     EmptyDocumentError,
     UnsupportedDocumentError,
@@ -92,8 +93,31 @@ def test_chunk_overlap_must_be_smaller_than_chunk_size() -> None:
     settings = make_settings(chunk_size_tokens=4, chunk_overlap_tokens=4)
     section = DocumentSection(filename="bad.txt", page=1, section="Bad", text="alpha beta")
 
-    with pytest.raises(ValueError, match="CHUNK_OVERLAP_TOKENS"):
+    # A ChunkConfigError (DocumentError subclass) maps to 400, not the bare
+    # ValueError this used to raise, which surfaced as an unhandled 500.
+    with pytest.raises(ChunkConfigError, match="CHUNK_OVERLAP_TOKENS"):
         chunk_sections([section], settings)
+
+
+def test_parse_text_document_falls_back_to_cp1252_when_not_valid_utf8() -> None:
+    """A Windows-exported .txt saved as cp1252 must not be rejected outright — only
+    utf-8-sig was tried before, which raised DocumentParseError for this input."""
+
+    content = "café notes".encode("cp1252")
+
+    sections = parse_document_bytes("notes.txt", content)
+
+    assert sections[0].text == "café notes"
+
+
+def test_parse_text_document_falls_back_to_latin1_as_last_resort() -> None:
+    # 0x81 is undefined in cp1252 but valid in latin-1 (maps to U+0081) — proves the
+    # fallback chain reaches its final, always-succeeding rung rather than raising.
+    content = b"bad\x81byte"
+
+    sections = parse_document_bytes("notes.txt", content)
+
+    assert sections[0].text == "bad\x81byte"
 
 
 def test_empty_and_unsupported_documents_are_rejected() -> None:

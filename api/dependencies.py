@@ -33,7 +33,12 @@ def get_qdrant_client() -> QdrantClient:
 
 @lru_cache
 def get_embedding_provider() -> LocalEmbeddingProvider:
-    """Return a cached local embedding provider."""
+    """Return a cached local embedding provider.
+
+    Intentionally hardcoded to local — embeddings stay local by design regardless of
+    the selected generation provider (see CLAUDE.md's provider rules), so there is no
+    settings-driven switch here.
+    """
 
     return LocalEmbeddingProvider(get_app_settings())
 

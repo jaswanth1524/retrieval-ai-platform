@@ -28,8 +28,9 @@ class FakeGenerator:
         self.answer = answer
         self.messages: list[ChatMessage] = []
 
-    def complete(self, messages: Sequence[ChatMessage]) -> str:
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
         self.messages = list(messages)
+        self.settings = settings
         return self.answer
 
 
@@ -186,9 +187,10 @@ def test_generate_grounded_answer_rejects_empty_model_response() -> None:
 
 def test_litellm_generator_uses_ollama_configuration() -> None:
     completion_client = FakeCompletionClient({"choices": [{"message": {"content": "Answer [1]."}}]})
-    generator = LiteLLMGenerator(make_settings(), completion_client=completion_client)
+    settings = make_settings()
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
 
-    answer = generator.complete([{"role": "user", "content": "Hi"}])
+    answer = generator.complete([{"role": "user", "content": "Hi"}], settings)
 
     assert answer == "Answer [1]."
     assert completion_client.kwargs is not None
@@ -197,6 +199,42 @@ def test_litellm_generator_uses_ollama_configuration() -> None:
     assert completion_client.kwargs["temperature"] == 0
     assert completion_client.kwargs["max_tokens"] == 512
     assert completion_client.kwargs["timeout"] == 60.0
+
+
+def test_litellm_generator_routes_to_settings_provider_not_construction_provider() -> None:
+    """A per-request settings override picks the provider, not the construction settings.
+
+    Guards the per-request switch: one cached generator built with the ollama base must
+    still route to OpenAI when handed OpenAI settings at call time.
+    """
+
+    completion_client = FakeCompletionClient({"choices": [{"message": {"content": "Answer [1]."}}]})
+    base_settings = make_settings()  # llm_provider="ollama"
+    generator = LiteLLMGenerator(base_settings, completion_client=completion_client)
+
+    override = base_settings.model_copy(
+        update={
+            "llm_provider": "openai",
+            "openai_model": "gpt-test",
+            "openai_api_key": "test-key",
+        }
+    )
+    generator.complete([{"role": "user", "content": "Hi"}], override)
+
+    assert completion_client.kwargs is not None
+    assert completion_client.kwargs["model"] == "gpt-test"
+    assert completion_client.kwargs["api_key"] == "test-key"
+    assert "base_url" not in completion_client.kwargs
+
+
+def test_litellm_generator_openai_override_without_key_raises() -> None:
+    completion_client = FakeCompletionClient({"choices": [{"message": {"content": "x"}}]})
+    base_settings = make_settings()
+    generator = LiteLLMGenerator(base_settings, completion_client=completion_client)
+
+    override = base_settings.model_copy(update={"llm_provider": "openai", "openai_api_key": None})
+    with pytest.raises(GenerationConfigError, match="OPENAI_API_KEY"):
+        generator.complete([{"role": "user", "content": "Hi"}], override)
 
 
 def test_completion_model_and_kwargs_supports_openai_with_key() -> None:
@@ -231,3 +269,32 @@ def test_extract_completion_text_supports_object_responses() -> None:
 def test_extract_completion_text_rejects_malformed_response() -> None:
     with pytest.raises(GenerationError, match="choices"):
         extract_completion_text({})
+
+
+class RaisingCompletionClient:
+    def __call__(self, **kwargs: Any) -> object:
+        raise RuntimeError("connection refused")
+
+
+def test_litellm_generator_wraps_provider_exceptions_as_generation_error() -> None:
+    """The completion boundary must translate provider-library exceptions (auth,
+    connection, rate-limit, ...) into GenerationError so main.py maps them to a clean
+    502 instead of an opaque 500 (proven live: a bad OpenAI key previously surfaced as
+    a raw 500 after ~40s of LiteLLM retries).
+    """
+
+    generator = LiteLLMGenerator(make_settings(), completion_client=RaisingCompletionClient())
+
+    with pytest.raises(GenerationError, match="connection refused"):
+        generator.complete([{"role": "user", "content": "Hi"}], make_settings())
+
+
+def test_litellm_generator_passes_num_retries_from_settings() -> None:
+    completion_client = FakeCompletionClient({"choices": [{"message": {"content": "ok"}}]})
+    settings = make_settings(llm_num_retries=2)
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+
+    generator.complete([{"role": "user", "content": "Hi"}], settings)
+
+    assert completion_client.kwargs is not None
+    assert completion_client.kwargs["num_retries"] == 2

@@ -20,7 +20,6 @@ describe('App', () => {
         if (url.endsWith('/config')) {
           return jsonResponse({
             qdrant_collection: 'docrag_documents',
-            embedding_provider: 'local',
             dense_embedding_model: 'BAAI/bge-small-en-v1.5',
             sparse_embedding_model: 'Qdrant/BM25',
             reranker_model: 'BAAI/bge-reranker-v2-m3',
@@ -28,12 +27,14 @@ describe('App', () => {
             llm_provider: 'ollama',
             llm_model: 'llama3.1:8b',
             openai_model: 'gpt-4o-mini',
+            openai_available: false,
             rrf_k: 60,
             dense_retrieval_limit: 50,
             sparse_retrieval_limit: 50,
             fused_top_n: 50,
             rerank_top_k: 8,
             max_context_chunks: 6,
+            max_upload_bytes: 52428800,
           });
         }
         throw new Error(`unexpected fetch: ${url}`);

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from weakref import WeakKeyDictionary
 
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from api.settings import AppSettings
 
@@ -20,6 +22,14 @@ PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
 
 class CollectionSchemaError(RuntimeError):
     """Raised when an existing Qdrant collection does not match DocRAG's schema."""
+
+
+class VectorStoreUnavailableError(RuntimeError):
+    """Raised when Qdrant cannot be reached (connection refused, timeout, DNS, ...).
+
+    Distinct from ``CollectionSchemaError``: this is an infra/connectivity failure,
+    not a schema mismatch, so it maps to a 503 rather than a 409.
+    """
 
 
 class EmbeddingModelMismatchError(CollectionSchemaError):
@@ -89,6 +99,30 @@ def create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
         )
 
 
+def ensure_payload_indexes(
+    client: QdrantClient,
+    collection_name: str,
+    collection_info: models.CollectionInfo,
+) -> None:
+    """Create any required payload index missing from an already-existing collection.
+
+    Guards against a collection left index-less by a crash between
+    ``create_collection`` and ``create_payload_indexes`` (they are not atomic).
+    Idempotent: local/in-memory Qdrant never reports indexes in ``payload_schema``
+    (they are a no-op there per its own warning), so this repairs real deployments
+    and is a harmless no-op replay against local/test clients.
+    """
+
+    existing = set((collection_info.payload_schema or {}).keys())
+    for field_name, field_schema in PAYLOAD_INDEXES:
+        if field_name not in existing:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=field_schema,
+            )
+
+
 # Per-client cache of already-validated collections, keyed by (collection, embedding
 # tag, sparse model) so a config change is never masked by a stale cache entry. Only
 # successful readiness is cached; validation failures always re-check against Qdrant so
@@ -96,6 +130,13 @@ def create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
 _ReadinessKey = tuple[str, str, str]
 _readiness_cache: WeakKeyDictionary[QdrantClient, dict[_ReadinessKey, CollectionReady]]
 _readiness_cache = WeakKeyDictionary()
+
+# Serializes collection creation across the threadpool FastAPI runs sync dependencies
+# in: without this, two concurrent first-ever requests can both see "not exists" and
+# both call create_collection, and the loser gets an unhandled error. One process-wide
+# lock is deliberately coarse — cold-start collection creation is rare and cheap enough
+# that contention is never a real concern.
+_ensure_collection_lock = Lock()
 
 
 def ensure_collection(client: QdrantClient, settings: AppSettings) -> CollectionReady:
@@ -110,9 +151,14 @@ def ensure_collection(client: QdrantClient, settings: AppSettings) -> Collection
     if cached is not None:
         return cached
 
-    ready = _ensure_collection_uncached(client, settings)
-    _readiness_cache.setdefault(client, {})[cache_key] = ready
-    return ready
+    with _ensure_collection_lock:
+        # Re-check inside the lock: another thread may have finished while we waited.
+        cached = _readiness_cache.get(client, {}).get(cache_key)
+        if cached is not None:
+            return cached
+        ready = _ensure_collection_uncached(client, settings)
+        _readiness_cache.setdefault(client, {})[cache_key] = ready
+        return ready
 
 
 def clear_readiness_cache() -> None:
@@ -124,23 +170,43 @@ def clear_readiness_cache() -> None:
 def _ensure_collection_uncached(client: QdrantClient, settings: AppSettings) -> CollectionReady:
     """Create or validate the configured Qdrant collection against Qdrant itself."""
 
+    try:
+        return _ensure_collection_against_qdrant(client, settings)
+    except ResponseHandlingException as exc:
+        raise VectorStoreUnavailableError(f"Qdrant is unreachable: {exc}") from exc
+
+
+def _ensure_collection_against_qdrant(
+    client: QdrantClient, settings: AppSettings
+) -> CollectionReady:
+    """Create or validate the collection, letting connection failures propagate."""
+
     collection_name = settings.qdrant_collection
     if not client.collection_exists(collection_name):
-        client.create_collection(
-            collection_name=collection_name,
-            vectors_config=dense_vectors_config(settings),
-            sparse_vectors_config=sparse_vectors_config(settings),
-            metadata=collection_metadata(settings),
-        )
-        create_payload_indexes(client, collection_name)
-        return CollectionReady(
-            collection_name=collection_name,
-            created=True,
-            embedding_model_tag=settings.embedding_model_tag,
-        )
+        try:
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=dense_vectors_config(settings),
+                sparse_vectors_config=sparse_vectors_config(settings),
+                metadata=collection_metadata(settings),
+            )
+            create_payload_indexes(client, collection_name)
+            return CollectionReady(
+                collection_name=collection_name,
+                created=True,
+                embedding_model_tag=settings.embedding_model_tag,
+            )
+        except UnexpectedResponse:
+            # A concurrent process (a separate server instance, outside this
+            # in-process lock's reach) may have created it between our exists-check
+            # and this call. Fall through to validation only if it genuinely exists
+            # now; otherwise this was a real failure.
+            if not client.collection_exists(collection_name):
+                raise
 
     collection_info = client.get_collection(collection_name)
     validate_collection_schema(collection_info, settings)
+    ensure_payload_indexes(client, collection_name, collection_info)
     return CollectionReady(
         collection_name=collection_name,
         created=False,

@@ -143,3 +143,21 @@ def test_local_cross_encoder_reranker_delegates_to_model() -> None:
     assert model.seen_documents == ["doc one", "doc two"]
     assert model.seen_batch_size == 11
 
+
+class RaisingCrossEncoder:
+    def rerank(
+        self, query: str, documents: Iterable[str], batch_size: int = 64, **kwargs: Any
+    ) -> Iterable[float]:
+        raise RuntimeError("model download failed")
+
+
+def test_local_cross_encoder_reranker_wraps_model_failure_as_reranking_error() -> None:
+    """The model is lazy_load=True, so a bad model name or failed download only
+    surfaces on this first call, not at construction — this call must translate it
+    into RerankingError (-> 502) rather than an unwrapped exception (-> 500)."""
+
+    reranker = LocalCrossEncoderReranker(make_settings(), model=RaisingCrossEncoder())
+
+    with pytest.raises(RerankingError, match="model download failed"):
+        reranker.score("query", ["doc"])
+

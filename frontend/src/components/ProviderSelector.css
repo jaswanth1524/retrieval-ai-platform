@@ -1,0 +1,32 @@
+.provider-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.provider-selector__label {
+  color: var(--text-muted);
+}
+
+.provider-selector__select {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 0.35rem 0.6rem;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+
+.provider-selector__select:focus {
+  outline: 1px solid var(--accent);
+}
+
+.provider-selector__hint {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from api.qdrant_schema import (
     EMBEDDING_MODEL_TAG_KEY,
+    PAYLOAD_INDEXES,
     CollectionSchemaError,
     EmbeddingModelMismatchError,
+    VectorStoreUnavailableError,
     clear_readiness_cache,
     collection_metadata,
     dense_vectors_config,
@@ -171,3 +175,77 @@ def test_existing_collection_without_expected_dense_vector_is_rejected() -> None
 
     with pytest.raises(CollectionSchemaError, match="missing dense vector"):
         ensure_collection(client, settings)
+
+
+def test_ensure_collection_wraps_connection_failure_as_service_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+
+    def fail_connection(*args: Any, **kwargs: Any) -> Any:
+        raise ResponseHandlingException(ConnectionError("connection refused"))
+
+    monkeypatch.setattr(client, "collection_exists", fail_connection)
+
+    with pytest.raises(VectorStoreUnavailableError, match="unreachable"):
+        ensure_collection(client, settings)
+
+
+def test_ensure_collection_repairs_missing_payload_indexes_on_existing_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guards against a collection left index-less by a crash between
+    create_collection and create_payload_indexes (they are not atomic) — validation
+    must notice and repair missing indexes, not just check vectors/tags forever."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        collection_name=settings.qdrant_collection,
+        vectors_config=dense_vectors_config(settings),
+        sparse_vectors_config=sparse_vectors_config(settings),
+        metadata=collection_metadata(settings),
+    )
+    # Deliberately skip create_payload_indexes to simulate the crash window.
+
+    created_indexes: list[str] = []
+    original_create_index = client.create_payload_index
+
+    def tracking_create_index(*args: Any, **kwargs: Any) -> Any:
+        created_indexes.append(kwargs["field_name"])
+        return original_create_index(*args, **kwargs)
+
+    monkeypatch.setattr(client, "create_payload_index", tracking_create_index)
+
+    ensure_collection(client, settings)
+
+    assert set(created_indexes) == {field_name for field_name, _ in PAYLOAD_INDEXES}
+
+
+def test_ensure_collection_concurrent_cold_calls_create_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent first-ever requests (FastAPI's threadpool) must not both see
+    'not exists' and both call create_collection — the lock must serialize them."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    create_calls = 0
+    original_create = client.create_collection
+
+    def counting_create(*args: Any, **kwargs: Any) -> Any:
+        nonlocal create_calls
+        create_calls += 1
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(client, "create_collection", counting_create)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: ensure_collection(client, settings), range(4)))
+
+    # The lock serializes access: exactly one thread actually creates the collection;
+    # the rest hit the cache the winner populated (all four share that cached result,
+    # which is why every result reports created=True here, not just one).
+    assert create_calls == 1
+    assert all(result.created for result in results)

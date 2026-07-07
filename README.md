@@ -85,7 +85,9 @@ The intended newcomer workflow is:
 docker compose up
 ```
 
-The Compose file runs two services: Qdrant, and the API. The API's Docker image builds the `frontend/` React app and serves the built static files itself, so the browser UI and the JSON API share a single origin/port — there is no separate UI container. It loads non-secret defaults from `.env.example`; local overrides can be supplied through the shell or a copied `.env` file.
+The Compose file runs two services: Qdrant, and the API. The API's Docker image builds the `frontend/` React app and serves the built static files itself, so the browser UI and the JSON API share a single origin/port — there is no separate UI container. It loads non-secret defaults from `.env.example`; copy it to `.env` (`cp .env.example .env`) to set real secrets such as `OPENAI_API_KEY` — values in `.env` override `.env.example` and the file is git-ignored.
+
+The default `OLLAMA_BASE_URL` targets `host.docker.internal`, which Docker Desktop (macOS/Windows) resolves automatically. On native Linux, Compose maps this via `extra_hosts: host-gateway`, so no extra setup is required there either.
 
 For local frontend iteration without a full rebuild, run `uv run uvicorn api.main:app --reload` and `npm --prefix frontend run dev` separately — Vite's dev server proxies API calls to `localhost:8000`.
 

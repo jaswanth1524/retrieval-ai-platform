@@ -9,7 +9,7 @@ from qdrant_client import QdrantClient, models
 
 from api.documents import DocumentChunk, EmptyDocumentError
 from api.embeddings import EmbeddedText, EmbeddingError
-from api.ingestion import ingest_chunks, point_id_for_chunk
+from api.ingestion import IngestionError, ingest_chunks, point_id_for_chunk
 from api.qdrant_schema import CollectionSchemaError
 from api.repository import VectorRepository
 from api.settings import AppSettings
@@ -160,3 +160,34 @@ def test_ingest_chunks_rejects_embedding_count_mismatch() -> None:
 
     with pytest.raises(EmbeddingError, match="count mismatch"):
         ingest_chunks(repository, settings, [make_chunk()], provider)
+
+
+def test_ingest_chunks_wraps_upsert_failure_with_un_indexed_warning() -> None:
+    """Delete-then-upsert is forced (deterministic point IDs share the filename, so
+    upserting first would let a later delete wipe the new points too) — but that
+    means an upsert failure after a successful delete leaves the document with zero
+    indexed chunks. The caller must get a clear signal to retry, not a bare
+    connection-error traceback."""
+
+    class DeletesThenFailsToUpsert:
+        def __init__(self, inner: VectorRepository) -> None:
+            self._inner = inner
+            self.deleted = False
+
+        def ensure_ready(self, settings: AppSettings) -> None:
+            self._inner.ensure_ready(settings)
+
+        def delete_by_filename(self, settings: AppSettings, filenames: object) -> None:
+            self.deleted = True
+
+        def upsert(self, settings: AppSettings, points: object) -> None:
+            raise ConnectionError("connection refused")
+
+    settings = make_settings()
+    repository = DeletesThenFailsToUpsert(VectorRepository(QdrantClient(":memory:")))
+    provider = FakeEmbeddingProvider([make_embedding()])
+
+    with pytest.raises(IngestionError, match="un-indexed"):
+        ingest_chunks(repository, settings, [make_chunk()], provider)
+
+    assert repository.deleted is True

@@ -15,8 +15,9 @@ from api.dependencies import get_app_settings, get_ingest_service, get_rag_pipel
 from api.documents import DocumentError
 from api.embeddings import EmbeddingError
 from api.generation import GenerationConfigError, GenerationError
+from api.ingestion import IngestionError
 from api.pipeline import IngestService, RagPipeline
-from api.qdrant_schema import CollectionSchemaError
+from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.reranking import RerankingError
 from api.retrieval import RetrievalError, RetrievalPayloadError
 from api.schemas import (
@@ -28,6 +29,7 @@ from api.schemas import (
     QuestionResponse,
 )
 from api.settings import AppSettings
+from api.upload import UploadTooLargeError, read_upload_within_limit
 
 SettingsDep = Annotated[AppSettings, Depends(get_app_settings)]
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
@@ -79,9 +81,10 @@ def register_routes(app: FastAPI) -> None:
     @app.post("/documents", response_model=DocumentIngestResponse)
     async def upload_document(
         ingest_service: IngestServiceDep,
+        settings: SettingsDep,
         file: Annotated[UploadFile, File()],
     ) -> DocumentIngestResponse:
-        content = await file.read()
+        content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
         filename = file.filename or ""
         # Parsing, embedding, and upsert are blocking; run off the event loop so a
         # single upload cannot stall the whole server.
@@ -98,7 +101,7 @@ def register_routes(app: FastAPI) -> None:
         request: QuestionRequest,
         pipeline: RagPipelineDep,
     ) -> QuestionResponse:
-        grounded = pipeline.answer(request.question)
+        grounded = pipeline.answer(request.question, request.llm_provider)
         return QuestionResponse(
             answer=grounded.answer,
             sources=[
@@ -120,7 +123,6 @@ def public_config(settings: AppSettings) -> PublicConfigResponse:
 
     return PublicConfigResponse(
         qdrant_collection=settings.qdrant_collection,
-        embedding_provider=settings.embedding_provider,
         dense_embedding_model=settings.dense_embedding_model,
         sparse_embedding_model=settings.sparse_embedding_model,
         reranker_model=settings.reranker_model,
@@ -128,12 +130,14 @@ def public_config(settings: AppSettings) -> PublicConfigResponse:
         llm_provider=settings.llm_provider,
         llm_model=settings.llm_model,
         openai_model=settings.openai_model,
+        openai_available=bool(settings.openai_api_key),
         rrf_k=int(settings.rrf_k),
         dense_retrieval_limit=int(settings.dense_retrieval_limit),
         sparse_retrieval_limit=int(settings.sparse_retrieval_limit),
         fused_top_n=int(settings.fused_top_n),
         rerank_top_k=int(settings.rerank_top_k),
         max_context_chunks=int(settings.max_context_chunks),
+        max_upload_bytes=int(settings.max_upload_bytes),
     )
 
 
@@ -141,9 +145,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     """Register domain exception handlers."""
 
     app.add_exception_handler(DocumentError, bad_request_handler)
+    app.add_exception_handler(UploadTooLargeError, payload_too_large_handler)
+    app.add_exception_handler(IngestionError, bad_gateway_handler)
     app.add_exception_handler(RetrievalPayloadError, internal_error_handler)
     app.add_exception_handler(RetrievalError, bad_request_handler)
     app.add_exception_handler(CollectionSchemaError, conflict_handler)
+    app.add_exception_handler(VectorStoreUnavailableError, service_unavailable_handler)
     app.add_exception_handler(GenerationConfigError, bad_request_handler)
     app.add_exception_handler(GenerationError, bad_gateway_handler)
     app.add_exception_handler(RerankingError, bad_gateway_handler)
@@ -166,6 +173,18 @@ async def bad_gateway_handler(request: Request, exc: Exception) -> JSONResponse:
     """Return a 502 response for provider failures."""
 
     return error_response(502, exc)
+
+
+async def service_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return a 503 response when a required backing service is unreachable."""
+
+    return error_response(503, exc)
+
+
+async def payload_too_large_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return a 413 response when an upload exceeds the configured size limit."""
+
+    return error_response(413, exc)
 
 
 async def internal_error_handler(request: Request, exc: Exception) -> JSONResponse:
