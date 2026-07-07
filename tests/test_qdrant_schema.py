@@ -35,7 +35,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "embedding_model_tag": "local-dense:v1",
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def test_vector_configs_use_named_dense_and_sparse_vectors() -> None:

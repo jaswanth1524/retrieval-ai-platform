@@ -66,25 +66,50 @@ class VectorRepository:
             wait=True,
         )
 
-    def delete_by_filename(self, settings: AppSettings, filenames: Sequence[str]) -> None:
-        """Remove any prior points for these filenames so re-ingest leaves no orphans."""
+    def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]:
+        """Return all point IDs currently indexed for a filename.
+
+        Used to compute which points are stale *after* a re-ingest upsert, rather than
+        deleting by filename before the upsert — see ``ingest_chunks`` for why ordering
+        matters.
+        """
 
         self.ensure_ready(settings)
-        for filename in sorted(set(filenames)):
-            self._client.delete(
+        ids: list[str] = []
+        offset: models.ExtendedPointId | None = None
+        while True:
+            points, offset = self._client.scroll(
                 collection_name=settings.qdrant_collection,
-                points_selector=models.FilterSelector(
-                    filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="filename",
-                                match=models.MatchValue(value=filename),
-                            )
-                        ]
-                    )
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="filename",
+                            match=models.MatchValue(value=filename),
+                        )
+                    ]
                 ),
-                wait=True,
+                with_payload=False,
+                with_vectors=False,
+                limit=256,
+                offset=offset,
             )
+            ids.extend(str(point.id) for point in points)
+            if offset is None:
+                break
+        return ids
+
+    def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
+        """Remove specific points by id — a single call regardless of how many
+        filenames those ids originally belonged to (no per-filename round-trips)."""
+
+        if not point_ids:
+            return
+        self.ensure_ready(settings)
+        self._client.delete(
+            collection_name=settings.qdrant_collection,
+            points_selector=models.PointIdsList(points=list(point_ids)),
+            wait=True,
+        )
 
     def _server_side_hybrid_query(
         self,

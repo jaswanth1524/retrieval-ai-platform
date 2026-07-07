@@ -69,7 +69,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "llm_max_tokens": 512,
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def make_chunk(chunk_id: str, text: str, page: int = 1) -> RerankedChunk:

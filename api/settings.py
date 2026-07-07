@@ -52,6 +52,15 @@ class AppSettings(BaseSettings):
     # separately-running frontend directly at this API instead of using the proxy.
     cors_allow_origins: list[str] = Field(default_factory=list)
 
+    # Off by default: the embedding/reranker models are lazy-loaded on first use, so a
+    # cold-start warmup at boot moves that (potentially tens-of-seconds) cost earlier,
+    # surfacing a misconfigured MODEL name at startup instead of on a user's first
+    # question. Left opt-in rather than on-by-default because the warmup path reads
+    # this setting directly (not through FastAPI's DI), which sidesteps test fixtures'
+    # dependency overrides — an operator-set `true` in a real `.env` would otherwise
+    # also trigger real model downloads during local test runs against that same file.
+    warmup_models: bool = False
+
 
 def get_settings() -> AppSettings:
     """Return settings from the current process environment."""

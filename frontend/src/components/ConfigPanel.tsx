@@ -31,6 +31,7 @@ function ConfigPanel({ config }: ConfigPanelProps) {
 
   return (
     <div className="config-panel">
+      <div className="config-panel__section-label">Retrieval settings</div>
       <div className="config-panel__metrics">
         {METRICS.map(([label, key]) => (
           <div key={key} className="config-panel__metric">

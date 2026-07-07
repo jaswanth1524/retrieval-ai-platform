@@ -20,7 +20,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "embedding_model_tag": "test-embedding:v1",
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def scored_point(chunk_id: str, score: float) -> models.ScoredPoint:
@@ -86,15 +86,52 @@ def test_vector_repository_upsert_indexes_and_ensures_collection() -> None:
     assert records[0].payload["filename"] == "guide.md"
 
 
-def test_vector_repository_delete_by_filename_removes_only_that_file() -> None:
+def test_vector_repository_point_ids_for_filename_returns_only_that_files_ids() -> None:
     settings = make_settings()
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
-    repository.upsert(settings, [make_point("p1", "guide.md"), make_point("p2", "other.md")])
+    guide_point = make_point("p1", "guide.md")
+    repository.upsert(settings, [guide_point, make_point("p2", "other.md")])
 
-    repository.delete_by_filename(settings, ["guide.md"])
+    ids = repository.point_ids_for_filename(settings, "guide.md")
+
+    assert ids == [str(guide_point.id)]
+
+
+def test_vector_repository_point_ids_for_filename_empty_for_unknown_file() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(settings, [make_point("p1", "guide.md")])
+
+    assert repository.point_ids_for_filename(settings, "missing.md") == []
+
+
+def test_vector_repository_delete_by_ids_removes_only_those_points() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    guide_point = make_point("p1", "guide.md")
+    other_point = make_point("p2", "other.md")
+    repository.upsert(settings, [guide_point, other_point])
+
+    repository.delete_by_ids(settings, [str(guide_point.id)])
 
     records, _ = client.scroll(
         collection_name=settings.qdrant_collection, with_payload=True, with_vectors=False
     )
     assert [record.payload["filename"] for record in records if record.payload] == ["other.md"]
+
+
+def test_vector_repository_delete_by_ids_is_a_noop_for_empty_list() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(settings, [make_point("p1", "guide.md")])
+
+    repository.delete_by_ids(settings, [])
+
+    records, _ = client.scroll(
+        collection_name=settings.qdrant_collection, with_payload=True, with_vectors=False
+    )
+    assert len(records) == 1

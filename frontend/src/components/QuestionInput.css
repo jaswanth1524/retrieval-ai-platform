@@ -1,32 +1,42 @@
 .question-input {
   display: flex;
-  gap: 0.6rem;
-  align-items: flex-end;
-  border-top: 1px solid var(--border);
-  padding: 0.8rem;
+  gap: 10px;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  margin: 20px 28px 26px;
+  padding: 8px 8px 8px 18px;
+}
+
+.question-input:focus-within {
+  border-color: var(--accent);
 }
 
 .question-input__textarea {
   flex: 1;
   resize: none;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  background: transparent;
+  border: none;
   color: var(--text);
-  padding: 0.5rem 0.7rem;
+  padding: 8px 0;
   font-family: inherit;
-  font-size: 0.9rem;
+  font-size: 14px;
+}
+
+.question-input__textarea::placeholder {
+  color: var(--text-placeholder);
 }
 
 .question-input__textarea:focus {
-  outline: 1px solid var(--accent);
+  outline: none;
 }
 
 .question-input__submit {
   background: var(--accent);
-  color: var(--bg);
+  color: var(--accent-contrast);
   border: none;
-  border-radius: 6px;
-  padding: 0.55rem 1.1rem;
-  font-weight: 600;
+  border-radius: 11px;
+  padding: 11px 20px;
+  font: 600 13.5px var(--font-sans);
 }

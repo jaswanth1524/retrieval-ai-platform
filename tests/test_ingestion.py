@@ -35,7 +35,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "embedding_model_tag": "test-embedding:v1",
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def make_chunk(
@@ -109,7 +109,8 @@ def test_ingest_chunks_replaces_prior_points_for_same_filename() -> None:
     original = make_chunk(chunk_id="old", text="original text")
     ingest_chunks(repository, settings, [original], FakeEmbeddingProvider([make_embedding()]))
 
-    # An edited re-upload of the same file yields a new chunk_id (new point id).
+    # An edited re-upload of the same file yields a new chunk_id (new point id) — the
+    # old point must end up deleted as stale, not left behind alongside the new one.
     edited = make_chunk(chunk_id="new", text="edited text")
     ingest_chunks(repository, settings, [edited], FakeEmbeddingProvider([make_embedding(0.2)]))
 
@@ -123,6 +124,33 @@ def test_ingest_chunks_replaces_prior_points_for_same_filename() -> None:
     assert records[0].payload["chunk_id"] == "new"
 
 
+def test_ingest_chunks_keeps_matching_point_when_chunk_is_unchanged() -> None:
+    """A chunk whose id/text is unchanged across re-ingests must NOT be treated as
+    stale and deleted — only ids absent from the new upsert should be removed."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    unchanged = make_chunk(chunk_id="stable", text="same text")
+    ingest_chunks(repository, settings, [unchanged], FakeEmbeddingProvider([make_embedding()]))
+
+    new_chunk = make_chunk(chunk_id="added", text="new text")
+    ingest_chunks(
+        repository,
+        settings,
+        [unchanged, new_chunk],
+        FakeEmbeddingProvider([make_embedding(), make_embedding(0.2)]),
+    )
+
+    records, _ = client.scroll(
+        collection_name=settings.qdrant_collection,
+        with_payload=True,
+        with_vectors=False,
+    )
+    chunk_ids = {record.payload["chunk_id"] for record in records if record.payload}
+    assert chunk_ids == {"stable", "added"}
+
+
 def test_ingest_chunks_validates_before_embedding() -> None:
     class RefusingRepository:
         def ensure_ready(self, settings: AppSettings) -> None:
@@ -131,7 +159,10 @@ def test_ingest_chunks_validates_before_embedding() -> None:
         def upsert(self, settings: AppSettings, points: object) -> None:
             raise AssertionError("upsert must not run when ensure_ready refuses")
 
-        def delete_by_filename(self, settings: AppSettings, filenames: object) -> None:
+        def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]:
+            raise AssertionError("lookup must not run when ensure_ready refuses")
+
+        def delete_by_ids(self, settings: AppSettings, point_ids: object) -> None:
             raise AssertionError("delete must not run when ensure_ready refuses")
 
     class FailingEmbeddingProvider:
@@ -162,32 +193,88 @@ def test_ingest_chunks_rejects_embedding_count_mismatch() -> None:
         ingest_chunks(repository, settings, [make_chunk()], provider)
 
 
-def test_ingest_chunks_wraps_upsert_failure_with_un_indexed_warning() -> None:
-    """Delete-then-upsert is forced (deterministic point IDs share the filename, so
-    upserting first would let a later delete wipe the new points too) — but that
-    means an upsert failure after a successful delete leaves the document with zero
-    indexed chunks. The caller must get a clear signal to retry, not a bare
-    connection-error traceback."""
+def test_ingest_chunks_upsert_failure_leaves_previous_version_intact() -> None:
+    """Points upsert first, stale cleanup happens after — so an upsert failure must
+    leave whatever was previously indexed fully intact and queryable, not wipe it."""
 
-    class DeletesThenFailsToUpsert:
+    class FailsToUpsert:
         def __init__(self, inner: VectorRepository) -> None:
             self._inner = inner
-            self.deleted = False
 
         def ensure_ready(self, settings: AppSettings) -> None:
             self._inner.ensure_ready(settings)
 
-        def delete_by_filename(self, settings: AppSettings, filenames: object) -> None:
-            self.deleted = True
+        def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]:
+            return self._inner.point_ids_for_filename(settings, filename)
 
         def upsert(self, settings: AppSettings, points: object) -> None:
             raise ConnectionError("connection refused")
 
+        def delete_by_ids(self, settings: AppSettings, point_ids: object) -> None:
+            raise AssertionError("delete must not run when upsert fails")
+
     settings = make_settings()
-    repository = DeletesThenFailsToUpsert(VectorRepository(QdrantClient(":memory:")))
-    provider = FakeEmbeddingProvider([make_embedding()])
+    client = QdrantClient(":memory:")
+    inner = VectorRepository(client)
+    original = make_chunk(chunk_id="old", text="original text")
+    ingest_chunks(inner, settings, [original], FakeEmbeddingProvider([make_embedding()]))
 
-    with pytest.raises(IngestionError, match="un-indexed"):
-        ingest_chunks(repository, settings, [make_chunk()], provider)
+    failing_repository = FailsToUpsert(inner)
+    provider = FakeEmbeddingProvider([make_embedding(0.2)])
+    edited = make_chunk(chunk_id="new", text="edited text")
 
-    assert repository.deleted is True
+    with pytest.raises(IngestionError, match="previous version remains indexed"):
+        ingest_chunks(failing_repository, settings, [edited], provider)
+
+    records, _ = client.scroll(
+        collection_name=settings.qdrant_collection,
+        with_payload=True,
+        with_vectors=False,
+    )
+    assert len(records) == 1
+    assert records[0].payload is not None
+    assert records[0].payload["chunk_id"] == "old"
+
+
+def test_ingest_chunks_wraps_stale_cleanup_failure_distinctly() -> None:
+    """A failure deleting stale points is milder than an upsert failure — the new
+    content is already indexed — so it gets its own distinct error message."""
+
+    class FailsToDeleteStale:
+        def __init__(self, inner: VectorRepository) -> None:
+            self._inner = inner
+
+        def ensure_ready(self, settings: AppSettings) -> None:
+            self._inner.ensure_ready(settings)
+
+        def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]:
+            return self._inner.point_ids_for_filename(settings, filename)
+
+        def upsert(self, settings: AppSettings, points: object) -> None:
+            self._inner.upsert(settings, points)  # type: ignore[arg-type]
+
+        def delete_by_ids(self, settings: AppSettings, point_ids: object) -> None:
+            raise ConnectionError("connection refused")
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    inner = VectorRepository(client)
+    original = make_chunk(chunk_id="old", text="original text")
+    ingest_chunks(inner, settings, [original], FakeEmbeddingProvider([make_embedding()]))
+
+    failing_repository = FailsToDeleteStale(inner)
+    provider = FakeEmbeddingProvider([make_embedding(0.2)])
+    edited = make_chunk(chunk_id="new", text="edited text")
+
+    with pytest.raises(IngestionError, match="failed to remove"):
+        ingest_chunks(failing_repository, settings, [edited], provider)
+
+    records, _ = client.scroll(
+        collection_name=settings.qdrant_collection,
+        with_payload=True,
+        with_vectors=False,
+    )
+    chunk_ids = {record.payload["chunk_id"] for record in records if record.payload}
+    # The new content IS indexed despite the error — only the stale "old" point
+    # failed to clean up, proving this failure mode is milder than an upsert failure.
+    assert chunk_ids == {"old", "new"}

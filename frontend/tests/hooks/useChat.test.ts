@@ -145,4 +145,38 @@ describe('useChat', () => {
 
     expect(signal?.aborted).toBe(true);
   });
+
+  it('cancel() aborts the in-flight request and clears pending via the existing error path', async () => {
+    askQuestionMock.mockImplementation(
+      (_question, _provider, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new ApiClientError('Request timed out or was cancelled.')));
+        }),
+    );
+
+    const { result } = renderHook(() => useChat());
+
+    let askPromise!: Promise<void>;
+    act(() => {
+      askPromise = result.current.ask('alpha');
+    });
+    expect(result.current.pending).toBe(true);
+
+    await act(async () => {
+      result.current.cancel();
+      await askPromise;
+    });
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.turns[1]).toMatchObject({
+      role: 'error',
+      content: 'Request timed out or was cancelled.',
+    });
+  });
+
+  it('cancel() is a no-op when nothing is in flight', () => {
+    const { result } = renderHook(() => useChat());
+
+    expect(() => result.current.cancel()).not.toThrow();
+  });
 });

@@ -54,4 +54,10 @@ describe('ChatMessage', () => {
     expect(screen.getByTestId('chat-message')).toHaveAttribute('data-role', 'error');
     expect(screen.getByText('API returned HTTP 502.')).toBeInTheDocument();
   });
+
+  it('announces error turns to assistive tech via role="alert"', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('API returned HTTP 502.');
+  });
 });

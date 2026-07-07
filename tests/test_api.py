@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from api.dependencies import (
     clear_dependency_caches,
@@ -17,9 +19,10 @@ from api.dependencies import (
     get_reranker,
 )
 from api.embeddings import EmbeddedText
-from api.generation import ChatMessage, LiteLLMGenerator
-from api.main import create_app
+from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
+from api.main import create_app, run_model_warmup
 from api.qdrant_schema import EMBEDDING_MODEL_TAG_KEY, dense_vectors_config, sparse_vectors_config
+from api.reranking import RerankingError
 from api.settings import AppSettings
 
 
@@ -62,6 +65,7 @@ class FakeGenerator:
 @dataclass
 class ApiTestContext:
     client: TestClient
+    app: FastAPI
     settings: AppSettings
     qdrant: QdrantClient
     embeddings: FakeEmbeddingProvider
@@ -87,6 +91,7 @@ def api_context() -> Generator[ApiTestContext]:
     with TestClient(app) as client:
         yield ApiTestContext(
             client=client,
+            app=app,
             settings=settings,
             qdrant=qdrant,
             embeddings=embeddings,
@@ -112,7 +117,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "max_context_chunks": 2,
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def make_embedding(
@@ -238,6 +243,84 @@ def test_question_endpoint_rejects_blank_query(api_context: ApiTestContext) -> N
     assert "Query text is required" in response.json()["detail"]
 
 
+def test_question_endpoint_rejects_empty_string_query(api_context: ApiTestContext) -> None:
+    """Distinct from the whitespace case above: truly empty fails schema validation
+    (min_length=1) before the pipeline's own strip-and-check ever runs."""
+
+    response = api_context.client.post("/questions", json={"question": ""})
+
+    assert response.status_code == 422
+
+
+def test_question_endpoint_rejects_oversized_query(api_context: ApiTestContext) -> None:
+    response = api_context.client.post("/questions", json={"question": "a" * 4001})
+
+    assert response.status_code == 422
+
+
+class RaisingReranker:
+    def score(self, query: str, documents: Sequence[str]) -> list[float]:
+        raise RerankingError("Reranker model failed: out of memory")
+
+
+class RaisingGenerator:
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        raise GenerationError("Generation provider request failed: connection refused")
+
+
+def test_question_endpoint_returns_502_shape_for_reranking_failure(
+    api_context: ApiTestContext,
+) -> None:
+    """Pins the exact response shape (status + string `detail`) the frontend's
+    extractErrorDetail relies on — a regression here would silently break error
+    rendering in the UI without any type system catching it."""
+
+    upload_response = api_context.client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
+    )
+    assert upload_response.status_code == 200
+    api_context.app.dependency_overrides[get_reranker] = lambda: RaisingReranker()
+
+    response = api_context.client.post("/questions", json={"question": "alpha"})
+
+    assert response.status_code == 502
+    assert isinstance(response.json()["detail"], str)
+    assert "out of memory" in response.json()["detail"]
+
+
+def test_question_endpoint_returns_502_shape_for_generation_failure(
+    api_context: ApiTestContext,
+) -> None:
+    upload_response = api_context.client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
+    )
+    assert upload_response.status_code == 200
+    api_context.app.dependency_overrides[get_generator] = lambda: RaisingGenerator()
+
+    response = api_context.client.post("/questions", json={"question": "alpha"})
+
+    assert response.status_code == 502
+    assert isinstance(response.json()["detail"], str)
+    assert "connection refused" in response.json()["detail"]
+
+
+def test_question_endpoint_returns_503_when_qdrant_unreachable(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_connection(*args: object, **kwargs: object) -> bool:
+        raise ResponseHandlingException(ConnectionError("connection refused"))
+
+    monkeypatch.setattr(api_context.qdrant, "collection_exists", fail_connection)
+
+    response = api_context.client.post("/questions", json={"question": "alpha"})
+
+    assert response.status_code == 503
+    assert isinstance(response.json()["detail"], str)
+    assert "unreachable" in response.json()["detail"]
+
+
 def test_config_reports_openai_available_when_key_present() -> None:
     clear_dependency_caches()
     settings = make_settings(openai_api_key="sk-test")
@@ -347,4 +430,61 @@ def test_question_endpoint_returns_conflict_for_embedding_mismatch(
 
     assert response.status_code == 409
     assert "Re-ingest documents" in response.json()["detail"]
+
+
+def test_run_model_warmup_touches_both_models() -> None:
+    embeddings = FakeEmbeddingProvider()
+    reranker = FakeReranker()
+
+    run_model_warmup(embeddings, reranker)
+
+    assert embeddings.seen_text_batches == [["warmup"]]
+    assert reranker.seen_documents == ["warmup"]
+
+
+def test_run_model_warmup_swallows_failures_instead_of_raising() -> None:
+    class RaisingEmbeddingProvider:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            raise RuntimeError("model download failed")
+
+    # Must not raise — a warmup failure is logged, not fatal to app startup.
+    run_model_warmup(RaisingEmbeddingProvider(), FakeReranker())
+
+
+def test_lifespan_runs_warmup_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lifespan calls get_embedding_provider()/get_reranker() directly (not via
+    FastAPI Depends), so dependency_overrides can't intercept them — patch the names
+    api.main actually holds instead, same as production code would resolve them."""
+
+    clear_dependency_caches()
+    settings = make_settings(warmup_models=True)
+    embeddings = FakeEmbeddingProvider()
+    reranker = FakeReranker()
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.main.get_embedding_provider", lambda: embeddings)
+    monkeypatch.setattr("api.main.get_reranker", lambda: reranker)
+
+    app = create_app()
+    with TestClient(app):
+        pass
+
+    assert embeddings.seen_text_batches == [["warmup"]]
+    assert reranker.seen_documents == ["warmup"]
+    clear_dependency_caches()
+
+
+def test_lifespan_skips_warmup_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_dependency_caches()
+    settings = make_settings(warmup_models=False)
+    embeddings = FakeEmbeddingProvider()
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.main.get_embedding_provider", lambda: embeddings)
+    monkeypatch.setattr("api.main.get_reranker", lambda: FakeReranker())
+
+    app = create_app()
+    with TestClient(app):
+        pass
+
+    assert embeddings.seen_text_batches == []
+    clear_dependency_caches()
 

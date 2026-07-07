@@ -49,7 +49,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "reranker_batch_size": 7,
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def make_candidate(chunk_id: str, text: str, score: float) -> RetrievedChunk:

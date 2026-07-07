@@ -58,7 +58,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "max_context_chunks": 2,
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def make_embedding(value: float) -> EmbeddedText:

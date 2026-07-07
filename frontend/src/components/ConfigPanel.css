@@ -1,23 +1,36 @@
+.config-panel__section-label {
+  font: 600 11px var(--font-heading);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
 .config-panel__metrics {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 0.6rem;
+  gap: 12px;
   margin-bottom: 0.6rem;
 }
 
 .config-panel__metric {
   display: flex;
   flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 10px 12px;
 }
 
 .config-panel__metric-value {
-  font-size: 1rem;
+  font: 600 19px var(--font-mono);
   color: var(--accent);
 }
 
 .config-panel__metric-label {
-  font-size: 0.7rem;
+  font-size: 10.5px;
   color: var(--text-muted);
+  margin-top: 2px;
 }
 
 .config-panel__toggle {
