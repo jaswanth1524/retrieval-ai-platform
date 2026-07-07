@@ -46,7 +46,7 @@ class DocumentIngestResponse(BaseModel):
 class QuestionRequest(BaseModel):
     """Question-answering request."""
 
-    question: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=4000)
     llm_provider: Literal["ollama", "openai"] | None = None
 
 

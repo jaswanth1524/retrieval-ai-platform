@@ -3,6 +3,10 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
 }
 
 .status-badge__dot {

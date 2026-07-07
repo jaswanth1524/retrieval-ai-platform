@@ -91,6 +91,11 @@ class LiteLLMGenerator:
                 max_tokens=int(settings.llm_max_tokens),
                 timeout=float(settings.llm_request_timeout_seconds),
                 num_retries=int(settings.llm_num_retries),
+                # Some models (e.g. the gpt-5 family) reject params other models
+                # accept fine (temperature != 1). Let LiteLLM drop an unsupported
+                # param for the selected model rather than raising, so provider
+                # quirks don't turn into a hard failure.
+                drop_params=True,
                 **provider_kwargs,
             )
         except Exception as exc:

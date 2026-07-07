@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Protocol
 
 from fastapi import Depends, FastAPI, File, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -11,9 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
-from api.dependencies import get_app_settings, get_ingest_service, get_rag_pipeline
+from api.dependencies import (
+    get_app_settings,
+    get_embedding_provider,
+    get_ingest_service,
+    get_rag_pipeline,
+    get_reranker,
+)
 from api.documents import DocumentError
-from api.embeddings import EmbeddingError
+from api.embeddings import EmbeddedText, EmbeddingError
 from api.generation import GenerationConfigError, GenerationError
 from api.ingestion import IngestionError
 from api.pipeline import IngestService, RagPipeline
@@ -31,12 +41,65 @@ from api.schemas import (
 from api.settings import AppSettings
 from api.upload import UploadTooLargeError, read_upload_within_limit
 
+logger = logging.getLogger(__name__)
+
 SettingsDep = Annotated[AppSettings, Depends(get_app_settings)]
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 RagPipelineDep = Annotated[RagPipeline, Depends(get_rag_pipeline)]
 
 
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+
+class WarmupEmbeddingProvider(Protocol):
+    """Minimal embedding surface the warmup step needs."""
+
+    def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]: ...
+
+
+class WarmupReranker(Protocol):
+    """Minimal reranker surface the warmup step needs."""
+
+    def score(self, query: str, documents: Sequence[str]) -> list[float]: ...
+
+
+def run_model_warmup(
+    embedding_provider: WarmupEmbeddingProvider,
+    reranker: WarmupReranker,
+) -> None:
+    """Force both lazy-loaded models to load once, logging duration or failure.
+
+    Both models are constructed with ``lazy_load=True``, so the real download/load
+    cost is paid on first use, not at construction — this runs that first use at boot
+    instead of on a user's first request. Deliberately never raises: a warmup failure
+    (e.g. a transient network blip fetching a model) must not prevent the app from
+    starting and serving requests that might succeed once the model is retried lazily;
+    it only means the misconfiguration is now visible in the startup log instead of
+    silently deferred.
+    """
+
+    start = time.monotonic()
+    try:
+        embedding_provider.embed_texts(["warmup"])
+        reranker.score("warmup", ["warmup"])
+    except Exception:
+        logger.exception(
+            "Model warmup failed — this will resurface as an error on the first real "
+            "request instead. Check DENSE_EMBEDDING_MODEL/SPARSE_EMBEDDING_MODEL/"
+            "RERANKER_MODEL."
+        )
+    else:
+        logger.info("Model warmup completed in %.1fs", time.monotonic() - start)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
+
+    settings = get_app_settings()
+    if settings.warmup_models:
+        await run_in_threadpool(run_model_warmup, get_embedding_provider(), get_reranker())
+    yield
 
 
 def create_app() -> FastAPI:
@@ -46,6 +109,7 @@ def create_app() -> FastAPI:
         title="DocRAG API",
         version="0.1.0",
         description="Self-hostable document Q&A API with hybrid retrieval and citations.",
+        lifespan=lifespan,
     )
     settings = get_app_settings()
     app.add_middleware(

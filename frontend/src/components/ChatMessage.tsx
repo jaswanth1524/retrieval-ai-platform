@@ -21,7 +21,19 @@ function ChatMessage({ turn }: ChatMessageProps) {
       data-testid="chat-message"
       data-role={turn.role}
     >
-      <div className="chat-message__bubble">{turn.content}</div>
+      {turn.role === 'error' ? (
+        <div className="chat-message__bubble chat-message__bubble--error" role="alert">
+          <span className="chat-message__error-icon" aria-hidden="true">
+            ⚠
+          </span>
+          <div className="chat-message__error-body">
+            <div className="chat-message__error-lead">Generation provider unavailable</div>
+            {turn.content}
+          </div>
+        </div>
+      ) : (
+        <div className="chat-message__bubble">{turn.content}</div>
+      )}
       {turn.role === 'assistant' && turn.sources.length > 0 && (
         <div className="chat-message__sources">
           {turn.sources.map((source) => (

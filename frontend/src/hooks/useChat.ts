@@ -7,6 +7,7 @@ export interface UseChatResult {
   turns: ChatTurn[];
   pending: boolean;
   ask: (question: string, provider?: LlmProvider) => Promise<void>;
+  cancel: () => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
@@ -52,5 +53,12 @@ export function useChat(): UseChatResult {
     }
   };
 
-  return { turns, pending, ask };
+  const cancel = () => {
+    // The abort surfaces through askQuestion's fetch as an AbortError, which the
+    // catch block above already turns into a clean error turn — no separate
+    // cancellation path needed.
+    inflightRef.current?.abort();
+  };
+
+  return { turns, pending, ask, cancel };
 }

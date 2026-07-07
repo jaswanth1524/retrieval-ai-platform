@@ -1,27 +1,98 @@
 .upload-panel {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 10px;
   padding-bottom: 1rem;
   border-bottom: 1px solid var(--border);
   margin-bottom: 1rem;
 }
 
 .upload-panel__title {
-  font-size: 0.8rem;
+  font: 600 11px var(--font-heading);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-muted);
   margin: 0;
 }
 
-.upload-panel__button {
-  background: transparent;
-  border: 1px solid var(--accent);
+.upload-panel__dropzone {
+  position: relative;
+  border: 1.5px dashed var(--border);
+  border-radius: 10px;
+  padding: 18px 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  background: var(--bg-card);
+}
+
+.upload-panel__dropzone--active {
+  border-color: var(--accent);
+}
+
+.upload-panel__dropzone:has(.upload-panel__input:focus-visible) {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.upload-panel__dropzone-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  position: relative;
+}
+
+.upload-panel__dropzone-icon::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 14px;
+  border: 1.5px solid var(--accent);
+  border-radius: 2px;
+  transform: translate(-50%, -50%);
+}
+
+.upload-panel__dropzone-text {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.upload-panel__dropzone-browse {
   color: var(--accent);
-  border-radius: 6px;
-  padding: 0.4rem 0.8rem;
-  font-size: 0.85rem;
+  text-decoration: underline;
+}
+
+.upload-panel__dropzone-hint {
+  font-size: 10.5px;
+  color: var(--text-placeholder);
+}
+
+.upload-panel__input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.upload-panel__input:disabled {
+  cursor: not-allowed;
+}
+
+.upload-panel__button {
+  border: none;
+  border-radius: 8px;
+  padding: 9px 0;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font: 600 13px var(--font-sans);
 }
 
 .upload-panel__success {

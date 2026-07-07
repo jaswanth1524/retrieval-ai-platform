@@ -69,7 +69,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "llm_max_tokens": 512,
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def make_chunk(chunk_id: str, text: str, page: int = 1) -> RerankedChunk:
@@ -199,6 +199,7 @@ def test_litellm_generator_uses_ollama_configuration() -> None:
     assert completion_client.kwargs["temperature"] == 0
     assert completion_client.kwargs["max_tokens"] == 512
     assert completion_client.kwargs["timeout"] == 60.0
+    assert completion_client.kwargs["drop_params"] is True
 
 
 def test_litellm_generator_routes_to_settings_provider_not_construction_provider() -> None:

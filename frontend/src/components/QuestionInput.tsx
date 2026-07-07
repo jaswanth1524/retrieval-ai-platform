@@ -2,6 +2,9 @@ import { useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import './QuestionInput.css';
 
+// Matches the backend's QuestionRequest.question max_length in api/schemas.py.
+const MAX_QUESTION_LENGTH = 4000;
+
 interface QuestionInputProps {
   onSubmit: (question: string) => void;
   disabled: boolean;
@@ -32,8 +35,10 @@ function QuestionInput({ onSubmit, disabled }: QuestionInputProps) {
         onChange={(event) => setValue(event.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="Ask a question about your documents..."
+        aria-label="Ask a question about your documents"
         disabled={disabled}
         rows={2}
+        maxLength={MAX_QUESTION_LENGTH}
         data-testid="question-textarea"
       />
       <button

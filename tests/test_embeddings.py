@@ -80,7 +80,9 @@ def test_local_embedding_provider_wraps_model_failure_as_embedding_error() -> No
     into EmbeddingError rather than an unwrapped exception."""
 
     provider = LocalEmbeddingProvider(
-        AppSettings(), dense_model=RaisingDenseModel(), sparse_model=EmptySparseModel()
+        AppSettings(_env_file=None),  # type: ignore[call-arg]
+        dense_model=RaisingDenseModel(),
+        sparse_model=EmptySparseModel(),
     )
 
     with pytest.raises(EmbeddingError, match="model download failed"):

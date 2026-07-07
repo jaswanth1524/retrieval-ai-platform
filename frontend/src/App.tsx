@@ -15,7 +15,23 @@ function App() {
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [uploadState, setUploadState] = useState<UploadState>({ status: 'idle' });
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
-  const { turns, pending, ask } = useChat();
+  const [theme, setTheme] = useState<'dark' | 'light'>(
+    () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
+  );
+  const { turns, pending, ask, cancel } = useChat();
+
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    document.documentElement.dataset.theme = next;
+    // localStorage can throw in some private-browsing/storage-denied contexts —
+    // the theme should still flip for this session even if persistence fails.
+    try {
+      localStorage.setItem('docrag-theme', next);
+    } catch {
+      // Persistence is best-effort; the visible toggle above already succeeded.
+    }
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -72,10 +88,13 @@ function App() {
         config={config}
         onUpload={handleUpload}
         uploadState={uploadState}
+        onFileSelected={() => setUploadState({ status: 'idle' })}
+        theme={theme}
+        onToggleTheme={toggleTheme}
       />
       <main className="app-main">
         {apiStatus === 'error' ? (
-          <div className="app-main__unreachable">
+          <div className="app-main__unreachable" role="alert">
             Cannot reach the DocRAG API &mdash; start the API service and refresh.
           </div>
         ) : (
@@ -88,7 +107,7 @@ function App() {
                 disabled={pending}
               />
             )}
-            <ChatThread turns={turns} pending={pending} />
+            <ChatThread turns={turns} pending={pending} onCancel={cancel} />
             <QuestionInput
               onSubmit={(question) => ask(question, selectedProvider)}
               disabled={!apiReachable || pending}

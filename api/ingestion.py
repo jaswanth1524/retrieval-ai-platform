@@ -15,14 +15,17 @@ from api.settings import AppSettings
 
 
 class IngestionError(RuntimeError):
-    """Raised when indexing chunks fails after prior points were already removed.
+    """Raised when indexing or stale-chunk cleanup fails during ingestion.
 
-    Deterministic point IDs are derived from filename (see ``point_id_for_chunk``),
-    so a re-ingest must delete a file's old points before writing its new ones —
-    otherwise the new upsert would collide with, rather than replace, the old data
-    for chunks that no longer exist in the new version. That ordering means a write
-    failure here leaves the document with zero indexed chunks; the caller must know
-    to retry rather than assume the previous version is still queryable.
+    Points use deterministic IDs derived from filename/page/section/chunk_id (see
+    ``point_id_for_chunk``), so re-ingesting an edited chunk overwrites its prior
+    version in place on upsert. ``ingest_chunks`` upserts the new points *first*, then
+    deletes only the point IDs that are now stale (the filename's previously indexed
+    IDs minus the new ones) — so an upsert failure leaves the previous version of the
+    document fully intact and queryable, rather than leaving it un-indexed. A failure
+    during the stale-cleanup step is milder still: the new content is already correctly
+    indexed, only a few now-orphaned old chunks remain until the next re-ingest retries
+    the cleanup.
     """
 
 
@@ -39,7 +42,9 @@ class WriteRepository(Protocol):
 
     def upsert(self, settings: AppSettings, points: Sequence[models.PointStruct]) -> None: ...
 
-    def delete_by_filename(self, settings: AppSettings, filenames: Sequence[str]) -> None: ...
+    def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]: ...
+
+    def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -74,16 +79,34 @@ def ingest_chunks(
         build_point(chunk, embedding, settings)
         for chunk, embedding in zip(chunks, embeddings, strict=True)
     ]
-    repository.delete_by_filename(settings, [chunk.filename for chunk in chunks])
+
+    # Snapshot each filename's currently-indexed point IDs *before* upserting — this
+    # is what "stale" gets computed against once the new points are written.
+    filenames = sorted({chunk.filename for chunk in chunks})
+    stale_candidate_ids: set[str] = set()
+    for filename in filenames:
+        stale_candidate_ids.update(repository.point_ids_for_filename(settings, filename))
+
     try:
         repository.upsert(settings, points)
     except Exception as exc:
-        filenames = sorted({chunk.filename for chunk in chunks})
         raise IngestionError(
-            f"Indexing failed after removing the previous version of "
-            f"{', '.join(filenames)}; the document is currently un-indexed. "
-            "Please retry the upload."
+            f"Indexing failed while updating {', '.join(filenames)}; the previous "
+            "version remains indexed. Please retry the upload."
         ) from exc
+
+    new_ids = {str(point.id) for point in points}
+    stale_ids = stale_candidate_ids - new_ids
+    if stale_ids:
+        try:
+            repository.delete_by_ids(settings, list(stale_ids))
+        except Exception as exc:
+            raise IngestionError(
+                f"Indexed the new version of {', '.join(filenames)}, but failed to "
+                f"remove {len(stale_ids)} stale chunk(s) from the previous version. "
+                "Re-ingesting again will complete the cleanup."
+            ) from exc
+
     return IngestResult(
         collection_name=settings.qdrant_collection,
         points_count=len(points),

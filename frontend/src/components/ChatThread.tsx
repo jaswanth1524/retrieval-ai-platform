@@ -5,9 +5,10 @@ import './ChatThread.css';
 interface ChatThreadProps {
   turns: ChatTurn[];
   pending: boolean;
+  onCancel: () => void;
 }
 
-function ChatThread({ turns, pending }: ChatThreadProps) {
+function ChatThread({ turns, pending, onCancel }: ChatThreadProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -28,8 +29,21 @@ function ChatThread({ turns, pending }: ChatThreadProps) {
         <ChatMessage key={turn.id} turn={turn} />
       ))}
       {pending && (
-        <div className="chat-thread__pending" data-testid="chat-pending">
-          Generating answer...
+        <div
+          className="chat-thread__pending"
+          data-testid="chat-pending"
+          role="status"
+          aria-live="polite"
+        >
+          <span>Generating answer...</span>
+          <button
+            type="button"
+            className="chat-thread__cancel"
+            onClick={onCancel}
+            data-testid="chat-cancel"
+          >
+            Stop
+          </button>
         </div>
       )}
       <div ref={bottomRef} />

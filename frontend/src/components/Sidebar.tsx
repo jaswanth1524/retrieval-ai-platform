@@ -10,14 +10,45 @@ interface SidebarProps {
   config: PublicConfigResponse | null;
   onUpload: (file: File) => Promise<void>;
   uploadState: UploadState;
+  onFileSelected: () => void;
+  theme: 'dark' | 'light';
+  onToggleTheme: () => void;
 }
 
-function Sidebar({ apiStatus, apiStatusMessage, config, onUpload, uploadState }: SidebarProps) {
+function Sidebar({
+  apiStatus,
+  apiStatusMessage,
+  config,
+  onUpload,
+  uploadState,
+  onFileSelected,
+  theme,
+  onToggleTheme,
+}: SidebarProps) {
   return (
     <aside className="sidebar">
-      <h1 className="sidebar__title">DocRAG</h1>
+      <div className="sidebar__header">
+        <div className="sidebar__brand">
+          <span className="sidebar__logo">D</span>
+          <h1 className="sidebar__title">DocRAG</h1>
+        </div>
+        <button
+          type="button"
+          className="sidebar__theme-toggle"
+          onClick={onToggleTheme}
+          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          data-testid="theme-toggle"
+        >
+          {theme === 'dark' ? '☀' : '☾'}
+        </button>
+      </div>
       <StatusBadge status={apiStatus} message={apiStatusMessage} />
-      <UploadPanel onUpload={onUpload} state={uploadState} maxUploadBytes={config?.max_upload_bytes} />
+      <UploadPanel
+        onUpload={onUpload}
+        state={uploadState}
+        maxUploadBytes={config?.max_upload_bytes}
+        onFileSelected={onFileSelected}
+      />
       {config && <ConfigPanel config={config} />}
     </aside>
   );

@@ -15,7 +15,7 @@ const LABELS: Record<ApiStatus, string> = {
 
 function StatusBadge({ status, message }: StatusBadgeProps) {
   return (
-    <div className="status-badge" data-testid="status-badge" data-status={status}>
+    <div className="status-badge" data-testid="status-badge" data-status={status} role="status">
       <span className={`status-badge__dot status-badge__dot--${status}`} />
       <span className="status-badge__label">{LABELS[status]}</span>
       {message && status === 'error' && <p className="status-badge__message mono">{message}</p>}

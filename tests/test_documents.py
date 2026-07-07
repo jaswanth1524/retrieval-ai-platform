@@ -22,7 +22,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "chunk_overlap_tokens": 1,
     }
     defaults.update(overrides)
-    return AppSettings(**defaults)
+    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
 
 
 def test_parse_text_document_normalizes_filename_and_metadata() -> None:

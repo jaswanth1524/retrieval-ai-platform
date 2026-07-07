@@ -91,6 +91,12 @@ The default `OLLAMA_BASE_URL` targets `host.docker.internal`, which Docker Deskt
 
 For local frontend iteration without a full rebuild, run `uv run uvicorn api.main:app --reload` and `npm --prefix frontend run dev` separately — Vite's dev server proxies API calls to `localhost:8000`.
 
+> **Known issue:** the default reranker model (`BAAI/bge-reranker-v2-m3`) is not
+> supported by the currently pinned `fastembed` version, so the first question asked
+> against an out-of-the-box `docker compose up` will fail. Until this is resolved,
+> set `RERANKER_MODEL=BAAI/bge-reranker-base` in your `.env` to get a working local
+> stack.
+
 ## Current Files
 
 - `AGENTS.md`: operating instructions for future agents.
@@ -111,6 +117,39 @@ For local frontend iteration without a full rebuild, run `uv run uvicorn api.mai
 - `api/main.py`: FastAPI app with health, config, document upload, and question-answering endpoints.
 - `frontend/`: React + Vite + TypeScript browser UI (chat-style Q&A with citation cards), built and served by the API in production.
 - `eval/ragas_runner.py`: optional RAGAS evaluation runner for JSON/JSONL answer datasets.
+
+## Evaluation (optional)
+
+`eval/ragas_runner.py` scores a set of question/answer/context examples with
+[RAGAS](https://github.com/explodinggradients/ragas) metrics (faithfulness, answer
+relevancy, context precision, context recall by default). It's independent of the
+running API — you supply the question, the answer DocRAG produced, and the context
+chunks it was grounded in, as a dataset file.
+
+Install the optional extra first:
+
+```bash
+uv sync --extra eval
+```
+
+Dataset format — a JSON list, a JSON object with an `examples` key, or JSONL (one
+object per line), each example shaped like:
+
+```json
+{
+  "question": "What is the refund window?",
+  "answer": "Refunds must be requested within 30 days of purchase.",
+  "contexts": ["Refund requests must be submitted within 30 days of purchase..."]
+}
+```
+
+Run it:
+
+```bash
+uv run python -m eval.ragas_runner path/to/dataset.json --output results.json
+```
+
+`--metrics` accepts a comma-separated list to override the default four metrics.
 
 ## License
 
