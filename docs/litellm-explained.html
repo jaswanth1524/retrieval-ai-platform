@@ -1,0 +1,211 @@
+<title>LiteLLM in DocRAG — How and Why</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b6472; --card: #f6f7f9;
+    --border: #e2e5ea; --accent: #2f6fed; --code-bg: #eef1f6; --ok: #1a7f4b; --warn: #b5540a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #12151c; --fg: #e7e9ee; --muted: #9aa4b2; --card: #1a1e27;
+      --border: #2a2f3a; --accent: #6fa1ff; --code-bg: #1e2330; --ok: #4ad196; --warn: #e0964a; }
+  }
+  :root[data-theme="dark"] { --bg: #12151c; --fg: #e7e9ee; --muted: #9aa4b2; --card: #1a1e27;
+    --border: #2a2f3a; --accent: #6fa1ff; --code-bg: #1e2330; --ok: #4ad196; --warn: #e0964a; }
+  :root[data-theme="light"] { --bg: #ffffff; --fg: #1a1a1a; --muted: #5b6472; --card: #f6f7f9;
+    --border: #e2e5ea; --accent: #2f6fed; --code-bg: #eef1f6; --ok: #1a7f4b; --warn: #b5540a; }
+
+  body { background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.6; max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  h1 { font-size: 1.9rem; margin-bottom: 0.3rem; }
+  h2 { font-size: 1.35rem; margin-top: 3rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.8rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  p, li { color: var(--fg); }
+  code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.9em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;
+    overflow-x: auto; font-size: 0.85rem; }
+  pre code { background: none; padding: 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.3rem; margin: 1.2rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--border); padding: 0.5rem 0.7rem; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em; }
+  .flow { display: flex; flex-direction: column; gap: 0; margin: 1.5rem 0; }
+  .step { background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 0.5rem; }
+  .step .n { color: var(--accent); font-weight: 600; margin-right: 0.4rem; }
+  .arrow { text-align: center; color: var(--muted); margin: -0.1rem 0; }
+  .tag-ok { color: var(--ok); font-weight: 600; }
+  .tag-warn { color: var(--warn); font-weight: 600; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+  footer { margin-top: 4rem; color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+</style>
+
+<h1>LiteLLM in DocRAG</h1>
+<p class="subtitle">Why it's there, exactly what it does, and a full worked example — for the <code>ollama</code> and <code>openai</code> providers as configured in this repo.</p>
+
+<h2>1. What LiteLLM actually is</h2>
+<p>
+LiteLLM is a thin translation library. Every LLM provider — OpenAI, Anthropic, Ollama, Azure, Bedrock,
+100+ others — has a slightly different HTTP API. LiteLLM gives one function,
+<code>litellm.completion(model=..., messages=..., ...)</code>, that accepts an
+OpenAI-style <code>messages</code> list and internally routes to whichever provider
+the <code>model</code> string names, then normalizes the response back into the same
+OpenAI-style shape (<code>response.choices[0].message.content</code>) no matter which
+provider actually answered.
+</p>
+<div class="card">
+<strong>Why that matters here:</strong> DocRAG's generation code (<code>api/generation.py</code>)
+is written once, against that one shape. Swapping the backing model — local Ollama vs. hosted
+OpenAI — is a <em>configuration change</em>, not a code change or a second code path.
+</div>
+
+<h2>2. Why DocRAG uses it (the project rule)</h2>
+<p>Per <code>CLAUDE.md</code>'s provider rules:</p>
+<ul>
+  <li>Generation provider and embedding provider are <strong>separate</strong> config knobs — changing one never touches the other.</li>
+  <li>Default generation is <strong>local Ollama</strong> — self-hostable, no API key required, no data leaves the machine.</li>
+  <li>OpenAI generation is <strong>optional</strong>, user-selectable, never required for upload/indexing.</li>
+  <li>Embeddings (<code>bge-small-en-v1.5</code>) always run locally via FastEmbed, regardless of which generation provider is picked. LiteLLM is <strong>only</strong> in the generation path — it never touches embeddings, retrieval, or reranking.</li>
+</ul>
+<p>LiteLLM is the mechanism that makes "swap generation provider without touching retrieval" actually true in code, not just in a settings file.</p>
+
+<h2>3. Where it sits in the pipeline</h2>
+<p>A question only reaches LiteLLM after retrieval and reranking are done — it never sees raw documents, only the already-selected context:</p>
+<div class="flow">
+  <div class="step"><span class="n">1.</span> <strong>Retrieve</strong> — dense (bge-small) + sparse (BM25) search in Qdrant, fused with Reciprocal Rank Fusion (k=60). <span class="mono">api/retrieval.py</span></div>
+  <div class="arrow">↓</div>
+  <div class="step"><span class="n">2.</span> <strong>Rerank</strong> — cross-encoder (<code>bge-reranker-*</code>) scores the fused top-N, keeps top-K. <span class="mono">api/reranking.py</span></div>
+  <div class="arrow">↓</div>
+  <div class="step"><span class="n">3.</span> <strong>Build prompt</strong> — top-K chunks formatted into a grounded system+user message pair with citation markers. <span class="mono">api/generation.py: build_grounded_messages</span></div>
+  <div class="arrow">↓</div>
+  <div class="step"><span class="n">4.</span> <strong>LiteLLM call</strong> — <code>completion_model_and_kwargs()</code> picks the model string + provider kwargs; <code>litellm.completion(...)</code> makes the actual request. <span class="mono">api/generation.py: LiteLLMGenerator.complete</span></div>
+  <div class="arrow">↓</div>
+  <div class="step"><span class="n">5.</span> <strong>Extract + cite</strong> — pull text out of the response, keep only sources the answer actually cited. <span class="mono">extract_completion_text, cited_sources</span></div>
+</div>
+
+<h2>4. The provider switch, exactly</h2>
+<p>This is the whole trick — one function decides the LiteLLM <code>model</code> string and extra kwargs from settings:</p>
+<pre><code>def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, str]]:
+    provider = settings.llm_provider.lower().strip()
+    if provider == "ollama":
+        return f"ollama/{settings.llm_model}", {"base_url": settings.ollama_base_url}
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise GenerationConfigError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
+        return settings.openai_model, {"api_key": settings.openai_api_key}
+    raise GenerationConfigError(f"Unsupported LLM_PROVIDER '{settings.llm_provider}'.")</code></pre>
+<table>
+  <tr><th>Provider</th><th>Model string sent to LiteLLM</th><th>Extra kwarg</th><th>What LiteLLM does with it</th></tr>
+  <tr><td><code>ollama</code></td><td class="mono">ollama/qwen2.5:latest</td><td class="mono">base_url=http://host.docker.internal:11434</td><td>Sends an HTTP request to your local Ollama server's <code>/api/chat</code>-equivalent endpoint. No API key, no internet.</td></tr>
+  <tr><td><code>openai</code></td><td class="mono">gpt-5-mini</td><td class="mono">api_key=sk-proj-...</td><td>Sends a real HTTPS request to OpenAI's API using the standard OpenAI SDK under the hood.</td></tr>
+</table>
+<p>The <code>ollama/</code> prefix is a LiteLLM convention — it's how LiteLLM's internal router knows "don't call OpenAI's API with this string, call the Ollama provider adapter instead." Without the prefix, LiteLLM would try to look up <code>qwen2.5:latest</code> as an OpenAI model and fail.</p>
+
+<h3>Per-request override, not global mutation</h3>
+<p>The frontend's provider dropdown doesn't change server config — it passes <code>llm_provider</code> on the <code>/questions</code> request. <code>RagPipeline.answer</code> handles it like this:</p>
+<pre><code>generation_settings = (
+    self._settings.model_copy(update={"llm_provider": llm_provider})
+    if llm_provider is not None
+    else self._settings
+)
+return generate_grounded_answer(..., settings=generation_settings)</code></pre>
+<p><code>model_copy</code> makes a new settings object for that one call — the shared, cached settings singleton is never mutated. Two concurrent users, one asking via Ollama and one via OpenAI, don't interfere with each other. Retrieval and reranking always use the base settings — embeddings stay local no matter what generation provider was requested, per the CLAUDE.md rule.</p>
+
+<h2>5. Full worked example, start to end</h2>
+<p>Say you've uploaded a document containing this sentence, and Qdrant has already indexed it as chunk <code>c_004a</code>, page 2, section "Refunds":</p>
+<div class="card mono" style="white-space: pre-wrap;">"Refund requests must be submitted within 30 days of purchase. After 30 days, no refunds are issued."</div>
+<p>You ask: <strong>"What is the refund window?"</strong> with the provider dropdown set to Ollama.</p>
+
+<h3>Step 1 — Retrieval + rerank produce one strong candidate</h3>
+<p>Dense + sparse search both surface chunk <code>c_004a</code>; RRF fusion ranks it #1; the cross-encoder reranker confirms it's the best match. This becomes the only context chunk passed forward (in practice there'd usually be a few).</p>
+
+<h3>Step 2 — <code>build_grounded_messages</code> constructs the prompt</h3>
+<pre><code>[
+  {
+    "role": "system",
+    "content": "You are DocRAG, a document question-answering assistant. Answer only from
+the provided context. Do not use outside knowledge. If the context is insufficient,
+explicitly say that the provided documents do not contain enough information. Cite
+supporting sources with bracketed source numbers like [1]."
+  },
+  {
+    "role": "user",
+    "content": "Question:\nWhat is the refund window?\n\nContext:\n[1] filename=policy.txt;
+page=2; section=Refunds; chunk_id=c_004a\nRefund requests must be submitted within 30 days
+of purchase. After 30 days, no refunds are issued.\n\nInstructions:\n- Use only the context
+above.\n- Include citations using source numbers such as [1] or [2].\n- If the context is
+insufficient, say so directly."
+  }
+]</code></pre>
+
+<h3>Step 3 — the LiteLLM call actually made</h3>
+<p>With your current <code>.env</code> (<code>LLM_PROVIDER=ollama</code>, <code>LLM_MODEL=qwen2.5:latest</code>):</p>
+<pre><code>litellm.completion(
+    model="ollama/qwen2.5:latest",
+    messages=[...the two messages above...],
+    temperature=0,
+    max_tokens=512,
+    timeout=60.0,
+    num_retries=0,
+    base_url="http://host.docker.internal:11434",
+)</code></pre>
+<p>LiteLLM sees the <code>ollama/</code> prefix, routes to its Ollama adapter, and issues the request to your local Ollama server instead of any hosted API. If you'd had the dropdown on OpenAI instead, the exact same call site would instead run:</p>
+<pre><code>litellm.completion(
+    model="gpt-5-mini",
+    messages=[...same two messages...],
+    temperature=0,
+    max_tokens=512,
+    timeout=60.0,
+    num_retries=0,
+    api_key="sk-proj-...",
+)</code></pre>
+<p><code>build_grounded_messages</code>, the retrieval, and the reranking are <strong>completely unchanged</strong> between these two cases. Only <code>completion_model_and_kwargs</code>'s output differs.</p>
+
+<h3>Step 4 — response comes back, gets normalized</h3>
+<p>Ollama's native response and OpenAI's native response have different raw shapes. LiteLLM converts both into the same object shape before <code>extract_completion_text</code> ever sees it:</p>
+<pre><code>response.choices[0].message.content
+  == "Refund requests must be submitted within 30 days of purchase [1]."</code></pre>
+
+<h3>Step 5 — citation filtering</h3>
+<p><code>cited_sources</code> regex-scans the answer for <code>[1]</code>, <code>[2]</code>, etc., and keeps only the sources actually referenced (falling back to all sources if the model cited none). Here it kept source 1. The API returns:</p>
+<pre><code>{
+  "answer": "Refund requests must be submitted within 30 days of purchase [1].",
+  "sources": [
+    {
+      "source_number": 1,
+      "filename": "policy.txt",
+      "page": 2,
+      "section": "Refunds",
+      "chunk_id": "c_004a",
+      "text": "Refund requests must be submitted within 30 days of purchase. After 30 days, no refunds are issued."
+    }
+  ]
+}</code></pre>
+
+<h2>6. Failure handling</h2>
+<p>Every LiteLLM call is wrapped:</p>
+<pre><code>try:
+    response = self.completion_client(...)
+except Exception as exc:
+    raise GenerationError(f"Generation provider request failed: {exc}") from exc</code></pre>
+<p>LiteLLM/provider SDKs raise many distinct exception types (auth failure, connection refused, rate limit, model-not-found...) — rather than enumerate all of them, this boundary catches broadly and re-raises as DocRAG's own <code>GenerationError</code>, which <code>api/main.py</code> maps to a clean <span class="tag-warn">HTTP 502</span> instead of an opaque 500.</p>
+<table>
+  <tr><th>Setting</th><th>Purpose</th></tr>
+  <tr><td class="mono">LLM_REQUEST_TIMEOUT_SECONDS</td><td>Per-request timeout passed straight to LiteLLM (currently 60s).</td></tr>
+  <tr><td class="mono">LLM_NUM_RETRIES</td><td>LiteLLM's built-in retry count. Set to <code>0</code> so a bad key or dead provider fails in ~seconds instead of retrying for ~40s before surfacing an error.</td></tr>
+</table>
+
+<h2>7. Your current effective config</h2>
+<table>
+  <tr><th>Key</th><th>Value</th><th>Note</th></tr>
+  <tr><td class="mono">LLM_PROVIDER</td><td class="mono">ollama</td><td>default path used when the UI dropdown doesn't override it</td></tr>
+  <tr><td class="mono">LLM_MODEL</td><td class="mono">qwen2.5:latest</td><td>must be pulled in your local Ollama — confirmed pulled</td></tr>
+  <tr><td class="mono">OLLAMA_BASE_URL</td><td class="mono">http://host.docker.internal:11434</td><td>lets the Dockerized API reach Ollama running on your host machine</td></tr>
+  <tr><td class="mono">OPENAI_MODEL</td><td class="mono">gpt-5-mini</td><td>used only when the dropdown selects OpenAI, or <code>LLM_PROVIDER=openai</code></td></tr>
+  <tr><td class="mono">OPENAI_API_KEY</td><td class="tag-ok">set</td><td>enables the OpenAI option in the frontend dropdown (<code>openai_available</code> in <code>/config</code>)</td></tr>
+</table>
+<p><em>Note: the spec default model, <code>llama3.1:8b</code>, was never pulled in your Ollama — that's why the effective model is <code>qwen2.5:latest</code> instead. Both work identically through the same LiteLLM call path; only the model string changes.</em></p>
+
+<footer>DocRAG — generated reference doc, <code>docs/litellm-explained.html</code>. Reflects <code>api/generation.py</code>, <code>api/pipeline.py</code>, <code>api/main.py</code> as of this repo's current <code>main</code> branch.</footer>

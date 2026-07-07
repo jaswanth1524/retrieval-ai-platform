@@ -199,6 +199,7 @@ def test_litellm_generator_uses_ollama_configuration() -> None:
     assert completion_client.kwargs["temperature"] == 0
     assert completion_client.kwargs["max_tokens"] == 512
     assert completion_client.kwargs["timeout"] == 60.0
+    assert completion_client.kwargs["drop_params"] is True
 
 
 def test_litellm_generator_routes_to_settings_provider_not_construction_provider() -> None:
