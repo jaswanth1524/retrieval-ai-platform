@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
-import type { LlmProvider } from '../api/types';
+import type { LlmProvider, QuestionOverrides } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 
 export interface UseChatResult {
   turns: ChatTurn[];
   pending: boolean;
-  ask: (question: string, provider?: LlmProvider) => Promise<void>;
+  ask: (question: string, provider?: LlmProvider, overrides?: QuestionOverrides) => Promise<void>;
   cancel: () => void;
 }
 
@@ -34,7 +34,7 @@ export function useChat(): UseChatResult {
     };
   }, []);
 
-  const ask = async (question: string, provider?: LlmProvider) => {
+  const ask = async (question: string, provider?: LlmProvider, overrides?: QuestionOverrides) => {
     if (inflightRef.current) return;
     const controller = new AbortController();
     inflightRef.current = controller;
@@ -42,7 +42,7 @@ export function useChat(): UseChatResult {
     setTurns((prev) => [...prev, makeTurn('user', question)]);
     setPending(true);
     try {
-      const result = await api.askQuestion(question, provider, controller.signal);
+      const result = await api.askQuestion(question, provider, overrides, controller.signal);
       setTurns((prev) => [...prev, makeTurn('assistant', result.answer, result.sources)]);
     } catch (err) {
       const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';

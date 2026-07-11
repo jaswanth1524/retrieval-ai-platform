@@ -80,6 +80,35 @@ describe('api client', () => {
     expect('llm_provider' in body).toBe(false);
   });
 
+  it('includes only the set override fields in the body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestion('hi', undefined, {
+      rerankTopK: 3,
+      maxContextChunks: null,
+      llmTemperature: 1.5,
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ question: 'hi', rerank_top_k: 3, llm_temperature: 1.5 });
+    expect('max_context_chunks' in body).toBe(false);
+  });
+
+  it('omits all override fields when overrides is undefined or all null', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestion('hi', undefined, {
+      rerankTopK: null,
+      maxContextChunks: null,
+      llmTemperature: null,
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ question: 'hi' });
+  });
+
   it('aborts and reports a timeout when a request runs past its budget', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {

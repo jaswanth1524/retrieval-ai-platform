@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Protocol
@@ -19,6 +19,7 @@ from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
     get_ingest_service,
+    get_ollama_reachability_checker,
     get_rag_pipeline,
     get_reranker,
 )
@@ -26,11 +27,14 @@ from api.documents import DocumentError
 from api.embeddings import EmbeddedText, EmbeddingError
 from api.generation import GenerationConfigError, GenerationError
 from api.ingestion import IngestionError
-from api.pipeline import IngestService, RagPipeline
+from api.pipeline import AnswerOverrides, IngestService, RagPipeline
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.reranking import RerankingError
 from api.retrieval import RetrievalError, RetrievalPayloadError
 from api.schemas import (
+    REQUEST_MAX_CONTEXT_CHUNKS_MAX,
+    REQUEST_RERANK_TOP_K_MAX,
+    REQUEST_TEMPERATURE_MAX,
     CitationResponse,
     DocumentIngestResponse,
     HealthResponse,
@@ -46,6 +50,7 @@ logger = logging.getLogger(__name__)
 SettingsDep = Annotated[AppSettings, Depends(get_app_settings)]
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 RagPipelineDep = Annotated[RagPipeline, Depends(get_rag_pipeline)]
+OllamaCheckDep = Annotated[Callable[[AppSettings], bool], Depends(get_ollama_reachability_checker)]
 
 
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
@@ -139,8 +144,8 @@ def register_routes(app: FastAPI) -> None:
         return HealthResponse(status="ok")
 
     @app.get("/config", response_model=PublicConfigResponse)
-    def config(settings: SettingsDep) -> PublicConfigResponse:
-        return public_config(settings)
+    def config(settings: SettingsDep, check_ollama: OllamaCheckDep) -> PublicConfigResponse:
+        return public_config(settings, ollama_available=check_ollama(settings))
 
     @app.post("/documents", response_model=DocumentIngestResponse)
     async def upload_document(
@@ -165,7 +170,15 @@ def register_routes(app: FastAPI) -> None:
         request: QuestionRequest,
         pipeline: RagPipelineDep,
     ) -> QuestionResponse:
-        grounded = pipeline.answer(request.question, request.llm_provider)
+        grounded = pipeline.answer(
+            request.question,
+            AnswerOverrides(
+                llm_provider=request.llm_provider,
+                rerank_top_k=request.rerank_top_k,
+                max_context_chunks=request.max_context_chunks,
+                llm_temperature=request.llm_temperature,
+            ),
+        )
         return QuestionResponse(
             answer=grounded.answer,
             sources=[
@@ -182,7 +195,7 @@ def register_routes(app: FastAPI) -> None:
         )
 
 
-def public_config(settings: AppSettings) -> PublicConfigResponse:
+def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicConfigResponse:
     """Build a non-secret config response."""
 
     return PublicConfigResponse(
@@ -193,15 +206,21 @@ def public_config(settings: AppSettings) -> PublicConfigResponse:
         embedding_model_tag=settings.embedding_model_tag,
         llm_provider=settings.llm_provider,
         llm_model=settings.llm_model,
+        llm_temperature=float(settings.llm_temperature),
         openai_model=settings.openai_model,
         openai_available=bool(settings.openai_api_key),
+        ollama_available=ollama_available,
         rrf_k=int(settings.rrf_k),
         dense_retrieval_limit=int(settings.dense_retrieval_limit),
         sparse_retrieval_limit=int(settings.sparse_retrieval_limit),
         fused_top_n=int(settings.fused_top_n),
         rerank_top_k=int(settings.rerank_top_k),
         max_context_chunks=int(settings.max_context_chunks),
+        rerank_min_score=float(settings.rerank_min_score),
         max_upload_bytes=int(settings.max_upload_bytes),
+        rerank_top_k_limit=min(REQUEST_RERANK_TOP_K_MAX, int(settings.fused_top_n)),
+        max_context_chunks_limit=REQUEST_MAX_CONTEXT_CHUNKS_MAX,
+        llm_temperature_max=REQUEST_TEMPERATURE_MAX,
     )
 
 

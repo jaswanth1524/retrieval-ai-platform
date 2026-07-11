@@ -4,6 +4,7 @@ import type {
   HealthResponse,
   LlmProvider,
   PublicConfigResponse,
+  QuestionOverrides,
   QuestionResponse,
 } from './types';
 
@@ -113,16 +114,27 @@ export const api = {
     });
   },
 
-  askQuestion: (question: string, llmProvider?: LlmProvider, signal?: AbortSignal) =>
-    request<QuestionResponse>('/questions', {
+  askQuestion: (
+    question: string,
+    llmProvider?: LlmProvider,
+    overrides?: QuestionOverrides,
+    signal?: AbortSignal,
+  ) => {
+    // Only include a field when it's set, so an unset value exercises the backend's
+    // `| None` default (base provider/settings) rather than pinning a value.
+    const body: Record<string, unknown> = { question };
+    if (llmProvider) body.llm_provider = llmProvider;
+    if (overrides?.rerankTopK != null) body.rerank_top_k = overrides.rerankTopK;
+    if (overrides?.maxContextChunks != null) body.max_context_chunks = overrides.maxContextChunks;
+    if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
+    return request<QuestionResponse>('/questions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // Only include llm_provider when chosen, so an unset selection exercises the
-      // backend's `| None` default (base provider) rather than pinning a value.
-      body: JSON.stringify(llmProvider ? { question, llm_provider: llmProvider } : { question }),
+      body: JSON.stringify(body),
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
-    }),
+    });
+  },
 };
 
 export type { CitationResponse, DocumentIngestResponse, HealthResponse, PublicConfigResponse, QuestionResponse };

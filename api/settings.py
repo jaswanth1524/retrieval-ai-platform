@@ -17,7 +17,7 @@ class AppSettings(BaseSettings):
 
     dense_embedding_model: str = "BAAI/bge-small-en-v1.5"
     sparse_embedding_model: str = "Qdrant/BM25"
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
     embedding_model_tag: str = "fastembed:BAAI/bge-small-en-v1.5"
 
     rrf_k: PositiveInt = 60
@@ -27,6 +27,12 @@ class AppSettings(BaseSettings):
     rerank_top_k: PositiveInt = 8
     reranker_batch_size: PositiveInt = 64
     max_context_chunks: PositiveInt = 6
+    # Cross-encoder logits are unbounded and model-specific; sigmoid-normalizing to
+    # [0, 1] before comparing against this threshold makes it comparable across
+    # reranker models. sigmoid(0)=0.5 is the "indifferent" point; 0.30 (~logit -0.85)
+    # only drops chunks the model actively considers irrelevant, erring toward not
+    # over-filtering borderline-relevant results.
+    rerank_min_score: float = Field(default=0.30, ge=0.0, le=1.0)
 
     llm_provider: str = "ollama"
     llm_model: str = "llama3.1:8b"
@@ -46,6 +52,10 @@ class AppSettings(BaseSettings):
     # silently dropped the tail of most full-size chunks from the embedded vector.
     chunk_size_tokens: PositiveInt = 300
     chunk_overlap_tokens: int = Field(default=75, ge=0)
+    # Markdown heading sections shorter than this are folded into a neighboring
+    # section before chunking, so a one-line subsection doesn't become its own
+    # low-information, hard-to-retrieve chunk.
+    min_section_words: int = Field(default=40, ge=0)
 
     # Inert in the primary paths (dev uses the Vite proxy, prod serves the frontend
     # same-origin via StaticFiles) — a fallback for a contributor who points a
@@ -59,6 +69,9 @@ class AppSettings(BaseSettings):
     # this setting directly (not through FastAPI's DI), which sidesteps test fixtures'
     # dependency overrides — an operator-set `true` in a real `.env` would otherwise
     # also trigger real model downloads during local test runs against that same file.
+    # Note: the default reranker (jinaai/jina-reranker-v2-base-multilingual) is ~1.1 GB,
+    # larger than the previous default — enabling warmup or asking the first question
+    # after a config change pays that download cost once.
     warmup_models: bool = False
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -10,6 +11,16 @@ from fastembed.rerank.cross_encoder import TextCrossEncoder
 
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
+
+
+def _sigmoid(x: float) -> float:
+    """Numerically stable sigmoid; avoids OverflowError for large-magnitude logits."""
+
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
 
 
 class RerankingError(RuntimeError):
@@ -87,7 +98,15 @@ def rerank_candidates(
     reranker: Reranker,
     settings: AppSettings,
 ) -> list[RerankedChunk]:
-    """Rerank only the fused top-N candidates and return the top-K results."""
+    """Rerank the fused top-N candidates, drop low-relevance ones, keep the top-K.
+
+    ``rerank_score`` is the raw cross-encoder logit sigmoid-normalized to [0, 1] so
+    ``rerank_min_score`` is comparable across reranker models. Because the candidate
+    list is sorted descending before filtering, dropping everything below the
+    threshold and then slicing to ``rerank_top_k`` is equivalent to slicing first and
+    filtering after — either way the result is the sorted prefix that clears the bar,
+    which may be shorter than ``rerank_top_k`` or empty.
+    """
 
     normalized_query = query.strip()
     if not normalized_query:
@@ -97,6 +116,7 @@ def rerank_candidates(
 
     fused_top_n = int(settings.fused_top_n)
     rerank_top_k = int(settings.rerank_top_k)
+    min_score = float(settings.rerank_min_score)
     candidates_to_score = list(candidates[:fused_top_n])
     documents = [candidate.text for candidate in candidates_to_score]
     scores = reranker.score(normalized_query, documents)
@@ -116,12 +136,14 @@ def rerank_candidates(
             chunk_id=candidate.chunk_id,
             text=candidate.text,
             retrieval_score=candidate.score,
-            rerank_score=float(score),
+            rerank_score=_sigmoid(float(score)),
         )
         for candidate, score in zip(candidates_to_score, scores, strict=True)
     ]
-    return sorted(
+    sorted_chunks = sorted(
         reranked,
         key=lambda chunk: (-chunk.rerank_score, -chunk.retrieval_score, chunk.chunk_id),
-    )[:rerank_top_k]
+    )
+    filtered = [chunk for chunk in sorted_chunks if chunk.rerank_score >= min_score]
+    return filtered[:rerank_top_k]
 

@@ -15,6 +15,7 @@ from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
     get_generator,
+    get_ollama_reachability_checker,
     get_qdrant_client,
     get_reranker,
 )
@@ -87,6 +88,8 @@ def api_context() -> Generator[ApiTestContext]:
     app.dependency_overrides[get_embedding_provider] = lambda: embeddings
     app.dependency_overrides[get_reranker] = lambda: reranker
     app.dependency_overrides[get_generator] = lambda: generator
+    # Hermetic by default: never let /config make a real network call to Ollama.
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
 
     with TestClient(app) as client:
         yield ApiTestContext(
@@ -187,6 +190,7 @@ def test_document_upload_rejects_file_over_size_limit() -> None:
     app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
     with TestClient(app) as client:
         response = client.post(
             "/documents",
@@ -258,6 +262,65 @@ def test_question_endpoint_rejects_oversized_query(api_context: ApiTestContext) 
     assert response.status_code == 422
 
 
+def test_question_endpoint_rejects_out_of_bounds_rerank_top_k(
+    api_context: ApiTestContext,
+) -> None:
+    response = api_context.client.post(
+        "/questions", json={"question": "alpha", "rerank_top_k": 999}
+    )
+
+    assert response.status_code == 422
+
+
+def test_question_endpoint_rejects_max_context_chunks_above_rerank_top_k(
+    api_context: ApiTestContext,
+) -> None:
+    response = api_context.client.post(
+        "/questions",
+        json={"question": "alpha", "rerank_top_k": 3, "max_context_chunks": 5},
+    )
+
+    assert response.status_code == 422
+
+
+def test_question_endpoint_rejects_rerank_top_k_above_fused_top_n(
+    api_context: ApiTestContext,
+) -> None:
+    """api_context's settings default to fused_top_n=5 — a business rule known only
+    inside the pipeline, so this is a 400 (RetrievalConfigError), not the schema's 422."""
+
+    upload_response = api_context.client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
+    )
+    assert upload_response.status_code == 200
+
+    response = api_context.client.post(
+        "/questions", json={"question": "alpha", "rerank_top_k": 45}
+    )
+
+    assert response.status_code == 400
+    assert "fused_top_n" in response.json()["detail"]
+
+
+def test_question_endpoint_accepts_valid_overrides_and_limits_sources(
+    api_context: ApiTestContext,
+) -> None:
+    upload_response = api_context.client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
+    )
+    assert upload_response.status_code == 200
+
+    response = api_context.client.post(
+        "/questions",
+        json={"question": "alpha", "rerank_top_k": 1, "max_context_chunks": 1},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["sources"]) <= 1
+
+
 class RaisingReranker:
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
         raise RerankingError("Reranker model failed: out of memory")
@@ -326,12 +389,47 @@ def test_config_reports_openai_available_when_key_present() -> None:
     settings = make_settings(openai_api_key="sk-test")
     app = create_app()
     app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
     with TestClient(app) as client:
         payload = client.get("/config").json()
     clear_dependency_caches()
 
     assert payload["openai_available"] is True
     assert "openai_api_key" not in payload
+
+
+def test_config_reports_ollama_available_true_or_false_from_checker() -> None:
+    clear_dependency_caches()
+    settings = make_settings()
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: True)
+    with TestClient(app) as client:
+        assert client.get("/config").json()["ollama_available"] is True
+
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    with TestClient(app) as client:
+        assert client.get("/config").json()["ollama_available"] is False
+    clear_dependency_caches()
+
+
+def test_config_exposes_override_limit_fields() -> None:
+    clear_dependency_caches()
+    settings = make_settings(fused_top_n=5)
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    with TestClient(app) as client:
+        payload = client.get("/config").json()
+    clear_dependency_caches()
+
+    # rerank_top_k_limit is capped by the server's own fused_top_n (5 here), not the
+    # global REQUEST_RERANK_TOP_K_MAX (50).
+    assert payload["rerank_top_k_limit"] == 5
+    assert payload["max_context_chunks_limit"] == 20
+    assert payload["llm_temperature_max"] == 2.0
+    assert payload["llm_temperature"] == settings.llm_temperature
 
 
 class CapturingCompletionClient:
@@ -362,6 +460,7 @@ def _ingested_client(
     app.dependency_overrides[get_embedding_provider] = lambda: embeddings
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: generator
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
     client = TestClient(app)
     upload = client.post(
         "/documents",

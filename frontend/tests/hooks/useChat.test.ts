@@ -126,7 +126,7 @@ describe('useChat', () => {
 
   it('aborts the in-flight request when the component unmounts', async () => {
     askQuestionMock.mockImplementation(
-      (_question, _provider, signal) =>
+      (_question, _provider, _overrides, signal) =>
         new Promise((_resolve, reject) => {
           signal?.addEventListener('abort', () => reject(new Error('aborted')));
         }),
@@ -138,7 +138,7 @@ describe('useChat', () => {
       void result.current.ask('alpha');
     });
 
-    const signal = askQuestionMock.mock.calls[0][2];
+    const signal = askQuestionMock.mock.calls[0][3];
     expect(signal?.aborted).toBe(false);
 
     unmount();
@@ -148,7 +148,7 @@ describe('useChat', () => {
 
   it('cancel() aborts the in-flight request and clears pending via the existing error path', async () => {
     askQuestionMock.mockImplementation(
-      (_question, _provider, signal) =>
+      (_question, _provider, _overrides, signal) =>
         new Promise((_resolve, reject) => {
           signal?.addEventListener('abort', () => reject(new ApiClientError('Request timed out or was cancelled.')));
         }),

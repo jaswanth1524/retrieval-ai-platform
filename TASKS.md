@@ -51,9 +51,11 @@ This task plan follows the requested build order and the architecture implied by
 ## Milestone 7: Cross-Encoder Reranking
 
 - Rerank only the fused top-N candidates.
-- Use FastEmbed reranker `BAAI/bge-reranker-v2-m3`.
+- Use FastEmbed reranker `jinaai/jina-reranker-v2-base-multilingual` (owner-approved swap from the
+  originally spec'd `BAAI/bge-reranker-v2-m3`, which fastembed cannot load at any version).
+- Drop candidates scoring below `RERANK_MIN_SCORE` (sigmoid-normalized) before returning.
 - Return the highest-ranked chunks with their source metadata intact.
-- Status: reranking adapter and top-N/top-K ordering added; tests use fake cross-encoder scores to avoid model downloads.
+- Status: reranking adapter, top-N/top-K ordering, and relevance-score filtering added; tests use fake cross-encoder scores to avoid model downloads.
 
 ## Milestone 8: Grounded Generation
 
@@ -98,7 +100,7 @@ This task plan follows the requested build order and the architecture implied by
 - The requested repository structure is shown under `docrag/`, while the requested planning files are named without that prefix; this repository now treats the current root as the DocRAG project root.
 - Qdrant server-side hybrid query support depends on the installed Qdrant server/client feature set, so manual RRF fallback is required.
 - First-run FastEmbed model downloads may make the initial one-command run slower.
-- `BAAI/bge-reranker-v2-m3` may require more CPU and memory than the dense embedding model.
-- Installed FastEmbed exposes `TextCrossEncoder`, but version `0.8.0` does not list `BAAI/bge-reranker-v2-m3` as a supported model; runtime reranker setup may require a newer FastEmbed release, custom model registration, or an owner-approved supported-model fallback.
+- `jinaai/jina-reranker-v2-base-multilingual` (~1.1 GB) may require more CPU and memory than the dense embedding model.
+- RESOLVED: `BAAI/bge-reranker-v2-m3` is not listed as a supported model by FastEmbed's `TextCrossEncoder` at any released version (confirmed against `main`, not just the pinned `0.8.0`) — not a version-lag issue. Owner approved swapping the default to `jinaai/jina-reranker-v2-base-multilingual`, the strongest model FastEmbed does support.
 - RAGAS evaluation can require an evaluator LLM for some metrics; evaluation remains optional and separate from the core local workflow.
 - The currently resolved RAGAS dependency set fails to import because `ragas 0.4.3` expects `langchain_community.chat_models.vertexai`, which is absent from `langchain-community 0.4.2`; the evaluation runner lazy-loads RAGAS and reports this setup error without breaking the core app.

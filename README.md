@@ -40,7 +40,7 @@ DocRAG will use a hybrid RAG pipeline:
 5. Store named dense and sparse vectors in Qdrant.
 6. Retrieve with both semantic and keyword search.
 7. Fuse retrieval results with Reciprocal Rank Fusion using `k=60`.
-8. Rerank only the fused top-N candidates with `BAAI/bge-reranker-v2-m3`.
+8. Rerank only the fused top-N candidates with `jinaai/jina-reranker-v2-base-multilingual`, then drop any candidate scoring below `RERANK_MIN_SCORE` (default 0.30) before it ever reaches the LLM context or citations.
 9. Generate an answer through LiteLLM using only the provided context.
 10. Return the answer with citations.
 
@@ -91,11 +91,33 @@ The default `OLLAMA_BASE_URL` targets `host.docker.internal`, which Docker Deskt
 
 For local frontend iteration without a full rebuild, run `uv run uvicorn api.main:app --reload` and `npm --prefix frontend run dev` separately — Vite's dev server proxies API calls to `localhost:8000`.
 
-> **Known issue:** the default reranker model (`BAAI/bge-reranker-v2-m3`) is not
-> supported by the currently pinned `fastembed` version, so the first question asked
-> against an out-of-the-box `docker compose up` will fail. Until this is resolved,
-> set `RERANKER_MODEL=BAAI/bge-reranker-base` in your `.env` to get a working local
-> stack.
+> **Note:** the default reranker (`jinaai/jina-reranker-v2-base-multilingual`) is
+> ~1.1 GB and downloads once on first use (or at boot if `WARMUP_MODELS=true`) —
+> larger than the previous default, so the first question after a fresh install or a
+> reranker config change pays that one-time download cost.
+
+> **Known issue:** generation defaults to local Ollama. If `ollama serve` isn't
+> running (or `OLLAMA_BASE_URL` doesn't resolve from wherever the API process runs —
+> `host.docker.internal` only resolves *inside* a Docker container; use
+> `http://localhost:11434` when running the API directly on your host), questions
+> will fail with a 502. `/config`'s `ollama_available` field and the UI's provider
+> selector both reflect current reachability.
+
+> **Chunking improved:** `.txt` uploads are now split into paragraph sections (and,
+> when the content contains two or more Markdown-style headings, parsed as Markdown)
+> instead of becoming a single section for the whole file; Markdown parsing also now
+> recognizes setext-style H1 headings (`Title` underlined with `===`). Documents
+> ingested before this change keep their old, coarser chunk boundaries — re-upload
+> any previously ingested `.txt` files (and `.md` files using setext headings) to
+> pick up the improved splitting; re-uploading the same filename automatically
+> replaces the old chunks.
+
+> **Chunking improved further:** chunk windows now cross PDF page breaks and
+> plain-text paragraph breaks (Markdown heading boundaries are still respected, so
+> chunks never mix content from two different headings), and tiny Markdown
+> subsections are folded into a neighboring section before chunking. As above,
+> re-upload a previously ingested file to replace its chunks with the new,
+> better-bounded ones.
 
 ## Current Files
 

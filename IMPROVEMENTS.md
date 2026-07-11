@@ -8,9 +8,9 @@ was verified directly against source this session.
 **Constraints for whoever implements these** (see `CLAUDE.md`):
 - Hybrid RAG behavior is non-negotiable (RRF `k=60`, rerank fused top-N, citations with
   filename/page/section/chunk_id).
-- The reranker default `BAAI/bge-reranker-v2-m3` is a spec'd default — do NOT change it
-  unilaterally even though it's currently incompatible with installed FastEmbed 0.8.0 (see A2 —
-  flagged as an owner decision, not prescribed).
+- ~~The reranker default `BAAI/bge-reranker-v2-m3` is a spec'd default — do NOT change it
+  unilaterally~~ **Resolved:** owner approved swapping the default to
+  `jinaai/jina-reranker-v2-base-multilingual` (see A2).
 - Git is read-only by default; follow the repo's validation policy (backend-verify / frontend-verify
   workflows) for every change.
 - Implement one item (or one tightly-related group) at a time, with a red-without/green-with test
@@ -41,19 +41,17 @@ ordering.
 **Test:** run the full suite with a real `OPENAI_API_KEY` (and other overrides) present in `.env` —
 all green regardless.
 
-### A2. Out-of-box `docker compose up` still breaks on first question — owner decision needed
+### A2. Out-of-box `docker compose up` still breaks on first question — RESOLVED
 
-`api/settings.py:20` defaults `reranker_model` to `BAAI/bge-reranker-v2-m3`; installed FastEmbed
-0.8.0 does not support it (confirmed in a prior session — required
-`RERANKER_MODEL=BAAI/bge-reranker-base` override to get a working local stack). A newcomer
-following the README quickstart gets a clean 502 on their very first question. Carried over from
-audit #1 (was P1-8) — still undecided.
+`api/settings.py:20` defaulted `reranker_model` to `BAAI/bge-reranker-v2-m3`; confirmed against
+fastembed's `main` branch (not just the pinned 0.8.0) that this model is not loadable by fastembed
+at any version — `TextCrossEncoder.list_supported_models()` never lists it. A newcomer following
+the README quickstart got a clean 502 on their very first question.
 
-Options for the owner: (a) bump `fastembed` when a supporting release ships, (b) change the spec'd
-default in `CLAUDE.md` + `settings.py` + `.env.example` to `BAAI/bge-reranker-base`, (c) keep the
-spec'd default and document the required override prominently in the README quickstart (see D2).
-This is the single worst newcomer-experience issue in the project right now — not something to fix
-unilaterally, but worth prioritizing a decision on.
+**Owner decision:** default changed to `jinaai/jina-reranker-v2-base-multilingual` — the strongest
+cross-encoder fastembed does support (1K context, ~1.1 GB). Updated in `CLAUDE.md`, `api/settings.py`,
+`.env.example`, and the local `.env`. Swapping the reranker does not invalidate the Qdrant index
+(the embedding tag is derived only from the dense model). See D2 for the now-removed README callout.
 
 ### A3. No request length cap on questions
 
@@ -205,22 +203,24 @@ Trigger on push and PR to `main`. Note: land A1 first — CI runners won't have 
 12 of the 18 findings in the previous version of `IMPROVEMENTS.md` were implemented and shipped.
 This audit replaces it wholesale — that replacement is the deliverable of the audit task itself.
 
-### D2. README drift risk around the reranker default
+### D2. README drift risk around the reranker default — RESOLVED
 
-The README's Docker quickstart implies `docker compose up` + ask a question works out of the box;
-with A2 unresolved, the first question 502s. Until the owner decides A2, add a clearly visible
-"known issue" callout to the README's quickstart with the `RERANKER_MODEL=BAAI/bge-reranker-base`
-override. Also document the `eval` extra (`uv sync --extra eval`) and a usage example for
+Was: the README's Docker quickstart implied `docker compose up` + ask a question works out of the
+box, but with A2 unresolved the first question 502s. Now that A2 is resolved (new default is
+fastembed-loadable), the "known issue" callout describing the 502 has been removed from the README
+and replaced with a note about the new reranker's larger (~1.1 GB) first-download size.
+
+Still open: document the `eval` extra (`uv sync --extra eval`) and a usage example for
 `eval/ragas_runner.py` — the module is complete, tested, and functional but currently unreachable
 from any documentation, so nobody would discover it exists.
 
 ### D3. Minor code-quality notes (fix opportunistically, not worth standalone PRs)
 
-- `api/generation.py cited_sources` — when the model declines to answer ("insufficient context") in
-  its own words without citing any `[n]` marker, the fallback currently attaches ALL context
-  sources to that non-answer. Consider special-casing "no citations + answer signals
-  insufficiency" → return `[]`; alternatively, leave as-is (always returning ≥1 citation for a
-  grounded answer is also a defensible reading of the spec) — note the tradeoff explicitly if kept.
+- ~~`api/generation.py cited_sources` — when the model declines to answer ("insufficient context")
+  in its own words without citing any `[n]` marker, the fallback currently attaches ALL context
+  sources to that non-answer.~~ **Resolved:** the fallback was removed — zero `[n]` markers now
+  returns zero sources, since an answer citing nothing is exactly the case that shouldn't imply
+  every candidate chunk is a source.
 - `api/documents.py` `ChunkConfigError` currently maps to 400 (user-blame) though the root cause is
   server-side configuration (`CHUNK_OVERLAP_TOKENS`/`CHUNK_SIZE_TOKENS`), not user input — arguably
   should be a 500. Low impact either way; noting for awareness only.

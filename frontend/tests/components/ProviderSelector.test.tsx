@@ -9,19 +9,25 @@ function makeConfig(overrides: Partial<PublicConfigResponse> = {}): PublicConfig
     qdrant_collection: 'docrag_documents',
     dense_embedding_model: 'BAAI/bge-small-en-v1.5',
     sparse_embedding_model: 'Qdrant/BM25',
-    reranker_model: 'BAAI/bge-reranker-v2-m3',
+    reranker_model: 'jinaai/jina-reranker-v2-base-multilingual',
     embedding_model_tag: 'fastembed:BAAI/bge-small-en-v1.5',
     llm_provider: 'ollama',
     llm_model: 'llama3.1:8b',
+    llm_temperature: 0,
     openai_model: 'gpt-4o-mini',
     openai_available: false,
+    ollama_available: true,
     rrf_k: 60,
     dense_retrieval_limit: 50,
     sparse_retrieval_limit: 50,
     fused_top_n: 50,
     rerank_top_k: 8,
     max_context_chunks: 6,
+    rerank_min_score: 0.3,
     max_upload_bytes: 52428800,
+    rerank_top_k_limit: 50,
+    max_context_chunks_limit: 20,
+    llm_temperature_max: 2.0,
     ...overrides,
   };
 }
@@ -52,6 +58,24 @@ describe('ProviderSelector', () => {
 
     expect(screen.getByRole('option', { name: /OpenAI/ })).toBeEnabled();
     expect(screen.queryByTestId('provider-openai-hint')).not.toBeInTheDocument();
+  });
+
+  it('disables the Ollama option and shows a hint when Ollama is unreachable', () => {
+    render(
+      <ProviderSelector config={makeConfig({ ollama_available: false })} value="ollama" onChange={() => {}} />,
+    );
+
+    expect(screen.getByRole('option', { name: /Local \(Ollama/ })).toBeDisabled();
+    expect(screen.getByTestId('provider-ollama-hint')).toBeInTheDocument();
+  });
+
+  it('enables the Ollama option and hides the hint when Ollama is reachable', () => {
+    render(
+      <ProviderSelector config={makeConfig({ ollama_available: true })} value="ollama" onChange={() => {}} />,
+    );
+
+    expect(screen.getByRole('option', { name: /Local \(Ollama/ })).toBeEnabled();
+    expect(screen.queryByTestId('provider-ollama-hint')).not.toBeInTheDocument();
   });
 
   it('calls onChange when a provider is selected', async () => {

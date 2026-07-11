@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypedDict
 
 import litellm
+from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
 
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
@@ -98,6 +99,17 @@ class LiteLLMGenerator:
                 drop_params=True,
                 **provider_kwargs,
             )
+        except LiteLLMAPIConnectionError as exc:
+            if settings.llm_provider.lower().strip() == "ollama":
+                raise GenerationError(
+                    f"Cannot reach Ollama at {settings.ollama_base_url}. Start Ollama "
+                    "(`ollama serve`) and confirm OLLAMA_BASE_URL is reachable from "
+                    "wherever the API process runs — use http://localhost:11434 when "
+                    "the API runs directly on your host, or "
+                    "http://host.docker.internal:11434 only when the API itself runs "
+                    "inside Docker."
+                ) from exc
+            raise GenerationError(f"Generation provider request failed: {exc}") from exc
         except Exception as exc:
             # LiteLLM/provider SDKs raise many distinct exception types (auth,
             # connection, rate limit, ...); this boundary's job is translating all
@@ -217,15 +229,14 @@ def cited_sources(
 ) -> list[SourceCitation]:
     """Return only the sources the answer actually cites via ``[n]`` markers.
 
-    Falls back to all provided sources when the answer cites none (so a grounded
-    answer is never returned with zero citations).
+    An answer with zero ``[n]`` markers is treated as ungrounded/insufficient — it
+    gets zero sources rather than every candidate chunk attached regardless of
+    relevance.
     """
 
     referenced = {int(match) for match in _CITATION_RE.findall(answer)}
     available = {source.source_number for source in sources}
     used = referenced & available
-    if not used:
-        return list(sources)
     return [source for source in sources if source.source_number in used]
 
 

@@ -23,6 +23,10 @@ class RetrievalPayloadError(RetrievalError):
     """Raised when a stored point is missing required citation metadata."""
 
 
+class RetrievalConfigError(RetrievalError):
+    """Raised when a per-request retrieval override is invalid against server config."""
+
+
 class QueryEmbeddingProvider(Protocol):
     """Embedding provider surface used by retrieval."""
 

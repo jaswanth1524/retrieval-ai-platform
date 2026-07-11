@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import lru_cache
 from typing import Annotated
 
@@ -11,6 +12,7 @@ from qdrant_client import QdrantClient
 from api.embeddings import LocalEmbeddingProvider
 from api.generation import LiteLLMGenerator
 from api.pipeline import IngestService, RagPipeline
+from api.provider_health import check_ollama_reachable
 from api.qdrant_schema import clear_readiness_cache
 from api.repository import VectorRepository
 from api.reranking import LocalCrossEncoderReranker, RerankingError
@@ -58,6 +60,17 @@ def get_generator() -> LiteLLMGenerator:
     """Return a cached LiteLLM generator."""
 
     return LiteLLMGenerator(get_app_settings())
+
+
+def get_ollama_reachability_checker() -> Callable[[AppSettings], bool]:
+    """Return the Ollama-reachability probe.
+
+    Not cached: Ollama can start or stop between requests, so ``/config`` must probe
+    live each time. Exposed as a dependency (rather than a direct import in main.py)
+    so tests can override it without hitting a real localhost:11434.
+    """
+
+    return check_ollama_reachable
 
 
 def get_vector_repository(

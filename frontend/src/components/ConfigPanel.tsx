@@ -1,16 +1,18 @@
 import { useState } from 'react';
-import type { PublicConfigResponse } from '../api/types';
+import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import './ConfigPanel.css';
 
 interface ConfigPanelProps {
   config: PublicConfigResponse;
+  overrides: QuestionOverrides;
+  onOverridesChange: (value: QuestionOverrides) => void;
+  disabled?: boolean;
 }
 
-const METRICS: Array<[label: string, key: keyof PublicConfigResponse]> = [
+const READONLY_METRICS: Array<[label: string, key: keyof PublicConfigResponse]> = [
   ['RRF k', 'rrf_k'],
   ['Fused top N', 'fused_top_n'],
-  ['Rerank top K', 'rerank_top_k'],
-  ['Context chunks', 'max_context_chunks'],
+  ['Min rerank score', 'rerank_min_score'],
 ];
 
 const IDENTIFIER_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
@@ -26,20 +28,123 @@ const IDENTIFIER_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]>
   ['Sparse retrieval limit', 'sparse_retrieval_limit'],
 ];
 
-function ConfigPanel({ config }: ConfigPanelProps) {
+const EMPTY_OVERRIDES: QuestionOverrides = {
+  rerankTopK: null,
+  maxContextChunks: null,
+  llmTemperature: null,
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+interface StepperCardProps {
+  label: string;
+  displayValue: string;
+  onStep: (delta: number) => void;
+  disabled?: boolean;
+}
+
+function StepperCard({ label, displayValue, onStep, disabled }: StepperCardProps) {
+  return (
+    <div className="config-panel__metric config-panel__metric--stepper">
+      <div>
+        <span className="config-panel__metric-value mono" aria-live="polite">
+          {displayValue}
+        </span>
+        <span className="config-panel__metric-label">{label}</span>
+      </div>
+      <div className="config-panel__stepper-controls">
+        <button
+          type="button"
+          className="config-panel__stepper-btn"
+          onClick={() => onStep(1)}
+          disabled={disabled}
+          aria-label={`Increase ${label}`}
+        >
+          &#9650;
+        </button>
+        <button
+          type="button"
+          className="config-panel__stepper-btn"
+          onClick={() => onStep(-1)}
+          disabled={disabled}
+          aria-label={`Decrease ${label}`}
+        >
+          &#9660;
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ConfigPanel({ config, overrides, onOverridesChange, disabled }: ConfigPanelProps) {
   const [expanded, setExpanded] = useState(false);
+
+  const rerankTopK = overrides.rerankTopK ?? config.rerank_top_k;
+  const maxContextChunks = overrides.maxContextChunks ?? config.max_context_chunks;
+  const llmTemperature = overrides.llmTemperature ?? config.llm_temperature;
+
+  const stepRerankTopK = (delta: number) => {
+    const next = clamp(rerankTopK + delta, 1, config.rerank_top_k_limit);
+    onOverridesChange({ ...overrides, rerankTopK: next });
+  };
+
+  const stepMaxContextChunks = (delta: number) => {
+    const next = clamp(maxContextChunks + delta, 1, config.max_context_chunks_limit);
+    onOverridesChange({ ...overrides, maxContextChunks: next });
+  };
+
+  const stepTemperature = (direction: 1 | -1) => {
+    // Guard against binary float drift (0.1 + 0.2 !== 0.3) across repeated clicks.
+    const next = clamp(
+      Math.round((llmTemperature + direction * 0.1) * 10) / 10,
+      0,
+      config.llm_temperature_max,
+    );
+    onOverridesChange({ ...overrides, llmTemperature: next });
+  };
 
   return (
     <div className="config-panel">
       <div className="config-panel__section-label">Retrieval settings</div>
       <div className="config-panel__metrics">
-        {METRICS.map(([label, key]) => (
+        {READONLY_METRICS.map(([label, key]) => (
           <div key={key} className="config-panel__metric">
             <span className="config-panel__metric-value mono">{config[key]}</span>
             <span className="config-panel__metric-label">{label}</span>
           </div>
         ))}
+        <StepperCard
+          label="Rerank top K"
+          displayValue={String(rerankTopK)}
+          onStep={stepRerankTopK}
+          disabled={disabled}
+        />
+        <StepperCard
+          label="Context chunks"
+          displayValue={String(maxContextChunks)}
+          onStep={stepMaxContextChunks}
+          disabled={disabled}
+        />
       </div>
+
+      <div className="config-panel__advanced-label">Advanced</div>
+      <StepperCard
+        label="Temperature"
+        displayValue={llmTemperature.toFixed(1)}
+        onStep={(delta) => stepTemperature(delta > 0 ? 1 : -1)}
+        disabled={disabled}
+      />
+      <button
+        type="button"
+        className="config-panel__reset"
+        onClick={() => onOverridesChange(EMPTY_OVERRIDES)}
+        disabled={disabled}
+      >
+        Reset to defaults
+      </button>
+
       <button
         type="button"
         className="config-panel__toggle"
