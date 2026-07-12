@@ -1,14 +1,39 @@
 import { useRef, useState } from 'react';
 import type { DragEvent } from 'react';
-import type { DocumentIngestResponse } from '../api/types';
+import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import './UploadPanel.css';
 
 export type UploadStatus = 'idle' | 'uploading' | 'success' | 'error';
+
+export interface UploadProgress {
+  state: IngestJobState;
+  chunksDone: number;
+  chunksTotal: number;
+}
 
 export interface UploadState {
   status: UploadStatus;
   result?: DocumentIngestResponse;
   error?: string;
+  progress?: UploadProgress;
+}
+
+const PROGRESS_LABELS: Record<IngestJobState, string> = {
+  queued: 'Queued...',
+  parsing: 'Parsing...',
+  embedding: 'Embedding...',
+  indexing: 'Indexing...',
+  done: 'Done',
+  failed: 'Failed',
+};
+
+function uploadingLabel(progress?: UploadProgress): string {
+  if (!progress) return 'Uploading...';
+  const label = PROGRESS_LABELS[progress.state];
+  if (progress.chunksTotal > 0) {
+    return `${label} (${progress.chunksDone}/${progress.chunksTotal})`;
+  }
+  return label;
 }
 
 // Matches the backend's AppSettings.max_upload_bytes default — used only until
@@ -112,7 +137,7 @@ function UploadPanel({
         disabled={!selectedFile || uploading}
         data-testid="upload-button"
       >
-        {uploading ? 'Uploading...' : 'Upload'}
+        {uploading ? uploadingLabel(state.progress) : 'Upload'}
       </button>
       {sizeError && (
         <p className="upload-panel__error" role="alert" data-testid="upload-size-error">

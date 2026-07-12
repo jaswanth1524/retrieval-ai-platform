@@ -87,6 +87,40 @@ def test_rerank_candidates_sorts_by_cross_encoder_score_and_truncates() -> None:
     assert results[0].rerank_score == pytest.approx(_sigmoid(0.95))
 
 
+def test_rerank_candidates_scores_only_rerank_candidates_setting() -> None:
+    """``rerank_candidates`` (clamped to fused_top_n) trims how many of the fused
+    candidates are actually sent through the cross-encoder — independent of
+    fused_top_n itself, which stays the fusion spec's own top-N."""
+
+    settings = make_settings(fused_top_n=5, rerank_top_k=5, rerank_candidates=2)
+    candidates = [
+        make_candidate("c1", "first", 0.9),
+        make_candidate("c2", "second", 0.8),
+        make_candidate("c3", "third", 0.7),
+    ]
+    reranker = FakeReranker([0.1, 0.2])
+
+    results = rerank_candidates("query", candidates, reranker, settings)
+
+    assert reranker.seen_documents == ["first", "second"]
+    assert [result.chunk_id for result in results] == ["c2", "c1"]
+
+
+def test_rerank_candidates_rerank_candidates_setting_never_exceeds_fused_top_n() -> None:
+    settings = make_settings(fused_top_n=2, rerank_top_k=5, rerank_candidates=50)
+    candidates = [
+        make_candidate("c1", "first", 0.9),
+        make_candidate("c2", "second", 0.8),
+        make_candidate("c3", "third", 0.7),
+    ]
+    reranker = FakeReranker([0.1, 0.2])
+
+    results = rerank_candidates("query", candidates, reranker, settings)
+
+    assert reranker.seen_documents == ["first", "second"]
+    assert [result.chunk_id for result in results] == ["c2", "c1"]
+
+
 def test_rerank_candidates_scores_only_fused_top_n() -> None:
     settings = make_settings(fused_top_n=2, rerank_top_k=5)
     candidates = [

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -60,8 +60,18 @@ def ingest_chunks(
     settings: AppSettings,
     chunks: Sequence[DocumentChunk],
     embedding_provider: EmbeddingProvider,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> IngestResult:
-    """Embed chunks locally and index them, replacing any prior points for the file."""
+    """Embed chunks locally and index them, replacing any prior points for the file.
+
+    Chunks are embedded and upserted in batches of ``settings.ingest_batch_size`` so a
+    single huge document reports incremental progress (via ``on_progress(done, total)``)
+    and never holds one giant embedding call in memory. Stale-cleanup ordering is
+    unchanged: every filename's currently-indexed IDs are snapshotted *before* the
+    first batch is written, and only IDs absent from every new batch are deleted
+    afterward — a failure partway through a multi-batch ingest still leaves whatever
+    batches already succeeded correctly indexed, never wiped.
+    """
 
     if not chunks:
         raise EmptyDocumentError("No document chunks were provided for ingestion.")
@@ -69,16 +79,6 @@ def ingest_chunks(
     # Validate before embedding: an embedding-tag mismatch should refuse the ingest
     # without paying for embedding work on chunks that can't be written anyway.
     repository.ensure_ready(settings)
-    embeddings = embedding_provider.embed_texts([chunk.text for chunk in chunks])
-    if len(embeddings) != len(chunks):
-        raise EmbeddingError(
-            f"Embedding count mismatch: got {len(embeddings)}, expected {len(chunks)}."
-        )
-
-    points = [
-        build_point(chunk, embedding, settings)
-        for chunk, embedding in zip(chunks, embeddings, strict=True)
-    ]
 
     # Snapshot each filename's currently-indexed point IDs *before* upserting — this
     # is what "stale" gets computed against once the new points are written.
@@ -87,15 +87,39 @@ def ingest_chunks(
     for filename in filenames:
         stale_candidate_ids.update(repository.point_ids_for_filename(settings, filename))
 
-    try:
-        repository.upsert(settings, points)
-    except Exception as exc:
-        raise IngestionError(
-            f"Indexing failed while updating {', '.join(filenames)}; the previous "
-            "version remains indexed. Please retry the upload."
-        ) from exc
+    batch_size = int(settings.ingest_batch_size)
+    total = len(chunks)
+    new_ids: set[str] = set()
+    batches_written = 0
+    for start in range(0, total, batch_size):
+        batch = list(chunks[start : start + batch_size])
+        embeddings = embedding_provider.embed_texts([_contextual_embedding_text(c) for c in batch])
+        if len(embeddings) != len(batch):
+            raise EmbeddingError(
+                f"Embedding count mismatch: got {len(embeddings)}, expected {len(batch)}."
+            )
+        points = [
+            build_point(chunk, embedding, settings)
+            for chunk, embedding in zip(batch, embeddings, strict=True)
+        ]
+        try:
+            repository.upsert(settings, points)
+        except Exception as exc:
+            if batches_written == 0:
+                raise IngestionError(
+                    f"Indexing failed while updating {', '.join(filenames)}; the previous "
+                    "version remains indexed. Please retry the upload."
+                ) from exc
+            raise IngestionError(
+                f"Indexing failed partway through updating {', '.join(filenames)} "
+                f"({start} of {total} chunks already indexed alongside the previous "
+                "version). Please retry the upload."
+            ) from exc
+        new_ids.update(str(point.id) for point in points)
+        batches_written += 1
+        if on_progress is not None:
+            on_progress(min(start + batch_size, total), total)
 
-    new_ids = {str(point.id) for point in points}
     stale_ids = stale_candidate_ids - new_ids
     if stale_ids:
         try:
@@ -109,8 +133,21 @@ def ingest_chunks(
 
     return IngestResult(
         collection_name=settings.qdrant_collection,
-        points_count=len(points),
+        points_count=total,
     )
+
+
+def _contextual_embedding_text(chunk: DocumentChunk) -> str:
+    """Prefix a chunk's embedded text with its filename/section (contextual retrieval).
+
+    Only the *embedded* text changes — the stored payload keeps ``chunk.text`` raw
+    (see ``build_point``), so citations and the generation prompt are unaffected.
+    Giving both the dense and sparse (BM25) models the filename/section as context
+    improves matches on queries that reference a document or heading by name, which a
+    bare chunk of body text wouldn't otherwise surface.
+    """
+
+    return f"{chunk.filename} › {chunk.section}\n{chunk.text}"
 
 
 def build_point(

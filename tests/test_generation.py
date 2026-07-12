@@ -342,3 +342,55 @@ def test_litellm_generator_passes_num_retries_from_settings() -> None:
 
     assert completion_client.kwargs is not None
     assert completion_client.kwargs["num_retries"] == 2
+
+
+def test_completion_model_and_kwargs_passes_ollama_keep_alive() -> None:
+    model, kwargs = completion_model_and_kwargs(
+        make_settings(llm_provider="ollama", ollama_keep_alive="45m")
+    )
+
+    assert model == "ollama/llama3.1:8b"
+    assert kwargs["keep_alive"] == "45m"
+
+
+class FakeStreamCompletionClient:
+    def __init__(self, chunks: list[dict[str, Any]]) -> None:
+        self.chunks = chunks
+        self.kwargs: dict[str, Any] | None = None
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self.kwargs = kwargs
+        return iter(self.chunks)
+
+
+def test_litellm_generator_stream_yields_deltas_and_sets_stream_true() -> None:
+    chunks = [
+        {"choices": [{"delta": {"content": "Hel"}}]},
+        {"choices": [{"delta": {"content": "lo"}}]},
+        {"choices": [{"delta": {}}]},
+    ]
+    completion_client = FakeStreamCompletionClient(chunks)
+    settings = make_settings()
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+
+    deltas = list(generator.stream([{"role": "user", "content": "Hi"}], settings))
+
+    assert deltas == ["Hel", "lo"]
+    assert completion_client.kwargs is not None
+    assert completion_client.kwargs["stream"] is True
+
+
+def test_litellm_generator_stream_wraps_connection_failure_for_ollama() -> None:
+    class RaisingStreamClient:
+        def __call__(self, **kwargs: Any) -> Any:
+            from litellm.exceptions import APIConnectionError
+
+            raise APIConnectionError(
+                message="Connection refused", model="ollama/llama3.1:8b", llm_provider="ollama"
+            )
+
+    settings = make_settings(llm_provider="ollama", ollama_base_url="http://localhost:11434")
+    generator = LiteLLMGenerator(settings, completion_client=RaisingStreamClient())
+
+    with pytest.raises(GenerationError, match="ollama serve"):
+        list(generator.stream([{"role": "user", "content": "Hi"}], settings))

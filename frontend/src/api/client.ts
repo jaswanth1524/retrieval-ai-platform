@@ -1,11 +1,14 @@
 import type {
   CitationResponse,
-  DocumentIngestResponse,
+  DocumentJobAcceptedResponse,
+  DocumentJobStatusResponse,
+  DocumentListResponse,
   HealthResponse,
   LlmProvider,
   PublicConfigResponse,
   QuestionOverrides,
   QuestionResponse,
+  TimingsResponse,
 } from './types';
 
 export class ApiClientError extends Error {
@@ -97,16 +100,78 @@ export async function extractErrorDetail(response: Response): Promise<string> {
 // routinely takes 70+ seconds; health/config use the short DEFAULT_TIMEOUT_MS.
 const LONG_RUNNING_TIMEOUT_MS = 120_000;
 
+// How often to poll a background ingest job's status.
+const JOB_POLL_INTERVAL_MS = 1_000;
+
+function questionRequestBody(
+  question: string,
+  llmProvider?: LlmProvider,
+  overrides?: QuestionOverrides,
+  filenames?: string[],
+): Record<string, unknown> {
+  // Only include a field when it's set, so an unset value exercises the backend's
+  // `| None` default (base provider/settings) rather than pinning a value.
+  const body: Record<string, unknown> = { question };
+  if (llmProvider) body.llm_provider = llmProvider;
+  if (overrides?.rerankTopK != null) body.rerank_top_k = overrides.rerankTopK;
+  if (overrides?.maxContextChunks != null) body.max_context_chunks = overrides.maxContextChunks;
+  if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
+  if (filenames && filenames.length > 0) body.filenames = filenames;
+  return body;
+}
+
+export interface QuestionStreamHandlers {
+  onSources?: (sources: CitationResponse[]) => void;
+  onDelta?: (text: string) => void;
+  onDone?: (answer: string, sources: CitationResponse[], timings: TimingsResponse | null) => void;
+}
+
+type QuestionStreamEvent =
+  | { type: 'sources'; sources: CitationResponse[] }
+  | { type: 'delta'; text: string }
+  | { type: 'done'; answer: string; sources: CitationResponse[]; timings: TimingsResponse }
+  | { type: 'error'; detail: string };
+
+async function readSseStream(
+  response: Response,
+  onEvent: (event: QuestionStreamEvent) => void,
+): Promise<void> {
+  if (!response.body) {
+    throw new ApiClientError('Streaming response had no body.');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let separatorIndex = buffer.indexOf('\n\n');
+    while (separatorIndex !== -1) {
+      const rawEvent = buffer.slice(0, separatorIndex);
+      buffer = buffer.slice(separatorIndex + 2);
+      const dataLine = rawEvent.split('\n').find((line) => line.startsWith('data: '));
+      if (dataLine) {
+        onEvent(JSON.parse(dataLine.slice('data: '.length)) as QuestionStreamEvent);
+      }
+      separatorIndex = buffer.indexOf('\n\n');
+    }
+  }
+}
+
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/health', { signal }),
 
   config: (signal?: AbortSignal) => request<PublicConfigResponse>('/config', { signal }),
 
+  listDocuments: (signal?: AbortSignal) =>
+    request<DocumentListResponse>('/documents', { signal }),
+
   uploadDocument: (file: File, signal?: AbortSignal) => {
     const form = new FormData();
     // Do NOT set Content-Type manually — the browser sets the multipart boundary.
     form.append('file', file);
-    return request<DocumentIngestResponse>('/documents', {
+    return request<DocumentJobAcceptedResponse>('/documents', {
       method: 'POST',
       body: form,
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
@@ -114,27 +179,112 @@ export const api = {
     });
   },
 
+  getDocumentJob: (jobId: string, signal?: AbortSignal) =>
+    request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, { signal }),
+
+  // Uploads and ingests run in a background job (see api.uploadDocument) — this
+  // polls the job status endpoint until it reaches a terminal state, so the caller
+  // never has to hold one long-lived request open for a large document's ingest.
+  pollDocumentJob: async (
+    jobId: string,
+    onProgress?: (status: DocumentJobStatusResponse) => void,
+    signal?: AbortSignal,
+  ): Promise<DocumentJobStatusResponse> => {
+    while (true) {
+      const status = await request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, {
+        signal,
+      });
+      onProgress?.(status);
+      if (status.state === 'done' || status.state === 'failed') {
+        return status;
+      }
+      await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(resolve, JOB_POLL_INTERVAL_MS);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timeoutId);
+            reject(new ApiClientError('Upload cancelled.'));
+          },
+          { once: true },
+        );
+      });
+    }
+  },
+
   askQuestion: (
     question: string,
     llmProvider?: LlmProvider,
     overrides?: QuestionOverrides,
     signal?: AbortSignal,
-  ) => {
-    // Only include a field when it's set, so an unset value exercises the backend's
-    // `| None` default (base provider/settings) rather than pinning a value.
-    const body: Record<string, unknown> = { question };
-    if (llmProvider) body.llm_provider = llmProvider;
-    if (overrides?.rerankTopK != null) body.rerank_top_k = overrides.rerankTopK;
-    if (overrides?.maxContextChunks != null) body.max_context_chunks = overrides.maxContextChunks;
-    if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
-    return request<QuestionResponse>('/questions', {
+    filenames?: string[],
+  ) =>
+    request<QuestionResponse>('/questions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(questionRequestBody(question, llmProvider, overrides, filenames)),
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
-    });
+    }),
+
+  // Streams sources -> answer deltas -> a final done event over SSE, so the UI can
+  // render citations and incremental text instead of waiting the full ~70s+ for a
+  // complete answer. Falls back to nothing special on failure — errors (including a
+  // mid-stream `error` event from the backend) reject the returned promise the same
+  // way askQuestion's non-streaming failures do.
+  askQuestionStream: async (
+    question: string,
+    llmProvider: LlmProvider | undefined,
+    overrides: QuestionOverrides | undefined,
+    filenames: string[] | undefined,
+    handlers: QuestionStreamHandlers,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(), LONG_RUNNING_TIMEOUT_MS);
+    const abortFromCaller = () => timeoutController.abort();
+    signal?.addEventListener('abort', abortFromCaller);
+
+    try {
+      let response: Response;
+      try {
+        response = await fetch(`${BASE_URL}/questions/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(questionRequestBody(question, llmProvider, overrides, filenames)),
+          signal: timeoutController.signal,
+        });
+      } catch (err) {
+        if (timeoutController.signal.aborted) {
+          throw new ApiClientError('Request timed out or was cancelled.');
+        }
+        throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+      }
+
+      if (!response.ok) {
+        throw new ApiClientError(await extractErrorDetail(response), response.status);
+      }
+
+      await readSseStream(response, (event) => {
+        if (event.type === 'sources') handlers.onSources?.(event.sources);
+        else if (event.type === 'delta') handlers.onDelta?.(event.text);
+        else if (event.type === 'done') handlers.onDone?.(event.answer, event.sources, event.timings);
+        else if (event.type === 'error') throw new ApiClientError(event.detail);
+      });
+    } finally {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', abortFromCaller);
+    }
   },
 };
 
-export type { CitationResponse, DocumentIngestResponse, HealthResponse, PublicConfigResponse, QuestionResponse };
+export type {
+  CitationResponse,
+  DocumentJobAcceptedResponse,
+  DocumentJobStatusResponse,
+  DocumentListResponse,
+  HealthResponse,
+  PublicConfigResponse,
+  QuestionResponse,
+  TimingsResponse,
+};

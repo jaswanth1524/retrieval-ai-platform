@@ -40,6 +40,28 @@ export interface DocumentIngestResponse {
   collection_name: string;
 }
 
+export type IngestJobState = 'queued' | 'parsing' | 'embedding' | 'indexing' | 'done' | 'failed';
+
+export interface DocumentJobAcceptedResponse {
+  job_id: string;
+  filename: string;
+  state: 'queued';
+}
+
+export interface DocumentJobStatusResponse {
+  job_id: string;
+  filename: string;
+  state: IngestJobState;
+  chunks_total: number;
+  chunks_done: number;
+  error: string | null;
+  result: DocumentIngestResponse | null;
+}
+
+export interface DocumentListResponse {
+  filenames: string[];
+}
+
 export interface CitationResponse {
   source_number: number;
   filename: string;
@@ -49,9 +71,18 @@ export interface CitationResponse {
   text: string;
 }
 
+export interface TimingsResponse {
+  embed_ms: number;
+  search_ms: number;
+  rerank_ms: number;
+  generate_ms: number;
+  total_ms: number;
+}
+
 export interface QuestionResponse {
   answer: string;
   sources: CitationResponse[];
+  timings?: TimingsResponse | null;
 }
 
 export type LlmProvider = 'ollama' | 'openai';

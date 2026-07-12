@@ -52,12 +52,38 @@ class PublicConfigResponse(BaseModel):
 
 
 class DocumentIngestResponse(BaseModel):
-    """Document upload and ingestion response."""
+    """Completed document ingestion result (also embedded in a finished job status)."""
 
     filename: str
     sections_parsed: int
     chunks_ingested: int
     collection_name: str
+
+
+class DocumentJobAcceptedResponse(BaseModel):
+    """Response returned immediately when an upload is accepted for background ingestion."""
+
+    job_id: str
+    filename: str
+    state: Literal["queued"]
+
+
+class DocumentJobStatusResponse(BaseModel):
+    """Current status of a background ingestion job."""
+
+    job_id: str
+    filename: str
+    state: Literal["queued", "parsing", "embedding", "indexing", "done", "failed"]
+    chunks_total: int
+    chunks_done: int
+    error: str | None = None
+    result: DocumentIngestResponse | None = None
+
+
+class DocumentListResponse(BaseModel):
+    """Filenames currently indexed, for per-document query filtering."""
+
+    filenames: list[str]
 
 
 class QuestionRequest(BaseModel):
@@ -72,6 +98,9 @@ class QuestionRequest(BaseModel):
     llm_temperature: float | None = Field(
         default=None, ge=REQUEST_TEMPERATURE_MIN, le=REQUEST_TEMPERATURE_MAX
     )
+    # Restricts retrieval to these documents only, when given. None/omitted searches
+    # the whole collection — the pre-existing behavior.
+    filenames: list[str] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_context_within_rerank(self) -> QuestionRequest:
@@ -99,9 +128,20 @@ class CitationResponse(BaseModel):
     text: str
 
 
+class TimingsResponse(BaseModel):
+    """Per-stage wall-clock latency, in milliseconds, for one answer."""
+
+    embed_ms: float
+    search_ms: float
+    rerank_ms: float
+    generate_ms: float
+    total_ms: float
+
+
 class QuestionResponse(BaseModel):
     """Grounded answer response."""
 
     answer: str
     sources: list[CitationResponse]
+    timings: TimingsResponse | None = None
 

@@ -41,7 +41,12 @@ class CrossEncoderModel(Protocol):
 
 @dataclass(frozen=True)
 class RerankedChunk:
-    """A retrieval candidate after cross-encoder reranking."""
+    """A retrieval candidate after cross-encoder reranking.
+
+    ``expanded_text``, when set by neighbor-context expansion, is what actually goes
+    into the generation prompt (small-to-big retrieval) — ``text`` stays the original
+    chunk content used for the citation excerpt shown to the user.
+    """
 
     point_id: str
     filename: str
@@ -51,6 +56,8 @@ class RerankedChunk:
     text: str
     retrieval_score: float
     rerank_score: float
+    chunk_ordinal: int | None = None
+    expanded_text: str | None = None
 
 
 class LocalCrossEncoderReranker:
@@ -106,6 +113,11 @@ def rerank_candidates(
     threshold and then slicing to ``rerank_top_k`` is equivalent to slicing first and
     filtering after — either way the result is the sorted prefix that clears the bar,
     which may be shorter than ``rerank_top_k`` or empty.
+
+    ``rerank_candidates`` (clamped to ``fused_top_n``) controls how many of the fused
+    candidates are actually sent through the cross-encoder — the reranker is the most
+    expensive retrieval-side stage, so this is the knob for trading candidate coverage
+    against latency without touching the fusion spec itself.
     """
 
     normalized_query = query.strip()
@@ -115,9 +127,10 @@ def rerank_candidates(
         return []
 
     fused_top_n = int(settings.fused_top_n)
+    candidates_considered = min(int(settings.rerank_candidates), fused_top_n)
     rerank_top_k = int(settings.rerank_top_k)
     min_score = float(settings.rerank_min_score)
-    candidates_to_score = list(candidates[:fused_top_n])
+    candidates_to_score = list(candidates[:candidates_considered])
     documents = [candidate.text for candidate in candidates_to_score]
     scores = reranker.score(normalized_query, documents)
 
@@ -137,6 +150,7 @@ def rerank_candidates(
             text=candidate.text,
             retrieval_score=candidate.score,
             rerank_score=_sigmoid(float(score)),
+            chunk_ordinal=candidate.chunk_ordinal,
         )
         for candidate, score in zip(candidates_to_score, scores, strict=True)
     ]

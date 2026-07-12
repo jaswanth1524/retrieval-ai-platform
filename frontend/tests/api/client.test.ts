@@ -148,3 +148,111 @@ describe('api client', () => {
     await expect(promise).rejects.toMatchObject({ name: 'ApiClientError' });
   });
 });
+
+describe('uploadDocument', () => {
+  it('posts multipart form data and returns the accepted job envelope', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(202, { job_id: 'job-1', filename: 'guide.txt', state: 'queued' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const file = new File(['content'], 'guide.txt', { type: 'text/plain' });
+
+    const result = await api.uploadDocument(file);
+
+    expect(result).toEqual({ job_id: 'job-1', filename: 'guide.txt', state: 'queued' });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect(init.body).toBeInstanceOf(FormData);
+  });
+});
+
+describe('pollDocumentJob', () => {
+  it('polls until a terminal state and calls onProgress for each poll', async () => {
+    vi.useFakeTimers();
+    const responses = [
+      { job_id: 'j1', filename: 'a.txt', state: 'embedding', chunks_total: 4, chunks_done: 2, error: null, result: null },
+      { job_id: 'j1', filename: 'a.txt', state: 'done', chunks_total: 4, chunks_done: 4, error: null, result: { filename: 'a.txt', sections_parsed: 1, chunks_ingested: 4, collection_name: 'c' } },
+    ];
+    let call = 0;
+    const fetchMock = vi.fn(async () => jsonResponse(200, responses[call++]));
+    vi.stubGlobal('fetch', fetchMock);
+    const onProgress = vi.fn();
+
+    const promise = api.pollDocumentJob('j1', onProgress);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+
+    expect(result.state).toBe('done');
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+});
+
+describe('askQuestionStream', () => {
+  function sseResponse(frames: string[]): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  }
+
+  it('parses sources, delta, and done SSE events in order', async () => {
+    const frames = [
+      `data: ${JSON.stringify({ type: 'sources', sources: [] })}\n\n`,
+      `data: ${JSON.stringify({ type: 'delta', text: 'Hel' })}\n\n`,
+      `data: ${JSON.stringify({ type: 'delta', text: 'lo' })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'done',
+        answer: 'Hello',
+        sources: [],
+        timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+      })}\n\n`,
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(frames)));
+
+    const onSources = vi.fn();
+    const onDelta = vi.fn();
+    const onDone = vi.fn();
+
+    await api.askQuestionStream('hi', undefined, undefined, undefined, {
+      onSources,
+      onDelta,
+      onDone,
+    });
+
+    expect(onSources).toHaveBeenCalledWith([]);
+    expect(onDelta).toHaveBeenNthCalledWith(1, 'Hel');
+    expect(onDelta).toHaveBeenNthCalledWith(2, 'lo');
+    expect(onDone).toHaveBeenCalledWith('Hello', [], { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 });
+  });
+
+  it('throws ApiClientError on a non-2xx response before reading the stream', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(jsonResponse(400, { detail: 'Query text is required.' })),
+    );
+
+    await expect(
+      api.askQuestionStream('', undefined, undefined, undefined, {}),
+    ).rejects.toMatchObject({ name: 'ApiClientError', message: 'Query text is required.' });
+  });
+
+  it('includes filenames in the request body only when non-empty', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestionStream('hi', undefined, undefined, ['a.txt'], {});
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ question: 'hi', filenames: ['a.txt'] });
+  });
+});

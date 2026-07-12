@@ -35,16 +35,19 @@ DocRAG will use a hybrid RAG pipeline:
    - page
    - section
    - chunk_id
-3. Generate local dense embeddings with `BAAI/bge-small-en-v1.5`.
-4. Generate local sparse vectors with `Qdrant/BM25`.
-5. Store named dense and sparse vectors in Qdrant.
-6. Retrieve with both semantic and keyword search.
+3. Generate local dense embeddings with `BAAI/bge-small-en-v1.5`, prefixed with the chunk's filename/section at embed time (contextual retrieval) — the stored payload and every citation still show the raw chunk text.
+4. Generate local sparse vectors with `Qdrant/BM25` over the same contextualized text.
+5. Store named dense and sparse vectors in Qdrant, tagged with each chunk's ordinal position for small-to-big context expansion.
+6. Retrieve with both semantic and keyword search, optionally scoped to a caller-selected subset of filenames.
 7. Fuse retrieval results with Reciprocal Rank Fusion using `k=60`.
-8. Rerank only the fused top-N candidates with `jinaai/jina-reranker-v2-base-multilingual`, then drop any candidate scoring below `RERANK_MIN_SCORE` (default 0.30) before it ever reaches the LLM context or citations.
-9. Generate an answer through LiteLLM using only the provided context.
-10. Return the answer with citations.
+8. Rerank up to `RERANK_CANDIDATES` (clamped to and default equal to the fused top-N) candidates with `jinaai/jina-reranker-v2-base-multilingual`, then drop any candidate scoring below `RERANK_MIN_SCORE` (default 0.15) before it ever reaches the LLM context or citations.
+9. Expand each selected chunk's generation context with up to `CONTEXT_NEIGHBOR_RADIUS` neighboring chunks on each side (citations still point at the original chunk).
+10. Generate an answer through LiteLLM using only the provided context — streamed token-by-token over `/questions/stream`, or returned in full from `/questions`.
+11. Return the answer with citations and per-stage latency timings.
 
-Qdrant server-side hybrid query will be used where available. If the installed Qdrant server or client does not support the needed hybrid query shape, DocRAG will fetch dense and sparse results separately and perform RRF in application code.
+Qdrant server-side hybrid query is used where available (with `QDRANT_PREFER_GRPC` to skip REST JSON overhead). If the installed Qdrant server or client does not support the needed hybrid query shape, DocRAG fetches dense and sparse results separately and performs RRF in application code.
+
+Document ingestion runs as a background job: `POST /documents` returns a `job_id` immediately (HTTP 202), and `GET /documents/jobs/{job_id}` reports progress (`queued` → `parsing` → `embedding` → `done`/`failed`) as the document is parsed, chunked, embedded, and indexed in batches. `GET /documents` lists currently-indexed filenames for the per-document search-scope filter. `GET /metrics` exposes Prometheus counters/histograms for question and ingest latency.
 
 ## Provider Model
 
@@ -119,6 +122,13 @@ For local frontend iteration without a full rebuild, run `uv run uvicorn api.mai
 > re-upload a previously ingested file to replace its chunks with the new,
 > better-bounded ones.
 
+> **Contextual retrieval and neighbor expansion added:** chunks are now embedded
+> with their filename/section prefixed (improves both dense and BM25 matches on
+> queries that reference a document or heading by name) and tagged with a
+> `chunk_ordinal` used for small-to-big context expansion at answer time.
+> Previously-ingested chunks lack both — they still retrieve correctly, but won't
+> benefit from either improvement until re-uploaded.
+
 ## Current Files
 
 - `AGENTS.md`: operating instructions for future agents.
@@ -135,8 +145,10 @@ For local frontend iteration without a full rebuild, run `uv run uvicorn api.mai
 - `api/embeddings.py` and `api/ingestion.py`: local embedding adapters and Qdrant upsert helpers for parsed chunks.
 - `api/retrieval.py`: hybrid dense+sparse retrieval with Qdrant RRF and manual RRF fallback.
 - `api/reranking.py`: cross-encoder reranking for fused retrieval candidates.
-- `api/generation.py`: grounded prompt construction and LiteLLM generation adapter for Ollama/OpenAI.
-- `api/main.py`: FastAPI app with health, config, document upload, and question-answering endpoints.
+- `api/generation.py`: grounded prompt construction and LiteLLM generation/streaming adapter for Ollama/OpenAI.
+- `api/jobs.py`: in-memory background job tracking for document ingestion.
+- `api/metrics.py`: Prometheus counters/histograms for question and ingest latency (`GET /metrics`).
+- `api/main.py`: FastAPI app — health, config, document upload/listing/job-status, and question-answering (including streaming) endpoints.
 - `frontend/`: React + Vite + TypeScript browser UI (chat-style Q&A with citation cards), built and served by the API in production.
 - `eval/ragas_runner.py`: optional RAGAS evaluation runner for JSON/JSONL answer datasets.
 

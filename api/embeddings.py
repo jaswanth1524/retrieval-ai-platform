@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -68,7 +69,12 @@ class LocalEmbeddingProvider:
         )
 
     def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
-        """Embed texts with local dense and sparse models."""
+        """Embed texts with local dense and sparse models.
+
+        The two ONNX-backed models run on separate threads — both release the GIL
+        during inference, so this overlaps their latency instead of paying it twice
+        sequentially (roughly halving embedding wall-clock for a batch).
+        """
 
         if not texts:
             return []
@@ -77,14 +83,13 @@ class LocalEmbeddingProvider:
         # download/load happens on this first call, not at __init__ — this is the
         # boundary that must translate a load failure into EmbeddingError.
         try:
-            dense_vectors = [
-                coerce_dense_vector(vector)
-                for vector in self.dense_model.embed(texts)
-            ]
-            sparse_vectors = [
-                coerce_sparse_vector(vector)
-                for vector in self.sparse_model.embed(texts)
-            ]
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                dense_future = executor.submit(lambda: list(self.dense_model.embed(texts)))
+                sparse_future = executor.submit(lambda: list(self.sparse_model.embed(texts)))
+                dense_vectors = [coerce_dense_vector(vector) for vector in dense_future.result()]
+                sparse_vectors = [
+                    coerce_sparse_vector(vector) for vector in sparse_future.result()
+                ]
         except EmbeddingError:
             raise
         except Exception as exc:

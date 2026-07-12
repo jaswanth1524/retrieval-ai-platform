@@ -2,26 +2,42 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useChat } from '../../src/hooks/useChat';
 import { ApiClientError, api } from '../../src/api/client';
+import type { QuestionStreamHandlers } from '../../src/api/client';
+import type { TimingsResponse } from '../../src/api/types';
 
 vi.mock('../../src/api/client', async () => {
   const actual = await vi.importActual<typeof import('../../src/api/client')>('../../src/api/client');
-  return { ...actual, api: { ...actual.api, askQuestion: vi.fn() } };
+  return { ...actual, api: { ...actual.api, askQuestionStream: vi.fn() } };
 });
 
-const askQuestionMock = vi.mocked(api.askQuestion);
+const askQuestionStreamMock = vi.mocked(api.askQuestionStream);
+
+const ZERO_TIMINGS: TimingsResponse = {
+  embed_ms: 0,
+  search_ms: 0,
+  rerank_ms: 0,
+  generate_ms: 0,
+  total_ms: 0,
+};
 
 afterEach(() => {
-  askQuestionMock.mockReset();
+  askQuestionStreamMock.mockReset();
 });
 
 describe('useChat', () => {
-  it('appends a user turn, then an assistant turn, toggling pending around the call', async () => {
-    let resolveAsk!: (value: { answer: string; sources: [] }) => void;
-    askQuestionMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveAsk = resolve;
-      }),
-    );
+  it('streams sources then deltas into a single assistant turn, then finalizes on done', async () => {
+    let resolveStream!: () => void;
+    askQuestionStreamMock.mockImplementation((_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
+      handlers.onSources?.([]);
+      handlers.onDelta?.('Run ');
+      handlers.onDelta?.('docker compose up.');
+      return new Promise<void>((resolve) => {
+        resolveStream = () => {
+          handlers.onDone?.('Run docker compose up.', [], ZERO_TIMINGS);
+          resolve();
+        };
+      });
+    });
 
     const { result } = renderHook(() => useChat());
 
@@ -31,11 +47,15 @@ describe('useChat', () => {
     });
 
     expect(result.current.pending).toBe(true);
-    expect(result.current.turns).toHaveLength(1);
+    expect(result.current.turns).toHaveLength(2);
     expect(result.current.turns[0]).toMatchObject({ role: 'user', content: 'How do I run it?' });
+    expect(result.current.turns[1]).toMatchObject({
+      role: 'assistant',
+      content: 'Run docker compose up.',
+    });
 
     await act(async () => {
-      resolveAsk({ answer: 'Run docker compose up.', sources: [] });
+      resolveStream();
       await askPromise;
     });
 
@@ -47,8 +67,10 @@ describe('useChat', () => {
     });
   });
 
-  it('appends an error turn with the ApiClientError message on failure', async () => {
-    askQuestionMock.mockRejectedValue(new ApiClientError('Re-ingest documents before querying.', 409));
+  it('appends an error turn with the ApiClientError message on failure, with no stray assistant turn', async () => {
+    askQuestionStreamMock.mockRejectedValue(
+      new ApiClientError('Re-ingest documents before querying.', 409),
+    );
 
     const { result } = renderHook(() => useChat());
 
@@ -57,6 +79,7 @@ describe('useChat', () => {
     });
 
     expect(result.current.pending).toBe(false);
+    expect(result.current.turns).toHaveLength(2);
     expect(result.current.turns[1]).toMatchObject({
       role: 'error',
       content: 'Re-ingest documents before querying.',
@@ -64,7 +87,7 @@ describe('useChat', () => {
   });
 
   it('appends a generic error turn for a non-ApiClientError failure', async () => {
-    askQuestionMock.mockRejectedValue(new Error('boom'));
+    askQuestionStreamMock.mockRejectedValue(new Error('boom'));
 
     const { result } = renderHook(() => useChat());
 
@@ -79,12 +102,12 @@ describe('useChat', () => {
   });
 
   it('ignores a second ask() while one is still in flight (reentrancy guard)', async () => {
-    let resolveAsk!: (value: { answer: string; sources: [] }) => void;
-    askQuestionMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveAsk = resolve;
-      }),
-    );
+    let resolveStream!: () => void;
+    askQuestionStreamMock.mockImplementation(() => {
+      return new Promise<void>((resolve) => {
+        resolveStream = resolve;
+      });
+    });
 
     const { result } = renderHook(() => useChat());
 
@@ -94,22 +117,26 @@ describe('useChat', () => {
       void result.current.ask('second');
     });
 
-    expect(askQuestionMock).toHaveBeenCalledTimes(1);
+    expect(askQuestionStreamMock).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      resolveAsk({ answer: 'ok', sources: [] });
+      resolveStream();
       await firstAskPromise;
     });
 
     expect(result.current.pending).toBe(false);
-    // Only the first question's user+assistant turns exist — the second call was a
-    // no-op, not a second user turn queued behind it.
-    expect(result.current.turns).toHaveLength(2);
+    // Only the first question's user turn exists (no sources/delta/done ever fired
+    // for it, so no assistant turn either) — the second call was a no-op.
+    expect(result.current.turns).toHaveLength(1);
   });
 
   it('allows a new ask() once the previous one has resolved', async () => {
-    askQuestionMock.mockResolvedValueOnce({ answer: 'first answer', sources: [] });
-    askQuestionMock.mockResolvedValueOnce({ answer: 'second answer', sources: [] });
+    askQuestionStreamMock.mockImplementationOnce(async (_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
+      handlers.onDone?.('first answer', [], ZERO_TIMINGS);
+    });
+    askQuestionStreamMock.mockImplementationOnce(async (_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
+      handlers.onDone?.('second answer', [], ZERO_TIMINGS);
+    });
 
     const { result } = renderHook(() => useChat());
 
@@ -120,13 +147,15 @@ describe('useChat', () => {
       await result.current.ask('second');
     });
 
-    expect(askQuestionMock).toHaveBeenCalledTimes(2);
+    expect(askQuestionStreamMock).toHaveBeenCalledTimes(2);
     expect(result.current.turns).toHaveLength(4);
+    expect(result.current.turns[1]).toMatchObject({ content: 'first answer' });
+    expect(result.current.turns[3]).toMatchObject({ content: 'second answer' });
   });
 
   it('aborts the in-flight request when the component unmounts', async () => {
-    askQuestionMock.mockImplementation(
-      (_question, _provider, _overrides, signal) =>
+    askQuestionStreamMock.mockImplementation(
+      (_question, _provider, _overrides, _filenames, _handlers, signal) =>
         new Promise((_resolve, reject) => {
           signal?.addEventListener('abort', () => reject(new Error('aborted')));
         }),
@@ -138,7 +167,7 @@ describe('useChat', () => {
       void result.current.ask('alpha');
     });
 
-    const signal = askQuestionMock.mock.calls[0][3];
+    const signal = askQuestionStreamMock.mock.calls[0][5];
     expect(signal?.aborted).toBe(false);
 
     unmount();
@@ -147,10 +176,12 @@ describe('useChat', () => {
   });
 
   it('cancel() aborts the in-flight request and clears pending via the existing error path', async () => {
-    askQuestionMock.mockImplementation(
-      (_question, _provider, _overrides, signal) =>
+    askQuestionStreamMock.mockImplementation(
+      (_question, _provider, _overrides, _filenames, _handlers, signal) =>
         new Promise((_resolve, reject) => {
-          signal?.addEventListener('abort', () => reject(new ApiClientError('Request timed out or was cancelled.')));
+          signal?.addEventListener('abort', () =>
+            reject(new ApiClientError('Request timed out or was cancelled.')),
+          );
         }),
     );
 

@@ -6,7 +6,12 @@ import type { ChatTurn } from '../components/ChatMessage';
 export interface UseChatResult {
   turns: ChatTurn[];
   pending: boolean;
-  ask: (question: string, provider?: LlmProvider, overrides?: QuestionOverrides) => Promise<void>;
+  ask: (
+    question: string,
+    provider?: LlmProvider,
+    overrides?: QuestionOverrides,
+    filenames?: string[],
+  ) => Promise<void>;
   cancel: () => void;
 }
 
@@ -34,16 +39,56 @@ export function useChat(): UseChatResult {
     };
   }, []);
 
-  const ask = async (question: string, provider?: LlmProvider, overrides?: QuestionOverrides) => {
+  const ask = async (
+    question: string,
+    provider?: LlmProvider,
+    overrides?: QuestionOverrides,
+    filenames?: string[],
+  ) => {
     if (inflightRef.current) return;
     const controller = new AbortController();
     inflightRef.current = controller;
 
     setTurns((prev) => [...prev, makeTurn('user', question)]);
     setPending(true);
+
+    // The assistant turn is created lazily on the first `sources` or `delta` event
+    // (not up front) so a mid-stream failure before any event arrives still renders
+    // as a clean error turn instead of leaving a stray empty assistant bubble.
+    const assistantTurnId = crypto.randomUUID();
+    let assistantTurnCreated = false;
+    const updateAssistantTurn = (update: (turn: ChatTurn) => ChatTurn) => {
+      setTurns((prev) => {
+        if (!assistantTurnCreated) {
+          assistantTurnCreated = true;
+          return [...prev, update(makeTurn('assistant', ''))];
+        }
+        return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
+      });
+    };
+    // makeTurn() mints a random id — override it so updateAssistantTurn can find
+    // this turn again on the next event via assistantTurnId.
+    const withId = (turn: ChatTurn): ChatTurn => ({ ...turn, id: assistantTurnId });
+
     try {
-      const result = await api.askQuestion(question, provider, overrides, controller.signal);
-      setTurns((prev) => [...prev, makeTurn('assistant', result.answer, result.sources)]);
+      await api.askQuestionStream(
+        question,
+        provider,
+        overrides,
+        filenames,
+        {
+          onSources: (sources) => {
+            updateAssistantTurn((turn) => withId({ ...turn, sources }));
+          },
+          onDelta: (text) => {
+            updateAssistantTurn((turn) => withId({ ...turn, content: turn.content + text }));
+          },
+          onDone: (answer, sources) => {
+            updateAssistantTurn((turn) => withId({ ...turn, content: answer, sources }));
+          },
+        },
+        controller.signal,
+      );
     } catch (err) {
       const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
       setTurns((prev) => [...prev, makeTurn('error', message)]);
@@ -54,8 +99,8 @@ export function useChat(): UseChatResult {
   };
 
   const cancel = () => {
-    // The abort surfaces through askQuestion's fetch as an AbortError, which the
-    // catch block above already turns into a clean error turn — no separate
+    // The abort surfaces through askQuestionStream's fetch as an AbortError, which
+    // the catch block above already turns into a clean error turn — no separate
     // cancellation path needed.
     inflightRef.current?.abort();
   };

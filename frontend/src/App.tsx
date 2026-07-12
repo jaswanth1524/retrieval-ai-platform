@@ -39,10 +39,24 @@ function App() {
   const [uploadState, setUploadState] = useState<UploadState>({ status: 'idle' });
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
+  const [documentFilenames, setDocumentFilenames] = useState<string[]>([]);
+  const [selectedFilenames, setSelectedFilenames] = useState<string[]>([]);
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
   );
   const { turns, pending, ask, cancel } = useChat();
+
+  const refreshDocumentList = async () => {
+    try {
+      const listing = await api.listDocuments();
+      setDocumentFilenames(listing.filenames);
+      // Drop any selected filename that no longer exists (e.g. re-ingest under a
+      // different name) rather than silently filtering on a name that can't match.
+      setSelectedFilenames((prev) => prev.filter((name) => listing.filenames.includes(name)));
+    } catch {
+      // Best-effort — the filter just stays at its previous/empty state.
+    }
+  };
 
   const updateAdvancedOptions = (next: QuestionOverrides) => {
     setAdvancedOptions(next);
@@ -90,6 +104,7 @@ function App() {
           setSelectedProvider('openai');
         }
         setApiStatus('ok');
+        void refreshDocumentList();
       } catch (err) {
         if (cancelled) return;
         setApiStatus('error');
@@ -110,8 +125,23 @@ function App() {
   const handleUpload = async (file: File) => {
     setUploadState({ status: 'uploading' });
     try {
-      const result = await api.uploadDocument(file);
-      setUploadState({ status: 'success', result });
+      const accepted = await api.uploadDocument(file);
+      const status = await api.pollDocumentJob(accepted.job_id, (jobStatus) => {
+        setUploadState({
+          status: 'uploading',
+          progress: {
+            state: jobStatus.state,
+            chunksDone: jobStatus.chunks_done,
+            chunksTotal: jobStatus.chunks_total,
+          },
+        });
+      });
+      if (status.state === 'failed') {
+        setUploadState({ status: 'error', error: status.error ?? 'Ingestion failed.' });
+        return;
+      }
+      setUploadState({ status: 'success', result: status.result ?? undefined });
+      void refreshDocumentList();
     } catch (err) {
       setUploadState({
         status: 'error',
@@ -136,6 +166,9 @@ function App() {
         overrides={advancedOptions}
         onOverridesChange={updateAdvancedOptions}
         overridesDisabled={pending}
+        documentFilenames={documentFilenames}
+        selectedFilenames={selectedFilenames}
+        onSelectedFilenamesChange={setSelectedFilenames}
       />
       <main className="app-main">
         {apiStatus === 'error' ? (
@@ -154,7 +187,9 @@ function App() {
             )}
             <ChatThread turns={turns} pending={pending} onCancel={cancel} />
             <QuestionInput
-              onSubmit={(question) => ask(question, selectedProvider, advancedOptions)}
+              onSubmit={(question) =>
+                ask(question, selectedProvider, advancedOptions, selectedFilenames)
+              }
               disabled={!apiReachable || pending}
             />
           </>

@@ -8,9 +8,10 @@ from qdrant_client import QdrantClient, models
 
 from api.embeddings import EmbeddedText
 from api.generation import ChatMessage
-from api.pipeline import AnswerOverrides, IngestService, RagPipeline
+from api.pipeline import AnswerOverrides, IngestService, RagPipeline, expand_with_neighbors
 from api.repository import VectorRepository
-from api.retrieval import RetrievalConfigError
+from api.reranking import rerank_candidates
+from api.retrieval import RetrievalConfigError, retrieve_candidates
 from api.settings import AppSettings
 
 
@@ -45,6 +46,14 @@ class FakeGenerator:
         self.seen_provider = settings.llm_provider
         self.seen_temperature = settings.llm_temperature
         return self.answer
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        self.messages = list(messages)
+        self.seen_provider = settings.llm_provider
+        self.seen_temperature = settings.llm_temperature
+        words = self.answer.split(" ")
+        for index, word in enumerate(words):
+            yield word if index == len(words) - 1 else word + " "
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -272,3 +281,142 @@ def test_rag_pipeline_multiple_overrides_isolated_across_concurrent_style_calls(
     # Neither call mutated the shared singleton.
     assert settings.llm_provider == "ollama"
     assert settings.max_context_chunks == 2
+
+
+def test_rag_pipeline_answer_records_stage_timings() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.timings is not None
+    assert grounded.timings.embed_ms >= 0
+    assert grounded.timings.search_ms >= 0
+    assert grounded.timings.rerank_ms >= 0
+    assert grounded.timings.generate_ms >= 0
+    assert grounded.timings.total_ms >= 0
+
+
+def test_rag_pipeline_answer_filters_by_filenames() -> None:
+    settings = make_settings(fused_top_n=5, rerank_top_k=5, max_context_chunks=5)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    for name, text in [("a.txt", "alpha in a"), ("b.txt", "alpha in b")]:
+        IngestService(
+            repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings
+        ).ingest(name, text.encode())
+
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Found in b [1]."),
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("alpha", filenames=["b.txt"])
+
+    assert [source.filename for source in grounded.sources] == ["b.txt"]
+
+
+def test_rag_pipeline_answer_stream_emits_sources_then_deltas_then_done() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+    )
+
+    events = list(pipeline.answer_stream("alpha"))
+
+    assert events[0]["type"] == "sources"
+    assert events[0]["sources"][0]["filename"] == "guide.txt"
+    delta_events = events[1:-1]
+    assert delta_events
+    assert all(event["type"] == "delta" for event in delta_events)
+    assert "".join(event["text"] for event in delta_events) == "Alpha is documented [1]."
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["answer"] == "Alpha is documented [1]."
+    assert [source["source_number"] for source in done["sources"]] == [1]
+    assert done["timings"]["total_ms"] >= 0
+
+
+def test_rag_pipeline_answer_stream_returns_insufficient_context_for_empty_collection() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("unused"),
+        settings=settings,
+    )
+
+    events = list(pipeline.answer_stream("alpha"))
+
+    assert events[0] == {"type": "sources", "sources": []}
+    assert events[-1]["type"] == "done"
+    assert "not have enough information" in events[-1]["answer"]
+    assert events[-1]["sources"] == []
+
+
+def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=3, chunk_overlap_tokens=0)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    # Three chunks of 3 words each -> ordinals 1, 2, 3.
+    embeddings = [make_embedding(1.0), make_embedding(1.0), make_embedding(1.0)]
+    IngestService(
+        repository, StaticEmbeddingProvider(embeddings), settings
+    ).ingest("guide.txt", b"one two three four five six seven eight nine")
+
+    candidates = retrieve_candidates(
+        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
+    )
+    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    middle = next(chunk for chunk in reranked if chunk.chunk_ordinal == 2)
+
+    expanded = expand_with_neighbors(reranked, repository, settings)
+    expanded_middle = next(chunk for chunk in expanded if chunk.chunk_ordinal == 2)
+
+    assert middle.expanded_text is None
+    assert expanded_middle.expanded_text is not None
+    assert "one two three" in expanded_middle.expanded_text
+    assert "seven eight nine" in expanded_middle.expanded_text
+
+
+def test_expand_with_neighbors_disabled_by_zero_radius() -> None:
+    settings = make_settings(context_neighbor_radius=0)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro alpha beta"
+    )
+    candidates = retrieve_candidates(
+        repository, settings, "alpha", StaticEmbeddingProvider([make_embedding(1.0)])
+    )
+    reranked = rerank_candidates("alpha", candidates, FakeReranker(), settings)
+
+    expanded = expand_with_neighbors(reranked, repository, settings)
+
+    assert expanded == reranked

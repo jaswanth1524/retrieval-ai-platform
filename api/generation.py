@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, TypedDict
+from typing import Any, Literal, Protocol, TypedDict, cast
 
 import litellm
 from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
@@ -57,11 +57,23 @@ class SourceCitation:
 
 
 @dataclass(frozen=True)
+class StageTimings:
+    """Wall-clock time spent in each pipeline stage, for latency observability."""
+
+    embed_ms: float
+    search_ms: float
+    rerank_ms: float
+    generate_ms: float
+    total_ms: float
+
+
+@dataclass(frozen=True)
 class GroundedAnswer:
     """Generated answer and the sources made available to the model."""
 
     answer: str
     sources: list[SourceCitation]
+    timings: StageTimings | None = None
 
 
 class LiteLLMGenerator:
@@ -118,11 +130,57 @@ class LiteLLMGenerator:
             raise GenerationError(f"Generation provider request failed: {exc}") from exc
         return extract_completion_text(response)
 
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterator[str]:
+        """Call the LiteLLM provider with ``stream=True`` and yield assistant text deltas.
+
+        Same provider selection and error-translation boundary as ``complete`` — the
+        request is identical except for ``stream=True``. Because this is a generator
+        function, the try/except below covers the whole streamed response: LiteLLM's
+        ``CustomStreamWrapper`` is lazy, so a connection failure raised while iterating
+        chunks is caught here exactly like a failure raised by the initial call.
+        """
+
+        model, provider_kwargs = completion_model_and_kwargs(settings)
+        try:
+            response = self.completion_client(
+                model=model,
+                messages=list(messages),
+                temperature=float(settings.llm_temperature),
+                max_tokens=int(settings.llm_max_tokens),
+                timeout=float(settings.llm_request_timeout_seconds),
+                num_retries=int(settings.llm_num_retries),
+                drop_params=True,
+                stream=True,
+                **provider_kwargs,
+            )
+            # completion_client's return type is `object` (it must also cover the
+            # non-streaming response `complete` uses) — with stream=True it is
+            # actually an iterable of chunks; cast narrows that for the loop below.
+            for chunk in cast(Iterable[object], response):
+                delta = extract_delta_text(chunk)
+                if delta:
+                    yield delta
+        except LiteLLMAPIConnectionError as exc:
+            if settings.llm_provider.lower().strip() == "ollama":
+                raise GenerationError(
+                    f"Cannot reach Ollama at {settings.ollama_base_url}. Start Ollama "
+                    "(`ollama serve`) and confirm OLLAMA_BASE_URL is reachable from "
+                    "wherever the API process runs — use http://localhost:11434 when "
+                    "the API runs directly on your host, or "
+                    "http://host.docker.internal:11434 only when the API itself runs "
+                    "inside Docker."
+                ) from exc
+            raise GenerationError(f"Generation provider request failed: {exc}") from exc
+        except Exception as exc:
+            raise GenerationError(f"Generation provider request failed: {exc}") from exc
+
 
 class ChatGenerator(Protocol):
-    """Generator surface used by the grounded answer pipeline."""
+    """Generator surface used by the grounded answer pipeline (both response modes)."""
 
     def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str: ...
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterable[str]: ...
 
 
 def generate_grounded_answer(
@@ -189,12 +247,18 @@ def build_grounded_messages(
 
 
 def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
-    """Format one chunk and its citation metadata for the generation prompt."""
+    """Format one chunk and its citation metadata for the generation prompt.
 
+    Uses ``expanded_text`` (neighbor-context expansion) when present so the model
+    sees richer surrounding context; the citation shown to the user always excerpts
+    the original ``text`` (see ``source_citations``), independent of expansion.
+    """
+
+    text = chunk.expanded_text if chunk.expanded_text is not None else chunk.text
     return (
         f"[{index}] filename={chunk.filename}; page={chunk.page}; "
         f"section={chunk.section}; chunk_id={chunk.chunk_id}\n"
-        f"{chunk.text}"
+        f"{text}"
     )
 
 
@@ -245,7 +309,10 @@ def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, s
 
     provider = settings.llm_provider.lower().strip()
     if provider == "ollama":
-        return f"ollama/{settings.llm_model}", {"base_url": settings.ollama_base_url}
+        return f"ollama/{settings.llm_model}", {
+            "base_url": settings.ollama_base_url,
+            "keep_alive": settings.ollama_keep_alive,
+        }
     if provider == "openai":
         if not settings.openai_api_key:
             raise GenerationConfigError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
@@ -266,6 +333,22 @@ def extract_completion_text(response: object) -> str:
     if not isinstance(content, str):
         raise GenerationError("Generation provider response did not include message content.")
     return content
+
+
+def extract_delta_text(chunk: object) -> str:
+    """Extract the incremental assistant text from one streamed LiteLLM chunk.
+
+    Returns "" for chunks that carry no content delta (e.g. the final chunk, or a
+    role-only opening chunk) rather than raising — those are a normal part of a
+    stream, unlike a malformed non-streaming response.
+    """
+
+    choices = read_value(chunk, "choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
+        return ""
+    delta = read_value(choices[0], "delta")
+    content = read_value(delta, "content")
+    return content if isinstance(content, str) else ""
 
 
 def read_value(source: object, key: str) -> object:

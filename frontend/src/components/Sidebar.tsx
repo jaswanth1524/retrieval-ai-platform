@@ -1,5 +1,6 @@
 import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import ConfigPanel from './ConfigPanel';
+import DocumentFilter from './DocumentFilter';
 import StatusBadge, { type ApiStatus } from './StatusBadge';
 import UploadPanel, { type UploadState } from './UploadPanel';
 import './Sidebar.css';
@@ -16,6 +17,9 @@ interface SidebarProps {
   overrides: QuestionOverrides;
   onOverridesChange: (value: QuestionOverrides) => void;
   overridesDisabled?: boolean;
+  documentFilenames: string[];
+  selectedFilenames: string[];
+  onSelectedFilenamesChange: (filenames: string[]) => void;
 }
 
 function Sidebar({
@@ -30,6 +34,9 @@ function Sidebar({
   overrides,
   onOverridesChange,
   overridesDisabled,
+  documentFilenames,
+  selectedFilenames,
+  onSelectedFilenamesChange,
 }: SidebarProps) {
   return (
     <aside className="sidebar">
@@ -54,6 +61,12 @@ function Sidebar({
         state={uploadState}
         maxUploadBytes={config?.max_upload_bytes}
         onFileSelected={onFileSelected}
+      />
+      <DocumentFilter
+        filenames={documentFilenames}
+        selected={selectedFilenames}
+        onChange={onSelectedFilenamesChange}
+        disabled={overridesDisabled}
       />
       {config && (
         <ConfigPanel

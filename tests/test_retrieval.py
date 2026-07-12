@@ -184,6 +184,26 @@ def test_retrieve_candidates_wraps_connection_failure_as_service_unavailable(
         retrieve_candidates(repository, settings, "alpha", query_provider)
 
 
+def test_retrieve_candidates_filters_by_filenames() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    chunks = [
+        DocumentChunk(filename="a.md", page=1, section="Setup", chunk_id="a1", text="alpha in a"),
+        DocumentChunk(filename="b.md", page=1, section="Setup", chunk_id="b1", text="alpha in b"),
+    ]
+    embeddings = [
+        make_embedding([1.0, 0.0, 0.0], [10], [1.0]),
+        make_embedding([1.0, 0.0, 0.0], [10], [1.0]),
+    ]
+    ingest_chunks(repository, settings, chunks, StaticEmbeddingProvider(embeddings))
+    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
+
+    results = retrieve_candidates(repository, settings, "alpha", query_provider, filenames=["b.md"])
+
+    assert [result.filename for result in results] == ["b.md"]
+
+
 def test_retrieve_candidates_rejects_empty_query() -> None:
     settings = make_settings()
     client = seed_collection(settings)

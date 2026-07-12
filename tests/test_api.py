@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Generator, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -61,6 +63,11 @@ class FakeGenerator:
         self.messages = list(messages)
         self.seen_provider = settings.llm_provider
         return self.answer
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        self.messages = list(messages)
+        self.seen_provider = settings.llm_provider
+        yield self.answer
 
 
 @dataclass
@@ -134,6 +141,34 @@ def make_embedding(
     )
 
 
+def _upload_and_wait(
+    client: TestClient,
+    filename: str,
+    content: bytes,
+    content_type: str = "text/plain",
+) -> dict[str, Any]:
+    """Upload a document via the async job endpoint and poll until it terminates.
+
+    Ingestion now runs on a background executor (see api/jobs.py), so POST
+    /documents only returns 202 + a job id — tests that need the document actually
+    indexed (or need to see why ingestion failed) poll the job status endpoint
+    instead of asserting on the upload response directly.
+    """
+
+    response = client.post(
+        "/documents", files={"file": (filename, content, content_type)}
+    )
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    for _ in range(500):
+        status = client.get(f"/documents/jobs/{job_id}").json()
+        if status["state"] in ("done", "failed"):
+            return status
+        time.sleep(0.01)
+    raise AssertionError(f"ingest job {job_id} did not finish in time")
+
+
 def test_health_endpoint(api_context: ApiTestContext) -> None:
     response = api_context.client.get("/health")
 
@@ -154,13 +189,10 @@ def test_config_endpoint_exposes_non_secret_settings(api_context: ApiTestContext
 
 
 def test_document_upload_ingests_chunks(api_context: ApiTestContext) -> None:
-    response = api_context.client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
 
-    assert response.status_code == 200
-    assert response.json() == {
+    assert status["state"] == "done"
+    assert status["result"] == {
         "filename": "guide.txt",
         "sections_parsed": 1,
         "chunks_ingested": 1,
@@ -205,21 +237,20 @@ def test_document_upload_rejects_file_over_size_limit() -> None:
 
 
 def test_document_upload_rejects_unsupported_file(api_context: ApiTestContext) -> None:
-    response = api_context.client.post(
-        "/documents",
-        files={"file": ("archive.zip", b"not supported", "application/zip")},
+    """Parsing happens inside the background job, so the upload itself is still
+    accepted (202) — the unsupported-type failure surfaces on the job status."""
+
+    status = _upload_and_wait(
+        api_context.client, "archive.zip", b"not supported", "application/zip"
     )
 
-    assert response.status_code == 400
-    assert "Unsupported document type" in response.json()["detail"]
+    assert status["state"] == "failed"
+    assert "Unsupported document type" in status["error"]
 
 
 def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -> None:
-    upload_response = api_context.client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
-    assert upload_response.status_code == 200
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
 
     response = api_context.client.post("/questions", json={"question": "alpha"})
 
@@ -289,11 +320,8 @@ def test_question_endpoint_rejects_rerank_top_k_above_fused_top_n(
     """api_context's settings default to fused_top_n=5 — a business rule known only
     inside the pipeline, so this is a 400 (RetrievalConfigError), not the schema's 422."""
 
-    upload_response = api_context.client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
-    assert upload_response.status_code == 200
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
 
     response = api_context.client.post(
         "/questions", json={"question": "alpha", "rerank_top_k": 45}
@@ -306,11 +334,8 @@ def test_question_endpoint_rejects_rerank_top_k_above_fused_top_n(
 def test_question_endpoint_accepts_valid_overrides_and_limits_sources(
     api_context: ApiTestContext,
 ) -> None:
-    upload_response = api_context.client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
-    assert upload_response.status_code == 200
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
 
     response = api_context.client.post(
         "/questions",
@@ -338,11 +363,8 @@ def test_question_endpoint_returns_502_shape_for_reranking_failure(
     extractErrorDetail relies on — a regression here would silently break error
     rendering in the UI without any type system catching it."""
 
-    upload_response = api_context.client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
-    assert upload_response.status_code == 200
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
     api_context.app.dependency_overrides[get_reranker] = lambda: RaisingReranker()
 
     response = api_context.client.post("/questions", json={"question": "alpha"})
@@ -355,11 +377,8 @@ def test_question_endpoint_returns_502_shape_for_reranking_failure(
 def test_question_endpoint_returns_502_shape_for_generation_failure(
     api_context: ApiTestContext,
 ) -> None:
-    upload_response = api_context.client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
-    assert upload_response.status_code == 200
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
     api_context.app.dependency_overrides[get_generator] = lambda: RaisingGenerator()
 
     response = api_context.client.post("/questions", json={"question": "alpha"})
@@ -462,11 +481,8 @@ def _ingested_client(
     app.dependency_overrides[get_generator] = lambda: generator
     app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
     client = TestClient(app)
-    upload = client.post(
-        "/documents",
-        files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")},
-    )
-    assert upload.status_code == 200
+    status = _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
     return client, qdrant
 
 
@@ -586,4 +602,87 @@ def test_lifespan_skips_warmup_when_disabled(monkeypatch: pytest.MonkeyPatch) ->
 
     assert embeddings.seen_text_batches == []
     clear_dependency_caches()
+
+
+def test_document_job_status_returns_404_for_unknown_job(api_context: ApiTestContext) -> None:
+    response = api_context.client.get("/documents/jobs/does-not-exist")
+
+    assert response.status_code == 404
+    assert "does-not-exist" in response.json()["detail"]
+
+
+def test_list_documents_returns_indexed_filenames(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
+
+    response = api_context.client.get("/documents")
+
+    assert response.status_code == 200
+    assert response.json()["filenames"] == ["a.txt", "b.txt"]
+
+
+def test_list_documents_empty_for_no_uploads(api_context: ApiTestContext) -> None:
+    response = api_context.client.get("/documents")
+
+    assert response.status_code == 200
+    assert response.json()["filenames"] == []
+
+
+def test_metrics_endpoint_exposes_prometheus_text(api_context: ApiTestContext) -> None:
+    response = api_context.client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+
+
+def test_question_endpoint_includes_stage_timings(api_context: ApiTestContext) -> None:
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
+
+    response = api_context.client.post("/questions", json={"question": "alpha"})
+
+    assert response.status_code == 200
+    timings = response.json()["timings"]
+    assert timings is not None
+    assert set(timings) == {"embed_ms", "search_ms", "rerank_ms", "generate_ms", "total_ms"}
+
+
+def test_question_endpoint_filters_by_filenames(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha in a")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"alpha in b")["state"] == "done"
+
+    response = api_context.client.post(
+        "/questions", json={"question": "alpha", "filenames": ["b.txt"]}
+    )
+
+    assert response.status_code == 200
+    assert [source["filename"] for source in response.json()["sources"]] == ["b.txt"]
+
+
+def _parse_sse_events(text: str) -> list[dict[str, Any]]:
+    events = []
+    for block in text.strip().split("\n\n"):
+        if not block:
+            continue
+        _, _, data = block.partition("data: ")
+        events.append(json.loads(data))
+    return events
+
+
+def test_question_stream_endpoint_emits_sources_delta_done(
+    api_context: ApiTestContext,
+) -> None:
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
+
+    response = api_context.client.post("/questions/stream", json={"question": "alpha"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = _parse_sse_events(response.text)
+
+    assert events[0]["type"] == "sources"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["answer"] == "Alpha is documented [1]."
+    assert "timings" in events[-1]
 

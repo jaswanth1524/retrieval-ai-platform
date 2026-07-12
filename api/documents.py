@@ -82,15 +82,23 @@ class DocumentSection:
 
 @dataclass(frozen=True)
 class DocumentChunk:
-    """A chunk ready for embedding and storage with citation metadata."""
+    """A chunk ready for embedding and storage with citation metadata.
+
+    ``ordinal`` is the chunk's 1-based position within its source document (stable
+    across re-ingests of the same content) — stored in the payload so retrieval can
+    fetch a chunk's immediate neighbors for small-to-big context expansion without
+    needing a separate ordering scheme.
+    """
 
     filename: str
     page: int
     section: str
     chunk_id: str
     text: str
+    ordinal: int = 1
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
+    PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
 
     def to_payload(self) -> dict[str, str | int]:
         """Return the Qdrant payload shape needed for grounded citations."""
@@ -101,6 +109,7 @@ class DocumentChunk:
             "section": self.section,
             "chunk_id": self.chunk_id,
             self.PAYLOAD_TEXT_KEY: self.text,
+            self.PAYLOAD_ORDINAL_KEY: self.ordinal,
         }
 
 
@@ -181,6 +190,7 @@ def chunk_sections(
                         filename, window_page, window_section, ordinal, chunk_text
                     ),
                     text=chunk_text,
+                    ordinal=ordinal,
                 )
                 chunks.append(chunk)
                 if len(chunk_text) > _TRUNCATION_WARNING_CHAR_THRESHOLD:

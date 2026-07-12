@@ -12,6 +12,7 @@ dependencies = [
   "fastapi>=0.115",
   "fastembed>=0.4",
   "litellm>=1.50",
+  "prometheus-client>=0.25.0",
   "pydantic-settings>=2.6",
   "pypdf>=5.0",
   "python-dotenv>=1.0",
