@@ -11,6 +11,34 @@ function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
 
+function makeConfigPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    qdrant_collection: 'docrag_documents',
+    dense_embedding_model: 'BAAI/bge-small-en-v1.5',
+    sparse_embedding_model: 'Qdrant/BM25',
+    reranker_model: 'jinaai/jina-reranker-v2-base-multilingual',
+    embedding_model_tag: 'fastembed:BAAI/bge-small-en-v1.5',
+    llm_provider: 'ollama',
+    llm_model: 'llama3.1:8b',
+    llm_temperature: 0,
+    openai_model: 'gpt-4o-mini',
+    openai_available: false,
+    ollama_available: true,
+    rrf_k: 60,
+    dense_retrieval_limit: 50,
+    sparse_retrieval_limit: 50,
+    fused_top_n: 50,
+    rerank_top_k: 8,
+    max_context_chunks: 6,
+    rerank_min_score: 0.3,
+    max_upload_bytes: 52428800,
+    rerank_top_k_limit: 50,
+    max_context_chunks_limit: 20,
+    llm_temperature_max: 2.0,
+    ...overrides,
+  };
+}
+
 describe('App', () => {
   it('renders the shell and reaches "API online" when health+config succeed', async () => {
     vi.stubGlobal(
@@ -19,24 +47,7 @@ describe('App', () => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) {
-          return jsonResponse({
-            qdrant_collection: 'docrag_documents',
-            dense_embedding_model: 'BAAI/bge-small-en-v1.5',
-            sparse_embedding_model: 'Qdrant/BM25',
-            reranker_model: 'BAAI/bge-reranker-v2-m3',
-            embedding_model_tag: 'fastembed:BAAI/bge-small-en-v1.5',
-            llm_provider: 'ollama',
-            llm_model: 'llama3.1:8b',
-            openai_model: 'gpt-4o-mini',
-            openai_available: false,
-            rrf_k: 60,
-            dense_retrieval_limit: 50,
-            sparse_retrieval_limit: 50,
-            fused_top_n: 50,
-            rerank_top_k: 8,
-            max_context_chunks: 6,
-            max_upload_bytes: 52428800,
-          });
+          return jsonResponse(makeConfigPayload());
         }
         throw new Error(`unexpected fetch: ${url}`);
       }),
@@ -56,24 +67,7 @@ describe('App', () => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) {
-          return jsonResponse({
-            qdrant_collection: 'docrag_documents',
-            dense_embedding_model: 'BAAI/bge-small-en-v1.5',
-            sparse_embedding_model: 'Qdrant/BM25',
-            reranker_model: 'BAAI/bge-reranker-v2-m3',
-            embedding_model_tag: 'fastembed:BAAI/bge-small-en-v1.5',
-            llm_provider: 'ollama',
-            llm_model: 'llama3.1:8b',
-            openai_model: 'gpt-4o-mini',
-            openai_available: false,
-            rrf_k: 60,
-            dense_retrieval_limit: 50,
-            sparse_retrieval_limit: 50,
-            fused_top_n: 50,
-            rerank_top_k: 8,
-            max_context_chunks: 6,
-            max_upload_bytes: 52428800,
-          });
+          return jsonResponse(makeConfigPayload());
         }
         throw new Error(`unexpected fetch: ${url}`);
       }),
@@ -99,24 +93,7 @@ describe('App', () => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) {
-          return jsonResponse({
-            qdrant_collection: 'docrag_documents',
-            dense_embedding_model: 'BAAI/bge-small-en-v1.5',
-            sparse_embedding_model: 'Qdrant/BM25',
-            reranker_model: 'BAAI/bge-reranker-v2-m3',
-            embedding_model_tag: 'fastembed:BAAI/bge-small-en-v1.5',
-            llm_provider: 'ollama',
-            llm_model: 'llama3.1:8b',
-            openai_model: 'gpt-4o-mini',
-            openai_available: false,
-            rrf_k: 60,
-            dense_retrieval_limit: 50,
-            sparse_retrieval_limit: 50,
-            fused_top_n: 50,
-            rerank_top_k: 8,
-            max_context_chunks: 6,
-            max_upload_bytes: 52428800,
-          });
+          return jsonResponse(makeConfigPayload());
         }
         throw new Error(`unexpected fetch: ${url}`);
       }),
@@ -134,6 +111,27 @@ describe('App', () => {
     expect(document.documentElement.dataset.theme).not.toBe(initialTheme);
   });
 
+  it('auto-switches the provider to OpenAI when Ollama is unreachable but OpenAI is available', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) {
+          return jsonResponse(
+            makeConfigPayload({ ollama_available: false, openai_available: true }),
+          );
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    expect(screen.getByTestId('provider-select')).toHaveValue('openai');
+  });
+
   it('shows the unreachable banner when health check fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
 
@@ -142,5 +140,185 @@ describe('App', () => {
     expect(await screen.findByText('API unreachable')).toBeInTheDocument();
     expect(screen.getByText(/Cannot reach the DocRAG API/)).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent(/Cannot reach the DocRAG API/);
+  });
+
+  it('does not call GET /documents on boot', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+      if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/documents'))).toBe(false);
+  });
+
+  it('disables the question input with an upload hint when no session documents exist', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    expect(screen.getByTestId('question-textarea')).toBeDisabled();
+    expect(screen.getByTestId('question-hint')).toHaveTextContent('Upload a document to start.');
+  });
+
+  function makeFile(name: string, sizeBytes = 10): File {
+    const file = new File(['x'], name, { type: 'text/plain' });
+    Object.defineProperty(file, 'size', { value: sizeBytes });
+    return file;
+  }
+
+  function sseResponse(frames: string[]): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  }
+
+  function doneFrame(): string {
+    return `data: ${JSON.stringify({
+      type: 'done',
+      answer: 'Answer.',
+      sources: [],
+      timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+    })}\n\n`;
+  }
+
+  function stubUploadAndQuestionFetch(): ReturnType<typeof vi.fn> {
+    let jobCounter = 0;
+    const jobFilenames = new Map<string, string>();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+      if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+      if (url.endsWith('/documents') && init?.method === 'POST') {
+        const form = init.body as FormData;
+        const file = form.get('file') as File;
+        jobCounter += 1;
+        const jobId = `job-${jobCounter}`;
+        jobFilenames.set(jobId, file.name);
+        return jsonResponse({ job_id: jobId, filename: file.name, state: 'queued' });
+      }
+      if (url.includes('/documents/jobs/job-')) {
+        const jobId = url.split('/').pop() as string;
+        const filename = jobFilenames.get(jobId) as string;
+        return jsonResponse({
+          job_id: jobId,
+          filename,
+          state: 'done',
+          chunks_total: 1,
+          chunks_done: 1,
+          error: null,
+          result: { filename, sections_parsed: 1, chunks_ingested: 1, collection_name: 'docrag_documents' },
+        });
+      }
+      if (url.endsWith('/questions/stream')) {
+        return sseResponse([doneFrame()]);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('uploading files enables the question input and adds them to the search scope', async () => {
+    stubUploadAndQuestionFetch();
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    const input = screen.getByTestId('upload-input') as HTMLInputElement;
+    await userEvent.upload(input, [makeFile('a.txt'), makeFile('b.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+
+    const jobItems = await vi.waitFor(() => {
+      const items = screen.getAllByTestId('upload-job-item');
+      expect(items.every((item) => item.textContent?.includes('chunks'))).toBe(true);
+      return items;
+    });
+    expect(jobItems).toHaveLength(2);
+    expect(screen.getAllByTestId('document-filter-item')).toHaveLength(2);
+    expect(screen.getByTestId('question-textarea')).toBeEnabled();
+    expect(screen.queryByTestId('question-hint')).not.toBeInTheDocument();
+  });
+
+  it('asking with "All documents" selected sends every session filename', async () => {
+    const fetchMock = stubUploadAndQuestionFetch();
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt'), makeFile('b.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await screen.findAllByTestId('document-filter-item');
+
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
+    await userEvent.click(screen.getByTestId('question-submit'));
+
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/questions/stream'))).toBe(true);
+    });
+    const streamCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/questions/stream'));
+    const body = JSON.parse(String(streamCall?.[1]?.body));
+    expect(body.filenames.sort()).toEqual(['a.txt', 'b.txt']);
+  });
+
+  it('selecting one document in the filter restricts the filenames sent', async () => {
+    const fetchMock = stubUploadAndQuestionFetch();
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt'), makeFile('b.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    const filterItems = await screen.findAllByTestId('document-filter-item');
+    const aItem = filterItems.find((item) => item.textContent?.includes('a.txt'));
+    await userEvent.click(aItem?.querySelector('input') as HTMLInputElement);
+
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
+    await userEvent.click(screen.getByTestId('question-submit'));
+
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/questions/stream'))).toBe(true);
+    });
+    const streamCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/questions/stream'));
+    const body = JSON.parse(String(streamCall?.[1]?.body));
+    expect(body.filenames).toEqual(['a.txt']);
+  });
+
+  it('re-uploading a file with the same name does not duplicate it in the search scope', async () => {
+    stubUploadAndQuestionFetch();
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await screen.findAllByTestId('document-filter-item');
+
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('upload-job-item')).toHaveLength(2);
+    });
+    expect(screen.getAllByTestId('document-filter-item')).toHaveLength(1);
   });
 });

@@ -1,24 +1,62 @@
 import { useEffect, useState } from 'react';
 import { ApiClientError, api } from './api/client';
-import type { LlmProvider, PublicConfigResponse } from './api/types';
+import type { LlmProvider, PublicConfigResponse, QuestionOverrides } from './api/types';
 import ChatThread from './components/ChatThread';
 import ProviderSelector from './components/ProviderSelector';
 import QuestionInput from './components/QuestionInput';
 import Sidebar from './components/Sidebar';
 import type { ApiStatus } from './components/StatusBadge';
-import type { UploadState } from './components/UploadPanel';
+import type { UploadItem } from './components/UploadPanel';
 import { useChat } from './hooks/useChat';
+
+const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
+const EMPTY_OVERRIDES: QuestionOverrides = {
+  rerankTopK: null,
+  maxContextChunks: null,
+  llmTemperature: null,
+};
+
+function loadPersistedOverrides(): QuestionOverrides {
+  try {
+    const raw = localStorage.getItem(ADVANCED_OPTIONS_STORAGE_KEY);
+    if (!raw) return EMPTY_OVERRIDES;
+    const parsed = JSON.parse(raw) as Partial<QuestionOverrides>;
+    return {
+      rerankTopK: parsed.rerankTopK ?? null,
+      maxContextChunks: parsed.maxContextChunks ?? null,
+      llmTemperature: parsed.llmTemperature ?? null,
+    };
+  } catch {
+    // Storage denied/corrupt — fall back to defaults for this session.
+    return EMPTY_OVERRIDES;
+  }
+}
 
 function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking');
   const [apiStatusMessage, setApiStatusMessage] = useState<string | undefined>();
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
-  const [uploadState, setUploadState] = useState<UploadState>({ status: 'idle' });
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
+  const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
+  // Documents uploaded during this browser session only — resets on reload. Never
+  // backed by GET /documents, which lists every filename ever indexed in Qdrant
+  // across all sessions; searching those would surface stale, user-invisible docs.
+  const [sessionFilenames, setSessionFilenames] = useState<string[]>([]);
+  const [selectedFilenames, setSelectedFilenames] = useState<string[]>([]);
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
   );
   const { turns, pending, ask, cancel } = useChat();
+
+  const updateAdvancedOptions = (next: QuestionOverrides) => {
+    setAdvancedOptions(next);
+    try {
+      localStorage.setItem(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Persistence is best-effort; the in-session value above already applies.
+    }
+  };
 
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'light' : 'dark';
@@ -47,6 +85,15 @@ function App() {
         if (configResult.llm_provider === 'openai' && configResult.openai_available) {
           setSelectedProvider('openai');
         }
+        // Ollama is the hardcoded default above, but if it's unreachable and OpenAI
+        // is configured, don't leave the user stuck on a provider that will 502.
+        if (
+          configResult.llm_provider === 'ollama' &&
+          !configResult.ollama_available &&
+          configResult.openai_available
+        ) {
+          setSelectedProvider('openai');
+        }
         setApiStatus('ok');
       } catch (err) {
         if (cancelled) return;
@@ -65,20 +112,69 @@ function App() {
     };
   }, []);
 
-  const handleUpload = async (file: File) => {
-    setUploadState({ status: 'uploading' });
+  const uploadOne = async (file: File, id: string) => {
     try {
-      const result = await api.uploadDocument(file);
-      setUploadState({ status: 'success', result });
-    } catch (err) {
-      setUploadState({
-        status: 'error',
-        error: err instanceof ApiClientError ? err.message : 'Upload failed.',
+      const accepted = await api.uploadDocument(file);
+      const status = await api.pollDocumentJob(accepted.job_id, (jobStatus) => {
+        setUploads((prev) =>
+          prev.map((item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  progress: {
+                    state: jobStatus.state,
+                    chunksDone: jobStatus.chunks_done,
+                    chunksTotal: jobStatus.chunks_total,
+                  },
+                }
+              : item,
+          ),
+        );
       });
+      if (status.state === 'failed') {
+        setUploads((prev) =>
+          prev.map((item) =>
+            item.id === id
+              ? { ...item, status: 'error', error: status.error ?? 'Ingestion failed.' }
+              : item,
+          ),
+        );
+        return;
+      }
+      setUploads((prev) =>
+        prev.map((item) =>
+          item.id === id ? { ...item, status: 'success', result: status.result ?? undefined } : item,
+        ),
+      );
+      const filename = status.result?.filename;
+      if (filename) {
+        // Dedupe by name — re-uploading the same filename replaces its chunks
+        // server-side, so the scope list should not grow a second entry for it.
+        setSessionFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
+      }
+    } catch (err) {
+      setUploads((prev) =>
+        prev.map((item) =>
+          item.id === id
+            ? { ...item, status: 'error', error: err instanceof ApiClientError ? err.message : 'Upload failed.' }
+            : item,
+        ),
+      );
     }
   };
 
+  const handleUpload = async (files: File[]) => {
+    const newItems: UploadItem[] = files.map((file) => ({
+      id: crypto.randomUUID(),
+      filename: file.name,
+      status: 'uploading',
+    }));
+    setUploads((prev) => [...prev, ...newItems]);
+    await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
+  };
+
   const apiReachable = apiStatus === 'ok';
+  const noSessionDocs = sessionFilenames.length === 0;
 
   return (
     <div className="app-shell">
@@ -87,10 +183,15 @@ function App() {
         apiStatusMessage={apiStatusMessage}
         config={config}
         onUpload={handleUpload}
-        uploadState={uploadState}
-        onFileSelected={() => setUploadState({ status: 'idle' })}
+        uploads={uploads}
         theme={theme}
         onToggleTheme={toggleTheme}
+        overrides={advancedOptions}
+        onOverridesChange={updateAdvancedOptions}
+        overridesDisabled={pending}
+        sessionFilenames={sessionFilenames}
+        selectedFilenames={selectedFilenames}
+        onSelectedFilenamesChange={setSelectedFilenames}
       />
       <main className="app-main">
         {apiStatus === 'error' ? (
@@ -109,8 +210,16 @@ function App() {
             )}
             <ChatThread turns={turns} pending={pending} onCancel={cancel} />
             <QuestionInput
-              onSubmit={(question) => ask(question, selectedProvider)}
-              disabled={!apiReachable || pending}
+              onSubmit={(question) =>
+                ask(
+                  question,
+                  selectedProvider,
+                  advancedOptions,
+                  selectedFilenames.length > 0 ? selectedFilenames : sessionFilenames,
+                )
+              }
+              disabled={!apiReachable || pending || noSessionDocs}
+              hint={noSessionDocs ? 'Upload a document to start.' : undefined}
             />
           </>
         )}

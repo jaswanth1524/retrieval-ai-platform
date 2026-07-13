@@ -140,14 +140,14 @@ def test_generate_grounded_answer_returns_only_cited_sources() -> None:
     assert answer.sources[0].source_number == 3
 
 
-def test_generate_grounded_answer_keeps_all_sources_when_none_cited() -> None:
+def test_generate_grounded_answer_returns_no_sources_when_none_cited() -> None:
     settings = make_settings(max_context_chunks=2)
     chunks = [make_chunk("c1", "first"), make_chunk("c2", "second")]
     generator = FakeGenerator("An answer with no bracketed citations at all.")
 
     answer = generate_grounded_answer("How?", chunks, generator, settings)
 
-    assert [source.chunk_id for source in answer.sources] == ["c1", "c2"]
+    assert answer.sources == []
 
 
 def test_generate_grounded_answer_ignores_out_of_range_citations() -> None:
@@ -290,6 +290,49 @@ def test_litellm_generator_wraps_provider_exceptions_as_generation_error() -> No
         generator.complete([{"role": "user", "content": "Hi"}], make_settings())
 
 
+class RaisingAPIConnectionClient:
+    def __init__(self, *, model: str, llm_provider: str) -> None:
+        self._model = model
+        self._llm_provider = llm_provider
+
+    def __call__(self, **kwargs: Any) -> object:
+        from litellm.exceptions import APIConnectionError
+
+        raise APIConnectionError(
+            message="Connection refused",
+            model=self._model,
+            llm_provider=self._llm_provider,
+        )
+
+
+def test_litellm_generator_raises_actionable_message_for_unreachable_ollama() -> None:
+    """A connection failure to Ollama must surface a message pointing the user at
+    `ollama serve` and the configured OLLAMA_BASE_URL — the exact regression proven
+    live this session (Ollama not running -> opaque 502)."""
+
+    settings = make_settings(llm_provider="ollama", ollama_base_url="http://localhost:11434")
+    completion_client = RaisingAPIConnectionClient(
+        model="ollama/llama3.1:8b", llm_provider="ollama"
+    )
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+
+    with pytest.raises(GenerationError, match="ollama serve"):
+        generator.complete([{"role": "user", "content": "Hi"}], settings)
+
+
+def test_litellm_generator_openai_connection_failure_uses_generic_message() -> None:
+    """The Ollama-specific branch must not fire for other providers."""
+
+    settings = make_settings(llm_provider="openai", openai_api_key="sk-test")
+    completion_client = RaisingAPIConnectionClient(model="gpt-4o-mini", llm_provider="openai")
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+
+    with pytest.raises(GenerationError) as excinfo:
+        generator.complete([{"role": "user", "content": "Hi"}], settings)
+    assert "ollama serve" not in str(excinfo.value)
+    assert "Generation provider request failed" in str(excinfo.value)
+
+
 def test_litellm_generator_passes_num_retries_from_settings() -> None:
     completion_client = FakeCompletionClient({"choices": [{"message": {"content": "ok"}}]})
     settings = make_settings(llm_num_retries=2)
@@ -299,3 +342,55 @@ def test_litellm_generator_passes_num_retries_from_settings() -> None:
 
     assert completion_client.kwargs is not None
     assert completion_client.kwargs["num_retries"] == 2
+
+
+def test_completion_model_and_kwargs_passes_ollama_keep_alive() -> None:
+    model, kwargs = completion_model_and_kwargs(
+        make_settings(llm_provider="ollama", ollama_keep_alive="45m")
+    )
+
+    assert model == "ollama/llama3.1:8b"
+    assert kwargs["keep_alive"] == "45m"
+
+
+class FakeStreamCompletionClient:
+    def __init__(self, chunks: list[dict[str, Any]]) -> None:
+        self.chunks = chunks
+        self.kwargs: dict[str, Any] | None = None
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self.kwargs = kwargs
+        return iter(self.chunks)
+
+
+def test_litellm_generator_stream_yields_deltas_and_sets_stream_true() -> None:
+    chunks = [
+        {"choices": [{"delta": {"content": "Hel"}}]},
+        {"choices": [{"delta": {"content": "lo"}}]},
+        {"choices": [{"delta": {}}]},
+    ]
+    completion_client = FakeStreamCompletionClient(chunks)
+    settings = make_settings()
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+
+    deltas = list(generator.stream([{"role": "user", "content": "Hi"}], settings))
+
+    assert deltas == ["Hel", "lo"]
+    assert completion_client.kwargs is not None
+    assert completion_client.kwargs["stream"] is True
+
+
+def test_litellm_generator_stream_wraps_connection_failure_for_ollama() -> None:
+    class RaisingStreamClient:
+        def __call__(self, **kwargs: Any) -> Any:
+            from litellm.exceptions import APIConnectionError
+
+            raise APIConnectionError(
+                message="Connection refused", model="ollama/llama3.1:8b", llm_provider="ollama"
+            )
+
+    settings = make_settings(llm_provider="ollama", ollama_base_url="http://localhost:11434")
+    generator = LiteLLMGenerator(settings, completion_client=RaisingStreamClient())
+
+    with pytest.raises(GenerationError, match="ollama serve"):
+        list(generator.stream([{"role": "user", "content": "Hi"}], settings))

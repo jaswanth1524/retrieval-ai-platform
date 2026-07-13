@@ -23,6 +23,10 @@ class RetrievalPayloadError(RetrievalError):
     """Raised when a stored point is missing required citation metadata."""
 
 
+class RetrievalConfigError(RetrievalError):
+    """Raised when a per-request retrieval override is invalid against server config."""
+
+
 class QueryEmbeddingProvider(Protocol):
     """Embedding provider surface used by retrieval."""
 
@@ -35,7 +39,10 @@ class SearchRepository(Protocol):
     def ensure_ready(self, settings: AppSettings) -> None: ...
 
     def hybrid_search(
-        self, settings: AppSettings, query_embedding: EmbeddedText
+        self,
+        settings: AppSettings,
+        query_embedding: EmbeddedText,
+        filenames: Sequence[str] | None = None,
     ) -> list[models.ScoredPoint]: ...
 
 
@@ -50,6 +57,9 @@ class RetrievedChunk:
     chunk_id: str
     text: str
     score: float
+    # None for points indexed before chunk_ordinal existed — neighbor expansion
+    # skips those gracefully rather than treating a missing ordinal as an error.
+    chunk_ordinal: int | None = None
 
 
 def retrieve_candidates(
@@ -57,8 +67,13 @@ def retrieve_candidates(
     settings: AppSettings,
     query: str,
     embedding_provider: QueryEmbeddingProvider,
+    filenames: Sequence[str] | None = None,
 ) -> list[RetrievedChunk]:
-    """Retrieve fused dense+sparse candidates for a user query."""
+    """Retrieve fused dense+sparse candidates for a user query.
+
+    ``filenames``, when given, restricts retrieval to those documents only (both the
+    dense and sparse prefetch legs are filtered before fusion, not after).
+    """
 
     normalized_query = query.strip()
     if not normalized_query:
@@ -68,7 +83,7 @@ def retrieve_candidates(
     # without paying for embedding work first.
     repository.ensure_ready(settings)
     query_embedding = embed_query(normalized_query, embedding_provider)
-    points = repository.hybrid_search(settings, query_embedding)
+    points = repository.hybrid_search(settings, query_embedding, filenames)
     return points_to_chunks(points)
 
 
@@ -112,6 +127,7 @@ def scored_point_to_chunk(point: models.ScoredPoint) -> RetrievedChunk:
         chunk_id=payload_string(payload, "chunk_id"),
         text=payload_string(payload, "text"),
         score=float(point.score),
+        chunk_ordinal=payload_optional_int(payload, "chunk_ordinal"),
     )
 
 
@@ -130,4 +146,13 @@ def payload_page(payload: dict[str, object]) -> int:
     value = payload.get("page")
     if not isinstance(value, int) or isinstance(value, bool):
         raise RetrievalPayloadError("Retrieved point is missing payload field 'page'.")
+    return value
+
+
+def payload_optional_int(payload: dict[str, object], key: str) -> int | None:
+    """Read an optional integer payload field, absent on pre-upgrade points."""
+
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
     return value

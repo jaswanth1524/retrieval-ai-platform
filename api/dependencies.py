@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Annotated
 
@@ -10,8 +12,10 @@ from qdrant_client import QdrantClient
 
 from api.embeddings import LocalEmbeddingProvider
 from api.generation import LiteLLMGenerator
+from api.jobs import IngestJobStore
 from api.pipeline import IngestService, RagPipeline
-from api.qdrant_schema import clear_readiness_cache
+from api.provider_health import check_ollama_reachable
+from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
 from api.repository import VectorRepository
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
@@ -28,7 +32,7 @@ def get_app_settings() -> AppSettings:
 def get_qdrant_client() -> QdrantClient:
     """Return a cached Qdrant client."""
 
-    return QdrantClient(url=get_app_settings().qdrant_url)
+    return make_qdrant_client(get_app_settings())
 
 
 @lru_cache
@@ -58,6 +62,17 @@ def get_generator() -> LiteLLMGenerator:
     """Return a cached LiteLLM generator."""
 
     return LiteLLMGenerator(get_app_settings())
+
+
+def get_ollama_reachability_checker() -> Callable[[AppSettings], bool]:
+    """Return the Ollama-reachability probe.
+
+    Not cached: Ollama can start or stop between requests, so ``/config`` must probe
+    live each time. Exposed as a dependency (rather than a direct import in main.py)
+    so tests can override it without hitting a real localhost:11434.
+    """
+
+    return check_ollama_reachable
 
 
 def get_vector_repository(
@@ -105,6 +120,24 @@ def get_ingest_service(
     )
 
 
+@lru_cache
+def get_ingest_job_store() -> IngestJobStore:
+    """Return the process-wide background ingest job status store."""
+
+    return IngestJobStore()
+
+
+@lru_cache
+def get_ingest_executor() -> ThreadPoolExecutor:
+    """Return the process-wide executor background ingest jobs run on.
+
+    Two workers: enough to overlap ingest of a couple of documents without letting an
+    unbounded queue of uploads exhaust memory competing with query-time model calls.
+    """
+
+    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-ingest")
+
+
 def clear_dependency_caches() -> None:
     """Clear dependency caches for tests and process reloads."""
 
@@ -113,4 +146,6 @@ def clear_dependency_caches() -> None:
     get_embedding_provider.cache_clear()
     get_reranker.cache_clear()
     get_generator.cache_clear()
+    get_ingest_job_store.cache_clear()
+    get_ingest_executor.cache_clear()
     clear_readiness_cache()

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import UploadPanel, { type UploadState } from '../../src/components/UploadPanel';
+import UploadPanel, { type UploadItem } from '../../src/components/UploadPanel';
 
 function makeFile(name: string, sizeBytes: number): File {
   const file = new File(['x'], name, { type: 'text/plain' });
@@ -9,15 +9,14 @@ function makeFile(name: string, sizeBytes: number): File {
   return file;
 }
 
-function dataTransferWith(file: File): DataTransfer {
-  return { files: [file] } as unknown as DataTransfer;
+function dataTransferWith(files: File[]): DataTransfer {
+  return { files } as unknown as DataTransfer;
 }
 
 describe('UploadPanel', () => {
   it('rejects a file over the configured limit without calling onUpload', async () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} maxUploadBytes={10} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={10} />);
 
     const input = screen.getByTestId('upload-input') as HTMLInputElement;
     await userEvent.upload(input, makeFile('big.txt', 100));
@@ -27,26 +26,27 @@ describe('UploadPanel', () => {
     expect(onUpload).not.toHaveBeenCalled();
   });
 
-  it('accepts a file at or under the configured limit', async () => {
+  it('stages a file at or under the configured limit and uploads it as an array', async () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} maxUploadBytes={1000} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={1000} />);
 
     const input = screen.getByTestId('upload-input') as HTMLInputElement;
     await userEvent.upload(input, makeFile('small.txt', 10));
 
     expect(screen.queryByTestId('upload-size-error')).not.toBeInTheDocument();
+    expect(screen.getByTestId('upload-staged-item')).toHaveTextContent('small.txt');
     expect(screen.getByTestId('upload-button')).toBeEnabled();
 
     await userEvent.click(screen.getByTestId('upload-button'));
 
     expect(onUpload).toHaveBeenCalledTimes(1);
+    expect(onUpload.mock.calls[0][0]).toHaveLength(1);
+    expect(onUpload.mock.calls[0][0][0].name).toBe('small.txt');
   });
 
   it('falls back to the default limit when maxUploadBytes is not supplied', async () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} />);
 
     const input = screen.getByTestId('upload-input') as HTMLInputElement;
     // Well under the 50MB default — should be accepted with no config loaded yet.
@@ -55,40 +55,59 @@ describe('UploadPanel', () => {
     expect(screen.queryByTestId('upload-size-error')).not.toBeInTheDocument();
   });
 
-  it('notifies the owner when a valid file is selected, so a stale result can be cleared', async () => {
+  it('stages multiple files from one multi-select and uploads all of them', async () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const onFileSelected = vi.fn();
-    const state: UploadState = {
-      status: 'success',
-      result: { filename: 'old.txt', sections_parsed: 1, chunks_ingested: 1, collection_name: 'c' },
-    };
-    render(<UploadPanel onUpload={onUpload} state={state} onFileSelected={onFileSelected} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={1000} />);
 
-    await userEvent.upload(screen.getByTestId('upload-input'), makeFile('new.txt', 10));
+    const input = screen.getByTestId('upload-input') as HTMLInputElement;
+    await userEvent.upload(input, [makeFile('a.txt', 10), makeFile('b.txt', 10)]);
 
-    expect(onFileSelected).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByTestId('upload-staged-item')).toHaveLength(2);
+
+    await userEvent.click(screen.getByTestId('upload-button'));
+
+    expect(onUpload).toHaveBeenCalledTimes(1);
+    const uploaded = onUpload.mock.calls[0][0] as File[];
+    expect(uploaded.map((f) => f.name)).toEqual(['a.txt', 'b.txt']);
   });
 
-  it('also notifies the owner when a rejected oversized file is selected (clears a stale prior result)', async () => {
+  it('removes a staged file via its remove button before upload', async () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const onFileSelected = vi.fn();
-    const state: UploadState = { status: 'idle' };
-    render(
-      <UploadPanel onUpload={onUpload} state={state} maxUploadBytes={10} onFileSelected={onFileSelected} />,
-    );
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={1000} />);
 
-    await userEvent.upload(screen.getByTestId('upload-input'), makeFile('big.txt', 100));
+    const input = screen.getByTestId('upload-input') as HTMLInputElement;
+    await userEvent.upload(input, [makeFile('a.txt', 10), makeFile('b.txt', 10)]);
 
-    expect(onFileSelected).toHaveBeenCalledTimes(1);
+    const removeButtons = screen.getAllByTestId('upload-staged-remove');
+    await userEvent.click(removeButtons[0]);
+
+    expect(screen.getAllByTestId('upload-staged-item')).toHaveLength(1);
+
+    await userEvent.click(screen.getByTestId('upload-button'));
+
+    expect(onUpload).toHaveBeenCalledTimes(1);
+    const uploaded = onUpload.mock.calls[0][0] as File[];
+    expect(uploaded.map((f) => f.name)).toEqual(['b.txt']);
   });
 
-  it('accepts a valid file dropped onto the drop-zone', () => {
+  it('rejects an oversized file but keeps the other valid ones staged', async () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} maxUploadBytes={1000} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={50} />);
+
+    const input = screen.getByTestId('upload-input') as HTMLInputElement;
+    await userEvent.upload(input, [makeFile('ok.txt', 10), makeFile('big.txt', 100)]);
+
+    expect(screen.getAllByTestId('upload-size-error')).toHaveLength(1);
+    expect(screen.getAllByTestId('upload-staged-item')).toHaveLength(1);
+    expect(screen.getByTestId('upload-button')).toBeEnabled();
+  });
+
+  it('accepts valid files dropped onto the drop-zone', () => {
+    const onUpload = vi.fn().mockResolvedValue(undefined);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={1000} />);
 
     const dropzone = screen.getByTestId('upload-dropzone');
-    fireEvent.drop(dropzone, { dataTransfer: dataTransferWith(makeFile('dropped.txt', 10)) });
+    fireEvent.drop(dropzone, { dataTransfer: dataTransferWith([makeFile('dropped.txt', 10)]) });
 
     expect(screen.queryByTestId('upload-size-error')).not.toBeInTheDocument();
     expect(screen.getByTestId('upload-button')).toBeEnabled();
@@ -96,11 +115,10 @@ describe('UploadPanel', () => {
 
   it('rejects an oversized file dropped onto the drop-zone', () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} maxUploadBytes={10} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={10} />);
 
     const dropzone = screen.getByTestId('upload-dropzone');
-    fireEvent.drop(dropzone, { dataTransfer: dataTransferWith(makeFile('big.txt', 100)) });
+    fireEvent.drop(dropzone, { dataTransfer: dataTransferWith([makeFile('big.txt', 100)]) });
 
     expect(screen.getByTestId('upload-size-error')).toHaveTextContent(/too large/);
     expect(screen.getByTestId('upload-button')).toBeDisabled();
@@ -108,8 +126,7 @@ describe('UploadPanel', () => {
 
   it('highlights the drop-zone on dragover and clears it on dragleave', () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} />);
 
     const dropzone = screen.getByTestId('upload-dropzone');
     expect(dropzone.className).not.toMatch(/--active/);
@@ -123,13 +140,48 @@ describe('UploadPanel', () => {
 
   it('clears the active highlight after a drop', () => {
     const onUpload = vi.fn().mockResolvedValue(undefined);
-    const state: UploadState = { status: 'idle' };
-    render(<UploadPanel onUpload={onUpload} state={state} maxUploadBytes={1000} />);
+    render(<UploadPanel onUpload={onUpload} uploads={[]} maxUploadBytes={1000} />);
 
     const dropzone = screen.getByTestId('upload-dropzone');
     fireEvent.dragOver(dropzone);
-    fireEvent.drop(dropzone, { dataTransfer: dataTransferWith(makeFile('dropped.txt', 10)) });
+    fireEvent.drop(dropzone, { dataTransfer: dataTransferWith([makeFile('dropped.txt', 10)]) });
 
     expect(dropzone.className).not.toMatch(/--active/);
+  });
+
+  it('renders a per-file progress row while a job is uploading', () => {
+    const onUpload = vi.fn().mockResolvedValue(undefined);
+    const uploads: UploadItem[] = [
+      {
+        id: '1',
+        filename: 'a.txt',
+        status: 'uploading',
+        progress: { state: 'embedding', chunksDone: 2, chunksTotal: 4 },
+      },
+    ];
+    render(<UploadPanel onUpload={onUpload} uploads={uploads} />);
+
+    expect(screen.getByTestId('upload-job-item')).toHaveTextContent(/Embedding\.\.\. \(2\/4\)/);
+  });
+
+  it('renders per-file success and error rows independently', () => {
+    const onUpload = vi.fn().mockResolvedValue(undefined);
+    const uploads: UploadItem[] = [
+      {
+        id: '1',
+        filename: 'a.txt',
+        status: 'success',
+        result: { filename: 'a.txt', sections_parsed: 1, chunks_ingested: 3, collection_name: 'docrag_documents' },
+      },
+      { id: '2', filename: 'b.txt', status: 'error', error: 'Ingestion failed.' },
+    ];
+    render(<UploadPanel onUpload={onUpload} uploads={uploads} />);
+
+    const items = screen.getAllByTestId('upload-job-item');
+    expect(items).toHaveLength(2);
+    expect(items[0]).toHaveTextContent('a.txt');
+    expect(items[0]).toHaveTextContent(/3 chunks/);
+    expect(items[1]).toHaveTextContent('b.txt');
+    expect(items[1]).toHaveTextContent('Ingestion failed.');
   });
 });

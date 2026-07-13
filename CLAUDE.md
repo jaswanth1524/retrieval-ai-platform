@@ -28,7 +28,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Treat the project sp
   - Rerank only the fused top-N candidates with a cross-encoder.
 - Dense model default: `BAAI/bge-small-en-v1.5`.
 - Sparse model default: `Qdrant/BM25`.
-- Reranker default: `BAAI/bge-reranker-v2-m3`.
+- Reranker default: `jinaai/jina-reranker-v2-base-multilingual` (strongest cross-encoder fastembed supports; `BAAI/bge-reranker-v2-m3` is not loadable by fastembed at any version — owner-approved swap).
 - Embeddings default to local and remain independent from the LLM provider.
 - Changing the embedding model invalidates the index.
 - Store an embedding model version tag with the Qdrant collection.

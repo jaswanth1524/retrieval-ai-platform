@@ -38,13 +38,19 @@ class VectorRepository:
         self,
         settings: AppSettings,
         query_embedding: EmbeddedText,
+        filenames: Sequence[str] | None = None,
     ) -> list[models.ScoredPoint]:
-        """Fused dense+sparse candidates: server-side RRF, falling back to manual fusion."""
+        """Fused dense+sparse candidates: server-side RRF, falling back to manual fusion.
+
+        ``filenames``, when given, restricts both the dense and sparse legs to those
+        documents before fusion (a payload filter on the indexed ``filename`` field).
+        """
 
         self.ensure_ready(settings)
+        query_filter = _filename_filter(filenames)
         try:
             try:
-                return self._server_side_hybrid_query(settings, query_embedding)
+                return self._server_side_hybrid_query(settings, query_embedding, query_filter)
             except UnexpectedResponse as exc:
                 if exc.status_code not in _RRF_UNSUPPORTED_STATUS_CODES:
                     # A real query error (auth, malformed request, server fault) —
@@ -52,7 +58,7 @@ class VectorRepository:
                     # more confusing failure and hide the actual cause.
                     raise
                 # Older Qdrant servers may not support server-side prefetch + RRF.
-                return self._manual_hybrid_query(settings, query_embedding)
+                return self._manual_hybrid_query(settings, query_embedding, query_filter)
         except ResponseHandlingException as exc:
             raise VectorStoreUnavailableError(f"Qdrant is unreachable: {exc}") from exc
 
@@ -98,6 +104,27 @@ class VectorRepository:
                 break
         return ids
 
+    def list_filenames(self, settings: AppSettings) -> list[str]:
+        """Return the distinct filenames currently indexed, for per-document filtering."""
+
+        self.ensure_ready(settings)
+        filenames: set[str] = set()
+        offset: models.ExtendedPointId | None = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=settings.qdrant_collection,
+                with_payload=["filename"],
+                with_vectors=False,
+                limit=256,
+                offset=offset,
+            )
+            for point in points:
+                if point.payload and isinstance(point.payload.get("filename"), str):
+                    filenames.add(point.payload["filename"])
+            if offset is None:
+                break
+        return sorted(filenames)
+
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
         """Remove specific points by id — a single call regardless of how many
         filenames those ids originally belonged to (no per-filename round-trips)."""
@@ -115,6 +142,7 @@ class VectorRepository:
         self,
         settings: AppSettings,
         query_embedding: EmbeddedText,
+        query_filter: models.Filter | None,
     ) -> list[models.ScoredPoint]:
         response = self._client.query_points(
             collection_name=settings.qdrant_collection,
@@ -123,11 +151,13 @@ class VectorRepository:
                     query=query_embedding.dense,
                     using=settings.qdrant_dense_vector_name,
                     limit=int(settings.dense_retrieval_limit),
+                    filter=query_filter,
                 ),
                 models.Prefetch(
                     query=query_embedding.sparse,
                     using=settings.qdrant_sparse_vector_name,
                     limit=int(settings.sparse_retrieval_limit),
+                    filter=query_filter,
                 ),
             ],
             query=models.RrfQuery(rrf=models.Rrf(k=int(settings.rrf_k))),
@@ -141,12 +171,14 @@ class VectorRepository:
         self,
         settings: AppSettings,
         query_embedding: EmbeddedText,
+        query_filter: models.Filter | None,
     ) -> list[models.ScoredPoint]:
         dense_response = self._client.query_points(
             collection_name=settings.qdrant_collection,
             query=query_embedding.dense,
             using=settings.qdrant_dense_vector_name,
             limit=int(settings.dense_retrieval_limit),
+            query_filter=query_filter,
             with_payload=True,
             with_vectors=False,
         )
@@ -155,6 +187,7 @@ class VectorRepository:
             query=query_embedding.sparse,
             using=settings.qdrant_sparse_vector_name,
             limit=int(settings.sparse_retrieval_limit),
+            query_filter=query_filter,
             with_payload=True,
             with_vectors=False,
         )
@@ -163,6 +196,46 @@ class VectorRepository:
             k=int(settings.rrf_k),
             limit=int(settings.fused_top_n),
         )
+
+    def fetch_neighbors(
+        self,
+        settings: AppSettings,
+        filename: str,
+        ordinals: Sequence[int],
+    ) -> list[models.ScoredPoint]:
+        """Fetch chunks for a filename at specific ordinals (small-to-big expansion)."""
+
+        if not ordinals:
+            return []
+        self.ensure_ready(settings)
+        points, _ = self._client.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(key="filename", match=models.MatchValue(value=filename)),
+                    models.FieldCondition(
+                        key="chunk_ordinal", match=models.MatchAny(any=list(ordinals))
+                    ),
+                ]
+            ),
+            with_payload=True,
+            with_vectors=False,
+            limit=len(ordinals),
+        )
+        return [
+            models.ScoredPoint(id=point.id, version=0, score=0.0, payload=point.payload)
+            for point in points
+        ]
+
+
+def _filename_filter(filenames: Sequence[str] | None) -> models.Filter | None:
+    """Build a payload filter restricting search to specific filenames, or None."""
+
+    if not filenames:
+        return None
+    return models.Filter(
+        must=[models.FieldCondition(key="filename", match=models.MatchAny(any=list(filenames)))]
+    )
 
 
 def reciprocal_rank_fusion(

@@ -135,3 +135,72 @@ def test_vector_repository_delete_by_ids_is_a_noop_for_empty_list() -> None:
         collection_name=settings.qdrant_collection, with_payload=True, with_vectors=False
     )
     assert len(records) == 1
+
+
+def test_vector_repository_list_filenames_returns_distinct_sorted_names() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(
+        settings,
+        [make_point("p1", "b.md"), make_point("p2", "a.md"), make_point("p3", "b.md")],
+    )
+
+    assert repository.list_filenames(settings) == ["a.md", "b.md"]
+
+
+def test_vector_repository_list_filenames_empty_for_empty_collection() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.ensure_ready(settings)
+
+    assert repository.list_filenames(settings) == []
+
+
+def make_ordinal_point(
+    point_id: str, filename: str, ordinal: int, text: str
+) -> models.PointStruct:
+    return models.PointStruct(
+        id=str(uuid5(NAMESPACE_URL, point_id)),
+        vector={
+            "dense": [0.1, 0.2, 0.3],
+            "sparse": models.SparseVector(indices=[1], values=[0.5]),
+        },
+        payload={
+            "filename": filename,
+            "page": 1,
+            "section": "Intro",
+            "chunk_id": point_id,
+            "text": text,
+            "chunk_ordinal": ordinal,
+        },
+    )
+
+
+def test_vector_repository_fetch_neighbors_returns_matching_ordinals() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(
+        settings,
+        [
+            make_ordinal_point("p1", "guide.md", 1, "one"),
+            make_ordinal_point("p2", "guide.md", 2, "two"),
+            make_ordinal_point("p3", "guide.md", 3, "three"),
+            make_ordinal_point("p4", "other.md", 2, "other-two"),
+        ],
+    )
+
+    neighbors = repository.fetch_neighbors(settings, "guide.md", [1, 3])
+
+    texts = sorted(point.payload["text"] for point in neighbors if point.payload)
+    assert texts == ["one", "three"]
+
+
+def test_vector_repository_fetch_neighbors_empty_for_no_ordinals() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+
+    assert repository.fetch_neighbors(settings, "guide.md", []) == []

@@ -17,6 +17,7 @@ PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
     ("page", models.PayloadSchemaType.INTEGER),
     ("section", models.PayloadSchemaType.KEYWORD),
     ("chunk_id", models.PayloadSchemaType.KEYWORD),
+    ("chunk_ordinal", models.PayloadSchemaType.INTEGER),
 )
 
 
@@ -58,7 +59,7 @@ class CollectionReady:
 def make_qdrant_client(settings: AppSettings) -> QdrantClient:
     """Create a Qdrant client from application settings."""
 
-    return QdrantClient(url=settings.qdrant_url)
+    return QdrantClient(url=settings.qdrant_url, prefer_grpc=settings.qdrant_prefer_grpc)
 
 
 def dense_vectors_config(settings: AppSettings) -> dict[str, models.VectorParams]:

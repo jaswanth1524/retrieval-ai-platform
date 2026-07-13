@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -8,6 +9,10 @@ import pytest
 from api.reranking import LocalCrossEncoderReranker, RerankingError, rerank_candidates
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
 
 
 class FakeReranker:
@@ -79,7 +84,41 @@ def test_rerank_candidates_sorts_by_cross_encoder_score_and_truncates() -> None:
     assert reranker.seen_documents == ["first", "second", "third"]
     assert [result.chunk_id for result in results] == ["c2", "c3"]
     assert results[0].retrieval_score == 0.8
-    assert results[0].rerank_score == 0.95
+    assert results[0].rerank_score == pytest.approx(_sigmoid(0.95))
+
+
+def test_rerank_candidates_scores_only_rerank_candidates_setting() -> None:
+    """``rerank_candidates`` (clamped to fused_top_n) trims how many of the fused
+    candidates are actually sent through the cross-encoder — independent of
+    fused_top_n itself, which stays the fusion spec's own top-N."""
+
+    settings = make_settings(fused_top_n=5, rerank_top_k=5, rerank_candidates=2)
+    candidates = [
+        make_candidate("c1", "first", 0.9),
+        make_candidate("c2", "second", 0.8),
+        make_candidate("c3", "third", 0.7),
+    ]
+    reranker = FakeReranker([0.1, 0.2])
+
+    results = rerank_candidates("query", candidates, reranker, settings)
+
+    assert reranker.seen_documents == ["first", "second"]
+    assert [result.chunk_id for result in results] == ["c2", "c1"]
+
+
+def test_rerank_candidates_rerank_candidates_setting_never_exceeds_fused_top_n() -> None:
+    settings = make_settings(fused_top_n=2, rerank_top_k=5, rerank_candidates=50)
+    candidates = [
+        make_candidate("c1", "first", 0.9),
+        make_candidate("c2", "second", 0.8),
+        make_candidate("c3", "third", 0.7),
+    ]
+    reranker = FakeReranker([0.1, 0.2])
+
+    results = rerank_candidates("query", candidates, reranker, settings)
+
+    assert reranker.seen_documents == ["first", "second"]
+    assert [result.chunk_id for result in results] == ["c2", "c1"]
 
 
 def test_rerank_candidates_scores_only_fused_top_n() -> None:
@@ -129,6 +168,34 @@ def test_rerank_candidates_rejects_score_count_mismatch() -> None:
 
     with pytest.raises(RerankingError, match="score count mismatch"):
         rerank_candidates("query", candidates, FakeReranker([0.1]), make_settings())
+
+
+def test_rerank_candidates_filters_below_min_score() -> None:
+    settings = make_settings(rerank_top_k=5, rerank_min_score=0.30)
+    candidates = [
+        make_candidate("relevant", "on topic", 0.9),
+        make_candidate("irrelevant", "off topic", 0.1),
+    ]
+    # sigmoid(2.0) ~= 0.88 (passes 0.30); sigmoid(-5.0) ~= 0.0067 (fails 0.30).
+    reranker = FakeReranker([2.0, -5.0])
+
+    results = rerank_candidates("query", candidates, reranker, settings)
+
+    assert [result.chunk_id for result in results] == ["relevant"]
+    assert len(results) < settings.rerank_top_k
+
+
+def test_rerank_candidates_returns_empty_when_all_below_min_score() -> None:
+    settings = make_settings(rerank_top_k=5, rerank_min_score=0.30)
+    candidates = [
+        make_candidate("c1", "first", 0.9),
+        make_candidate("c2", "second", 0.8),
+    ]
+    reranker = FakeReranker([-6.0, -7.0])
+
+    results = rerank_candidates("query", candidates, reranker, settings)
+
+    assert results == []
 
 
 def test_local_cross_encoder_reranker_delegates_to_model() -> None:

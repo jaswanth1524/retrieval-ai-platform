@@ -81,7 +81,9 @@ def test_ingest_chunks_upserts_named_vectors_and_payload() -> None:
     result = ingest_chunks(repository, settings, [chunk], provider)
 
     assert result.points_count == 1
-    assert provider.seen_texts == ["run docker compose"]
+    # Embedded text is filename/section-prefixed (contextual retrieval) even though
+    # the stored payload keeps the raw chunk text (asserted below).
+    assert provider.seen_texts == ["guide.md › Setup\nrun docker compose"]
     records, _ = client.scroll(
         collection_name=settings.qdrant_collection,
         with_payload=True,
@@ -96,6 +98,7 @@ def test_ingest_chunks_upserts_named_vectors_and_payload() -> None:
         "section": "Setup",
         "chunk_id": "chunk-a",
         "text": "run docker compose",
+        "chunk_ordinal": 1,
     }
     assert isinstance(record.vector, dict)
     assert set(record.vector) == {"dense", "sparse"}

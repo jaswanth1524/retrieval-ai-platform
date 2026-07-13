@@ -53,6 +53,26 @@ def test_warmup_models_defaults_to_false() -> None:
     assert AppSettings(_env_file=None).warmup_models is False  # type: ignore[call-arg]
 
 
+def test_rerank_min_score_rejects_below_zero() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, rerank_min_score=-0.01)  # type: ignore[call-arg]
+
+
+def test_rerank_min_score_rejects_above_one() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, rerank_min_score=1.01)  # type: ignore[call-arg]
+
+
+def test_rerank_min_score_accepts_boundary_values() -> None:
+    assert AppSettings(_env_file=None, rerank_min_score=0.0).rerank_min_score == 0.0  # type: ignore[call-arg]
+    assert AppSettings(_env_file=None, rerank_min_score=1.0).rerank_min_score == 1.0  # type: ignore[call-arg]
+
+
+def test_min_section_words_rejects_negative() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, min_section_words=-1)  # type: ignore[call-arg]
+
+
 def test_app_settings_env_isolation_survives_a_leaked_env_var(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

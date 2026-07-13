@@ -1,18 +1,24 @@
-import type { PublicConfigResponse } from '../api/types';
+import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import ConfigPanel from './ConfigPanel';
+import DocumentFilter from './DocumentFilter';
 import StatusBadge, { type ApiStatus } from './StatusBadge';
-import UploadPanel, { type UploadState } from './UploadPanel';
+import UploadPanel, { type UploadItem } from './UploadPanel';
 import './Sidebar.css';
 
 interface SidebarProps {
   apiStatus: ApiStatus;
   apiStatusMessage?: string;
   config: PublicConfigResponse | null;
-  onUpload: (file: File) => Promise<void>;
-  uploadState: UploadState;
-  onFileSelected: () => void;
+  onUpload: (files: File[]) => Promise<void>;
+  uploads: UploadItem[];
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
+  overrides: QuestionOverrides;
+  onOverridesChange: (value: QuestionOverrides) => void;
+  overridesDisabled?: boolean;
+  sessionFilenames: string[];
+  selectedFilenames: string[];
+  onSelectedFilenamesChange: (filenames: string[]) => void;
 }
 
 function Sidebar({
@@ -20,10 +26,15 @@ function Sidebar({
   apiStatusMessage,
   config,
   onUpload,
-  uploadState,
-  onFileSelected,
+  uploads,
   theme,
   onToggleTheme,
+  overrides,
+  onOverridesChange,
+  overridesDisabled,
+  sessionFilenames,
+  selectedFilenames,
+  onSelectedFilenamesChange,
 }: SidebarProps) {
   return (
     <aside className="sidebar">
@@ -43,13 +54,21 @@ function Sidebar({
         </button>
       </div>
       <StatusBadge status={apiStatus} message={apiStatusMessage} />
-      <UploadPanel
-        onUpload={onUpload}
-        state={uploadState}
-        maxUploadBytes={config?.max_upload_bytes}
-        onFileSelected={onFileSelected}
+      <UploadPanel onUpload={onUpload} uploads={uploads} maxUploadBytes={config?.max_upload_bytes} />
+      <DocumentFilter
+        filenames={sessionFilenames}
+        selected={selectedFilenames}
+        onChange={onSelectedFilenamesChange}
+        disabled={overridesDisabled}
       />
-      {config && <ConfigPanel config={config} />}
+      {config && (
+        <ConfigPanel
+          config={config}
+          overrides={overrides}
+          onOverridesChange={onOverridesChange}
+          disabled={overridesDisabled}
+        />
+      )}
     </aside>
   );
 }

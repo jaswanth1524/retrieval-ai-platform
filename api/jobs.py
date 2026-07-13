@@ -1,0 +1,85 @@
+"""In-memory background job tracking for document ingestion.
+
+Jobs are process-local and lost on restart — acceptable for a single-instance
+self-hosted deployment; there is no requirement for durable job persistence across
+process restarts (unlike the indexed documents themselves, which live in Qdrant).
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
+from threading import Lock
+from typing import Literal
+
+JobState = Literal["queued", "parsing", "embedding", "indexing", "done", "failed"]
+
+
+class JobNotFoundError(RuntimeError):
+    """Raised when a job id has no known job (never existed, or was pruned)."""
+
+TERMINAL_STATES: frozenset[JobState] = frozenset({"done", "failed"})
+
+# Finished jobs beyond this count are pruned oldest-first, so a long-running process
+# doesn't accumulate unbounded job history in memory.
+_MAX_RETAINED_JOBS = 50
+
+
+@dataclass
+class IngestJob:
+    """Status of one background document-ingestion job."""
+
+    id: str
+    filename: str
+    state: JobState = "queued"
+    chunks_total: int = 0
+    chunks_done: int = 0
+    error: str | None = None
+    result: dict[str, object] | None = None
+    created_at: float = field(default_factory=time.monotonic)
+
+
+class IngestJobStore:
+    """Thread-safe in-memory store for background ingest job status."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._jobs: OrderedDict[str, IngestJob] = OrderedDict()
+
+    def create(self, filename: str) -> IngestJob:
+        job = IngestJob(id=str(uuid.uuid4()), filename=filename)
+        with self._lock:
+            self._jobs[job.id] = job
+            self._prune_finished_locked()
+        return job
+
+    def get(self, job_id: str) -> IngestJob | None:
+        """Return a snapshot of a job's current status, or None if unknown/pruned.
+
+        Returns a copy (not the live object) so callers never observe a
+        partially-updated job while a background thread is mid-``update``.
+        """
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return replace(job) if job is not None else None
+
+    def update(self, job_id: str, **fields: object) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            for key, value in fields.items():
+                setattr(job, key, value)
+
+    def _prune_finished_locked(self) -> None:
+        overflow = len(self._jobs) - _MAX_RETAINED_JOBS
+        if overflow <= 0:
+            return
+        finished_ids = [
+            job_id for job_id, job in self._jobs.items() if job.state in TERMINAL_STATES
+        ]
+        for job_id in finished_ids[:overflow]:
+            del self._jobs[job_id]

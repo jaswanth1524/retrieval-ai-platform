@@ -24,6 +24,11 @@ services:
         required: false
     environment:
       QDRANT_URL: http://qdrant:6333
+      # Cold-start the embedding/reranker models at boot rather than on the first
+      # real request — worth the extra startup time in a long-running container.
+      WARMUP_MODELS: "true"
+      # Same Docker network as Qdrant, so gRPC is reachable without extra config.
+      QDRANT_PREFER_GRPC: "true"
     extra_hosts:
       # Lets OLLAMA_BASE_URL=http://host.docker.internal:... resolve on native Linux
       # Docker (Docker Desktop on macOS/Windows already resolves this automatically).
