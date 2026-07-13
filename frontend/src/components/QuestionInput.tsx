@@ -8,9 +8,10 @@ const MAX_QUESTION_LENGTH = 4000;
 interface QuestionInputProps {
   onSubmit: (question: string) => void;
   disabled: boolean;
+  hint?: string;
 }
 
-function QuestionInput({ onSubmit, disabled }: QuestionInputProps) {
+function QuestionInput({ onSubmit, disabled, hint }: QuestionInputProps) {
   const [value, setValue] = useState('');
 
   const submit = () => {
@@ -29,27 +30,34 @@ function QuestionInput({ onSubmit, disabled }: QuestionInputProps) {
 
   return (
     <div className="question-input">
-      <textarea
-        className="question-input__textarea"
-        value={value}
-        onChange={(event) => setValue(event.target.value)}
-        onKeyDown={handleKeyDown}
-        placeholder="Ask a question about your documents..."
-        aria-label="Ask a question about your documents"
-        disabled={disabled}
-        rows={2}
-        maxLength={MAX_QUESTION_LENGTH}
-        data-testid="question-textarea"
-      />
-      <button
-        type="button"
-        className="question-input__submit"
-        onClick={submit}
-        disabled={disabled || !value.trim()}
-        data-testid="question-submit"
-      >
-        Ask
-      </button>
+      {hint && (
+        <p className="question-input__hint" data-testid="question-hint">
+          {hint}
+        </p>
+      )}
+      <div className="question-input__row">
+        <textarea
+          className="question-input__textarea"
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Ask a question about your documents..."
+          aria-label="Ask a question about your documents"
+          disabled={disabled}
+          rows={2}
+          maxLength={MAX_QUESTION_LENGTH}
+          data-testid="question-textarea"
+        />
+        <button
+          type="button"
+          className="question-input__submit"
+          onClick={submit}
+          disabled={disabled || !value.trim()}
+          data-testid="question-submit"
+        >
+          Ask
+        </button>
+      </div>
     </div>
   );
 }

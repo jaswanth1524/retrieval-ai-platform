@@ -56,19 +56,20 @@ export function useChat(): UseChatResult {
     // (not up front) so a mid-stream failure before any event arrives still renders
     // as a clean error turn instead of leaving a stray empty assistant bubble.
     const assistantTurnId = crypto.randomUUID();
-    let assistantTurnCreated = false;
+    // Whether the turn already exists is derived from `prev` itself (not a mutated
+    // outer flag) — React 18 (StrictMode, concurrent features) may invoke a setState
+    // updater more than once per commit, and a mutated closure variable would then
+    // see "already created" on a replay whose append never actually committed,
+    // silently dropping every subsequent update.
     const updateAssistantTurn = (update: (turn: ChatTurn) => ChatTurn) => {
       setTurns((prev) => {
-        if (!assistantTurnCreated) {
-          assistantTurnCreated = true;
-          return [...prev, update(makeTurn('assistant', ''))];
+        const existing = prev.find((turn) => turn.id === assistantTurnId);
+        if (!existing) {
+          return [...prev, update({ ...makeTurn('assistant', ''), id: assistantTurnId })];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
       });
     };
-    // makeTurn() mints a random id — override it so updateAssistantTurn can find
-    // this turn again on the next event via assistantTurnId.
-    const withId = (turn: ChatTurn): ChatTurn => ({ ...turn, id: assistantTurnId });
 
     try {
       await api.askQuestionStream(
@@ -78,13 +79,13 @@ export function useChat(): UseChatResult {
         filenames,
         {
           onSources: (sources) => {
-            updateAssistantTurn((turn) => withId({ ...turn, sources }));
+            updateAssistantTurn((turn) => ({ ...turn, sources }));
           },
           onDelta: (text) => {
-            updateAssistantTurn((turn) => withId({ ...turn, content: turn.content + text }));
+            updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }));
           },
           onDone: (answer, sources) => {
-            updateAssistantTurn((turn) => withId({ ...turn, content: answer, sources }));
+            updateAssistantTurn((turn) => ({ ...turn, content: answer, sources }));
           },
         },
         controller.signal,

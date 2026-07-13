@@ -66,4 +66,16 @@ describe('QuestionInput', () => {
 
     expect(onSubmit).toHaveBeenCalledWith('Hello');
   });
+
+  it('renders a hint line when provided', () => {
+    render(<QuestionInput onSubmit={vi.fn()} disabled hint="Upload a document to start." />);
+
+    expect(screen.getByTestId('question-hint')).toHaveTextContent('Upload a document to start.');
+  });
+
+  it('renders no hint line when hint is omitted', () => {
+    render(<QuestionInput onSubmit={vi.fn()} disabled={false} />);
+
+    expect(screen.queryByTestId('question-hint')).not.toBeInTheDocument();
+  });
 });

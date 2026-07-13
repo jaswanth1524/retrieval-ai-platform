@@ -1,7 +1,7 @@
 .question-input {
   display: flex;
-  gap: 10px;
-  align-items: center;
+  flex-direction: column;
+  gap: 4px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 16px;
@@ -11,6 +11,18 @@
 
 .question-input:focus-within {
   border-color: var(--accent);
+}
+
+.question-input__row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.question-input__hint {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
 }
 
 .question-input__textarea {
