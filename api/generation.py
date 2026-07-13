@@ -74,6 +74,7 @@ class GroundedAnswer:
     answer: str
     sources: list[SourceCitation]
     timings: StageTimings | None = None
+    trace_id: str | None = None
 
 
 class LiteLLMGenerator:

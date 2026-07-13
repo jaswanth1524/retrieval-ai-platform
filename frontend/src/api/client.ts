@@ -9,6 +9,7 @@ import type {
   QuestionOverrides,
   QuestionResponse,
   TimingsResponse,
+  TraceDetailResponse,
 } from './types';
 
 export class ApiClientError extends Error {
@@ -121,15 +122,26 @@ function questionRequestBody(
 }
 
 export interface QuestionStreamHandlers {
-  onSources?: (sources: CitationResponse[]) => void;
+  onSources?: (sources: CitationResponse[], traceId: string | null) => void;
   onDelta?: (text: string) => void;
-  onDone?: (answer: string, sources: CitationResponse[], timings: TimingsResponse | null) => void;
+  onDone?: (
+    answer: string,
+    sources: CitationResponse[],
+    timings: TimingsResponse | null,
+    traceId: string | null,
+  ) => void;
 }
 
 type QuestionStreamEvent =
-  | { type: 'sources'; sources: CitationResponse[] }
+  | { type: 'sources'; sources: CitationResponse[]; trace_id: string | null }
   | { type: 'delta'; text: string }
-  | { type: 'done'; answer: string; sources: CitationResponse[]; timings: TimingsResponse }
+  | {
+      type: 'done';
+      answer: string;
+      sources: CitationResponse[];
+      timings: TimingsResponse;
+      trace_id: string | null;
+    }
   | { type: 'error'; detail: string };
 
 async function readSseStream(
@@ -181,6 +193,12 @@ export const api = {
 
   getDocumentJob: (jobId: string, signal?: AbortSignal) =>
     request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, { signal }),
+
+  // Trace detail is fetched lazily — only when a debug drawer is actually opened —
+  // since the full prompt + candidate list can be tens of KB per question and most
+  // turns are never inspected.
+  getTrace: (traceId: string, signal?: AbortSignal) =>
+    request<TraceDetailResponse>(`/traces/${traceId}`, { signal }),
 
   // Uploads and ingests run in a background job (see api.uploadDocument) — this
   // polls the job status endpoint until it reaches a terminal state, so the caller
@@ -266,9 +284,10 @@ export const api = {
       }
 
       await readSseStream(response, (event) => {
-        if (event.type === 'sources') handlers.onSources?.(event.sources);
+        if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
         else if (event.type === 'delta') handlers.onDelta?.(event.text);
-        else if (event.type === 'done') handlers.onDone?.(event.answer, event.sources, event.timings);
+        else if (event.type === 'done')
+          handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);
         else if (event.type === 'error') throw new ApiClientError(event.detail);
       });
     } finally {
@@ -287,4 +306,5 @@ export type {
   PublicConfigResponse,
   QuestionResponse,
   TimingsResponse,
+  TraceDetailResponse,
 };

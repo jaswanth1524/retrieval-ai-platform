@@ -4,9 +4,10 @@ DocRAG is a self-hostable, open-source document Q&A system. Treat the project sp
 
 ## Current State
 
-- The repository is in the scaffold phase.
-- Project configuration and placeholder directories may exist.
-- Do not implement application feature code until the project owner explicitly approves the relevant implementation milestone.
+- Core upload, ingestion, hybrid retrieval, reranking, streaming Q&A, and citations are implemented (`api/`, `frontend/`).
+- Session-scoped multi-file upload and per-document search-scope filtering are the current feature area (branch `feature/session-scoped-multi-upload`).
+- Evaluation (`eval/ragas_runner.py`) and both test suites (`tests/`, `frontend/tests/`) exist and run in CI (`.github/workflows/ci.yml`).
+- Treat new work as additive to this implementation, not a from-scratch scaffold — read the relevant module before changing it.
 
 ## Project Constraints
 
@@ -49,16 +50,69 @@ DocRAG is a self-hostable, open-source document Q&A system. Treat the project sp
 - OpenAI generation support is optional and user-selectable.
 - Local embeddings remain the default even when OpenAI generation is selected.
 
+## Common Commands
+
+Backend (`uv`-managed, from repo root):
+
+```bash
+uv sync --extra dev            # install backend + test + lint + typecheck deps
+uv run pytest                  # run backend test suite
+uv run pytest tests/test_retrieval.py::test_name  # run a single test
+uv run ruff check .            # lint
+uv run mypy api                # typecheck (strict mode, api/ only)
+uv run uvicorn api.main:app --reload   # run API alone against localhost Qdrant/Ollama
+```
+
+Frontend (`frontend/`, npm-managed):
+
+```bash
+npm ci                         # install deps (matches CI)
+npm run dev                    # Vite dev server, proxies API calls to localhost:8000
+npm run test                   # vitest run (all tests)
+npx vitest run tests/App.test.tsx   # run a single test file
+npm run build                  # tsc -b && vite build -> frontend/dist
+npm run lint                   # oxlint
+```
+
+Full stack:
+
+```bash
+docker compose up              # Qdrant + API (API builds and serves frontend/dist)
+```
+
+CI (`.github/workflows/ci.yml`) runs both suites independently: backend job does `uv sync --extra dev` → `pytest` → `ruff check .` → `mypy api`; frontend job does `npm ci` → `npm run test` → `npm run build` → `npm run lint`.
+
+Optional eval extra: `uv sync --extra eval` then `uv run python -m eval.ragas_runner path/to/dataset.json --output results.json`.
+
+## Architecture
+
+**Request flow (question answering).** `api/main.py` routes (`/questions`, `/questions/stream`) delegate everything to `RagPipeline.answer` / `answer_stream` in `api/pipeline.py`. The pipeline is a thin orchestration seam over four collaborators injected via `api/dependencies.py` (`VectorRepository`, an embedding provider, a reranker, and a `ChatGenerator`) plus `AppSettings`:
+
+1. `api/retrieval.py` embeds the query and calls `VectorRepository.hybrid_search` (`api/repository.py`), which prefers Qdrant's server-side hybrid query and falls back to fetching dense + sparse separately and fusing with RRF in application code when the installed Qdrant doesn't support the needed query shape.
+2. `api/reranking.py` cross-encoder-reranks the fused candidates and drops anything below `rerank_min_score`.
+3. `expand_with_neighbors` (in `pipeline.py`) widens each surviving chunk's *generation* context using `chunk_ordinal`-adjacent chunks (`context_neighbor_radius`), while citations still point at the original chunk — small-to-big retrieval.
+4. `api/generation.py` builds a context-only grounded prompt and calls the configured LiteLLM provider (Ollama or OpenAI), either as one call (`/questions`) or token-streamed as SSE frames (`/questions/stream`, event types `sources` → `delta`* → `done`).
+
+Per-request overrides (`llm_provider`, `rerank_top_k`, `max_context_chunks`, `llm_temperature`, and an optional `filenames` scope) are folded into an immutable `settings.model_copy(...)` per call in `RagPipeline._effective_settings` — the shared `AppSettings` singleton is never mutated, so concurrent requests with different overrides can't interfere. `rrf_k`, `fused_top_n`, and the dense/sparse retrieval limits are deliberately *not* overridable per-request (see Non-Negotiable RAG Behavior above).
+
+**Request flow (ingestion).** `POST /documents` reads the upload (`api/upload.py`, size-capped by `max_upload_bytes`), creates a job in `IngestJobStore` (`api/jobs.py`, in-memory, process-wide), and hands the actual work to `IngestService.ingest` (`api/pipeline.py`) running on a dedicated `ThreadPoolExecutor` (`get_ingest_executor`, 2 workers) — not FastAPI's request threadpool — so a client disconnect doesn't interrupt ingestion. The client polls `GET /documents/jobs/{job_id}` for state transitions (`queued` → `parsing` → `embedding` → `done`/`failed`). `api/documents.py` parses (PDF/text/Markdown) and chunks with citation metadata preserved; `api/embeddings.py` + `api/ingestion.py` embed chunks (batched by `ingest_batch_size`) with filename/section-prefixed contextual text and upsert them into Qdrant tagged with `chunk_ordinal` and `embedding_model_tag`. `GET /documents` lists indexed filenames for the frontend's per-document search-scope filter (`filenames` on `/questions*`).
+
+**Dependency injection.** `api/dependencies.py` is the single seam for constructing collaborators — most factories are `@lru_cache`d process-wide singletons (settings, Qdrant client, embedding provider, reranker, generator, job store, ingest executor); `get_vector_repository` and the pipeline/service factories are expressed as FastAPI sub-dependencies specifically so tests can override `get_qdrant_client` (or others) and have the override cascade through everything built on top. `clear_dependency_caches()` resets all of it between tests/reloads.
+
+**Settings.** `api/settings.py`'s `AppSettings` (pydantic-settings, reads `.env`) is the single source of runtime config — env var names are the field names upper-cased (see `.env.example`). Changing `dense_embedding_model` requires bumping `embedding_model_tag`; `api/qdrant_schema.py` checks this tag against the stored collection's tag and refuses queries on mismatch (see Non-Negotiable RAG Behavior).
+
+**Frontend.** React + Vite + TS, single-origin with the API in production (`frontend/dist/` is mounted by `api/main.py`'s `StaticFiles`; in dev, Vite proxies to `localhost:8000`). `frontend/src/hooks/useChat.ts` owns chat/session state and talks to the API through `frontend/src/api/client.ts`; components under `frontend/src/components/` are presentational (`ChatThread`/`ChatMessage`/`CitationCard` for the conversation, `UploadPanel`/`StatusBadge` for ingestion progress, `DocumentFilter`/`ProviderSelector`/`ConfigPanel` for per-session query scoping and provider overrides).
+
 ## Validation Rules
 
-- Follow the repository owner's validation policy before presenting changes as complete.
-- For backend/API/service/data changes, use the installed backend verification workflow when available.
-- For UI changes, use the installed frontend verification workflow when available.
-- For documentation, config, or standalone tooling changes, use ephemeral tests in `.verify-scratch/`, run them, report results, and delete the scratch directory unconditionally.
-- After validation, `git status --short` should show only intended source changes.
+- Every code change must be validated before it is presented as done.
+- For UI changes, use the `frontend-verify` skill. For API/service/data changes, use the `backend-verify` skill. For full-stack changes, use both.
+- Follow each skill's pipeline and its "all verification tests are ephemeral" policy exactly: temporary tests live in the scratch folder, get deleted unconditionally after validation, and the working tree must match the pre-run snapshot afterward.
+- If a change falls outside both skills (standalone scripts, config tooling, docs generators), apply the same policy manually: write throwaway tests in `.verify-scratch/`, run them, report the results, then delete them.
+- After any task, `git status` must show only intended source changes.
 
 ## Git Rules
 
-- Git is read-only by default.
-- Do not run `git add`, `git commit`, `git push`, create branches, or open PRs unless the owner explicitly asks for that exact action in the current conversation.
-- Do not add AI attribution, co-author trailers, or generated-by notices to commit messages or PR descriptions.
+- Git is read-only by default: never run `git add`, `git commit`, `git push`, or create branches/PRs unless the owner explicitly requests that exact action in the current conversation. `git status` / `git diff` / `git log` are always fine.
+- When a commit is requested, author it as the owner using their existing git config identity only. Never add "Co-Authored-By: Claude", "Generated with Claude Code", or any Claude/Anthropic attribution to commit messages or PR descriptions.
+- If an instruction conflicts with these rules, stop and ask instead of guessing.

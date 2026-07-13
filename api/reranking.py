@@ -99,6 +99,20 @@ class Reranker(Protocol):
     def score(self, query: str, documents: Sequence[str]) -> list[float]: ...
 
 
+@dataclass(frozen=True)
+class RerankOutcome:
+    """Full result of a rerank pass, for callers that need the dropped candidates too.
+
+    ``scored`` is every candidate actually sent to the cross-encoder, sorted
+    descending — including ones later dropped by ``rerank_min_score`` or the
+    ``rerank_top_k`` cut. ``kept`` is the same list ``rerank_candidates`` has always
+    returned: filtered and sliced to the top-K.
+    """
+
+    scored: list[RerankedChunk]
+    kept: list[RerankedChunk]
+
+
 def rerank_candidates(
     query: str,
     candidates: Sequence[RetrievedChunk],
@@ -107,6 +121,21 @@ def rerank_candidates(
 ) -> list[RerankedChunk]:
     """Rerank the fused top-N candidates, drop low-relevance ones, keep the top-K.
 
+    Thin wrapper over ``rerank_candidates_detailed`` for callers that only need the
+    survivors — see that function's docstring for the full scoring/filtering rules.
+    """
+
+    return rerank_candidates_detailed(query, candidates, reranker, settings).kept
+
+
+def rerank_candidates_detailed(
+    query: str,
+    candidates: Sequence[RetrievedChunk],
+    reranker: Reranker,
+    settings: AppSettings,
+) -> RerankOutcome:
+    """Rerank the fused top-N candidates, returning both the scored and kept lists.
+
     ``rerank_score`` is the raw cross-encoder logit sigmoid-normalized to [0, 1] so
     ``rerank_min_score`` is comparable across reranker models. Because the candidate
     list is sorted descending before filtering, dropping everything below the
@@ -114,17 +143,17 @@ def rerank_candidates(
     filtering after — either way the result is the sorted prefix that clears the bar,
     which may be shorter than ``rerank_top_k`` or empty.
 
-    ``rerank_candidates`` (clamped to ``fused_top_n``) controls how many of the fused
-    candidates are actually sent through the cross-encoder — the reranker is the most
-    expensive retrieval-side stage, so this is the knob for trading candidate coverage
-    against latency without touching the fusion spec itself.
+    ``rerank_candidates`` (the settings field, clamped to ``fused_top_n``) controls
+    how many of the fused candidates are actually sent through the cross-encoder — the
+    reranker is the most expensive retrieval-side stage, so this is the knob for
+    trading candidate coverage against latency without touching the fusion spec itself.
     """
 
     normalized_query = query.strip()
     if not normalized_query:
         raise RetrievalError("Query text is required.")
     if not candidates:
-        return []
+        return RerankOutcome(scored=[], kept=[])
 
     fused_top_n = int(settings.fused_top_n)
     candidates_considered = min(int(settings.rerank_candidates), fused_top_n)
@@ -159,5 +188,5 @@ def rerank_candidates(
         key=lambda chunk: (-chunk.rerank_score, -chunk.retrieval_score, chunk.chunk_id),
     )
     filtered = [chunk for chunk in sorted_chunks if chunk.rerank_score >= min_score]
-    return filtered[:rerank_top_k]
+    return RerankOutcome(scored=sorted_chunks, kept=filtered[:rerank_top_k])
 

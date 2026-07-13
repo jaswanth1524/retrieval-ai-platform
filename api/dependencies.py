@@ -19,6 +19,7 @@ from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
 from api.repository import VectorRepository
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
+from api.tracing import TraceStore
 
 
 @lru_cache
@@ -88,12 +89,26 @@ def get_vector_repository(
     return VectorRepository(client)
 
 
+@lru_cache
+def get_trace_store() -> TraceStore:
+    """Return the process-wide per-query debug trace store.
+
+    Reads settings directly (not through FastAPI's DI) the same way
+    ``get_ingest_executor``'s worker count does — the retention cap is sized once at
+    first use, not per request. A test wanting a non-default cap should override this
+    dependency directly, or unit-test ``TraceStore`` in isolation.
+    """
+
+    return TraceStore(max_retained=int(get_app_settings().trace_max_retained))
+
+
 def get_rag_pipeline(
     repository: Annotated[VectorRepository, Depends(get_vector_repository)],
     embedding_provider: Annotated[LocalEmbeddingProvider, Depends(get_embedding_provider)],
     reranker: Annotated[LocalCrossEncoderReranker, Depends(get_reranker)],
     generator: Annotated[LiteLLMGenerator, Depends(get_generator)],
     settings: Annotated[AppSettings, Depends(get_app_settings)],
+    trace_store: Annotated[TraceStore, Depends(get_trace_store)],
 ) -> RagPipeline:
     """Return the query orchestration seam: retrieve -> rerank -> generate."""
 
@@ -103,6 +118,9 @@ def get_rag_pipeline(
         reranker=reranker,
         generator=generator,
         settings=settings,
+        # The gate reads the *injected* settings (not a direct get_app_settings()
+        # call) so a test overriding get_app_settings controls trace_enabled too.
+        trace_store=trace_store if settings.trace_enabled else None,
     )
 
 
@@ -148,4 +166,5 @@ def clear_dependency_caches() -> None:
     get_generator.cache_clear()
     get_ingest_job_store.cache_clear()
     get_ingest_executor.cache_clear()
+    get_trace_store.cache_clear()
     clear_readiness_cache()

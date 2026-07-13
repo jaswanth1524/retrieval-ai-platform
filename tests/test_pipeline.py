@@ -56,6 +56,28 @@ class FakeGenerator:
             yield word if index == len(words) - 1 else word + " "
 
 
+class RaisingGenerator:
+    """Fails ``complete`` outright, and ``stream`` after yielding a partial answer —
+    for exercising the pipeline's partial-trace-on-error paths."""
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        raise RuntimeError("generation boom")
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        yield "partial "
+        raise RuntimeError("generation boom mid-stream")
+
+
+class ListTraceStore:
+    """Minimal in-memory ``TraceSink`` for asserting on what the pipeline records."""
+
+    def __init__(self) -> None:
+        self.traces: list[Any] = []
+
+    def add(self, trace: Any) -> None:
+        self.traces.append(trace)
+
+
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
         "qdrant_url": ":memory:",
@@ -374,7 +396,7 @@ def test_rag_pipeline_answer_stream_returns_insufficient_context_for_empty_colle
 
     events = list(pipeline.answer_stream("alpha"))
 
-    assert events[0] == {"type": "sources", "sources": []}
+    assert events[0] == {"type": "sources", "sources": [], "trace_id": None}
     assert events[-1]["type"] == "done"
     assert "not have enough information" in events[-1]["answer"]
     assert events[-1]["sources"] == []
@@ -420,3 +442,183 @@ def test_expand_with_neighbors_disabled_by_zero_radius() -> None:
     expanded = expand_with_neighbors(reranked, repository, settings)
 
     assert expanded == reranked
+
+
+def test_rag_pipeline_answer_records_a_trace_when_a_store_is_configured() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.trace_id is not None
+    assert len(trace_store.traces) == 1
+    trace = trace_store.traces[0]
+    assert trace.trace_id == grounded.trace_id
+    assert trace.mode == "sync"
+    assert trace.status == "ok"
+    assert trace.question == "alpha"
+    assert trace.answer == "Alpha is documented [1]."
+    assert trace.cited_source_numbers == [1]
+    assert trace.error is None
+    assert trace.timings is not None and trace.timings["total_ms"] >= 0
+    assert trace.config is not None
+    assert trace.config.llm_provider == "ollama"
+    assert len(trace.candidates) == 1
+    assert trace.candidates[0].filename == "guide.txt"
+    assert trace.candidates[0].kept is True
+    assert trace.candidates[0].selected_for_context is True
+    assert trace.prompt_messages is not None
+    assert "Intro alpha beta" in trace.prompt_messages[1]["content"]
+
+
+def test_rag_pipeline_answer_without_trace_store_leaves_trace_id_none() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.trace_id is None
+
+
+def test_rag_pipeline_answer_records_partial_trace_on_generation_error() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=RaisingGenerator(),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    with pytest.raises(RuntimeError, match="generation boom"):
+        pipeline.answer("alpha")
+
+    assert len(trace_store.traces) == 1
+    trace = trace_store.traces[0]
+    assert trace.status == "error"
+    assert trace.error == "generation boom"
+    assert trace.answer is None
+    # The retrieval phase completed before generation failed, so the effective
+    # config is still captured even though the trace as a whole is an error.
+    assert trace.config is not None
+
+
+def test_rag_pipeline_answer_stream_carries_matching_trace_id_in_sources_and_done() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    events = list(pipeline.answer_stream("alpha"))
+
+    sources_event = events[0]
+    done_event = events[-1]
+    assert sources_event["trace_id"] is not None
+    assert sources_event["trace_id"] == done_event["trace_id"]
+    assert len(trace_store.traces) == 1
+    trace = trace_store.traces[0]
+    assert trace.trace_id == done_event["trace_id"]
+    assert trace.mode == "stream"
+    assert trace.status == "ok"
+    assert trace.prompt_messages is not None
+
+
+def test_rag_pipeline_answer_stream_records_partial_trace_on_mid_stream_error() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=RaisingGenerator(),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    with pytest.raises(RuntimeError, match="generation boom mid-stream"):
+        list(pipeline.answer_stream("alpha"))
+
+    assert len(trace_store.traces) == 1
+    trace = trace_store.traces[0]
+    assert trace.mode == "stream"
+    assert trace.status == "error"
+    assert trace.error == "generation boom mid-stream"
+    assert trace.answer == "partial"
+
+
+def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_close() -> None:
+    """A client disconnecting mid-stream closes the generator (GeneratorExit) before
+    any `except Exception`/success path runs — the `finally` clause must still record
+    a trace rather than silently dropping it."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    generator = pipeline.answer_stream("alpha")
+    next(generator)  # advance to the first yield (the sources event), then abandon it
+    generator.close()
+
+    assert len(trace_store.traces) == 1
+    trace = trace_store.traces[0]
+    assert trace.status == "error"
+    assert trace.error == "Stream closed before completion."

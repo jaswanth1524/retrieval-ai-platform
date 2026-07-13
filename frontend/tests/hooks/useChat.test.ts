@@ -28,12 +28,12 @@ describe('useChat', () => {
   it('streams sources then deltas into a single assistant turn, then finalizes on done', async () => {
     let resolveStream!: () => void;
     askQuestionStreamMock.mockImplementation((_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
-      handlers.onSources?.([]);
+      handlers.onSources?.([], 'trace-1');
       handlers.onDelta?.('Run ');
       handlers.onDelta?.('docker compose up.');
       return new Promise<void>((resolve) => {
         resolveStream = () => {
-          handlers.onDone?.('Run docker compose up.', [], ZERO_TIMINGS);
+          handlers.onDone?.('Run docker compose up.', [], ZERO_TIMINGS, 'trace-1');
           resolve();
         };
       });
@@ -52,6 +52,7 @@ describe('useChat', () => {
     expect(result.current.turns[1]).toMatchObject({
       role: 'assistant',
       content: 'Run docker compose up.',
+      traceId: 'trace-1',
     });
 
     await act(async () => {
@@ -64,7 +65,31 @@ describe('useChat', () => {
     expect(result.current.turns[1]).toMatchObject({
       role: 'assistant',
       content: 'Run docker compose up.',
+      traceId: 'trace-1',
+      timings: ZERO_TIMINGS,
     });
+  });
+
+  it('keeps the traceId set by the sources event even if the stream then errors', async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
+        handlers.onSources?.([], 'trace-2');
+        throw new ApiClientError('Generation provider request failed.');
+      },
+    );
+
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('alpha');
+    });
+
+    // The failure still appends a separate error turn (existing behavior); the
+    // assistant turn created by the sources event keeps its trace link so the
+    // partial trace recorded server-side stays reachable from the UI.
+    expect(result.current.turns).toHaveLength(3);
+    expect(result.current.turns[1]).toMatchObject({ role: 'assistant', traceId: 'trace-2' });
+    expect(result.current.turns[2]).toMatchObject({ role: 'error' });
   });
 
   it('appends an error turn with the ApiClientError message on failure, with no stray assistant turn', async () => {
@@ -132,10 +157,10 @@ describe('useChat', () => {
 
   it('allows a new ask() once the previous one has resolved', async () => {
     askQuestionStreamMock.mockImplementationOnce(async (_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
-      handlers.onDone?.('first answer', [], ZERO_TIMINGS);
+      handlers.onDone?.('first answer', [], ZERO_TIMINGS, 'trace-a');
     });
     askQuestionStreamMock.mockImplementationOnce(async (_q, _p, _o, _f, handlers: QuestionStreamHandlers) => {
-      handlers.onDone?.('second answer', [], ZERO_TIMINGS);
+      handlers.onDone?.('second answer', [], ZERO_TIMINGS, 'trace-b');
     });
 
     const { result } = renderHook(() => useChat());

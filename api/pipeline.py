@@ -5,6 +5,7 @@ chunk -> embed -> index), each behind a single call so handlers stay thin.
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, TypedDict
@@ -25,15 +26,17 @@ from api.generation import (
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
 from api.repository import VectorRepository
-from api.reranking import RerankedChunk, Reranker, rerank_candidates
+from api.reranking import RerankedChunk, Reranker, rerank_candidates_detailed
 from api.retrieval import (
     QueryEmbeddingProvider,
     RetrievalConfigError,
     RetrievalError,
+    RetrievedChunk,
     embed_query,
     points_to_chunks,
 )
 from api.settings import AppSettings
+from api.tracing import QueryTrace, TraceConfig, TraceSink, build_trace_candidates
 
 
 @dataclass(frozen=True)
@@ -52,11 +55,31 @@ class AnswerOverrides:
     llm_temperature: float | None = None
 
 
+@dataclass(frozen=True)
+class RetrievalPhase:
+    """Result of retrieve -> rerank -> neighbor-expand, kept as a single value so
+    trace capture (see api.tracing) can see the full fused candidate list and every
+    scored chunk, not just the ones that survived to generation.
+    """
+
+    context_chunks: list[RerankedChunk]
+    fused_candidates: list[RetrievedChunk]
+    scored_chunks: list[RerankedChunk]
+    embed_ms: float
+    search_ms: float
+    rerank_ms: float
+
+
 class SourcesEvent(TypedDict):
-    """SSE event: citation metadata for the selected context, sent before generation."""
+    """SSE event: citation metadata for the selected context, sent before generation.
+
+    Carries ``trace_id`` (None when tracing is disabled) so the UI can link this turn
+    to its debug trace even if generation fails before the ``done`` event is reached.
+    """
 
     type: Literal["sources"]
     sources: list[dict[str, Any]]
+    trace_id: str | None
 
 
 class DeltaEvent(TypedDict):
@@ -73,6 +96,7 @@ class DoneEvent(TypedDict):
     answer: str
     sources: list[dict[str, Any]]
     timings: dict[str, float]
+    trace_id: str | None
 
 
 StreamEvent = SourcesEvent | DeltaEvent | DoneEvent
@@ -158,12 +182,17 @@ class RagPipeline:
         reranker: Reranker,
         generator: ChatGenerator,
         settings: AppSettings,
+        trace_store: TraceSink | None = None,
     ) -> None:
         self._repository = repository
         self._embedding_provider = embedding_provider
         self._reranker = reranker
         self._generator = generator
         self._settings = settings
+        # None disables trace capture entirely (the default) — every trace-related
+        # call below is skipped rather than merely producing an empty trace, so
+        # tracing costs nothing when the operator has turned it off.
+        self._trace_store = trace_store
 
     def _effective_settings(
         self, overrides: AnswerOverrides
@@ -191,14 +220,26 @@ class RagPipeline:
         }
         return settings.model_copy(update=update) if update else settings
 
+    def _trace_config(
+        self, effective_settings: AppSettings, filenames: Sequence[str] | None
+    ) -> TraceConfig:
+        return TraceConfig(
+            llm_provider=effective_settings.llm_provider,
+            rerank_top_k=int(effective_settings.rerank_top_k),
+            max_context_chunks=int(effective_settings.max_context_chunks),
+            llm_temperature=float(effective_settings.llm_temperature),
+            rerank_min_score=float(effective_settings.rerank_min_score),
+            fused_top_n=int(effective_settings.fused_top_n),
+            filenames=list(filenames) if filenames else None,
+        )
+
     def _retrieve_and_rerank(
         self,
         question: str,
         effective_settings: AppSettings,
         filenames: Sequence[str] | None,
-    ) -> tuple[list[RerankedChunk], float, float, float]:
-        """Run retrieve -> rerank -> neighbor-expand, returning
-        (chunks, embed_ms, search_ms, rerank_ms).
+    ) -> RetrievalPhase:
+        """Run retrieve -> rerank -> neighbor-expand.
 
         Inlines ``retrieve_candidates``' steps (rather than calling it as one call)
         so embedding and search can be timed separately for observability.
@@ -219,15 +260,22 @@ class RagPipeline:
         search_ms = (time.monotonic() - search_start) * 1000
 
         rerank_start = time.monotonic()
-        reranked = rerank_candidates(
+        outcome = rerank_candidates_detailed(
             query=question,
             candidates=candidates,
             reranker=self._reranker,
             settings=effective_settings,
         )
-        expanded = expand_with_neighbors(reranked, self._repository, effective_settings)
+        expanded = expand_with_neighbors(outcome.kept, self._repository, effective_settings)
         rerank_ms = (time.monotonic() - rerank_start) * 1000
-        return expanded, embed_ms, search_ms, rerank_ms
+        return RetrievalPhase(
+            context_chunks=expanded,
+            fused_candidates=candidates,
+            scored_chunks=outcome.scored,
+            embed_ms=embed_ms,
+            search_ms=search_ms,
+            rerank_ms=rerank_ms,
+        )
 
     def answer(
         self,
@@ -247,30 +295,81 @@ class RagPipeline:
         """
 
         total_start = time.monotonic()
-        effective_settings = self._effective_settings(overrides or AnswerOverrides())
+        trace_store = self._trace_store
+        trace_id = str(uuid.uuid4()) if trace_store is not None else None
+        effective_settings: AppSettings | None = None
 
-        reranked, embed_ms, search_ms, rerank_ms = self._retrieve_and_rerank(
-            question, effective_settings, filenames
-        )
+        try:
+            effective_settings = self._effective_settings(overrides or AnswerOverrides())
+            phase = self._retrieve_and_rerank(question, effective_settings, filenames)
+            selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
 
-        generate_start = time.monotonic()
-        grounded = generate_grounded_answer(
-            query=question,
-            context_chunks=reranked,
-            generator=self._generator,
-            settings=effective_settings,
-        )
-        generate_ms = (time.monotonic() - generate_start) * 1000
-        total_ms = (time.monotonic() - total_start) * 1000
+            generate_start = time.monotonic()
+            grounded = generate_grounded_answer(
+                query=question,
+                context_chunks=phase.context_chunks,
+                generator=self._generator,
+                settings=effective_settings,
+            )
+            generate_ms = (time.monotonic() - generate_start) * 1000
+            total_ms = (time.monotonic() - total_start) * 1000
 
-        timings = StageTimings(
-            embed_ms=embed_ms,
-            search_ms=search_ms,
-            rerank_ms=rerank_ms,
-            generate_ms=generate_ms,
-            total_ms=total_ms,
-        )
-        return replace(grounded, timings=timings)
+            timings = StageTimings(
+                embed_ms=phase.embed_ms,
+                search_ms=phase.search_ms,
+                rerank_ms=phase.rerank_ms,
+                generate_ms=generate_ms,
+                total_ms=total_ms,
+            )
+        except Exception as exc:
+            if trace_store is not None and trace_id is not None:
+                trace_store.add(
+                    QueryTrace(
+                        trace_id=trace_id,
+                        created_at=time.time(),
+                        question=question,
+                        mode="sync",
+                        status="error",
+                        config=self._trace_config(effective_settings, filenames)
+                        if effective_settings is not None
+                        else None,
+                        candidates=[],
+                        prompt_messages=None,
+                        answer=None,
+                        cited_source_numbers=[],
+                        timings=None,
+                        error=str(exc),
+                    )
+                )
+            raise
+
+        if trace_store is not None and trace_id is not None:
+            prompt_messages = (
+                build_grounded_messages(question.strip(), selected) if selected else None
+            )
+            trace_store.add(
+                QueryTrace(
+                    trace_id=trace_id,
+                    created_at=time.time(),
+                    question=question,
+                    mode="sync",
+                    status="ok" if selected else "insufficient_context",
+                    config=self._trace_config(effective_settings, filenames),
+                    candidates=build_trace_candidates(
+                        phase.fused_candidates,
+                        phase.scored_chunks,
+                        phase.context_chunks,
+                        selected,
+                        min_score=float(effective_settings.rerank_min_score),
+                    ),
+                    prompt_messages=prompt_messages,
+                    answer=grounded.answer,
+                    cited_source_numbers=[source.source_number for source in grounded.sources],
+                    timings=_timings_dict(timings),
+                    error=None,
+                )
+            )
+        return replace(grounded, timings=timings, trace_id=trace_id)
 
     def answer_stream(
         self,
@@ -286,63 +385,157 @@ class RagPipeline:
         """
 
         total_start = time.monotonic()
-        effective_settings = self._effective_settings(overrides or AnswerOverrides())
-
-        reranked, embed_ms, search_ms, rerank_ms = self._retrieve_and_rerank(
-            question, effective_settings, filenames
-        )
-        selected = reranked[: int(effective_settings.max_context_chunks)]
-
-        if not selected:
-            yield {"type": "sources", "sources": []}
-            total_ms = (time.monotonic() - total_start) * 1000
-            yield {
-                "type": "done",
-                "answer": INSUFFICIENT_CONTEXT_ANSWER,
-                "sources": [],
-                "timings": _timings_dict(
-                    StageTimings(
-                        embed_ms=embed_ms,
-                        search_ms=search_ms,
-                        rerank_ms=rerank_ms,
-                        generate_ms=0.0,
-                        total_ms=total_ms,
-                    )
-                ),
-            }
-            return
-
-        all_sources = source_citations(selected)
-        yield {"type": "sources", "sources": [_citation_dict(source) for source in all_sources]}
-
-        messages = build_grounded_messages(question, selected)
-        generate_start = time.monotonic()
+        trace_store = self._trace_store
+        trace_id = str(uuid.uuid4()) if trace_store is not None else None
+        effective_settings: AppSettings | None = None
         parts: list[str] = []
-        for delta in self._generator.stream(messages, effective_settings):
-            parts.append(delta)
-            yield {"type": "delta", "text": delta}
-        generate_ms = (time.monotonic() - generate_start) * 1000
+        # Set the moment a trace has been stored (success, insufficient-context, or a
+        # caught error below) — the `finally` clause uses this to detect the one case
+        # none of those cover: the client disconnecting (GeneratorExit, a BaseException
+        # that `except Exception` never sees) before any of them ran.
+        finalized = False
 
-        answer = "".join(parts).strip()
-        if not answer:
-            raise GenerationError("Generation provider returned an empty answer.")
+        def _store_error_trace(error: BaseException) -> None:
+            if trace_store is None or trace_id is None:
+                return
+            trace_store.add(
+                QueryTrace(
+                    trace_id=trace_id,
+                    created_at=time.time(),
+                    question=question,
+                    mode="stream",
+                    status="error",
+                    config=self._trace_config(effective_settings, filenames)
+                    if effective_settings is not None
+                    else None,
+                    candidates=[],
+                    prompt_messages=None,
+                    answer="".join(parts).strip() or None,
+                    cited_source_numbers=[],
+                    timings=None,
+                    error=str(error),
+                )
+            )
 
-        total_ms = (time.monotonic() - total_start) * 1000
-        cited = cited_sources(answer, all_sources)
-        yield {
-            "type": "done",
-            "answer": answer,
-            "sources": [_citation_dict(source) for source in cited],
-            "timings": _timings_dict(
-                StageTimings(
-                    embed_ms=embed_ms,
-                    search_ms=search_ms,
-                    rerank_ms=rerank_ms,
-                    generate_ms=generate_ms,
+        try:
+            effective_settings = self._effective_settings(overrides or AnswerOverrides())
+            phase = self._retrieve_and_rerank(question, effective_settings, filenames)
+            selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
+
+            if not selected:
+                yield {"type": "sources", "sources": [], "trace_id": trace_id}
+                total_ms = (time.monotonic() - total_start) * 1000
+                timings = StageTimings(
+                    embed_ms=phase.embed_ms,
+                    search_ms=phase.search_ms,
+                    rerank_ms=phase.rerank_ms,
+                    generate_ms=0.0,
                     total_ms=total_ms,
                 )
-            ),
-        }
+                if trace_store is not None and trace_id is not None:
+                    trace_store.add(
+                        QueryTrace(
+                            trace_id=trace_id,
+                            created_at=time.time(),
+                            question=question,
+                            mode="stream",
+                            status="insufficient_context",
+                            config=self._trace_config(effective_settings, filenames),
+                            candidates=build_trace_candidates(
+                                phase.fused_candidates,
+                                phase.scored_chunks,
+                                phase.context_chunks,
+                                [],
+                                min_score=float(effective_settings.rerank_min_score),
+                            ),
+                            prompt_messages=None,
+                            answer=INSUFFICIENT_CONTEXT_ANSWER,
+                            cited_source_numbers=[],
+                            timings=_timings_dict(timings),
+                            error=None,
+                        )
+                    )
+                finalized = True
+                yield {
+                    "type": "done",
+                    "answer": INSUFFICIENT_CONTEXT_ANSWER,
+                    "sources": [],
+                    "timings": _timings_dict(timings),
+                    "trace_id": trace_id,
+                }
+                return
+
+            all_sources = source_citations(selected)
+            yield {
+                "type": "sources",
+                "sources": [_citation_dict(source) for source in all_sources],
+                "trace_id": trace_id,
+            }
+
+            messages = build_grounded_messages(question, selected)
+            generate_start = time.monotonic()
+            for delta in self._generator.stream(messages, effective_settings):
+                parts.append(delta)
+                yield {"type": "delta", "text": delta}
+            generate_ms = (time.monotonic() - generate_start) * 1000
+
+            answer = "".join(parts).strip()
+            if not answer:
+                raise GenerationError("Generation provider returned an empty answer.")
+
+            total_ms = (time.monotonic() - total_start) * 1000
+            cited = cited_sources(answer, all_sources)
+            timings = StageTimings(
+                embed_ms=phase.embed_ms,
+                search_ms=phase.search_ms,
+                rerank_ms=phase.rerank_ms,
+                generate_ms=generate_ms,
+                total_ms=total_ms,
+            )
+            if trace_store is not None and trace_id is not None:
+                trace_store.add(
+                    QueryTrace(
+                        trace_id=trace_id,
+                        created_at=time.time(),
+                        question=question,
+                        mode="stream",
+                        status="ok",
+                        config=self._trace_config(effective_settings, filenames),
+                        candidates=build_trace_candidates(
+                            phase.fused_candidates,
+                            phase.scored_chunks,
+                            phase.context_chunks,
+                            selected,
+                            min_score=float(effective_settings.rerank_min_score),
+                        ),
+                        prompt_messages=list(messages),
+                        answer=answer,
+                        cited_source_numbers=[source.source_number for source in cited],
+                        timings=_timings_dict(timings),
+                        error=None,
+                    )
+                )
+            finalized = True
+            yield {
+                "type": "done",
+                "answer": answer,
+                "sources": [_citation_dict(source) for source in cited],
+                "timings": _timings_dict(timings),
+                "trace_id": trace_id,
+            }
+        except Exception as exc:
+            if not finalized:
+                _store_error_trace(exc)
+                finalized = True
+            raise
+        finally:
+            if not finalized:
+                # Reached only via GeneratorExit (the client disconnected, or the
+                # generator was otherwise closed mid-stream without completing or
+                # raising an `Exception`) — `finally` re-raises it automatically once
+                # this block returns, so no explicit `raise` is needed here.
+                _store_error_trace(RuntimeError("Stream closed before completion."))
+                finalized = True
 
 
 @dataclass(frozen=True)

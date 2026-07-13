@@ -22,6 +22,8 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
     content,
     sources,
     timestamp: Date.now(),
+    timings: null,
+    traceId: null,
   };
 }
 
@@ -78,14 +80,17 @@ export function useChat(): UseChatResult {
         overrides,
         filenames,
         {
-          onSources: (sources) => {
-            updateAssistantTurn((turn) => ({ ...turn, sources }));
+          onSources: (sources, traceId) => {
+            // traceId lands on the turn here (before generation starts) so an
+            // assistant turn that errors mid-stream still links to its (partial)
+            // debug trace, not just a turn that completed successfully.
+            updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
           },
           onDelta: (text) => {
             updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }));
           },
-          onDone: (answer, sources) => {
-            updateAssistantTurn((turn) => ({ ...turn, content: answer, sources }));
+          onDone: (answer, sources, timings, traceId) => {
+            updateAssistantTurn((turn) => ({ ...turn, content: answer, sources, timings, traceId }));
           },
         },
         controller.signal,

@@ -207,7 +207,7 @@ describe('askQuestionStream', () => {
 
   it('parses sources, delta, and done SSE events in order', async () => {
     const frames = [
-      `data: ${JSON.stringify({ type: 'sources', sources: [] })}\n\n`,
+      `data: ${JSON.stringify({ type: 'sources', sources: [], trace_id: 'trace-1' })}\n\n`,
       `data: ${JSON.stringify({ type: 'delta', text: 'Hel' })}\n\n`,
       `data: ${JSON.stringify({ type: 'delta', text: 'lo' })}\n\n`,
       `data: ${JSON.stringify({
@@ -215,6 +215,7 @@ describe('askQuestionStream', () => {
         answer: 'Hello',
         sources: [],
         timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+        trace_id: 'trace-1',
       })}\n\n`,
     ];
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(frames)));
@@ -229,10 +230,15 @@ describe('askQuestionStream', () => {
       onDone,
     });
 
-    expect(onSources).toHaveBeenCalledWith([]);
+    expect(onSources).toHaveBeenCalledWith([], 'trace-1');
     expect(onDelta).toHaveBeenNthCalledWith(1, 'Hel');
     expect(onDelta).toHaveBeenNthCalledWith(2, 'lo');
-    expect(onDone).toHaveBeenCalledWith('Hello', [], { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 });
+    expect(onDone).toHaveBeenCalledWith(
+      'Hello',
+      [],
+      { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+      'trace-1',
+    );
   });
 
   it('throws ApiClientError on a non-2xx response before reading the stream', async () => {
@@ -254,5 +260,31 @@ describe('askQuestionStream', () => {
 
     const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
     expect(body).toEqual({ question: 'hi', filenames: ['a.txt'] });
+  });
+});
+
+describe('getTrace', () => {
+  it('fetches the trace detail endpoint by id', async () => {
+    const detail = {
+      trace_id: 'trace-1',
+      created_at: 0,
+      question: 'alpha',
+      mode: 'sync',
+      status: 'ok',
+      config: null,
+      candidates: [],
+      prompt_messages: null,
+      answer: 'Alpha [1].',
+      cited_source_numbers: [1],
+      timings: null,
+      error: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, detail));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.getTrace('trace-1');
+
+    expect(result).toEqual(detail);
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/traces/trace-1');
   });
 });
