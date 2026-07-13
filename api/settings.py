@@ -102,6 +102,14 @@ class AppSettings(BaseSettings):
     # after a config change pays that download cost once.
     warmup_models: bool = False
 
+    # Per-query debug traces (retrieval candidates, rerank keep/drop decisions, the
+    # full generation prompt, stage timings) held in an in-memory ring buffer — same
+    # persistence tradeoff as IngestJobStore: lost on restart, fine for debugging a
+    # running instance. trace_max_retained caps memory use for large prompts/candidate
+    # lists; oldest traces are pruned first once the cap is exceeded.
+    trace_enabled: bool = True
+    trace_max_retained: PositiveInt = 100
+
 
 def get_settings() -> AppSettings:
     """Return settings from the current process environment."""

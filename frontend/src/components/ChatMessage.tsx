@@ -1,5 +1,6 @@
-import type { CitationResponse } from '../api/types';
+import type { CitationResponse, TimingsResponse } from '../api/types';
 import CitationCard from './CitationCard';
+import TraceDrawer from './TraceDrawer';
 import './ChatMessage.css';
 
 export interface ChatTurn {
@@ -8,6 +9,8 @@ export interface ChatTurn {
   content: string;
   sources: CitationResponse[];
   timestamp: number;
+  timings: TimingsResponse | null;
+  traceId: string | null;
 }
 
 interface ChatMessageProps {
@@ -48,6 +51,9 @@ function ChatMessage({ turn }: ChatMessageProps) {
             />
           ))}
         </div>
+      )}
+      {turn.role === 'assistant' && turn.traceId && (
+        <TraceDrawer traceId={turn.traceId} timings={turn.timings} />
       )}
     </div>
   );

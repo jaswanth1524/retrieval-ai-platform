@@ -9,6 +9,8 @@ function makeTurn(overrides: Partial<ChatTurn>): ChatTurn {
     content: 'Hello',
     sources: [],
     timestamp: 0,
+    timings: null,
+    traceId: null,
     ...overrides,
   };
 }
@@ -59,5 +61,19 @@ describe('ChatMessage', () => {
     render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} />);
 
     expect(screen.getByRole('alert')).toHaveTextContent('API returned HTTP 502.');
+  });
+
+  it('renders the trace drawer toggle for an assistant turn with a traceId', () => {
+    render(
+      <ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.', traceId: 'trace-1' })} />,
+    );
+
+    expect(screen.getByTestId('trace-drawer-toggle')).toBeInTheDocument();
+  });
+
+  it('renders no trace drawer when the turn has no traceId', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} />);
+
+    expect(screen.queryByTestId('trace-drawer-toggle')).not.toBeInTheDocument();
   });
 });

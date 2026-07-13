@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from api.reranking import LocalCrossEncoderReranker, RerankingError, rerank_candidates
+from api.reranking import (
+    LocalCrossEncoderReranker,
+    RerankingError,
+    rerank_candidates,
+    rerank_candidates_detailed,
+)
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
 
@@ -196,6 +201,48 @@ def test_rerank_candidates_returns_empty_when_all_below_min_score() -> None:
     results = rerank_candidates("query", candidates, reranker, settings)
 
     assert results == []
+
+
+def test_rerank_candidates_detailed_scored_includes_dropped_below_min_score() -> None:
+    """`.kept` matches `rerank_candidates`'s return; `.scored` also carries the
+    candidate that was filtered out, for trace/debug visibility into why."""
+
+    settings = make_settings(rerank_top_k=5, rerank_min_score=0.30)
+    candidates = [
+        make_candidate("relevant", "on topic", 0.9),
+        make_candidate("irrelevant", "off topic", 0.1),
+    ]
+    reranker = FakeReranker([2.0, -5.0])
+
+    outcome = rerank_candidates_detailed("query", candidates, reranker, settings)
+
+    assert [c.chunk_id for c in outcome.kept] == ["relevant"]
+    assert {c.chunk_id for c in outcome.scored} == {"relevant", "irrelevant"}
+    assert outcome.kept == rerank_candidates("query", candidates, reranker, settings)
+
+
+def test_rerank_candidates_detailed_scored_excludes_beyond_rerank_candidates_cap() -> None:
+    """A candidate outside the `rerank_candidates` cutoff was never sent to the
+    cross-encoder at all, so it must not appear in `.scored` either."""
+
+    settings = make_settings(fused_top_n=5, rerank_top_k=5, rerank_candidates=2)
+    candidates = [
+        make_candidate("c1", "first", 0.9),
+        make_candidate("c2", "second", 0.8),
+        make_candidate("c3", "third", 0.7),
+    ]
+    reranker = FakeReranker([0.1, 0.2])
+
+    outcome = rerank_candidates_detailed("query", candidates, reranker, settings)
+
+    assert {c.chunk_id for c in outcome.scored} == {"c1", "c2"}
+
+
+def test_rerank_candidates_detailed_empty_candidates_returns_empty_outcome() -> None:
+    outcome = rerank_candidates_detailed("query", [], FakeReranker([1.0]), make_settings())
+
+    assert outcome.scored == []
+    assert outcome.kept == []
 
 
 def test_local_cross_encoder_reranker_delegates_to_model() -> None:

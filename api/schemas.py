@@ -86,6 +86,78 @@ class DocumentListResponse(BaseModel):
     filenames: list[str]
 
 
+class PromptMessageResponse(BaseModel):
+    """One message from the exact prompt sent to the generation provider."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class TraceConfigResponse(BaseModel):
+    """Effective per-request settings a trace was generated under."""
+
+    llm_provider: str
+    rerank_top_k: int
+    max_context_chunks: int
+    llm_temperature: float
+    rerank_min_score: float
+    fused_top_n: int
+    filenames: list[str] | None
+
+
+class TraceCandidateResponse(BaseModel):
+    """One fused retrieval candidate's journey through rerank and context selection."""
+
+    point_id: str
+    filename: str
+    page: int
+    section: str
+    chunk_id: str
+    retrieval_score: float
+    rerank_score: float | None
+    kept: bool
+    drop_reason: Literal["below_min_score", "top_k_cut", "not_scored"] | None
+    selected_for_context: bool
+    neighbor_expanded: bool
+
+
+class TraceSummaryResponse(BaseModel):
+    """One row of the trace list — enough to pick a trace without fetching it."""
+
+    trace_id: str
+    created_at: float
+    question: str
+    mode: Literal["sync", "stream"]
+    status: Literal["ok", "insufficient_context", "error"]
+    llm_provider: str | None
+    total_ms: float | None
+    candidate_count: int
+    kept_count: int
+
+
+class TraceListResponse(BaseModel):
+    """Recent query traces, newest first."""
+
+    traces: list[TraceSummaryResponse]
+
+
+class TraceDetailResponse(BaseModel):
+    """Full per-query debug trace: candidates, the exact prompt, and timings."""
+
+    trace_id: str
+    created_at: float
+    question: str
+    mode: Literal["sync", "stream"]
+    status: Literal["ok", "insufficient_context", "error"]
+    config: TraceConfigResponse | None
+    candidates: list[TraceCandidateResponse]
+    prompt_messages: list[PromptMessageResponse] | None
+    answer: str | None
+    cited_source_numbers: list[int]
+    timings: TimingsResponse | None
+    error: str | None
+
+
 class QuestionRequest(BaseModel):
     """Question-answering request."""
 
@@ -144,4 +216,5 @@ class QuestionResponse(BaseModel):
     answer: str
     sources: list[CitationResponse]
     timings: TimingsResponse | None = None
+    trace_id: str | None = None
 

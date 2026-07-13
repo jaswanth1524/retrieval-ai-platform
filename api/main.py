@@ -27,6 +27,7 @@ from api.dependencies import (
     get_ollama_reachability_checker,
     get_rag_pipeline,
     get_reranker,
+    get_trace_store,
     get_vector_repository,
 )
 from api.documents import DocumentError
@@ -55,12 +56,19 @@ from api.schemas import (
     DocumentJobStatusResponse,
     DocumentListResponse,
     HealthResponse,
+    PromptMessageResponse,
     PublicConfigResponse,
     QuestionRequest,
     QuestionResponse,
     TimingsResponse,
+    TraceCandidateResponse,
+    TraceConfigResponse,
+    TraceDetailResponse,
+    TraceListResponse,
+    TraceSummaryResponse,
 )
 from api.settings import AppSettings
+from api.tracing import QueryTrace, TraceNotFoundError, TraceStore
 from api.upload import UploadTooLargeError, read_upload_within_limit
 
 logger = logging.getLogger(__name__)
@@ -72,6 +80,7 @@ OllamaCheckDep = Annotated[Callable[[AppSettings], bool], Depends(get_ollama_rea
 VectorRepositoryDep = Annotated[VectorRepository, Depends(get_vector_repository)]
 IngestJobStoreDep = Annotated[IngestJobStore, Depends(get_ingest_job_store)]
 IngestExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_ingest_executor)]
+TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
 
 
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
@@ -220,6 +229,75 @@ def _timings_response(timings: StageTimings | None) -> TimingsResponse | None:
     )
 
 
+def _trace_summary_response(trace: QueryTrace) -> TraceSummaryResponse:
+    """Build one row of the trace list from a stored trace."""
+
+    return TraceSummaryResponse(
+        trace_id=trace.trace_id,
+        created_at=trace.created_at,
+        question=trace.question,
+        mode=trace.mode,
+        status=trace.status,
+        llm_provider=trace.config.llm_provider if trace.config is not None else None,
+        total_ms=trace.timings.get("total_ms") if trace.timings is not None else None,
+        candidate_count=len(trace.candidates),
+        kept_count=sum(1 for candidate in trace.candidates if candidate.kept),
+    )
+
+
+def _trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
+    """Build the full trace detail response from a stored trace."""
+
+    return TraceDetailResponse(
+        trace_id=trace.trace_id,
+        created_at=trace.created_at,
+        question=trace.question,
+        mode=trace.mode,
+        status=trace.status,
+        config=(
+            TraceConfigResponse(
+                llm_provider=trace.config.llm_provider,
+                rerank_top_k=trace.config.rerank_top_k,
+                max_context_chunks=trace.config.max_context_chunks,
+                llm_temperature=trace.config.llm_temperature,
+                rerank_min_score=trace.config.rerank_min_score,
+                fused_top_n=trace.config.fused_top_n,
+                filenames=trace.config.filenames,
+            )
+            if trace.config is not None
+            else None
+        ),
+        candidates=[
+            TraceCandidateResponse(
+                point_id=candidate.point_id,
+                filename=candidate.filename,
+                page=candidate.page,
+                section=candidate.section,
+                chunk_id=candidate.chunk_id,
+                retrieval_score=candidate.retrieval_score,
+                rerank_score=candidate.rerank_score,
+                kept=candidate.kept,
+                drop_reason=candidate.drop_reason,
+                selected_for_context=candidate.selected_for_context,
+                neighbor_expanded=candidate.neighbor_expanded,
+            )
+            for candidate in trace.candidates
+        ],
+        prompt_messages=(
+            [
+                PromptMessageResponse(role=message["role"], content=message["content"])
+                for message in trace.prompt_messages
+            ]
+            if trace.prompt_messages is not None
+            else None
+        ),
+        answer=trace.answer,
+        cited_source_numbers=trace.cited_source_numbers,
+        timings=TimingsResponse(**trace.timings) if trace.timings is not None else None,
+        error=trace.error,
+    )
+
+
 def _timings_dict(timings: StageTimings) -> dict[str, float]:
     return {
         "embed_ms": timings.embed_ms,
@@ -304,6 +382,19 @@ def register_routes(app: FastAPI) -> None:
             result=result,
         )
 
+    @app.get("/traces", response_model=TraceListResponse)
+    def list_traces(trace_store: TraceStoreDep) -> TraceListResponse:
+        return TraceListResponse(
+            traces=[_trace_summary_response(trace) for trace in trace_store.list_traces()]
+        )
+
+    @app.get("/traces/{trace_id}", response_model=TraceDetailResponse)
+    def get_trace(trace_id: str, trace_store: TraceStoreDep) -> TraceDetailResponse:
+        trace = trace_store.get(trace_id)
+        if trace is None:
+            raise TraceNotFoundError(f"No trace found with id '{trace_id}'.")
+        return _trace_detail_response(trace)
+
     @app.post("/questions", response_model=QuestionResponse)
     def answer_question(
         request: QuestionRequest,
@@ -346,6 +437,7 @@ def register_routes(app: FastAPI) -> None:
                 for source in grounded.sources
             ],
             timings=_timings_response(grounded.timings),
+            trace_id=grounded.trace_id,
         )
 
     @app.post("/questions/stream")
@@ -429,6 +521,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RerankingError, bad_gateway_handler)
     app.add_exception_handler(EmbeddingError, internal_error_handler)
     app.add_exception_handler(JobNotFoundError, not_found_handler)
+    app.add_exception_handler(TraceNotFoundError, not_found_handler)
 
 
 async def bad_request_handler(request: Request, exc: Exception) -> JSONResponse:
