@@ -6,9 +6,11 @@ interface ChatThreadProps {
   turns: ChatTurn[];
   pending: boolean;
   onCancel: () => void;
+  onRetry?: (question: string) => void;
+  onOpenSource?: (filename: string, chunkId: string) => void;
 }
 
-function ChatThread({ turns, pending, onCancel }: ChatThreadProps) {
+function ChatThread({ turns, pending, onCancel, onRetry, onOpenSource }: ChatThreadProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -26,7 +28,7 @@ function ChatThread({ turns, pending, onCancel }: ChatThreadProps) {
   return (
     <div className="chat-thread">
       {turns.map((turn) => (
-        <ChatMessage key={turn.id} turn={turn} />
+        <ChatMessage key={turn.id} turn={turn} onRetry={onRetry} onOpenSource={onOpenSource} />
       ))}
       {pending && (
         <div

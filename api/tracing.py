@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import Literal, Protocol
 
@@ -20,7 +21,7 @@ from api.retrieval import RetrievedChunk
 
 TraceStatus = Literal["ok", "insufficient_context", "error"]
 TraceMode = Literal["sync", "stream"]
-DropReason = Literal["below_min_score", "top_k_cut", "not_scored"]
+DropReason = Literal["below_min_score", "near_duplicate", "top_k_cut", "not_scored"]
 
 
 class TraceNotFoundError(RuntimeError):
@@ -75,6 +76,16 @@ class QueryTrace:
     cited_source_numbers: list[int]
     timings: dict[str, float] | None
     error: str | None
+    # None when no history was sent, condense was disabled, or the condense call
+    # failed/returned empty and the pipeline fell back to the raw question — in the
+    # error path specifically, None also covers "the failure preceded condense."
+    condensed_question: str | None = None
+    history_message_count: int = 0
+    # Alternative query phrasings used for multi-query retrieval (empty when expansion
+    # is disabled — the default).
+    query_variants: list[str] = field(default_factory=list)
+    # True when the answer initially lacked citations and a stricter retry supplied them.
+    citation_retry_used: bool = False
 
 
 class TraceSink(Protocol):
@@ -124,6 +135,7 @@ def build_trace_candidates(
     selected_chunks: Sequence[RerankedChunk],
     *,
     min_score: float,
+    diversity_dropped_ids: AbstractSet[str] = frozenset(),
 ) -> list[TraceCandidate]:
     """Join the fused, scored, kept, and context-selected candidate lists by point id.
 
@@ -152,6 +164,8 @@ def build_trace_candidates(
                 drop_reason = "not_scored"
             elif scored.rerank_score < min_score:
                 drop_reason = "below_min_score"
+            elif candidate.point_id in diversity_dropped_ids:
+                drop_reason = "near_duplicate"
             else:
                 drop_reason = "top_k_cut"
         result.append(

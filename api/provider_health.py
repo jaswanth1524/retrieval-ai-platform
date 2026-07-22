@@ -1,8 +1,9 @@
-"""Lightweight reachability checks for generation providers."""
+"""Lightweight reachability checks for generation providers and the vector store."""
 
 from __future__ import annotations
 
 import httpx
+from qdrant_client import QdrantClient
 
 from api.settings import AppSettings
 
@@ -24,3 +25,17 @@ def check_ollama_reachable(settings: AppSettings) -> bool:
     except httpx.HTTPError:
         return False
     return response.is_success
+
+
+def check_qdrant_reachable(client: QdrantClient) -> bool:
+    """Return True only if Qdrant answers a cheap metadata call.
+
+    Same never-raises contract as ``check_ollama_reachable`` — a readiness probe
+    must never itself become a source of 500s.
+    """
+
+    try:
+        client.get_collections()
+    except Exception:
+        return False
+    return True

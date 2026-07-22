@@ -16,7 +16,14 @@ afterEach(() => {
   getTraceMock.mockReset();
 });
 
-const ZERO_TIMINGS = { embed_ms: 1, search_ms: 2, rerank_ms: 3, generate_ms: 4, total_ms: 10 };
+const ZERO_TIMINGS = {
+  embed_ms: 1,
+  search_ms: 2,
+  rerank_ms: 3,
+  generate_ms: 4,
+  total_ms: 10,
+  condense_ms: 0,
+};
 
 function makeDetail(overrides: Partial<TraceDetailResponse> = {}): TraceDetailResponse {
   return {

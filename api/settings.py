@@ -1,7 +1,12 @@
 """Application settings loaded from environment variables."""
 
-from pydantic import Field, PositiveInt
+from pydantic import Field, PositiveInt, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+# OpenAI reasoning models (gpt-5 family, o-series) accept a reasoning_effort knob;
+# "" disables sending it (uses the provider default).
+_VALID_REASONING_EFFORTS = frozenset({"", "minimal", "low", "medium", "high"})
 
 
 class AppSettings(BaseSettings):
@@ -21,6 +26,11 @@ class AppSettings(BaseSettings):
 
     dense_embedding_model: str = "BAAI/bge-small-en-v1.5"
     sparse_embedding_model: str = "Qdrant/BM25"
+    # Prepended to the dense query text only (never the corpus side) before embedding.
+    # bge-small's model card recommends this instruction for short-query→passage
+    # retrieval, and fastembed does not apply it for us. Empty string disables it.
+    # Query-side only, so changing it needs no re-ingest.
+    dense_query_instruction: str = "Represent this sentence for searching relevant passages: "
     reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
     embedding_model_tag: str = "fastembed:BAAI/bge-small-en-v1.5"
 
@@ -60,30 +70,59 @@ class AppSettings(BaseSettings):
     ollama_keep_alive: str = "30m"
     openai_api_key: str | None = Field(default=None)
     openai_model: str = "gpt-4o-mini"
+    # Reasoning models (gpt-5 family) spend hidden reasoning tokens out of the same
+    # max_completion_tokens budget as the visible answer. "low" keeps that spend modest
+    # while still reasoning; "minimal" nearly eliminates it. "" leaves the provider
+    # default. Only applied to models LiteLLM reports as reasoning-capable.
+    openai_reasoning_effort: str = "low"
+    # Extra output-token budget added ON TOP of llm_max_tokens for reasoning models, so
+    # hidden reasoning tokens don't starve the visible answer (a 512 budget is entirely
+    # consumed by reasoning on non-trivial questions, yielding an empty answer). Ignored
+    # for non-reasoning models, which keep the plain llm_max_tokens budget.
+    reasoning_token_headroom: PositiveInt = 3072
 
     max_upload_bytes: PositiveInt = 50 * 1024 * 1024
-    # Despite the name, this counts whitespace-delimited words (api/documents.py splits
-    # on str.split()), not the dense embedding model's subword tokens. bge-small hard-
-    # truncates at 512 subword tokens, and English words expand to ~1.3-1.8 subword
-    # tokens each, so 300 words stays safely under that limit after expansion; 500
-    # silently dropped the tail of most full-size chunks from the embedded vector.
-    chunk_size_tokens: PositiveInt = 300
-    chunk_overlap_tokens: int = Field(default=75, ge=0)
+    # Real dense-model subword tokens (api/chunking.py counts with the model's own
+    # tokenizer). bge-small hard-truncates at 512 tokens; the chunker reserves headroom
+    # for the contextual-embedding prefix and never exceeds this budget, so the embedded
+    # string fits the model. 448 leaves margin under 512 for special tokens and the
+    # prefix. Changing this alters chunk contents — re-upload documents for consistency.
+    chunk_size_tokens: PositiveInt = 448
+    chunk_overlap_tokens: int = Field(default=100, ge=0)
     # Markdown heading sections shorter than this are folded into a neighboring
     # section before chunking, so a one-line subsection doesn't become its own
     # low-information, hard-to-retrieve chunk.
     min_section_words: int = Field(default=40, ge=0)
+
+    # CSV rows per section: a CSV upload is grouped into sections of this many data
+    # rows (each row rendered as "col: value; ..."), so citations point at a labeled
+    # row range instead of one giant section.
+    csv_rows_per_section: int = Field(default=50, ge=1)
 
     # Chunks are embedded and upserted in batches of this size rather than all at
     # once, so a single huge document reports incremental job progress and never
     # holds one giant embedding call in memory.
     ingest_batch_size: PositiveInt = 64
 
+    # Finished background ingest jobs beyond this count are pruned oldest-first, so
+    # a long-running process doesn't accumulate unbounded job history in memory —
+    # same tradeoff/pattern as trace_max_retained below.
+    ingest_jobs_max_retained: PositiveInt = 50
+
     # After rerank, each selected chunk's context is expanded with up to this many
     # neighboring chunks (by chunk_ordinal) on each side from the same document —
     # small-to-big retrieval: rerank on tight chunks, generate on richer context.
     # 0 disables expansion entirely.
     context_neighbor_radius: int = Field(default=1, ge=0)
+
+    # Post-rerank diversity/dedup: after scoring, drop a survivor that is a near-
+    # duplicate of a higher-ranked kept chunk (same-document neighbor within
+    # context_neighbor_radius ordinals, whose expanded contexts would nearly coincide,
+    # OR word-shingle Jaccard >= context_diversity_max_similarity). Freed slots refill
+    # from lower-ranked survivors, so context still gets up to rerank_top_k *distinct*
+    # chunks. Pure selection after scoring — rerank scores/order are untouched.
+    context_diversity_enabled: bool = True
+    context_diversity_max_similarity: float = Field(default=0.6, gt=0.0, le=1.0)
 
     # Inert in the primary paths (dev uses the Vite proxy, prod serves the frontend
     # same-origin via StaticFiles) — a fallback for a contributor who points a
@@ -109,6 +148,65 @@ class AppSettings(BaseSettings):
     # lists; oldest traces are pruned first once the cap is exceeded.
     trace_enabled: bool = True
     trace_max_retained: PositiveInt = 100
+
+    # Conversation memory: the client sends recent prior turns with each question
+    # (the server stays stateless — no session store). When history is present, one
+    # extra LLM call rewrites the follow-up into a standalone retrieval query before
+    # embedding/search/rerank, so "what about the second one?" doesn't get embedded
+    # literally. Generation always sees the raw history either way; this only gates
+    # the condense step.
+    conversation_condense_enabled: bool = True
+    # Server-side truncation cap (most recent messages kept) — independent of the
+    # request schema's own cap, so an operator can tighten it without a schema change.
+    conversation_max_history_messages: int = Field(default=12, ge=0)
+    # The condense call only needs to produce one rewritten sentence — capped well
+    # below llm_max_tokens so a runaway rewrite can't burn the generation token budget.
+    condense_max_tokens: PositiveInt = 128
+
+    # Multi-query expansion (default OFF): when enabled, one LLM call rewrites the
+    # query into query_expansion_count alternative phrasings; each is embedded and
+    # hybrid-searched, and the result lists are RRF-fused (same pinned rrf_k) before a
+    # single rerank. Adds one LLM round-trip per question, so it stays opt-in.
+    query_expansion_enabled: bool = False
+    query_expansion_count: int = Field(default=3, ge=1, le=8)
+    query_expansion_max_tokens: PositiveInt = 192
+
+    # Zero-citation retry (default ON): if a non-insufficient answer comes back with no
+    # [n] citation markers though sources were available, retry once with a stricter
+    # reminder to cite. Never loops; falls back to the original answer if the retry
+    # still lacks citations. See api/generation.py.
+    citation_retry_enabled: bool = True
+
+    # Verbosity of the application's own loggers (the "api" and "eval" namespaces).
+    # api/logging_config.py consumes this via dictConfig at app construction; without
+    # it the root logger's WARNING default silences every logger.info in the codebase
+    # (request logs, ingest progress, warmup notices).
+    log_level: str = "INFO"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized not in _VALID_LOG_LEVELS:
+                raise ValueError(
+                    f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}, got {value!r}."
+                )
+            return normalized
+        return value
+
+    @field_validator("openai_reasoning_effort", mode="before")
+    @classmethod
+    def _normalize_reasoning_effort(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in _VALID_REASONING_EFFORTS:
+                raise ValueError(
+                    "openai_reasoning_effort must be one of "
+                    f"{sorted(_VALID_REASONING_EFFORTS)}, got {value!r}."
+                )
+            return normalized
+        return value
 
 
 def get_settings() -> AppSettings:

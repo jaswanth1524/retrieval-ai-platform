@@ -40,7 +40,7 @@ export interface DocumentIngestResponse {
   collection_name: string;
 }
 
-export type IngestJobState = 'queued' | 'parsing' | 'embedding' | 'indexing' | 'done' | 'failed';
+export type IngestJobState = 'queued' | 'parsing' | 'embedding' | 'done' | 'failed';
 
 export interface DocumentJobAcceptedResponse {
   job_id: string;
@@ -62,6 +62,24 @@ export interface DocumentListResponse {
   filenames: string[];
 }
 
+export interface DocumentDeleteResponse {
+  filename: string;
+  points_deleted: number;
+}
+
+export interface DocumentChunkResponse {
+  chunk_id: string;
+  page: number;
+  section: string;
+  text: string;
+  chunk_ordinal: number | null;
+}
+
+export interface DocumentContentResponse {
+  filename: string;
+  chunks: DocumentChunkResponse[];
+}
+
 export interface CitationResponse {
   source_number: number;
   filename: string;
@@ -77,6 +95,13 @@ export interface TimingsResponse {
   rerank_ms: number;
   generate_ms: number;
   total_ms: number;
+  condense_ms: number;
+  expand_ms?: number;
+}
+
+export interface HistoryMessage {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 export interface QuestionResponse {
@@ -90,7 +115,7 @@ export type LlmProvider = 'ollama' | 'openai';
 
 export type TraceStatus = 'ok' | 'insufficient_context' | 'error';
 export type TraceMode = 'sync' | 'stream';
-export type TraceDropReason = 'below_min_score' | 'top_k_cut' | 'not_scored';
+export type TraceDropReason = 'below_min_score' | 'near_duplicate' | 'top_k_cut' | 'not_scored';
 
 export interface PromptMessage {
   role: 'system' | 'user' | 'assistant';
@@ -150,4 +175,8 @@ export interface TraceDetailResponse {
   cited_source_numbers: number[];
   timings: TimingsResponse | null;
   error: string | null;
+  condensed_question?: string | null;
+  history_message_count?: number;
+  query_variants?: string[];
+  citation_retry_used?: boolean;
 }

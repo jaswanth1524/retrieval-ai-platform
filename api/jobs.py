@@ -14,17 +14,13 @@ from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import Literal
 
-JobState = Literal["queued", "parsing", "embedding", "indexing", "done", "failed"]
+JobState = Literal["queued", "parsing", "embedding", "done", "failed"]
 
 
 class JobNotFoundError(RuntimeError):
     """Raised when a job id has no known job (never existed, or was pruned)."""
 
 TERMINAL_STATES: frozenset[JobState] = frozenset({"done", "failed"})
-
-# Finished jobs beyond this count are pruned oldest-first, so a long-running process
-# doesn't accumulate unbounded job history in memory.
-_MAX_RETAINED_JOBS = 50
 
 
 @dataclass
@@ -44,7 +40,11 @@ class IngestJob:
 class IngestJobStore:
     """Thread-safe in-memory store for background ingest job status."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_retained: int) -> None:
+        # Finished jobs beyond this count are pruned oldest-first, so a long-running
+        # process doesn't accumulate unbounded job history in memory — mirrors
+        # TraceStore's max_retained (api.tracing), sized from AppSettings.
+        self._max_retained = max_retained
         self._lock = Lock()
         self._jobs: OrderedDict[str, IngestJob] = OrderedDict()
 
@@ -75,7 +75,7 @@ class IngestJobStore:
                 setattr(job, key, value)
 
     def _prune_finished_locked(self) -> None:
-        overflow = len(self._jobs) - _MAX_RETAINED_JOBS
+        overflow = len(self._jobs) - self._max_retained
         if overflow <= 0:
             return
         finished_ids = [

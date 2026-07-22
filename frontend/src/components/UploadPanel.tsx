@@ -29,7 +29,6 @@ const PROGRESS_LABELS: Record<IngestJobState, string> = {
   queued: 'Queued...',
   parsing: 'Parsing...',
   embedding: 'Embedding...',
-  indexing: 'Indexing...',
   done: 'Done',
   failed: 'Failed',
 };
@@ -129,12 +128,12 @@ function UploadPanel({ onUpload, uploads, maxUploadBytes = DEFAULT_MAX_UPLOAD_BY
         <span className="upload-panel__dropzone-text">
           Drop files or <span className="upload-panel__dropzone-browse">browse</span>
         </span>
-        <span className="upload-panel__dropzone-hint">PDF, TXT, MD &middot; up to {formatBytes(maxUploadBytes)} each</span>
+        <span className="upload-panel__dropzone-hint">PDF, DOCX, HTML, CSV, TXT, MD &middot; up to {formatBytes(maxUploadBytes)} each</span>
         <input
           ref={inputRef}
           type="file"
           className="upload-panel__input"
-          accept=".pdf,.txt,.md,.markdown"
+          accept=".pdf,.txt,.md,.markdown,.docx,.html,.htm,.csv"
           multiple
           onChange={(event) => handleFilesChange(event.target.files)}
           disabled={uploading}

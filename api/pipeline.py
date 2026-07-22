@@ -4,28 +4,36 @@ chunk -> embed -> index), each behind a single call so handlers stay thin.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypedDict
 
-from api.documents import chunk_sections, parse_document_bytes
+from api.chunking import HeuristicTokenCounter, TokenCounter
+from api.diversity import select_diverse
+from api.documents import CHUNKER_VERSION, chunk_sections, parse_document_bytes
 from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
     ChatGenerator,
+    ChatMessage,
     GenerationError,
     GroundedAnswer,
     SourceCitation,
     StageTimings,
     build_grounded_messages,
     cited_sources,
+    condense_question,
     generate_grounded_answer,
+    generate_query_variants,
+    needs_citation_retry,
+    retry_uncited_answer,
     source_citations,
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
-from api.repository import VectorRepository
+from api.repository import VectorRepository, reciprocal_rank_fusion
 from api.reranking import RerankedChunk, Reranker, rerank_candidates_detailed
 from api.retrieval import (
     QueryEmbeddingProvider,
@@ -37,6 +45,8 @@ from api.retrieval import (
 )
 from api.settings import AppSettings
 from api.tracing import QueryTrace, TraceConfig, TraceSink, build_trace_candidates
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,9 @@ class RetrievalPhase:
     embed_ms: float
     search_ms: float
     rerank_ms: float
+    expand_ms: float = 0.0
+    diversity_dropped_ids: frozenset[str] = frozenset()
+    query_variants: list[str] = field(default_factory=list)
 
 
 class SourcesEvent(TypedDict):
@@ -120,6 +133,8 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "rerank_ms": timings.rerank_ms,
         "generate_ms": timings.generate_ms,
         "total_ms": timings.total_ms,
+        "condense_ms": timings.condense_ms,
+        "expand_ms": timings.expand_ms,
     }
 
 
@@ -233,6 +248,50 @@ class RagPipeline:
             filenames=list(filenames) if filenames else None,
         )
 
+    def _truncate_history(
+        self, history: Sequence[ChatMessage] | None, effective_settings: AppSettings
+    ) -> list[ChatMessage]:
+        """Keep only the most recent history messages, per server-side config."""
+
+        if not history:
+            return []
+        cap = int(effective_settings.conversation_max_history_messages)
+        return list(history)[-cap:] if cap > 0 else []
+
+    def _condense_query(
+        self,
+        question: str,
+        truncated_history: Sequence[ChatMessage],
+        effective_settings: AppSettings,
+    ) -> tuple[str, float, str | None]:
+        """Rewrite a follow-up into a standalone retrieval query, when history exists.
+
+        ``truncated_history`` is expected to already be capped (see
+        ``_truncate_history``) — the same truncated list is what generation sees.
+        Returns ``(retrieval_query, condense_ms, condensed_question)`` — the third
+        element is the trace-visible rewrite, or None when condense was skipped
+        (no history, or disabled) or failed/returned empty (falls back to the raw
+        question). A condense failure must never fail the whole request — retrieval
+        just proceeds on the raw question, exactly as it did before this feature.
+        """
+
+        if not truncated_history or not effective_settings.conversation_condense_enabled:
+            return question, 0.0, None
+
+        condense_start = time.monotonic()
+        try:
+            condensed = condense_question(
+                question, truncated_history, self._generator, effective_settings
+            )
+        except GenerationError as exc:
+            logger.warning("Condense step failed, falling back to raw question: %s", exc)
+            return question, (time.monotonic() - condense_start) * 1000, None
+        condense_ms = (time.monotonic() - condense_start) * 1000
+        if not condensed:
+            logger.warning("Condense step returned an empty result, falling back to raw question.")
+            return question, condense_ms, None
+        return condensed, condense_ms, condensed
+
     def _retrieve_and_rerank(
         self,
         question: str,
@@ -250,12 +309,40 @@ class RagPipeline:
             raise RetrievalError("Query text is required.")
         self._repository.ensure_ready(effective_settings)
 
+        # Multi-query expansion (opt-in): rewrite into variant phrasings, retrieve each,
+        # and RRF-fuse the result lists with the same pinned rrf_k before one rerank.
+        # Left un-timed (expand_ms stays 0.0) when disabled, mirroring condense_ms.
+        variants: list[str] = []
+        expand_ms = 0.0
+        if effective_settings.query_expansion_enabled:
+            expand_start = time.monotonic()
+            variants = generate_query_variants(
+                normalized_query,
+                int(effective_settings.query_expansion_count),
+                self._generator,
+                effective_settings,
+            )
+            expand_ms = (time.monotonic() - expand_start) * 1000
+        queries = [normalized_query, *variants]
+
         embed_start = time.monotonic()
-        query_embedding = embed_query(normalized_query, self._embedding_provider)
+        query_embeddings = [embed_query(query, self._embedding_provider) for query in queries]
         embed_ms = (time.monotonic() - embed_start) * 1000
 
         search_start = time.monotonic()
-        points = self._repository.hybrid_search(effective_settings, query_embedding, filenames)
+        result_lists = [
+            self._repository.hybrid_search(effective_settings, embedding, filenames)
+            for embedding in query_embeddings
+        ]
+        points = (
+            result_lists[0]
+            if len(result_lists) == 1
+            else reciprocal_rank_fusion(
+                result_lists,
+                k=int(effective_settings.rrf_k),
+                limit=int(effective_settings.fused_top_n),
+            )
+        )
         candidates = points_to_chunks(points)
         search_ms = (time.monotonic() - search_start) * 1000
 
@@ -266,7 +353,10 @@ class RagPipeline:
             reranker=self._reranker,
             settings=effective_settings,
         )
-        expanded = expand_with_neighbors(outcome.kept, self._repository, effective_settings)
+        diverse_outcome, diversity_dropped = select_diverse(outcome, effective_settings)
+        expanded = expand_with_neighbors(
+            diverse_outcome.kept, self._repository, effective_settings
+        )
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         return RetrievalPhase(
             context_chunks=expanded,
@@ -275,6 +365,9 @@ class RagPipeline:
             embed_ms=embed_ms,
             search_ms=search_ms,
             rerank_ms=rerank_ms,
+            expand_ms=expand_ms,
+            diversity_dropped_ids=frozenset(diversity_dropped),
+            query_variants=variants,
         )
 
     def answer(
@@ -282,6 +375,7 @@ class RagPipeline:
         question: str,
         overrides: AnswerOverrides | None = None,
         filenames: Sequence[str] | None = None,
+        history: Sequence[ChatMessage] | None = None,
     ) -> GroundedAnswer:
         """Retrieve, rerank, and generate a grounded, cited answer.
 
@@ -291,17 +385,25 @@ class RagPipeline:
         ``max_context_chunks``, and ``llm_temperature`` can vary per request; the
         dense/sparse retrieval limits, ``fused_top_n``, and ``rrf_k`` always come from
         the base settings (embeddings and hybrid fusion stay fixed regardless).
-        ``filenames``, when given, restricts retrieval to those documents.
+        ``filenames``, when given, restricts retrieval to those documents. ``history``,
+        when given, drives one extra condense call that rewrites ``question`` into a
+        standalone retrieval query — the server itself stores no conversation state.
         """
 
         total_start = time.monotonic()
         trace_store = self._trace_store
         trace_id = str(uuid.uuid4()) if trace_store is not None else None
         effective_settings: AppSettings | None = None
+        condensed_question: str | None = None
+        truncated_history: list[ChatMessage] = []
 
         try:
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
-            phase = self._retrieve_and_rerank(question, effective_settings, filenames)
+            truncated_history = self._truncate_history(history, effective_settings)
+            retrieval_query, condense_ms, condensed_question = self._condense_query(
+                question, truncated_history, effective_settings
+            )
+            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames)
             selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
 
             generate_start = time.monotonic()
@@ -310,6 +412,7 @@ class RagPipeline:
                 context_chunks=phase.context_chunks,
                 generator=self._generator,
                 settings=effective_settings,
+                history=truncated_history or None,
             )
             generate_ms = (time.monotonic() - generate_start) * 1000
             total_ms = (time.monotonic() - total_start) * 1000
@@ -320,6 +423,8 @@ class RagPipeline:
                 rerank_ms=phase.rerank_ms,
                 generate_ms=generate_ms,
                 total_ms=total_ms,
+                condense_ms=condense_ms,
+                expand_ms=phase.expand_ms,
             )
         except Exception as exc:
             if trace_store is not None and trace_id is not None:
@@ -339,13 +444,17 @@ class RagPipeline:
                         cited_source_numbers=[],
                         timings=None,
                         error=str(exc),
+                        condensed_question=condensed_question,
+                        history_message_count=len(truncated_history),
                     )
                 )
             raise
 
         if trace_store is not None and trace_id is not None:
             prompt_messages = (
-                build_grounded_messages(question.strip(), selected) if selected else None
+                build_grounded_messages(question.strip(), selected, truncated_history or None)
+                if selected
+                else None
             )
             trace_store.add(
                 QueryTrace(
@@ -361,12 +470,17 @@ class RagPipeline:
                         phase.context_chunks,
                         selected,
                         min_score=float(effective_settings.rerank_min_score),
+                        diversity_dropped_ids=phase.diversity_dropped_ids,
                     ),
                     prompt_messages=prompt_messages,
                     answer=grounded.answer,
                     cited_source_numbers=[source.source_number for source in grounded.sources],
                     timings=_timings_dict(timings),
                     error=None,
+                    condensed_question=condensed_question,
+                    history_message_count=len(truncated_history),
+                    query_variants=phase.query_variants,
+                    citation_retry_used=grounded.citation_retry_used,
                 )
             )
         return replace(grounded, timings=timings, trace_id=trace_id)
@@ -376,12 +490,14 @@ class RagPipeline:
         question: str,
         overrides: AnswerOverrides | None = None,
         filenames: Sequence[str] | None = None,
+        history: Sequence[ChatMessage] | None = None,
     ) -> Iterator[StreamEvent]:
         """Stream a grounded answer as SSE-ready events: sources, deltas, then done.
 
         Sources are emitted immediately after rerank (before the LLM call starts) so
         the UI can render citations while the answer is still generating. ``done``
         carries the final answer, the citation-filtered source list, and timings.
+        ``history``, when given, drives the same condense step as ``answer``.
         """
 
         total_start = time.monotonic()
@@ -389,6 +505,8 @@ class RagPipeline:
         trace_id = str(uuid.uuid4()) if trace_store is not None else None
         effective_settings: AppSettings | None = None
         parts: list[str] = []
+        condensed_question: str | None = None
+        truncated_history: list[ChatMessage] = []
         # Set the moment a trace has been stored (success, insufficient-context, or a
         # caught error below) — the `finally` clause uses this to detect the one case
         # none of those cover: the client disconnecting (GeneratorExit, a BaseException
@@ -414,12 +532,18 @@ class RagPipeline:
                     cited_source_numbers=[],
                     timings=None,
                     error=str(error),
+                    condensed_question=condensed_question,
+                    history_message_count=len(truncated_history),
                 )
             )
 
         try:
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
-            phase = self._retrieve_and_rerank(question, effective_settings, filenames)
+            truncated_history = self._truncate_history(history, effective_settings)
+            retrieval_query, condense_ms, condensed_question = self._condense_query(
+                question, truncated_history, effective_settings
+            )
+            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames)
             selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
 
             if not selected:
@@ -431,6 +555,8 @@ class RagPipeline:
                     rerank_ms=phase.rerank_ms,
                     generate_ms=0.0,
                     total_ms=total_ms,
+                    condense_ms=condense_ms,
+                    expand_ms=phase.expand_ms,
                 )
                 if trace_store is not None and trace_id is not None:
                     trace_store.add(
@@ -447,12 +573,16 @@ class RagPipeline:
                                 phase.context_chunks,
                                 [],
                                 min_score=float(effective_settings.rerank_min_score),
+                                diversity_dropped_ids=phase.diversity_dropped_ids,
                             ),
                             prompt_messages=None,
                             answer=INSUFFICIENT_CONTEXT_ANSWER,
                             cited_source_numbers=[],
                             timings=_timings_dict(timings),
                             error=None,
+                            condensed_question=condensed_question,
+                            history_message_count=len(truncated_history),
+                            query_variants=phase.query_variants,
                         )
                     )
                 finalized = True
@@ -472,7 +602,7 @@ class RagPipeline:
                 "trace_id": trace_id,
             }
 
-            messages = build_grounded_messages(question, selected)
+            messages = build_grounded_messages(question, selected, truncated_history or None)
             generate_start = time.monotonic()
             for delta in self._generator.stream(messages, effective_settings):
                 parts.append(delta)
@@ -483,14 +613,36 @@ class RagPipeline:
             if not answer:
                 raise GenerationError("Generation provider returned an empty answer.")
 
-            total_ms = (time.monotonic() - total_start) * 1000
             cited = cited_sources(answer, all_sources)
+            # Streaming can't retry before the deltas already sent, and buffering would
+            # destroy the streaming UX for the common case. Instead, if the streamed
+            # answer carries no citations, run one non-streaming retry and swap the
+            # corrected answer/sources into the `done` event — the frontend replaces the
+            # streamed content with `done.answer`, so it snaps to the cited version.
+            citation_retry_used = False
+            if (
+                not cited
+                and effective_settings.citation_retry_enabled
+                and needs_citation_retry(answer, len(all_sources))
+            ):
+                retried = retry_uncited_answer(
+                    question, selected, answer, self._generator, effective_settings,
+                    truncated_history or None,
+                )
+                if retried is not None:
+                    answer = retried
+                    cited = cited_sources(answer, all_sources)
+                    citation_retry_used = True
+
+            total_ms = (time.monotonic() - total_start) * 1000
             timings = StageTimings(
                 embed_ms=phase.embed_ms,
                 search_ms=phase.search_ms,
                 rerank_ms=phase.rerank_ms,
                 generate_ms=generate_ms,
                 total_ms=total_ms,
+                condense_ms=condense_ms,
+                expand_ms=phase.expand_ms,
             )
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
@@ -507,12 +659,17 @@ class RagPipeline:
                             phase.context_chunks,
                             selected,
                             min_score=float(effective_settings.rerank_min_score),
+                            diversity_dropped_ids=phase.diversity_dropped_ids,
                         ),
                         prompt_messages=list(messages),
                         answer=answer,
                         cited_source_numbers=[source.source_number for source in cited],
                         timings=_timings_dict(timings),
                         error=None,
+                        condensed_question=condensed_question,
+                        history_message_count=len(truncated_history),
+                        query_variants=phase.query_variants,
+                        citation_retry_used=citation_retry_used,
                     )
                 )
             finalized = True
@@ -556,10 +713,14 @@ class IngestService:
         repository: VectorRepository,
         embedding_provider: IngestEmbeddingProvider,
         settings: AppSettings,
+        token_counter: TokenCounter | None = None,
     ) -> None:
         self._repository = repository
         self._embedding_provider = embedding_provider
         self._settings = settings
+        # Default to the heuristic (no model fetch) so direct constructions in tests
+        # stay hermetic; production DI passes the dense model's real tokenizer.
+        self._token_counter = token_counter or HeuristicTokenCounter()
 
     def ingest(
         self,
@@ -569,8 +730,14 @@ class IngestService:
     ) -> DocumentIngestOutcome:
         """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop."""
 
-        sections = parse_document_bytes(filename, content)
-        chunks = chunk_sections(sections, self._settings)
+        sections = parse_document_bytes(filename, content, self._settings)
+        chunks = chunk_sections(sections, self._settings, self._token_counter)
+        logger.info(
+            "Chunked %s into %d chunks (chunker v%d).",
+            sections[0].filename,
+            len(chunks),
+            CHUNKER_VERSION,
+        )
         result: IngestResult = ingest_chunks(
             self._repository, self._settings, chunks, self._embedding_provider, on_progress
         )

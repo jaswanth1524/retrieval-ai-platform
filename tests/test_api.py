@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException
 
+from api.chunking import HeuristicTokenCounter
 from api.dependencies import (
     clear_dependency_caches,
     get_app_settings,
@@ -19,7 +20,9 @@ from api.dependencies import (
     get_generator,
     get_ollama_reachability_checker,
     get_qdrant_client,
+    get_qdrant_reachability_checker,
     get_reranker,
+    get_token_counter,
 )
 from api.embeddings import EmbeddedText
 from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
@@ -95,6 +98,9 @@ def api_context() -> Generator[ApiTestContext]:
     app.dependency_overrides[get_embedding_provider] = lambda: embeddings
     app.dependency_overrides[get_reranker] = lambda: reranker
     app.dependency_overrides[get_generator] = lambda: generator
+    # Hermetic ingest: use the word heuristic instead of fetching the bge tokenizer
+    # from the HF Hub over the network on every ingest-path test.
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
     # Hermetic by default: never let /config make a real network call to Ollama.
     app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
 
@@ -170,6 +176,68 @@ def _upload_and_wait(
 
 
 def test_health_endpoint(api_context: ApiTestContext) -> None:
+    response = api_context.client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
+    api_context: ApiTestContext,
+) -> None:
+    api_context.app.dependency_overrides[get_ollama_reachability_checker] = (
+        lambda: (lambda _: True)
+    )
+
+    response = api_context.client.get("/health/ready")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "status": "ok",
+        "qdrant": True,
+        "generation_provider": True,
+        "llm_provider": "ollama",
+    }
+
+
+def test_health_ready_returns_503_when_generation_provider_unreachable(
+    api_context: ApiTestContext,
+) -> None:
+    # api_context's default Ollama checker override already returns False.
+    response = api_context.client.get("/health/ready")
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "degraded"
+    assert payload["qdrant"] is True
+    assert payload["generation_provider"] is False
+
+
+def test_health_ready_returns_503_when_qdrant_unreachable(api_context: ApiTestContext) -> None:
+    api_context.app.dependency_overrides[get_qdrant_reachability_checker] = (
+        lambda: (lambda _: False)
+    )
+    api_context.app.dependency_overrides[get_ollama_reachability_checker] = (
+        lambda: (lambda _: True)
+    )
+
+    response = api_context.client.get("/health/ready")
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["qdrant"] is False
+    assert payload["generation_provider"] is True
+
+
+def test_health_endpoint_never_probes_dependencies(api_context: ApiTestContext) -> None:
+    def raise_if_called(_client: object) -> bool:
+        raise AssertionError("check_qdrant_reachable must not run for /health")
+
+    api_context.app.dependency_overrides[get_qdrant_reachability_checker] = (
+        lambda: raise_if_called
+    )
+
     response = api_context.client.get("/health")
 
     assert response.status_code == 200
@@ -289,6 +357,46 @@ def test_question_endpoint_rejects_empty_string_query(api_context: ApiTestContex
 
 def test_question_endpoint_rejects_oversized_query(api_context: ApiTestContext) -> None:
     response = api_context.client.post("/questions", json={"question": "a" * 4001})
+
+    assert response.status_code == 422
+
+
+def test_question_endpoint_accepts_history(api_context: ApiTestContext) -> None:
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
+
+    response = api_context.client.post(
+        "/questions",
+        json={
+            "question": "alpha",
+            "history": [
+                {"role": "user", "content": "Tell me about doc A."},
+                {"role": "assistant", "content": "Doc A covers setup [1]."},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["timings"]["condense_ms"] > 0.0
+
+
+def test_question_endpoint_rejects_more_than_twelve_history_messages(
+    api_context: ApiTestContext,
+) -> None:
+    history = [{"role": "user", "content": f"turn {i}"} for i in range(13)]
+
+    response = api_context.client.post(
+        "/questions", json={"question": "alpha", "history": history}
+    )
+
+    assert response.status_code == 422
+
+
+def test_question_endpoint_rejects_invalid_history_role(api_context: ApiTestContext) -> None:
+    response = api_context.client.post(
+        "/questions",
+        json={"question": "alpha", "history": [{"role": "system", "content": "nope"}]},
+    )
 
     assert response.status_code == 422
 
@@ -628,6 +736,58 @@ def test_list_documents_empty_for_no_uploads(api_context: ApiTestContext) -> Non
     assert response.json()["filenames"] == []
 
 
+def test_delete_document_removes_indexed_chunks(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+
+    response = api_context.client.delete("/documents/a.txt")
+
+    assert response.status_code == 200
+    assert response.json() == {"filename": "a.txt", "points_deleted": 1}
+    assert api_context.client.get("/documents").json()["filenames"] == []
+
+
+def test_delete_document_returns_404_for_unknown_filename(api_context: ApiTestContext) -> None:
+    response = api_context.client.delete("/documents/does-not-exist.txt")
+
+    assert response.status_code == 404
+    assert "does-not-exist.txt" in response.json()["detail"]
+
+
+def test_delete_document_leaves_other_filenames_searchable(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
+
+    response = api_context.client.delete("/documents/a.txt")
+
+    assert response.status_code == 200
+    assert response.json()["points_deleted"] == 1
+    assert api_context.client.get("/documents").json()["filenames"] == ["b.txt"]
+
+    question_response = api_context.client.post("/questions", json={"question": "beta"})
+    assert question_response.status_code == 200
+
+
+def test_document_content_returns_chunks_in_ordinal_order(api_context: ApiTestContext) -> None:
+    status = _upload_and_wait(api_context.client, "a.md", b"Intro\nalpha beta gamma")
+    assert status["state"] == "done"
+
+    response = api_context.client.get("/documents/a.md/content")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "a.md"
+    assert len(body["chunks"]) >= 1
+    ordinals = [chunk["chunk_ordinal"] for chunk in body["chunks"]]
+    assert ordinals == sorted(o for o in ordinals if o is not None)
+    assert all({"chunk_id", "page", "section", "text"} <= set(chunk) for chunk in body["chunks"])
+
+
+def test_document_content_returns_404_for_unknown_filename(api_context: ApiTestContext) -> None:
+    response = api_context.client.get("/documents/missing.md/content")
+
+    assert response.status_code == 404
+
+
 def test_metrics_endpoint_exposes_prometheus_text(api_context: ApiTestContext) -> None:
     response = api_context.client.get("/metrics")
 
@@ -644,7 +804,17 @@ def test_question_endpoint_includes_stage_timings(api_context: ApiTestContext) -
     assert response.status_code == 200
     timings = response.json()["timings"]
     assert timings is not None
-    assert set(timings) == {"embed_ms", "search_ms", "rerank_ms", "generate_ms", "total_ms"}
+    assert set(timings) == {
+        "embed_ms",
+        "search_ms",
+        "rerank_ms",
+        "generate_ms",
+        "total_ms",
+        "condense_ms",
+        "expand_ms",
+    }
+    assert timings["condense_ms"] == 0.0
+    assert timings["expand_ms"] == 0.0
 
 
 def test_question_endpoint_filters_by_filenames(api_context: ApiTestContext) -> None:
@@ -751,6 +921,33 @@ def test_question_stream_endpoint_trace_id_matches_across_events_and_is_fetchabl
     detail_response = api_context.client.get(f"/traces/{trace_id}")
     assert detail_response.status_code == 200
     assert detail_response.json()["mode"] == "stream"
+
+
+def test_question_stream_endpoint_done_timings_include_condense_ms(
+    api_context: ApiTestContext,
+) -> None:
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
+
+    response = api_context.client.post(
+        "/questions/stream",
+        json={
+            "question": "What about the second one?",
+            "history": [
+                {"role": "user", "content": "Tell me about doc A."},
+                {"role": "assistant", "content": "Doc A covers setup [1]."},
+            ],
+        },
+    )
+    events = _parse_sse_events(response.text)
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["timings"]["condense_ms"] > 0.0
+
+    detail = api_context.client.get(f"/traces/{done['trace_id']}").json()
+    assert detail["history_message_count"] == 2
+    assert detail["condensed_question"]
 
 
 def test_question_endpoint_trace_id_null_and_traces_empty_when_tracing_disabled() -> None:

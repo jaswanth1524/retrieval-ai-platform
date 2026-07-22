@@ -15,15 +15,31 @@ dependencies = [
   "prometheus-client>=0.25.0",
   "pydantic-settings>=2.6",
   "pypdf>=5.0",
+  # Document format parsers. python-docx: the only maintained pure-Python DOCX reader,
+  # needed for heading structure (citation sections). beautifulsoup4: robust HTML text
+  # extraction over malformed markup (stdlib parser backend, no lxml). pdfplumber: PDF
+  # table extraction via pdfminer layout analysis (pypdf has none; pypdf stays the text
+  # path). See api/documents.py.
+  "python-docx>=1.1",
+  "beautifulsoup4>=4.12",
+  "pdfplumber>=0.11",
   "python-dotenv>=1.0",
   "python-multipart>=0.0.12",
   "qdrant-client>=1.12",
+  # Already present transitively via fastembed; declared explicitly because the chunker
+  # loads the dense model's tokenizer directly to count subword tokens (api/chunking.py).
+  "tokenizers>=0.20",
   "uvicorn[standard]>=0.32",
 ]
 
 [project.optional-dependencies]
 eval = [
   "ragas>=0.2",
+]
+# Optional OCR for scanned/image PDFs. Pure-Python ONNX (onnxruntime is already a
+# fastembed dependency); when absent, scanned PDFs fail with a message pointing here.
+ocr = [
+  "rapidocr-onnxruntime>=1.4",
 ]
 test = [
   "httpx>=0.27",
@@ -56,4 +72,9 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 warn_unused_configs = true
+
+# Third-party document parsers without bundled type stubs.
+[[tool.mypy.overrides]]
+module = ["docx.*", "bs4.*", "pdfplumber.*", "rapidocr_onnxruntime.*"]
+ignore_missing_imports = true
 

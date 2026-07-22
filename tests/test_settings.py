@@ -49,8 +49,45 @@ def test_qdrant_dense_vector_size_rejects_non_positive() -> None:
         AppSettings(_env_file=None, qdrant_dense_vector_size=0)  # type: ignore[call-arg]
 
 
+def test_openai_reasoning_effort_normalizes_case_and_whitespace() -> None:
+    settings = AppSettings(_env_file=None, openai_reasoning_effort="  LOW ")  # type: ignore[call-arg]
+    assert settings.openai_reasoning_effort == "low"
+
+
+def test_openai_reasoning_effort_accepts_empty_to_disable() -> None:
+    assert AppSettings(_env_file=None, openai_reasoning_effort="").openai_reasoning_effort == ""  # type: ignore[call-arg]
+
+
+def test_openai_reasoning_effort_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, openai_reasoning_effort="turbo")  # type: ignore[call-arg]
+
+
+def test_reasoning_token_headroom_rejects_non_positive() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, reasoning_token_headroom=0)  # type: ignore[call-arg]
+
+
 def test_warmup_models_defaults_to_false() -> None:
     assert AppSettings(_env_file=None).warmup_models is False  # type: ignore[call-arg]
+
+
+def test_conversation_memory_defaults() -> None:
+    settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.conversation_condense_enabled is True
+    assert settings.conversation_max_history_messages == 12
+    assert settings.condense_max_tokens == 128
+
+
+def test_conversation_max_history_messages_rejects_negative() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, conversation_max_history_messages=-1)  # type: ignore[call-arg]
+
+
+def test_condense_max_tokens_rejects_non_positive() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, condense_max_tokens=0)  # type: ignore[call-arg]
 
 
 def test_rerank_min_score_rejects_below_zero() -> None:
@@ -68,9 +105,48 @@ def test_rerank_min_score_accepts_boundary_values() -> None:
     assert AppSettings(_env_file=None, rerank_min_score=1.0).rerank_min_score == 1.0  # type: ignore[call-arg]
 
 
+def test_csv_rows_per_section_defaults_and_validates() -> None:
+    assert AppSettings(_env_file=None).csv_rows_per_section == 50  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, csv_rows_per_section=0)  # type: ignore[call-arg]
+
+
+def test_query_expansion_count_bounds() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, query_expansion_count=0)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, query_expansion_count=9)  # type: ignore[call-arg]
+
+
+def test_context_diversity_defaults() -> None:
+    settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.context_diversity_enabled is True
+    assert settings.context_diversity_max_similarity == 0.6
+
+
+def test_context_diversity_max_similarity_rejects_out_of_range() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, context_diversity_max_similarity=0.0)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, context_diversity_max_similarity=1.5)  # type: ignore[call-arg]
+
+
 def test_min_section_words_rejects_negative() -> None:
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None, min_section_words=-1)  # type: ignore[call-arg]
+
+
+def test_log_level_defaults_to_info() -> None:
+    assert AppSettings(_env_file=None).log_level == "INFO"  # type: ignore[call-arg]
+
+
+def test_log_level_normalizes_case() -> None:
+    assert AppSettings(_env_file=None, log_level="debug").log_level == "DEBUG"  # type: ignore[call-arg]
+
+
+def test_log_level_rejects_unknown_level() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, log_level="verbose")  # type: ignore[call-arg]
 
 
 def test_app_settings_env_isolation_survives_a_leaked_env_var(

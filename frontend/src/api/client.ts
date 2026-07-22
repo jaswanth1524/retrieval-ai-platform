@@ -1,15 +1,19 @@
 import type {
   CitationResponse,
+  DocumentContentResponse,
+  DocumentDeleteResponse,
   DocumentJobAcceptedResponse,
   DocumentJobStatusResponse,
   DocumentListResponse,
   HealthResponse,
+  HistoryMessage,
   LlmProvider,
   PublicConfigResponse,
   QuestionOverrides,
   QuestionResponse,
   TimingsResponse,
   TraceDetailResponse,
+  TraceListResponse,
 } from './types';
 
 export class ApiClientError extends Error {
@@ -109,6 +113,7 @@ function questionRequestBody(
   llmProvider?: LlmProvider,
   overrides?: QuestionOverrides,
   filenames?: string[],
+  history?: HistoryMessage[],
 ): Record<string, unknown> {
   // Only include a field when it's set, so an unset value exercises the backend's
   // `| None` default (base provider/settings) rather than pinning a value.
@@ -118,6 +123,7 @@ function questionRequestBody(
   if (overrides?.maxContextChunks != null) body.max_context_chunks = overrides.maxContextChunks;
   if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
   if (filenames && filenames.length > 0) body.filenames = filenames;
+  if (history && history.length > 0) body.history = history;
   return body;
 }
 
@@ -194,11 +200,29 @@ export const api = {
   getDocumentJob: (jobId: string, signal?: AbortSignal) =>
     request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, { signal }),
 
+  deleteDocument: (filename: string, signal?: AbortSignal) =>
+    request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
+      method: 'DELETE',
+      signal,
+    }),
+
+  // Reconstructs a document from its stored chunks (ordinal order) for the source
+  // viewer — no original file is retained, so this is the only content route.
+  getDocumentContent: (filename: string, signal?: AbortSignal) =>
+    request<DocumentContentResponse>(
+      `/documents/${encodeURIComponent(filename)}/content`,
+      { signal },
+    ),
+
   // Trace detail is fetched lazily — only when a debug drawer is actually opened —
   // since the full prompt + candidate list can be tens of KB per question and most
   // turns are never inspected.
   getTrace: (traceId: string, signal?: AbortSignal) =>
     request<TraceDetailResponse>(`/traces/${traceId}`, { signal }),
+
+  // Lists recent query traces (newest first) for the trace history browser.
+  listTraces: (signal?: AbortSignal) =>
+    request<TraceListResponse>('/traces', { signal }),
 
   // Uploads and ingests run in a background job (see api.uploadDocument) — this
   // polls the job status endpoint until it reaches a terminal state, so the caller
@@ -236,11 +260,14 @@ export const api = {
     overrides?: QuestionOverrides,
     signal?: AbortSignal,
     filenames?: string[],
+    history?: HistoryMessage[],
   ) =>
     request<QuestionResponse>('/questions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(questionRequestBody(question, llmProvider, overrides, filenames)),
+      body: JSON.stringify(
+        questionRequestBody(question, llmProvider, overrides, filenames, history),
+      ),
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
     }),
@@ -255,6 +282,7 @@ export const api = {
     llmProvider: LlmProvider | undefined,
     overrides: QuestionOverrides | undefined,
     filenames: string[] | undefined,
+    history: HistoryMessage[] | undefined,
     handlers: QuestionStreamHandlers,
     signal?: AbortSignal,
   ): Promise<void> => {
@@ -269,7 +297,9 @@ export const api = {
         response = await fetch(`${BASE_URL}/questions/stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(questionRequestBody(question, llmProvider, overrides, filenames)),
+          body: JSON.stringify(
+            questionRequestBody(question, llmProvider, overrides, filenames, history),
+          ),
           signal: timeoutController.signal,
         });
       } catch (err) {
@@ -299,6 +329,8 @@ export const api = {
 
 export type {
   CitationResponse,
+  DocumentContentResponse,
+  DocumentDeleteResponse,
   DocumentJobAcceptedResponse,
   DocumentJobStatusResponse,
   DocumentListResponse,
@@ -307,4 +339,5 @@ export type {
   QuestionResponse,
   TimingsResponse,
   TraceDetailResponse,
+  TraceListResponse,
 };

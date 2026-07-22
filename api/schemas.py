@@ -14,11 +14,26 @@ REQUEST_MAX_CONTEXT_CHUNKS_MAX = 20
 REQUEST_TEMPERATURE_MIN = 0.0
 REQUEST_TEMPERATURE_MAX = 2.0
 
+# Bounds for the client-sent conversation history on QuestionRequest. The server
+# also has its own conversation_max_history_messages setting for further truncation;
+# these are the hard request-shape limits enforced regardless of server config.
+REQUEST_HISTORY_MAX_MESSAGES = 12
+REQUEST_HISTORY_MESSAGE_MAX_CHARS = 4000
+
 
 class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str
+
+
+class ReadinessResponse(BaseModel):
+    """Readiness check response — unlike /health, this probes real dependencies."""
+
+    status: Literal["ok", "degraded"]
+    qdrant: bool
+    generation_provider: bool
+    llm_provider: str
 
 
 class PublicConfigResponse(BaseModel):
@@ -73,7 +88,7 @@ class DocumentJobStatusResponse(BaseModel):
 
     job_id: str
     filename: str
-    state: Literal["queued", "parsing", "embedding", "indexing", "done", "failed"]
+    state: Literal["queued", "parsing", "embedding", "done", "failed"]
     chunks_total: int
     chunks_done: int
     error: str | None = None
@@ -84,6 +99,30 @@ class DocumentListResponse(BaseModel):
     """Filenames currently indexed, for per-document query filtering."""
 
     filenames: list[str]
+
+
+class DocumentDeleteResponse(BaseModel):
+    """Result of removing an indexed document's chunks."""
+
+    filename: str
+    points_deleted: int
+
+
+class DocumentChunkResponse(BaseModel):
+    """One stored chunk of a document, for the source viewer."""
+
+    chunk_id: str
+    page: int
+    section: str
+    text: str
+    chunk_ordinal: int | None = None
+
+
+class DocumentContentResponse(BaseModel):
+    """A document reconstructed from its stored chunks, in ordinal order."""
+
+    filename: str
+    chunks: list[DocumentChunkResponse]
 
 
 class PromptMessageResponse(BaseModel):
@@ -116,7 +155,7 @@ class TraceCandidateResponse(BaseModel):
     retrieval_score: float
     rerank_score: float | None
     kept: bool
-    drop_reason: Literal["below_min_score", "top_k_cut", "not_scored"] | None
+    drop_reason: Literal["below_min_score", "near_duplicate", "top_k_cut", "not_scored"] | None
     selected_for_context: bool
     neighbor_expanded: bool
 
@@ -156,6 +195,21 @@ class TraceDetailResponse(BaseModel):
     cited_source_numbers: list[int]
     timings: TimingsResponse | None
     error: str | None
+    # None when no history was sent, condense was disabled, or the condense call
+    # failed/returned empty and the pipeline fell back to the raw question.
+    condensed_question: str | None = None
+    history_message_count: int = 0
+    # Alternative query phrasings used for multi-query retrieval (empty when disabled).
+    query_variants: list[str] = Field(default_factory=list)
+    # True when a zero-citation answer was retried and the retry supplied citations.
+    citation_retry_used: bool = False
+
+
+class HistoryMessageRequest(BaseModel):
+    """One prior turn of client-sent conversation history."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=REQUEST_HISTORY_MESSAGE_MAX_CHARS)
 
 
 class QuestionRequest(BaseModel):
@@ -173,6 +227,12 @@ class QuestionRequest(BaseModel):
     # Restricts retrieval to these documents only, when given. None/omitted searches
     # the whole collection — the pre-existing behavior.
     filenames: list[str] | None = Field(default=None, min_length=1)
+    # Prior turns of the conversation, oldest first. None/omitted (the pre-existing
+    # behavior) skips the condense step entirely — the server itself stores no
+    # conversation state, the client resends what it wants remembered each request.
+    history: list[HistoryMessageRequest] | None = Field(
+        default=None, max_length=REQUEST_HISTORY_MAX_MESSAGES
+    )
 
     @model_validator(mode="after")
     def _validate_context_within_rerank(self) -> QuestionRequest:
@@ -208,6 +268,10 @@ class TimingsResponse(BaseModel):
     rerank_ms: float
     generate_ms: float
     total_ms: float
+    # 0.0 when no history was sent, or when CONVERSATION_CONDENSE_ENABLED is off.
+    condense_ms: float = 0.0
+    # 0.0 when query expansion is disabled (the default) or produced no variants.
+    expand_ms: float = 0.0
 
 
 class QuestionResponse(BaseModel):

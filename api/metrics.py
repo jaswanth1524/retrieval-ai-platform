@@ -36,6 +36,8 @@ ingest_chunks_total = Counter(
 def observe_question_timings(timings: dict[str, float]) -> None:
     """Record one question's per-stage timings (input in milliseconds) as seconds."""
 
+    question_stage_seconds.labels(stage="condense").observe(timings.get("condense_ms", 0.0) / 1000)
+    question_stage_seconds.labels(stage="expand").observe(timings.get("expand_ms", 0.0) / 1000)
     question_stage_seconds.labels(stage="embed").observe(timings["embed_ms"] / 1000)
     question_stage_seconds.labels(stage="search").observe(timings["search_ms"] / 1000)
     question_stage_seconds.labels(stage="rerank").observe(timings["rerank_ms"] / 1000)

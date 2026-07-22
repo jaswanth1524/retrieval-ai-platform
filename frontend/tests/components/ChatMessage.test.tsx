@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import ChatMessage, { type ChatTurn } from '../../src/components/ChatMessage';
 
 function makeTurn(overrides: Partial<ChatTurn>): ChatTurn {
@@ -25,7 +26,7 @@ describe('ChatMessage', () => {
     expect(screen.queryByTestId('citation-card')).not.toBeInTheDocument();
   });
 
-  it('renders an assistant turn with citation cards', () => {
+  it('renders an assistant turn with citation cards hidden behind a sources toggle', async () => {
     render(
       <ChatMessage
         turn={makeTurn({
@@ -47,7 +48,26 @@ describe('ChatMessage', () => {
 
     const message = screen.getByTestId('chat-message');
     expect(message).toHaveAttribute('data-role', 'assistant');
+    expect(screen.queryByTestId('citation-card')).not.toBeInTheDocument();
+
+    const toggle = screen.getByTestId('chat-message-sources-toggle');
+    expect(toggle).toHaveTextContent('Sources (1)');
+
+    await userEvent.click(toggle);
+
     expect(screen.getByTestId('citation-card')).toBeInTheDocument();
+    expect(toggle).toHaveTextContent('Hide sources');
+
+    await userEvent.click(toggle);
+
+    expect(screen.queryByTestId('citation-card')).not.toBeInTheDocument();
+    expect(toggle).toHaveTextContent('Sources (1)');
+  });
+
+  it('renders no sources toggle when the assistant turn has no sources', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} />);
+
+    expect(screen.queryByTestId('chat-message-sources-toggle')).not.toBeInTheDocument();
   });
 
   it('renders an error turn distinctly', () => {
@@ -75,5 +95,81 @@ describe('ChatMessage', () => {
     render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} />);
 
     expect(screen.queryByTestId('trace-drawer-toggle')).not.toBeInTheDocument();
+  });
+
+  it('renders assistant markdown content (bold, lists) as real elements', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({
+          role: 'assistant',
+          content: '**Important**\n\n- one\n- two',
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Important').tagName).toBe('STRONG');
+    expect(screen.getByText('one').closest('ul')).toBeInTheDocument();
+    expect(screen.getByText('two').closest('li')).toBeInTheDocument();
+  });
+
+  it('does not inject raw HTML from assistant content', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: '<img src=x onerror=alert(1)>' })}
+      />,
+    );
+
+    expect(document.querySelector('img')).not.toBeInTheDocument();
+  });
+
+  it('renders a timestamp for every turn', () => {
+    render(<ChatMessage turn={makeTurn({ timestamp: Date.now() })} />);
+
+    expect(document.querySelector('time')).toBeInTheDocument();
+  });
+
+  describe('copy button', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('copies the assistant answer to the clipboard when clicked', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+
+      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} />);
+      await userEvent.click(screen.getByTestId('chat-message-copy'));
+
+      expect(writeText).toHaveBeenCalledWith('Answer text.');
+      expect(await screen.findByText('Copied')).toBeInTheDocument();
+    });
+
+    it('renders no copy button when the clipboard API is unavailable', () => {
+      vi.stubGlobal('navigator', { ...navigator, clipboard: undefined });
+
+      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} />);
+
+      expect(screen.queryByTestId('chat-message-copy')).not.toBeInTheDocument();
+    });
+  });
+
+  it('renders a Retry button on an error turn with a retained question and fires onRetry', async () => {
+    const onRetry = vi.fn();
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'error', content: 'boom', question: 'What is DocRAG?' })}
+        onRetry={onRetry}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('chat-message-retry'));
+
+    expect(onRetry).toHaveBeenCalledWith('What is DocRAG?');
+  });
+
+  it('renders no Retry button when the error turn has no retained question', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'boom' })} onRetry={vi.fn()} />);
+
+    expect(screen.queryByTestId('chat-message-retry')).not.toBeInTheDocument();
   });
 });

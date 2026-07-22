@@ -7,7 +7,7 @@ import pytest
 from qdrant_client import QdrantClient, models
 
 from api.embeddings import EmbeddedText
-from api.generation import ChatMessage
+from api.generation import ChatMessage, GenerationError
 from api.pipeline import AnswerOverrides, IngestService, RagPipeline, expand_with_neighbors
 from api.repository import VectorRepository
 from api.reranking import rerank_candidates
@@ -28,8 +28,10 @@ class StaticEmbeddingProvider:
 class FakeReranker:
     def __init__(self) -> None:
         self.seen_documents: list[str] = []
+        self.seen_query: str | None = None
 
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
+        self.seen_query = query
         self.seen_documents = list(documents)
         return [1.0 for _ in documents]
 
@@ -68,6 +70,72 @@ class RaisingGenerator:
         raise RuntimeError("generation boom mid-stream")
 
 
+class SequencedGenerator:
+    """Returns a different ``complete``/``stream`` response on each successive call —
+    for asserting on the condense call distinctly from the final-answer call."""
+
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = list(answers)
+        self.call_count = 0
+        self.calls: list[tuple[list[ChatMessage], AppSettings]] = []
+
+    def _next_answer(self) -> str:
+        answer = self.answers[min(self.call_count, len(self.answers) - 1)]
+        self.call_count += 1
+        return answer
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        self.calls.append((list(messages), settings))
+        return self._next_answer()
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        self.calls.append((list(messages), settings))
+        answer = self._next_answer()
+        words = answer.split(" ")
+        for index, word in enumerate(words):
+            yield word if index == len(words) - 1 else word + " "
+
+
+class GenerationErrorOnceGenerator:
+    """Raises ``GenerationError`` on the first ``complete`` call (the condense call),
+    then answers normally — for exercising the condense-failure fallback path."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.call_count = 0
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        self.call_count += 1
+        if self.call_count == 1:
+            raise GenerationError("condense boom")
+        return self.answer
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        words = self.answer.split(" ")
+        for index, word in enumerate(words):
+            yield word if index == len(words) - 1 else word + " "
+
+
+class EmptyThenAnswerGenerator:
+    """Returns an empty/whitespace ``complete`` response the first call (the condense
+    call), then answers normally — exercises the empty-condense-result fallback."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.call_count = 0
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        self.call_count += 1
+        if self.call_count == 1:
+            return "   "
+        return self.answer
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        words = self.answer.split(" ")
+        for index, word in enumerate(words):
+            yield word if index == len(words) - 1 else word + " "
+
+
 class ListTraceStore:
     """Minimal in-memory ``TraceSink`` for asserting on what the pipeline records."""
 
@@ -101,6 +169,13 @@ def make_embedding(value: float) -> EmbeddedText:
         dense=[value, 0.0, 0.0],
         sparse=models.SparseVector(indices=[1], values=[1.0]),
     )
+
+
+class WordTokenCounter:
+    """Deterministic 1-token-per-word counter for predictable chunk boundaries."""
+
+    def count(self, text: str) -> int:
+        return len(text.split())
 
 
 def test_ingest_service_parses_chunks_and_indexes_them() -> None:
@@ -403,14 +478,18 @@ def test_rag_pipeline_answer_stream_returns_insufficient_context_for_empty_colle
 
 
 def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
-    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=3, chunk_overlap_tokens=0)
+    # budget = 8 - 3 (prefix words) = 5, so each sentence becomes its own chunk
+    # (ordinals 1, 2, 3) under the injected word counter.
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=8, chunk_overlap_tokens=0)
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
-    # Three chunks of 3 words each -> ordinals 1, 2, 3.
     embeddings = [make_embedding(1.0), make_embedding(1.0), make_embedding(1.0)]
     IngestService(
-        repository, StaticEmbeddingProvider(embeddings), settings
-    ).ingest("guide.txt", b"one two three four five six seven eight nine")
+        repository,
+        StaticEmbeddingProvider(embeddings),
+        settings,
+        token_counter=WordTokenCounter(),
+    ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
 
     candidates = retrieve_candidates(
         repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
@@ -423,8 +502,8 @@ def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
 
     assert middle.expanded_text is None
     assert expanded_middle.expanded_text is not None
-    assert "one two three" in expanded_middle.expanded_text
-    assert "seven eight nine" in expanded_middle.expanded_text
+    assert "One two three" in expanded_middle.expanded_text
+    assert "Seven eight nine" in expanded_middle.expanded_text
 
 
 def test_expand_with_neighbors_disabled_by_zero_radius() -> None:
@@ -622,3 +701,327 @@ def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_clos
     trace = trace_store.traces[0]
     assert trace.status == "error"
     assert trace.error == "Stream closed before completion."
+
+
+_HISTORY: list[ChatMessage] = [
+    {"role": "user", "content": "Tell me about doc A and doc B."},
+    {"role": "assistant", "content": "Doc A covers setup [1]. Doc B covers billing [2]."},
+]
+
+
+def test_rag_pipeline_answer_with_history_condenses_before_retrieval() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    embeddings = StaticEmbeddingProvider([make_embedding(1.0)])
+    reranker = FakeReranker()
+    generator = SequencedGenerator(["What is the second document about?", "Doc B is billing [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=embeddings,
+        reranker=reranker,
+        generator=generator,
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("What about the second one?", history=_HISTORY)
+
+    assert generator.call_count == 2
+    assert embeddings.seen_texts == ["What is the second document about?"]
+    assert reranker.seen_query == "What is the second document about?"
+    assert grounded.answer == "Doc B is billing [1]."
+    # Generation still sees the raw question plus the history, not the condensed one.
+    final_call_messages = generator.calls[-1][0]
+    assert any("What about the second one?" in m["content"] for m in final_call_messages)
+    assert _HISTORY[0] in final_call_messages
+    assert _HISTORY[1] in final_call_messages
+
+
+def test_rag_pipeline_answer_without_history_makes_a_single_generation_call() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    generator = SequencedGenerator(["Alpha is documented [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("alpha")
+
+    assert generator.call_count == 1
+    assert grounded.answer == "Alpha is documented [1]."
+    assert grounded.timings is not None
+    assert grounded.timings.condense_ms == 0.0
+
+
+def test_rag_pipeline_answer_condense_disabled_skips_condense_but_keeps_history() -> None:
+    settings = make_settings(conversation_condense_enabled=False)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    embeddings = StaticEmbeddingProvider([make_embedding(1.0)])
+    generator = SequencedGenerator(["Alpha is documented [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=embeddings,
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("alpha", history=_HISTORY)
+
+    assert generator.call_count == 1
+    assert embeddings.seen_texts == ["alpha"]
+    final_call_messages = generator.calls[-1][0]
+    assert _HISTORY[0] in final_call_messages
+    assert grounded.answer == "Alpha is documented [1]."
+
+
+def test_rag_pipeline_answer_condense_generation_error_falls_back_to_raw_question() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    embeddings = StaticEmbeddingProvider([make_embedding(1.0)])
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=embeddings,
+        reranker=FakeReranker(),
+        generator=GenerationErrorOnceGenerator("Alpha is documented [1]."),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    grounded = pipeline.answer("alpha", history=_HISTORY)
+
+    assert grounded.answer == "Alpha is documented [1]."
+    assert embeddings.seen_texts == ["alpha"]
+    trace = trace_store.traces[0]
+    assert trace.condensed_question is None
+    assert trace.history_message_count == len(_HISTORY)
+
+
+def test_rag_pipeline_answer_condense_empty_result_falls_back_to_raw_question() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    embeddings = StaticEmbeddingProvider([make_embedding(1.0)])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=embeddings,
+        reranker=FakeReranker(),
+        generator=EmptyThenAnswerGenerator("Alpha is documented [1]."),
+        settings=settings,
+    )
+
+    grounded = pipeline.answer("alpha", history=_HISTORY)
+
+    assert grounded.answer == "Alpha is documented [1]."
+    assert embeddings.seen_texts == ["alpha"]
+
+
+def test_rag_pipeline_answer_history_truncated_to_max_history_messages() -> None:
+    settings = make_settings(conversation_max_history_messages=2)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    long_history: list[ChatMessage] = [
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=SequencedGenerator(["condensed query", "Alpha is documented [1]."]),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    pipeline.answer("alpha", history=long_history)
+
+    trace = trace_store.traces[0]
+    assert trace.history_message_count == 2
+    final_call_messages = trace_store.traces[0].prompt_messages
+    assert final_call_messages is not None
+    assert {"role": "user", "content": "turn 1"} not in final_call_messages
+    assert {"role": "user", "content": "turn 2"} in final_call_messages
+    assert {"role": "assistant", "content": "reply 2"} in final_call_messages
+
+
+def test_rag_pipeline_answer_records_condensed_question_in_trace() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=SequencedGenerator(
+            ["What is the second document about?", "Doc B is billing [1]."]
+        ),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    grounded = pipeline.answer("What about the second one?", history=_HISTORY)
+
+    trace = trace_store.traces[0]
+    assert trace.condensed_question == "What is the second document about?"
+    assert trace.history_message_count == len(_HISTORY)
+    assert grounded.timings is not None
+    assert grounded.timings.condense_ms > 0.0
+
+
+def test_rag_pipeline_answer_stream_condense_parity_with_sync() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    embeddings = StaticEmbeddingProvider([make_embedding(1.0)])
+    generator = SequencedGenerator(["What is the second document about?", "Doc B is billing [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=embeddings,
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+    )
+
+    events = list(pipeline.answer_stream("What about the second one?", history=_HISTORY))
+
+    # The condense call (via `complete`) happens before the sources event, which
+    # itself happens before any `stream` delta call.
+    assert generator.call_count == 2
+    assert embeddings.seen_texts == ["What is the second document about?"]
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["timings"]["condense_ms"] > 0.0
+
+
+class CountingRepository:
+    """Wraps a real repository to count hybrid_search calls (multi-query assertions)."""
+
+    def __init__(self, inner: VectorRepository) -> None:
+        self.inner = inner
+        self.search_calls = 0
+
+    def ensure_ready(self, settings: AppSettings) -> None:
+        self.inner.ensure_ready(settings)
+
+    def hybrid_search(
+        self, settings: AppSettings, query_embedding: Any, filenames: Any = None
+    ) -> Any:
+        self.search_calls += 1
+        return self.inner.hybrid_search(settings, query_embedding, filenames)
+
+    def fetch_neighbors(self, settings: AppSettings, filename: str, ordinals: Any) -> Any:
+        return self.inner.fetch_neighbors(settings, filename, ordinals)
+
+
+def test_multi_query_expansion_runs_extra_searches_and_records_variants() -> None:
+    settings = make_settings(query_expansion_enabled=True, query_expansion_count=2)
+    client = QdrantClient(":memory:")
+    inner = VectorRepository(client)
+    IngestService(inner, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    counting = CountingRepository(inner)
+    trace_store = ListTraceStore()
+    generator = SequencedGenerator(["rewrite one\nrewrite two", "Alpha is documented [1]."])
+    pipeline = RagPipeline(
+        repository=counting,  # type: ignore[arg-type]
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    result = pipeline.answer("alpha")
+
+    assert result.answer == "Alpha is documented [1]."
+    # Original query + 2 variants => 3 hybrid searches.
+    assert counting.search_calls == 3
+    assert trace_store.traces[0].query_variants == ["rewrite one", "rewrite two"]
+
+
+def test_no_expansion_runs_single_search_and_no_variants() -> None:
+    settings = make_settings(query_expansion_enabled=False)
+    client = QdrantClient(":memory:")
+    inner = VectorRepository(client)
+    IngestService(inner, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    counting = CountingRepository(inner)
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=counting,  # type: ignore[arg-type]
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    pipeline.answer("alpha")
+
+    assert counting.search_calls == 1
+    assert trace_store.traces[0].query_variants == []
+
+
+def test_streaming_citation_retry_swaps_corrected_answer_into_done() -> None:
+    settings = make_settings(citation_retry_enabled=True)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    # Streamed answer has no citation; the retry supplies one.
+    generator = SequencedGenerator(["alpha is documented plainly", "Alpha is documented [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    events = list(pipeline.answer_stream("alpha"))
+    done = next(event for event in events if event["type"] == "done")
+
+    assert done["answer"] == "Alpha is documented [1]."
+    assert [source["source_number"] for source in done["sources"]] == [1]
+    assert trace_store.traces[0].citation_retry_used is True

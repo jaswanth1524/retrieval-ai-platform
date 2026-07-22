@@ -1,0 +1,6 @@
+{"question": "What retrieval strategy does DocRAG use?", "reference": "Hybrid dense + sparse BM25 retrieval fused with RRF at k=60, then cross-encoder rerank.", "relevant_filenames": ["docrag_overview.md"], "relevant_chunk_ids": []}
+{"question": "What is the default dense embedding model?", "reference": "BAAI/bge-small-en-v1.5.", "relevant_filenames": ["docrag_overview.md"], "relevant_chunk_ids": []}
+{"question": "What must every answer include?", "reference": "Citations carrying filename, page, section, and chunk_id.", "relevant_filenames": ["docrag_citations.md"], "relevant_chunk_ids": []}
+{"question": "Which generation provider is the default?", "reference": "Local Ollama via LiteLLM, model llama3.1:8b.", "relevant_filenames": ["docrag_providers.md"], "relevant_chunk_ids": []}
+{"question": "What happens on an embedding tag mismatch?", "reference": "The query is refused and the user is told to re-ingest.", "relevant_filenames": ["docrag_overview.md"], "relevant_chunk_ids": []}
+{"question": "How are follow-up questions handled with conversation memory?", "reference": "The client sends recent turns; the server condenses the follow-up into a standalone retrieval query before search.", "relevant_filenames": ["docrag_conversation.md"], "relevant_chunk_ids": []}

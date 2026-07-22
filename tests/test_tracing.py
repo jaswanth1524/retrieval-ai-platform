@@ -60,6 +60,40 @@ def test_trace_store_add_and_get_roundtrip() -> None:
     assert fetched.answer == "Refunds within 30 days [1]."
 
 
+def test_query_trace_condense_fields_default_to_none_and_zero() -> None:
+    trace = _trace("t1")
+
+    assert trace.condensed_question is None
+    assert trace.history_message_count == 0
+
+
+def test_query_trace_condense_fields_roundtrip_through_the_store() -> None:
+    store = TraceStore(max_retained=10)
+    trace = QueryTrace(
+        trace_id="t1",
+        created_at=0.0,
+        question="What about the second one?",
+        mode="sync",
+        status="ok",
+        config=None,
+        candidates=[],
+        prompt_messages=None,
+        answer="Doc B covers billing [1].",
+        cited_source_numbers=[1],
+        timings={"total_ms": 42.0, "condense_ms": 5.0},
+        error=None,
+        condensed_question="What is the second document about?",
+        history_message_count=2,
+    )
+
+    store.add(trace)
+
+    fetched = store.get("t1")
+    assert fetched is not None
+    assert fetched.condensed_question == "What is the second document about?"
+    assert fetched.history_message_count == 2
+
+
 def test_trace_store_get_returns_none_for_unknown_id() -> None:
     store = TraceStore(max_retained=10)
 

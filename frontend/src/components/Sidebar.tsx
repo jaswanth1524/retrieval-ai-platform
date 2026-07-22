@@ -1,5 +1,8 @@
 import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
+import type { ConversationSummary } from '../hooks/useChat';
 import ConfigPanel from './ConfigPanel';
+import ConversationList from './ConversationList';
+import CorpusPanel from './CorpusPanel';
 import DocumentFilter from './DocumentFilter';
 import StatusBadge, { type ApiStatus } from './StatusBadge';
 import UploadPanel, { type UploadItem } from './UploadPanel';
@@ -16,9 +19,20 @@ interface SidebarProps {
   overrides: QuestionOverrides;
   onOverridesChange: (value: QuestionOverrides) => void;
   overridesDisabled?: boolean;
-  sessionFilenames: string[];
   selectedFilenames: string[];
   onSelectedFilenamesChange: (filenames: string[]) => void;
+  indexedFilenames: string[];
+  onDeleteDocument: (filename: string) => Promise<void>;
+  conversations: ConversationSummary[];
+  activeConversationId: string | null;
+  onNewConversation: () => void;
+  onSwitchConversation: (id: string) => void;
+  onRenameConversation: (id: string, title: string) => void;
+  onDeleteConversation: (id: string) => void;
+  // Off-canvas overlay state used only below the responsive breakpoint (see
+  // global.css) — the sidebar is always visible above it regardless of `open`.
+  open?: boolean;
+  onClose?: () => void;
 }
 
 function Sidebar({
@@ -32,12 +46,21 @@ function Sidebar({
   overrides,
   onOverridesChange,
   overridesDisabled,
-  sessionFilenames,
   selectedFilenames,
   onSelectedFilenamesChange,
+  indexedFilenames,
+  onDeleteDocument,
+  conversations,
+  activeConversationId,
+  onNewConversation,
+  onSwitchConversation,
+  onRenameConversation,
+  onDeleteConversation,
+  open,
+  onClose,
 }: SidebarProps) {
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${open ? ' sidebar--open' : ''}`}>
       <div className="sidebar__header">
         <div className="sidebar__brand">
           <span className="sidebar__logo">D</span>
@@ -52,11 +75,36 @@ function Sidebar({
         >
           {theme === 'dark' ? '☀' : '☾'}
         </button>
+        {onClose && (
+          <button
+            type="button"
+            className="sidebar__close"
+            onClick={onClose}
+            aria-label="Close sidebar"
+            data-testid="sidebar-close"
+          >
+            &times;
+          </button>
+        )}
       </div>
       <StatusBadge status={apiStatus} message={apiStatusMessage} />
+      <ConversationList
+        conversations={conversations}
+        activeId={activeConversationId}
+        onNew={onNewConversation}
+        onSwitch={onSwitchConversation}
+        onRename={onRenameConversation}
+        onDelete={onDeleteConversation}
+        disabled={overridesDisabled}
+      />
       <UploadPanel onUpload={onUpload} uploads={uploads} maxUploadBytes={config?.max_upload_bytes} />
+      <CorpusPanel
+        filenames={indexedFilenames}
+        onDelete={onDeleteDocument}
+        disabled={overridesDisabled}
+      />
       <DocumentFilter
-        filenames={sessionFilenames}
+        filenames={indexedFilenames}
         selected={selectedFilenames}
         onChange={onSelectedFilenamesChange}
         disabled={overridesDisabled}

@@ -10,11 +10,12 @@ from typing import Annotated
 from fastapi import Depends
 from qdrant_client import QdrantClient
 
+from api.chunking import TokenCounter, make_token_counter
 from api.embeddings import LocalEmbeddingProvider
 from api.generation import LiteLLMGenerator
 from api.jobs import IngestJobStore
 from api.pipeline import IngestService, RagPipeline
-from api.provider_health import check_ollama_reachable
+from api.provider_health import check_ollama_reachable, check_qdrant_reachable
 from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
 from api.repository import VectorRepository
 from api.reranking import LocalCrossEncoderReranker, RerankingError
@@ -76,6 +77,16 @@ def get_ollama_reachability_checker() -> Callable[[AppSettings], bool]:
     return check_ollama_reachable
 
 
+def get_qdrant_reachability_checker() -> Callable[[QdrantClient], bool]:
+    """Return the Qdrant-reachability probe.
+
+    Not cached, mirroring ``get_ollama_reachability_checker`` — exposed as a
+    dependency so tests can override it without needing a real Qdrant instance.
+    """
+
+    return check_qdrant_reachable
+
+
 def get_vector_repository(
     client: Annotated[QdrantClient, Depends(get_qdrant_client)],
 ) -> VectorRepository:
@@ -124,10 +135,23 @@ def get_rag_pipeline(
     )
 
 
+@lru_cache
+def get_token_counter() -> TokenCounter:
+    """Return the process-wide token counter for chunk sizing.
+
+    Built from the dense embedding model name so chunking counts the same subword
+    tokens the model will. Lazy-loads the tokenizer on first use and degrades to a
+    word heuristic if it can't be fetched (see api/chunking.py).
+    """
+
+    return make_token_counter(get_app_settings().dense_embedding_model)
+
+
 def get_ingest_service(
     repository: Annotated[VectorRepository, Depends(get_vector_repository)],
     embedding_provider: Annotated[LocalEmbeddingProvider, Depends(get_embedding_provider)],
     settings: Annotated[AppSettings, Depends(get_app_settings)],
+    token_counter: Annotated[TokenCounter, Depends(get_token_counter)],
 ) -> IngestService:
     """Return the ingest orchestration seam: parse -> chunk -> embed -> index."""
 
@@ -135,14 +159,19 @@ def get_ingest_service(
         repository=repository,
         embedding_provider=embedding_provider,
         settings=settings,
+        token_counter=token_counter,
     )
 
 
 @lru_cache
 def get_ingest_job_store() -> IngestJobStore:
-    """Return the process-wide background ingest job status store."""
+    """Return the process-wide background ingest job status store.
 
-    return IngestJobStore()
+    Reads settings directly (not through FastAPI's DI), the same pattern as
+    ``get_trace_store`` — the retention cap is sized once at first use.
+    """
+
+    return IngestJobStore(max_retained=int(get_app_settings().ingest_jobs_max_retained))
 
 
 @lru_cache
@@ -164,6 +193,7 @@ def clear_dependency_caches() -> None:
     get_embedding_provider.cache_clear()
     get_reranker.cache_clear()
     get_generator.cache_clear()
+    get_token_counter.cache_clear()
     get_ingest_job_store.cache_clear()
     get_ingest_executor.cache_clear()
     get_trace_store.cache_clear()
