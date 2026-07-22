@@ -10,6 +10,7 @@ interface TraceDrawerProps {
 
 const DROP_REASON_LABEL: Record<string, string> = {
   below_min_score: 'below threshold',
+  near_duplicate: 'near-duplicate',
   top_k_cut: 'top-k cut',
   not_scored: 'not scored',
 };
@@ -94,6 +95,7 @@ function TraceDrawer({ traceId, timings }: TraceDrawerProps) {
               <div className="trace-drawer__timings">
                 {(
                   [
+                    ['condense', effectiveTimings.condense_ms],
                     ['embed', effectiveTimings.embed_ms],
                     ['search', effectiveTimings.search_ms],
                     ['rerank', effectiveTimings.rerank_ms],
@@ -126,6 +128,15 @@ function TraceDrawer({ traceId, timings }: TraceDrawerProps) {
                 <dt>scope</dt>
                 <dd>{trace.config.filenames ? trace.config.filenames.join(', ') : 'all documents'}</dd>
               </dl>
+            </div>
+          )}
+
+          {trace?.condensed_question && (
+            <div className="trace-drawer__section">
+              <h4 className="trace-drawer__heading">Condensed query</h4>
+              <p className="trace-drawer__answer mono" data-testid="trace-drawer-condensed-question">
+                {trace.condensed_question}
+              </p>
             </div>
           )}
 

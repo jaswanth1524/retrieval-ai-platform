@@ -22,6 +22,46 @@ _CITATION_RE = re.compile(r"\[(\d+)\]")
 
 CITATION_EXCERPT_MAX_CHARS = 200
 
+CONDENSE_SYSTEM_PROMPT = (
+    "You rewrite a follow-up question into one standalone search query for document "
+    "retrieval. Use the conversation to resolve pronouns and references. Output only "
+    "the rewritten question — no preamble, quotes, or explanation. If the question is "
+    "already self-contained, return it unchanged."
+)
+
+# Strips a leading bullet ("- ", "• ", "* ") or an enumerator ("1. ", "2) ") from a
+# variant line — but only a real list prefix, so a variant like "3D printing basics"
+# keeps its leading digit.
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[-•*]\s+|\d+[.)]\s+)")
+
+
+def _strip_list_marker(line: str) -> str:
+    return _LIST_MARKER_RE.sub("", line, count=1)
+
+
+EXPANSION_SYSTEM_PROMPT = (
+    "You rewrite a search query into alternative phrasings for document retrieval. "
+    "Output one variant per line — no numbering, bullets, quotes, or preamble. Vary "
+    "the wording and emphasis while keeping the original meaning."
+)
+
+CITATION_RETRY_REMINDER = (
+    "Your previous answer included no [n] citation markers. Rewrite it, keeping the "
+    "same substance, and cite the specific numbered sources that support each claim "
+    "(for example [1], [2]). If the context does not actually support an answer, say "
+    "the provided documents do not contain enough information."
+)
+
+# Phrases that signal the model already declared the context insufficient — a valid
+# no-citation answer that must not trigger a citation retry.
+_INSUFFICIENCY_HINTS = (
+    "enough information",
+    "insufficient",
+    "do not contain",
+    "does not contain",
+    "cannot answer",
+)
+
 
 class GenerationError(RuntimeError):
     """Raised when grounded generation fails."""
@@ -65,6 +105,10 @@ class StageTimings:
     rerank_ms: float
     generate_ms: float
     total_ms: float
+    # 0.0 when there was no history to condense, or condense was disabled.
+    condense_ms: float = 0.0
+    # 0.0 when query expansion is disabled (the default) or produced no variants.
+    expand_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +119,9 @@ class GroundedAnswer:
     sources: list[SourceCitation]
     timings: StageTimings | None = None
     trace_id: str | None = None
+    # True when the answer initially lacked citations and a stricter retry supplied
+    # them (see needs_citation_retry / retry_uncited_answer).
+    citation_retry_used: bool = False
 
 
 class LiteLLMGenerator:
@@ -102,7 +149,7 @@ class LiteLLMGenerator:
                 model=model,
                 messages=list(messages),
                 temperature=float(settings.llm_temperature),
-                max_tokens=int(settings.llm_max_tokens),
+                max_tokens=effective_max_tokens(settings, model),
                 timeout=float(settings.llm_request_timeout_seconds),
                 num_retries=int(settings.llm_num_retries),
                 # Some models (e.g. the gpt-5 family) reject params other models
@@ -147,7 +194,7 @@ class LiteLLMGenerator:
                 model=model,
                 messages=list(messages),
                 temperature=float(settings.llm_temperature),
-                max_tokens=int(settings.llm_max_tokens),
+                max_tokens=effective_max_tokens(settings, model),
                 timeout=float(settings.llm_request_timeout_seconds),
                 num_retries=int(settings.llm_num_retries),
                 drop_params=True,
@@ -189,6 +236,7 @@ def generate_grounded_answer(
     context_chunks: Sequence[RerankedChunk],
     generator: ChatGenerator,
     settings: AppSettings,
+    history: Sequence[ChatMessage] | None = None,
 ) -> GroundedAnswer:
     """Generate a grounded answer from reranked context chunks."""
 
@@ -200,39 +248,61 @@ def generate_grounded_answer(
     if not selected_chunks:
         return GroundedAnswer(answer=INSUFFICIENT_CONTEXT_ANSWER, sources=[])
 
-    messages = build_grounded_messages(normalized_query, selected_chunks)
+    messages = build_grounded_messages(normalized_query, selected_chunks, history)
     answer = generator.complete(messages, settings).strip()
     if not answer:
         raise GenerationError("Generation provider returned an empty answer.")
 
     all_sources = source_citations(selected_chunks)
+    retry_used = False
+    if settings.citation_retry_enabled and needs_citation_retry(answer, len(all_sources)):
+        retried = retry_uncited_answer(
+            normalized_query, selected_chunks, answer, generator, settings, history
+        )
+        if retried is not None:
+            answer = retried
+            retry_used = True
+
     return GroundedAnswer(
         answer=answer,
         sources=cited_sources(answer, all_sources),
+        citation_retry_used=retry_used,
     )
 
 
 def build_grounded_messages(
     query: str,
     context_chunks: Sequence[RerankedChunk],
+    history: Sequence[ChatMessage] | None = None,
 ) -> list[ChatMessage]:
-    """Build the prompt that constrains the model to provided context."""
+    """Build the prompt that constrains the model to provided context.
+
+    ``history``, when given, is inserted verbatim between the system message and the
+    final user message — the final user message always carries the raw ``query`` plus
+    context plus instructions, unchanged by history's presence, so the context-only /
+    mandatory-citation grounding rules never weaken for a follow-up question.
+    """
 
     context = "\n\n".join(
         format_context_chunk(index, chunk)
         for index, chunk in enumerate(context_chunks, start=1)
     )
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are DocRAG, a document question-answering assistant. "
-                "Answer only from the provided context. Do not use outside knowledge. "
-                "If the context is insufficient, explicitly say that the provided "
-                "documents do not contain enough information. Cite supporting sources "
-                "with bracketed source numbers like [1]."
-            ),
-        },
+    system_content = (
+        "You are DocRAG, a document question-answering assistant. "
+        "Answer only from the provided context. Do not use outside knowledge. "
+        "If the context is insufficient, explicitly say that the provided "
+        "documents do not contain enough information. Cite supporting sources "
+        "with bracketed source numbers like [1]."
+    )
+    if history:
+        system_content += (
+            " Prior conversation turns are provided for continuity only — still "
+            "answer strictly from the provided context and cite sources like [1]."
+        )
+    messages: list[ChatMessage] = [{"role": "system", "content": system_content}]
+    if history:
+        messages.extend(history)
+    messages.append(
         {
             "role": "user",
             "content": (
@@ -243,8 +313,58 @@ def build_grounded_messages(
                 "- Include citations using source numbers such as [1] or [2].\n"
                 "- If the context is insufficient, say so directly."
             ),
+        }
+    )
+    return messages
+
+
+def build_condense_messages(
+    question: str,
+    history: Sequence[ChatMessage],
+) -> list[ChatMessage]:
+    """Build the prompt that rewrites a follow-up into a standalone retrieval query."""
+
+    transcript = "\n".join(
+        f"{'User' if message['role'] == 'user' else 'Assistant'}: {message['content']}"
+        for message in history
+    )
+    return [
+        {"role": "system", "content": CONDENSE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"{transcript}\n\n"
+                f"Follow-up question: {question}\n\n"
+                "Standalone question:"
+            ),
         },
     ]
+
+
+def condense_question(
+    question: str,
+    history: Sequence[ChatMessage],
+    generator: ChatGenerator,
+    settings: AppSettings,
+) -> str:
+    """Rewrite a follow-up question into a standalone retrieval query.
+
+    Deterministic (temperature 0) regardless of the caller's own temperature
+    override — this is a mechanical rewrite, not a creative generation. Returns ""
+    (rather than raising) when the provider returns an empty response, so the
+    caller's own fallback-to-raw-question logic handles both failure modes the
+    same way.
+    """
+
+    messages = build_condense_messages(question, history)
+    condense_settings = settings.model_copy(
+        update={
+            "llm_temperature": 0.0,
+            "llm_max_tokens": int(settings.condense_max_tokens),
+        }
+    )
+    result = generator.complete(messages, condense_settings).strip()
+    return result.strip("\"'")
 
 
 def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
@@ -305,6 +425,129 @@ def cited_sources(
     return [source for source in sources if source.source_number in used]
 
 
+def needs_citation_retry(answer: str, source_count: int) -> bool:
+    """True when an answer should be retried for missing citations.
+
+    Only when sources were available, the answer contains no ``[n]`` marker, and the
+    answer did not already declare the context insufficient (a valid uncited answer).
+    """
+
+    if source_count <= 0 or _CITATION_RE.search(answer):
+        return False
+    lowered = answer.lower()
+    return not any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
+
+
+def retry_uncited_answer(
+    query: str,
+    context_chunks: Sequence[RerankedChunk],
+    first_answer: str,
+    generator: ChatGenerator,
+    settings: AppSettings,
+    history: Sequence[ChatMessage] | None = None,
+) -> str | None:
+    """One-shot retry that reminds the model to cite; returns the cited answer or None.
+
+    Returns None (caller keeps the original answer) when the retry fails or still
+    produces no citations — never loops.
+    """
+
+    selected_chunks = list(context_chunks[: int(settings.max_context_chunks)])
+    messages: list[ChatMessage] = [
+        *build_grounded_messages(query, selected_chunks, history),
+        {"role": "assistant", "content": first_answer},
+        {"role": "user", "content": CITATION_RETRY_REMINDER},
+    ]
+    try:
+        retried = generator.complete(messages, settings).strip()
+    except GenerationError:
+        return None
+    return retried if retried and _CITATION_RE.search(retried) else None
+
+
+def build_expansion_messages(question: str, count: int) -> list[ChatMessage]:
+    """Build the prompt that asks for ``count`` alternative query phrasings."""
+
+    return [
+        {"role": "system", "content": EXPANSION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Query: {question}\n\n"
+                f"Write {count} alternative search queries, one per line:"
+            ),
+        },
+    ]
+
+
+def generate_query_variants(
+    question: str,
+    count: int,
+    generator: ChatGenerator,
+    settings: AppSettings,
+) -> list[str]:
+    """Generate up to ``count`` alternative query phrasings for multi-query retrieval.
+
+    Best-effort: any provider error or empty output returns ``[]`` so retrieval falls
+    back to the single original query (mirrors ``condense_question``'s contract).
+    Deterministic-ish temperature 0.3 for mild variation.
+    """
+
+    if count <= 0:
+        return []
+    expansion_settings = settings.model_copy(
+        update={
+            "llm_temperature": 0.3,
+            "llm_max_tokens": int(settings.query_expansion_max_tokens),
+        }
+    )
+    try:
+        raw = generator.complete(build_expansion_messages(question, count), expansion_settings)
+    except GenerationError:
+        return []
+
+    original = question.strip().lower()
+    seen: set[str] = set()
+    variants: list[str] = []
+    for line in raw.splitlines():
+        cleaned = _strip_list_marker(line.strip()).strip("\"'").strip()
+        key = cleaned.lower()
+        if not cleaned or key == original or key in seen:
+            continue
+        seen.add(key)
+        variants.append(cleaned)
+    return variants[:count]
+
+
+def supports_reasoning(model: str) -> bool:
+    """True when LiteLLM reports ``model`` as a reasoning model (gpt-5 family, o-series).
+
+    Wrapped so an unknown model or an offline metadata lookup degrades to False rather
+    than raising — non-reasoning is the safe default (plain max_tokens, no effort knob).
+    """
+
+    try:
+        return bool(litellm.supports_reasoning(model))
+    except Exception:
+        return False
+
+
+def effective_max_tokens(settings: AppSettings, model: str) -> int:
+    """Output-token budget for ``model``.
+
+    Reasoning models spend hidden reasoning tokens out of the same budget as the visible
+    answer, so they get ``llm_max_tokens`` plus ``reasoning_token_headroom`` — otherwise
+    reasoning alone exhausts a small budget and the visible answer comes back empty. The
+    additive form preserves the relative sizing of the cheaper condense/expansion calls,
+    which lower ``llm_max_tokens`` via ``model_copy``.
+    """
+
+    base = int(settings.llm_max_tokens)
+    if supports_reasoning(model):
+        return base + int(settings.reasoning_token_headroom)
+    return base
+
+
 def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, str]]:
     """Return LiteLLM model name and provider-specific keyword arguments."""
 
@@ -317,7 +560,11 @@ def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, s
     if provider == "openai":
         if not settings.openai_api_key:
             raise GenerationConfigError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
-        return settings.openai_model, {"api_key": settings.openai_api_key}
+        kwargs = {"api_key": settings.openai_api_key}
+        effort = settings.openai_reasoning_effort.strip()
+        if effort and supports_reasoning(settings.openai_model):
+            kwargs["reasoning_effort"] = effort
+        return settings.openai_model, kwargs
     raise GenerationConfigError(f"Unsupported LLM_PROVIDER '{settings.llm_provider}'.")
 
 

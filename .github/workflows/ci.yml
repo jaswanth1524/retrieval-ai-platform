@@ -29,6 +29,9 @@ jobs:
       - name: Typecheck
         run: uv run mypy api
 
+      - name: Validate eval dataset
+        run: uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -55,3 +58,13 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-only: running the image would pull the ~1.1 GB reranker + embedding
+      # models, which isn't worth paying for on every CI run.
+      - name: Build image
+        run: docker build -t docrag:ci .

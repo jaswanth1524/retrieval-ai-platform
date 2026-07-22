@@ -1,0 +1,9 @@
+# Committed retrieval-eval baselines live here.
+#
+# Produce one locally against your ingested corpus:
+#   uv run python -m eval.harness retrieval eval/datasets/retrieval_eval.sample.jsonl \
+#     --output eval/baselines/retrieval_baseline.json
+#
+# Then gate future changes:
+#   uv run python -m eval.harness retrieval eval/datasets/retrieval_eval.sample.jsonl \
+#     --baseline eval/baselines/retrieval_baseline.json --max-regression 0.05

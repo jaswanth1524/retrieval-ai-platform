@@ -4,7 +4,7 @@ from api.jobs import IngestJobStore
 
 
 def test_ingest_job_store_create_returns_queued_job() -> None:
-    store = IngestJobStore()
+    store = IngestJobStore(max_retained=50)
 
     job = store.create("guide.txt")
 
@@ -17,13 +17,13 @@ def test_ingest_job_store_create_returns_queued_job() -> None:
 
 
 def test_ingest_job_store_get_returns_none_for_unknown_id() -> None:
-    store = IngestJobStore()
+    store = IngestJobStore(max_retained=50)
 
     assert store.get("missing") is None
 
 
 def test_ingest_job_store_update_mutates_tracked_fields() -> None:
-    store = IngestJobStore()
+    store = IngestJobStore(max_retained=50)
     job = store.create("guide.txt")
 
     store.update(job.id, state="embedding", chunks_done=3, chunks_total=10)
@@ -36,7 +36,7 @@ def test_ingest_job_store_update_mutates_tracked_fields() -> None:
 
 
 def test_ingest_job_store_update_is_a_noop_for_unknown_id() -> None:
-    store = IngestJobStore()
+    store = IngestJobStore(max_retained=50)
 
     store.update("missing", state="done")  # must not raise
 
@@ -45,7 +45,7 @@ def test_ingest_job_store_get_returns_a_snapshot_not_the_live_object() -> None:
     """Mutating the store after a `get()` must not retroactively change the
     already-returned snapshot — callers should see a point-in-time status."""
 
-    store = IngestJobStore()
+    store = IngestJobStore(max_retained=50)
     job = store.create("guide.txt")
 
     snapshot = store.get(job.id)
@@ -57,8 +57,8 @@ def test_ingest_job_store_get_returns_a_snapshot_not_the_live_object() -> None:
 
 
 def test_ingest_job_store_prunes_oldest_finished_jobs_beyond_retention_limit() -> None:
-    store = IngestJobStore()
-    # _MAX_RETAINED_JOBS is 50 — create one more finished job than that limit.
+    store = IngestJobStore(max_retained=50)
+    # Create one more finished job than the retention limit.
     job_ids = []
     for i in range(51):
         job = store.create(f"doc-{i}.txt")
@@ -68,3 +68,16 @@ def test_ingest_job_store_prunes_oldest_finished_jobs_beyond_retention_limit() -
     # The oldest finished job should have been pruned; the newest must survive.
     assert store.get(job_ids[0]) is None
     assert store.get(job_ids[-1]) is not None
+
+
+def test_ingest_job_store_respects_a_custom_max_retained() -> None:
+    store = IngestJobStore(max_retained=2)
+    job_ids = []
+    for i in range(3):
+        job = store.create(f"doc-{i}.txt")
+        store.update(job.id, state="done")
+        job_ids.append(job.id)
+
+    assert store.get(job_ids[0]) is None
+    assert store.get(job_ids[1]) is not None
+    assert store.get(job_ids[2]) is not None

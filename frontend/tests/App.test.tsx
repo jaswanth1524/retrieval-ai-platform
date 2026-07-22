@@ -142,11 +142,14 @@ describe('App', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(/Cannot reach the DocRAG API/);
   });
 
-  it('does not call GET /documents on boot', async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  it('fetches the indexed corpus on boot and renders it in the corpus panel', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
       if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+      if (url.endsWith('/documents') && (!init?.method || init.method === 'GET')) {
+        return jsonResponse({ filenames: ['existing.pdf'] });
+      }
       throw new Error(`unexpected fetch: ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -154,7 +157,36 @@ describe('App', () => {
     render(<App />);
     await screen.findByText('API online');
 
-    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/documents'))).toBe(false);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/documents'))).toBe(true);
+    const items = await screen.findAllByTestId('corpus-panel-item');
+    expect(items.map((item) => item.textContent)).toEqual(['existing.pdf✕']);
+  });
+
+  it('deleting an indexed document removes it from the corpus panel and search scope', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+      if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+      if (url.endsWith('/documents/existing.pdf') && init?.method === 'DELETE') {
+        return jsonResponse({ filename: 'existing.pdf', points_deleted: 3 });
+      }
+      if (url.endsWith('/documents') && (!init?.method || init.method === 'GET')) {
+        return jsonResponse({ filenames: ['existing.pdf'] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await screen.findByText('API online');
+    await screen.findAllByTestId('corpus-panel-item');
+
+    await userEvent.click(screen.getByLabelText('Delete existing.pdf'));
+    await userEvent.click(screen.getByText('Confirm'));
+
+    await vi.waitFor(() => {
+      expect(screen.queryAllByTestId('corpus-panel-item')).toHaveLength(0);
+    });
   });
 
   it('disables the question input with an upload hint when no session documents exist', async () => {
@@ -259,7 +291,7 @@ describe('App', () => {
     expect(screen.queryByTestId('question-hint')).not.toBeInTheDocument();
   });
 
-  it('asking with "All documents" selected sends every session filename', async () => {
+  it('asking with "All documents" selected searches the whole corpus (no filenames)', async () => {
     const fetchMock = stubUploadAndQuestionFetch();
 
     render(<App />);
@@ -277,7 +309,8 @@ describe('App', () => {
     });
     const streamCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/questions/stream'));
     const body = JSON.parse(String(streamCall?.[1]?.body));
-    expect(body.filenames.sort()).toEqual(['a.txt', 'b.txt']);
+    // No document selected = search everything; the client omits `filenames` entirely.
+    expect(body.filenames).toBeUndefined();
   });
 
   it('selecting one document in the filter restricts the filenames sent', async () => {
@@ -320,5 +353,28 @@ describe('App', () => {
       expect(screen.getAllByTestId('upload-job-item')).toHaveLength(2);
     });
     expect(screen.getAllByTestId('document-filter-item')).toHaveLength(1);
+  });
+
+  it('opens the sidebar overlay on mobile toggle and closes it via the backdrop', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('API online');
+
+    expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId('sidebar-open'));
+    expect(screen.getByTestId('sidebar-backdrop')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId('sidebar-backdrop'));
+    expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument();
   });
 });

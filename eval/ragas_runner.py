@@ -248,6 +248,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated RAGAS metric names.",
     )
     parser.add_argument("--output", type=Path, help="Optional JSON output path.")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help=(
+            "Load and shape-check the dataset and metric names without running RAGAS "
+            "(no ragas/datasets import, no LLM calls) — a CI-safe smoke check that "
+            "the shipped dataset stays loadable, independent of the optional eval extra."
+        ),
+    )
     return parser
 
 
@@ -256,6 +265,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.validate_only:
+        try:
+            examples = load_examples(args.dataset)
+            metric_names = parse_metric_names(args.metrics)
+        except EvaluationDataError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"validated {len(examples)} examples, {len(metric_names)} metrics")
+        return 0
 
     try:
         examples = load_examples(args.dataset)

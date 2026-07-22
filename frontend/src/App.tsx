@@ -2,7 +2,10 @@ import { useEffect, useState } from 'react';
 import { ApiClientError, api } from './api/client';
 import type { LlmProvider, PublicConfigResponse, QuestionOverrides } from './api/types';
 import ChatThread from './components/ChatThread';
+import ChatToolbar from './components/ChatToolbar';
+import DocumentViewer from './components/DocumentViewer';
 import ProviderSelector from './components/ProviderSelector';
+import TraceBrowser from './components/TraceBrowser';
 import QuestionInput from './components/QuestionInput';
 import Sidebar from './components/Sidebar';
 import type { ApiStatus } from './components/StatusBadge';
@@ -39,15 +42,33 @@ function App() {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
-  // Documents uploaded during this browser session only — resets on reload. Never
-  // backed by GET /documents, which lists every filename ever indexed in Qdrant
-  // across all sessions; searching those would surface stale, user-invisible docs.
-  const [sessionFilenames, setSessionFilenames] = useState<string[]>([]);
   const [selectedFilenames, setSelectedFilenames] = useState<string[]>([]);
+  // The full corpus currently indexed in Qdrant (across all sessions). Both the
+  // corpus-management panel and the search-scope filter operate over this one list,
+  // so any indexed document is scopable regardless of which session uploaded it.
+  const [indexedFilenames, setIndexedFilenames] = useState<string[]>([]);
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
   );
-  const { turns, pending, ask, cancel } = useChat();
+  // Sidebar becomes an off-canvas overlay below the responsive breakpoint (see
+  // global.css); closed by default so it never covers the chat on first paint.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Source document viewer: which document/chunk a clicked citation opens (null = closed).
+  const [sourceView, setSourceView] = useState<{ filename: string; chunkId: string } | null>(null);
+  const [traceBrowserOpen, setTraceBrowserOpen] = useState(false);
+  const {
+    turns,
+    pending,
+    ask,
+    cancel,
+    clear,
+    conversations,
+    activeConversationId,
+    newConversation,
+    switchConversation,
+    renameConversation,
+    deleteConversation,
+  } = useChat();
 
   const updateAdvancedOptions = (next: QuestionOverrides) => {
     setAdvancedOptions(next);
@@ -95,6 +116,12 @@ function App() {
           setSelectedProvider('openai');
         }
         setApiStatus('ok');
+        try {
+          const documents = await api.listDocuments(controller.signal);
+          if (!cancelled) setIndexedFilenames(documents.filenames);
+        } catch {
+          // Non-fatal — the corpus panel just stays empty until the next refresh.
+        }
       } catch (err) {
         if (cancelled) return;
         setApiStatus('error');
@@ -149,8 +176,8 @@ function App() {
       const filename = status.result?.filename;
       if (filename) {
         // Dedupe by name — re-uploading the same filename replaces its chunks
-        // server-side, so the scope list should not grow a second entry for it.
-        setSessionFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
+        // server-side, so the corpus list should not grow a second entry for it.
+        setIndexedFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
       }
     } catch (err) {
       setUploads((prev) =>
@@ -173,11 +200,36 @@ function App() {
     await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
   };
 
+  const handleDeleteDocument = async (filename: string) => {
+    await api.deleteDocument(filename);
+    // A deleted document can never remain in the corpus or the active search scope.
+    setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
+    setSelectedFilenames((prev) => prev.filter((name) => name !== filename));
+  };
+
   const apiReachable = apiStatus === 'ok';
-  const noSessionDocs = sessionFilenames.length === 0;
+  const noDocs = indexedFilenames.length === 0;
+
+  // Shared by both the input box and a Retry click on a failed turn — retry always
+  // uses the CURRENT provider/overrides/scope, not whatever was selected when the
+  // original question failed. No selection = search the whole corpus (undefined).
+  const askQuestion = (question: string) =>
+    ask(
+      question,
+      selectedProvider,
+      advancedOptions,
+      selectedFilenames.length > 0 ? selectedFilenames : undefined,
+    );
 
   return (
     <div className="app-shell">
+      {sidebarOpen && (
+        <div
+          className="app-shell__backdrop"
+          data-testid="sidebar-backdrop"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
       <Sidebar
         apiStatus={apiStatus}
         apiStatusMessage={apiStatusMessage}
@@ -189,9 +241,18 @@ function App() {
         overrides={advancedOptions}
         onOverridesChange={updateAdvancedOptions}
         overridesDisabled={pending}
-        sessionFilenames={sessionFilenames}
         selectedFilenames={selectedFilenames}
         onSelectedFilenamesChange={setSelectedFilenames}
+        indexedFilenames={indexedFilenames}
+        onDeleteDocument={handleDeleteDocument}
+        conversations={conversations}
+        activeConversationId={activeConversationId}
+        onNewConversation={newConversation}
+        onSwitchConversation={switchConversation}
+        onRenameConversation={renameConversation}
+        onDeleteConversation={deleteConversation}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
       />
       <main className="app-main">
         {apiStatus === 'error' ? (
@@ -200,6 +261,15 @@ function App() {
           </div>
         ) : (
           <>
+            <button
+              type="button"
+              className="app-main__sidebar-toggle"
+              onClick={() => setSidebarOpen(true)}
+              aria-label="Open sidebar"
+              data-testid="sidebar-open"
+            >
+              &#9776;
+            </button>
             {config && (
               <ProviderSelector
                 config={config}
@@ -208,22 +278,40 @@ function App() {
                 disabled={pending}
               />
             )}
-            <ChatThread turns={turns} pending={pending} onCancel={cancel} />
+            <div className="app-main__toolbar-row">
+              <ChatToolbar turns={turns} onClear={clear} disabled={pending} />
+              <button
+                type="button"
+                className="app-main__traces-button"
+                onClick={() => setTraceBrowserOpen(true)}
+                data-testid="open-trace-browser"
+              >
+                Traces
+              </button>
+            </div>
+            <ChatThread
+              turns={turns}
+              pending={pending}
+              onCancel={cancel}
+              onRetry={askQuestion}
+              onOpenSource={(filename, chunkId) => setSourceView({ filename, chunkId })}
+            />
             <QuestionInput
-              onSubmit={(question) =>
-                ask(
-                  question,
-                  selectedProvider,
-                  advancedOptions,
-                  selectedFilenames.length > 0 ? selectedFilenames : sessionFilenames,
-                )
-              }
-              disabled={!apiReachable || pending || noSessionDocs}
-              hint={noSessionDocs ? 'Upload a document to start.' : undefined}
+              onSubmit={askQuestion}
+              disabled={!apiReachable || pending || noDocs}
+              hint={noDocs ? 'Upload a document to start.' : undefined}
             />
           </>
         )}
       </main>
+      {sourceView && (
+        <DocumentViewer
+          filename={sourceView.filename}
+          chunkId={sourceView.chunkId}
+          onClose={() => setSourceView(null)}
+        />
+      )}
+      {traceBrowserOpen && <TraceBrowser onClose={() => setTraceBrowserOpen(false)} />}
     </div>
   );
 }

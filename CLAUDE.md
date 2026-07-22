@@ -4,9 +4,11 @@ DocRAG is a self-hostable, open-source document Q&A system. Treat the project sp
 
 ## Current State
 
-- Core upload, ingestion, hybrid retrieval, reranking, streaming Q&A, and citations are implemented (`api/`, `frontend/`).
-- Session-scoped multi-file upload and per-document search-scope filtering are the current feature area (branch `feature/session-scoped-multi-upload`).
-- Evaluation (`eval/ragas_runner.py`) and both test suites (`tests/`, `frontend/tests/`) exist and run in CI (`.github/workflows/ci.yml`).
+- Core upload, ingestion, hybrid retrieval, reranking, streaming Q&A, citations, and per-query debug traces (`GET /traces`) are implemented (`api/`, `frontend/`).
+- Session-scoped multi-file upload, per-document search-scope filtering, document deletion (`DELETE /documents/{filename}`), client-sent conversation memory with LLM-condensed follow-up retrieval, chat UX (markdown rendering, persistence, export, retry, responsive layout), and ops/quality hardening (`/health/ready`, eval-dataset CI validation, Docker healthcheck/non-root) are implemented (branch `feature/conversation-memory-and-doc-management`).
+- Retrieval-quality pack: token-aware sentence-boundary chunking (`api/chunking.py` counts the dense model's real subword tokens; `chunk_size_tokens`/`chunk_overlap_tokens` are now genuine tokens), query/corpus embedding symmetry (bge dense query instruction + BM25 `query_embed` in `api/embeddings.py`), post-rerank near-duplicate diversity filter (`api/diversity.py`, trace drop-reason `near_duplicate`), opt-in multi-query expansion (`QUERY_EXPANSION_ENABLED`, default off — cross-variant fusion reuses the same pinned `rrf_k`), and a zero-citation retry (`CITATION_RETRY_ENABLED`, default on). The chunking change does **not** bump `embedding_model_tag` (same vector space; re-upload recommended, not required).
+- Format expansion (`api/documents.py`): DOCX/HTML/CSV parsers, PDF table extraction (pdfplumber), and optional OCR for scanned PDFs (`rapidocr-onnxruntime`, `ocr` extra). Frontend product pack: multi-conversation chat (localStorage v2 with v1 migration in `useChat.ts`), chunk-based source viewer + citation click-through (`GET /documents/{filename}/content`, `DocumentViewer.tsx`), trace-history browser (`TraceBrowser.tsx`), and unified whole-corpus search-scope filtering. Application logging is wired via `LOG_LEVEL` (`api/logging_config.py`).
+- Evaluation (`eval/ragas_runner.py`, sample at `eval/datasets/sample_eval.jsonl`) plus a live retrieval/answer harness (`eval/harness.py`, `eval/metrics.py`, labeled sample `eval/datasets/retrieval_eval.sample.jsonl`, baselines under `eval/baselines/`). The harness needs a live corpus/models so it runs locally; only the metric math is unit-tested in CI. Both test suites (`tests/`, `frontend/tests/`) run in CI (`.github/workflows/ci.yml`), which also builds the Docker image.
 - Treat new work as additive to this implementation, not a from-scratch scaffold — read the relevant module before changing it.
 
 ## Project Constraints
@@ -48,6 +50,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Treat the project sp
 - Default generation provider is local Ollama via LiteLLM.
 - Default local model is `llama3.1:8b`.
 - OpenAI generation support is optional and user-selectable.
+- Reasoning models (gpt-5 family, o-series) spend hidden reasoning tokens from the same `max_completion_tokens` budget as the visible answer, so `LLM_MAX_TOKENS=512` alone leaves an empty answer. `api/generation.py` detects them via `litellm.supports_reasoning`, sends `OPENAI_REASONING_EFFORT` (default `low`), and adds `REASONING_TOKEN_HEADROOM` (default 3072) on top of `LLM_MAX_TOKENS` — both scoped to reasoning models only; local models keep the plain budget.
 - Local embeddings remain the default even when OpenAI generation is selected.
 
 ## Common Commands

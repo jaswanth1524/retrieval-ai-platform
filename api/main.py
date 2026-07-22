@@ -16,6 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from qdrant_client import QdrantClient
 from starlette.staticfiles import StaticFiles
 
 from api.dependencies import (
@@ -25,16 +26,19 @@ from api.dependencies import (
     get_ingest_job_store,
     get_ingest_service,
     get_ollama_reachability_checker,
+    get_qdrant_client,
+    get_qdrant_reachability_checker,
     get_rag_pipeline,
     get_reranker,
     get_trace_store,
     get_vector_repository,
 )
-from api.documents import DocumentError
+from api.documents import DocumentError, DocumentNotFoundError
 from api.embeddings import EmbeddedText, EmbeddingError
-from api.generation import GenerationConfigError, GenerationError, StageTimings
+from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
 from api.ingestion import IngestionError
 from api.jobs import IngestJobStore, JobNotFoundError
+from api.logging_config import configure_logging
 from api.metrics import (
     ingest_chunks_total,
     ingest_jobs_total,
@@ -51,15 +55,20 @@ from api.schemas import (
     REQUEST_RERANK_TOP_K_MAX,
     REQUEST_TEMPERATURE_MAX,
     CitationResponse,
+    DocumentChunkResponse,
+    DocumentContentResponse,
+    DocumentDeleteResponse,
     DocumentIngestResponse,
     DocumentJobAcceptedResponse,
     DocumentJobStatusResponse,
     DocumentListResponse,
     HealthResponse,
+    HistoryMessageRequest,
     PromptMessageResponse,
     PublicConfigResponse,
     QuestionRequest,
     QuestionResponse,
+    ReadinessResponse,
     TimingsResponse,
     TraceCandidateResponse,
     TraceConfigResponse,
@@ -77,6 +86,10 @@ SettingsDep = Annotated[AppSettings, Depends(get_app_settings)]
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 RagPipelineDep = Annotated[RagPipeline, Depends(get_rag_pipeline)]
 OllamaCheckDep = Annotated[Callable[[AppSettings], bool], Depends(get_ollama_reachability_checker)]
+QdrantClientDep = Annotated[QdrantClient, Depends(get_qdrant_client)]
+QdrantCheckDep = Annotated[
+    Callable[[QdrantClient], bool], Depends(get_qdrant_reachability_checker)
+]
 VectorRepositoryDep = Annotated[VectorRepository, Depends(get_vector_repository)]
 IngestJobStoreDep = Annotated[IngestJobStore, Depends(get_ingest_job_store)]
 IngestExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_ingest_executor)]
@@ -147,10 +160,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     settings = get_app_settings()
+    configure_logging(settings.log_level)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type"],
     )
     register_exception_handlers(app)
@@ -226,6 +240,33 @@ def _timings_response(timings: StageTimings | None) -> TimingsResponse | None:
         rerank_ms=timings.rerank_ms,
         generate_ms=timings.generate_ms,
         total_ms=timings.total_ms,
+        condense_ms=timings.condense_ms,
+        expand_ms=timings.expand_ms,
+    )
+
+
+def _history_messages(history: list[HistoryMessageRequest] | None) -> list[ChatMessage] | None:
+    """Convert the request's history schema into pipeline-layer chat messages."""
+
+    if not history:
+        return None
+    return [{"role": message.role, "content": message.content} for message in history]
+
+
+def _payload_optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _content_chunk(payload: dict[str, object]) -> DocumentChunkResponse:
+    """Build one source-viewer chunk from a stored Qdrant payload, tolerating gaps."""
+
+    page = _payload_optional_int(payload.get("page"))
+    return DocumentChunkResponse(
+        chunk_id=str(payload.get("chunk_id", "")),
+        page=page if page is not None else 0,
+        section=str(payload.get("section", "")),
+        text=str(payload.get("text", "")),
+        chunk_ordinal=_payload_optional_int(payload.get("chunk_ordinal")),
     )
 
 
@@ -295,6 +336,10 @@ def _trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         cited_source_numbers=trace.cited_source_numbers,
         timings=TimingsResponse(**trace.timings) if trace.timings is not None else None,
         error=trace.error,
+        condensed_question=trace.condensed_question,
+        history_message_count=trace.history_message_count,
+        query_variants=trace.query_variants,
+        citation_retry_used=trace.citation_retry_used,
     )
 
 
@@ -305,6 +350,8 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "rerank_ms": timings.rerank_ms,
         "generate_ms": timings.generate_ms,
         "total_ms": timings.total_ms,
+        "condense_ms": timings.condense_ms,
+        "expand_ms": timings.expand_ms,
     }
 
 
@@ -314,10 +361,11 @@ def _log_question(
     """Emit one structured log line per answered question for latency observability."""
 
     logger.info(
-        "question answered provider=%s sources=%d embed_ms=%.1f search_ms=%.1f "
-        "rerank_ms=%.1f generate_ms=%.1f total_ms=%.1f",
+        "question answered provider=%s sources=%d condense_ms=%.1f embed_ms=%.1f "
+        "search_ms=%.1f rerank_ms=%.1f generate_ms=%.1f total_ms=%.1f",
         provider or "default",
         source_count,
+        timings.get("condense_ms", 0.0),
         timings["embed_ms"],
         timings["search_ms"],
         timings["rerank_ms"],
@@ -332,6 +380,31 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(status="ok")
+
+    @app.get("/health/ready")
+    def health_ready(
+        settings: SettingsDep,
+        check_qdrant: QdrantCheckDep,
+        qdrant_client: QdrantClientDep,
+        check_ollama: OllamaCheckDep,
+    ) -> Response:
+        # Plain `def`, not `async def`: both probes below block (an httpx sync call,
+        # a Qdrant client call), so this runs on FastAPI's request threadpool instead
+        # of the event loop — a slow Ollama probe (~1.5s worst case) never stalls
+        # other in-flight requests the way it would inside an async handler.
+        qdrant_ok = check_qdrant(qdrant_client)
+        provider = settings.llm_provider.lower().strip()
+        provider_ok = (
+            check_ollama(settings) if provider == "ollama" else bool(settings.openai_api_key)
+        )
+        body = ReadinessResponse(
+            status="ok" if qdrant_ok and provider_ok else "degraded",
+            qdrant=qdrant_ok,
+            generation_provider=provider_ok,
+            llm_provider=settings.llm_provider,
+        )
+        status_code = 200 if qdrant_ok and provider_ok else 503
+        return JSONResponse(status_code=status_code, content=body.model_dump())
 
     @app.get("/metrics")
     def metrics() -> Response:
@@ -364,6 +437,20 @@ def register_routes(app: FastAPI) -> None:
         executor.submit(_run_ingest_job, job_store, job.id, ingest_service, filename, content)
         return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
 
+    @app.delete("/documents/{filename}", response_model=DocumentDeleteResponse)
+    def delete_document(
+        filename: str, repository: VectorRepositoryDep, settings: SettingsDep
+    ) -> DocumentDeleteResponse:
+        # Filenames are always basenames (normalize_filename strips any path
+        # component at upload time), so a plain path segment is sufficient — a
+        # filename containing "/" simply can't match this route, which is fine
+        # since one can never have been uploaded.
+        point_ids = repository.point_ids_for_filename(settings, filename)
+        if not point_ids:
+            raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+        repository.delete_by_ids(settings, point_ids)
+        return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
+
     @app.get("/documents/jobs/{job_id}", response_model=DocumentJobStatusResponse)
     def get_document_job(job_id: str, job_store: IngestJobStoreDep) -> DocumentJobStatusResponse:
         job = job_store.get(job_id)
@@ -381,6 +468,16 @@ def register_routes(app: FastAPI) -> None:
             error=job.error,
             result=result,
         )
+
+    @app.get("/documents/{filename}/content", response_model=DocumentContentResponse)
+    def document_content(
+        filename: str, repository: VectorRepositoryDep, settings: SettingsDep
+    ) -> DocumentContentResponse:
+        payloads = repository.chunks_for_filename(settings, filename)
+        if not payloads:
+            raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+        chunks = [_content_chunk(payload) for payload in payloads]
+        return DocumentContentResponse(filename=filename, chunks=chunks)
 
     @app.get("/traces", response_model=TraceListResponse)
     def list_traces(trace_store: TraceStoreDep) -> TraceListResponse:
@@ -410,6 +507,7 @@ def register_routes(app: FastAPI) -> None:
                     llm_temperature=request.llm_temperature,
                 ),
                 filenames=request.filenames,
+                history=_history_messages(request.history),
             )
         except Exception:
             questions_total.labels(outcome="error").inc()
@@ -459,7 +557,10 @@ def register_routes(app: FastAPI) -> None:
             # here (partway through an already-started streamed response).
             try:
                 for event in pipeline.answer_stream(
-                    request.question, overrides, filenames=request.filenames
+                    request.question,
+                    overrides,
+                    filenames=request.filenames,
+                    history=_history_messages(request.history),
                 ):
                     if event["type"] == "done":
                         questions_total.labels(outcome="ok").inc()
@@ -522,6 +623,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(EmbeddingError, internal_error_handler)
     app.add_exception_handler(JobNotFoundError, not_found_handler)
     app.add_exception_handler(TraceNotFoundError, not_found_handler)
+    app.add_exception_handler(DocumentNotFoundError, not_found_handler)
 
 
 async def bad_request_handler(request: Request, exc: Exception) -> JSONResponse:

@@ -104,6 +104,40 @@ class VectorRepository:
                 break
         return ids
 
+    def chunks_for_filename(
+        self, settings: AppSettings, filename: str
+    ) -> list[dict[str, object]]:
+        """Return all payloads for a filename, ordered by ``chunk_ordinal``.
+
+        Backs the document-content endpoint (reconstruct a document from its chunks for
+        the source viewer). Points with no ``chunk_ordinal`` sort last, stably.
+        """
+
+        self.ensure_ready(settings)
+        payloads: list[dict[str, object]] = []
+        offset: models.ExtendedPointId | None = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="filename",
+                            match=models.MatchValue(value=filename),
+                        )
+                    ]
+                ),
+                with_payload=True,
+                with_vectors=False,
+                limit=256,
+                offset=offset,
+            )
+            payloads.extend(point.payload for point in points if point.payload)
+            if offset is None:
+                break
+        payloads.sort(key=_chunk_ordinal_sort_key)
+        return payloads
+
     def list_filenames(self, settings: AppSettings) -> list[str]:
         """Return the distinct filenames currently indexed, for per-document filtering."""
 
@@ -236,6 +270,15 @@ def _filename_filter(filenames: Sequence[str] | None) -> models.Filter | None:
     return models.Filter(
         must=[models.FieldCondition(key="filename", match=models.MatchAny(any=list(filenames)))]
     )
+
+
+def _chunk_ordinal_sort_key(payload: dict[str, object]) -> tuple[int, int]:
+    """Sort by chunk_ordinal; payloads without an int ordinal sort last, stably."""
+
+    ordinal = payload.get("chunk_ordinal")
+    if isinstance(ordinal, int) and not isinstance(ordinal, bool):
+        return (0, ordinal)
+    return (1, 0)
 
 
 def reciprocal_rank_fusion(

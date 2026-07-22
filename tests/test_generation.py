@@ -12,10 +12,16 @@ from api.generation import (
     GenerationConfigError,
     GenerationError,
     LiteLLMGenerator,
+    build_condense_messages,
     build_grounded_messages,
     completion_model_and_kwargs,
+    condense_question,
+    effective_max_tokens,
     extract_completion_text,
     generate_grounded_answer,
+    generate_query_variants,
+    needs_citation_retry,
+    retry_uncited_answer,
     source_citations,
 )
 from api.reranking import RerankedChunk
@@ -32,6 +38,26 @@ class FakeGenerator:
         self.messages = list(messages)
         self.settings = settings
         return self.answer
+
+
+class ScriptedGenerator:
+    """Returns queued answers in order; records the messages of each call."""
+
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = list(answers)
+        self.calls: list[list[ChatMessage]] = []
+        self.settings_seen: list[AppSettings] = []
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        self.calls.append(list(messages))
+        self.settings_seen.append(settings)
+        index = min(len(self.calls) - 1, len(self.answers) - 1)
+        return self.answers[index]
+
+
+class RaisingGenerator:
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        raise GenerationError("boom")
 
 
 class FakeCompletionClient:
@@ -98,6 +124,82 @@ def test_build_grounded_messages_requires_context_only_and_citations() -> None:
     assert "How do I run it?" in user_prompt
     assert "[1] filename=guide.md; page=3; section=Setup; chunk_id=c1" in user_prompt
     assert "Run docker compose up." in user_prompt
+
+
+def test_build_grounded_messages_inserts_history_between_system_and_user() -> None:
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "What is DocRAG?"},
+        {"role": "assistant", "content": "A document Q&A system [1]."},
+    ]
+    messages = build_grounded_messages(
+        "What about the second one?",
+        [make_chunk("c1", "Run docker compose up.", page=3)],
+        history,
+    )
+
+    assert messages[0]["role"] == "system"
+    assert "continuity only" in messages[0]["content"]
+    assert "Answer only from the provided context" in messages[0]["content"]
+    assert messages[1] == history[0]
+    assert messages[2] == history[1]
+    assert messages[3]["role"] == "user"
+    assert "What about the second one?" in messages[3]["content"]
+
+
+def test_build_grounded_messages_no_history_shape_is_unchanged() -> None:
+    messages = build_grounded_messages(
+        "How do I run it?",
+        [make_chunk("c1", "Run docker compose up.", page=3)],
+    )
+
+    assert len(messages) == 2
+    assert "continuity only" not in messages[0]["content"]
+
+
+def test_build_condense_messages_renders_transcript_and_follow_up() -> None:
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "What is DocRAG?"},
+        {"role": "assistant", "content": "A document Q&A system."},
+    ]
+    messages = build_condense_messages("What about the second one?", history)
+
+    assert messages[0]["role"] == "system"
+    user_content = messages[1]["content"]
+    assert "User: What is DocRAG?" in user_content
+    assert "Assistant: A document Q&A system." in user_content
+    assert "Follow-up question: What about the second one?" in user_content
+
+
+def test_condense_question_forwards_temperature_zero_and_condense_max_tokens() -> None:
+    settings = make_settings(llm_temperature=0.9, llm_max_tokens=512, condense_max_tokens=64)
+    generator = FakeGenerator("What is the second document about?")
+    history: list[ChatMessage] = [{"role": "user", "content": "Tell me about doc A and doc B."}]
+
+    result = condense_question("What about the second one?", history, generator, settings)
+
+    assert result == "What is the second document about?"
+    assert generator.settings.llm_temperature == 0.0
+    assert generator.settings.llm_max_tokens == 64
+
+
+def test_condense_question_strips_surrounding_quotes_and_whitespace() -> None:
+    settings = make_settings()
+    generator = FakeGenerator('  "What is the second document about?"  ')
+    history: list[ChatMessage] = [{"role": "user", "content": "Tell me about doc A and doc B."}]
+
+    result = condense_question("What about the second one?", history, generator, settings)
+
+    assert result == "What is the second document about?"
+
+
+def test_condense_question_returns_empty_string_for_empty_response() -> None:
+    settings = make_settings()
+    generator = FakeGenerator("   ")
+    history: list[ChatMessage] = [{"role": "user", "content": "Tell me about doc A."}]
+
+    result = condense_question("What about it?", history, generator, settings)
+
+    assert result == ""
 
 
 def test_generate_grounded_answer_limits_context_and_returns_source_metadata() -> None:
@@ -261,6 +363,74 @@ def test_completion_model_and_kwargs_rejects_unknown_provider() -> None:
         completion_model_and_kwargs(make_settings(llm_provider="anthropic"))
 
 
+def test_completion_model_and_kwargs_adds_reasoning_effort_for_reasoning_model() -> None:
+    model, kwargs = completion_model_and_kwargs(
+        make_settings(
+            llm_provider="openai",
+            openai_model="gpt-5-mini",
+            openai_api_key="test-key",
+            openai_reasoning_effort="low",
+        )
+    )
+
+    assert model == "gpt-5-mini"
+    assert kwargs == {"api_key": "test-key", "reasoning_effort": "low"}
+
+
+def test_completion_model_and_kwargs_omits_reasoning_effort_for_plain_model() -> None:
+    _, kwargs = completion_model_and_kwargs(
+        make_settings(
+            llm_provider="openai",
+            openai_model="gpt-4o-mini",
+            openai_api_key="test-key",
+            openai_reasoning_effort="low",
+        )
+    )
+
+    assert "reasoning_effort" not in kwargs
+
+
+def test_completion_model_and_kwargs_omits_reasoning_effort_when_disabled() -> None:
+    _, kwargs = completion_model_and_kwargs(
+        make_settings(
+            llm_provider="openai",
+            openai_model="gpt-5-mini",
+            openai_api_key="test-key",
+            openai_reasoning_effort="",
+        )
+    )
+
+    assert "reasoning_effort" not in kwargs
+
+
+def test_effective_max_tokens_adds_headroom_only_for_reasoning_models() -> None:
+    settings = make_settings(llm_max_tokens=512, reasoning_token_headroom=3072)
+
+    assert effective_max_tokens(settings, "gpt-5-mini") == 512 + 3072
+    assert effective_max_tokens(settings, "gpt-4o-mini") == 512
+    assert effective_max_tokens(settings, "ollama/llama3.1:8b") == 512
+
+
+def test_reasoning_model_gets_expanded_max_tokens_in_completion_call() -> None:
+    completion_client = FakeCompletionClient(
+        {"choices": [{"message": {"content": "Answer [1]."}}]}
+    )
+    settings = make_settings(
+        llm_provider="openai",
+        openai_model="gpt-5-mini",
+        openai_api_key="test-key",
+        llm_max_tokens=512,
+        reasoning_token_headroom=3072,
+    )
+    generator = LiteLLMGenerator(settings, completion_client=completion_client)
+
+    generator.complete([{"role": "user", "content": "Hi"}], settings)
+
+    assert completion_client.kwargs is not None
+    assert completion_client.kwargs["max_tokens"] == 512 + 3072
+    assert completion_client.kwargs["reasoning_effort"] == "low"
+
+
 def test_extract_completion_text_supports_object_responses() -> None:
     response = Response(choices=[Choice(Message("Object answer"))])
 
@@ -394,3 +564,104 @@ def test_litellm_generator_stream_wraps_connection_failure_for_ollama() -> None:
 
     with pytest.raises(GenerationError, match="ollama serve"):
         list(generator.stream([{"role": "user", "content": "Hi"}], settings))
+
+
+def test_generate_query_variants_parses_and_dedupes() -> None:
+    generator = ScriptedGenerator(
+        ["1. how to deploy docrag\n2. docrag deployment steps\n- how to deploy docrag"]
+    )
+    variants = generate_query_variants("deploy docrag", 3, generator, make_settings())
+    # Numbering/bullets stripped, exact duplicate collapsed.
+    assert variants == ["how to deploy docrag", "docrag deployment steps"]
+
+
+def test_generate_query_variants_preserves_leading_digit_in_content() -> None:
+    generator = ScriptedGenerator(["1. 3D printing basics\n- 5G network design"])
+    variants = generate_query_variants("printing", 3, generator, make_settings())
+    # List markers stripped, but "3D" / "5G" leading digits are kept.
+    assert variants == ["3D printing basics", "5G network design"]
+
+
+def test_generate_query_variants_drops_echo_of_original() -> None:
+    generator = ScriptedGenerator(["deploy docrag\nalternative deploy phrasing"])
+    variants = generate_query_variants("deploy docrag", 3, generator, make_settings())
+    assert variants == ["alternative deploy phrasing"]
+
+
+def test_generate_query_variants_returns_empty_on_error() -> None:
+    assert generate_query_variants("q", 3, RaisingGenerator(), make_settings()) == []
+
+
+def test_generate_query_variants_respects_zero_count() -> None:
+    generator = ScriptedGenerator(["a\nb\nc"])
+    assert generate_query_variants("q", 0, generator, make_settings()) == []
+
+
+def test_generate_query_variants_forwards_expansion_settings() -> None:
+    generator = ScriptedGenerator(["variant one\nvariant two"])
+    settings = make_settings(query_expansion_max_tokens=64)
+    generate_query_variants("q", 2, generator, settings)
+    # The expansion call runs at temperature 0.3 with the expansion token cap.
+    assert generator.settings_seen[0].llm_temperature == 0.3
+    assert generator.settings_seen[0].llm_max_tokens == 64
+
+
+def test_needs_citation_retry_logic() -> None:
+    assert needs_citation_retry("The answer is here.", 2) is True
+    assert needs_citation_retry("The answer is [1].", 2) is False
+    assert needs_citation_retry("The answer is here.", 0) is False
+    assert needs_citation_retry("The documents do not contain enough information.", 2) is False
+
+
+def test_retry_uncited_answer_returns_cited_retry() -> None:
+    generator = ScriptedGenerator(["Now with citation [1]."])
+    result = retry_uncited_answer(
+        "q", [make_chunk("c1", "context text")], "no citation here", generator, make_settings()
+    )
+    assert result == "Now with citation [1]."
+
+
+def test_retry_uncited_answer_returns_none_when_still_uncited() -> None:
+    generator = ScriptedGenerator(["still no citation"])
+    result = retry_uncited_answer(
+        "q", [make_chunk("c1", "context text")], "no citation", generator, make_settings()
+    )
+    assert result is None
+
+
+def test_generate_grounded_answer_retries_uncited_answer() -> None:
+    generator = ScriptedGenerator(["The setup is simple.", "The setup is simple [1]."])
+    result = generate_grounded_answer(
+        "How do I set up?",
+        [make_chunk("c1", "Run docker compose up.")],
+        generator,
+        make_settings(citation_retry_enabled=True),
+    )
+    assert result.answer == "The setup is simple [1]."
+    assert result.citation_retry_used is True
+    assert [source.source_number for source in result.sources] == [1]
+
+
+def test_generate_grounded_answer_skips_retry_when_disabled() -> None:
+    generator = ScriptedGenerator(["The setup is simple."])
+    result = generate_grounded_answer(
+        "How do I set up?",
+        [make_chunk("c1", "Run docker compose up.")],
+        generator,
+        make_settings(citation_retry_enabled=False),
+    )
+    assert result.answer == "The setup is simple."
+    assert result.citation_retry_used is False
+    assert len(generator.calls) == 1  # no retry call
+
+
+def test_generate_grounded_answer_skips_retry_on_insufficiency() -> None:
+    generator = ScriptedGenerator(["The provided documents do not contain enough information."])
+    result = generate_grounded_answer(
+        "How do I set up?",
+        [make_chunk("c1", "Unrelated content.")],
+        generator,
+        make_settings(citation_retry_enabled=True),
+    )
+    assert result.citation_retry_used is False
+    assert len(generator.calls) == 1

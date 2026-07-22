@@ -1,5 +1,13 @@
 # DocRAG Improvement Recommendations — Audit #2
 
+> **Status banner (2026-07-14):** this audit predates the conversation-memory,
+> document-management, chat-UX, and ops/quality milestone (per `CLAUDE.md`'s
+> Current State). Several findings below are now stale/resolved — see the inline
+> annotations on C3 and D2 — kept in place rather than deleted, since this file
+> documents decision history `CLAUDE.md` still references (e.g. the reranker-swap
+> approval in A2). Treat the rest of this document as a historical snapshot, not
+> a current punch list.
+
 Second full-codebase audit, done after all 12 actionable items from audit #1 (previous version of
 this doc) were implemented and shipped, plus the `drop_params` gpt-5 fix and the frontend dark/light
 redesign. This audit covers the current codebase, redesigned frontend included. Every finding below
@@ -183,7 +191,10 @@ misconfigured model fails loudly at boot instead of on a user's first request. G
   trims whitespace, disabled state blocks submit), `ChatThread.test.tsx` (empty state, pending
   indicator, rendered turn list).
 
-### C3. No CI
+### C3. No CI — RESOLVED
+
+`.github/workflows/ci.yml` now exists with backend, frontend, and Docker-build jobs, matching the
+shape recommended below. Left in place for context on the original ask.
 
 No `.github/workflows/` directory exists. Add one workflow with two jobs mirroring the local
 validation gates:
@@ -210,9 +221,11 @@ box, but with A2 unresolved the first question 502s. Now that A2 is resolved (ne
 fastembed-loadable), the "known issue" callout describing the 502 has been removed from the README
 and replaced with a note about the new reranker's larger (~1.1 GB) first-download size.
 
-Still open: document the `eval` extra (`uv sync --extra eval`) and a usage example for
+~~Still open: document the `eval` extra (`uv sync --extra eval`) and a usage example for
 `eval/ragas_runner.py` — the module is complete, tested, and functional but currently unreachable
-from any documentation, so nobody would discover it exists.
+from any documentation, so nobody would discover it exists.~~ **RESOLVED:** the README's
+"Evaluation (optional)" section documents the extra, dataset format, and run command, and
+`eval/datasets/sample_eval.jsonl` ships a runnable example.
 
 ### D3. Minor code-quality notes (fix opportunistically, not worth standalone PRs)
 

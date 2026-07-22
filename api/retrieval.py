@@ -107,7 +107,19 @@ def points_to_chunks(points: Sequence[models.ScoredPoint]) -> list[RetrievedChun
 
 
 def embed_query(query: str, embedding_provider: QueryEmbeddingProvider) -> EmbeddedText:
-    """Embed a single query with the configured local embedding provider."""
+    """Embed a single query with the configured local embedding provider.
+
+    Prefers the provider's ``embed_query`` (query/document embedding symmetry: dense
+    query instruction + BM25 query-side encoding) when available, falling back to
+    ``embed_texts`` for providers/test fakes that only implement the batch path.
+    """
+
+    query_embed = getattr(embedding_provider, "embed_query", None)
+    if callable(query_embed):
+        result = query_embed(query)
+        if not isinstance(result, EmbeddedText):
+            raise EmbeddingError("embed_query must return a single EmbeddedText.")
+        return result
 
     embeddings = embedding_provider.embed_texts([query])
     if len(embeddings) != 1:

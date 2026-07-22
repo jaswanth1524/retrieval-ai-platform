@@ -40,6 +40,12 @@ class SparseEmbeddingModel(Protocol):
         **kwargs: Any,
     ) -> Iterable[object]: ...
 
+    def query_embed(
+        self,
+        query: str | Iterable[str],
+        **kwargs: Any,
+    ) -> Iterable[object]: ...
+
 
 @dataclass(frozen=True)
 class EmbeddedText:
@@ -109,6 +115,37 @@ class LocalEmbeddingProvider:
             EmbeddedText(dense=dense, sparse=sparse)
             for dense, sparse in zip(dense_vectors, sparse_vectors, strict=True)
         ]
+
+    def embed_query(self, text: str) -> EmbeddedText:
+        """Embed one query symmetrically to the corpus side.
+
+        Two asymmetries the corpus path has that a raw query lacks are fixed here:
+        - Dense: prepend the model's query instruction (bge-small recommends
+          "Represent this sentence for searching relevant passages: "; fastembed does
+          not apply it automatically). Empty ``dense_query_instruction`` disables it.
+        - Sparse: use BM25's ``query_embed`` (unique-token, weight-1.0 query encoding)
+          rather than the document-side ``embed`` (TF-saturation/length weighting) —
+          the model pair's intended query path.
+        """
+
+        instruction = self.settings.dense_query_instruction
+        dense_text = f"{instruction}{text}" if instruction else text
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                dense_future = executor.submit(lambda: list(self.dense_model.embed([dense_text])))
+                sparse_future = executor.submit(lambda: list(self.sparse_model.query_embed([text])))
+                dense_vectors = [coerce_dense_vector(v) for v in dense_future.result()]
+                sparse_vectors = [coerce_sparse_vector(v) for v in sparse_future.result()]
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Embedding model failed: {exc}") from exc
+
+        if len(dense_vectors) != 1 or len(sparse_vectors) != 1:
+            raise EmbeddingError(
+                "Query embedding must produce exactly one dense and one sparse vector."
+            )
+        return EmbeddedText(dense=dense_vectors[0], sparse=sparse_vectors[0])
 
 
 def coerce_dense_vector(vector: object) -> list[float]:

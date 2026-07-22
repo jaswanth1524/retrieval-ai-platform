@@ -108,42 +108,96 @@ def test_txt_upload_without_blank_lines_stays_a_single_section() -> None:
     assert len(sections) == 1
 
 
+class WordTokenCounter:
+    """Deterministic 1-token-per-word counter for hermetic chunker tests.
+
+    ``chunk_sections`` reserves budget for the contextual-embedding prefix
+    ("filename › section\\n"), which is 3 words under this counter (filename, ›,
+    section) — so the effective per-chunk word budget is ``chunk_size_tokens - 3``.
+    """
+
+    def count(self, text: str) -> int:
+        return len(text.split())
+
+
+_WORD_COUNTER = WordTokenCounter()
+
+
 def test_chunk_sections_preserves_citation_payload_metadata() -> None:
-    settings = make_settings(chunk_size_tokens=4, chunk_overlap_tokens=1)
+    # budget = 6 - 3 (prefix) = 3 words; two 3-word sentences -> one chunk each.
+    settings = make_settings(chunk_size_tokens=6, chunk_overlap_tokens=1)
     sections = [
         DocumentSection(
             filename="guide.md",
             page=2,
             section="Setup",
-            text="one two three four five six seven",
+            text="One two three. Four five six.",
         )
     ]
 
-    chunks = chunk_sections(sections, settings)
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
 
-    assert [chunk.text for chunk in chunks] == [
-        "one two three four",
-        "four five six seven",
-    ]
+    assert [chunk.text for chunk in chunks] == ["One two three.", "Four five six."]
     first_payload = chunks[0].to_payload()
     assert first_payload["filename"] == "guide.md"
     assert first_payload["page"] == 2
     assert first_payload["section"] == "Setup"
     assert first_payload["chunk_id"] == chunks[0].chunk_id
-    assert first_payload["text"] == "one two three four"
+    assert first_payload["text"] == "One two three."
+
+
+def test_chunk_sections_windows_on_sentence_boundaries_with_overlap() -> None:
+    # budget = 7 - 3 = 4 words; sentences must start with a capital for the sentence
+    # regex to break on them (real prose does).
+    settings = make_settings(chunk_size_tokens=7, chunk_overlap_tokens=2)
+    sections = [
+        DocumentSection(filename="d.txt", page=1, section="s", text="Aa bb. Cc dd. Ee ff."),
+    ]
+
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
+
+    # Two whole sentences per window; the trailing sentence overlaps into the next.
+    assert [chunk.text for chunk in chunks] == ["Aa bb. Cc dd.", "Cc dd. Ee ff."]
+
+
+def test_chunk_sections_never_exceeds_token_budget() -> None:
+    settings = make_settings(chunk_size_tokens=8, chunk_overlap_tokens=2)
+    text = " ".join(f"Sentence number {i} here." for i in range(20))
+    sections = [DocumentSection(filename="doc.txt", page=1, section="Body", text=text)]
+
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
+
+    budget = 8 - 3  # chunk_size - prefix words
+    assert chunks
+    assert all(_WORD_COUNTER.count(chunk.text) <= budget for chunk in chunks)
+
+
+def test_chunk_sections_force_splits_oversized_sentence() -> None:
+    # A single 10-word sentence with no internal breaks, budget 4 -> split into
+    # <=4-word pieces rather than one overweight chunk.
+    settings = make_settings(chunk_size_tokens=7, chunk_overlap_tokens=1)
+    text = " ".join(f"w{i}" for i in range(10))
+    sections = [DocumentSection(filename="d.txt", page=1, section="s", text=text)]
+
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
+
+    budget = 7 - 3
+    assert all(_WORD_COUNTER.count(chunk.text) <= budget for chunk in chunks)
+    # Every word survives, in order.
+    assert " ".join(chunk.text for chunk in chunks) == text
 
 
 def test_chunk_ids_are_stable_for_same_source_and_text() -> None:
-    settings = make_settings()
+    settings = make_settings(chunk_size_tokens=8, chunk_overlap_tokens=1)
     section = DocumentSection(
         filename="same.txt",
         page=1,
         section="Same",
-        text="alpha beta gamma delta epsilon",
+        text="Alpha beta. Gamma delta. Epsilon zeta.",
     )
 
-    first = chunk_sections([section], settings)
-    second = chunk_sections([section], settings)
+    first = chunk_sections([section], settings, _WORD_COUNTER)
+    second = chunk_sections([section], settings, _WORD_COUNTER)
 
     assert [chunk.chunk_id for chunk in first] == [chunk.chunk_id for chunk in second]
 
@@ -155,7 +209,7 @@ def test_chunk_overlap_must_be_smaller_than_chunk_size() -> None:
     # A ChunkConfigError (DocumentError subclass) maps to 400, not the bare
     # ValueError this used to raise, which surfaced as an unhandled 500.
     with pytest.raises(ChunkConfigError, match="CHUNK_OVERLAP_TOKENS"):
-        chunk_sections([section], settings)
+        chunk_sections([section], settings, _WORD_COUNTER)
 
 
 def test_parse_text_document_falls_back_to_cp1252_when_not_valid_utf8() -> None:
@@ -214,119 +268,66 @@ def test_pdf_parser_preserves_page_numbers(monkeypatch: pytest.MonkeyPatch) -> N
     ]
 
 
-def test_chunk_sections_crosses_physical_page_boundary() -> None:
-    """Overlap must carry across a PDF page break, not reset to zero at it."""
+def test_chunk_sections_windows_physical_pages_as_one_stream() -> None:
+    """Consecutive physical sections (PDF pages) window as one continuous stream."""
 
-    settings = make_settings(chunk_size_tokens=4, chunk_overlap_tokens=1)
+    # budget = 12 - 3 = 9 words; both pages' sentences fit one window together.
+    settings = make_settings(chunk_size_tokens=12, chunk_overlap_tokens=1)
     sections = [
-        DocumentSection(filename="paper.pdf", page=1, section="Intro", text="one two three"),
-        DocumentSection(filename="paper.pdf", page=2, section="Middle", text="four five six seven"),
+        DocumentSection(filename="paper.pdf", page=1, section="Intro", text="One two three."),
+        DocumentSection(filename="paper.pdf", page=2, section="Intro", text="Four five six."),
     ]
 
-    chunks = chunk_sections(sections, settings)
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
 
-    # A single continuous word stream: one two three four five six seven (7 words),
-    # windowed size=4 step=3 -> windows [0:4], [3:7].
-    assert [chunk.text for chunk in chunks] == [
-        "one two three four",
-        "four five six seven",
-    ]
-    # Page/section attribution follows the window's first word (window-start rule).
+    # One chunk drawing from both pages -> the page break did not reset windowing.
+    assert len(chunks) == 1
+    assert chunks[0].text == "One two three. Four five six."
+    # Page/section attribution follows the window's first unit.
     assert chunks[0].page == 1
-    assert chunks[0].section == "Intro"
-    assert chunks[1].page == 2
-    assert chunks[1].section == "Middle"
-
-
-def test_chunk_sections_crosses_paragraph_boundary() -> None:
-    """Plain-text paragraph breaks are physical too — overlap must cross them."""
-
-    settings = make_settings(chunk_size_tokens=4, chunk_overlap_tokens=1)
-    sections = [
-        DocumentSection(filename="notes.txt", page=1, section="First para", text="alpha beta"),
-        DocumentSection(
-            filename="notes.txt", page=1, section="Second para", text="gamma delta epsilon"
-        ),
-    ]
-
-    chunks = chunk_sections(sections, settings)
-
-    assert [chunk.text for chunk in chunks] == [
-        "alpha beta gamma delta",
-        "delta epsilon",
-    ]
 
 
 def test_chunk_sections_does_not_cross_markdown_heading_boundary() -> None:
     """Semantic (Markdown heading) boundaries must never be crossed by a window."""
 
-    settings = make_settings(chunk_size_tokens=10, chunk_overlap_tokens=2)
+    settings = make_settings(chunk_size_tokens=13, chunk_overlap_tokens=2)
     sections = [
         DocumentSection(
             filename="guide.md",
             page=1,
             section="Intro",
-            text="one two three",
+            text="One two three.",
             boundary="semantic",
         ),
         DocumentSection(
             filename="guide.md",
             page=1,
             section="Setup",
-            text="four five six",
+            text="Four five six.",
             boundary="semantic",
         ),
     ]
 
-    chunks = chunk_sections(sections, settings)
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
 
-    # Each section windowed independently -> no chunk mixes words from both.
-    assert [chunk.text for chunk in chunks] == ["one two three", "four five six"]
+    # Each section windowed independently -> no chunk mixes text from both.
+    assert [chunk.text for chunk in chunks] == ["One two three.", "Four five six."]
     assert [chunk.section for chunk in chunks] == ["Intro", "Setup"]
 
 
 def test_chunk_sections_does_not_cross_different_filenames() -> None:
     """Physical sections from different files must never be windowed together."""
 
-    settings = make_settings(chunk_size_tokens=10, chunk_overlap_tokens=2)
+    settings = make_settings(chunk_size_tokens=13, chunk_overlap_tokens=2)
     sections = [
-        DocumentSection(filename="a.txt", page=1, section="A", text="one two three"),
-        DocumentSection(filename="b.txt", page=1, section="B", text="four five six"),
+        DocumentSection(filename="a.txt", page=1, section="A", text="One two three."),
+        DocumentSection(filename="b.txt", page=1, section="B", text="Four five six."),
     ]
 
-    chunks = chunk_sections(sections, settings)
+    chunks = chunk_sections(sections, settings, _WORD_COUNTER)
 
-    assert [chunk.text for chunk in chunks] == ["one two three", "four five six"]
+    assert [chunk.text for chunk in chunks] == ["One two three.", "Four five six."]
     assert [chunk.filename for chunk in chunks] == ["a.txt", "b.txt"]
-
-
-def test_chunk_sections_warns_on_oversized_chunk_text(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = make_settings(chunk_size_tokens=600, chunk_overlap_tokens=0)
-    long_text = " ".join(f"word{i}" for i in range(600))
-    sections = [DocumentSection(filename="dense.txt", page=1, section="Dense", text=long_text)]
-
-    with caplog.at_level("WARNING", logger="api.documents"):
-        chunks = chunk_sections(sections, settings)
-
-    assert len(chunks) == 1
-    assert any("may exceed" in record.message for record in caplog.records)
-
-
-def test_chunk_sections_does_not_warn_on_ordinary_chunk_text(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = make_settings(chunk_size_tokens=300, chunk_overlap_tokens=75)
-    ordinary_text = " ".join("word" for _ in range(300))
-    sections = [
-        DocumentSection(filename="normal.txt", page=1, section="Normal", text=ordinary_text)
-    ]
-
-    with caplog.at_level("WARNING", logger="api.documents"):
-        chunk_sections(sections, settings)
-
-    assert not any("may exceed" in record.message for record in caplog.records)
 
 
 def test_merge_tiny_semantic_sections_folds_forward_into_next_section() -> None:

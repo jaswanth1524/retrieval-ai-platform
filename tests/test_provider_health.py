@@ -4,8 +4,9 @@ from typing import Any
 
 import httpx
 import pytest
+from qdrant_client import QdrantClient
 
-from api.provider_health import check_ollama_reachable
+from api.provider_health import check_ollama_reachable, check_qdrant_reachable
 from api.settings import AppSettings
 
 
@@ -63,3 +64,18 @@ def test_check_ollama_reachable_strips_trailing_slash(monkeypatch: pytest.Monkey
     check_ollama_reachable(make_settings(ollama_base_url="http://localhost:11434/"))
 
     assert seen_urls == ["http://localhost:11434/api/tags"]
+
+
+class RaisingQdrantClient:
+    def get_collections(self) -> None:
+        raise RuntimeError("connection refused")
+
+
+def test_check_qdrant_reachable_true_for_a_live_client() -> None:
+    client = QdrantClient(":memory:")
+
+    assert check_qdrant_reachable(client) is True
+
+
+def test_check_qdrant_reachable_false_on_any_exception() -> None:
+    assert check_qdrant_reachable(RaisingQdrantClient()) is False  # type: ignore[arg-type]

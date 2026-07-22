@@ -13,9 +13,14 @@ from eval.ragas_runner import (
     RagasUnavailableError,
     load_examples,
     load_ragas_runtime,
+    main,
     parse_metric_names,
     result_to_jsonable,
     run_ragas_evaluation,
+)
+
+SAMPLE_DATASET_PATH = (
+    Path(__file__).resolve().parent.parent / "eval" / "datasets" / "sample_eval.jsonl"
 )
 
 
@@ -159,3 +164,45 @@ def test_result_to_jsonable_prefers_to_dict() -> None:
             return {"score": 0.5}
 
     assert result_to_jsonable(Result()) == {"score": 0.5}
+
+
+def test_shipped_sample_dataset_loads_via_load_examples() -> None:
+    examples = load_examples(SAMPLE_DATASET_PATH)
+
+    assert len(examples) >= 5
+    assert all(example.contexts for example in examples)
+
+
+def test_main_validate_only_on_shipped_dataset_returns_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main([str(SAMPLE_DATASET_PATH), "--validate-only"])
+
+    assert exit_code == 0
+    assert "validated" in capsys.readouterr().out
+
+
+def test_main_validate_only_on_malformed_dataset_returns_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_dataset = tmp_path / "bad.jsonl"
+    bad_dataset.write_text("not json\n", encoding="utf-8")
+
+    exit_code = main([str(bad_dataset), "--validate-only"])
+
+    assert exit_code == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def test_main_validate_only_never_imports_ragas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_if_called(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in {"ragas", "ragas.metrics", "datasets"}:
+            raise AssertionError(f"--validate-only must not import {name}")
+        return real_import_module(name, *args, **kwargs)
+
+    real_import_module = importlib.import_module
+    monkeypatch.setattr(importlib, "import_module", fail_if_called)
+
+    assert main([str(SAMPLE_DATASET_PATH), "--validate-only"]) == 0

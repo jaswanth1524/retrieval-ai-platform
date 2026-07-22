@@ -166,6 +166,48 @@ describe('uploadDocument', () => {
   });
 });
 
+describe('deleteDocument', () => {
+  it('sends a DELETE request to the encoded filename path', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(200, { filename: 'a b.pdf', points_deleted: 3 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.deleteDocument('a b.pdf');
+
+    expect(result).toEqual({ filename: 'a b.pdf', points_deleted: 3 });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe('/documents/a%20b.pdf');
+    expect((init as RequestInit).method).toBe('DELETE');
+  });
+});
+
+describe('getDocumentContent', () => {
+  it('requests the encoded content path', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(200, { filename: 'a b.md', chunks: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.getDocumentContent('a b.md');
+
+    expect(result).toEqual({ filename: 'a b.md', chunks: [] });
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/documents/a%20b.md/content');
+  });
+});
+
+describe('listTraces', () => {
+  it('requests the traces list endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { traces: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.listTraces();
+
+    expect(result).toEqual({ traces: [] });
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/traces');
+  });
+});
+
 describe('pollDocumentJob', () => {
   it('polls until a terminal state and calls onProgress for each poll', async () => {
     vi.useFakeTimers();
@@ -224,7 +266,7 @@ describe('askQuestionStream', () => {
     const onDelta = vi.fn();
     const onDone = vi.fn();
 
-    await api.askQuestionStream('hi', undefined, undefined, undefined, {
+    await api.askQuestionStream('hi', undefined, undefined, undefined, undefined, {
       onSources,
       onDelta,
       onDone,
@@ -248,7 +290,7 @@ describe('askQuestionStream', () => {
     );
 
     await expect(
-      api.askQuestionStream('', undefined, undefined, undefined, {}),
+      api.askQuestionStream('', undefined, undefined, undefined, undefined, {}),
     ).rejects.toMatchObject({ name: 'ApiClientError', message: 'Query text is required.' });
   });
 
@@ -256,10 +298,33 @@ describe('askQuestionStream', () => {
     const fetchMock = vi.fn().mockResolvedValue(sseResponse([]));
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.askQuestionStream('hi', undefined, undefined, ['a.txt'], {});
+    await api.askQuestionStream('hi', undefined, undefined, ['a.txt'], undefined, {});
 
     const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
     expect(body).toEqual({ question: 'hi', filenames: ['a.txt'] });
+  });
+
+  it('includes history in the request body only when non-empty', async () => {
+    const fetchMock = vi.fn(async () => sseResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestionStream('hi', undefined, undefined, undefined, [], {});
+    let body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ question: 'hi' });
+
+    await api.askQuestionStream(
+      'hi',
+      undefined,
+      undefined,
+      undefined,
+      [{ role: 'user', content: 'earlier turn' }],
+      {},
+    );
+    body = JSON.parse(String(fetchMock.mock.calls[1][1].body));
+    expect(body).toEqual({
+      question: 'hi',
+      history: [{ role: 'user', content: 'earlier turn' }],
+    });
   });
 });
 

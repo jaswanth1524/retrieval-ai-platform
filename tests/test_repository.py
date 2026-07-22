@@ -204,3 +204,32 @@ def test_vector_repository_fetch_neighbors_empty_for_no_ordinals() -> None:
     repository = VectorRepository(client)
 
     assert repository.fetch_neighbors(settings, "guide.md", []) == []
+
+
+def test_vector_repository_chunks_for_filename_sorted_by_ordinal() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(
+        settings,
+        [
+            make_ordinal_point("p3", "guide.md", 3, "three"),
+            make_ordinal_point("p1", "guide.md", 1, "one"),
+            make_ordinal_point("p2", "guide.md", 2, "two"),
+            make_ordinal_point("x1", "other.md", 1, "other-one"),
+        ],
+    )
+
+    chunks = repository.chunks_for_filename(settings, "guide.md")
+
+    assert [payload["chunk_ordinal"] for payload in chunks] == [1, 2, 3]
+    assert all(payload["filename"] == "guide.md" for payload in chunks)
+
+
+def test_vector_repository_chunks_for_filename_empty_for_unknown_file() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(settings, [make_point("p1", "guide.md")])
+
+    assert repository.chunks_for_filename(settings, "missing.md") == []

@@ -1,0 +1,109 @@
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg-card);
+}
+
+.conversation-list__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.conversation-list__title {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.conversation-list__new {
+  font-size: 0.8rem;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  background: var(--bg-elevated);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.conversation-list__new:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.conversation-list__items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+.conversation-list__item {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  border-radius: 0.35rem;
+  padding: 0.1rem 0.25rem;
+}
+
+.conversation-list__item--active {
+  background: var(--accent-soft);
+}
+
+.conversation-list__select {
+  flex: 1;
+  text-align: left;
+  border: none;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.25rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-list__actions {
+  display: flex;
+  gap: 0.1rem;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.conversation-list__item:hover .conversation-list__actions,
+.conversation-list__item:focus-within .conversation-list__actions {
+  opacity: 1;
+}
+
+.conversation-list__action {
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 0.15rem 0.25rem;
+}
+
+.conversation-list__action:hover {
+  color: var(--text);
+}
+
+.conversation-list__edit {
+  flex: 1;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.35rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.35rem;
+  background: var(--bg);
+  color: var(--text);
+}

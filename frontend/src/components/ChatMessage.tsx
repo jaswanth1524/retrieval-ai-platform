@@ -1,3 +1,6 @@
+import { useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { CitationResponse, TimingsResponse } from '../api/types';
 import CitationCard from './CitationCard';
 import TraceDrawer from './TraceDrawer';
@@ -11,13 +14,31 @@ export interface ChatTurn {
   timestamp: number;
   timings: TimingsResponse | null;
   traceId: string | null;
+  // The question that produced this turn — set on error turns only, so a failed
+  // question's text isn't lost and can be resubmitted via the Retry button.
+  question?: string;
 }
 
 interface ChatMessageProps {
   turn: ChatTurn;
+  onRetry?: (question: string) => void;
+  onOpenSource?: (filename: string, chunkId: string) => void;
 }
 
-function ChatMessage({ turn }: ChatMessageProps) {
+const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+
+function ChatMessage({ turn, onRetry, onOpenSource }: ChatMessageProps) {
+  const [copied, setCopied] = useState(false);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+
+  const handleCopy = () => {
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(turn.content).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
   return (
     <div
       className={`chat-message chat-message--${turn.role}`}
@@ -32,13 +53,53 @@ function ChatMessage({ turn }: ChatMessageProps) {
           <div className="chat-message__error-body">
             <div className="chat-message__error-lead">Generation provider unavailable</div>
             {turn.content}
+            {turn.question && onRetry && (
+              <button
+                type="button"
+                className="chat-message__retry"
+                onClick={() => onRetry(turn.question!)}
+                data-testid="chat-message-retry"
+              >
+                Retry
+              </button>
+            )}
           </div>
+        </div>
+      ) : turn.role === 'assistant' ? (
+        <div className="chat-message__bubble chat-message__bubble--markdown">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
         </div>
       ) : (
         <div className="chat-message__bubble">{turn.content}</div>
       )}
-      {turn.role === 'assistant' && turn.sources.length > 0 && (
-        <div className="chat-message__sources">
+      <div className="chat-message__meta">
+        <time className="chat-message__timestamp mono" dateTime={new Date(turn.timestamp).toISOString()}>
+          {TIME_FORMATTER.format(turn.timestamp)}
+        </time>
+        {turn.role === 'assistant' && turn.content && navigator.clipboard && (
+          <button
+            type="button"
+            className="chat-message__copy"
+            onClick={handleCopy}
+            data-testid="chat-message-copy"
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        )}
+        {turn.role === 'assistant' && turn.sources.length > 0 && (
+          <button
+            type="button"
+            className="chat-message__sources-toggle"
+            onClick={() => setSourcesOpen((prev) => !prev)}
+            aria-expanded={sourcesOpen}
+            data-testid="chat-message-sources-toggle"
+          >
+            {sourcesOpen ? 'Hide sources' : `Sources (${turn.sources.length})`}
+          </button>
+        )}
+      </div>
+      {turn.role === 'assistant' && turn.sources.length > 0 && sourcesOpen && (
+        <div className="chat-message__sources" data-testid="chat-message-sources">
           {turn.sources.map((source) => (
             <CitationCard
               key={`${turn.id}-${source.source_number}`}
@@ -48,6 +109,9 @@ function ChatMessage({ turn }: ChatMessageProps) {
               section={source.section}
               chunkId={source.chunk_id}
               text={source.text}
+              onOpen={
+                onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined
+              }
             />
           ))}
         </div>
