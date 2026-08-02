@@ -84,6 +84,14 @@ npm --prefix frontend run dev             # Vite dev server, proxies API calls t
 > **Note:** the default reranker (`jinaai/jina-reranker-v2-base-multilingual`) is
 > ~1.1 GB and downloads once on first use (or at boot if `WARMUP_MODELS=true`) —
 > the first question after a fresh install pays that one-time download cost.
+>
+> It is also the memory floor: answering a question peaks around **2.7 GB** in the API
+> container, so give Docker at least **4 GB** (Docker Desktop → Settings → Resources).
+> That peak is reached when the model loads, so a container that boots and answers one
+> question has already hit its high-water mark. If you raise `RERANKER_BATCH_SIZE` above
+> `RERANK_CANDIDATES`, the reranker scores every candidate in one forward pass instead
+> and the peak jumps to ~6.3 GB, which OOM-kills the container (exit 137) — see the
+> comment on that setting in `.env.example`.
 
 ## Development commands
 
