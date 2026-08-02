@@ -83,7 +83,7 @@ Full stack:
 docker compose up              # Qdrant + API (API builds and serves frontend/dist)
 ```
 
-CI (`.github/workflows/ci.yml`) runs both suites independently: backend job does `uv sync --extra dev` → `pytest` → `ruff check .` → `mypy api`; frontend job does `npm ci` → `npm run test` → `npm run build` → `npm run lint`.
+CI (`.github/workflows/ci.yml`) runs three jobs: backend (`uv sync --extra dev` → `pytest` → `ruff check .` → `mypy api` → import the `eval` extra → validate the sample eval dataset), frontend (`npm ci` → `npm run test` → `npm run build` → `npm run lint`), and a build-only Docker image job.
 
 Optional eval extra: `uv sync --extra eval` then `uv run python -m eval.ragas_runner path/to/dataset.json --output results.json`.
 
