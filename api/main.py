@@ -37,7 +37,7 @@ from api.dependencies import (
 from api.documents import DocumentError, DocumentNotFoundError
 from api.embeddings import EmbeddedText, EmbeddingError
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
-from api.ingestion import IngestionError
+from api.ingestion import IngestionError, filename_write_lock
 from api.jobs import IngestJobStore, JobNotFoundError
 from api.logging_config import configure_logging
 from api.metrics import (
@@ -464,10 +464,16 @@ def register_routes(app: FastAPI) -> None:
         # component at upload time), so a plain path segment is sufficient — a
         # filename containing "/" simply can't match this route, which is fine
         # since one can never have been uploaded.
-        point_ids = repository.point_ids_for_filename(settings, filename)
-        if not point_ids:
-            raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-        repository.delete_by_ids(settings, point_ids)
+        #
+        # Same lock the ingest path takes: snapshot-then-delete is a read-modify-write,
+        # so without it a delete landing between a concurrent ingest's upsert and its
+        # stale-cleanup would remove the points that ingest just wrote, and the ingest
+        # would still report success.
+        with filename_write_lock(filename):
+            point_ids = repository.point_ids_for_filename(settings, filename)
+            if not point_ids:
+                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+            repository.delete_by_ids(settings, point_ids)
         return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
 
     # Guarded like its sibling document routes: the response carries the filename (and

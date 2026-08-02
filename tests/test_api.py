@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from api.dependencies import (
 )
 from api.embeddings import EmbeddedText
 from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
+from api.ingestion import filename_write_lock
 from api.main import create_app, run_model_warmup
 from api.qdrant_schema import EMBEDDING_MODEL_TAG_KEY, dense_vectors_config, sparse_vectors_config
 from api.reranking import RerankingError
@@ -1090,6 +1092,34 @@ def test_api_key_set_rejects_wrong_header_value() -> None:
         )
 
     assert response.status_code == 401
+
+
+def test_delete_document_waits_for_the_filename_write_lock(api_context: ApiTestContext) -> None:
+    """DELETE must take the same per-filename lock ingest_chunks does.
+
+    Snapshot-then-delete is a read-modify-write, so a delete landing between a
+    concurrent ingest's upsert and its stale-cleanup would remove the points that
+    ingest just wrote while the ingest still reported success. Holding the lock here
+    and asserting the request can't finish proves the route participates in it —
+    guarding only the ingest path left this half of the race open.
+    """
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    statuses: list[int] = []
+
+    def delete_in_background() -> None:
+        statuses.append(api_context.client.delete("/documents/guide.txt").status_code)
+
+    worker = threading.Thread(target=delete_in_background, daemon=True)
+    with filename_write_lock("guide.txt"):
+        worker.start()
+        worker.join(timeout=0.75)
+        assert worker.is_alive(), "DELETE finished while the filename write lock was held"
+        assert statuses == []
+
+    worker.join(timeout=15)
+    assert not worker.is_alive(), "DELETE never completed after the lock was released"
+    assert statuses == [200]
 
 
 def test_api_key_non_ascii_header_is_401_not_500() -> None:
