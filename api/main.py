@@ -32,6 +32,7 @@ from api.dependencies import (
     get_reranker,
     get_trace_store,
     get_vector_repository,
+    require_api_key,
 )
 from api.documents import DocumentError, DocumentNotFoundError
 from api.embeddings import EmbeddedText, EmbeddingError
@@ -406,7 +407,12 @@ def register_routes(app: FastAPI) -> None:
         status_code = 200 if qdrant_ok and provider_ok else 503
         return JSONResponse(status_code=status_code, content=body.model_dump())
 
-    @app.get("/metrics")
+    # Guarded when a key is configured. The labels carry no content (only `stage` and
+    # `outcome`, see api/metrics.py), but the counters still disclose usage volume and
+    # rough corpus growth, and an operator who bothered to set a key did not intend to
+    # publish those. A Prometheus scraper needs the header threaded into its scrape
+    # config; /health and /health/ready stay open for liveness either way.
+    @app.get("/metrics", dependencies=[Depends(require_api_key)])
     def metrics() -> Response:
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
@@ -414,13 +420,22 @@ def register_routes(app: FastAPI) -> None:
     def config(settings: SettingsDep, check_ollama: OllamaCheckDep) -> PublicConfigResponse:
         return public_config(settings, ollama_available=check_ollama(settings))
 
-    @app.get("/documents", response_model=DocumentListResponse)
+    @app.get(
+        "/documents",
+        response_model=DocumentListResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     def list_documents(
         repository: VectorRepositoryDep, settings: SettingsDep
     ) -> DocumentListResponse:
         return DocumentListResponse(filenames=repository.list_filenames(settings))
 
-    @app.post("/documents", response_model=DocumentJobAcceptedResponse, status_code=202)
+    @app.post(
+        "/documents",
+        response_model=DocumentJobAcceptedResponse,
+        status_code=202,
+        dependencies=[Depends(require_api_key)],
+    )
     async def upload_document(
         ingest_service: IngestServiceDep,
         settings: SettingsDep,
@@ -437,7 +452,11 @@ def register_routes(app: FastAPI) -> None:
         executor.submit(_run_ingest_job, job_store, job.id, ingest_service, filename, content)
         return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
 
-    @app.delete("/documents/{filename}", response_model=DocumentDeleteResponse)
+    @app.delete(
+        "/documents/{filename}",
+        response_model=DocumentDeleteResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     def delete_document(
         filename: str, repository: VectorRepositoryDep, settings: SettingsDep
     ) -> DocumentDeleteResponse:
@@ -451,7 +470,15 @@ def register_routes(app: FastAPI) -> None:
         repository.delete_by_ids(settings, point_ids)
         return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
 
-    @app.get("/documents/jobs/{job_id}", response_model=DocumentJobStatusResponse)
+    # Guarded like its sibling document routes: the response carries the filename (and
+    # on failure the error text), and the frontend polls this URL once a second during
+    # every upload, so the job id lands in browser history and any intermediate proxy
+    # log — places a party who never held the key can read it from.
+    @app.get(
+        "/documents/jobs/{job_id}",
+        response_model=DocumentJobStatusResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     def get_document_job(job_id: str, job_store: IngestJobStoreDep) -> DocumentJobStatusResponse:
         job = job_store.get(job_id)
         if job is None:
@@ -469,7 +496,14 @@ def register_routes(app: FastAPI) -> None:
             result=result,
         )
 
-    @app.get("/documents/{filename}/content", response_model=DocumentContentResponse)
+    # Guarded alongside GET /documents: this returns every chunk's raw text, so leaving
+    # it open would let an unauthenticated caller list the corpus and then dump it in
+    # full — the key would protect Q&A while the documents themselves stayed readable.
+    @app.get(
+        "/documents/{filename}/content",
+        response_model=DocumentContentResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     def document_content(
         filename: str, repository: VectorRepositoryDep, settings: SettingsDep
     ) -> DocumentContentResponse:
@@ -479,20 +513,26 @@ def register_routes(app: FastAPI) -> None:
         chunks = [_content_chunk(payload) for payload in payloads]
         return DocumentContentResponse(filename=filename, chunks=chunks)
 
-    @app.get("/traces", response_model=TraceListResponse)
+    @app.get("/traces", response_model=TraceListResponse, dependencies=[Depends(require_api_key)])
     def list_traces(trace_store: TraceStoreDep) -> TraceListResponse:
         return TraceListResponse(
             traces=[_trace_summary_response(trace) for trace in trace_store.list_traces()]
         )
 
-    @app.get("/traces/{trace_id}", response_model=TraceDetailResponse)
+    @app.get(
+        "/traces/{trace_id}",
+        response_model=TraceDetailResponse,
+        dependencies=[Depends(require_api_key)],
+    )
     def get_trace(trace_id: str, trace_store: TraceStoreDep) -> TraceDetailResponse:
         trace = trace_store.get(trace_id)
         if trace is None:
             raise TraceNotFoundError(f"No trace found with id '{trace_id}'.")
         return _trace_detail_response(trace)
 
-    @app.post("/questions", response_model=QuestionResponse)
+    @app.post(
+        "/questions", response_model=QuestionResponse, dependencies=[Depends(require_api_key)]
+    )
     def answer_question(
         request: QuestionRequest,
         pipeline: RagPipelineDep,
@@ -538,7 +578,7 @@ def register_routes(app: FastAPI) -> None:
             trace_id=grounded.trace_id,
         )
 
-    @app.post("/questions/stream")
+    @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
     def answer_question_stream(
         request: QuestionRequest,
         pipeline: RagPipelineDep,

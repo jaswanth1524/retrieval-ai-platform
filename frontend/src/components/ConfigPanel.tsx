@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { getApiKey, setApiKey } from '../api/client';
 import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import './ConfigPanel.css';
 
@@ -80,6 +81,9 @@ function StepperCard({ label, displayValue, onStep, disabled }: StepperCardProps
 
 function ConfigPanel({ config, overrides, onOverridesChange, disabled }: ConfigPanelProps) {
   const [expanded, setExpanded] = useState(false);
+  // Only meaningful when the server has API_KEY set (see api/settings.py) — with no
+  // key configured server-side, sending this header is harmless and ignored.
+  const [apiKeyDraft, setApiKeyDraft] = useState(getApiKey);
 
   const rerankTopK = overrides.rerankTopK ?? config.rerank_top_k;
   const maxContextChunks = overrides.maxContextChunks ?? config.max_context_chunks;
@@ -144,6 +148,22 @@ function ConfigPanel({ config, overrides, onOverridesChange, disabled }: ConfigP
       >
         Reset to defaults
       </button>
+
+      <label className="config-panel__api-key-label" htmlFor="config-panel-api-key">
+        API key (only needed if the server has one configured)
+      </label>
+      <input
+        id="config-panel-api-key"
+        type="password"
+        className="config-panel__api-key-input"
+        value={apiKeyDraft}
+        onChange={(event) => {
+          setApiKeyDraft(event.target.value);
+          setApiKey(event.target.value);
+        }}
+        placeholder="X-API-Key"
+        data-testid="config-panel-api-key"
+      />
 
       <button
         type="button"

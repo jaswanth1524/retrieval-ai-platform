@@ -177,6 +177,13 @@ class AppSettings(BaseSettings):
     # still lacks citations. See api/generation.py.
     citation_retry_enabled: bool = True
 
+    # Optional single shared API key. Empty (the default) keeps every route fully open,
+    # preserving the zero-config self-host story. When set, mutating/query routes
+    # require a matching X-API-Key header (see api/dependencies.py's require_api_key);
+    # /health and /health/ready stay unauthenticated so container healthchecks and
+    # probes keep working either way. Not multi-user auth — one key for the whole API.
+    api_key: str = ""
+
     # Verbosity of the application's own loggers (the "api" and "eval" namespaces).
     # api/logging_config.py consumes this via dictConfig at app construction; without
     # it the root logger's WARNING default silences every logger.info in the codebase

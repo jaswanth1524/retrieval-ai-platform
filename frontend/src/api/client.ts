@@ -28,18 +28,46 @@ export class ApiClientError extends Error {
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
+// Only relevant when the server has API_KEY set (see api/settings.py); with no key
+// configured server-side, the header is harmless to send and ignored.
+const API_KEY_STORAGE_KEY = 'docrag-api-key';
+
+export function getApiKey(): string {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function setApiKey(key: string): void {
+  try {
+    if (key) localStorage.setItem(API_KEY_STORAGE_KEY, key);
+    else localStorage.removeItem(API_KEY_STORAGE_KEY);
+  } catch {
+    // Best-effort; the key still applies for the rest of this session via the
+    // in-memory value read on the next request even if persistence failed.
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const key = getApiKey();
+  return key ? { 'X-API-Key': key } : {};
+}
+
 // Without a timeout, a hung backend (a stalled Ollama call, a network blip) leaves
 // the UI stuck on its loading state for the browser's own default (~300s) with no
 // way to cancel. Question-answering routinely takes 70+ seconds, so it gets a much
 // longer budget than health/config.
 const DEFAULT_TIMEOUT_MS = 15_000;
 
-interface RequestOptions extends RequestInit {
+interface RequestOptions extends Omit<RequestInit, 'headers'> {
   timeoutMs?: number;
+  headers?: Record<string, string>;
 }
 
 async function request<T>(path: string, options?: RequestOptions): Promise<T> {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, ...init } = options ?? {};
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, headers, ...init } = options ?? {};
   const timeoutController = new AbortController();
   const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
   // Let the caller's own signal (e.g. aborted on component unmount) cancel the
@@ -49,7 +77,11 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
 
   let response: Response;
   try {
-    response = await fetch(`${BASE_URL}${path}`, { ...init, signal: timeoutController.signal });
+    response = await fetch(`${BASE_URL}${path}`, {
+      ...init,
+      headers: { ...authHeaders(), ...headers },
+      signal: timeoutController.signal,
+    });
   } catch (err) {
     if (timeoutController.signal.aborted) {
       throw new ApiClientError('Request timed out or was cancelled.');
@@ -296,7 +328,7 @@ export const api = {
       try {
         response = await fetch(`${BASE_URL}/questions/stream`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify(
             questionRequestBody(question, llmProvider, overrides, filenames, history),
           ),
