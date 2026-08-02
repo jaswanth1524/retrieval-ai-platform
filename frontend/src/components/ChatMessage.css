@@ -55,12 +55,6 @@
   color: var(--error-body);
 }
 
-.chat-message__error-lead {
-  font-weight: 600;
-  color: var(--error-lead);
-  margin-bottom: 3px;
-}
-
 .chat-message__sources {
   margin-top: 0.5rem;
 }

@@ -107,3 +107,37 @@
   background: var(--bg);
   color: var(--text);
 }
+
+.conversation-list__confirm {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  flex: 1;
+}
+
+.conversation-list__confirm-text {
+  color: var(--text-muted);
+}
+
+.conversation-list__confirm-yes,
+.conversation-list__confirm-no {
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  border-radius: 0.35rem;
+  font-size: 0.7rem;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+}
+
+.conversation-list__confirm-yes {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.conversation-list__confirm-yes:disabled,
+.conversation-list__confirm-no:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

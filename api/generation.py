@@ -254,18 +254,13 @@ def generate_grounded_answer(
         raise GenerationError("Generation provider returned an empty answer.")
 
     all_sources = source_citations(selected_chunks)
-    retry_used = False
-    if settings.citation_retry_enabled and needs_citation_retry(answer, len(all_sources)):
-        retried = retry_uncited_answer(
-            normalized_query, selected_chunks, answer, generator, settings, history
-        )
-        if retried is not None:
-            answer = retried
-            retry_used = True
+    answer, cited, retry_used = finalize_citations(
+        normalized_query, selected_chunks, answer, all_sources, generator, settings, history
+    )
 
     return GroundedAnswer(
         answer=answer,
-        sources=cited_sources(answer, all_sources),
+        sources=cited,
         citation_retry_used=retry_used,
     )
 
@@ -463,6 +458,46 @@ def retry_uncited_answer(
     except GenerationError:
         return None
     return retried if retried and _CITATION_RE.search(retried) else None
+
+
+def finalize_citations(
+    query: str,
+    context_chunks: Sequence[RerankedChunk],
+    answer: str,
+    all_sources: Sequence[SourceCitation],
+    generator: ChatGenerator,
+    settings: AppSettings,
+    history: Sequence[ChatMessage] | None = None,
+) -> tuple[str, list[SourceCitation], bool]:
+    """Filter ``answer`` to its cited sources, retrying once if none are cited.
+
+    Shared by both response modes (sync ``generate_grounded_answer`` and the streaming
+    path in ``RagPipeline.answer_stream``) so the retry-trigger condition can't drift
+    between them.
+
+    The ``not cited`` guard is redundant with ``needs_citation_retry`` — that returns
+    False whenever the answer contains any ``[n]`` marker, and ``cited`` is only
+    non-empty when a marker matched — so it never changes the outcome. It's kept as a
+    cheap, explicit statement of the intent ("only retry when we ended up with zero
+    sources"). Note the deliberate gap it does *not* close: an answer citing ``[9]``
+    when only 3 sources exist yields empty ``cited`` but no retry, because the marker
+    check in ``needs_citation_retry`` short-circuits first. Retrying there would mean
+    re-prompting a model that did cite, just badly, so it's left alone.
+    """
+
+    cited = cited_sources(answer, all_sources)
+    retry_used = False
+    if (
+        not cited
+        and settings.citation_retry_enabled
+        and needs_citation_retry(answer, len(all_sources))
+    ):
+        retried = retry_uncited_answer(query, context_chunks, answer, generator, settings, history)
+        if retried is not None:
+            answer = retried
+            cited = cited_sources(answer, all_sources)
+            retry_used = True
+    return answer, cited, retry_used
 
 
 def build_expansion_messages(question: str, count: int) -> list[ChatMessage]:

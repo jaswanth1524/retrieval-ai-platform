@@ -23,12 +23,10 @@ from api.generation import (
     SourceCitation,
     StageTimings,
     build_grounded_messages,
-    cited_sources,
     condense_question,
+    finalize_citations,
     generate_grounded_answer,
     generate_query_variants,
-    needs_citation_retry,
-    retry_uncited_answer,
     source_citations,
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
@@ -613,26 +611,17 @@ class RagPipeline:
             if not answer:
                 raise GenerationError("Generation provider returned an empty answer.")
 
-            cited = cited_sources(answer, all_sources)
             # Streaming can't retry before the deltas already sent, and buffering would
             # destroy the streaming UX for the common case. Instead, if the streamed
             # answer carries no citations, run one non-streaming retry and swap the
             # corrected answer/sources into the `done` event — the frontend replaces the
             # streamed content with `done.answer`, so it snaps to the cited version.
-            citation_retry_used = False
-            if (
-                not cited
-                and effective_settings.citation_retry_enabled
-                and needs_citation_retry(answer, len(all_sources))
-            ):
-                retried = retry_uncited_answer(
-                    question, selected, answer, self._generator, effective_settings,
-                    truncated_history or None,
-                )
-                if retried is not None:
-                    answer = retried
-                    cited = cited_sources(answer, all_sources)
-                    citation_retry_used = True
+            # finalize_citations is the same helper generate_grounded_answer (sync path)
+            # uses, so the retry-trigger condition can't drift between response modes.
+            answer, cited, citation_retry_used = finalize_citations(
+                question, selected, answer, all_sources, self._generator, effective_settings,
+                truncated_history or None,
+            )
 
             total_ms = (time.monotonic() - total_start) * 1000
             timings = StageTimings(

@@ -458,7 +458,7 @@ def _extract_pdf_tables(content: bytes) -> dict[int, list[str]]:
                     result[page_number] = blocks
         return result
     except Exception:
-        logger.warning("PDF table extraction failed; continuing with text only.")
+        logger.warning("PDF table extraction failed; continuing with text only.", exc_info=True)
         return {}
 
 

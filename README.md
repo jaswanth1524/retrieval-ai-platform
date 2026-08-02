@@ -202,7 +202,7 @@ local because it needs models, a corpus, and (for `answer`) an LLM.
 - `docker-compose.yml`: Qdrant + API services (the API also serves the built frontend).
 - `Dockerfile`: multi-stage build — Node stage builds `frontend/`, Python stage runs the API as a non-root user with a container healthcheck.
 - `api/settings.py`, `api/qdrant_schema.py`: backend configuration and Qdrant collection schema/versioning helpers.
-- `api/documents.py`: document parsing and chunking for PDF, text, and Markdown.
+- `api/documents.py`: document parsing and chunking for PDF, DOCX, HTML, CSV, text, and Markdown.
 - `api/embeddings.py`, `api/ingestion.py`: local embedding adapters and Qdrant upsert helpers.
 - `api/retrieval.py`, `api/repository.py`: hybrid dense+sparse retrieval, RRF, and the Qdrant repository seam (search, upsert, delete).
 - `api/reranking.py`: cross-encoder reranking for fused retrieval candidates.

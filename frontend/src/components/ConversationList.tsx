@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ConversationSummary } from '../hooks/useChat';
 import './ConversationList.css';
 
@@ -23,6 +23,23 @@ function ConversationList({
 }: ConversationListProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+
+  // Nothing else clears the pending confirmation, so without this a row left armed keeps
+  // its "Delete?" prompt — and stays unselectable, since the confirm block replaces the
+  // row's own switch button — until the user comes back and answers it. Keyed on the
+  // active conversation and on the row still existing, deliberately *not* on the
+  // `conversations` array: that identity changes on every appended turn and every rename,
+  // which would yank the prompt away mid-decision during unrelated activity.
+  const confirmingStillListed = conversations.some(
+    (conversation) => conversation.id === confirmingDeleteId,
+  );
+  useEffect(() => {
+    if (confirmingDeleteId !== null && !confirmingStillListed) setConfirmingDeleteId(null);
+  }, [confirmingDeleteId, confirmingStillListed]);
+  useEffect(() => {
+    setConfirmingDeleteId(null);
+  }, [activeId]);
 
   const startEditing = (conversation: ConversationSummary) => {
     setEditingId(conversation.id);
@@ -74,6 +91,43 @@ function ConversationList({
                 }}
                 aria-label={`Rename ${conversation.title}`}
               />
+            ) : confirmingDeleteId === conversation.id ? (
+              // Escape dismisses, matching the rename input's own handler — otherwise the
+              // only way out is a mouse click on Cancel.
+              <div
+                className="conversation-list__confirm"
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') setConfirmingDeleteId(null);
+                }}
+              >
+                <span className="conversation-list__confirm-text">Delete?</span>
+                <button
+                  type="button"
+                  className="conversation-list__confirm-yes"
+                  onClick={() => {
+                    onDelete(conversation.id);
+                    setConfirmingDeleteId(null);
+                  }}
+                  disabled={disabled}
+                  aria-label={`Confirm delete ${conversation.title}`}
+                >
+                  Confirm
+                </button>
+                <button
+                  type="button"
+                  className="conversation-list__confirm-no"
+                  onClick={() => setConfirmingDeleteId(null)}
+                  disabled={disabled}
+                  aria-label={`Cancel delete ${conversation.title}`}
+                  // Clicking Delete unmounts the button that had focus, dropping it to
+                  // <body> — where the Escape handler above would never see a keypress.
+                  // Cancel takes it rather than Confirm so a stray Enter dismisses the
+                  // prompt instead of destroying the conversation.
+                  autoFocus
+                >
+                  Cancel
+                </button>
+              </div>
             ) : (
               <>
                 <button
@@ -97,7 +151,7 @@ function ConversationList({
                   <button
                     type="button"
                     className="conversation-list__action"
-                    onClick={() => onDelete(conversation.id)}
+                    onClick={() => setConfirmingDeleteId(conversation.id)}
                     disabled={disabled}
                     aria-label={`Delete ${conversation.title}`}
                   >

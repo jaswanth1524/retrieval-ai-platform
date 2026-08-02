@@ -17,7 +17,6 @@
   --error-bg: rgba(248, 81, 73, 0.08);
   --error-border: rgba(248, 81, 73, 0.28);
   --error-body: #e3a49f;
-  --error-lead: #f2a6a0;
 }
 
 :root[data-theme='light'] {
@@ -38,7 +37,6 @@
   --error-bg: rgba(216, 60, 50, 0.06);
   --error-border: rgba(216, 60, 50, 0.24);
   --error-body: #7a2b25;
-  --error-lead: #a8352c;
 }
 
 :root {

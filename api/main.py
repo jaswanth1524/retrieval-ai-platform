@@ -203,7 +203,7 @@ def _run_ingest_job(
     try:
         outcome = ingest_service.ingest(filename, content, on_progress)
     except Exception as exc:
-        logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc)
+        logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
         ingest_jobs_total.labels(outcome="failed").inc()
         job_store.update(job_id, state="failed", error=str(exc))
         return

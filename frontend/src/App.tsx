@@ -68,6 +68,8 @@ function App() {
     switchConversation,
     renameConversation,
     deleteConversation,
+    persistError,
+    persistPartial,
   } = useChat();
 
   const updateAdvancedOptions = (next: QuestionOverrides) => {
@@ -277,6 +279,22 @@ function App() {
                 onChange={setSelectedProvider}
                 disabled={pending}
               />
+            )}
+            {persistError && (
+              <div className="app-main__persist-warning" role="alert" data-testid="persist-error-banner">
+                Chat history couldn&apos;t be saved to this browser (storage may be full) &mdash;
+                this session won&apos;t be there after a reload.
+              </div>
+            )}
+            {!persistError && persistPartial && (
+              <div
+                className="app-main__persist-warning"
+                role="alert"
+                data-testid="persist-partial-banner"
+              >
+                Browser storage is full, so only this conversation was saved &mdash; your other
+                conversations won&apos;t be there after a reload. Export anything you need to keep.
+              </div>
             )}
             <div className="app-main__toolbar-row">
               <ChatToolbar turns={turns} onClear={clear} disabled={pending} />

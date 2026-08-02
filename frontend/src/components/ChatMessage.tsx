@@ -29,14 +29,21 @@ const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, { hour: '2-digit', min
 
 function ChatMessage({ turn, onRetry, onOpenSource }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
 
   const handleCopy = () => {
     if (!navigator.clipboard) return;
-    navigator.clipboard.writeText(turn.content).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+    navigator.clipboard.writeText(turn.content).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      },
+      () => {
+        setCopyFailed(true);
+        setTimeout(() => setCopyFailed(false), 1500);
+      },
+    );
   };
 
   return (
@@ -51,7 +58,6 @@ function ChatMessage({ turn, onRetry, onOpenSource }: ChatMessageProps) {
             ⚠
           </span>
           <div className="chat-message__error-body">
-            <div className="chat-message__error-lead">Generation provider unavailable</div>
             {turn.content}
             {turn.question && onRetry && (
               <button
@@ -83,7 +89,7 @@ function ChatMessage({ turn, onRetry, onOpenSource }: ChatMessageProps) {
             onClick={handleCopy}
             data-testid="chat-message-copy"
           >
-            {copied ? 'Copied' : 'Copy'}
+            {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
           </button>
         )}
         {turn.role === 'assistant' && turn.sources.length > 0 && (

@@ -3,9 +3,11 @@ import type { DragEvent } from 'react';
 import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import './UploadPanel.css';
 
-export type UploadItemStatus = 'uploading' | 'success' | 'error';
+// Both are structural details of UploadItem below and have no consumers outside this
+// file — kept unexported so the module's public surface is just UploadItem + default.
+type UploadItemStatus = 'uploading' | 'success' | 'error';
 
-export interface UploadProgress {
+interface UploadProgress {
   state: IngestJobState;
   chunksDone: number;
   chunksTotal: number;
