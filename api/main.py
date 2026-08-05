@@ -428,7 +428,8 @@ def register_routes(app: FastAPI) -> None:
     def list_documents(
         repository: VectorRepositoryDep, settings: SettingsDep
     ) -> DocumentListResponse:
-        return DocumentListResponse(filenames=repository.list_filenames(settings))
+        counts = repository.filename_chunk_counts(settings)
+        return DocumentListResponse(filenames=sorted(counts), chunk_counts=counts)
 
     @app.post(
         "/documents",

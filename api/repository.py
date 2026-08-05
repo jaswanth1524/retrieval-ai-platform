@@ -7,6 +7,7 @@ typing, so callers never import ``qdrant_client`` directly.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 
 from qdrant_client import QdrantClient, models
@@ -138,11 +139,11 @@ class VectorRepository:
         payloads.sort(key=_chunk_ordinal_sort_key)
         return payloads
 
-    def list_filenames(self, settings: AppSettings) -> list[str]:
-        """Return the distinct filenames currently indexed, for per-document filtering."""
+    def filename_chunk_counts(self, settings: AppSettings) -> dict[str, int]:
+        """Return each indexed filename's chunk count, for the corpus panel and its footer total."""
 
         self.ensure_ready(settings)
-        filenames: set[str] = set()
+        counts: Counter[str] = Counter()
         offset: models.ExtendedPointId | None = None
         while True:
             points, offset = self._client.scroll(
@@ -154,10 +155,15 @@ class VectorRepository:
             )
             for point in points:
                 if point.payload and isinstance(point.payload.get("filename"), str):
-                    filenames.add(point.payload["filename"])
+                    counts[point.payload["filename"]] += 1
             if offset is None:
                 break
-        return sorted(filenames)
+        return dict(counts)
+
+    def list_filenames(self, settings: AppSettings) -> list[str]:
+        """Return the distinct filenames currently indexed, for per-document filtering."""
+
+        return sorted(self.filename_chunk_counts(settings))
 
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
         """Remove specific points by id — a single call regardless of how many

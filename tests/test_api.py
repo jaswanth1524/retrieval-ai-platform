@@ -775,6 +775,37 @@ def test_list_documents_empty_for_no_uploads(api_context: ApiTestContext) -> Non
     assert response.json()["filenames"] == []
 
 
+def test_list_documents_returns_chunk_counts_per_filename(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
+
+    response = api_context.client.get("/documents").json()
+
+    assert response["chunk_counts"] == {"a.txt": 1, "b.txt": 1}
+
+
+def test_list_documents_chunk_counts_replaced_not_accumulated_on_reupload(
+    api_context: ApiTestContext,
+) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha again")["state"] == "done"
+
+    response = api_context.client.get("/documents").json()
+
+    assert response["chunk_counts"] == {"a.txt": 1}
+
+
+def test_list_documents_chunk_counts_drop_deleted_filename(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
+
+    api_context.client.delete("/documents/a.txt")
+
+    response = api_context.client.get("/documents").json()
+
+    assert response["chunk_counts"] == {"b.txt": 1}
+
+
 def test_delete_document_removes_indexed_chunks(api_context: ApiTestContext) -> None:
     assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
 

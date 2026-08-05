@@ -60,6 +60,7 @@ export interface DocumentJobStatusResponse {
 
 export interface DocumentListResponse {
   filenames: string[];
+  chunk_counts?: Record<string, number>;
 }
 
 export interface DocumentDeleteResponse {

@@ -99,6 +99,7 @@ class DocumentListResponse(BaseModel):
     """Filenames currently indexed, for per-document query filtering."""
 
     filenames: list[str]
+    chunk_counts: dict[str, int] = {}
 
 
 class DocumentDeleteResponse(BaseModel):
