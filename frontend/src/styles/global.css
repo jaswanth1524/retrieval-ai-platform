@@ -114,24 +114,3 @@ button:disabled {
 a {
   color: var(--accent);
 }
-
-.app-main__toolbar-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-}
-
-.app-main__traces-button {
-  font-size: 0.8rem;
-  padding: 0.3rem 0.7rem;
-  border: 1px solid var(--border);
-  border-radius: 0.35rem;
-  background: var(--bg-card);
-  color: var(--text);
-  cursor: pointer;
-}
-
-.app-main__traces-button:hover {
-  border-color: var(--accent);
-}
