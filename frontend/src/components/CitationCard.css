@@ -1,37 +1,38 @@
 .citation-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.6rem 0.8rem;
-  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 4px 12px 4px 0;
+  margin-right: 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+  font-family: var(--fm);
 }
 
-.citation-card__header {
-  display: flex;
-  gap: 0.5rem;
-  align-items: baseline;
-  flex-wrap: wrap;
+.citation-card:hover,
+.citation-card:focus-visible {
+  color: var(--accent);
 }
 
 .citation-card__index {
-  color: var(--accent);
-  font-weight: 600;
+  color: var(--accent-ink);
+  background: var(--accent);
+  padding: 1px 4px;
+  font-size: 10px;
 }
 
 .citation-card__file {
-  font-weight: 600;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
 }
 
-.citation-card__meta {
-  color: var(--text-muted);
-  font-size: 0.78rem;
-}
-
-.citation-card__excerpt {
-  margin: 0.4rem 0 0 0;
-  padding-left: 0.6rem;
-  border-left: 3px solid var(--accent);
-  color: var(--text);
-  font-size: 0.85rem;
-  font-style: italic;
+.citation-card__loc {
+  font-size: 10px;
+  color: var(--dim);
 }

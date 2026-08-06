@@ -46,6 +46,27 @@ body {
   padding: 2rem;
 }
 
+.app-main__config-disclosure {
+  flex: 0 0 auto;
+  max-height: 40vh;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--rule);
+}
+
+.app-main__config-disclosure > summary {
+  padding: 8px 24px;
+  cursor: pointer;
+  font-family: var(--fm);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.app-main__config-disclosure > summary:hover {
+  color: var(--ink);
+}
+
 .app-main__persist-warning {
   color: var(--bad);
   font-size: 0.85rem;

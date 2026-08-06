@@ -50,9 +50,7 @@ describe('App', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
-        if (url.endsWith('/config')) {
-          return jsonResponse(makeConfigPayload());
-        }
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
@@ -70,9 +68,7 @@ describe('App', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
-        if (url.endsWith('/config')) {
-          return jsonResponse(makeConfigPayload());
-        }
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
@@ -83,9 +79,6 @@ describe('App', () => {
 
     await userEvent.click(screen.getByTestId('theme-toggle'));
 
-    // Assert against the post-click DOM state rather than a predicted pre-click
-    // value — document.documentElement persists across tests within this file, so
-    // the theme a fresh <App/> mounts into isn't reliably predictable here.
     const themeAfterToggle = document.documentElement.dataset.theme;
     expect(setItemSpy).toHaveBeenCalledWith('docrag-theme', themeAfterToggle);
   });
@@ -96,9 +89,7 @@ describe('App', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
-        if (url.endsWith('/config')) {
-          return jsonResponse(makeConfigPayload());
-        }
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
@@ -122,9 +113,7 @@ describe('App', () => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) {
-          return jsonResponse(
-            makeConfigPayload({ ollama_available: false, openai_available: true }),
-          );
+          return jsonResponse(makeConfigPayload({ ollama_available: false, openai_available: true }));
         }
         throw new Error(`unexpected fetch: ${url}`);
       }),
@@ -133,7 +122,8 @@ describe('App', () => {
     render(<App />);
     await screen.findByText('api ok');
 
-    expect(screen.getByTestId('provider-select')).toHaveValue('openai');
+    await userEvent.click(screen.getByTestId('composer-provider-button'));
+    expect(screen.getByTestId('provider-openai')).toBeChecked();
   });
 
   it('shows the unreachable banner when health check fails', async () => {
@@ -299,9 +289,11 @@ describe('App', () => {
     await vi.waitFor(() => {
       expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(2);
     });
-    expect(screen.getAllByTestId('document-filter-item')).toHaveLength(2);
     expect(screen.getByTestId('question-textarea')).toBeEnabled();
     expect(screen.queryByTestId('question-hint')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    expect(screen.getAllByTestId('scope-item')).toHaveLength(2);
   });
 
   it('asking with "All documents" selected searches the whole corpus (no filenames)', async () => {
@@ -313,7 +305,9 @@ describe('App', () => {
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt'), makeFile('b.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
-    await screen.findAllByTestId('document-filter-item');
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(2);
+    });
 
     await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
     await userEvent.click(screen.getByTestId('question-submit'));
@@ -327,7 +321,7 @@ describe('App', () => {
     expect(body.filenames).toBeUndefined();
   });
 
-  it('selecting one document in the filter restricts the filenames sent', async () => {
+  it('selecting one document in the scope popover restricts the filenames sent', async () => {
     const fetchMock = stubUploadAndQuestionFetch();
 
     render(<App />);
@@ -336,8 +330,13 @@ describe('App', () => {
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt'), makeFile('b.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
-    const filterItems = await screen.findAllByTestId('document-filter-item');
-    const aItem = filterItems.find((item) => item.textContent?.includes('a.txt'));
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(2);
+    });
+
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    const scopeItems = screen.getAllByTestId('scope-item');
+    const aItem = scopeItems.find((item) => item.textContent?.includes('a.txt'));
     await userEvent.click(aItem?.querySelector('input') as HTMLInputElement);
 
     await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
@@ -352,7 +351,7 @@ describe('App', () => {
   });
 
   it('re-uploading a file with the same name does not duplicate it in the search scope', async () => {
-    stubUploadAndQuestionFetch();
+    const fetchMock = stubUploadAndQuestionFetch();
 
     render(<App />);
     await screen.findByText('api ok');
@@ -360,15 +359,39 @@ describe('App', () => {
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
-    await screen.findAllByTestId('document-filter-item');
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
+    });
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
 
     await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/documents/jobs/job-2'))).toBe(
+        true,
+      );
+    });
+    expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
+  });
+
+  it('asking a question renders the answer and, in engineer mode, a duration/model meta line', async () => {
+    stubUploadAndQuestionFetch();
+
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await vi.waitFor(() => {
       expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
     });
-    expect(screen.getAllByTestId('document-filter-item')).toHaveLength(1);
+
+    await userEvent.click(screen.getByTestId('mode-engineer'));
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
+    await userEvent.click(screen.getByTestId('question-submit'));
+
+    expect(await screen.findByText('Answer.')).toBeInTheDocument();
+    expect(await screen.findByText('0.00s')).toBeInTheDocument();
   });
 
   it('switching rail panels shows the corresponding contextual panel', async () => {
