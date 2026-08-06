@@ -1,15 +1,26 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from './api/client';
-import type { LlmProvider, PublicConfigResponse, QuestionOverrides } from './api/types';
+import type {
+  ApiStatus,
+  LlmProvider,
+  PublicConfigResponse,
+  QuestionOverrides,
+  TraceSummaryResponse,
+} from './api/types';
 import ChatThread from './components/ChatThread';
 import ChatToolbar from './components/ChatToolbar';
+import ConfigPanel from './components/ConfigPanel';
+import ContextPanel from './components/ContextPanel';
+import ConversationList from './components/ConversationList';
+import CorpusPanel from './components/CorpusPanel';
+import type { UploadItem } from './components/CorpusPanel';
+import DocumentFilter from './components/DocumentFilter';
 import DocumentViewer from './components/DocumentViewer';
+import IconRail from './components/IconRail';
+import type { RailPanel } from './components/IconRail';
 import ProviderSelector from './components/ProviderSelector';
-import TraceBrowser from './components/TraceBrowser';
 import QuestionInput from './components/QuestionInput';
-import Sidebar from './components/Sidebar';
-import type { ApiStatus } from './components/StatusBadge';
-import type { UploadItem } from './components/UploadPanel';
+import TracesPanel from './components/TracesPanel';
 import { useChat } from './hooks/useChat';
 
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
@@ -35,9 +46,14 @@ function loadPersistedOverrides(): QuestionOverrides {
   }
 }
 
+const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
+  chat: { title: 'Conversations', actionLabel: 'New' },
+  corpus: { title: 'Corpus', actionLabel: 'Upload' },
+  traces: { title: 'Traces', actionLabel: 'Refresh' },
+};
+
 function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking');
-  const [apiStatusMessage, setApiStatusMessage] = useState<string | undefined>();
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
@@ -47,15 +63,16 @@ function App() {
   // corpus-management panel and the search-scope filter operate over this one list,
   // so any indexed document is scopable regardless of which session uploaded it.
   const [indexedFilenames, setIndexedFilenames] = useState<string[]>([]);
+  const [chunkCounts, setChunkCounts] = useState<Record<string, number>>({});
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
   );
-  // Sidebar becomes an off-canvas overlay below the responsive breakpoint (see
-  // global.css); closed by default so it never covers the chat on first paint.
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [rail, setRail] = useState<RailPanel>('chat');
+  const [traces, setTraces] = useState<TraceSummaryResponse[] | null>(null);
+  const [tracesError, setTracesError] = useState<string | null>(null);
   // Source document viewer: which document/chunk a clicked citation opens (null = closed).
   const [sourceView, setSourceView] = useState<{ filename: string; chunkId: string } | null>(null);
-  const [traceBrowserOpen, setTraceBrowserOpen] = useState(false);
+  const corpusBrowseInputRef = useRef<HTMLInputElement>(null);
   const {
     turns,
     pending,
@@ -94,6 +111,12 @@ function App() {
     }
   };
 
+  const refreshDocuments = async (signal?: AbortSignal) => {
+    const documents = await api.listDocuments(signal);
+    setIndexedFilenames(documents.filenames);
+    setChunkCounts(documents.chunk_counts ?? {});
+  };
+
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
@@ -119,27 +142,47 @@ function App() {
         }
         setApiStatus('ok');
         try {
-          const documents = await api.listDocuments(controller.signal);
-          if (!cancelled) setIndexedFilenames(documents.filenames);
+          await refreshDocuments(controller.signal);
         } catch {
           // Non-fatal — the corpus panel just stays empty until the next refresh.
         }
-      } catch (err) {
+      } catch {
         if (cancelled) return;
         setApiStatus('error');
-        setApiStatusMessage(err instanceof ApiClientError ? err.message : 'Unknown error');
       }
     }
 
     void checkHealth();
     return () => {
       cancelled = true;
-      // Previously only the `cancelled` flag guarded setState — the underlying
-      // fetch kept running to completion regardless. Aborting it here actually
-      // releases the in-flight request instead of just ignoring its result.
+      // Aborting releases the in-flight request instead of just ignoring its result.
       controller.abort();
     };
   }, []);
+
+  const loadTraces = (signal?: AbortSignal) => {
+    setTraces(null);
+    setTracesError(null);
+    api
+      .listTraces(signal)
+      .then((response) => setTraces(response.traces))
+      .catch((err) => {
+        if (signal?.aborted) return;
+        setTracesError(err instanceof ApiClientError ? err.message : 'Could not load traces.');
+      });
+  };
+
+  useEffect(() => {
+    if (rail !== 'traces') return;
+    const controller = new AbortController();
+    loadTraces(controller.signal);
+    return () => controller.abort();
+  }, [rail]);
+
+  // Opens the inspector on the Trace tab in stage 3; the inspector doesn't exist yet.
+  const handleSelectTrace = (traceId: string) => {
+    void traceId;
+  };
 
   const uploadOne = async (file: File, id: string) => {
     try {
@@ -181,6 +224,13 @@ function App() {
         // server-side, so the corpus list should not grow a second entry for it.
         setIndexedFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
       }
+      // Chunk counts live server-side; a targeted refetch keeps the footer total and
+      // this document's card accurate without threading the count through the job poll.
+      try {
+        await refreshDocuments();
+      } catch {
+        // Non-fatal — counts just stay stale until the next refresh.
+      }
     } catch (err) {
       setUploads((prev) =>
         prev.map((item) =>
@@ -207,10 +257,16 @@ function App() {
     // A deleted document can never remain in the corpus or the active search scope.
     setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
     setSelectedFilenames((prev) => prev.filter((name) => name !== filename));
+    setChunkCounts((prev) => {
+      const next = { ...prev };
+      delete next[filename];
+      return next;
+    });
   };
 
   const apiReachable = apiStatus === 'ok';
   const noDocs = indexedFilenames.length === 0;
+  const chunkTotal = Object.values(chunkCounts).reduce((sum, n) => sum + n, 0);
 
   // Shared by both the input box and a Retry click on a failed turn — retry always
   // uses the CURRENT provider/overrides/scope, not whatever was selected when the
@@ -223,39 +279,56 @@ function App() {
       selectedFilenames.length > 0 ? selectedFilenames : undefined,
     );
 
+  const handlePanelAction = () => {
+    if (rail === 'chat') newConversation();
+    else if (rail === 'corpus') corpusBrowseInputRef.current?.click();
+    else loadTraces();
+  };
+
   return (
     <div className="app-shell">
-      {sidebarOpen && (
-        <div
-          className="app-shell__backdrop"
-          data-testid="sidebar-backdrop"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-      <Sidebar
-        apiStatus={apiStatus}
-        apiStatusMessage={apiStatusMessage}
-        config={config}
-        onUpload={handleUpload}
-        uploads={uploads}
+      <IconRail
+        active={rail}
+        onSelect={setRail}
         theme={theme}
         onToggleTheme={toggleTheme}
-        overrides={advancedOptions}
-        onOverridesChange={updateAdvancedOptions}
-        overridesDisabled={pending}
-        selectedFilenames={selectedFilenames}
-        onSelectedFilenamesChange={setSelectedFilenames}
-        indexedFilenames={indexedFilenames}
-        onDeleteDocument={handleDeleteDocument}
-        conversations={conversations}
-        activeConversationId={activeConversationId}
-        onNewConversation={newConversation}
-        onSwitchConversation={switchConversation}
-        onRenameConversation={renameConversation}
-        onDeleteConversation={deleteConversation}
-        open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
+        onOpenSettings={() => {
+          /* settings modal lands in stage 4 */
+        }}
       />
+      <ContextPanel
+        title={PANEL_META[rail].title}
+        actionLabel={PANEL_META[rail].actionLabel}
+        onAction={handlePanelAction}
+        apiStatus={apiStatus}
+        chunkTotal={chunkTotal}
+      >
+        {rail === 'chat' && (
+          <ConversationList
+            conversations={conversations}
+            activeId={activeConversationId}
+            onSwitch={switchConversation}
+            onRename={renameConversation}
+            onDelete={deleteConversation}
+            disabled={pending}
+          />
+        )}
+        {rail === 'corpus' && (
+          <CorpusPanel
+            filenames={indexedFilenames}
+            chunkCounts={chunkCounts}
+            uploads={uploads}
+            onUpload={handleUpload}
+            onDelete={handleDeleteDocument}
+            maxUploadBytes={config?.max_upload_bytes}
+            disabled={pending}
+            browseInputRef={corpusBrowseInputRef}
+          />
+        )}
+        {rail === 'traces' && (
+          <TracesPanel traces={traces} error={tracesError} onSelect={handleSelectTrace} />
+        )}
+      </ContextPanel>
       <main className="app-main">
         {apiStatus === 'error' ? (
           <div className="app-main__unreachable" role="alert">
@@ -263,15 +336,6 @@ function App() {
           </div>
         ) : (
           <>
-            <button
-              type="button"
-              className="app-main__sidebar-toggle"
-              onClick={() => setSidebarOpen(true)}
-              aria-label="Open sidebar"
-              data-testid="sidebar-open"
-            >
-              &#9776;
-            </button>
             {config && (
               <ProviderSelector
                 config={config}
@@ -296,17 +360,21 @@ function App() {
                 conversations won&apos;t be there after a reload. Export anything you need to keep.
               </div>
             )}
-            <div className="app-main__toolbar-row">
-              <ChatToolbar turns={turns} onClear={clear} disabled={pending} />
-              <button
-                type="button"
-                className="app-main__traces-button"
-                onClick={() => setTraceBrowserOpen(true)}
-                data-testid="open-trace-browser"
-              >
-                Traces
-              </button>
-            </div>
+            <DocumentFilter
+              filenames={indexedFilenames}
+              selected={selectedFilenames}
+              onChange={setSelectedFilenames}
+              disabled={pending}
+            />
+            {config && (
+              <ConfigPanel
+                config={config}
+                overrides={advancedOptions}
+                onOverridesChange={updateAdvancedOptions}
+                disabled={pending}
+              />
+            )}
+            <ChatToolbar turns={turns} onClear={clear} disabled={pending} />
             <ChatThread
               turns={turns}
               pending={pending}
@@ -329,7 +397,6 @@ function App() {
           onClose={() => setSourceView(null)}
         />
       )}
-      {traceBrowserOpen && <TraceBrowser onClose={() => setTraceBrowserOpen(false)} />}
     </div>
   );
 }

@@ -2,6 +2,8 @@ export interface HealthResponse {
   status: string;
 }
 
+export type ApiStatus = 'checking' | 'ok' | 'error';
+
 export interface PublicConfigResponse {
   qdrant_collection: string;
   dense_embedding_model: string;

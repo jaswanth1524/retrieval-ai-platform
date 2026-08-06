@@ -72,6 +72,7 @@ export interface ConversationSummary {
   id: string;
   title: string;
   updatedAt: number;
+  turnCount: number;
 }
 
 export interface UseChatResult {
@@ -445,6 +446,7 @@ export function useChat(): UseChatResult {
       id: conversation.id,
       title: conversation.title,
       updatedAt: conversation.updatedAt,
+      turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
     }));
 
   return {
