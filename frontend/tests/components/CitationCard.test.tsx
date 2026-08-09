@@ -1,28 +1,46 @@
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { describe, expect, it, vi } from 'vitest';
 import CitationCard from '../../src/components/CitationCard';
 
 describe('CitationCard', () => {
-  it('renders all fields including the excerpt text', () => {
+  it('renders the source number, filename, and location as an inline chip', () => {
+    render(<CitationCard sourceNumber={1} filename="guide.md" page={3} section="Setup" />);
+
+    const chip = screen.getByTestId('citation-card');
+    expect(chip).toHaveTextContent('1');
+    expect(chip).toHaveTextContent('guide.md');
+    expect(chip).toHaveTextContent('p.3');
+    expect(chip).toHaveTextContent('Setup');
+    expect(chip).toHaveAccessibleName('Open guide.md at source 1');
+  });
+
+  it('fires onOpen when clicked', async () => {
+    const onOpen = vi.fn();
+    render(<CitationCard sourceNumber={1} filename="guide.md" page={3} section="Setup" onOpen={onOpen} />);
+
+    await userEvent.click(screen.getByTestId('citation-card'));
+    expect(onOpen).toHaveBeenCalledOnce();
+  });
+
+  it('fires onHoverStart/onHoverEnd on mouse enter/leave', async () => {
+    const onHoverStart = vi.fn();
+    const onHoverEnd = vi.fn();
     render(
       <CitationCard
         sourceNumber={1}
         filename="guide.md"
         page={3}
         section="Setup"
-        chunkId="8835c8aed15c331e74e8"
-        text="Start Docker Compose which launches Qdrant, the API, and the UI."
+        onHoverStart={onHoverStart}
+        onHoverEnd={onHoverEnd}
       />,
     );
 
-    expect(screen.getByTestId('citation-card')).toBeInTheDocument();
-    expect(screen.getByText('[1]')).toBeInTheDocument();
-    expect(screen.getByText('guide.md')).toBeInTheDocument();
-    expect(screen.getByText(/p\.3/)).toBeInTheDocument();
-    expect(screen.getByText(/Setup/)).toBeInTheDocument();
-    expect(screen.getByText(/8835c8aed15c331e74e8/)).toBeInTheDocument();
-    expect(
-      screen.getByText('Start Docker Compose which launches Qdrant, the API, and the UI.'),
-    ).toBeInTheDocument();
+    await userEvent.hover(screen.getByTestId('citation-card'));
+    expect(onHoverStart).toHaveBeenCalledOnce();
+
+    await userEvent.unhover(screen.getByTestId('citation-card'));
+    expect(onHoverEnd).toHaveBeenCalledOnce();
   });
 });

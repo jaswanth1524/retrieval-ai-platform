@@ -158,6 +158,27 @@ def test_vector_repository_list_filenames_empty_for_empty_collection() -> None:
     assert repository.list_filenames(settings) == []
 
 
+def test_vector_repository_filename_chunk_counts_counts_points_per_file() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(
+        settings,
+        [make_point("p1", "b.md"), make_point("p2", "a.md"), make_point("p3", "b.md")],
+    )
+
+    assert repository.filename_chunk_counts(settings) == {"a.md": 1, "b.md": 2}
+
+
+def test_vector_repository_filename_chunk_counts_empty_for_empty_collection() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.ensure_ready(settings)
+
+    assert repository.filename_chunk_counts(settings) == {}
+
+
 def make_ordinal_point(
     point_id: str, filename: str, ordinal: int, text: str
 ) -> models.PointStruct:

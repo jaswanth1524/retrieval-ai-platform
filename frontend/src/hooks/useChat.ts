@@ -9,11 +9,39 @@ import type { ChatTurn } from '../components/ChatMessage';
 // a small local model's context window; the server has its own count-based backstop.
 const HISTORY_MAX_MESSAGES = 12;
 const HISTORY_CHAR_BUDGET = 8000;
+// Mirrors the server's REQUEST_HISTORY_MESSAGE_MAX_CHARS (api/schemas.py) per-message
+// cap. Without this, one assistant answer over 4000 chars survives the total-budget
+// trim below (it's the only message so far) and the server 422s the whole request.
+const HISTORY_MESSAGE_MAX_CHARS = 4000;
+// How far back from the cap a whitespace break is still worth taking. A hard cut lands
+// mid-word and can sever a trailing qualifier or negation, which reads to the model as
+// something the speaker never said; backing up to the last space avoids that. Bounded
+// because text with no whitespace in its tail (a base64 blob, unspaced CJK) would
+// otherwise back off arbitrarily far — past this, a clean cut beats a short message.
+const HISTORY_TRUNCATION_BACKOFF_CHARS = Math.floor(HISTORY_MESSAGE_MAX_CHARS * 0.12);
+
+/** Truncate to HISTORY_MESSAGE_MAX_CHARS, preferring a nearby whitespace boundary.
+ *
+ * The result is always <= HISTORY_MESSAGE_MAX_CHARS: the ellipsis has to fit inside the
+ * server's per-message limit too, so the budget it occupies is reserved up front rather
+ * than appended after a full-width cut (which would land one char over and 422). */
+function truncateForHistory(content: string): string {
+  if (content.length <= HISTORY_MESSAGE_MAX_CHARS) return content;
+  const ELLIPSIS = '…';
+  const budget = HISTORY_MESSAGE_MAX_CHARS - ELLIPSIS.length;
+  const hardCut = content.slice(0, budget);
+  const lastBreak = hardCut.lastIndexOf(' ');
+  const cut = lastBreak >= budget - HISTORY_TRUNCATION_BACKOFF_CHARS ? hardCut.slice(0, lastBreak) : hardCut;
+  // The marker is for the model's benefit: without it a truncated answer looks complete,
+  // so it may treat a severed sentence as the speaker's final word.
+  return `${cut.trimEnd()}${ELLIPSIS}`;
+}
 
 /** Build bounded conversation history from prior turns: only completed user/assistant
  * turns (error turns carry no useful context and are excluded), most recent first
- * up to HISTORY_MAX_MESSAGES, then trimmed to a total char budget (dropping the
- * oldest first), restored to chronological order. */
+ * up to HISTORY_MAX_MESSAGES, each truncated to HISTORY_MESSAGE_MAX_CHARS, then
+ * trimmed to a total char budget (dropping the oldest first), restored to
+ * chronological order. */
 export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
   const candidates = turns
     .filter((turn): turn is ChatTurn & { role: 'user' | 'assistant' } =>
@@ -24,10 +52,10 @@ export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
   const withinBudget: HistoryMessage[] = [];
   let charsUsed = 0;
   for (let i = candidates.length - 1; i >= 0; i -= 1) {
-    const turn = candidates[i];
-    charsUsed += turn.content.length;
+    const content = truncateForHistory(candidates[i].content);
+    charsUsed += content.length;
     if (charsUsed > HISTORY_CHAR_BUDGET && withinBudget.length > 0) break;
-    withinBudget.unshift({ role: turn.role, content: turn.content });
+    withinBudget.unshift({ role: candidates[i].role, content });
   }
   return withinBudget;
 }
@@ -44,11 +72,14 @@ export interface ConversationSummary {
   id: string;
   title: string;
   updatedAt: number;
+  turnCount: number;
 }
 
 export interface UseChatResult {
   turns: ChatTurn[];
   pending: boolean;
+  persistError: boolean;
+  persistPartial: boolean;
   conversations: ConversationSummary[];
   activeConversationId: string | null;
   ask: (
@@ -135,9 +166,23 @@ function sanitizeConversation(value: unknown): Conversation | null {
   };
 }
 
+// Logs an unreadable or unrecognized-shape persisted value before it's replaced with an
+// empty conversation, so the corruption is diagnosable from the console instead of
+// vanishing silently. Deliberately does *not* copy the blob to a sibling storage key:
+// nothing in the app ever reads such a copy back, so it would double the footprint of a
+// value that may well have been what exceeded the quota, and pay that cost forever.
+// Recovery would need a real UI to surface and discard it — a feature, not a side effect.
+function reportUnreadableStorage(raw: string): void {
+  console.warn(
+    `Discarding unreadable chat history in localStorage["${CHAT_STORAGE_KEY}"] ` +
+      `(${raw.length} chars); starting a fresh conversation.`,
+  );
+}
+
 function loadStorage(): ChatStorageV2 {
+  let raw: string | null = null;
   try {
-    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    raw = localStorage.getItem(CHAT_STORAGE_KEY);
     if (!raw) return emptyStorage();
     const parsed = JSON.parse(raw) as {
       version?: number;
@@ -174,8 +219,10 @@ function loadStorage(): ChatStorageV2 {
       return { version: 2, activeConversationId: conversation.id, conversations: [conversation] };
     }
 
+    reportUnreadableStorage(raw);
     return emptyStorage();
   } catch {
+    if (raw) reportUnreadableStorage(raw);
     return emptyStorage();
   }
 }
@@ -183,6 +230,13 @@ function loadStorage(): ChatStorageV2 {
 export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
   const [pending, setPending] = useState(false);
+  // True when the last persist attempt failed even after the reduced-payload retry
+  // below — the session is memory-only from that point on until a write succeeds.
+  const [persistError, setPersistError] = useState(false);
+  // True when the reduced-payload retry *succeeded*: the active conversation is saved
+  // but the others aren't. Distinct from persistError because "some of this survives a
+  // reload" and "none of this survives a reload" need different warnings.
+  const [persistPartial, setPersistPartial] = useState(false);
 
   const { conversations, activeConversationId } = storage;
   const activeConversation =
@@ -194,26 +248,53 @@ export function useChat(): UseChatResult {
     // Skip writes while a stream is in flight — the assistant turn's content mutates
     // on every delta, and persisting each one would thrash localStorage.
     if (pending) return;
-    try {
-      const onlyEmpty =
-        conversations.length === 1 && conversations[0].turns.length === 0;
-      if (onlyEmpty) {
+    const onlyEmpty = conversations.length === 1 && conversations[0].turns.length === 0;
+    if (onlyEmpty) {
+      try {
         localStorage.removeItem(CHAT_STORAGE_KEY);
-      } else {
-        localStorage.setItem(
-          CHAT_STORAGE_KEY,
-          JSON.stringify({
-            version: CHAT_STORAGE_VERSION,
-            activeConversationId,
-            conversations: conversations.map((conversation) => ({
-              ...conversation,
-              turns: conversation.turns.slice(-CHAT_STORAGE_MAX_TURNS),
-            })),
-          }),
-        );
+        setPersistError(false);
+      } catch {
+        // Nothing more to do if even a removeItem fails.
       }
+      return;
+    }
+    const payloadFor = (convos: Conversation[], maxTurns: number) =>
+      JSON.stringify({
+        version: CHAT_STORAGE_VERSION,
+        activeConversationId,
+        conversations: convos.map((conversation) => ({
+          ...conversation,
+          turns: conversation.turns.slice(-maxTurns),
+        })),
+      });
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(conversations, CHAT_STORAGE_MAX_TURNS));
+      setPersistError(false);
+      setPersistPartial(false);
     } catch {
-      // Persistence is best-effort; the in-session state above is unaffected.
+      // Quota most likely exceeded. Retry once with only the active conversation and a
+      // shorter tail rather than freezing at the last successful write with no signal —
+      // this still drops older conversations from disk but keeps the current one saved.
+      const reduced = conversations.filter((c) => c.id === activeConversationId);
+      if (reduced.length === 0) {
+        // No active match to fall back to. Writing the reduced payload here would
+        // persist an empty conversations array, which loadStorage reads back as
+        // "nothing saved" — a silent wipe reported as success. Fail loudly instead.
+        setPersistError(true);
+        return;
+      }
+      try {
+        localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(reduced, 20));
+        setPersistError(false);
+        // The write succeeded but every other conversation, and all but the last 20
+        // turns of this one, are now absent from disk. Reporting a clean save here
+        // would be a lie the user only discovers after a reload, so this gets its own
+        // signal rather than being folded into persistError (which means "nothing
+        // was saved at all") or silently swallowed.
+        setPersistPartial(true);
+      } catch {
+        setPersistError(true);
+      }
     }
   }, [storage, pending, conversations, activeConversationId]);
 
@@ -365,11 +446,14 @@ export function useChat(): UseChatResult {
       id: conversation.id,
       title: conversation.title,
       updatedAt: conversation.updatedAt,
+      turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
     }));
 
   return {
     turns,
     pending,
+    persistError,
+    persistPartial,
     conversations: summaries,
     activeConversationId: activeConversation?.id ?? null,
     ask,

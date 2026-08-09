@@ -1,0 +1,59 @@
+.traces-panel__row {
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--rail-text);
+  padding: 10px 12px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-family: var(--fb);
+}
+
+.traces-panel__row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.traces-panel__query {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.traces-panel__meta {
+  display: flex;
+  gap: 9px;
+  font-size: 10px;
+  color: var(--rail-dim);
+}
+
+.traces-panel__latency--good {
+  color: var(--good);
+}
+
+.traces-panel__latency--warn {
+  color: var(--warn);
+}
+
+.traces-panel__latency--bad {
+  color: var(--bad);
+}
+
+.traces-panel__latency--dim {
+  color: var(--rail-dim);
+}
+
+.traces-panel__spacer {
+  flex: 1;
+}
+
+.traces-panel__message {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--rail-dim);
+  margin: 0;
+}

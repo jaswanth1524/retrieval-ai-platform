@@ -45,7 +45,17 @@ class AppSettings(BaseSettings):
     # fused_top_n at the call site — it can never rerank more than fusion produced.
     rerank_candidates: PositiveInt = 50
     rerank_top_k: PositiveInt = 8
-    reranker_batch_size: PositiveInt = 64
+    # Caps how many query-document pairs the cross-encoder scores per forward pass, which
+    # is what bounds its peak memory: attention cost grows with batch x sequence^2, and at
+    # CHUNK_SIZE_TOKENS=448 the sequences are long. This MUST stay <= rerank_candidates or
+    # batching silently becomes a no-op — the previous default of 64 exceeded the 50
+    # candidates, so every pair went through in one pass and the container OOM-killed
+    # (exit 137) on the first whole-corpus question. Measured over 50 candidates x ~448
+    # tokens: batch 50 peaked at 6.33 GB, batch 16 at 3.53 GB, batch 8 at 2.66 GB — which
+    # is exactly the loaded-model baseline, i.e. scoring adds nothing on top. Latency was
+    # flat across all of them (~45-49s), so this trades no speed and no answer quality;
+    # it only changes how the same work is chunked. Raise it only with memory headroom.
+    reranker_batch_size: PositiveInt = 8
     max_context_chunks: PositiveInt = 6
     # Cross-encoder logits are unbounded and model-specific; sigmoid-normalizing to
     # [0, 1] before comparing against this threshold makes it comparable across
@@ -176,6 +186,13 @@ class AppSettings(BaseSettings):
     # reminder to cite. Never loops; falls back to the original answer if the retry
     # still lacks citations. See api/generation.py.
     citation_retry_enabled: bool = True
+
+    # Optional single shared API key. Empty (the default) keeps every route fully open,
+    # preserving the zero-config self-host story. When set, mutating/query routes
+    # require a matching X-API-Key header (see api/dependencies.py's require_api_key);
+    # /health and /health/ready stay unauthenticated so container healthchecks and
+    # probes keep working either way. Not multi-user auth — one key for the whole API.
+    api_key: str = ""
 
     # Verbosity of the application's own loggers (the "api" and "eval" namespaces).
     # api/logging_config.py consumes this via dictConfig at app construction; without

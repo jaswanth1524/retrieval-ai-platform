@@ -18,7 +18,7 @@ function makeTurn(overrides: Partial<ChatTurn>): ChatTurn {
 
 describe('ChatMessage', () => {
   it('renders a user turn without citations', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'user', content: 'How do I run this?' })} />);
+    render(<ChatMessage turn={makeTurn({ role: 'user', content: 'How do I run this?' })} engineerMode={false} />);
 
     const message = screen.getByTestId('chat-message');
     expect(message).toHaveAttribute('data-role', 'user');
@@ -26,7 +26,7 @@ describe('ChatMessage', () => {
     expect(screen.queryByTestId('citation-card')).not.toBeInTheDocument();
   });
 
-  it('renders an assistant turn with citation cards hidden behind a sources toggle', async () => {
+  it('renders assistant citations always visible, with no toggle', () => {
     render(
       <ChatMessage
         turn={makeTurn({
@@ -43,56 +43,48 @@ describe('ChatMessage', () => {
             },
           ],
         })}
+        engineerMode={false}
       />,
     );
 
     const message = screen.getByTestId('chat-message');
     expect(message).toHaveAttribute('data-role', 'assistant');
-    expect(screen.queryByTestId('citation-card')).not.toBeInTheDocument();
-
-    const toggle = screen.getByTestId('chat-message-sources-toggle');
-    expect(toggle).toHaveTextContent('Sources (1)');
-
-    await userEvent.click(toggle);
-
+    expect(screen.queryByTestId('chat-message-sources-toggle')).not.toBeInTheDocument();
     expect(screen.getByTestId('citation-card')).toBeInTheDocument();
-    expect(toggle).toHaveTextContent('Hide sources');
-
-    await userEvent.click(toggle);
-
-    expect(screen.queryByTestId('citation-card')).not.toBeInTheDocument();
-    expect(toggle).toHaveTextContent('Sources (1)');
   });
 
-  it('renders no sources toggle when the assistant turn has no sources', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} />);
+  it('renders no citations row when the assistant turn has no sources', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} engineerMode={false} />);
 
-    expect(screen.queryByTestId('chat-message-sources-toggle')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('chat-message-sources')).not.toBeInTheDocument();
   });
 
   it('renders an error turn distinctly', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} />);
+    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} engineerMode={false} />);
 
     expect(screen.getByTestId('chat-message')).toHaveAttribute('data-role', 'error');
     expect(screen.getByText('API returned HTTP 502.')).toBeInTheDocument();
   });
 
   it('announces error turns to assistive tech via role="alert"', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} />);
+    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} engineerMode={false} />);
 
     expect(screen.getByRole('alert')).toHaveTextContent('API returned HTTP 502.');
   });
 
   it('renders the trace drawer toggle for an assistant turn with a traceId', () => {
     render(
-      <ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.', traceId: 'trace-1' })} />,
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Answer.', traceId: 'trace-1' })}
+        engineerMode={false}
+      />,
     );
 
     expect(screen.getByTestId('trace-drawer-toggle')).toBeInTheDocument();
   });
 
   it('renders no trace drawer when the turn has no traceId', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} />);
+    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} engineerMode={false} />);
 
     expect(screen.queryByTestId('trace-drawer-toggle')).not.toBeInTheDocument();
   });
@@ -100,10 +92,8 @@ describe('ChatMessage', () => {
   it('renders assistant markdown content (bold, lists) as real elements', () => {
     render(
       <ChatMessage
-        turn={makeTurn({
-          role: 'assistant',
-          content: '**Important**\n\n- one\n- two',
-        })}
+        turn={makeTurn({ role: 'assistant', content: '**Important**\n\n- one\n- two' })}
+        engineerMode={false}
       />,
     );
 
@@ -116,16 +106,87 @@ describe('ChatMessage', () => {
     render(
       <ChatMessage
         turn={makeTurn({ role: 'assistant', content: '<img src=x onerror=alert(1)>' })}
+        engineerMode={false}
       />,
     );
 
     expect(document.querySelector('img')).not.toBeInTheDocument();
   });
 
-  it('renders a timestamp for every turn', () => {
-    render(<ChatMessage turn={makeTurn({ timestamp: Date.now() })} />);
+  it('renders a timestamp for every assistant turn', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.', timestamp: Date.now() })} engineerMode={false} />);
 
     expect(document.querySelector('time')).toBeInTheDocument();
+  });
+
+  describe('streaming', () => {
+    it('renders the streaming skeleton instead of content while content is empty and streamStage is set', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: '' })}
+          engineerMode={false}
+          streamStage="generating answer…"
+        />,
+      );
+
+      expect(screen.getByTestId('streaming-skeleton')).toHaveTextContent('generating answer…');
+    });
+
+    it('renders real content instead of the skeleton once content has started flowing', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'Partial answer' })}
+          engineerMode={false}
+          streamStage="generating answer…"
+        />,
+      );
+
+      expect(screen.queryByTestId('streaming-skeleton')).not.toBeInTheDocument();
+      expect(screen.getByText('Partial answer')).toBeInTheDocument();
+    });
+  });
+
+  describe('engineer meta line', () => {
+    it('shows duration and model only in engineer mode with timings present', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({
+            role: 'assistant',
+            content: 'Answer.',
+            timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 2310, condense_ms: 0 },
+          })}
+          engineerMode
+          currentModelLabel="llama3.1:8b"
+        />,
+      );
+
+      expect(screen.getByText('2.31s')).toBeInTheDocument();
+      expect(screen.getByText('llama3.1:8b')).toBeInTheDocument();
+    });
+
+    it('hides the meta line in reader mode', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({
+            role: 'assistant',
+            content: 'Answer.',
+            timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 2310, condense_ms: 0 },
+          })}
+          engineerMode={false}
+          currentModelLabel="llama3.1:8b"
+        />,
+      );
+
+      expect(screen.queryByText('2.31s')).not.toBeInTheDocument();
+    });
+
+    it('hides the meta line before timings arrive, even in engineer mode', () => {
+      render(
+        <ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} engineerMode currentModelLabel="llama3.1:8b" />,
+      );
+
+      expect(screen.queryByText('llama3.1:8b')).not.toBeInTheDocument();
+    });
   });
 
   describe('copy button', () => {
@@ -137,7 +198,7 @@ describe('ChatMessage', () => {
       const writeText = vi.fn().mockResolvedValue(undefined);
       vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
 
-      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} />);
+      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} engineerMode={false} />);
       await userEvent.click(screen.getByTestId('chat-message-copy'));
 
       expect(writeText).toHaveBeenCalledWith('Answer text.');
@@ -147,7 +208,7 @@ describe('ChatMessage', () => {
     it('renders no copy button when the clipboard API is unavailable', () => {
       vi.stubGlobal('navigator', { ...navigator, clipboard: undefined });
 
-      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} />);
+      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} engineerMode={false} />);
 
       expect(screen.queryByTestId('chat-message-copy')).not.toBeInTheDocument();
     });
@@ -158,6 +219,7 @@ describe('ChatMessage', () => {
     render(
       <ChatMessage
         turn={makeTurn({ role: 'error', content: 'boom', question: 'What is DocRAG?' })}
+        engineerMode={false}
         onRetry={onRetry}
       />,
     );
@@ -168,7 +230,7 @@ describe('ChatMessage', () => {
   });
 
   it('renders no Retry button when the error turn has no retained question', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'boom' })} onRetry={vi.fn()} />);
+    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'boom' })} engineerMode={false} onRetry={vi.fn()} />);
 
     expect(screen.queryByTestId('chat-message-retry')).not.toBeInTheDocument();
   });

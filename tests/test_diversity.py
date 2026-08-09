@@ -100,6 +100,39 @@ def test_never_exceeds_top_k() -> None:
     assert len(result.kept) == 2
 
 
+def test_zero_radius_keeps_ordinal_neighbors_with_distinct_text() -> None:
+    """context_neighbor_radius=0 disables neighbor expansion entirely (see the
+    setting's docstring) — with no expansion, ordinal-adjacent chunks aren't
+    near-identical, so the ordinal check must not fire at radius 0. Shingle-based
+    textual dedup still applies independently."""
+
+    settings = make_settings(context_neighbor_radius=0, rerank_top_k=2)
+    out = outcome_of(
+        chunk("c1", ordinal=5, text="first distinct passage about alpha"),
+        chunk("c2", ordinal=6, text="second passage covers a totally different topic"),
+    )
+    result, dropped = select_diverse(out, settings)
+
+    assert dropped == set()
+    assert [c.point_id for c in result.kept] == ["c1", "c2"]
+
+
+def test_zero_radius_still_drops_textual_near_duplicates() -> None:
+    settings = make_settings(context_neighbor_radius=0, rerank_top_k=2)
+    shared = "the deployment guide explains docker compose setup steps in detail"
+    # Deliberately far-apart ordinals: with adjacent ones the pre-change code's
+    # clamped radius would drop c2 via the ordinal check, so the test would pass
+    # without ever exercising the shingle path it exists to cover.
+    out = outcome_of(
+        chunk("c1", ordinal=5, text=shared),
+        chunk("c2", ordinal=40, text=shared),
+    )
+    result, dropped = select_diverse(out, settings)
+
+    assert "c2" in dropped
+    assert [c.point_id for c in result.kept] == ["c1"]
+
+
 def test_ignores_below_min_score_candidates() -> None:
     settings = make_settings(rerank_min_score=0.5)
     out = RerankOutcome(

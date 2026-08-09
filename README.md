@@ -84,6 +84,14 @@ npm --prefix frontend run dev             # Vite dev server, proxies API calls t
 > **Note:** the default reranker (`jinaai/jina-reranker-v2-base-multilingual`) is
 > ~1.1 GB and downloads once on first use (or at boot if `WARMUP_MODELS=true`) —
 > the first question after a fresh install pays that one-time download cost.
+>
+> It is also the memory floor: answering a question peaks around **2.7 GB** in the API
+> container, so give Docker at least **4 GB** (Docker Desktop → Settings → Resources).
+> That peak is reached when the model loads, so a container that boots and answers one
+> question has already hit its high-water mark. If you raise `RERANKER_BATCH_SIZE` above
+> `RERANK_CANDIDATES`, the reranker scores every candidate in one forward pass instead
+> and the peak jumps to ~6.3 GB, which OOM-kills the container (exit 137) — see the
+> comment on that setting in `.env.example`.
 
 ## Development commands
 
@@ -194,7 +202,7 @@ local because it needs models, a corpus, and (for `answer`) an LLM.
 - `docker-compose.yml`: Qdrant + API services (the API also serves the built frontend).
 - `Dockerfile`: multi-stage build — Node stage builds `frontend/`, Python stage runs the API as a non-root user with a container healthcheck.
 - `api/settings.py`, `api/qdrant_schema.py`: backend configuration and Qdrant collection schema/versioning helpers.
-- `api/documents.py`: document parsing and chunking for PDF, text, and Markdown.
+- `api/documents.py`: document parsing and chunking for PDF, DOCX, HTML, CSV, text, and Markdown.
 - `api/embeddings.py`, `api/ingestion.py`: local embedding adapters and Qdrant upsert helpers.
 - `api/retrieval.py`, `api/repository.py`: hybrid dense+sparse retrieval, RRF, and the Qdrant repository seam (search, upsert, delete).
 - `api/reranking.py`: cross-encoder reranking for fused retrieval candidates.

@@ -1,16 +1,30 @@
 import { useEffect, useRef } from 'react';
+import type { CitationResponse } from '../api/types';
 import ChatMessage, { type ChatTurn } from './ChatMessage';
+import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
 
 interface ChatThreadProps {
   turns: ChatTurn[];
   pending: boolean;
-  onCancel: () => void;
+  engineerMode: boolean;
+  currentModelLabel?: string;
   onRetry?: (question: string) => void;
   onOpenSource?: (filename: string, chunkId: string) => void;
+  onCitationHover?: (citation: CitationResponse) => void;
+  onCitationLeave?: () => void;
 }
 
-function ChatThread({ turns, pending, onCancel, onRetry, onOpenSource }: ChatThreadProps) {
+function ChatThread({
+  turns,
+  pending,
+  engineerMode,
+  currentModelLabel,
+  onRetry,
+  onOpenSource,
+  onCitationHover,
+  onCitationLeave,
+}: ChatThreadProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -25,29 +39,41 @@ function ChatThread({ turns, pending, onCancel, onRetry, onOpenSource }: ChatThr
     );
   }
 
+  const lastTurn = turns[turns.length - 1];
+  // The assistant turn is created lazily on the first `sources`/`delta` event (see
+  // useChat), so while pending is true but the last turn is still the user's question,
+  // there's no ChatTurn yet to attach a skeleton to — render a placeholder in its slot.
+  const awaitingFirstEvent = pending && lastTurn?.role !== 'assistant';
+
   return (
     <div className="chat-thread">
-      {turns.map((turn) => (
-        <ChatMessage key={turn.id} turn={turn} onRetry={onRetry} onOpenSource={onOpenSource} />
-      ))}
-      {pending && (
-        <div
-          className="chat-thread__pending"
-          data-testid="chat-pending"
-          role="status"
-          aria-live="polite"
-        >
-          <span>Generating answer...</span>
-          <button
-            type="button"
-            className="chat-thread__cancel"
-            onClick={onCancel}
-            data-testid="chat-cancel"
-          >
-            Stop
-          </button>
-        </div>
-      )}
+      <div className="chat-thread__rail">
+        {turns.map((turn) => (
+          <ChatMessage
+            key={turn.id}
+            turn={turn}
+            engineerMode={engineerMode}
+            currentModelLabel={currentModelLabel}
+            streamStage={pending && turn.id === lastTurn?.id && turn.role === 'assistant' ? 'generating answer…' : undefined}
+            onRetry={onRetry}
+            onOpenSource={onOpenSource}
+            onCitationHover={onCitationHover}
+            onCitationLeave={onCitationLeave}
+          />
+        ))}
+        {awaitingFirstEvent && (
+          <div className="chat-message" data-testid="chat-pending">
+            <div className="chat-message__row">
+              <span className="chat-message__gutter chat-message__gutter--answer" aria-hidden="true">
+                A
+              </span>
+              <div className="chat-message__answer">
+                <StreamingSkeleton stage="retrieving…" />
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
       <div ref={bottomRef} />
     </div>
   );

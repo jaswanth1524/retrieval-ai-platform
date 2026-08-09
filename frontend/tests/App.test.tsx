@@ -39,24 +39,26 @@ function makeConfigPayload(overrides: Record<string, unknown> = {}): Record<stri
   };
 }
 
+async function openCorpusPanel(): Promise<void> {
+  await userEvent.click(screen.getByTestId('rail-corpus'));
+}
+
 describe('App', () => {
-  it('renders the shell and reaches "API online" when health+config succeed', async () => {
+  it('renders the shell and reaches "api ok" when health+config succeed', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
-        if (url.endsWith('/config')) {
-          return jsonResponse(makeConfigPayload());
-        }
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
 
     render(<App />);
 
-    expect(await screen.findByText('API online')).toBeInTheDocument();
-    expect(screen.getByText('DocRAG')).toBeInTheDocument();
+    expect(await screen.findByText('api ok')).toBeInTheDocument();
+    expect(screen.getByLabelText('DocRAG')).toBeInTheDocument();
     expect(screen.getByTestId('question-textarea')).toBeInTheDocument();
   });
 
@@ -66,22 +68,17 @@ describe('App', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
-        if (url.endsWith('/config')) {
-          return jsonResponse(makeConfigPayload());
-        }
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
     const setItemSpy = vi.spyOn(Storage.prototype, 'setItem');
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
 
     await userEvent.click(screen.getByTestId('theme-toggle'));
 
-    // Assert against the post-click DOM state rather than a predicted pre-click
-    // value — document.documentElement persists across tests within this file, so
-    // the theme a fresh <App/> mounts into isn't reliably predictable here.
     const themeAfterToggle = document.documentElement.dataset.theme;
     expect(setItemSpy).toHaveBeenCalledWith('docrag-theme', themeAfterToggle);
   });
@@ -92,9 +89,7 @@ describe('App', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
-        if (url.endsWith('/config')) {
-          return jsonResponse(makeConfigPayload());
-        }
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
@@ -103,7 +98,7 @@ describe('App', () => {
     });
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
 
     const initialTheme = document.documentElement.dataset.theme;
     await userEvent.click(screen.getByTestId('theme-toggle'));
@@ -118,18 +113,17 @@ describe('App', () => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) {
-          return jsonResponse(
-            makeConfigPayload({ ollama_available: false, openai_available: true }),
-          );
+          return jsonResponse(makeConfigPayload({ ollama_available: false, openai_available: true }));
         }
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
 
-    expect(screen.getByTestId('provider-select')).toHaveValue('openai');
+    await userEvent.click(screen.getByTestId('composer-provider-button'));
+    expect(screen.getByTestId('provider-openai')).toBeChecked();
   });
 
   it('shows the unreachable banner when health check fails', async () => {
@@ -137,7 +131,7 @@ describe('App', () => {
 
     render(<App />);
 
-    expect(await screen.findByText('API unreachable')).toBeInTheDocument();
+    expect(await screen.findByText('api unreachable')).toBeInTheDocument();
     expect(screen.getByText(/Cannot reach the DocRAG API/)).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent(/Cannot reach the DocRAG API/);
   });
@@ -148,18 +142,22 @@ describe('App', () => {
       if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
       if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
       if (url.endsWith('/documents') && (!init?.method || init.method === 'GET')) {
-        return jsonResponse({ filenames: ['existing.pdf'] });
+        return jsonResponse({ filenames: ['existing.pdf'], chunk_counts: { 'existing.pdf': 12 } });
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
+    await openCorpusPanel();
 
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/documents'))).toBe(true);
     const items = await screen.findAllByTestId('corpus-panel-item');
-    expect(items.map((item) => item.textContent)).toEqual(['existing.pdf✕']);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toHaveTextContent('existing.pdf');
+    expect(items[0]).toHaveTextContent('12 chunks');
+    expect(screen.getByTestId('context-panel-footer')).toHaveTextContent('12 chunks');
   });
 
   it('deleting an indexed document removes it from the corpus panel and search scope', async () => {
@@ -171,14 +169,15 @@ describe('App', () => {
         return jsonResponse({ filename: 'existing.pdf', points_deleted: 3 });
       }
       if (url.endsWith('/documents') && (!init?.method || init.method === 'GET')) {
-        return jsonResponse({ filenames: ['existing.pdf'] });
+        return jsonResponse({ filenames: ['existing.pdf'], chunk_counts: { 'existing.pdf': 3 } });
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
+    await openCorpusPanel();
     await screen.findAllByTestId('corpus-panel-item');
 
     await userEvent.click(screen.getByLabelText('Delete existing.pdf'));
@@ -201,7 +200,7 @@ describe('App', () => {
     );
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
 
     expect(screen.getByTestId('question-textarea')).toBeDisabled();
     expect(screen.getByTestId('question-hint')).toHaveTextContent('Upload a document to start.');
@@ -236,6 +235,7 @@ describe('App', () => {
   function stubUploadAndQuestionFetch(): ReturnType<typeof vi.fn> {
     let jobCounter = 0;
     const jobFilenames = new Map<string, string>();
+    const indexed = new Set<string>();
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
@@ -251,6 +251,7 @@ describe('App', () => {
       if (url.includes('/documents/jobs/job-')) {
         const jobId = url.split('/').pop() as string;
         const filename = jobFilenames.get(jobId) as string;
+        indexed.add(filename);
         return jsonResponse({
           job_id: jobId,
           filename,
@@ -260,6 +261,10 @@ describe('App', () => {
           error: null,
           result: { filename, sections_parsed: 1, chunks_ingested: 1, collection_name: 'docrag_documents' },
         });
+      }
+      if (url.endsWith('/documents') && (!init?.method || init.method === 'GET')) {
+        const chunk_counts = Object.fromEntries([...indexed].map((f) => [f, 1]));
+        return jsonResponse({ filenames: [...indexed], chunk_counts });
       }
       if (url.endsWith('/questions/stream')) {
         return sseResponse([doneFrame()]);
@@ -274,32 +279,35 @@ describe('App', () => {
     stubUploadAndQuestionFetch();
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
+    await openCorpusPanel();
 
     const input = screen.getByTestId('upload-input') as HTMLInputElement;
     await userEvent.upload(input, [makeFile('a.txt'), makeFile('b.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
 
-    const jobItems = await vi.waitFor(() => {
-      const items = screen.getAllByTestId('upload-job-item');
-      expect(items.every((item) => item.textContent?.includes('chunks'))).toBe(true);
-      return items;
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(2);
     });
-    expect(jobItems).toHaveLength(2);
-    expect(screen.getAllByTestId('document-filter-item')).toHaveLength(2);
     expect(screen.getByTestId('question-textarea')).toBeEnabled();
     expect(screen.queryByTestId('question-hint')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    expect(screen.getAllByTestId('scope-item')).toHaveLength(2);
   });
 
   it('asking with "All documents" selected searches the whole corpus (no filenames)', async () => {
     const fetchMock = stubUploadAndQuestionFetch();
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
+    await openCorpusPanel();
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt'), makeFile('b.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
-    await screen.findAllByTestId('document-filter-item');
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(2);
+    });
 
     await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
     await userEvent.click(screen.getByTestId('question-submit'));
@@ -313,16 +321,22 @@ describe('App', () => {
     expect(body.filenames).toBeUndefined();
   });
 
-  it('selecting one document in the filter restricts the filenames sent', async () => {
+  it('selecting one document in the scope popover restricts the filenames sent', async () => {
     const fetchMock = stubUploadAndQuestionFetch();
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
+    await openCorpusPanel();
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt'), makeFile('b.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
-    const filterItems = await screen.findAllByTestId('document-filter-item');
-    const aItem = filterItems.find((item) => item.textContent?.includes('a.txt'));
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(2);
+    });
+
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    const scopeItems = screen.getAllByTestId('scope-item');
+    const aItem = scopeItems.find((item) => item.textContent?.includes('a.txt'));
     await userEvent.click(aItem?.querySelector('input') as HTMLInputElement);
 
     await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
@@ -337,44 +351,72 @@ describe('App', () => {
   });
 
   it('re-uploading a file with the same name does not duplicate it in the search scope', async () => {
-    stubUploadAndQuestionFetch();
+    const fetchMock = stubUploadAndQuestionFetch();
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
+    await openCorpusPanel();
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
-    await screen.findAllByTestId('document-filter-item');
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
+    });
 
     await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
     await userEvent.click(screen.getByTestId('upload-button'));
 
     await vi.waitFor(() => {
-      expect(screen.getAllByTestId('upload-job-item')).toHaveLength(2);
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/documents/jobs/job-2'))).toBe(
+        true,
+      );
     });
-    expect(screen.getAllByTestId('document-filter-item')).toHaveLength(1);
+    expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
   });
 
-  it('opens the sidebar overlay on mobile toggle and closes it via the backdrop', async () => {
+  it('asking a question renders the answer and, in engineer mode, a duration/model meta line', async () => {
+    stubUploadAndQuestionFetch();
+
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
+    });
+
+    await userEvent.click(screen.getByTestId('mode-engineer'));
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is this about?');
+    await userEvent.click(screen.getByTestId('question-submit'));
+
+    expect(await screen.findByText('Answer.')).toBeInTheDocument();
+    expect(await screen.findByText('0.00s')).toBeInTheDocument();
+  });
+
+  it('switching rail panels shows the corresponding contextual panel', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: [], chunk_counts: {} });
+        if (url.endsWith('/traces')) return jsonResponse({ traces: [] });
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
 
     render(<App />);
-    await screen.findByText('API online');
+    await screen.findByText('api ok');
 
-    expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument();
+    expect(screen.getByTestId('rail-chat')).toHaveAttribute('aria-pressed', 'true');
 
-    await userEvent.click(screen.getByTestId('sidebar-open'));
-    expect(screen.getByTestId('sidebar-backdrop')).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId('rail-traces'));
+    expect(screen.getByTestId('rail-traces')).toHaveAttribute('aria-pressed', 'true');
+    expect(await screen.findByText('No traces yet.')).toBeInTheDocument();
 
-    await userEvent.click(screen.getByTestId('sidebar-backdrop'));
-    expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument();
+    await openCorpusPanel();
+    expect(screen.getByTestId('upload-dropzone')).toBeInTheDocument();
   });
 });

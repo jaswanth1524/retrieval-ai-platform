@@ -10,79 +10,116 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font-sans);
-  font-size: 15px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--fb);
+  font-size: 14px;
   line-height: 1.5;
 }
 
 .app-shell {
   display: grid;
-  grid-template-columns: 296px 1fr;
-  height: 100vh;
-}
-
-.app-main {
-  display: flex;
-  flex-direction: column;
+  grid-template-columns: var(--w-rail) minmax(0, var(--w-panel)) minmax(340px, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
 }
 
+.app-shell > * {
+  min-height: 0;
+}
+
+.app-main {
+  grid-column: 3;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--paper);
+}
+
 .app-main__unreachable {
   margin: auto;
-  color: var(--error);
+  color: var(--bad);
   text-align: center;
   padding: 2rem;
 }
 
-.app-main__sidebar-toggle {
-  display: none;
-  align-self: flex-start;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  border-radius: 8px;
-  width: 34px;
-  height: 34px;
-  font-size: 16px;
-  margin: 12px 0 0 12px;
+.app-main__config-disclosure {
+  flex: 0 0 auto;
+  max-height: 40vh;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--rule);
 }
 
-.app-shell__backdrop {
-  display: none;
+.app-main__config-disclosure > summary {
+  padding: 8px 24px;
+  cursor: pointer;
+  font-family: var(--fm);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
-@media (max-width: 900px) {
+.app-main__config-disclosure > summary:hover {
+  color: var(--ink);
+}
+
+.app-main__persist-warning {
+  color: var(--bad);
+  font-size: 0.85rem;
+  padding: 0.5rem 1rem;
+  text-align: center;
+}
+
+/* Below the responsive breakpoint the contextual panel (column 2) collapses to 0
+   width entirely — no off-canvas toggle needed, its minmax(0, ...) track just goes
+   to its floor. */
+@media (max-width: 860px) {
   .app-shell {
-    grid-template-columns: 1fr;
-  }
-
-  .app-main__sidebar-toggle {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .app-shell__backdrop {
-    display: block;
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.4);
-    z-index: 20;
+    grid-template-columns: var(--w-rail) 0 minmax(0, 1fr) auto;
   }
 }
 
-@media (max-width: 600px) {
-  body {
-    font-size: 14px;
+@keyframes dr-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes dr-shimmer {
+  0% {
+    background-position: -320px 0;
+  }
+  100% {
+    background-position: 320px 0;
+  }
+}
+
+@keyframes dr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }
 
 code,
 .mono {
-  font-family: var(--font-mono);
+  font-family: var(--fm);
 }
 
 button {
@@ -97,25 +134,4 @@ button:disabled {
 
 a {
   color: var(--accent);
-}
-
-.app-main__toolbar-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-}
-
-.app-main__traces-button {
-  font-size: 0.8rem;
-  padding: 0.3rem 0.7rem;
-  border: 1px solid var(--border);
-  border-radius: 0.35rem;
-  background: var(--bg-card);
-  color: var(--text);
-  cursor: pointer;
-}
-
-.app-main__traces-button:hover {
-  border-color: var(--accent);
 }

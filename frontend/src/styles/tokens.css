@@ -1,48 +1,90 @@
 :root,
 :root[data-theme='dark'] {
-  --bg: #0b0d12;
-  --bg-sidebar: #101318;
-  --bg-elevated: #101318;
-  --bg-card: rgba(255, 255, 255, 0.03);
-  --border: rgba(255, 255, 255, 0.07);
-  --text: #e8eaed;
-  --text-muted: #8b93a1;
-  --text-dim: #6b7280;
-  --text-placeholder: #5f6874;
-  --accent: oklch(78% 0.14 55);
-  --accent-contrast: #1a0f04;
-  --accent-soft: rgba(242, 146, 74, 0.12);
-  --success: oklch(74% 0.15 150);
-  --error: oklch(72% 0.17 25);
-  --error-bg: rgba(248, 81, 73, 0.08);
-  --error-border: rgba(248, 81, 73, 0.28);
-  --error-body: #e3a49f;
-  --error-lead: #f2a6a0;
+  --paper: #141211;
+  --card: #1b1918;
+  --sunk: #100f0e;
+  --rail: #0a0908;
+  --rail-2: #121110;
+  --rail-text: #eae5db;
+  --rail-dim: #7d766b;
+  --rail-rule: rgba(234, 229, 219, 0.12);
+  --ink: #eae5db;
+  --muted: #a49c8e;
+  --dim: #7d766b;
+  --rule: rgba(234, 229, 219, 0.14);
+  --rule-hi: rgba(234, 229, 219, 0.32);
+  --accent: oklch(71% 0.15 45);
+  --accent-ink: #1c0e04;
+  --accent-soft: oklch(71% 0.15 45 / 0.14);
+  --data: oklch(76% 0.08 232);
+  --good: oklch(72% 0.13 150);
+  --warn: oklch(80% 0.12 78);
+  --bad: oklch(68% 0.16 27);
 }
 
 :root[data-theme='light'] {
-  --bg: #f7f5f1;
-  --bg-sidebar: #ffffff;
-  --bg-elevated: #ffffff;
-  --bg-card: rgba(0, 0, 0, 0.025);
-  --border: rgba(0, 0, 0, 0.07);
-  --text: #1a1d23;
-  --text-muted: #8b93a1;
-  --text-dim: #6b7280;
-  --text-placeholder: #9aa1ab;
-  --accent: oklch(60% 0.16 55);
-  --accent-contrast: #ffffff;
-  --accent-soft: rgba(219, 119, 58, 0.12);
-  --success: oklch(56% 0.145 150);
-  --error: oklch(52% 0.18 25);
-  --error-bg: rgba(216, 60, 50, 0.06);
-  --error-border: rgba(216, 60, 50, 0.24);
-  --error-body: #7a2b25;
-  --error-lead: #a8352c;
+  --paper: #f3f0ea;
+  --card: #fbfaf7;
+  --sunk: #eae6de;
+  --rail: #141210;
+  --rail-2: #1e1b18;
+  --rail-text: #eae5db;
+  --rail-dim: #8b8377;
+  --rail-rule: rgba(234, 229, 219, 0.14);
+  --ink: #16130f;
+  --muted: #5f594e;
+  --dim: #8b8377;
+  --rule: rgba(20, 18, 15, 0.15);
+  --rule-hi: rgba(20, 18, 15, 0.34);
+  --accent: oklch(55% 0.16 45);
+  --accent-ink: #ffffff;
+  --accent-soft: oklch(55% 0.16 45 / 0.1);
+  --data: oklch(46% 0.09 232);
+  --good: oklch(48% 0.11 150);
+  --warn: oklch(60% 0.12 75);
+  --bad: oklch(52% 0.17 27);
 }
 
 :root {
-  --font-heading: 'Space Grotesk', sans-serif;
-  --font-sans: 'IBM Plex Sans', -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  --fb: 'Manrope', Helvetica, sans-serif;
+  --fm: 'DM Mono', ui-monospace, 'SFMono-Regular', Consolas, monospace;
+
+  /* Radii: 9px controls/chips/cards/small buttons, 10px rail tiles/list/palette rows,
+     11px document/candidate/stat cards, 12px source/latency cards, 14px composer/palette/
+     settings shells, 2-4px progress tracks. */
+  --radius-sm: 9px;
+  --radius-md: 10px;
+  --radius-lg: 11px;
+  --radius-xl: 12px;
+  --radius-2xl: 14px;
+  --radius-track: 3px;
+
+  /* Layout */
+  --w-rail: 52px;
+  --w-panel: 264px;
+  --w-inspector: 380px;
+  --content-rail: 720px;
+
+  /* --- Temporary aliases: map the pre-redesign token names onto the v2 palette so
+     components not yet migrated to --paper/--card/--ink/--rule keep rendering
+     correctly. Each redesign stage removes the aliases it stops depending on; the
+     final stage deletes this block entirely — if it survives, a component was missed. */
+  --bg: var(--paper);
+  --bg-sidebar: var(--rail-2);
+  --bg-elevated: var(--card);
+  --bg-card: var(--card);
+  --border: var(--rule);
+  --text: var(--ink);
+  --text-muted: var(--muted);
+  --text-dim: var(--dim);
+  --text-placeholder: var(--dim);
+  --accent-contrast: var(--accent-ink);
+  --success: var(--good);
+  --error: var(--bad);
+  --error-bg: var(--accent-soft);
+  --error-border: var(--rule-hi);
+  --error-body: var(--muted);
+  --font-heading: var(--fb);
+  --font-sans: var(--fb);
+  --font-mono: var(--fm);
 }

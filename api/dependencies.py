@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Header, HTTPException, status
 from qdrant_client import QdrantClient
 
 from api.chunking import TokenCounter, make_token_counter
@@ -85,6 +86,37 @@ def get_qdrant_reachability_checker() -> Callable[[QdrantClient], bool]:
     """
 
     return check_qdrant_reachable
+
+
+def require_api_key(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> None:
+    """Enforce the optional shared API key (see AppSettings.api_key).
+
+    No-op when ``api_key`` is empty (the default) — every route stays fully open,
+    preserving the zero-config self-host story. When set, the request must carry a
+    matching ``X-API-Key`` header, compared with ``secrets.compare_digest`` to avoid a
+    timing side channel. Not applied to /health or /health/ready, so healthchecks and
+    readiness probes keep working regardless of whether a key is configured.
+
+    The comparison is on *bytes*, not str: ``compare_digest`` raises TypeError on a
+    non-ASCII str, and Starlette hands header values over latin-1-decoded, so any
+    unauthenticated request carrying a non-ASCII byte in X-API-Key used to surface as a
+    500 instead of a 401. Re-encoding the header with latin-1 recovers the exact wire
+    bytes, which also lets a non-ASCII configured key (utf-8 out of the environment)
+    match a client sending it as utf-8 rather than mismatching via mojibake.
+    """
+
+    if not settings.api_key:
+        return
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key.encode("latin-1", "replace"), settings.api_key.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key.",
+        )
 
 
 def get_vector_repository(

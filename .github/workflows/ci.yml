@@ -29,6 +29,14 @@ jobs:
       - name: Typecheck
         run: uv run mypy api
 
+      - name: Import eval extra
+        # ragas has previously broken on import alone (an unpinned transitive
+        # langchain-community resolved to a version missing a module ragas imports
+        # unconditionally) while --validate-only below never touches the ragas
+        # package at all — this step exists specifically to catch that class of
+        # regression before it reaches "the eval extra silently doesn't work."
+        run: uv run python -c "import ragas"
+
       - name: Validate eval dataset
         run: uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
 

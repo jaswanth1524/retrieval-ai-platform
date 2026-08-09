@@ -1,0 +1,45 @@
+.streaming-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.streaming-skeleton__bar {
+  height: 10px;
+  background: linear-gradient(90deg, var(--sunk) 25%, var(--rule) 50%, var(--sunk) 75%);
+  background-size: 320px 100%;
+  animation: dr-shimmer 1.2s linear infinite;
+}
+
+.streaming-skeleton__bar--1 {
+  width: 94%;
+}
+
+.streaming-skeleton__bar--2 {
+  width: 80%;
+}
+
+.streaming-skeleton__bar--3 {
+  width: 52%;
+}
+
+.streaming-skeleton__stage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--fm);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-top: 3px;
+}
+
+.streaming-skeleton__spinner {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--accent);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: dr-spin 0.7s linear infinite;
+}

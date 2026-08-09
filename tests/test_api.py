@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +28,7 @@ from api.dependencies import (
 )
 from api.embeddings import EmbeddedText
 from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
+from api.ingestion import filename_write_lock
 from api.main import create_app, run_model_warmup
 from api.qdrant_schema import EMBEDDING_MODEL_TAG_KEY, dense_vectors_config, sparse_vectors_config
 from api.reranking import RerankingError
@@ -152,6 +155,7 @@ def _upload_and_wait(
     filename: str,
     content: bytes,
     content_type: str = "text/plain",
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Upload a document via the async job endpoint and poll until it terminates.
 
@@ -162,17 +166,52 @@ def _upload_and_wait(
     """
 
     response = client.post(
-        "/documents", files={"file": (filename, content, content_type)}
+        "/documents", files={"file": (filename, content, content_type)}, headers=headers
     )
     assert response.status_code == 202
     job_id = response.json()["job_id"]
 
     for _ in range(500):
-        status = client.get(f"/documents/jobs/{job_id}").json()
+        # Same headers as the upload: the job-status route is key-guarded too, so
+        # polling it bare would 401 here exactly as it would in a real client.
+        status = client.get(f"/documents/jobs/{job_id}", headers=headers).json()
         if status["state"] in ("done", "failed"):
             return status
         time.sleep(0.01)
     raise AssertionError(f"ingest job {job_id} did not finish in time")
+
+
+@contextmanager
+def _keyed_client(api_key: str) -> Generator[TestClient]:
+    """Client for an app with ``api_key`` configured and the standard hermetic overrides.
+
+    The ``api_context`` fixture can't serve these tests because ``make_settings()``
+    leaves ``api_key`` empty, but hand-rolling the override block per test drifted: the
+    copies were missing ``get_token_counter``, so any test that uploaded ran the real
+    chunker and fetched the bge tokenizer from the HF Hub — passing locally off a warm
+    cache and reaching the network on cold CI. One helper keeps the override set in one
+    place so a future addition to the fixture can't silently skip these.
+    """
+
+    clear_dependency_caches()
+    settings = make_settings(api_key=api_key)
+    # Built once and closed over: a `lambda: QdrantClient(":memory:")` would hand every
+    # request its own empty store, so an upload and the read that checks it would land in
+    # different databases and the read would 404 while looking like an auth failure.
+    qdrant = QdrantClient(":memory:")
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    try:
+        with TestClient(app) as client:
+            yield client
+    finally:
+        clear_dependency_caches()
 
 
 def test_health_endpoint(api_context: ApiTestContext) -> None:
@@ -736,6 +775,37 @@ def test_list_documents_empty_for_no_uploads(api_context: ApiTestContext) -> Non
     assert response.json()["filenames"] == []
 
 
+def test_list_documents_returns_chunk_counts_per_filename(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
+
+    response = api_context.client.get("/documents").json()
+
+    assert response["chunk_counts"] == {"a.txt": 1, "b.txt": 1}
+
+
+def test_list_documents_chunk_counts_replaced_not_accumulated_on_reupload(
+    api_context: ApiTestContext,
+) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha again")["state"] == "done"
+
+    response = api_context.client.get("/documents").json()
+
+    assert response["chunk_counts"] == {"a.txt": 1}
+
+
+def test_list_documents_chunk_counts_drop_deleted_filename(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
+    assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
+
+    api_context.client.delete("/documents/a.txt")
+
+    response = api_context.client.get("/documents").json()
+
+    assert response["chunk_counts"] == {"b.txt": 1}
+
+
 def test_delete_document_removes_indexed_chunks(api_context: ApiTestContext) -> None:
     assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
 
@@ -969,4 +1039,153 @@ def test_question_endpoint_trace_id_null_and_traces_empty_when_tracing_disabled(
 
     assert response.json()["trace_id"] is None
     assert traces_response.json()["traces"] == []
+
+
+def test_api_key_unset_leaves_every_route_open(api_context: ApiTestContext) -> None:
+    """Default AppSettings.api_key is "" — the zero-config self-host story must be
+    unaffected: no route requires X-API-Key when the operator never set one."""
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    response = api_context.client.post("/questions", json={"question": "alpha"})
+    traces_response = api_context.client.get("/traces")
+    list_response = api_context.client.get("/documents")
+    content_response = api_context.client.get("/documents/guide.txt/content")
+
+    assert response.status_code == 200
+    assert traces_response.status_code == 200
+    assert list_response.status_code == 200
+    assert content_response.status_code == 200
+
+
+def test_api_key_set_rejects_protected_routes_without_header() -> None:
+    with _keyed_client("secret-key") as client:
+        health_response = client.get("/health")
+        ready_response = client.get("/health/ready")
+        config_response = client.get("/config")
+        questions_response = client.post("/questions", json={"question": "alpha"})
+        traces_response = client.get("/traces")
+        upload_response = client.post(
+            "/documents", files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")}
+        )
+        delete_response = client.delete("/documents/guide.txt")
+        # The corpus read path is guarded too: an open GET /documents enumerates
+        # filenames and an open /content dumps every chunk's raw text, so a key that
+        # only covered writes and Q&A would still leave the documents readable. The
+        # job-status route carries the filename as well, and its id lands in browser
+        # history and proxy logs, so it is guarded rather than relying on uuid4 secrecy.
+        list_response = client.get("/documents")
+        content_response = client.get("/documents/guide.txt/content")
+        job_response = client.get("/documents/jobs/any-id")
+        metrics_response = client.get("/metrics")
+
+    # Open either way: liveness/readiness probes and the UI's boot request, which has to
+    # succeed before the user has anywhere to type a key.
+    assert health_response.status_code == 200
+    assert ready_response.status_code in (200, 503)
+    assert config_response.status_code == 200
+
+    assert questions_response.status_code == 401
+    assert traces_response.status_code == 401
+    assert upload_response.status_code == 401
+    assert delete_response.status_code == 401
+    assert list_response.status_code == 401
+    assert content_response.status_code == 401
+    # 401, not the 404 an unguarded route would return for an unknown job id.
+    assert job_response.status_code == 401
+    # Counters disclose usage volume and corpus growth; an operator who set a key did
+    # not intend to publish those.
+    assert metrics_response.status_code == 401
+
+
+def test_api_key_set_accepts_protected_routes_with_matching_header() -> None:
+    headers = {"X-API-Key": "secret-key"}
+    with _keyed_client("secret-key") as client:
+        _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta", headers=headers)
+        questions_response = client.post(
+            "/questions", json={"question": "alpha"}, headers=headers
+        )
+        traces_response = client.get("/traces", headers=headers)
+        list_response = client.get("/documents", headers=headers)
+        content_response = client.get("/documents/guide.txt/content", headers=headers)
+        metrics_response = client.get("/metrics", headers=headers)
+
+    assert questions_response.status_code == 200
+    assert traces_response.status_code == 200
+    assert list_response.status_code == 200
+    assert content_response.status_code == 200
+    assert metrics_response.status_code == 200
+
+
+def test_api_key_set_rejects_wrong_header_value() -> None:
+    with _keyed_client("secret-key") as client:
+        response = client.post(
+            "/questions", json={"question": "alpha"}, headers={"X-API-Key": "wrong-key"}
+        )
+
+    assert response.status_code == 401
+
+
+def test_delete_document_waits_for_the_filename_write_lock(api_context: ApiTestContext) -> None:
+    """DELETE must take the same per-filename lock ingest_chunks does.
+
+    Snapshot-then-delete is a read-modify-write, so a delete landing between a
+    concurrent ingest's upsert and its stale-cleanup would remove the points that
+    ingest just wrote while the ingest still reported success. Holding the lock here
+    and asserting the request can't finish proves the route participates in it —
+    guarding only the ingest path left this half of the race open.
+    """
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    statuses: list[int] = []
+
+    def delete_in_background() -> None:
+        statuses.append(api_context.client.delete("/documents/guide.txt").status_code)
+
+    worker = threading.Thread(target=delete_in_background, daemon=True)
+    with filename_write_lock("guide.txt"):
+        worker.start()
+        worker.join(timeout=0.75)
+        assert worker.is_alive(), "DELETE finished while the filename write lock was held"
+        assert statuses == []
+
+    worker.join(timeout=15)
+    assert not worker.is_alive(), "DELETE never completed after the lock was released"
+    assert statuses == [200]
+
+
+def test_api_key_non_ascii_header_is_401_not_500() -> None:
+    """A non-ASCII X-API-Key must be rejected, not crash the request.
+
+    ``secrets.compare_digest`` raises TypeError when handed a non-ASCII *str*, and
+    Starlette decodes header bytes with latin-1, so comparing strings turned any
+    unauthenticated request carrying a non-ASCII byte in X-API-Key into a 500 (plus a
+    traceback in the logs) on every guarded route. The comparison is on bytes now.
+    """
+
+    # Raw bytes, not str: a bare 0xe9 isn't valid utf-8, and "🔑" exercises the
+    # multi-byte path. Both reach require_api_key latin-1-decoded.
+    non_ascii_values = [b"\xe9", "é".encode(), "🔑".encode()]
+    with _keyed_client("secret-key") as client:
+        responses = [
+            client.get("/documents", headers={b"X-API-Key": value}) for value in non_ascii_values
+        ]
+
+    for value, response in zip(non_ascii_values, responses, strict=True):
+        assert response.status_code == 401, (value, response.status_code, response.text)
+
+
+def test_api_key_non_ascii_configured_key_matches_utf8_header() -> None:
+    """An operator-configured non-ASCII key still authenticates a utf-8 header.
+
+    Guards the bytes comparison against a naive fix that only avoided the TypeError:
+    latin-1-encoding the header recovers the exact wire bytes, so a key set as utf-8 in
+    the environment matches a client sending those same utf-8 bytes.
+    """
+
+    with _keyed_client("clé-secrète") as client:
+        matching = client.get("/documents", headers={b"X-API-Key": "clé-secrète".encode()})
+        mismatched = client.get("/documents", headers={b"X-API-Key": "clé-secrete".encode()})
+
+    assert matching.status_code == 200, matching.text
+    assert mismatched.status_code == 401, mismatched.text
 

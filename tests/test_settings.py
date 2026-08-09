@@ -168,3 +168,24 @@ def test_app_settings_env_isolation_survives_a_leaked_env_var(
     # ...but once cleared (what the autouse conftest fixture does before every test),
     # it's gone — regardless of what the developer's real .env file contains.
     assert AppSettings(_env_file=None).openai_api_key is None  # type: ignore[call-arg]
+
+
+def test_reranker_batch_size_actually_batches_the_default_candidate_set() -> None:
+    """The cross-encoder batch must not exceed the candidates it will be given.
+
+    Not a check that the value is any particular number — it's the relationship that
+    matters. reranker_batch_size is the only thing bounding the reranker's peak memory
+    (attention grows with batch x sequence^2), but it can only bound anything if it is
+    smaller than the number of pairs being scored. The old default of 64 against 50
+    candidates meant every pair went through in a single forward pass: 6.33 GB peak,
+    which OOM-killed (exit 137) the container on a ~6 GB Docker Desktop the first time
+    anyone asked a whole-corpus question. Raising it back above rerank_candidates would
+    silently restore one-shot scoring, so pin the invariant rather than the constant.
+    """
+
+    settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.reranker_batch_size <= settings.rerank_candidates
+    # rerank_candidates is itself clamped to fused_top_n at the call site, so the batch
+    # has to clear that bar too — otherwise a lowered fused_top_n reintroduces the bug.
+    assert settings.reranker_batch_size <= settings.fused_top_n

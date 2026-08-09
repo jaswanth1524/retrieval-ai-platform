@@ -1,6 +1,7 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { useChat } from '../../src/hooks/useChat';
+import { buildHistory, useChat } from '../../src/hooks/useChat';
+import type { ChatTurn } from '../../src/components/ChatMessage';
 import { ApiClientError, api } from '../../src/api/client';
 import type { QuestionStreamHandlers } from '../../src/api/client';
 import type { TimingsResponse } from '../../src/api/types';
@@ -425,5 +426,160 @@ describe('useChat', () => {
 
     expect(result.current.turns).toEqual([]);
     expect(localStorage.getItem('docrag-chat-history')).toBeNull();
+  });
+
+  it('warns and resets to empty on an unparseable persisted blob', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    localStorage.setItem('docrag-chat-history', 'not json');
+
+    const { result } = renderHook(() => useChat());
+
+    expect(result.current.turns).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('docrag-chat-history'));
+    // Deliberately not copied to a sibling key: nothing reads such a copy back, so it
+    // would double the footprint of a value that may be what exhausted the quota.
+    expect(localStorage.getItem('docrag-chat-history.corrupt')).toBeNull();
+
+    warn.mockRestore();
+  });
+
+  it('warns and resets to empty on a mismatched-version blob', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const raw = JSON.stringify({ version: 999, turns: [{ id: 't1', role: 'user', content: 'x' }] });
+    localStorage.setItem('docrag-chat-history', raw);
+
+    const { result } = renderHook(() => useChat());
+
+    expect(result.current.turns).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('docrag-chat-history'));
+    expect(localStorage.getItem('docrag-chat-history.corrupt')).toBeNull();
+
+    warn.mockRestore();
+  });
+
+  it('sets persistError and retries with a reduced payload when localStorage.setItem throws', async () => {
+    askQuestionStreamMock.mockImplementationOnce(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('an answer', [], ZERO_TIMINGS, 'trace-1');
+      },
+    );
+
+    const setItemSpy = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementationOnce(() => {
+        throw new Error('QuotaExceededError');
+      });
+
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('a question');
+    });
+
+    expect(setItemSpy).toHaveBeenCalledTimes(2);
+    expect(result.current.persistError).toBe(false);
+    expect(localStorage.getItem('docrag-chat-history')).not.toBeNull();
+    // The reduced write succeeded but dropped data from disk, so it must not report a
+    // clean save — otherwise the loss only surfaces after a reload, with no warning.
+    expect(result.current.persistPartial).toBe(true);
+
+    setItemSpy.mockRestore();
+  });
+
+  it('reports persistPartial only until a full write succeeds again', async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('an answer', [], ZERO_TIMINGS, 'trace-1');
+      },
+    );
+
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
+      throw new Error('QuotaExceededError');
+    });
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('a question');
+    });
+    expect(result.current.persistPartial).toBe(true);
+
+    // Next turn persists normally: nothing is being dropped any more, so the warning
+    // must clear rather than sticking for the rest of the session.
+    await act(async () => {
+      await result.current.ask('another question');
+    });
+
+    expect(result.current.persistPartial).toBe(false);
+    expect(result.current.persistError).toBe(false);
+
+    setItemSpy.mockRestore();
+  });
+
+  it('sets persistError when even the reduced-payload retry fails', async () => {
+    askQuestionStreamMock.mockImplementationOnce(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('an answer', [], ZERO_TIMINGS, 'trace-1');
+      },
+    );
+
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('a question');
+    });
+
+    expect(result.current.persistError).toBe(true);
+
+    setItemSpy.mockRestore();
+  });
+});
+
+describe('buildHistory', () => {
+  function makeChatTurn(role: ChatTurn['role'], content: string): ChatTurn {
+    return { id: role + content.length, role, content, sources: [], timestamp: 0, timings: null, traceId: null };
+  }
+
+  it('truncates a single message within the per-message char cap', () => {
+    // No whitespace anywhere, so the word-boundary backoff can't apply and this
+    // exercises the hard-cut floor.
+    const longAnswer = 'a'.repeat(5000);
+    const history = buildHistory([
+      makeChatTurn('user', 'question'),
+      makeChatTurn('assistant', longAnswer),
+    ]);
+
+    expect(history).toHaveLength(2);
+    // At most the cap, never over: the server rejects a longer message outright, so the
+    // truncation marker has to fit inside the budget rather than be appended past it.
+    expect(history[1].content.length).toBeLessThanOrEqual(4000);
+    expect(history[1].content).toBe(`${'a'.repeat(3999)}…`);
+  });
+
+  it('backs off to a word boundary when one is close to the cap', () => {
+    // A space just inside the cap: cutting at 3999 would sever "sever|ed", so the
+    // truncation should retreat to the space instead.
+    const head = 'word '.repeat(795); // 3975 chars, ends with a space
+    const longAnswer = `${head}${'z'.repeat(200)}`;
+    const history = buildHistory([makeChatTurn('assistant', longAnswer)]);
+
+    expect(history[0].content.length).toBeLessThanOrEqual(4000);
+    expect(history[0].content).toBe(`${head.trimEnd()}…`);
+    // No partial word survived the cut.
+    expect(history[0].content).not.toContain('z');
+  });
+
+  it('hard-cuts rather than backing off past the floor', () => {
+    // The only space is far outside the backoff window, so honoring it would discard
+    // most of the message; the hard cut has to win.
+    const longAnswer = `a ${'b'.repeat(5000)}`;
+    const history = buildHistory([makeChatTurn('assistant', longAnswer)]);
+
+    expect(history[0].content.length).toBeLessThanOrEqual(4000);
+    expect(history[0].content.startsWith('a b')).toBe(true);
+    expect(history[0].content.endsWith('…')).toBe(true);
   });
 });

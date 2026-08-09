@@ -1,0 +1,62 @@
+.icon-rail {
+  grid-column: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: var(--rail);
+  color: var(--rail-text);
+}
+
+.icon-rail__logo-slot {
+  height: 52px;
+  display: grid;
+  place-items: center;
+}
+
+.icon-rail__logo {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-ink);
+  display: grid;
+  place-items: center;
+  font-family: var(--fm);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: -0.03em;
+}
+
+.icon-rail__button {
+  height: 38px;
+  margin: 3px 7px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--rail-dim);
+  cursor: pointer;
+  font-size: 14px;
+  display: grid;
+  place-items: center;
+}
+
+.icon-rail__button:hover {
+  color: var(--rail-text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.icon-rail__button--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.icon-rail__button--active:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.icon-rail__spacer {
+  flex: 1;
+}

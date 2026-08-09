@@ -35,6 +35,11 @@ dependencies = [
 [project.optional-dependencies]
 eval = [
   "ragas>=0.2",
+  # ragas unconditionally imports langchain_community.chat_models.vertexai at module
+  # load (ragas/llms/base.py), but that submodule was removed in langchain-community
+  # 0.4 — an unpinned install resolves to 0.4.x and `import ragas` crashes with
+  # ModuleNotFoundError. Pin to the last 0.3.x line, which still ships it.
+  "langchain-community>=0.3,<0.4",
 ]
 # Optional OCR for scanned/image PDFs. Pure-Python ONNX (onnxruntime is already a
 # fastembed dependency); when absent, scanned PDFs fail with a message pointing here.

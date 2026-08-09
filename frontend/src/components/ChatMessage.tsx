@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { CitationResponse, TimingsResponse } from '../api/types';
 import CitationCard from './CitationCard';
+import StreamingSkeleton from './StreamingSkeleton';
 import TraceDrawer from './TraceDrawer';
 import './ChatMessage.css';
 
@@ -21,37 +22,128 @@ export interface ChatTurn {
 
 interface ChatMessageProps {
   turn: ChatTurn;
+  engineerMode: boolean;
+  // Set only on the single turn actively streaming; undefined means "not this one".
+  streamStage?: string;
+  currentModelLabel?: string;
   onRetry?: (question: string) => void;
   onOpenSource?: (filename: string, chunkId: string) => void;
+  onCitationHover?: (citation: CitationResponse) => void;
+  onCitationLeave?: () => void;
 }
 
-const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+function formatDuration(totalMs: number): string {
+  return `${(totalMs / 1000).toFixed(2)}s`;
+}
 
-function ChatMessage({ turn, onRetry, onOpenSource }: ChatMessageProps) {
+function ChatMessage({
+  turn,
+  engineerMode,
+  streamStage,
+  currentModelLabel,
+  onRetry,
+  onOpenSource,
+  onCitationHover,
+  onCitationLeave,
+}: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
-  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
 
   const handleCopy = () => {
     if (!navigator.clipboard) return;
-    navigator.clipboard.writeText(turn.content).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+    navigator.clipboard.writeText(turn.content).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      },
+      () => {
+        setCopyFailed(true);
+        setTimeout(() => setCopyFailed(false), 1500);
+      },
+    );
   };
 
+  const showSkeleton = streamStage !== undefined && turn.content === '';
+  const timings = turn.timings;
+  const showMeta = engineerMode && turn.role === 'assistant' && !showSkeleton && timings !== null;
+
   return (
-    <div
-      className={`chat-message chat-message--${turn.role}`}
-      data-testid="chat-message"
-      data-role={turn.role}
-    >
-      {turn.role === 'error' ? (
-        <div className="chat-message__bubble chat-message__bubble--error" role="alert">
-          <span className="chat-message__error-icon" aria-hidden="true">
-            ⚠
+    <div className="chat-message" data-testid="chat-message" data-role={turn.role}>
+      {turn.role === 'user' && (
+        <div className="chat-message__row">
+          <span className="chat-message__gutter" aria-hidden="true">
+            Q
           </span>
-          <div className="chat-message__error-body">
-            <div className="chat-message__error-lead">Generation provider unavailable</div>
+          <p className="chat-message__question">{turn.content}</p>
+        </div>
+      )}
+
+      {turn.role === 'assistant' && (
+        <div className="chat-message__row">
+          <span className="chat-message__gutter chat-message__gutter--answer" aria-hidden="true">
+            A
+          </span>
+          <div className="chat-message__answer">
+            {showSkeleton ? (
+              <StreamingSkeleton stage={streamStage} />
+            ) : (
+              <div className="chat-message__markdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+              </div>
+            )}
+            <div className="chat-message__meta-row">
+              <time
+                className="chat-message__timestamp mono"
+                dateTime={new Date(turn.timestamp).toISOString()}
+              >
+                {new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(
+                  turn.timestamp,
+                )}
+              </time>
+              {turn.content && navigator.clipboard && (
+                <button
+                  type="button"
+                  className="chat-message__copy"
+                  onClick={handleCopy}
+                  data-testid="chat-message-copy"
+                >
+                  {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
+                </button>
+              )}
+            </div>
+            {turn.sources.length > 0 && (
+              <div className="chat-message__citations" data-testid="chat-message-sources">
+                {turn.sources.map((source) => (
+                  <CitationCard
+                    key={`${turn.id}-${source.source_number}`}
+                    sourceNumber={source.source_number}
+                    filename={source.filename}
+                    page={source.page}
+                    section={source.section}
+                    onOpen={onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined}
+                    onHoverStart={onCitationHover ? () => onCitationHover(source) : undefined}
+                    onHoverEnd={onCitationLeave}
+                  />
+                ))}
+              </div>
+            )}
+            {showMeta && timings && (
+              <div className="chat-message__engineer-meta mono">
+                <span>{formatDuration(timings.total_ms)}</span>
+                {currentModelLabel && <span>{currentModelLabel}</span>}
+              </div>
+            )}
+            {turn.traceId && <TraceDrawer traceId={turn.traceId} timings={turn.timings} />}
+          </div>
+        </div>
+      )}
+
+      {turn.role === 'error' && (
+        <div className="chat-message__row">
+          <span className="chat-message__gutter chat-message__gutter--error" aria-hidden="true">
+            !
+          </span>
+          <div className="chat-message__error" role="alert">
             {turn.content}
             {turn.question && onRetry && (
               <button
@@ -65,59 +157,6 @@ function ChatMessage({ turn, onRetry, onOpenSource }: ChatMessageProps) {
             )}
           </div>
         </div>
-      ) : turn.role === 'assistant' ? (
-        <div className="chat-message__bubble chat-message__bubble--markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
-        </div>
-      ) : (
-        <div className="chat-message__bubble">{turn.content}</div>
-      )}
-      <div className="chat-message__meta">
-        <time className="chat-message__timestamp mono" dateTime={new Date(turn.timestamp).toISOString()}>
-          {TIME_FORMATTER.format(turn.timestamp)}
-        </time>
-        {turn.role === 'assistant' && turn.content && navigator.clipboard && (
-          <button
-            type="button"
-            className="chat-message__copy"
-            onClick={handleCopy}
-            data-testid="chat-message-copy"
-          >
-            {copied ? 'Copied' : 'Copy'}
-          </button>
-        )}
-        {turn.role === 'assistant' && turn.sources.length > 0 && (
-          <button
-            type="button"
-            className="chat-message__sources-toggle"
-            onClick={() => setSourcesOpen((prev) => !prev)}
-            aria-expanded={sourcesOpen}
-            data-testid="chat-message-sources-toggle"
-          >
-            {sourcesOpen ? 'Hide sources' : `Sources (${turn.sources.length})`}
-          </button>
-        )}
-      </div>
-      {turn.role === 'assistant' && turn.sources.length > 0 && sourcesOpen && (
-        <div className="chat-message__sources" data-testid="chat-message-sources">
-          {turn.sources.map((source) => (
-            <CitationCard
-              key={`${turn.id}-${source.source_number}`}
-              sourceNumber={source.source_number}
-              filename={source.filename}
-              page={source.page}
-              section={source.section}
-              chunkId={source.chunk_id}
-              text={source.text}
-              onOpen={
-                onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined
-              }
-            />
-          ))}
-        </div>
-      )}
-      {turn.role === 'assistant' && turn.traceId && (
-        <TraceDrawer traceId={turn.traceId} timings={turn.timings} />
       )}
     </div>
   );

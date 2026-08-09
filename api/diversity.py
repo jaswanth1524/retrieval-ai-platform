@@ -59,7 +59,10 @@ def select_diverse(
         return outcome, set()
 
     min_score = float(settings.rerank_min_score)
-    radius = max(int(settings.context_neighbor_radius), 1)
+    # 0 means neighbor expansion is disabled entirely (see context_neighbor_radius's
+    # docstring) — with no expansion, ordinal-adjacent chunks aren't near-identical and
+    # shouldn't be dropped on that basis alone; shingle dedup below still applies.
+    radius = int(settings.context_neighbor_radius)
     threshold = float(settings.context_diversity_max_similarity)
     top_k = int(settings.rerank_top_k)
 
@@ -71,7 +74,7 @@ def select_diverse(
     for candidate in eligible:
         if len(kept) >= top_k:
             break
-        near_ordinal = any(
+        near_ordinal = radius > 0 and any(
             keeper.filename == candidate.filename
             and keeper.chunk_ordinal is not None
             and candidate.chunk_ordinal is not None
