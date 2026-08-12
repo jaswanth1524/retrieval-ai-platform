@@ -72,19 +72,13 @@ describe('ChatMessage', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('API returned HTTP 502.');
   });
 
-  it('renders the trace drawer toggle for an assistant turn with a traceId', () => {
+  it('renders no per-turn trace drawer — trace detail lives in the inspector now', () => {
     render(
       <ChatMessage
         turn={makeTurn({ role: 'assistant', content: 'Answer.', traceId: 'trace-1' })}
         engineerMode={false}
       />,
     );
-
-    expect(screen.getByTestId('trace-drawer-toggle')).toBeInTheDocument();
-  });
-
-  it('renders no trace drawer when the turn has no traceId', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer.' })} engineerMode={false} />);
 
     expect(screen.queryByTestId('trace-drawer-toggle')).not.toBeInTheDocument();
   });
@@ -205,12 +199,43 @@ describe('ChatMessage', () => {
       expect(await screen.findByText('Copied')).toBeInTheDocument();
     });
 
-    it('renders no copy button when the clipboard API is unavailable', () => {
+    it('still copies via execCommand when the clipboard API is unavailable', async () => {
+      // Plain HTTP on a LAN address has no navigator.clipboard, and that is a
+      // first-class DocRAG deployment — hiding the button there removed the feature
+      // from exactly the self-hosting users the project targets.
       vi.stubGlobal('navigator', { ...navigator, clipboard: undefined });
+      const execCommand = vi.fn().mockReturnValue(true);
+      vi.stubGlobal('document', Object.assign(document, { execCommand }));
 
       render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} engineerMode={false} />);
+      await userEvent.click(screen.getByTestId('chat-message-copy'));
 
-      expect(screen.queryByTestId('chat-message-copy')).not.toBeInTheDocument();
+      expect(execCommand).toHaveBeenCalledWith('copy');
+      expect(await screen.findByText('Copied')).toBeInTheDocument();
+      // The temporary textarea must not survive the copy.
+      expect(document.querySelectorAll('textarea')).toHaveLength(0);
+    });
+
+    it('falls back to execCommand when a clipboard write is denied', async () => {
+      const writeText = vi.fn().mockRejectedValue(new Error('denied by permissions policy'));
+      vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+      const execCommand = vi.fn().mockReturnValue(true);
+      vi.stubGlobal('document', Object.assign(document, { execCommand }));
+
+      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} engineerMode={false} />);
+      await userEvent.click(screen.getByTestId('chat-message-copy'));
+
+      expect(await screen.findByText('Copied')).toBeInTheDocument();
+    });
+
+    it('reports failure when both copy paths fail', async () => {
+      vi.stubGlobal('navigator', { ...navigator, clipboard: undefined });
+      vi.stubGlobal('document', Object.assign(document, { execCommand: vi.fn().mockReturnValue(false) }));
+
+      render(<ChatMessage turn={makeTurn({ role: 'assistant', content: 'Answer text.' })} engineerMode={false} />);
+      await userEvent.click(screen.getByTestId('chat-message-copy'));
+
+      expect(await screen.findByText('Copy failed')).toBeInTheDocument();
     });
   });
 

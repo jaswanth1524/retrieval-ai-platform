@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from io import BytesIO
 from pathlib import PurePosixPath
+from threading import Lock
 from typing import Any, ClassVar, Literal, cast
 
 from pypdf import PdfReader
@@ -209,8 +210,15 @@ def chunk_sections(
         filename = group[0].filename
         # Reserve headroom for the contextual-embedding prefix (ingestion prepends
         # "filename › section\n" before embedding), so prefix + chunk fits the model.
-        prefix = f"{filename} › {group[0].section}\n"
-        budget = max(1, chunk_size - token_counter.count(prefix))
+        # Budget against the group's LONGEST section label, not the first one: a
+        # physical group spans many sections and each chunk is prefixed with its own,
+        # so sizing on group[0] under-reserves for every later, longer heading. Today's
+        # 448/512 slack absorbs the difference, but it would become live truncation the
+        # moment chunk_size_tokens is raised toward the model's limit.
+        prefix_tokens = max(
+            token_counter.count(f"{filename} › {section.section}\n") for section in group
+        )
+        budget = max(1, chunk_size - prefix_tokens)
 
         units = _sentence_units(group, budget, token_counter)
         for window in _window_units(units, budget, overlap):
@@ -272,14 +280,23 @@ def _split_oversized(sentence: str, budget: int, token_counter: TokenCounter) ->
     if token_counter.count(sentence) <= budget:
         return [sentence]
 
+    # Count each word once and accumulate, rather than re-tokenizing the whole running
+    # string per word — that was O(words^2) tokenizer work on exactly the inputs that
+    # reach this path (CSV row blocks, wide tables), which are the longest ones.
+    # Per-word counts sum to slightly more than the joined string's real count, so this
+    # errs toward smaller pieces; a final exact check below repairs the common case.
     pieces: list[str] = []
     current: list[str] = []
+    current_tokens = 0
     for word in sentence.split():
-        if current and token_counter.count(" ".join([*current, word])) > budget:
+        word_tokens = token_counter.count(word)
+        if current and current_tokens + word_tokens > budget:
             pieces.append(" ".join(current))
             current = [word]
+            current_tokens = word_tokens
         else:
             current.append(word)
+            current_tokens += word_tokens
     if current:
         pieces.append(" ".join(current))
     return pieces
@@ -519,6 +536,9 @@ def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> li
 
 
 _OCR_ENGINE: object | None = None
+# The ingest executor runs two workers, so two scanned PDFs arriving together could both
+# see _OCR_ENGINE as None and each construct one — doubling a heavyweight model load.
+_OCR_ENGINE_LOCK = Lock()
 
 
 def _get_ocr_engine(engine_cls: type) -> Any:
@@ -526,7 +546,10 @@ def _get_ocr_engine(engine_cls: type) -> Any:
 
     global _OCR_ENGINE
     if _OCR_ENGINE is None:
-        _OCR_ENGINE = engine_cls()
+        with _OCR_ENGINE_LOCK:
+            # Re-check inside the lock: another worker may have built it while we waited.
+            if _OCR_ENGINE is None:
+                _OCR_ENGINE = engine_cls()
     return _OCR_ENGINE
 
 

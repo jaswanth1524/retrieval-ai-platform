@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from './api/client';
 import type {
   ApiStatus,
@@ -11,8 +11,9 @@ import type {
 import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
+import CommandPalette from './components/CommandPalette';
+import type { Command } from './components/CommandPalette';
 import Composer from './components/Composer';
-import ConfigPanel from './components/ConfigPanel';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
 import CorpusPanel from './components/CorpusPanel';
@@ -20,9 +21,16 @@ import type { UploadItem } from './components/CorpusPanel';
 import DocumentViewer from './components/DocumentViewer';
 import IconRail from './components/IconRail';
 import type { RailPanel } from './components/IconRail';
+import Inspector from './components/Inspector';
+import type { InspectorTab } from './components/Inspector';
+import SettingsModal from './components/SettingsModal';
 import SourcePreview from './components/SourcePreview';
+import ToastRow from './components/ToastRow';
 import TracesPanel from './components/TracesPanel';
 import { useChat } from './hooks/useChat';
+import { useResponsiveLayout } from './hooks/useResponsiveLayout';
+import { useToasts } from './hooks/useToasts';
+import { chatToMarkdown, downloadFile } from './utils/exportChat';
 
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
 const MODE_STORAGE_KEY = 'docrag-mode';
@@ -87,8 +95,20 @@ function App() {
   const [rail, setRail] = useState<RailPanel>('chat');
   const [traces, setTraces] = useState<TraceSummaryResponse[] | null>(null);
   const [tracesError, setTracesError] = useState<string | null>(null);
-  // Plumbing for stage 3's inspector — nothing renders on this yet.
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  // Set once the user opens or closes the inspector themselves. The width-driven
+  // auto-collapse must not override a deliberate choice — otherwise crossing a
+  // breakpoint silently undoes what the user just did.
+  const [inspectorForced, setInspectorForced] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sources');
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
+  const { tooNarrowForInspector, roomyEnoughForInspector } = useResponsiveLayout();
+  // Which turn the inspector is describing. null follows the newest assistant turn,
+  // so the panel keeps up with the conversation on its own; clicking a trace row pins
+  // it to that specific turn instead.
+  const [pinnedTraceId, setPinnedTraceId] = useState<string | null>(null);
   const [hoveredCitation, setHoveredCitation] = useState<CitationResponse | null>(null);
   // Source document viewer: which document/chunk a clicked citation opens (null = closed).
   const [sourceView, setSourceView] = useState<{ filename: string; chunkId: string } | null>(null);
@@ -144,6 +164,24 @@ function App() {
     const documents = await api.listDocuments(signal);
     setIndexedFilenames(documents.filenames);
     setChunkCounts(documents.chunk_counts ?? {});
+    // A key that used to be rejected now works — clear the banner.
+    setApiStatus((prev) => (prev === 'unauthorized' ? 'ok' : prev));
+  };
+
+  /** Note a 401 so it isn't mistaken for an empty corpus.
+   *
+   * /health and /config are unauthenticated, so a server with API_KEY set answers both
+   * and the app looks healthy — while every /documents call 401s. Swallowing that left
+   * indexedFilenames empty, which disabled the composer under the hint "Upload a
+   * document to start.", advice that would itself have 401'd. Returns true when it
+   * handled the error, so callers keep their own fallback for everything else.
+   */
+  const noteAuthFailure = (err: unknown): boolean => {
+    if (err instanceof ApiClientError && err.statusCode === 401) {
+      setApiStatus('unauthorized');
+      return true;
+    }
+    return false;
   };
 
   useEffect(() => {
@@ -172,8 +210,11 @@ function App() {
         setApiStatus('ok');
         try {
           await refreshDocuments(controller.signal);
-        } catch {
-          // Non-fatal — the corpus panel just stays empty until the next refresh.
+        } catch (err) {
+          if (cancelled) return;
+          // Anything other than a 401 is non-fatal — the corpus panel just stays empty
+          // until the next refresh.
+          noteAuthFailure(err);
         }
       } catch {
         if (cancelled) return;
@@ -208,10 +249,25 @@ function App() {
     return () => controller.abort();
   }, [rail]);
 
-  // Opens the inspector on the Trace tab in stage 3; the inspector doesn't exist yet.
+  // A trace row is a debugging artifact, so opening one implies Engineer mode — the
+  // Trace tab does not exist in Reader and the click would otherwise appear to do
+  // nothing. Pins the inspector to that trace rather than the newest turn.
   const handleSelectTrace = (traceId: string) => {
-    void traceId;
+    setPinnedTraceId(traceId);
+    setMode('engineer');
+    setInspectorTab('trace');
+    setInspectorOpen(true);
+    // Opening a trace is an explicit request to see the inspector, so it outranks the
+    // width rule the same way a manual toggle does.
+    setInspectorForced(true);
   };
+
+  // Width-driven open/close, deferring to the user once they have taken a position.
+  useEffect(() => {
+    if (inspectorForced) return;
+    if (tooNarrowForInspector) setInspectorOpen(false);
+    else if (roomyEnoughForInspector) setInspectorOpen(true);
+  }, [inspectorForced, tooNarrowForInspector, roomyEnoughForInspector]);
 
   const uploadOne = async (file: File, id: string) => {
     try {
@@ -253,14 +309,8 @@ function App() {
         // server-side, so the corpus list should not grow a second entry for it.
         setIndexedFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
       }
-      // Chunk counts live server-side; a targeted refetch keeps the footer total and
-      // this document's card accurate without threading the count through the job poll.
-      try {
-        await refreshDocuments();
-      } catch {
-        // Non-fatal — counts just stay stale until the next refresh.
-      }
     } catch (err) {
+      noteAuthFailure(err);
       setUploads((prev) =>
         prev.map((item) =>
           item.id === id
@@ -279,6 +329,15 @@ function App() {
     }));
     setUploads((prev) => [...prev, ...newItems]);
     await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
+    // Once for the whole batch, not once per file. Chunk counts live server-side and
+    // GET /documents scrolls the entire collection to compute them, so refreshing
+    // inside uploadOne meant a 20-file drop triggered 20 full-collection scans.
+    try {
+      await refreshDocuments();
+    } catch (err) {
+      // Non-fatal — counts just stay stale until the next refresh.
+      noteAuthFailure(err);
+    }
   };
 
   const handleDeleteDocument = async (filename: string) => {
@@ -295,6 +354,14 @@ function App() {
 
   const apiReachable = apiStatus === 'ok';
   const noDocs = indexedFilenames.length === 0;
+  // Auth takes precedence over noDocs: when the corpus list 401s, "no documents" is a
+  // symptom, and telling the user to upload one would send them at a call that 401s too.
+  const composerHint =
+    apiStatus === 'unauthorized'
+      ? 'This server requires an API key — add one in Settings.'
+      : noDocs
+        ? 'Upload a document to start.'
+        : undefined;
   const chunkTotal = Object.values(chunkCounts).reduce((sum, n) => sum + n, 0);
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
   // The engineer meta line's model label is the CURRENTLY selected provider's model,
@@ -306,6 +373,24 @@ function App() {
       : config.openai_model
     : undefined;
 
+  // The turn the inspector describes: the one pinned by a trace-row click, else the
+  // most recent assistant turn so the panel tracks the conversation without a click.
+  const inspectedTurn =
+    (pinnedTraceId ? turns.find((turn) => turn.traceId === pinnedTraceId) : undefined) ??
+    [...turns].reverse().find((turn) => turn.role === 'assistant');
+  // A pinned trace from the trace browser may belong to a turn this conversation never
+  // held (another session, or one since cleared) — fall back to the id itself so the
+  // Retrieval and Trace tabs can still fetch and render it.
+  const inspectedTraceId = inspectedTurn?.traceId ?? pinnedTraceId;
+  // The server sends trace_id in the `sources` SSE event, before generation even
+  // starts (so a mid-stream failure can still be linked to a trace) — but only writes
+  // the trace itself once the turn reaches its terminal event, which is also the
+  // moment `timings` gets set (see useChat's onDone handler). Fetching in that gap
+  // 404s; a trace pinned from the trace browser is never mid-stream, so it defaults
+  // ready. Found via a real ~19s Ollama generation — a mocked instant SSE stream can't
+  // reproduce the gap this guards against.
+  const inspectedTraceReady = inspectedTurn ? inspectedTurn.timings !== null : true;
+
   // Shared by both the input box and a Retry click on a failed turn — retry always
   // uses the CURRENT provider/overrides/scope, not whatever was selected when the
   // original question failed. No selection = search the whole corpus (undefined).
@@ -316,6 +401,126 @@ function App() {
       advancedOptions,
       selectedFilenames.length > 0 ? selectedFilenames : undefined,
     );
+
+  // Persistence problems arrive as state flags, not events, so they are surfaced with
+  // stable ids — a re-render must refresh the same notice rather than stack duplicates.
+  useEffect(() => {
+    if (persistError) {
+      pushToast({
+        id: 'persist-error',
+        tone: 'bad',
+        title: "Chat history couldn't be saved",
+        body: "Storage may be full — this session won't be here after a reload.",
+      });
+    } else if (persistPartial) {
+      pushToast({
+        id: 'persist-partial',
+        tone: 'warn',
+        title: 'Only this conversation was saved',
+        body: 'Browser storage is full. Export anything you need to keep.',
+      });
+    }
+  }, [persistError, persistPartial, pushToast]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setPaletteOpen((prev) => !prev);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const exportMarkdown = useCallback(() => {
+    if (turns.length === 0) return;
+    downloadFile(
+      `docrag-${activeConversation?.title ?? 'chat'}.md`.replace(/[^\w.-]+/g, '-'),
+      chatToMarkdown(turns),
+      'text/markdown',
+    );
+  }, [turns, activeConversation]);
+
+  const commands: Command[] = useMemo(
+    () => [
+      {
+        id: 'new-conversation',
+        glyph: '＋',
+        label: 'New conversation',
+        shortcut: '⌘N',
+        run: () => {
+          setRail('chat');
+          newConversation();
+        },
+        disabled: pending,
+      },
+      {
+        id: 'upload',
+        glyph: '↑',
+        label: 'Upload a document',
+        shortcut: '⌘U',
+        run: () => {
+          setRail('corpus');
+          // The panel has to render before its hidden file input can be clicked.
+          requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
+        },
+      },
+      {
+        id: 'settings',
+        glyph: '⚙',
+        label: 'Open settings',
+        shortcut: '⌘,',
+        run: () => setSettingsOpen(true),
+        disabled: !config,
+      },
+      {
+        id: 'toggle-inspector',
+        glyph: '◧',
+        label: inspectorOpen ? 'Hide inspector' : 'Show inspector',
+        run: () => {
+          setInspectorForced(true);
+          setInspectorOpen((prev) => !prev);
+        },
+      },
+      {
+        id: 'toggle-mode',
+        glyph: '◑',
+        label: mode === 'engineer' ? 'Switch to Reader mode' : 'Switch to Engineer mode',
+        run: () => setMode(mode === 'engineer' ? 'reader' : 'engineer'),
+      },
+      {
+        id: 'toggle-theme',
+        glyph: theme === 'dark' ? '☀' : '☾',
+        label: theme === 'dark' ? 'Use light theme' : 'Use dark theme',
+        shortcut: '⌘J',
+        run: toggleTheme,
+      },
+      {
+        id: 'export',
+        glyph: '⇩',
+        label: 'Export conversation as Markdown',
+        run: exportMarkdown,
+        disabled: turns.length === 0,
+      },
+      {
+        id: 'traces',
+        glyph: '◔',
+        label: 'Browse traces',
+        run: () => setRail('traces'),
+      },
+      {
+        id: 'clear',
+        glyph: '✕',
+        label: 'Clear this conversation',
+        run: clear,
+        disabled: pending || turns.length === 0,
+      },
+    ],
+    // toggleTheme/clear/newConversation are stable enough for a menu rebuilt on open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown],
+  );
 
   const handlePanelAction = () => {
     if (rail === 'chat') newConversation();
@@ -330,9 +535,7 @@ function App() {
         onSelect={setRail}
         theme={theme}
         onToggleTheme={toggleTheme}
-        onOpenSettings={() => {
-          /* settings modal lands in stage 4 */
-        }}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
       <ContextPanel
         title={PANEL_META[rail].title}
@@ -382,42 +585,16 @@ function App() {
               turns={turns}
               onClear={clear}
               disabled={pending}
-              onOpenPalette={() => {
-                /* command palette lands in stage 4 */
-              }}
+              onOpenPalette={() => setPaletteOpen(true)}
               inspectorOpen={inspectorOpen}
-              onToggleInspector={() => setInspectorOpen((prev) => !prev)}
+              onToggleInspector={() => {
+                // Reopening on a new turn should follow the conversation again rather
+                // than resurface whatever trace row was last clicked.
+                if (!inspectorOpen) setPinnedTraceId(null);
+                setInspectorForced(true);
+                setInspectorOpen((prev) => !prev);
+              }}
             />
-            {persistError && (
-              <div className="app-main__persist-warning" role="alert" data-testid="persist-error-banner">
-                Chat history couldn&apos;t be saved to this browser (storage may be full) &mdash;
-                this session won&apos;t be there after a reload.
-              </div>
-            )}
-            {!persistError && persistPartial && (
-              <div
-                className="app-main__persist-warning"
-                role="alert"
-                data-testid="persist-partial-banner"
-              >
-                Browser storage is full, so only this conversation was saved &mdash; your other
-                conversations won&apos;t be there after a reload. Export anything you need to keep.
-              </div>
-            )}
-            {config && (
-              // Collapsed by default: ConfigPanel is a temporary placement pending
-              // stage 4's settings modal, and its full metrics grid is tall enough to
-              // squeeze the chat thread down to a sliver if left open in normal flow.
-              <details className="app-main__config-disclosure">
-                <summary>Advanced settings</summary>
-                <ConfigPanel
-                  config={config}
-                  overrides={advancedOptions}
-                  onOverridesChange={updateAdvancedOptions}
-                  disabled={pending}
-                />
-              </details>
-            )}
             <ChatThread
               turns={turns}
               pending={pending}
@@ -429,10 +606,11 @@ function App() {
               onCitationLeave={() => setHoveredCitation(null)}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
+            <ToastRow toasts={toasts} onDismiss={dismissToast} />
             <Composer
               onSubmit={askQuestion}
               disabled={!apiReachable || pending || noDocs}
-              hint={noDocs ? 'Upload a document to start.' : undefined}
+              hint={composerHint}
               pending={pending}
               onCancel={cancel}
               scopeLabel={scopeLabel(indexedFilenames, selectedFilenames)}
@@ -447,6 +625,31 @@ function App() {
           </>
         )}
       </main>
+      {inspectorOpen && apiStatus !== 'error' && (
+        <Inspector
+          engineerMode={mode === 'engineer'}
+          tab={inspectorTab}
+          onTabChange={setInspectorTab}
+          onClose={() => setInspectorOpen(false)}
+          sources={inspectedTurn?.sources ?? []}
+          traceId={inspectedTraceId ?? null}
+          traceReady={inspectedTraceReady}
+          onOpenSource={(filename, chunkId) => setSourceView({ filename, chunkId })}
+        />
+      )}
+      {paletteOpen && (
+        <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />
+      )}
+      {settingsOpen && config && (
+        <SettingsModal
+          config={config}
+          overrides={advancedOptions}
+          onOverridesChange={updateAdvancedOptions}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={() => pushToast({ tone: 'good', title: 'Settings saved' })}
+          disabled={pending}
+        />
+      )}
       {sourceView && (
         <DocumentViewer
           filename={sourceView.filename}

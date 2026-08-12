@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict, cast
 
 import litellm
@@ -102,13 +102,21 @@ class StageTimings:
 
     embed_ms: float
     search_ms: float
+    # Cross-encoder scoring plus the diversity filter. Neighbour expansion used to be
+    # folded in here, which hid a per-question Qdrant round trip inside "rerank".
     rerank_ms: float
     generate_ms: float
     total_ms: float
     # 0.0 when there was no history to condense, or condense was disabled.
     condense_ms: float = 0.0
-    # 0.0 when query expansion is disabled (the default) or produced no variants.
-    expand_ms: float = 0.0
+    # LLM generation of alternative query phrasings, which happens BEFORE embedding.
+    # 0.0 when multi-query expansion is disabled (the default) or produced no variants.
+    # Named for what it measures: the old `expand_ms` read as context expansion, which
+    # is a different stage at a different point in the pipeline (below).
+    query_expansion_ms: float = 0.0
+    # Neighbour/context expansion after rerank (small-to-big retrieval). 0.0 when
+    # context_neighbor_radius is 0.
+    context_expansion_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,12 @@ class GroundedAnswer:
     # True when the answer initially lacked citations and a stricter retry supplied
     # them (see needs_citation_retry / retry_uncited_answer).
     citation_retry_used: bool = False
+    # The exact message list of the call that produced `answer` — the retry's
+    # continuation when citation_retry_used is True. Carried out so tracing records what
+    # was really sent instead of re-deriving a prompt that may not be the one used.
+    # Never surfaced through the HTTP response (see main.py's QuestionResponse), only
+    # through the debug trace.
+    prompt_messages: list[ChatMessage] = field(default_factory=list)
 
 
 class LiteLLMGenerator:
@@ -254,14 +268,13 @@ def generate_grounded_answer(
         raise GenerationError("Generation provider returned an empty answer.")
 
     all_sources = source_citations(selected_chunks)
-    answer, cited, retry_used = finalize_citations(
-        normalized_query, selected_chunks, answer, all_sources, generator, settings, history
-    )
+    outcome = finalize_citations(messages, answer, all_sources, generator, settings)
 
     return GroundedAnswer(
-        answer=answer,
-        sources=cited,
-        citation_retry_used=retry_used,
+        answer=outcome.answer,
+        sources=outcome.cited,
+        citation_retry_used=outcome.retry_used,
+        prompt_messages=outcome.prompt_messages,
     )
 
 
@@ -434,22 +447,25 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 
 
 def retry_uncited_answer(
-    query: str,
-    context_chunks: Sequence[RerankedChunk],
+    prompt_messages: Sequence[ChatMessage],
     first_answer: str,
     generator: ChatGenerator,
     settings: AppSettings,
-    history: Sequence[ChatMessage] | None = None,
-) -> str | None:
-    """One-shot retry that reminds the model to cite; returns the cited answer or None.
+) -> tuple[str, list[ChatMessage]] | None:
+    """One-shot retry that reminds the model to cite.
 
-    Returns None (caller keeps the original answer) when the retry fails or still
-    produces no citations — never loops.
+    Returns ``(cited_answer, messages_actually_sent)``, or None when the retry fails or
+    still produces no citations — in which case the caller keeps the original answer.
+    Never loops.
+
+    Takes the already-built grounded prompt rather than rebuilding it from
+    ``query``/``context_chunks``/``history``: the retry must continue the *same*
+    conversation the first answer came from, and reconstructing it here was a second
+    derivation that could silently drift from the one generation actually used.
     """
 
-    selected_chunks = list(context_chunks[: int(settings.max_context_chunks)])
     messages: list[ChatMessage] = [
-        *build_grounded_messages(query, selected_chunks, history),
+        *prompt_messages,
         {"role": "assistant", "content": first_answer},
         {"role": "user", "content": CITATION_RETRY_REMINDER},
     ]
@@ -457,23 +473,40 @@ def retry_uncited_answer(
         retried = generator.complete(messages, settings).strip()
     except GenerationError:
         return None
-    return retried if retried and _CITATION_RE.search(retried) else None
+    if not retried or not _CITATION_RE.search(retried):
+        return None
+    return retried, messages
+
+
+@dataclass(frozen=True)
+class CitationOutcome:
+    """Result of citation filtering, including what actually produced the answer.
+
+    ``prompt_messages`` is the message list of the call the returned ``answer`` came
+    from — the retry's continuation when ``retry_used`` is True, the original prompt
+    otherwise. Traces record this rather than the first prompt, so a debug trace can
+    never show a prompt the model was not asked.
+    """
+
+    answer: str
+    cited: list[SourceCitation]
+    retry_used: bool
+    prompt_messages: list[ChatMessage]
 
 
 def finalize_citations(
-    query: str,
-    context_chunks: Sequence[RerankedChunk],
+    prompt_messages: Sequence[ChatMessage],
     answer: str,
     all_sources: Sequence[SourceCitation],
     generator: ChatGenerator,
     settings: AppSettings,
-    history: Sequence[ChatMessage] | None = None,
-) -> tuple[str, list[SourceCitation], bool]:
+) -> CitationOutcome:
     """Filter ``answer`` to its cited sources, retrying once if none are cited.
 
     Shared by both response modes (sync ``generate_grounded_answer`` and the streaming
     path in ``RagPipeline.answer_stream``) so the retry-trigger condition can't drift
-    between them.
+    between them. ``prompt_messages`` is the prompt that produced ``answer``; the
+    returned outcome carries whichever prompt produced its final answer.
 
     The ``not cited`` guard is redundant with ``needs_citation_retry`` — that returns
     False whenever the answer contains any ``[n]`` marker, and ``cited`` is only
@@ -486,18 +519,21 @@ def finalize_citations(
     """
 
     cited = cited_sources(answer, all_sources)
+    final_messages = list(prompt_messages)
     retry_used = False
     if (
         not cited
         and settings.citation_retry_enabled
         and needs_citation_retry(answer, len(all_sources))
     ):
-        retried = retry_uncited_answer(query, context_chunks, answer, generator, settings, history)
+        retried = retry_uncited_answer(prompt_messages, answer, generator, settings)
         if retried is not None:
-            answer = retried
+            answer, final_messages = retried
             cited = cited_sources(answer, all_sources)
             retry_used = True
-    return answer, cited, retry_used
+    return CitationOutcome(
+        answer=answer, cited=cited, retry_used=retry_used, prompt_messages=final_messages
+    )
 
 
 def build_expansion_messages(question: str, count: int) -> list[ChatMessage]:

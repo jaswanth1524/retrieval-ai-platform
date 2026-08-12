@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import ValidationError
 
+from api.main import MEASURED_SAFE_RERANKER_BATCH_SIZE, warn_on_risky_reranker_config
 from api.settings import AppSettings
 
 
@@ -170,22 +173,72 @@ def test_app_settings_env_isolation_survives_a_leaked_env_var(
     assert AppSettings(_env_file=None).openai_api_key is None  # type: ignore[call-arg]
 
 
-def test_reranker_batch_size_actually_batches_the_default_candidate_set() -> None:
-    """The cross-encoder batch must not exceed the candidates it will be given.
+def test_reranker_batch_size_default_is_within_measured_safe_peak_memory() -> None:
+    """The default cross-encoder batch must stay at the measured-safe absolute value.
 
-    Not a check that the value is any particular number — it's the relationship that
-    matters. reranker_batch_size is the only thing bounding the reranker's peak memory
-    (attention grows with batch x sequence^2), but it can only bound anything if it is
-    smaller than the number of pairs being scored. The old default of 64 against 50
-    candidates meant every pair went through in a single forward pass: 6.33 GB peak,
-    which OOM-killed (exit 137) the container on a ~6 GB Docker Desktop the first time
-    anyone asked a whole-corpus question. Raising it back above rerank_candidates would
-    silently restore one-shot scoring, so pin the invariant rather than the constant.
+    Peak reranker memory is a function of reranker_batch_size *alone* (attention grows
+    with batch x sequence^2): measured over 50 candidates of ~448 tokens, batch 8 peaked
+    at 2.66 GB — the loaded-model baseline — while batch 50 peaked at 6.33 GB and
+    OOM-killed (exit 137) the container on a ~6 GB Docker Desktop the first time anyone
+    asked a whole-corpus question.
+
+    The `<= rerank_candidates` relation asserted below is a separate and weaker rule
+    (above it, batching is merely a no-op) and is deliberately NOT sufficient on its own:
+    batch 50 against 50 candidates satisfies it and still peaks at 6.33 GB. The old
+    default of 64 against 50 violated both at once, which is what made the relation look
+    like the cause. Both are pinned here so neither can drift back.
     """
 
     settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
 
+    assert settings.reranker_batch_size <= MEASURED_SAFE_RERANKER_BATCH_SIZE
     assert settings.reranker_batch_size <= settings.rerank_candidates
     # rerank_candidates is itself clamped to fused_top_n at the call site, so the batch
     # has to clear that bar too — otherwise a lowered fused_top_n reintroduces the bug.
     assert settings.reranker_batch_size <= settings.fused_top_n
+
+
+def test_risky_reranker_batch_size_warns_without_refusing_to_boot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An operator-set batch above the measured-safe peak warns but still constructs.
+
+    Deliberately not a validator: memory headroom is deployment-specific, so a large
+    host is entitled to this config. What was missing is the signal — field-by-field the
+    settings look reasonable and the only symptom is exit 137 mid-question.
+    """
+
+    settings = AppSettings(  # type: ignore[call-arg]
+        _env_file=None, reranker_batch_size=32, rerank_candidates=50
+    )
+
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        warn_on_risky_reranker_config(settings)
+
+    assert "RERANKER_BATCH_SIZE=32" in caplog.text
+    assert "6.33 GB" in caplog.text
+    # The relation holds here (32 <= 50), so only the memory warning should fire —
+    # this is exactly the config the old relation-only rule called safe.
+    assert "no-op" not in caplog.text
+
+
+def test_batch_size_above_candidates_warns_that_batching_is_a_no_op(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = AppSettings(  # type: ignore[call-arg]
+        _env_file=None, reranker_batch_size=64, rerank_candidates=50
+    )
+
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        warn_on_risky_reranker_config(settings)
+
+    # The historical incident config trips both rules.
+    assert "no-op" in caplog.text
+    assert "6.33 GB" in caplog.text
+
+
+def test_default_reranker_config_logs_no_warning(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        warn_on_risky_reranker_config(AppSettings(_env_file=None))  # type: ignore[call-arg]
+
+    assert caplog.text == ""

@@ -314,19 +314,20 @@ export function useChat(): UseChatResult {
       const targetId = prev.activeConversationId ?? prev.conversations[0]?.id ?? null;
       return {
         ...prev,
-        conversations: prev.conversations.map((conversation) =>
-          conversation.id === targetId
-            ? {
-                ...conversation,
-                turns: update(conversation.turns),
-                title:
-                  conversation.title === 'New chat'
-                    ? deriveTitle(update(conversation.turns))
-                    : conversation.title,
-                updatedAt: Date.now(),
-              }
-            : conversation,
-        ),
+        conversations: prev.conversations.map((conversation) => {
+          if (conversation.id !== targetId) return conversation;
+          // Call the updater exactly once. It used to run a second time for the title,
+          // doubling the work on the hottest path in the app (every streamed delta
+          // rebuilds the turn list) and quietly requiring every updater to be pure.
+          const nextTurns = update(conversation.turns);
+          return {
+            ...conversation,
+            turns: nextTurns,
+            title:
+              conversation.title === 'New chat' ? deriveTitle(nextTurns) : conversation.title,
+            updatedAt: Date.now(),
+          };
+        }),
       };
     });
   };
@@ -380,8 +381,20 @@ export function useChat(): UseChatResult {
         controller.signal,
       );
     } catch (err) {
-      const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
-      setActiveTurns((prev) => [...prev, { ...makeTurn('error', message), question }]);
+      // A user-initiated Stop aborts `controller`; a timeout aborts askQuestionStream's
+      // own private controller instead, leaving this one untouched. So the flag is true
+      // only for a deliberate cancel — where whatever streamed so far should simply
+      // stand, with no error row claiming the request failed.
+      if (controller.signal.aborted) {
+        // Drop a content-less assistant turn: cancelling after `sources` but before the
+        // first delta would otherwise leave an empty answer bubble behind.
+        setActiveTurns((prev) =>
+          prev.filter((turn) => turn.id !== assistantTurnId || turn.content !== ''),
+        );
+      } else {
+        const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
+        setActiveTurns((prev) => [...prev, { ...makeTurn('error', message), question }]);
+      }
     } finally {
       inflightRef.current = null;
       setPending(false);

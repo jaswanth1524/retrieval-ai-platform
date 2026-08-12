@@ -395,3 +395,67 @@ def test_infer_section_skips_roman_numeral_first_line() -> None:
 def test_infer_section_falls_back_to_first_line_when_all_look_like_furniture() -> None:
     assert infer_section("12\n34") == "12"
 
+
+
+def test_chunk_budget_reserves_for_the_longest_section_label_in_the_group() -> None:
+    """Prefix headroom is sized on the group's longest label, not the first section's.
+
+    A physical group (PDF pages, plain-text paragraphs) is windowed as one stream but
+    each emitted chunk carries its OWN section label, and ingestion prefixes the
+    embedded text with "filename › section\\n". Sizing the budget on group[0] therefore
+    under-reserves for every later, longer heading, and the embedded string can exceed
+    the dense model's hard token limit and be silently truncated.
+
+    Under WordTokenCounter the prefix costs (2 + words-in-label) tokens, so a short
+    first label and a long later one make the two budgets visibly different.
+    """
+
+    counter = WordTokenCounter()
+    settings = make_settings(chunk_size_tokens=14, chunk_overlap_tokens=0)
+    long_label = "A Very Much Longer Heading Indeed"
+    # 11 words each: exactly the old budget (14 - 3 for the short "f.txt › A" prefix), so
+    # each section forms its own window and the second window carries the LONG label —
+    # embedding at 8 + 11 = 19 tokens against a 14-token limit.
+    sections = [
+        DocumentSection(
+            filename="f.txt", page=1, section="A", text=" ".join(f"a{i}" for i in range(11))
+        ),
+        DocumentSection(
+            filename="f.txt",
+            page=2,
+            section=long_label,
+            text=" ".join(f"b{i}" for i in range(11)),
+        ),
+    ]
+
+    chunks = chunk_sections(sections, settings, counter)
+
+    assert any(chunk.section == long_label for chunk in chunks), (
+        "the long-labelled section must actually reach a chunk, or this proves nothing"
+    )
+    for chunk in chunks:
+        embedded = f"{chunk.filename} › {chunk.section}\n{chunk.text}"
+        assert counter.count(embedded) <= settings.chunk_size_tokens, (
+            f"section {chunk.section!r} embeds to {counter.count(embedded)} tokens, "
+            f"over the {settings.chunk_size_tokens}-token budget"
+        )
+
+
+def test_split_oversized_pieces_stay_within_budget() -> None:
+    """The per-word accumulator must not let a piece exceed the budget.
+
+    Counting each word once (instead of re-tokenizing the running string per word, which
+    was O(words^2)) sums to slightly MORE than the joined string's real count, so pieces
+    err small. This pins that they never err large.
+    """
+
+    counter = WordTokenCounter()
+    sentence = " ".join(f"word{i}" for i in range(200))
+
+    pieces = documents._split_oversized(sentence, 10, counter)
+
+    assert len(pieces) > 1
+    for piece in pieces:
+        assert counter.count(piece) <= 10, piece
+    # Nothing is dropped or duplicated by the split.
+    assert " ".join(pieces) == sentence

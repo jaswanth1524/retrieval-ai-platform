@@ -2,6 +2,15 @@ import type { ReactNode } from 'react';
 import type { ApiStatus } from '../api/types';
 import './ContextPanel.css';
 
+// A Record, not a ternary chain: adding a status now fails to compile until it has a
+// label, instead of silently falling through to "checking".
+const API_STATUS_LABELS: Record<ApiStatus, string> = {
+  ok: 'api ok',
+  error: 'api unreachable',
+  checking: 'checking',
+  unauthorized: 'api key required',
+};
+
 interface ContextPanelProps {
   title: string;
   actionLabel: string;
@@ -26,7 +35,7 @@ function ContextPanel({ title, actionLabel, onAction, apiStatus, chunkTotal, chi
           className={`context-panel__status-dot context-panel__status-dot--${apiStatus}`}
           aria-hidden="true"
         />
-        <span>{apiStatus === 'ok' ? 'api ok' : apiStatus === 'error' ? 'api unreachable' : 'checking'}</span>
+        <span>{API_STATUS_LABELS[apiStatus]}</span>
         <span className="context-panel__spacer" />
         <span>{chunkTotal} chunks</span>
       </footer>

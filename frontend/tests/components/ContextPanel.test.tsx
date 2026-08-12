@@ -46,4 +46,12 @@ describe('ContextPanel', () => {
     );
     expect(screen.getByTestId('context-panel-footer')).toHaveTextContent('api unreachable');
   });
+
+  it('distinguishes an unauthorized server from an unreachable one', () => {
+    setup({ apiStatus: 'unauthorized' });
+
+    const footer = screen.getByTestId('context-panel-footer');
+    expect(footer).toHaveTextContent('api key required');
+    expect(footer).not.toHaveTextContent('api unreachable');
+  });
 });

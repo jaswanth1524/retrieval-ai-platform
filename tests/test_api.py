@@ -598,6 +598,71 @@ def test_config_exposes_override_limit_fields() -> None:
     assert payload["llm_temperature"] == settings.llm_temperature
 
 
+def _cors_app(monkeypatch: pytest.MonkeyPatch, origin: str) -> FastAPI:
+    """Build an app whose CORS middleware really is configured for ``origin``.
+
+    ``create_app`` reads settings through a direct ``get_app_settings()`` call to
+    install the middleware, before any route exists — so ``dependency_overrides``
+    (which only intercepts route dependencies) cannot reach it. Patching the name as
+    imported into ``api.main`` is the seam that can, and matches how the warmup tests
+    below control the same call.
+    """
+
+    clear_dependency_caches()
+    settings = make_settings(cors_allow_origins=[origin])
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    return create_app()
+
+
+def test_cors_preflight_allows_the_api_key_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cross-origin request carrying X-API-Key must survive its preflight.
+
+    X-API-Key is not a CORS-simple header, so the browser preflights it. When
+    allow_headers omitted it, the middleware answered 400 "Disallowed CORS headers"
+    and API_KEY + CORS_ALLOW_ORIGINS could never be used together.
+    """
+
+    origin = "http://localhost:5173"
+    app = _cors_app(monkeypatch, origin)
+
+    with TestClient(app) as client:
+        response = client.options(
+            "/documents",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "x-api-key",
+            },
+        )
+    clear_dependency_caches()
+
+    assert response.status_code == 200
+    allowed = response.headers["access-control-allow-headers"].lower()
+    assert "x-api-key" in allowed
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_cors_preflight_still_allows_content_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pre-existing Content-Type allowance is not regressed by adding X-API-Key."""
+
+    origin = "http://localhost:5173"
+    app = _cors_app(monkeypatch, origin)
+
+    with TestClient(app) as client:
+        response = client.options(
+            "/questions",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+    clear_dependency_caches()
+
+    assert response.status_code == 200
+    assert "content-type" in response.headers["access-control-allow-headers"].lower()
+
+
 class CapturingCompletionClient:
     def __init__(self) -> None:
         self.kwargs: dict[str, Any] | None = None
@@ -881,10 +946,15 @@ def test_question_endpoint_includes_stage_timings(api_context: ApiTestContext) -
         "generate_ms",
         "total_ms",
         "condense_ms",
-        "expand_ms",
+        # Two separate stages: query-variant generation before embedding, neighbour
+        # expansion after rerank. They were one ambiguous "expand_ms" that named the
+        # former and was ordered like the latter.
+        "query_expansion_ms",
+        "context_expansion_ms",
     }
     assert timings["condense_ms"] == 0.0
-    assert timings["expand_ms"] == 0.0
+    # No history to condense and query expansion is off by default.
+    assert timings["query_expansion_ms"] == 0.0
 
 
 def test_question_endpoint_filters_by_filenames(api_context: ApiTestContext) -> None:

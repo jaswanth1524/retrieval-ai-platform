@@ -192,4 +192,47 @@ describe('Composer', () => {
       expect(props.onProviderChange).toHaveBeenCalledWith('openai');
     });
   });
+  describe('popover accessibility', () => {
+    it('announces popover state on the trigger and labels the popover itself', async () => {
+      render(<Composer {...baseProps({ config: makeConfig({ openai_available: true }) })} />);
+
+      const scopeButton = screen.getByTestId('composer-scope-button');
+      expect(scopeButton).toHaveAttribute('aria-haspopup', 'true');
+      expect(scopeButton).toHaveAttribute('aria-expanded', 'false');
+
+      await userEvent.click(scopeButton);
+
+      expect(scopeButton).toHaveAttribute('aria-expanded', 'true');
+      const popover = screen.getByTestId('composer-scope-popover');
+      expect(popover).toHaveAttribute('role', 'group');
+      expect(popover).toHaveAccessibleName('Search scope');
+      // The trigger points at the popover it controls.
+      expect(scopeButton).toHaveAttribute('aria-controls', popover.id);
+    });
+
+    it('marks the provider popover as a radiogroup', async () => {
+      render(<Composer {...baseProps({ config: makeConfig({ openai_available: true }) })} />);
+
+      await userEvent.click(screen.getByTestId('composer-provider-button'));
+
+      const popover = screen.getByTestId('composer-provider-popover');
+      expect(popover).toHaveAttribute('role', 'radiogroup');
+      expect(popover).toHaveAccessibleName('Generation provider');
+    });
+
+    it('Escape closes the popover and returns focus to its trigger', async () => {
+      // Without this, escaping drops focus to document.body and a keyboard user is
+      // stranded at the top of the page.
+      render(<Composer {...baseProps({ config: makeConfig({ openai_available: true }) })} />);
+
+      const scopeButton = screen.getByTestId('composer-scope-button');
+      await userEvent.click(scopeButton);
+      expect(screen.getByTestId('composer-scope-popover')).toBeInTheDocument();
+
+      await userEvent.keyboard('{Escape}');
+
+      expect(screen.queryByTestId('composer-scope-popover')).not.toBeInTheDocument();
+      expect(scopeButton).toHaveFocus();
+    });
+  });
 });

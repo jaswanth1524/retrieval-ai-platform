@@ -9,9 +9,12 @@ RUN npm run build
 # ---- python runtime stage ----
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS runtime
 WORKDIR /app
+# Dependency layer first, and on its own: `[tool.uv] package = false` means uv sync
+# never reads api/, so copying the source before it only served to invalidate the
+# (slow, network-bound) dependency install on every code change.
 COPY pyproject.toml uv.lock ./
-COPY api/ ./api/
 RUN uv sync --frozen
+COPY api/ ./api/
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 # Non-root: created after uv sync/COPY so the venv/app dir is owned by root at build

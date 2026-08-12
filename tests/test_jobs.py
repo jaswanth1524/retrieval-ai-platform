@@ -81,3 +81,36 @@ def test_ingest_job_store_respects_a_custom_max_retained() -> None:
     assert store.get(job_ids[0]) is None
     assert store.get(job_ids[1]) is not None
     assert store.get(job_ids[2]) is not None
+
+
+def test_ingest_job_store_evicts_unfinished_jobs_past_the_cap() -> None:
+    """The cap must hold even when nothing has finished.
+
+    Only two executor workers run, so a burst of uploads leaves a long queue of
+    non-terminal jobs. Pruning finished jobs alone left that queue unbounded — a client
+    could grow the store without limit just by uploading. A client polling an evicted
+    job gets the same 404 it already gets for one pruned after completion.
+    """
+
+    store = IngestJobStore(max_retained=3)
+    job_ids = [store.create(f"doc-{i}.txt").id for i in range(6)]
+
+    assert store.get(job_ids[0]) is None
+    assert store.get(job_ids[2]) is None
+    # Oldest-first eviction, so the three most recent survive.
+    assert store.get(job_ids[3]) is not None
+    assert store.get(job_ids[5]) is not None
+
+
+def test_ingest_job_store_prefers_evicting_finished_jobs_over_running_ones() -> None:
+    store = IngestJobStore(max_retained=2)
+    finished = store.create("done.txt")
+    store.update(finished.id, state="done")
+    running = store.create("running.txt")
+    store.update(running.id, state="embedding")
+    newest = store.create("newest.txt")
+
+    # The finished job is the one nobody is polling, so it goes first.
+    assert store.get(finished.id) is None
+    assert store.get(running.id) is not None
+    assert store.get(newest.id) is not None

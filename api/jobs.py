@@ -75,6 +75,16 @@ class IngestJobStore:
                 setattr(job, key, value)
 
     def _prune_finished_locked(self) -> None:
+        """Evict oldest-first to stay within the cap, finished jobs first.
+
+        Finished jobs go first because nobody is polling them any more. But the store
+        must not grow without bound when none have finished: uploads are client-driven
+        and the executor has only two workers, so a burst leaves a long queue of
+        non-terminal jobs. Past the cap those are evicted too, oldest first — a client
+        polling an evicted job gets a 404 (``JobNotFoundError``), which is the same
+        answer it already gets for a job pruned after completion.
+        """
+
         overflow = len(self._jobs) - self._max_retained
         if overflow <= 0:
             return
@@ -82,4 +92,11 @@ class IngestJobStore:
             job_id for job_id, job in self._jobs.items() if job.state in TERMINAL_STATES
         ]
         for job_id in finished_ids[:overflow]:
+            del self._jobs[job_id]
+
+        still_over = len(self._jobs) - self._max_retained
+        if still_over <= 0:
+            return
+        # Insertion order is creation order, so this drops the least recently created.
+        for job_id in list(self._jobs)[:still_over]:
             del self._jobs[job_id]

@@ -1,0 +1,79 @@
+.toast-row {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 24px 0;
+  max-width: var(--content-rail);
+  width: 100%;
+  margin: 0 auto;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  padding: 9px 11px;
+  animation: dr-in 0.14s ease both;
+}
+
+.toast__dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-top: 6px;
+  background: var(--muted);
+}
+
+.toast--good .toast__dot {
+  background: var(--good);
+}
+
+.toast--warn .toast__dot {
+  background: var(--warn);
+}
+
+.toast--bad .toast__dot {
+  background: var(--bad);
+}
+
+.toast--bad {
+  border-color: var(--bad);
+}
+
+.toast__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toast__title {
+  font-size: 12.5px;
+  color: var(--ink);
+}
+
+.toast__body {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.toast__dismiss {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+.toast__dismiss:hover {
+  color: var(--ink);
+}

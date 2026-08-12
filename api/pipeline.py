@@ -76,7 +76,11 @@ class RetrievalPhase:
     embed_ms: float
     search_ms: float
     rerank_ms: float
-    expand_ms: float = 0.0
+    # Query-variant generation (before embedding) and neighbour expansion (after
+    # rerank) are separate stages at opposite ends of retrieval; they are timed apart
+    # so a latency breakdown can't attribute one to the other.
+    query_expansion_ms: float = 0.0
+    context_expansion_ms: float = 0.0
     diversity_dropped_ids: frozenset[str] = frozenset()
     query_variants: list[str] = field(default_factory=list)
 
@@ -132,7 +136,8 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "generate_ms": timings.generate_ms,
         "total_ms": timings.total_ms,
         "condense_ms": timings.condense_ms,
-        "expand_ms": timings.expand_ms,
+        "query_expansion_ms": timings.query_expansion_ms,
+        "context_expansion_ms": timings.context_expansion_ms,
     }
 
 
@@ -146,27 +151,51 @@ def expand_with_neighbors(
     Small-to-big retrieval: rerank on tight chunks, but let the model generate from a
     wider window around each one. Chunks with no recorded ``chunk_ordinal`` (indexed
     before this field existed) are returned unchanged rather than erroring.
+
+    Neighbours are fetched **once per distinct filename**, not once per chunk: the
+    surviving chunks are usually a handful drawn from one or two documents, so a
+    per-chunk round trip meant up to ``rerank_top_k`` sequential Qdrant scrolls on every
+    question for data one query per file could return.
     """
 
     radius = int(settings.context_neighbor_radius)
     if radius <= 0:
         return list(chunks)
 
+    def wanted_ordinals(chunk: RerankedChunk) -> list[int]:
+        assert chunk.chunk_ordinal is not None
+        return [
+            chunk.chunk_ordinal + delta
+            for delta in range(-radius, radius + 1)
+            if delta != 0 and chunk.chunk_ordinal + delta >= 1
+        ]
+
+    # Union every chunk's neighbour ordinals per filename, then one fetch per filename.
+    ordinals_by_file: dict[str, set[int]] = {}
+    for chunk in chunks:
+        if chunk.chunk_ordinal is None:
+            continue
+        ordinals_by_file.setdefault(chunk.filename, set()).update(wanted_ordinals(chunk))
+
+    # (filename, ordinal) -> text, so each chunk can pick its own neighbours back out.
+    neighbor_text: dict[tuple[str, int], str] = {}
+    for filename, ordinals in ordinals_by_file.items():
+        for point in repository.fetch_neighbors(settings, filename, sorted(ordinals)):
+            payload = point.payload or {}
+            ordinal = payload.get("chunk_ordinal")
+            text = payload.get("text")
+            if isinstance(ordinal, int) and not isinstance(ordinal, bool) and text:
+                neighbor_text[(filename, ordinal)] = str(text)
+
     expanded: list[RerankedChunk] = []
     for chunk in chunks:
         if chunk.chunk_ordinal is None:
             expanded.append(chunk)
             continue
-        neighbor_ordinals = [
-            chunk.chunk_ordinal + delta
-            for delta in range(-radius, radius + 1)
-            if delta != 0 and chunk.chunk_ordinal + delta >= 1
-        ]
-        neighbor_points = repository.fetch_neighbors(settings, chunk.filename, neighbor_ordinals)
         neighbor_texts = sorted(
-            (point.payload.get("chunk_ordinal", 0), point.payload.get("text", ""))
-            for point in neighbor_points
-            if point.payload and point.payload.get("text")
+            (ordinal, neighbor_text[(chunk.filename, ordinal)])
+            for ordinal in wanted_ordinals(chunk)
+            if (chunk.filename, ordinal) in neighbor_text
         )
         if not neighbor_texts:
             expanded.append(chunk)
@@ -309,18 +338,18 @@ class RagPipeline:
 
         # Multi-query expansion (opt-in): rewrite into variant phrasings, retrieve each,
         # and RRF-fuse the result lists with the same pinned rrf_k before one rerank.
-        # Left un-timed (expand_ms stays 0.0) when disabled, mirroring condense_ms.
+        # Left un-timed (query_expansion_ms stays 0.0) when disabled, like condense_ms.
         variants: list[str] = []
-        expand_ms = 0.0
+        query_expansion_ms = 0.0
         if effective_settings.query_expansion_enabled:
-            expand_start = time.monotonic()
+            query_expansion_start = time.monotonic()
             variants = generate_query_variants(
                 normalized_query,
                 int(effective_settings.query_expansion_count),
                 self._generator,
                 effective_settings,
             )
-            expand_ms = (time.monotonic() - expand_start) * 1000
+            query_expansion_ms = (time.monotonic() - query_expansion_start) * 1000
         queries = [normalized_query, *variants]
 
         embed_start = time.monotonic()
@@ -352,10 +381,16 @@ class RagPipeline:
             settings=effective_settings,
         )
         diverse_outcome, diversity_dropped = select_diverse(outcome, effective_settings)
+        rerank_ms = (time.monotonic() - rerank_start) * 1000
+
+        # Timed apart from rerank: neighbour expansion is a Qdrant round trip, not model
+        # scoring, and folding it into rerank_ms hid it from every latency breakdown.
+        context_expansion_start = time.monotonic()
         expanded = expand_with_neighbors(
             diverse_outcome.kept, self._repository, effective_settings
         )
-        rerank_ms = (time.monotonic() - rerank_start) * 1000
+        context_expansion_ms = (time.monotonic() - context_expansion_start) * 1000
+
         return RetrievalPhase(
             context_chunks=expanded,
             fused_candidates=candidates,
@@ -363,7 +398,8 @@ class RagPipeline:
             embed_ms=embed_ms,
             search_ms=search_ms,
             rerank_ms=rerank_ms,
-            expand_ms=expand_ms,
+            query_expansion_ms=query_expansion_ms,
+            context_expansion_ms=context_expansion_ms,
             diversity_dropped_ids=frozenset(diversity_dropped),
             query_variants=variants,
         )
@@ -422,7 +458,8 @@ class RagPipeline:
                 generate_ms=generate_ms,
                 total_ms=total_ms,
                 condense_ms=condense_ms,
-                expand_ms=phase.expand_ms,
+                query_expansion_ms=phase.query_expansion_ms,
+                context_expansion_ms=phase.context_expansion_ms,
             )
         except Exception as exc:
             if trace_store is not None and trace_id is not None:
@@ -449,11 +486,11 @@ class RagPipeline:
             raise
 
         if trace_store is not None and trace_id is not None:
-            prompt_messages = (
-                build_grounded_messages(question.strip(), selected, truncated_history or None)
-                if selected
-                else None
-            )
+            # Captured from generation, not rebuilt here. A second
+            # build_grounded_messages call would agree today but is a re-derivation that
+            # can drift, and it could never reproduce the citation-retry continuation
+            # that actually produced the answer when grounded.citation_retry_used is set.
+            prompt_messages = grounded.prompt_messages or None
             trace_store.add(
                 QueryTrace(
                     trace_id=trace_id,
@@ -554,7 +591,8 @@ class RagPipeline:
                     generate_ms=0.0,
                     total_ms=total_ms,
                     condense_ms=condense_ms,
-                    expand_ms=phase.expand_ms,
+                    query_expansion_ms=phase.query_expansion_ms,
+                    context_expansion_ms=phase.context_expansion_ms,
                 )
                 if trace_store is not None and trace_id is not None:
                     trace_store.add(
@@ -618,10 +656,12 @@ class RagPipeline:
             # streamed content with `done.answer`, so it snaps to the cited version.
             # finalize_citations is the same helper generate_grounded_answer (sync path)
             # uses, so the retry-trigger condition can't drift between response modes.
-            answer, cited, citation_retry_used = finalize_citations(
-                question, selected, answer, all_sources, self._generator, effective_settings,
-                truncated_history or None,
+            outcome = finalize_citations(
+                messages, answer, all_sources, self._generator, effective_settings
             )
+            answer = outcome.answer
+            cited = outcome.cited
+            citation_retry_used = outcome.retry_used
 
             total_ms = (time.monotonic() - total_start) * 1000
             timings = StageTimings(
@@ -631,7 +671,8 @@ class RagPipeline:
                 generate_ms=generate_ms,
                 total_ms=total_ms,
                 condense_ms=condense_ms,
-                expand_ms=phase.expand_ms,
+                query_expansion_ms=phase.query_expansion_ms,
+                context_expansion_ms=phase.context_expansion_ms,
             )
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
@@ -650,7 +691,11 @@ class RagPipeline:
                             min_score=float(effective_settings.rerank_min_score),
                             diversity_dropped_ids=phase.diversity_dropped_ids,
                         ),
-                        prompt_messages=list(messages),
+                        # outcome.prompt_messages, not the `messages` that were streamed:
+                        # when the citation retry fired, the streamed answer was replaced
+                        # by the retry's, and the retry's continuation is what produced
+                        # the text stored just below.
+                        prompt_messages=list(outcome.prompt_messages),
                         answer=answer,
                         cited_source_numbers=[source.source_number for source in cited],
                         timings=_timings_dict(timings),

@@ -137,6 +137,41 @@
   white-space: nowrap;
 }
 
+/* Narrow viewports: the control row is nowrap, so the hint was pushing Send past the
+   right edge and getting half-clipped itself. It documents keyboard shortcuts, which
+   is the least useful line on a touch device — drop it rather than clip Send. */
+/* Container-sized for the same reason as the header: the composer lives in the chat
+   column, which the inspector narrows by ~380px without changing the viewport. */
+@container chat (max-width: 660px) {
+  .composer__key-hint {
+    display: none;
+  }
+
+  .composer {
+    padding: 12px 14px 16px;
+  }
+
+  /* The scope and provider chips carry variable-length labels ("ALL 12 DOCUMENTS",
+     "LLAMA3.1:8B") and don't shrink by default, so on a phone they pushed Send off the
+     right edge. Let them give way and ellipsize; Send never shrinks — it is the only
+     control here that must always be tappable. */
+  .composer__popover-anchor {
+    flex-shrink: 1;
+    min-width: 0;
+  }
+
+  .composer__chip {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .composer__send {
+    flex-shrink: 0;
+  }
+}
+
 .composer__send {
   border: none;
   background: var(--accent);
