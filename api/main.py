@@ -99,6 +99,48 @@ TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
 
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
+# The largest reranker_batch_size with a measured peak (2.66 GB over 50 candidates of
+# ~448 tokens) equal to the loaded-model baseline — i.e. the point past which scoring
+# starts costing memory on top of just having the model resident. See the field's
+# docstring in api/settings.py for the full 8 / 16 / 50 -> 2.66 / 3.53 / 6.33 GB ladder.
+MEASURED_SAFE_RERANKER_BATCH_SIZE = 8
+
+
+def warn_on_risky_reranker_config(settings: AppSettings) -> None:
+    """Log a startup warning for reranker batch settings that have OOM-killed before.
+
+    Warnings, not validation errors, and deliberately so: peak reranker memory is
+    absolute (see MEASURED_SAFE_RERANKER_BATCH_SIZE), but how much memory is *available*
+    is deployment-specific — a 64 GB host is entitled to batch 50, and refusing to boot
+    there would be wrong. What an operator actually lacks is the signal, since the config
+    looks reasonable field-by-field and the failure only shows up as exit 137 partway
+    through the first whole-corpus question.
+    """
+
+    batch_size = int(settings.reranker_batch_size)
+    candidates = int(settings.rerank_candidates)
+
+    if batch_size > MEASURED_SAFE_RERANKER_BATCH_SIZE:
+        logger.warning(
+            "RERANKER_BATCH_SIZE=%d exceeds the measured-safe %d. Peak reranker memory "
+            "scales with this value alone (measured over 50 candidates of ~448 tokens: "
+            "8 -> 2.66 GB, 16 -> 3.53 GB, 50 -> 6.33 GB) and 6.33 GB OOM-kills a default "
+            "~6 GB Docker Desktop. Latency is flat across the range, so this buys no "
+            "speed — confirm the container has the headroom.",
+            batch_size,
+            MEASURED_SAFE_RERANKER_BATCH_SIZE,
+        )
+
+    if batch_size > candidates:
+        logger.warning(
+            "RERANKER_BATCH_SIZE=%d exceeds RERANK_CANDIDATES=%d, so batching is a no-op "
+            "— every pair goes through the cross-encoder in one forward pass. Lower the "
+            "batch size to at most %d.",
+            batch_size,
+            candidates,
+            candidates,
+        )
+
 
 class WarmupEmbeddingProvider(Protocol):
     """Minimal embedding surface the warmup step needs."""
@@ -162,11 +204,19 @@ def create_app() -> FastAPI:
     )
     settings = get_app_settings()
     configure_logging(settings.log_level)
+    warn_on_risky_reranker_config(settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Content-Type"],
+        # X-API-Key is not a CORS-simple header, so a cross-origin request carrying it
+        # is preflighted — omitting it here made the middleware answer that preflight
+        # with "Disallowed CORS headers" and every authenticated request failed before
+        # it reached a route. Configuring API_KEY and CORS_ALLOW_ORIGINS together (the
+        # separately-hosted-frontend fallback documented in .env.example) was therefore
+        # impossible. The single-origin Docker path never preflights, which is why this
+        # went unnoticed.
+        allow_headers=["Content-Type", "X-API-Key"],
     )
     register_exception_handlers(app)
     register_routes(app)
@@ -242,7 +292,8 @@ def _timings_response(timings: StageTimings | None) -> TimingsResponse | None:
         generate_ms=timings.generate_ms,
         total_ms=timings.total_ms,
         condense_ms=timings.condense_ms,
-        expand_ms=timings.expand_ms,
+        query_expansion_ms=timings.query_expansion_ms,
+        context_expansion_ms=timings.context_expansion_ms,
     )
 
 
@@ -352,7 +403,8 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "generate_ms": timings.generate_ms,
         "total_ms": timings.total_ms,
         "condense_ms": timings.condense_ms,
-        "expand_ms": timings.expand_ms,
+        "query_expansion_ms": timings.query_expansion_ms,
+        "context_expansion_ms": timings.context_expansion_ms,
     }
 
 

@@ -8,6 +8,7 @@ import pytest
 
 from api.generation import (
     CITATION_EXCERPT_MAX_CHARS,
+    CITATION_RETRY_REMINDER,
     ChatMessage,
     GenerationConfigError,
     GenerationError,
@@ -18,6 +19,7 @@ from api.generation import (
     condense_question,
     effective_max_tokens,
     extract_completion_text,
+    finalize_citations,
     generate_grounded_answer,
     generate_query_variants,
     needs_citation_retry,
@@ -613,20 +615,77 @@ def test_needs_citation_retry_logic() -> None:
     assert needs_citation_retry("The documents do not contain enough information.", 2) is False
 
 
-def test_retry_uncited_answer_returns_cited_retry() -> None:
+def test_retry_uncited_answer_returns_cited_retry_and_the_messages_it_sent() -> None:
     generator = ScriptedGenerator(["Now with citation [1]."])
-    result = retry_uncited_answer(
-        "q", [make_chunk("c1", "context text")], "no citation here", generator, make_settings()
-    )
-    assert result == "Now with citation [1]."
+    prompt = build_grounded_messages("q", [make_chunk("c1", "context text")])
+
+    result = retry_uncited_answer(prompt, "no citation here", generator, make_settings())
+
+    assert result is not None
+    answer, sent = result
+    assert answer == "Now with citation [1]."
+    # The retry continues the original conversation rather than restating it: the
+    # grounded prompt, then the uncited answer, then the reminder.
+    assert sent[: len(prompt)] == prompt
+    assert sent[-2] == {"role": "assistant", "content": "no citation here"}
+    assert sent[-1] == {"role": "user", "content": CITATION_RETRY_REMINDER}
+    assert sent == generator.calls[-1]
 
 
 def test_retry_uncited_answer_returns_none_when_still_uncited() -> None:
     generator = ScriptedGenerator(["still no citation"])
-    result = retry_uncited_answer(
-        "q", [make_chunk("c1", "context text")], "no citation", generator, make_settings()
+    prompt = build_grounded_messages("q", [make_chunk("c1", "context text")])
+
+    assert retry_uncited_answer(prompt, "no citation", generator, make_settings()) is None
+
+
+def test_finalize_citations_reports_the_retry_prompt_as_what_produced_the_answer() -> None:
+    """The outcome's prompt must be the retry continuation, not the first prompt.
+
+    This is what the debug trace records. Reporting the original prompt alongside a
+    retried answer would show a prompt the model was never asked.
+    """
+
+    generator = ScriptedGenerator(["Cited now [1]."])
+    chunks = [make_chunk("c1", "context text")]
+    prompt = build_grounded_messages("q", chunks)
+
+    outcome = finalize_citations(
+        prompt, "no citation", source_citations(chunks), generator, make_settings()
     )
-    assert result is None
+
+    assert outcome.retry_used is True
+    assert outcome.answer == "Cited now [1]."
+    assert outcome.prompt_messages[-1] == {"role": "user", "content": CITATION_RETRY_REMINDER}
+
+
+def test_finalize_citations_reports_the_original_prompt_when_no_retry_happens() -> None:
+    generator = ScriptedGenerator(["unused"])
+    chunks = [make_chunk("c1", "context text")]
+    prompt = build_grounded_messages("q", chunks)
+
+    outcome = finalize_citations(
+        prompt, "Already cited [1].", source_citations(chunks), generator, make_settings()
+    )
+
+    assert outcome.retry_used is False
+    assert outcome.prompt_messages == prompt
+
+
+def test_generate_grounded_answer_carries_the_retry_prompt_out() -> None:
+    generator = ScriptedGenerator(["The setup is simple.", "The setup is simple [1]."])
+
+    result = generate_grounded_answer(
+        "How do I set up?",
+        [make_chunk("c1", "Run docker compose up.")],
+        generator,
+        make_settings(citation_retry_enabled=True),
+    )
+
+    assert result.citation_retry_used is True
+    assert result.prompt_messages[-1] == {"role": "user", "content": CITATION_RETRY_REMINDER}
+    # And it is the message list the generator was actually called with, not a rebuild.
+    assert result.prompt_messages == generator.calls[-1]
 
 
 def test_generate_grounded_answer_retries_uncited_answer() -> None:

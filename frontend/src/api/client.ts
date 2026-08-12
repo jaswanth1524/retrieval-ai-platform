@@ -192,20 +192,29 @@ async function readSseStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let separatorIndex = buffer.indexOf('\n\n');
-    while (separatorIndex !== -1) {
-      const rawEvent = buffer.slice(0, separatorIndex);
-      buffer = buffer.slice(separatorIndex + 2);
-      const dataLine = rawEvent.split('\n').find((line) => line.startsWith('data: '));
-      if (dataLine) {
-        onEvent(JSON.parse(dataLine.slice('data: '.length)) as QuestionStreamEvent);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let separatorIndex = buffer.indexOf('\n\n');
+      while (separatorIndex !== -1) {
+        const rawEvent = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        const dataLine = rawEvent.split('\n').find((line) => line.startsWith('data: '));
+        if (dataLine) {
+          onEvent(JSON.parse(dataLine.slice('data: '.length)) as QuestionStreamEvent);
+        }
+        separatorIndex = buffer.indexOf('\n\n');
       }
-      separatorIndex = buffer.indexOf('\n\n');
     }
+  } finally {
+    // Leaving early — a backend `error` event, a malformed frame, an abort — used to
+    // leave the body locked to this reader until GC. cancel() releases the lock and
+    // tells the browser to stop pulling bytes we will never read.
+    await reader.cancel().catch(() => {
+      // Already errored or closed; nothing left to release.
+    });
   }
 }
 
@@ -273,15 +282,18 @@ export const api = {
         return status;
       }
       await new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(resolve, JOB_POLL_INTERVAL_MS);
-        signal?.addEventListener(
-          'abort',
-          () => {
-            clearTimeout(timeoutId);
-            reject(new ApiClientError('Upload cancelled.'));
-          },
-          { once: true },
-        );
+        // `{ once: true }` only removes the listener if it FIRES. When the timeout wins
+        // — which is every tick of a normal ingest — the listener stays attached, so a
+        // long upload accumulated one dead listener per second on the caller's signal.
+        const onAbort = () => {
+          clearTimeout(timeoutId);
+          reject(new ApiClientError('Upload cancelled.'));
+        };
+        const timeoutId = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve(undefined);
+        }, JOB_POLL_INTERVAL_MS);
+        signal?.addEventListener('abort', onAbort, { once: true });
       });
     }
   },
@@ -345,13 +357,26 @@ export const api = {
         throw new ApiClientError(await extractErrorDetail(response), response.status);
       }
 
-      await readSseStream(response, (event) => {
-        if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
-        else if (event.type === 'delta') handlers.onDelta?.(event.text);
-        else if (event.type === 'done')
-          handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);
-        else if (event.type === 'error') throw new ApiClientError(event.detail);
-      });
+      // Body reading needs the same error translation the fetch above already has.
+      // Once headers arrive, an abort surfaces as a raw DOMException out of
+      // reader.read() — outside the try/catch above — so it used to escape unwrapped
+      // and every caller saw an unrecognised error instead of a cancellation.
+      try {
+        await readSseStream(response, (event) => {
+          if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
+          else if (event.type === 'delta') handlers.onDelta?.(event.text);
+          else if (event.type === 'done')
+            handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);
+          else if (event.type === 'error') throw new ApiClientError(event.detail);
+        });
+      } catch (err) {
+        // A backend `error` event already threw the right thing — don't re-wrap it.
+        if (err instanceof ApiClientError) throw err;
+        if (timeoutController.signal.aborted) {
+          throw new ApiClientError('Request timed out or was cancelled.');
+        }
+        throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+      }
     } finally {
       clearTimeout(timeoutId);
       signal?.removeEventListener('abort', abortFromCaller);

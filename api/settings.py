@@ -47,14 +47,24 @@ class AppSettings(BaseSettings):
     rerank_top_k: PositiveInt = 8
     # Caps how many query-document pairs the cross-encoder scores per forward pass, which
     # is what bounds its peak memory: attention cost grows with batch x sequence^2, and at
-    # CHUNK_SIZE_TOKENS=448 the sequences are long. This MUST stay <= rerank_candidates or
-    # batching silently becomes a no-op — the previous default of 64 exceeded the 50
-    # candidates, so every pair went through in one pass and the container OOM-killed
-    # (exit 137) on the first whole-corpus question. Measured over 50 candidates x ~448
-    # tokens: batch 50 peaked at 6.33 GB, batch 16 at 3.53 GB, batch 8 at 2.66 GB — which
-    # is exactly the loaded-model baseline, i.e. scoring adds nothing on top. Latency was
-    # flat across all of them (~45-49s), so this trades no speed and no answer quality;
-    # it only changes how the same work is chunked. Raise it only with memory headroom.
+    # CHUNK_SIZE_TOKENS=448 the sequences are long.
+    #
+    # Peak memory is a function of THIS VALUE ALONE, not of its ratio to anything else.
+    # Measured over 50 candidates x ~448 tokens: batch 8 peaked at 2.66 GB (exactly the
+    # loaded-model baseline — scoring adds nothing on top), batch 16 at 3.53 GB, batch 50
+    # at 6.33 GB, which OOM-killed (exit 137) the container on a default ~6 GB Docker
+    # Desktop the first time anyone asked a whole-corpus question. Latency was flat across
+    # the whole range (~45-49s), so a larger batch buys no speed and no answer quality —
+    # it only changes how the same work is chunked, and what it peaks at while doing so.
+    # Raise it only against known memory headroom; api/main.py logs a warning at startup
+    # past the measured-safe point.
+    #
+    # Keeping it <= rerank_candidates is a SEPARATE and weaker rule: above that, batching
+    # is simply a no-op because there aren't enough pairs to fill a batch. That relation
+    # is not the memory guard, and satisfying it is not sufficient — batch 50 against 50
+    # candidates satisfies it and still peaks at 6.33 GB. The historical incident (a
+    # default of 64 against 50 candidates) happened to violate both rules at once, which
+    # is what made the relation look like the cause.
     reranker_batch_size: PositiveInt = 8
     max_context_chunks: PositiveInt = 6
     # Cross-encoder logits are unbounded and model-specific; sigmoid-normalizing to

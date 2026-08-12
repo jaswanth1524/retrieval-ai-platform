@@ -283,6 +283,69 @@ describe('askQuestionStream', () => {
     );
   });
 
+  it('reports a mid-stream abort as ApiClientError, not a raw DOMException', async () => {
+    // The response headers arrive, deltas flow, and only then does the caller abort —
+    // so the rejection comes out of reader.read(), not out of fetch(). That path used
+    // to escape unwrapped, and every caller saw an unrecognised error rather than a
+    // cancellation.
+    const encoder = new TextEncoder();
+    const controller = new AbortController();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        streamController = c;
+        c.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: 'delta', text: 'partial' })}\n\n`),
+        );
+      },
+    });
+    controller.signal.addEventListener('abort', () => {
+      streamController.error(new DOMException('The operation was aborted.', 'AbortError'));
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+      ),
+    );
+
+    const onDelta = vi.fn(() => {
+      controller.abort();
+    });
+
+    await expect(
+      api.askQuestionStream(
+        'hi',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { onDelta },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({
+      name: 'ApiClientError',
+      message: 'Request timed out or was cancelled.',
+    });
+    expect(onDelta).toHaveBeenCalledWith('partial');
+  });
+
+  it('does not re-wrap the ApiClientError a backend error event raises', async () => {
+    const frames = [
+      `data: ${JSON.stringify({ type: 'error', detail: 'Reranker model failed: boom' })}\n\n`,
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(frames)));
+
+    await expect(
+      api.askQuestionStream('hi', undefined, undefined, undefined, undefined, {}),
+    ).rejects.toMatchObject({
+      name: 'ApiClientError',
+      message: 'Reranker model failed: boom',
+    });
+  });
+
   it('throws ApiClientError on a non-2xx response before reading the stream', async () => {
     vi.stubGlobal(
       'fetch',

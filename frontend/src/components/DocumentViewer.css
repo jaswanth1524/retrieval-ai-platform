@@ -20,8 +20,8 @@
   max-height: 85vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  background: var(--card);
+  border: 1px solid var(--rule);
   border-radius: 0.6rem;
   overflow: hidden;
 }
@@ -31,18 +31,18 @@
   align-items: center;
   justify-content: space-between;
   padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--rule);
 }
 
 .document-viewer__filename {
   font-weight: 600;
-  color: var(--text);
+  color: var(--ink);
 }
 
 .document-viewer__close {
   border: none;
   background: none;
-  color: var(--text-muted);
+  color: var(--muted);
   font-size: 1.25rem;
   cursor: pointer;
   line-height: 1;
@@ -58,9 +58,9 @@
 
 .document-viewer__chunk {
   padding: 0.6rem 0.75rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--rule);
   border-radius: 0.4rem;
-  background: var(--bg-card);
+  background: var(--card);
 }
 
 .document-viewer__chunk--target {
@@ -70,23 +70,23 @@
 
 .document-viewer__chunk-meta {
   font-size: 0.72rem;
-  color: var(--text-muted);
+  color: var(--muted);
   margin-bottom: 0.35rem;
 }
 
 .document-viewer__chunk-text {
   margin: 0;
   white-space: pre-wrap;
-  color: var(--text);
+  color: var(--ink);
   font-size: 0.9rem;
   line-height: 1.5;
 }
 
 .document-viewer__loading,
 .document-viewer__error {
-  color: var(--text-muted);
+  color: var(--muted);
 }
 
 .document-viewer__error {
-  color: var(--error);
+  color: var(--bad);
 }

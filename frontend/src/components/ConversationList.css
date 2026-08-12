@@ -146,14 +146,14 @@
 }
 
 .conversation-list__confirm-text {
-  color: var(--text-muted);
+  color: var(--muted);
 }
 
 .conversation-list__confirm-yes,
 .conversation-list__confirm-no {
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  color: var(--text);
+  border: 1px solid var(--rule);
+  background: var(--card);
+  color: var(--ink);
   border-radius: 0.35rem;
   font-size: 0.7rem;
   padding: 0.1rem 0.45rem;
@@ -161,8 +161,8 @@
 }
 
 .conversation-list__confirm-yes {
-  border-color: var(--error);
-  color: var(--error);
+  border-color: var(--bad);
+  color: var(--bad);
 }
 
 .conversation-list__confirm-yes:disabled,

@@ -73,6 +73,12 @@ class LocalEmbeddingProvider:
             model_name=settings.sparse_embedding_model,
             lazy_load=True,
         )
+        # One long-lived pair of workers instead of a fresh pool per call. Every query
+        # embeds, so spawning and joining two OS threads was pure per-request overhead
+        # on the hot path. The provider is a process-wide singleton (see
+        # dependencies.get_embedding_provider), so the pool lives as long as the app;
+        # daemon threads let the process exit without an explicit shutdown.
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-embed")
 
     def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
         """Embed texts with local dense and sparse models.
@@ -89,13 +95,10 @@ class LocalEmbeddingProvider:
         # download/load happens on this first call, not at __init__ — this is the
         # boundary that must translate a load failure into EmbeddingError.
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                dense_future = executor.submit(lambda: list(self.dense_model.embed(texts)))
-                sparse_future = executor.submit(lambda: list(self.sparse_model.embed(texts)))
-                dense_vectors = [coerce_dense_vector(vector) for vector in dense_future.result()]
-                sparse_vectors = [
-                    coerce_sparse_vector(vector) for vector in sparse_future.result()
-                ]
+            dense_future = self._executor.submit(lambda: list(self.dense_model.embed(texts)))
+            sparse_future = self._executor.submit(lambda: list(self.sparse_model.embed(texts)))
+            dense_vectors = [coerce_dense_vector(vector) for vector in dense_future.result()]
+            sparse_vectors = [coerce_sparse_vector(vector) for vector in sparse_future.result()]
         except EmbeddingError:
             raise
         except Exception as exc:
@@ -131,11 +134,12 @@ class LocalEmbeddingProvider:
         instruction = self.settings.dense_query_instruction
         dense_text = f"{instruction}{text}" if instruction else text
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                dense_future = executor.submit(lambda: list(self.dense_model.embed([dense_text])))
-                sparse_future = executor.submit(lambda: list(self.sparse_model.query_embed([text])))
-                dense_vectors = [coerce_dense_vector(v) for v in dense_future.result()]
-                sparse_vectors = [coerce_sparse_vector(v) for v in sparse_future.result()]
+            dense_future = self._executor.submit(lambda: list(self.dense_model.embed([dense_text])))
+            sparse_future = self._executor.submit(
+                lambda: list(self.sparse_model.query_embed([text]))
+            )
+            dense_vectors = [coerce_dense_vector(v) for v in dense_future.result()]
+            sparse_vectors = [coerce_sparse_vector(v) for v in sparse_future.result()]
         except EmbeddingError:
             raise
         except Exception as exc:

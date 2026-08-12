@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, not just those targeting main. Restricting the base to main
+  # meant a stacked PR (feature branch -> an unmerged fix branch) ran no CI at all,
+  # which is exactly when review needs it most.
   pull_request:
-    branches: [main]
 
 jobs:
   backend:

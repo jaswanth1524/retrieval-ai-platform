@@ -40,6 +40,8 @@ function Composer({
   const [value, setValue] = useState('');
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const scopeButtonRef = useRef<HTMLButtonElement>(null);
+  const providerButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!openPopover) return;
@@ -49,7 +51,12 @@ function Composer({
       }
     };
     const handleKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === 'Escape') setOpenPopover(null);
+      if (event.key !== 'Escape') return;
+      // Return focus to the control that opened it. Escaping a popover otherwise drops
+      // focus to the document body, stranding a keyboard user at the top of the page.
+      const opener = openPopover === 'scope' ? scopeButtonRef : providerButtonRef;
+      setOpenPopover(null);
+      opener.current?.focus();
     };
     document.addEventListener('mousedown', handleClick);
     document.addEventListener('keydown', handleKey);
@@ -111,12 +118,22 @@ function Composer({
               className="composer__chip"
               onClick={() => setOpenPopover((prev) => (prev === 'scope' ? null : 'scope'))}
               disabled={indexedFilenames.length === 0}
+              aria-haspopup="true"
+              aria-expanded={openPopover === 'scope'}
+              aria-controls="composer-scope-popover"
+              ref={scopeButtonRef}
               data-testid="composer-scope-button"
             >
               <span aria-hidden="true">◎</span> {scopeLabel}
             </button>
             {openPopover === 'scope' && (
-              <div className="composer__popover" data-testid="composer-scope-popover">
+              <div
+                className="composer__popover"
+                id="composer-scope-popover"
+                role="group"
+                aria-label="Search scope"
+                data-testid="composer-scope-popover"
+              >
                 <label className="composer__popover-item">
                   <input
                     type="checkbox"
@@ -145,12 +162,22 @@ function Composer({
               className="composer__chip"
               onClick={() => setOpenPopover((prev) => (prev === 'provider' ? null : 'provider'))}
               disabled={!config}
+              aria-haspopup="true"
+              aria-expanded={openPopover === 'provider'}
+              aria-controls="composer-provider-popover"
+              ref={providerButtonRef}
               data-testid="composer-provider-button"
             >
               <span aria-hidden="true">⚙</span> {providerLabel}
             </button>
             {openPopover === 'provider' && config && (
-              <div className="composer__popover" data-testid="composer-provider-popover">
+              <div
+                className="composer__popover"
+                id="composer-provider-popover"
+                role="radiogroup"
+                aria-label="Generation provider"
+                data-testid="composer-provider-popover"
+              >
                 <label className="composer__popover-item">
                   <input
                     type="radio"

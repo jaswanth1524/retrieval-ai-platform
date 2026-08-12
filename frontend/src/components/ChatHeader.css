@@ -146,8 +146,32 @@
   white-space: nowrap;
 }
 
-@media (max-width: 1240px) {
+/* Sized against the chat column (see .app-main's container in global.css), not the
+   viewport. The row is a fixed-height flex line of nowrap controls, so once they stop
+   fitting the trailing ones clip off the right edge — no wrap, no scroll, no way to
+   reach them. Each step sheds the lowest-value element left rather than shrinking
+   everything below a comfortable target, so the title keeps its room the longest. */
+@container chat (max-width: 860px) {
   .chat-header__palette-label {
+    display: none;
+  }
+}
+
+@container chat (max-width: 660px) {
+  /* The scope is also on the composer's own chip, so here it is a duplicate. */
+  .chat-header__scope {
+    display: none;
+  }
+
+  .chat-header {
+    gap: 6px;
+    padding: 0 12px;
+  }
+}
+
+@container chat (max-width: 420px) {
+  /* ⌘K is unreachable without a keyboard anyway, and the palette has a rail entry. */
+  .chat-header__palette {
     display: none;
   }
 }

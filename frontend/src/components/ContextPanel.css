@@ -84,6 +84,10 @@
   background: var(--warn);
 }
 
+.context-panel__status-dot--unauthorized {
+  background: var(--warn);
+}
+
 .context-panel__spacer {
   flex: 1;
 }

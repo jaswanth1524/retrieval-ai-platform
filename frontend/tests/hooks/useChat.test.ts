@@ -234,10 +234,13 @@ describe('useChat', () => {
     expect(signal?.aborted).toBe(true);
   });
 
-  it('cancel() aborts the in-flight request and clears pending via the existing error path', async () => {
+  it('cancel() clears pending and keeps the partial answer without an error turn', async () => {
+    // A user pressing Stop deliberately ended their own request. Appending an error turn
+    // under the partial answer would report a failure they caused on purpose.
     askQuestionStreamMock.mockImplementation(
-      (_question, _provider, _overrides, _filenames, _history, _handlers, signal) =>
+      (_question, _provider, _overrides, _filenames, _history, handlers, signal) =>
         new Promise((_resolve, reject) => {
+          handlers.onDelta?.('partial answer so far');
           signal?.addEventListener('abort', () =>
             reject(new ApiClientError('Request timed out or was cancelled.')),
           );
@@ -258,6 +261,55 @@ describe('useChat', () => {
     });
 
     expect(result.current.pending).toBe(false);
+    expect(result.current.turns).toHaveLength(2);
+    expect(result.current.turns[1]).toMatchObject({
+      role: 'assistant',
+      content: 'partial answer so far',
+    });
+    expect(result.current.turns.some((turn) => turn.role === 'error')).toBe(false);
+  });
+
+  it('cancel() before any delta leaves no empty assistant bubble behind', async () => {
+    askQuestionStreamMock.mockImplementation(
+      (_question, _provider, _overrides, _filenames, _history, handlers, signal) =>
+        new Promise((_resolve, reject) => {
+          // `sources` arrives first and creates the assistant turn, but no text follows.
+          handlers.onSources?.([], 'trace-1');
+          signal?.addEventListener('abort', () =>
+            reject(new ApiClientError('Request timed out or was cancelled.')),
+          );
+        }),
+    );
+
+    const { result } = renderHook(() => useChat());
+
+    let askPromise!: Promise<void>;
+    act(() => {
+      askPromise = result.current.ask('alpha');
+    });
+
+    await act(async () => {
+      result.current.cancel();
+      await askPromise;
+    });
+
+    expect(result.current.turns).toHaveLength(1);
+    expect(result.current.turns[0]).toMatchObject({ role: 'user', content: 'alpha' });
+  });
+
+  it('a timeout, unlike a user cancel, still produces an error turn', async () => {
+    // A timeout aborts askQuestionStream's own private controller, never the one useChat
+    // holds — so it must stay on the error path the cancel case above now skips.
+    askQuestionStreamMock.mockRejectedValue(
+      new ApiClientError('Request timed out or was cancelled.'),
+    );
+
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('alpha');
+    });
+
     expect(result.current.turns[1]).toMatchObject({
       role: 'error',
       content: 'Request timed out or was cancelled.',

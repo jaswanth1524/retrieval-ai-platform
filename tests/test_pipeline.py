@@ -7,7 +7,7 @@ import pytest
 from qdrant_client import QdrantClient, models
 
 from api.embeddings import EmbeddedText
-from api.generation import ChatMessage, GenerationError
+from api.generation import CITATION_RETRY_REMINDER, ChatMessage, GenerationError
 from api.pipeline import AnswerOverrides, IngestService, RagPipeline, expand_with_neighbors
 from api.repository import VectorRepository
 from api.reranking import rerank_candidates
@@ -501,6 +501,55 @@ def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
     expanded_middle = next(chunk for chunk in expanded if chunk.chunk_ordinal == 2)
 
     assert middle.expanded_text is None
+    assert expanded_middle.expanded_text is not None
+    assert "One two three" in expanded_middle.expanded_text
+    assert "Seven eight nine" in expanded_middle.expanded_text
+
+
+def test_expand_with_neighbors_fetches_once_per_filename_not_once_per_chunk() -> None:
+    """Neighbour lookup is batched per document.
+
+    A per-chunk round trip meant up to rerank_top_k sequential Qdrant scrolls on every
+    question, for data one query per file returns. This pins the call count so the N+1
+    cannot come back, and re-asserts the merged text so batching didn't change output.
+    """
+
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=8, chunk_overlap_tokens=0)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    embeddings = [make_embedding(1.0) for _ in range(3)]
+    IngestService(
+        repository,
+        StaticEmbeddingProvider(embeddings),
+        settings,
+        token_counter=WordTokenCounter(),
+    ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
+
+    candidates = retrieve_candidates(
+        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
+    )
+    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    assert len(reranked) >= 3, "need several chunks from one file for this to mean anything"
+
+    calls: list[tuple[str, list[int]]] = []
+    real_fetch = repository.fetch_neighbors
+
+    def counting_fetch(
+        settings_arg: AppSettings, filename: str, ordinals: Sequence[int]
+    ) -> Any:
+        calls.append((filename, list(ordinals)))
+        return real_fetch(settings_arg, filename, ordinals)
+
+    repository.fetch_neighbors = counting_fetch  # type: ignore[method-assign]
+    expanded = expand_with_neighbors(reranked, repository, settings)
+
+    # One call, because every chunk came from the same document.
+    assert len(calls) == 1, calls
+    assert calls[0][0] == "guide.md"
+    # And it asked for the union of the neighbours, deduplicated and sorted.
+    assert calls[0][1] == sorted(set(calls[0][1]))
+
+    expanded_middle = next(chunk for chunk in expanded if chunk.chunk_ordinal == 2)
     assert expanded_middle.expanded_text is not None
     assert "One two three" in expanded_middle.expanded_text
     assert "Seven eight nine" in expanded_middle.expanded_text
@@ -1025,3 +1074,77 @@ def test_streaming_citation_retry_swaps_corrected_answer_into_done() -> None:
     assert done["answer"] == "Alpha is documented [1]."
     assert [source["source_number"] for source in done["sources"]] == [1]
     assert trace_store.traces[0].citation_retry_used is True
+
+
+def _retrying_pipeline(
+    trace_store: ListTraceStore, generator: SequencedGenerator
+) -> RagPipeline:
+    settings = make_settings(citation_retry_enabled=True)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    return RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+
+def test_streaming_trace_records_the_retry_prompt_not_the_first_one() -> None:
+    """When the citation retry fires, the trace must show the prompt that produced the
+    stored answer — the retry's continuation, not the prompt that was streamed.
+
+    A debug trace showing a prompt the model was never asked is worse than no trace at
+    all in a product whose purpose includes debugging retrieval.
+    """
+
+    trace_store = ListTraceStore()
+    generator = SequencedGenerator(["alpha is documented plainly", "Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(trace_store, generator)
+
+    list(pipeline.answer_stream("alpha"))
+
+    trace = trace_store.traces[0]
+    assert trace.citation_retry_used is True
+    assert trace.answer == "Alpha is documented [1]."
+    assert trace.prompt_messages[-1] == {"role": "user", "content": CITATION_RETRY_REMINDER}
+    assert trace.prompt_messages[-2] == {
+        "role": "assistant",
+        "content": "alpha is documented plainly",
+    }
+    # It is the message list the generator was really called with for that answer.
+    assert trace.prompt_messages == generator.calls[-1][0]
+
+
+def test_sync_trace_records_the_retry_prompt_not_a_rebuild() -> None:
+    trace_store = ListTraceStore()
+    generator = SequencedGenerator(["alpha is documented plainly", "Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(trace_store, generator)
+
+    grounded = pipeline.answer("alpha")
+
+    trace = trace_store.traces[0]
+    assert grounded.citation_retry_used is True
+    assert trace.prompt_messages[-1] == {"role": "user", "content": CITATION_RETRY_REMINDER}
+    assert trace.prompt_messages == generator.calls[-1][0]
+
+
+def test_sync_trace_records_the_plain_prompt_when_no_retry_happens() -> None:
+    """The no-retry path still records the exact messages generation used."""
+
+    trace_store = ListTraceStore()
+    generator = SequencedGenerator(["Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(trace_store, generator)
+
+    pipeline.answer("alpha")
+
+    trace = trace_store.traces[0]
+    assert trace.citation_retry_used is False
+    assert trace.prompt_messages == generator.calls[-1][0]
+    assert trace.prompt_messages[-1]["role"] == "user"
+    assert CITATION_RETRY_REMINDER not in trace.prompt_messages[-1]["content"]

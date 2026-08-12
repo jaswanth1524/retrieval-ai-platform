@@ -2,7 +2,10 @@ export interface HealthResponse {
   status: string;
 }
 
-export type ApiStatus = 'checking' | 'ok' | 'error';
+// 'unauthorized' is distinct from 'error' on purpose: the server is reachable and
+// answering, it just rejected us for want of an API key. Collapsing the two would put
+// the app behind an "unreachable" wall that hides the very settings needed to fix it.
+export type ApiStatus = 'checking' | 'ok' | 'error' | 'unauthorized';
 
 export interface PublicConfigResponse {
   qdrant_collection: string;
@@ -95,11 +98,16 @@ export interface CitationResponse {
 export interface TimingsResponse {
   embed_ms: number;
   search_ms: number;
+  // Cross-encoder scoring plus the diversity filter. Neighbour expansion is timed
+  // separately as context_expansion_ms rather than hidden in here.
   rerank_ms: number;
   generate_ms: number;
   total_ms: number;
   condense_ms: number;
-  expand_ms?: number;
+  // Query-variant generation, which runs BEFORE embedding — not context expansion.
+  query_expansion_ms?: number;
+  // Neighbour/context expansion after rerank (small-to-big retrieval).
+  context_expansion_ms?: number;
 }
 
 export interface HistoryMessage {

@@ -64,27 +64,11 @@
   --w-panel: 264px;
   --w-inspector: 380px;
   --content-rail: 720px;
-
-  /* --- Temporary aliases: map the pre-redesign token names onto the v2 palette so
-     components not yet migrated to --paper/--card/--ink/--rule keep rendering
-     correctly. Each redesign stage removes the aliases it stops depending on; the
-     final stage deletes this block entirely — if it survives, a component was missed. */
-  --bg: var(--paper);
-  --bg-sidebar: var(--rail-2);
-  --bg-elevated: var(--card);
-  --bg-card: var(--card);
-  --border: var(--rule);
-  --text: var(--ink);
-  --text-muted: var(--muted);
-  --text-dim: var(--dim);
-  --text-placeholder: var(--dim);
-  --accent-contrast: var(--accent-ink);
-  --success: var(--good);
-  --error: var(--bad);
-  --error-bg: var(--accent-soft);
-  --error-border: var(--rule-hi);
-  --error-body: var(--muted);
-  --font-heading: var(--fb);
-  --font-sans: var(--fb);
-  --font-mono: var(--fm);
 }
+
+/* The pre-redesign alias block (--bg/--text/--border/... mapped onto the v2 palette)
+   is gone: every component now names v2 tokens directly. Eight of its entries were
+   already dead, and the four remaining consumers — ConfigPanel, ConversationList,
+   DocumentViewer, TraceDrawer — were migrated together. DocumentViewer in particular
+   was owned by no redesign stage, so deleting the block on schedule would have left it
+   referencing tokens that no longer existed. */

@@ -4,7 +4,6 @@ import remarkGfm from 'remark-gfm';
 import type { CitationResponse, TimingsResponse } from '../api/types';
 import CitationCard from './CitationCard';
 import StreamingSkeleton from './StreamingSkeleton';
-import TraceDrawer from './TraceDrawer';
 import './ChatMessage.css';
 
 export interface ChatTurn {
@@ -49,18 +48,50 @@ function ChatMessage({
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
 
+  /** Copy without the async Clipboard API, which browsers gate behind a secure context.
+   *
+   *  DocRAG is self-hosted, so plain HTTP on a LAN address is a first-class deployment
+   *  — and there `navigator.clipboard` is undefined. Hiding the button there (what used
+   *  to happen) removed the feature from exactly the users the project targets. */
+  const legacyCopy = (text: string): boolean => {
+    const area = document.createElement('textarea');
+    area.value = text;
+    // Keep it out of view and off the tab order, but still selectable.
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.top = '-9999px';
+    document.body.appendChild(area);
+    area.select();
+    try {
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      document.body.removeChild(area);
+    }
+  };
+
+  const settle = (ok: boolean) => {
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } else {
+      setCopyFailed(true);
+      setTimeout(() => setCopyFailed(false), 1500);
+    }
+  };
+
   const handleCopy = () => {
-    if (!navigator.clipboard) return;
-    navigator.clipboard.writeText(turn.content).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      },
-      () => {
-        setCopyFailed(true);
-        setTimeout(() => setCopyFailed(false), 1500);
-      },
-    );
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(turn.content).then(
+        () => settle(true),
+        // Even in a secure context the write can be denied by permissions policy;
+        // fall back rather than reporting failure outright.
+        () => settle(legacyCopy(turn.content)),
+      );
+      return;
+    }
+    settle(legacyCopy(turn.content));
   };
 
   const showSkeleton = streamStage !== undefined && turn.content === '';
@@ -100,7 +131,7 @@ function ChatMessage({
                   turn.timestamp,
                 )}
               </time>
-              {turn.content && navigator.clipboard && (
+              {turn.content && (
                 <button
                   type="button"
                   className="chat-message__copy"
@@ -133,7 +164,6 @@ function ChatMessage({
                 {currentModelLabel && <span>{currentModelLabel}</span>}
               </div>
             )}
-            {turn.traceId && <TraceDrawer traceId={turn.traceId} timings={turn.timings} />}
           </div>
         </div>
       )}

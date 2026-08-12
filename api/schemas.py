@@ -126,6 +126,24 @@ class DocumentContentResponse(BaseModel):
     chunks: list[DocumentChunkResponse]
 
 
+class TimingsResponse(BaseModel):
+    """Per-stage wall-clock latency, in milliseconds, for one answer."""
+
+    embed_ms: float
+    search_ms: float
+    rerank_ms: float
+    generate_ms: float
+    total_ms: float
+    # 0.0 when no history was sent, or when CONVERSATION_CONDENSE_ENABLED is off.
+    condense_ms: float = 0.0
+    # LLM generation of alternative query phrasings, which runs BEFORE embedding. 0.0
+    # when QUERY_EXPANSION_ENABLED is off (the default) or it produced no variants.
+    query_expansion_ms: float = 0.0
+    # Neighbour/context expansion after rerank (small-to-big). 0.0 when
+    # CONTEXT_NEIGHBOR_RADIUS is 0. Previously folded into rerank_ms.
+    context_expansion_ms: float = 0.0
+
+
 class PromptMessageResponse(BaseModel):
     """One message from the exact prompt sent to the generation provider."""
 
@@ -259,20 +277,6 @@ class CitationResponse(BaseModel):
     section: str
     chunk_id: str
     text: str
-
-
-class TimingsResponse(BaseModel):
-    """Per-stage wall-clock latency, in milliseconds, for one answer."""
-
-    embed_ms: float
-    search_ms: float
-    rerank_ms: float
-    generate_ms: float
-    total_ms: float
-    # 0.0 when no history was sent, or when CONVERSATION_CONDENSE_ENABLED is off.
-    condense_ms: float = 0.0
-    # 0.0 when query expansion is disabled (the default) or produced no variants.
-    expand_ms: float = 0.0
 
 
 class QuestionResponse(BaseModel):
