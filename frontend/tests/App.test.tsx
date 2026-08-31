@@ -5,6 +5,12 @@ import App from '../src/App';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // useChat persists chat history to localStorage — without clearing it, a test
+  // whose App mount happens to boot after another test's successful ask-and-answer
+  // rehydrates that turn history into its own fresh render, silently doubling turn
+  // counts for any test that asks a question. Found via the feedback-button test
+  // below, which is the first test sensitive to an exact element count post-answer.
+  localStorage.clear();
 });
 
 function jsonResponse(body: unknown): Response {
@@ -705,6 +711,89 @@ describe('App', () => {
 
     expect(await screen.findByText('Answer.')).toBeInTheDocument();
     expect(await screen.findByText('0.00s')).toBeInTheDocument();
+  });
+
+  it('clicking thumbs-up on an answer POSTs feedback with the full derived payload', async () => {
+    let jobCounter = 0;
+    const jobFilenames = new Map<string, string>();
+    const indexed = new Set<string>();
+    let feedbackRequestBody: unknown = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload({ feedback_enabled: true }));
+        if (url.endsWith('/documents') && init?.method === 'POST') {
+          const form = init.body as FormData;
+          const file = form.get('file') as File;
+          jobCounter += 1;
+          const jobId = `job-${jobCounter}`;
+          jobFilenames.set(jobId, file.name);
+          return jsonResponse({ job_id: jobId, filename: file.name, state: 'queued' });
+        }
+        if (url.includes('/documents/jobs/job-')) {
+          const jobId = url.split('/').pop() as string;
+          const filename = jobFilenames.get(jobId) as string;
+          indexed.add(filename);
+          return jsonResponse({
+            job_id: jobId,
+            filename,
+            state: 'done',
+            chunks_total: 1,
+            chunks_done: 1,
+            error: null,
+            result: { filename, sections_parsed: 1, chunks_ingested: 1, collection_name: 'docrag_documents' },
+          });
+        }
+        if (url.endsWith('/documents') && (!init?.method || init.method === 'GET')) {
+          const chunk_counts = Object.fromEntries([...indexed].map((f) => [f, 1]));
+          return jsonResponse({ filenames: [...indexed], chunk_counts });
+        }
+        if (url.endsWith('/questions/stream')) {
+          const frame = `data: ${JSON.stringify({
+            type: 'done',
+            answer: 'The answer is 42 [1].',
+            sources: [
+              { source_number: 1, filename: 'a.txt', page: 1, section: 'Body', chunk_id: 'c1', text: 'x' },
+            ],
+            timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+            trace_id: 'trace-abc',
+          })}\n\n`;
+          return sseResponse([frame]);
+        }
+        if (url.endsWith('/feedback') && init?.method === 'POST') {
+          feedbackRequestBody = JSON.parse(init.body as string);
+          return jsonResponse({ id: 'feedback-1' });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1);
+    });
+
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is the answer?');
+    await userEvent.click(screen.getByTestId('question-submit'));
+    await screen.findByText(/The answer is 42/);
+
+    await userEvent.click(screen.getByTestId('chat-message-feedback-up'));
+
+    await vi.waitFor(() => expect(feedbackRequestBody).not.toBeNull());
+    expect(feedbackRequestBody).toEqual({
+      trace_id: 'trace-abc',
+      question: 'What is the answer?',
+      answer_excerpt: 'The answer is 42 [1].',
+      cited_filenames: ['a.txt'],
+      rating: 'up',
+      citation_source_number: null,
+    });
   });
 
   it('switching rail panels shows the corresponding contextual panel', async () => {

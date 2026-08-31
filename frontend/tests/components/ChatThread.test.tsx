@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { describe, expect, it, vi } from 'vitest';
 import ChatThread from '../../src/components/ChatThread';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 
@@ -209,5 +210,25 @@ describe('ChatThread', () => {
     );
 
     expect(thread.scrollTop).toBe(2000);
+  });
+
+  it('wires Regenerate on an assistant turn to re-ask the nearest preceding user question', async () => {
+    const onRetry = vi.fn();
+    const turns = [
+      makeTurn({ id: 'q1', role: 'user', content: 'First question' }),
+      makeTurn({ id: 'a1', role: 'assistant', content: 'First answer' }),
+      makeTurn({ id: 'q2', role: 'user', content: 'Second question' }),
+      makeTurn({ id: 'a2', role: 'assistant', content: 'Second answer' }),
+    ];
+    render(<ChatThread turns={turns} pending={false} engineerMode={false} onRetry={onRetry} />);
+
+    const regenerateButtons = screen.getAllByTestId('chat-message-regenerate');
+    expect(regenerateButtons).toHaveLength(2);
+
+    await userEvent.click(regenerateButtons[0]);
+    expect(onRetry).toHaveBeenLastCalledWith('First question');
+
+    await userEvent.click(regenerateButtons[1]);
+    expect(onRetry).toHaveBeenLastCalledWith('Second question');
   });
 });

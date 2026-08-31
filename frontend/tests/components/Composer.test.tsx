@@ -164,6 +164,63 @@ describe('Composer', () => {
       expect(screen.queryByTestId('composer-scope-popover')).not.toBeInTheDocument();
     });
 
+    it('shows no filter box for a small corpus', async () => {
+      render(<Composer {...baseProps()} />);
+
+      await userEvent.click(screen.getByTestId('composer-scope-button'));
+
+      expect(screen.queryByTestId('composer-scope-search')).not.toBeInTheDocument();
+    });
+
+    it('filters the checkbox list by a substring match once the corpus is large enough', async () => {
+      const filenames = ['contract.pdf', 'invoice.txt', 'README.md', 'notes.md', 'plan.md', 'todo.md'];
+      render(<Composer {...baseProps({ indexedFilenames: filenames })} />);
+
+      await userEvent.click(screen.getByTestId('composer-scope-button'));
+      expect(screen.getAllByTestId('scope-item')).toHaveLength(6);
+
+      await userEvent.type(screen.getByTestId('composer-scope-search'), 'read');
+
+      const items = screen.getAllByTestId('scope-item');
+      expect(items).toHaveLength(1);
+      expect(items[0]).toHaveTextContent('README.md');
+    });
+
+    it('keeps an already-selected filename visible even when it does not match the filter', async () => {
+      // Hard requirement: the checkbox list is the only way to unselect a filename —
+      // filtering it out of view would make it permanently unselectable.
+      const filenames = ['contract.pdf', 'invoice.txt', 'README.md', 'notes.md', 'plan.md', 'todo.md'];
+      const props = baseProps({ indexedFilenames: filenames, selectedFilenames: ['plan.md'] });
+      render(<Composer {...props} />);
+
+      await userEvent.click(screen.getByTestId('composer-scope-button'));
+      await userEvent.type(screen.getByTestId('composer-scope-search'), 'read');
+
+      const items = screen.getAllByTestId('scope-item');
+      const names = items.map((item) => item.textContent);
+      expect(names.some((text) => text?.includes('README.md'))).toBe(true);
+      expect(names.some((text) => text?.includes('plan.md'))).toBe(true);
+      expect(items).toHaveLength(2);
+
+      // And it must still be togglable from that filtered view.
+      const planItem = items.find((item) => item.textContent?.includes('plan.md'));
+      await userEvent.click(planItem!.querySelector('input') as HTMLInputElement);
+      expect(props.onSelectedFilenamesChange).toHaveBeenCalledWith([]);
+    });
+
+    it('resets the filter each time the popover reopens', async () => {
+      const filenames = ['contract.pdf', 'invoice.txt', 'README.md', 'notes.md', 'plan.md', 'todo.md'];
+      render(<Composer {...baseProps({ indexedFilenames: filenames })} />);
+
+      await userEvent.click(screen.getByTestId('composer-scope-button'));
+      await userEvent.type(screen.getByTestId('composer-scope-search'), 'read');
+      await userEvent.click(screen.getByTestId('composer-scope-button')); // close
+      await userEvent.click(screen.getByTestId('composer-scope-button')); // reopen
+
+      expect(screen.getByTestId('composer-scope-search')).toHaveValue('');
+      expect(screen.getAllByTestId('scope-item')).toHaveLength(6);
+    });
+
     it('is disabled when there are no indexed documents', () => {
       render(<Composer {...baseProps({ indexedFilenames: [] })} />);
 

@@ -29,6 +29,15 @@ services:
       WARMUP_MODELS: "true"
       # Same Docker network as Qdrant, so gRPC is reachable without extra config.
       QDRANT_PREFER_GRPC: "true"
+    # Off by default: JOB_STORE_BACKEND=memory and RAW_DOCUMENT_DIR="" (the
+    # .env.example defaults) mean ingest-job status is lost on container recreate and
+    # uploaded originals aren't kept, same as every prior release. To opt into either
+    # (JOB_STORE_BACKEND=sqlite and/or a real RAW_DOCUMENT_DIR=./data/originals in
+    # .env), also uncomment this volume — both features live under /app/data, so one
+    # mount covers both. Must be writable by the container's non-root uid 1000
+    # (Dockerfile creates user `app` with --uid 1000).
+    # volumes:
+    #   - docrag_job_store:/app/data
     extra_hosts:
       # Lets OLLAMA_BASE_URL=http://host.docker.internal:... resolve on native Linux
       # Docker (Docker Desktop on macOS/Windows already resolves this automatically).
@@ -50,3 +59,5 @@ services:
 
 volumes:
   qdrant_storage:
+  # Only used if the commented-out mount under the api service is enabled.
+  docrag_job_store:

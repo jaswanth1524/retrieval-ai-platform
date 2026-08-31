@@ -11,6 +11,7 @@ import type {
 import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
+import type { FeedbackPayload } from './components/ChatMessage';
 import CommandPalette from './components/CommandPalette';
 import type { Command } from './components/CommandPalette';
 import Composer from './components/Composer';
@@ -30,7 +31,7 @@ import TracesPanel from './components/TracesPanel';
 import { useChat } from './hooks/useChat';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
-import { chatToMarkdown, downloadFile } from './utils/exportChat';
+import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
 
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
 const MODE_STORAGE_KEY = 'docrag-mode';
@@ -88,6 +89,9 @@ function App() {
   // so any indexed document is scopable regardless of which session uploaded it.
   const [indexedFilenames, setIndexedFilenames] = useState<string[]>([]);
   const [chunkCounts, setChunkCounts] = useState<Record<string, number>>({});
+  const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
+  const [byteSizes, setByteSizes] = useState<Record<string, number>>({});
+  const [uploadedAts, setUploadedAts] = useState<Record<string, number>>({});
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
   );
@@ -164,6 +168,9 @@ function App() {
     const documents = await api.listDocuments(signal);
     setIndexedFilenames(documents.filenames);
     setChunkCounts(documents.chunk_counts ?? {});
+    setPageCounts(documents.page_counts ?? {});
+    setByteSizes(documents.byte_sizes ?? {});
+    setUploadedAts(documents.uploaded_ats ?? {});
     // A key that used to be rejected now works — clear the banner.
     setApiStatus((prev) => (prev === 'unauthorized' ? 'ok' : prev));
   };
@@ -394,13 +401,44 @@ function App() {
   // Shared by both the input box and a Retry click on a failed turn — retry always
   // uses the CURRENT provider/overrides/scope, not whatever was selected when the
   // original question failed. No selection = search the whole corpus (undefined).
-  const askQuestion = (question: string) =>
-    ask(
-      question,
-      selectedProvider,
-      advancedOptions,
-      selectedFilenames.length > 0 ? selectedFilenames : undefined,
-    );
+  // useCallback (not a plain const) because this is passed down as ChatMessage's
+  // onRetry prop through ChatThread — an unstable reference here would defeat
+  // React.memo(ChatMessage) and reintroduce a full-list re-render on every SSE delta.
+  const askQuestion = useCallback(
+    (question: string) =>
+      ask(
+        question,
+        selectedProvider,
+        advancedOptions,
+        selectedFilenames.length > 0 ? selectedFilenames : undefined,
+      ),
+    [ask, selectedProvider, advancedOptions, selectedFilenames],
+  );
+
+  // Same reasoning as askQuestion above — passed to both ChatThread and Inspector.
+  const handleOpenSource = useCallback(
+    (filename: string, chunkId: string) => setSourceView({ filename, chunkId }),
+    [],
+  );
+  const handleCitationLeave = useCallback(() => setHoveredCitation(null), []);
+
+  // Fire-and-forget: a rating is low-stakes feedback, not an action the user needs
+  // confirmed or retried on failure — ChatMessage already shows the pick optimistically
+  // (see its feedbackGiven state) before this even resolves.
+  const handleFeedback = useCallback((payload: FeedbackPayload) => {
+    void api
+      .submitFeedback({
+        trace_id: payload.traceId,
+        question: payload.question,
+        answer_excerpt: payload.answerExcerpt.slice(0, 2000),
+        cited_filenames: payload.citedFilenames,
+        rating: payload.rating,
+        citation_source_number: null,
+      })
+      .catch(() => {
+        // Best-effort — nothing in the UI depends on this succeeding.
+      });
+  }, []);
 
   // Persistence problems arrive as state flags, not events, so they are surfaced with
   // stable ids — a re-render must refresh the same notice rather than stack duplicates.
@@ -437,8 +475,17 @@ function App() {
     if (turns.length === 0) return;
     downloadFile(
       `docrag-${activeConversation?.title ?? 'chat'}.md`.replace(/[^\w.-]+/g, '-'),
-      chatToMarkdown(turns),
       'text/markdown',
+      chatToMarkdown(turns),
+    );
+  }, [turns, activeConversation]);
+
+  const exportJson = useCallback(() => {
+    if (turns.length === 0) return;
+    downloadFile(
+      `docrag-${activeConversation?.title ?? 'chat'}.json`.replace(/[^\w.-]+/g, '-'),
+      'application/json',
+      chatToJson(turns),
     );
   }, [turns, activeConversation]);
 
@@ -504,6 +551,13 @@ function App() {
         disabled: turns.length === 0,
       },
       {
+        id: 'export-json',
+        glyph: '⇩',
+        label: 'Export conversation as JSON',
+        run: exportJson,
+        disabled: turns.length === 0,
+      },
+      {
         id: 'traces',
         glyph: '◔',
         label: 'Browse traces',
@@ -519,7 +573,7 @@ function App() {
     ],
     // toggleTheme/clear/newConversation are stable enough for a menu rebuilt on open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown],
+    [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown, exportJson],
   );
 
   const handlePanelAction = () => {
@@ -558,6 +612,9 @@ function App() {
           <CorpusPanel
             filenames={indexedFilenames}
             chunkCounts={chunkCounts}
+            pageCounts={pageCounts}
+            byteSizes={byteSizes}
+            uploadedAts={uploadedAts}
             uploads={uploads}
             onUpload={handleUpload}
             onDelete={handleDeleteDocument}
@@ -601,9 +658,11 @@ function App() {
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
-              onOpenSource={(filename, chunkId) => setSourceView({ filename, chunkId })}
+              feedbackEnabled={config?.feedback_enabled}
+              onFeedback={handleFeedback}
+              onOpenSource={handleOpenSource}
               onCitationHover={setHoveredCitation}
-              onCitationLeave={() => setHoveredCitation(null)}
+              onCitationLeave={handleCitationLeave}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
             <ToastRow toasts={toasts} onDismiss={dismissToast} />
@@ -634,7 +693,7 @@ function App() {
           sources={inspectedTurn?.sources ?? []}
           traceId={inspectedTraceId ?? null}
           traceReady={inspectedTraceReady}
-          onOpenSource={(filename, chunkId) => setSourceView({ filename, chunkId })}
+          onOpenSource={handleOpenSource}
         />
       )}
       {paletteOpen && (

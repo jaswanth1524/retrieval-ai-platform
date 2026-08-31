@@ -242,3 +242,17 @@ def test_default_reranker_config_logs_no_warning(caplog: pytest.LogCaptureFixtur
         warn_on_risky_reranker_config(AppSettings(_env_file=None))  # type: ignore[call-arg]
 
     assert caplog.text == ""
+
+
+def test_job_store_backend_defaults_to_memory() -> None:
+    assert AppSettings(_env_file=None).job_store_backend == "memory"  # type: ignore[call-arg]
+
+
+def test_job_store_backend_accepts_sqlite() -> None:
+    settings = AppSettings(_env_file=None, job_store_backend="sqlite")  # type: ignore[call-arg]
+    assert settings.job_store_backend == "sqlite"
+
+
+def test_job_store_backend_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, job_store_backend="redis")  # type: ignore[call-arg]

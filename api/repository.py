@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
@@ -22,6 +23,19 @@ from api.settings import AppSettings
 # combination doesn't support prefetch+RRF" rather than a real query failure — only
 # these should trigger the manual-fusion fallback; anything else is a real error.
 _RRF_UNSUPPORTED_STATUS_CODES = frozenset({400, 404, 501})
+
+
+@dataclass(frozen=True)
+class DocumentMetadata:
+    """Per-filename aggregate derived from its indexed points' payloads."""
+
+    chunk_count: int
+    page_count: int
+    # None when every one of the filename's points predates byte_size/uploaded_at
+    # being stamped at ingest time (see api.documents.DocumentChunk) — nullable, not
+    # forced by a re-ingest.
+    byte_size: int | None
+    uploaded_at: float | None
 
 
 class VectorRepository:
@@ -159,6 +173,61 @@ class VectorRepository:
             if offset is None:
                 break
         return dict(counts)
+
+    def filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
+        """Return each indexed filename's chunk count, page count, byte size, and
+        upload time — one scroll, folded together rather than a separate query per
+        field (which would turn a page-count add into an N+1 against the corpus list).
+
+        ``page_count`` is ``max(page)`` seen across the filename's points — pages are
+        1-based per api.documents' parsers, so this is a direct count, not an index.
+        ``byte_size``/``uploaded_at`` come from whichever point has them (every chunk
+        of one ingest carries the same values — see api.documents.DocumentChunk); a
+        filename ingested before those fields existed has neither in any point's
+        payload, so both stay ``None``.
+        """
+
+        self.ensure_ready(settings)
+        chunk_counts: Counter[str] = Counter()
+        max_page: dict[str, int] = {}
+        byte_size: dict[str, int] = {}
+        uploaded_at: dict[str, float] = {}
+        offset: models.ExtendedPointId | None = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=settings.qdrant_collection,
+                with_payload=["filename", "page", "byte_size", "uploaded_at"],
+                with_vectors=False,
+                limit=256,
+                offset=offset,
+            )
+            for point in points:
+                if not point.payload:
+                    continue
+                filename = point.payload.get("filename")
+                if not isinstance(filename, str):
+                    continue
+                chunk_counts[filename] += 1
+                page = point.payload.get("page")
+                if isinstance(page, int):
+                    max_page[filename] = max(max_page.get(filename, 0), page)
+                size = point.payload.get("byte_size")
+                if isinstance(size, int) and filename not in byte_size:
+                    byte_size[filename] = size
+                stamp = point.payload.get("uploaded_at")
+                if isinstance(stamp, int | float) and filename not in uploaded_at:
+                    uploaded_at[filename] = float(stamp)
+            if offset is None:
+                break
+        return {
+            filename: DocumentMetadata(
+                chunk_count=count,
+                page_count=max_page.get(filename, 0),
+                byte_size=byte_size.get(filename),
+                uploaded_at=uploaded_at.get(filename),
+            )
+            for filename, count in chunk_counts.items()
+        }
 
     def list_filenames(self, settings: AppSettings) -> list[str]:
         """Return the distinct filenames currently indexed, for per-document filtering."""

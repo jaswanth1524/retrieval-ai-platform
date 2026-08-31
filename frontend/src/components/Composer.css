@@ -95,6 +95,23 @@
   animation: dr-in 0.14s ease both;
 }
 
+.composer__popover-search {
+  width: 100%;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--fm);
+  font-size: 12px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+}
+
+.composer__popover-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .composer__popover-item {
   display: flex;
   align-items: center;

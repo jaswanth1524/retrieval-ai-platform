@@ -615,6 +615,17 @@ def test_needs_citation_retry_logic() -> None:
     assert needs_citation_retry("The documents do not contain enough information.", 2) is False
 
 
+def test_needs_citation_retry_recognizes_contraction_phrasing() -> None:
+    """Regression guard: a model phrasing insufficiency with contractions must not
+    trigger a wasted extra generation round-trip. See _normalize_negation."""
+
+    assert needs_citation_retry("The documents don't contain that information.", 2) is False
+    assert needs_citation_retry("I can't answer this from the provided context.", 2) is False
+    assert needs_citation_retry("The docs doesn’t contain it.", 2) is False  # curly apostrophe
+    # Contraction expansion must not introduce false negatives on real answers.
+    assert needs_citation_retry("The system doesn't require a restart.", 2) is True
+
+
 def test_retry_uncited_answer_returns_cited_retry_and_the_messages_it_sent() -> None:
     generator = ScriptedGenerator(["Now with citation [1]."])
     prompt = build_grounded_messages("q", [make_chunk("c1", "context text")])

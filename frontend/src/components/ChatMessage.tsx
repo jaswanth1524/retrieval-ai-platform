@@ -1,10 +1,18 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { CitationResponse, TimingsResponse } from '../api/types';
+import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
 import CitationCard from './CitationCard';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
+
+export interface FeedbackPayload {
+  rating: FeedbackRating;
+  question: string;
+  answerExcerpt: string;
+  citedFilenames: string[];
+  traceId: string | null;
+}
 
 export interface ChatTurn {
   id: string;
@@ -26,6 +34,17 @@ interface ChatMessageProps {
   streamStage?: string;
   currentModelLabel?: string;
   onRetry?: (question: string) => void;
+  // The question a "Regenerate" click on this (assistant) turn should re-ask —
+  // undefined on any turn that isn't a regenerate-able assistant answer. Computed by
+  // ChatThread from array position; see findPrecedingUserQuestion there.
+  regenerateQuestion?: string;
+  // Off (undefined/false) unless the server has AppSettings.feedback_enabled set —
+  // sourced from PublicConfigResponse.feedback_enabled via App.tsx.
+  feedbackEnabled?: boolean;
+  // Presentational: ChatMessage reports what happened (rating + everything needed to
+  // build the request) and leaves the actual POST /feedback call to the caller — see
+  // FeedbackPayload above.
+  onFeedback?: (payload: FeedbackPayload) => void;
   onOpenSource?: (filename: string, chunkId: string) => void;
   onCitationHover?: (citation: CitationResponse) => void;
   onCitationLeave?: () => void;
@@ -41,12 +60,30 @@ function ChatMessage({
   streamStage,
   currentModelLabel,
   onRetry,
+  regenerateQuestion,
+  feedbackEnabled,
+  onFeedback,
   onOpenSource,
   onCitationHover,
   onCitationLeave,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
+  // Sticky once set: a rating is a one-shot action, not a toggle — clicking again
+  // would just resubmit the same signal, so the buttons disable after the first pick.
+  const [feedbackGiven, setFeedbackGiven] = useState<FeedbackRating | null>(null);
+
+  const submitFeedback = (rating: FeedbackRating) => {
+    if (!regenerateQuestion || !onFeedback) return;
+    setFeedbackGiven(rating);
+    onFeedback({
+      rating,
+      question: regenerateQuestion,
+      answerExcerpt: turn.content,
+      citedFilenames: [...new Set(turn.sources.map((source) => source.filename))],
+      traceId: turn.traceId,
+    });
+  };
 
   /** Copy without the async Clipboard API, which browsers gate behind a secure context.
    *
@@ -141,6 +178,44 @@ function ChatMessage({
                   {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
                 </button>
               )}
+              {turn.content && regenerateQuestion && onRetry && !streamStage && (
+                <button
+                  type="button"
+                  className="chat-message__regenerate"
+                  onClick={() => onRetry(regenerateQuestion)}
+                  data-testid="chat-message-regenerate"
+                >
+                  Regenerate
+                </button>
+              )}
+              {turn.content && feedbackEnabled && regenerateQuestion && onFeedback && !streamStage && (
+                <div className="chat-message__feedback" role="group" aria-label="Rate this answer">
+                  <button
+                    type="button"
+                    className="chat-message__feedback-btn"
+                    aria-pressed={feedbackGiven === 'up'}
+                    aria-label="Helpful"
+                    title="Helpful"
+                    disabled={feedbackGiven !== null}
+                    onClick={() => submitFeedback('up')}
+                    data-testid="chat-message-feedback-up"
+                  >
+                    <span aria-hidden="true">{feedbackGiven === 'up' ? '▲' : '△'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-message__feedback-btn"
+                    aria-pressed={feedbackGiven === 'down'}
+                    aria-label="Not helpful"
+                    title="Not helpful"
+                    disabled={feedbackGiven !== null}
+                    onClick={() => submitFeedback('down')}
+                    data-testid="chat-message-feedback-down"
+                  >
+                    <span aria-hidden="true">{feedbackGiven === 'down' ? '▼' : '▽'}</span>
+                  </button>
+                </div>
+              )}
             </div>
             {turn.sources.length > 0 && (
               <div className="chat-message__citations" data-testid="chat-message-sources">
@@ -192,4 +267,11 @@ function ChatMessage({
   );
 }
 
-export default ChatMessage;
+// Default shallow-compare memo is sufficient: `turn` keeps referential identity for
+// every turn except the one an update actually targets (see useChat's
+// updateAssistantTurn), and the callback props are stabilized at their App.tsx source
+// (askQuestion, onOpenSource, onCitationLeave) or are native useState setters
+// (onCitationHover). Without this, every prior answer's ReactMarkdown re-parses on
+// every SSE delta of the currently streaming turn — cost scales with conversation
+// length instead of staying O(1).
+export default memo(ChatMessage);

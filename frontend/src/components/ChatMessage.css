@@ -129,6 +129,47 @@
   color: var(--accent);
 }
 
+.chat-message__regenerate {
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-size: 11px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.chat-message__regenerate:hover {
+  color: var(--accent);
+}
+
+.chat-message__feedback {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.chat-message__feedback-btn {
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+}
+
+.chat-message__feedback-btn:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.chat-message__feedback-btn[aria-pressed='true'] {
+  color: var(--accent);
+}
+
+.chat-message__feedback-btn:disabled {
+  cursor: default;
+}
+
 .chat-message__citations {
   display: flex;
   flex-wrap: wrap;

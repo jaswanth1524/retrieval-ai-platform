@@ -13,11 +13,13 @@ from qdrant_client import QdrantClient
 
 from api.chunking import TokenCounter, make_token_counter
 from api.embeddings import LocalEmbeddingProvider
+from api.feedback import FeedbackStore
 from api.generation import LiteLLMGenerator
-from api.jobs import IngestJobStore
+from api.jobs import IngestJobStore, JobStore, SqliteIngestJobStore
 from api.pipeline import IngestService, RagPipeline
 from api.provider_health import check_ollama_reachable, check_qdrant_reachable
 from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
+from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
@@ -196,14 +198,45 @@ def get_ingest_service(
 
 
 @lru_cache
-def get_ingest_job_store() -> IngestJobStore:
+def get_ingest_job_store() -> JobStore:
     """Return the process-wide background ingest job status store.
 
     Reads settings directly (not through FastAPI's DI), the same pattern as
-    ``get_trace_store`` — the retention cap is sized once at first use.
+    ``get_trace_store`` — the retention cap is sized once at first use. The backend
+    (in-memory vs sqlite-persisted) is picked here, the only place that needs to know
+    which concrete class is in play — everything else types against ``JobStore``.
     """
 
-    return IngestJobStore(max_retained=int(get_app_settings().ingest_jobs_max_retained))
+    settings = get_app_settings()
+    if settings.job_store_backend == "sqlite":
+        return SqliteIngestJobStore(
+            path=settings.job_store_path,
+            max_retained=int(settings.ingest_jobs_max_retained),
+        )
+    return IngestJobStore(max_retained=int(settings.ingest_jobs_max_retained))
+
+
+@lru_cache
+def get_raw_document_store() -> RawDocumentStore | None:
+    """Return the optional original-bytes store, or None when the feature is off.
+
+    Same direct-settings-read pattern as ``get_ingest_job_store``. An empty string
+    (the ``.env.example`` default's literal value) means off, same as unset.
+    """
+
+    directory = get_app_settings().raw_document_dir
+    return RawDocumentStore(directory) if directory else None
+
+
+@lru_cache
+def get_feedback_store() -> FeedbackStore | None:
+    """Return the optional feedback store, or None when the feature is off.
+
+    Same direct-settings-read pattern as ``get_raw_document_store``.
+    """
+
+    settings = get_app_settings()
+    return FeedbackStore(settings.feedback_store_path) if settings.feedback_enabled else None
 
 
 @lru_cache
@@ -227,6 +260,8 @@ def clear_dependency_caches() -> None:
     get_generator.cache_clear()
     get_token_counter.cache_clear()
     get_ingest_job_store.cache_clear()
+    get_raw_document_store.cache_clear()
+    get_feedback_store.cache_clear()
     get_ingest_executor.cache_clear()
     get_trace_store.cache_clear()
     clear_readiness_cache()

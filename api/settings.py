@@ -1,5 +1,7 @@
 """Application settings loaded from environment variables."""
 
+from typing import Literal
+
 from pydantic import Field, PositiveInt, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -128,6 +130,35 @@ class AppSettings(BaseSettings):
     # a long-running process doesn't accumulate unbounded job history in memory —
     # same tradeoff/pattern as trace_max_retained below.
     ingest_jobs_max_retained: PositiveInt = 50
+
+    # "memory" (default) matches every prior release: jobs are lost on restart, and a
+    # client polling a job whose process just restarted gets a 404 even if the ingest
+    # actually succeeded in Qdrant. "sqlite" persists job status to job_store_path
+    # (stdlib sqlite3, no new dependency) so that poll survives a restart. Traces
+    # remain in-memory-only either way — see api/tracing.py's TraceStore docstring.
+    job_store_backend: Literal["memory", "sqlite"] = "memory"
+    # Only read when job_store_backend="sqlite". The containing directory must exist
+    # and be writable by the process; docker-compose.yml doesn't mount one by default,
+    # so an operator opting into this backend needs to add a volume for it.
+    job_store_path: str = "./data/jobs.db"
+
+    # None (default) matches every prior release: an uploaded document's raw bytes are
+    # discarded once ingestion is queued — no "download original", and a future
+    # chunking/embedding change needs every document manually re-uploaded. Setting
+    # this to a directory keeps a copy of each upload (keyed by its normalized
+    # basename filename) and exposes it via GET /documents/{filename}/original. Same
+    # writable-directory/volume requirement as job_store_path. Re-indexing from these
+    # originals isn't implemented — this only stores them.
+    raw_document_dir: str | None = None
+
+    # False (default): no answer-feedback capture, matching every prior release. When
+    # true, POST /feedback (thumbs up/down, from ChatMessage.tsx) is enabled and
+    # PublicConfigResponse.feedback_enabled tells the frontend to render the buttons.
+    # Stores to feedback_store_path — its own sqlite3 file (stdlib, no new
+    # dependency), independent of job_store_backend: this feature works regardless of
+    # whether the operator has also opted the job store into sqlite persistence.
+    feedback_enabled: bool = False
+    feedback_store_path: str = "./data/feedback.db"
 
     # After rerank, each selected chunk's context is expanded with up to this many
     # neighboring chunks (by chunk_ordinal) on each side from the same document —

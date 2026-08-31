@@ -67,23 +67,44 @@ describe('SettingsModal', () => {
     expect(screen.getByTestId('settings-max-context-chunks')).toHaveValue('6');
   });
 
-  it('reports slider changes as overrides', () => {
+  it('stages slider changes as a draft and only commits them on Save', async () => {
     const props = setup();
 
     // Range inputs are dragged, not typed, so drive the change event directly.
     fireEvent.change(screen.getByTestId('settings-max-context-chunks'), { target: { value: '11' } });
 
+    // The whole point of staging: a drag must not write through immediately.
+    expect(props.onOverridesChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId('settings-max-context-chunks')).toHaveValue('11');
+
+    await userEvent.click(screen.getByTestId('settings-save'));
+
     expect(props.onOverridesChange).toHaveBeenCalledWith({ ...EMPTY, maxContextChunks: 11 });
   });
 
-  it('rounds temperature to one decimal to survive repeated drags', () => {
+  it('rounds temperature to one decimal to survive repeated drags', async () => {
     // Binary float drift (0.1 + 0.2 !== 0.3) otherwise accumulates into a value the
     // server's own ge/le bounds would still accept but that renders as 0.7000000001.
     const props = setup();
 
     fireEvent.change(screen.getByTestId('settings-temperature'), { target: { value: '0.7000000001' } });
+    await userEvent.click(screen.getByTestId('settings-save'));
 
     expect(props.onOverridesChange).toHaveBeenCalledWith({ ...EMPTY, llmTemperature: 0.7 });
+  });
+
+  it('discards staged slider changes on Cancel', () => {
+    // Regression guard: only the API key used to be draft-then-commit — sliders wrote
+    // through on every tick and Cancel reverted nothing. A drag followed by Cancel
+    // (unmount, since the modal is only ever conditionally rendered) must never reach
+    // onOverridesChange at all.
+    const props = setup();
+
+    fireEvent.change(screen.getByTestId('settings-max-context-chunks'), { target: { value: '11' } });
+    fireEvent.click(screen.getByText('Cancel'));
+
+    expect(props.onClose).toHaveBeenCalled();
+    expect(props.onOverridesChange).not.toHaveBeenCalled();
   });
 
   it('keeps the Access section with the API key field', () => {
@@ -110,9 +131,20 @@ describe('SettingsModal', () => {
   });
 
   it('resets overrides back to the server defaults', async () => {
-    const props = setup({ overrides: { rerankTopK: 20, maxContextChunks: 3, llmTemperature: 1.4 } });
+    // Reset now stages like every other field — it must not commit until Save, or
+    // Cancel after a Reset click couldn't undo it.
+    const props = setup({
+      config: makeConfig({ rerank_top_k: 8, max_context_chunks: 6 }),
+      overrides: { rerankTopK: 20, maxContextChunks: 3, llmTemperature: 1.4 },
+    });
 
     await userEvent.click(screen.getByTestId('settings-reset'));
+
+    expect(props.onOverridesChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId('settings-rerank-top-k')).toHaveValue('8');
+    expect(screen.getByTestId('settings-max-context-chunks')).toHaveValue('6');
+
+    await userEvent.click(screen.getByTestId('settings-save'));
 
     expect(props.onOverridesChange).toHaveBeenCalledWith(EMPTY);
   });

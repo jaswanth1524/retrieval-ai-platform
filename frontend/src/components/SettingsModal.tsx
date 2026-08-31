@@ -84,12 +84,17 @@ function SettingsModal({
 }: SettingsModalProps) {
   const dialogRef = useDialog(true, onClose);
   const [apiKeyDraft, setApiKeyDraft] = useState(getApiKey);
+  // Staged like the API key: sliders only touch this draft, never onOverridesChange
+  // directly, so a drag doesn't localStorage-write on every tick and Cancel (unmount,
+  // since the modal is only ever conditionally rendered) discards it for free.
+  const [draftOverrides, setDraftOverrides] = useState(overrides);
 
-  const rerankTopK = overrides.rerankTopK ?? config.rerank_top_k;
-  const maxContextChunks = overrides.maxContextChunks ?? config.max_context_chunks;
-  const llmTemperature = overrides.llmTemperature ?? config.llm_temperature;
+  const rerankTopK = draftOverrides.rerankTopK ?? config.rerank_top_k;
+  const maxContextChunks = draftOverrides.maxContextChunks ?? config.max_context_chunks;
+  const llmTemperature = draftOverrides.llmTemperature ?? config.llm_temperature;
 
   const save = () => {
+    onOverridesChange(draftOverrides);
     setApiKey(apiKeyDraft);
     onSaved();
     onClose();
@@ -163,7 +168,7 @@ function SettingsModal({
               format={String}
               disabled={disabled}
               testId="settings-rerank-top-k"
-              onChange={(value) => onOverridesChange({ ...overrides, rerankTopK: value })}
+              onChange={(value) => setDraftOverrides({ ...draftOverrides, rerankTopK: value })}
             />
             <SliderRow
               label="Context chunks"
@@ -174,7 +179,9 @@ function SettingsModal({
               format={String}
               disabled={disabled}
               testId="settings-max-context-chunks"
-              onChange={(value) => onOverridesChange({ ...overrides, maxContextChunks: value })}
+              onChange={(value) =>
+                setDraftOverrides({ ...draftOverrides, maxContextChunks: value })
+              }
             />
             <SliderRow
               label="Temperature"
@@ -187,13 +194,16 @@ function SettingsModal({
               testId="settings-temperature"
               onChange={(value) =>
                 // Guard against binary float drift across repeated drags.
-                onOverridesChange({ ...overrides, llmTemperature: Math.round(value * 10) / 10 })
+                setDraftOverrides({
+                  ...draftOverrides,
+                  llmTemperature: Math.round(value * 10) / 10,
+                })
               }
             />
             <button
               type="button"
               className="settings__reset"
-              onClick={() => onOverridesChange(EMPTY_OVERRIDES)}
+              onClick={() => setDraftOverrides(EMPTY_OVERRIDES)}
               disabled={disabled}
               data-testid="settings-reset"
             >

@@ -30,6 +30,7 @@ export interface PublicConfigResponse {
   rerank_top_k_limit: number;
   max_context_chunks_limit: number;
   llm_temperature_max: number;
+  feedback_enabled: boolean;
 }
 
 export interface QuestionOverrides {
@@ -66,11 +67,31 @@ export interface DocumentJobStatusResponse {
 export interface DocumentListResponse {
   filenames: string[];
   chunk_counts?: Record<string, number>;
+  page_counts?: Record<string, number>;
+  // A filename is absent from these two (not present with a null value) when it was
+  // ingested before byte_size/uploaded_at were stamped at ingest time.
+  byte_sizes?: Record<string, number>;
+  uploaded_ats?: Record<string, number>;
 }
 
 export interface DocumentDeleteResponse {
   filename: string;
   points_deleted: number;
+}
+
+export type FeedbackRating = 'up' | 'down';
+
+export interface FeedbackRequest {
+  trace_id: string | null;
+  question: string;
+  answer_excerpt: string;
+  cited_filenames: string[];
+  rating: FeedbackRating;
+  citation_source_number: number | null;
+}
+
+export interface FeedbackResponse {
+  id: string;
 }
 
 export interface DocumentChunkResponse {

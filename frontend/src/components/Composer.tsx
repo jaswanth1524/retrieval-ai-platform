@@ -39,6 +39,7 @@ function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState('');
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
+  const [scopeQuery, setScopeQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
   const scopeButtonRef = useRef<HTMLButtonElement>(null);
   const providerButtonRef = useRef<HTMLButtonElement>(null);
@@ -91,6 +92,19 @@ function Composer({
   const openaiEnabled = config?.openai_available ?? false;
   const ollamaEnabled = config?.ollama_available ?? false;
 
+  // A search hiding an already-selected filename would make it permanently
+  // unselectable (the checkbox list is the only way to remove it from scope), so a
+  // selected filename always stays visible regardless of match.
+  const trimmedScopeQuery = scopeQuery.trim().toLowerCase();
+  const visibleFilenames =
+    trimmedScopeQuery === ''
+      ? indexedFilenames
+      : indexedFilenames.filter(
+          (filename) =>
+            filename.toLowerCase().includes(trimmedScopeQuery) ||
+            selectedFilenames.includes(filename),
+        );
+
   return (
     <div className="composer" ref={wrapRef}>
       {hint && (
@@ -116,7 +130,10 @@ function Composer({
             <button
               type="button"
               className="composer__chip"
-              onClick={() => setOpenPopover((prev) => (prev === 'scope' ? null : 'scope'))}
+              onClick={() => {
+                setOpenPopover((prev) => (prev === 'scope' ? null : 'scope'));
+                setScopeQuery('');
+              }}
               disabled={indexedFilenames.length === 0}
               aria-haspopup="true"
               aria-expanded={openPopover === 'scope'}
@@ -143,7 +160,18 @@ function Composer({
                   />
                   <span>All documents</span>
                 </label>
-                {indexedFilenames.map((filename) => (
+                {indexedFilenames.length > 5 && (
+                  <input
+                    type="search"
+                    className="composer__popover-search"
+                    placeholder="Filter documents…"
+                    aria-label="Filter documents"
+                    value={scopeQuery}
+                    onChange={(event) => setScopeQuery(event.target.value)}
+                    data-testid="composer-scope-search"
+                  />
+                )}
+                {visibleFilenames.map((filename) => (
                   <label key={filename} className="composer__popover-item" data-testid="scope-item">
                     <input
                       type="checkbox"
