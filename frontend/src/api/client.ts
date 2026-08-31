@@ -5,6 +5,8 @@ import type {
   DocumentJobAcceptedResponse,
   DocumentJobStatusResponse,
   DocumentListResponse,
+  FeedbackRequest,
+  FeedbackResponse,
   HealthResponse,
   HistoryMessage,
   LlmProvider,
@@ -248,12 +250,22 @@ export const api = {
     }),
 
   // Reconstructs a document from its stored chunks (ordinal order) for the source
-  // viewer — no original file is retained, so this is the only content route.
+  // viewer. A separate, opt-in GET /documents/{filename}/original route serves the
+  // literal uploaded bytes when the server has raw storage enabled (no client
+  // wrapper here yet — nothing in the UI surfaces it).
   getDocumentContent: (filename: string, signal?: AbortSignal) =>
     request<DocumentContentResponse>(
       `/documents/${encodeURIComponent(filename)}/content`,
       { signal },
     ),
+
+  submitFeedback: (body: FeedbackRequest, signal?: AbortSignal) =>
+    request<FeedbackResponse>('/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    }),
 
   // Trace detail is fetched lazily — only when a debug drawer is actually opened —
   // since the full prompt + candidate list can be tens of KB per question and most

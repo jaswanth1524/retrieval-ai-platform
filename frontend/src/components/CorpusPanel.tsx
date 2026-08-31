@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import type { DragEvent, RefObject } from 'react';
 import type { DocumentIngestResponse, IngestJobState } from '../api/types';
+import { formatRelativeTime } from '../utils/relativeTime';
 import './CorpusPanel.css';
 
 // Both are structural details of UploadItem below and have no consumers outside this
@@ -34,6 +35,11 @@ const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 interface CorpusPanelProps {
   filenames: string[];
   chunkCounts: Record<string, number>;
+  // Absent (not present with a null value) for a filename ingested before this
+  // metadata was stamped at ingest time — the detail line simply omits it.
+  pageCounts?: Record<string, number>;
+  byteSizes?: Record<string, number>;
+  uploadedAts?: Record<string, number>;
   uploads: UploadItem[];
   onUpload: (files: File[]) => Promise<void>;
   onDelete: (filename: string) => Promise<void>;
@@ -69,6 +75,9 @@ interface DocCard {
 function CorpusPanel({
   filenames,
   chunkCounts,
+  pageCounts = {},
+  byteSizes = {},
+  uploadedAts = {},
   uploads,
   onUpload,
   onDelete,
@@ -82,6 +91,7 @@ function CorpusPanel({
   const [confirming, setConfirming] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const internalInputRef = useRef<HTMLInputElement>(null);
   const inputRef = browseInputRef ?? internalInputRef;
   const submitting = uploads.some((item) => item.status === 'uploading');
@@ -144,12 +154,21 @@ function CorpusPanel({
     }
   };
 
-  const indexedCards: DocCard[] = filenames.map((filename) => ({
-    filename,
-    status: 'indexed',
-    detail: `${chunkCounts[filename] ?? 0} chunks`,
-    pct: 100,
-  }));
+  const indexedCards: DocCard[] = filenames.map((filename) => {
+    const parts = [`${chunkCounts[filename] ?? 0} chunks`];
+    const pages = pageCounts[filename];
+    if (pages) parts.push(`${pages} page${pages === 1 ? '' : 's'}`);
+    const bytes = byteSizes[filename];
+    if (bytes !== undefined) parts.push(formatBytes(bytes));
+    const uploadedAt = uploadedAts[filename];
+    if (uploadedAt !== undefined) parts.push(formatRelativeTime(uploadedAt * 1000));
+    return {
+      filename,
+      status: 'indexed' as const,
+      detail: parts.join(' · '),
+      pct: 100,
+    };
+  });
 
   // Only in-flight/failed uploads not yet reflected in `filenames` — a successful
   // upload's filename lands in `filenames` on the same render its status flips to
@@ -168,6 +187,11 @@ function CorpusPanel({
     );
 
   const cards = [...indexedCards, ...inFlightCards];
+  const trimmedQuery = searchQuery.trim().toLowerCase();
+  const filteredCards =
+    trimmedQuery === ''
+      ? cards
+      : cards.filter((card) => card.filename.toLowerCase().includes(trimmedQuery));
 
   return (
     <>
@@ -233,7 +257,23 @@ function CorpusPanel({
         </div>
       )}
 
-      {cards.map((card) => (
+      {cards.length > 0 && (
+        <input
+          type="search"
+          className="corpus-panel__search"
+          placeholder="Filter documents…"
+          aria-label="Filter documents"
+          value={searchQuery}
+          onChange={(event) => setSearchQuery(event.target.value)}
+          data-testid="corpus-panel-search"
+        />
+      )}
+
+      {trimmedQuery !== '' && filteredCards.length === 0 && (
+        <p className="corpus-panel__empty-filter">No documents match "{searchQuery.trim()}".</p>
+      )}
+
+      {filteredCards.map((card) => (
         <article key={card.filename} className="corpus-panel__card" data-testid="corpus-panel-item">
           <div className="corpus-panel__card-top">
             <span className="corpus-panel__ext">{extensionOf(card.filename)}</span>

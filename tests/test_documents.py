@@ -7,6 +7,7 @@ import pytest
 import api.documents as documents
 from api.documents import (
     ChunkConfigError,
+    DocumentChunk,
     DocumentSection,
     EmptyDocumentError,
     UnsupportedDocumentError,
@@ -144,6 +145,32 @@ def test_chunk_sections_preserves_citation_payload_metadata() -> None:
     assert first_payload["section"] == "Setup"
     assert first_payload["chunk_id"] == chunks[0].chunk_id
     assert first_payload["text"] == "One two three."
+
+
+def test_to_payload_omits_byte_size_and_uploaded_at_when_unset() -> None:
+    chunk = DocumentChunk(filename="guide.md", page=1, section="Intro", chunk_id="c1", text="hi")
+
+    payload = chunk.to_payload()
+
+    assert "byte_size" not in payload
+    assert "uploaded_at" not in payload
+
+
+def test_to_payload_includes_byte_size_and_uploaded_at_when_stamped() -> None:
+    chunk = DocumentChunk(
+        filename="guide.md",
+        page=1,
+        section="Intro",
+        chunk_id="c1",
+        text="hi",
+        byte_size=1024,
+        uploaded_at=1700000000.0,
+    )
+
+    payload = chunk.to_payload()
+
+    assert payload["byte_size"] == 1024
+    assert payload["uploaded_at"] == 1700000000.0
 
 
 def test_chunk_sections_windows_on_sentence_boundaries_with_overlap() -> None:

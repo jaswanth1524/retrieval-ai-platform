@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
 import type { HistoryMessage, LlmProvider, QuestionOverrides } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
@@ -243,6 +243,14 @@ export function useChat(): UseChatResult {
     conversations.find((conversation) => conversation.id === activeConversationId) ??
     conversations[0];
   const turns = activeConversation?.turns ?? [];
+  // Kept in sync every render (not inside an effect — it must be current before ask's
+  // first read, not one render behind) so `ask` below can be a stable useCallback
+  // identity: reading through the ref instead of closing over `activeConversation`
+  // directly means `ask`'s reference doesn't change on every delta, which matters
+  // because it's passed down as ChatMessage's onRetry prop and an unstable onRetry
+  // defeats React.memo(ChatMessage) — see App.tsx's askQuestion.
+  const activeConversationRef = useRef(activeConversation);
+  activeConversationRef.current = activeConversation;
 
   useEffect(() => {
     // Skip writes while a stream is in flight — the assistant turn's content mutates
@@ -332,7 +340,7 @@ export function useChat(): UseChatResult {
     });
   };
 
-  const ask = async (
+  const ask = useCallback(async (
     question: string,
     provider?: LlmProvider,
     overrides?: QuestionOverrides,
@@ -342,7 +350,7 @@ export function useChat(): UseChatResult {
     const controller = new AbortController();
     inflightRef.current = controller;
 
-    const history = buildHistory(activeConversation?.turns ?? []);
+    const history = buildHistory(activeConversationRef.current?.turns ?? []);
 
     setActiveTurns((prev) => [...prev, makeTurn('user', question)]);
     setPending(true);
@@ -399,7 +407,10 @@ export function useChat(): UseChatResult {
       inflightRef.current = null;
       setPending(false);
     }
-  };
+    // Empty deps: every closed-over value is either a ref (activeConversationRef,
+    // inflightRef) or a setState setter (setActiveTurns/setPending), both stable
+    // across renders regardless — see the comment on activeConversationRef above.
+  }, []);
 
   const cancel = () => {
     inflightRef.current?.abort();

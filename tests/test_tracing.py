@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from api.metrics import traces_evicted_total
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievedChunk
 from api.tracing import QueryTrace, TraceStore, build_trace_candidates
@@ -131,6 +132,19 @@ def test_trace_store_prunes_oldest_beyond_retention_limit() -> None:
     assert store.get("t0") is None
     assert store.get("t5") is not None
     assert len(store.list_traces()) == 5
+
+
+def test_trace_store_eviction_increments_the_metric() -> None:
+    """Eviction was previously silent — an operator had no way to see trace history
+    vanishing at the retention cap. Guards docrag_traces_evicted_total."""
+
+    before = traces_evicted_total._value.get()
+    store = TraceStore(max_retained=5)
+    for i in range(8):
+        store.add(_trace(f"t{i}"))
+
+    after = traces_evicted_total._value.get()
+    assert after - before == 3
 
 
 def test_build_trace_candidates_marks_selected_and_expanded_chunks() -> None:

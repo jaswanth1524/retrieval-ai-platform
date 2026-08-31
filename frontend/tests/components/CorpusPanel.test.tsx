@@ -43,6 +43,60 @@ describe('CorpusPanel', () => {
     expect(items[1]).toHaveTextContent('61 chunks');
   });
 
+  it('appends page count, size, and upload time to the detail line when present', () => {
+    setup({
+      filenames: ['a.txt'],
+      chunkCounts: { 'a.txt': 3 },
+      pageCounts: { 'a.txt': 2 },
+      byteSizes: { 'a.txt': 1024 * 1024 },
+      uploadedAts: { 'a.txt': Date.now() / 1000 },
+    });
+
+    const item = screen.getByTestId('corpus-panel-item');
+    expect(item).toHaveTextContent('3 chunks');
+    expect(item).toHaveTextContent('2 pages');
+    expect(item).toHaveTextContent('1.0 MB');
+    expect(item).toHaveTextContent('just now');
+  });
+
+  it('omits page/size/upload-time from the detail line for a filename missing that metadata', () => {
+    // The pre-existing case: a filename ingested before this metadata was stamped
+    // has none of these fields in the response at all.
+    setup({ filenames: ['legacy.txt'], chunkCounts: { 'legacy.txt': 1 } });
+
+    const item = screen.getByTestId('corpus-panel-item');
+    expect(item).toHaveTextContent('1 chunks');
+    expect(item.textContent).not.toContain('page');
+    expect(item.textContent).not.toContain('MB');
+  });
+
+  it('renders no search box when there are no documents', () => {
+    setup();
+    expect(screen.queryByTestId('corpus-panel-search')).not.toBeInTheDocument();
+  });
+
+  it('filters the document list by a substring match, case-insensitively', async () => {
+    setup({
+      filenames: ['contract.pdf', 'invoice.txt', 'README.md'],
+      chunkCounts: { 'contract.pdf': 3, 'invoice.txt': 1, 'README.md': 2 },
+    });
+
+    await userEvent.type(screen.getByTestId('corpus-panel-search'), 'read');
+
+    const items = screen.getAllByTestId('corpus-panel-item');
+    expect(items).toHaveLength(1);
+    expect(items[0]).toHaveTextContent('README.md');
+  });
+
+  it('shows a no-match message and no cards when the filter matches nothing', async () => {
+    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 } });
+
+    await userEvent.type(screen.getByTestId('corpus-panel-search'), 'zzz');
+
+    expect(screen.queryAllByTestId('corpus-panel-item')).toHaveLength(0);
+    expect(screen.getByText('No documents match "zzz".')).toBeInTheDocument();
+  });
+
   it('clicking delete shows an inline confirm, and confirming calls onDelete once', async () => {
     const props = setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 } });
 

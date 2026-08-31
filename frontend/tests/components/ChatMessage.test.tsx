@@ -259,4 +259,181 @@ describe('ChatMessage', () => {
 
     expect(screen.queryByTestId('chat-message-retry')).not.toBeInTheDocument();
   });
+
+  it('renders a Regenerate button on a successful answer and re-asks its question', async () => {
+    const onRetry = vi.fn();
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'The answer is 42.' })}
+        engineerMode={false}
+        onRetry={onRetry}
+        regenerateQuestion="What is the answer?"
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('chat-message-regenerate'));
+
+    expect(onRetry).toHaveBeenCalledWith('What is the answer?');
+  });
+
+  it('renders no Regenerate button without a regenerateQuestion', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'The answer is 42.' })}
+        engineerMode={false}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId('chat-message-regenerate')).not.toBeInTheDocument();
+  });
+
+  it('renders no Regenerate button on the turn actively streaming', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Partial' })}
+        engineerMode={false}
+        onRetry={vi.fn()}
+        regenerateQuestion="What is the answer?"
+        streamStage="generating answer…"
+      />,
+    );
+
+    expect(screen.queryByTestId('chat-message-regenerate')).not.toBeInTheDocument();
+  });
+
+  it('renders no Regenerate button on a user or error turn', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'user', content: 'What is the answer?' })}
+        engineerMode={false}
+        onRetry={vi.fn()}
+        regenerateQuestion="unused"
+      />,
+    );
+
+    expect(screen.queryByTestId('chat-message-regenerate')).not.toBeInTheDocument();
+  });
+
+  describe('feedback', () => {
+    it('renders no feedback buttons when feedbackEnabled is not set', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'The answer is 42.', traceId: 't1' })}
+          engineerMode={false}
+          regenerateQuestion="What is the answer?"
+          onFeedback={vi.fn()}
+        />,
+      );
+
+      expect(screen.queryByTestId('chat-message-feedback-up')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('chat-message-feedback-down')).not.toBeInTheDocument();
+    });
+
+    it('reports a full payload on a thumbs-up click, then disables both buttons', async () => {
+      const onFeedback = vi.fn();
+      render(
+        <ChatMessage
+          turn={makeTurn({
+            role: 'assistant',
+            content: 'The answer is 42 [1].',
+            traceId: 'trace-1',
+            sources: [
+              { source_number: 1, filename: 'doc.pdf', page: 3, section: 'Intro', chunk_id: 'c1', text: '' },
+            ],
+          })}
+          engineerMode={false}
+          regenerateQuestion="What is the answer?"
+          feedbackEnabled
+          onFeedback={onFeedback}
+        />,
+      );
+
+      await userEvent.click(screen.getByTestId('chat-message-feedback-up'));
+
+      expect(onFeedback).toHaveBeenCalledWith({
+        rating: 'up',
+        question: 'What is the answer?',
+        answerExcerpt: 'The answer is 42 [1].',
+        citedFilenames: ['doc.pdf'],
+        traceId: 'trace-1',
+      });
+      expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
+      expect(screen.getByTestId('chat-message-feedback-down')).toBeDisabled();
+      expect(screen.getByTestId('chat-message-feedback-up')).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    it('is a one-shot action — a second click on either button does not call onFeedback again', async () => {
+      const onFeedback = vi.fn();
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'Answer.' })}
+          engineerMode={false}
+          regenerateQuestion="Q"
+          feedbackEnabled
+          onFeedback={onFeedback}
+        />,
+      );
+
+      await userEvent.click(screen.getByTestId('chat-message-feedback-down'));
+      await userEvent.click(screen.getByTestId('chat-message-feedback-up'));
+
+      expect(onFeedback).toHaveBeenCalledTimes(1);
+      expect(onFeedback).toHaveBeenCalledWith(expect.objectContaining({ rating: 'down' }));
+    });
+
+    it('renders no feedback buttons on the turn actively streaming', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'Partial' })}
+          engineerMode={false}
+          regenerateQuestion="Q"
+          feedbackEnabled
+          onFeedback={vi.fn()}
+          streamStage="generating answer…"
+        />,
+      );
+
+      expect(screen.queryByTestId('chat-message-feedback-up')).not.toBeInTheDocument();
+    });
+
+    it('renders no feedback buttons without a regenerateQuestion (no traceable question to attach)', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'Answer.' })}
+          engineerMode={false}
+          feedbackEnabled
+          onFeedback={vi.fn()}
+        />,
+      );
+
+      expect(screen.queryByTestId('chat-message-feedback-up')).not.toBeInTheDocument();
+    });
+
+    it('deduplicates repeated citations of the same filename in citedFilenames', async () => {
+      const onFeedback = vi.fn();
+      render(
+        <ChatMessage
+          turn={makeTurn({
+            role: 'assistant',
+            content: 'Answer [1][2].',
+            sources: [
+              { source_number: 1, filename: 'doc.pdf', page: 1, section: 'A', chunk_id: 'c1', text: '' },
+              { source_number: 2, filename: 'doc.pdf', page: 2, section: 'B', chunk_id: 'c2', text: '' },
+            ],
+          })}
+          engineerMode={false}
+          regenerateQuestion="Q"
+          feedbackEnabled
+          onFeedback={onFeedback}
+        />,
+      );
+
+      await userEvent.click(screen.getByTestId('chat-message-feedback-up'));
+
+      expect(onFeedback).toHaveBeenCalledWith(
+        expect.objectContaining({ citedFilenames: ['doc.pdf'] }),
+      );
+    });
+  });
 });

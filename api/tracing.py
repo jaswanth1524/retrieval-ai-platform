@@ -16,6 +16,7 @@ from threading import Lock
 from typing import Literal, Protocol
 
 from api.generation import ChatMessage
+from api.metrics import traces_evicted_total
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievedChunk
 
@@ -108,6 +109,7 @@ class TraceStore:
             self._traces.move_to_end(trace.trace_id)
             while len(self._traces) > self._max_retained:
                 self._traces.popitem(last=False)
+                traces_evicted_total.inc()
 
     def get(self, trace_id: str) -> QueryTrace | None:
         """Return a snapshot of a trace, or None if unknown/evicted.

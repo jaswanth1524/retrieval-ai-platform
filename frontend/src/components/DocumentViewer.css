@@ -90,3 +90,21 @@
 .document-viewer__error {
   color: var(--bad);
 }
+
+.document-viewer__load-more,
+.document-viewer__show-all {
+  align-self: center;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--rule);
+  border-radius: 0.4rem;
+  background: var(--card);
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.document-viewer__load-more:hover,
+.document-viewer__show-all:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}

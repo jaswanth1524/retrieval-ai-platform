@@ -766,6 +766,14 @@ class IngestService:
 
         sections = parse_document_bytes(filename, content, self._settings)
         chunks = chunk_sections(sections, self._settings, self._token_counter)
+        # Stamped here (not in chunk_sections) because this is the first point in the
+        # pipeline that has both the raw upload's byte count and the upload instant —
+        # chunking itself works purely from parsed text.
+        upload_stamp = time.time()
+        upload_size = len(content)
+        chunks = [
+            replace(chunk, byte_size=upload_size, uploaded_at=upload_stamp) for chunk in chunks
+        ]
         logger.info(
             "Chunked %s into %d chunks (chunker v%d).",
             sections[0].filename,

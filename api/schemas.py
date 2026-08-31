@@ -64,6 +64,7 @@ class PublicConfigResponse(BaseModel):
     rerank_top_k_limit: int
     max_context_chunks_limit: int
     llm_temperature_max: float
+    feedback_enabled: bool
 
 
 class DocumentIngestResponse(BaseModel):
@@ -100,6 +101,12 @@ class DocumentListResponse(BaseModel):
 
     filenames: list[str]
     chunk_counts: dict[str, int] = {}
+    page_counts: dict[str, int] = {}
+    # A filename ingested before byte_size/uploaded_at were stamped at ingest time
+    # (api.documents.DocumentChunk) is simply absent from these two — not present with
+    # a null value — since neither field exists in any of its points' payloads.
+    byte_sizes: dict[str, int] = {}
+    uploaded_ats: dict[str, float] = {}
 
 
 class DocumentDeleteResponse(BaseModel):
@@ -107,6 +114,30 @@ class DocumentDeleteResponse(BaseModel):
 
     filename: str
     points_deleted: int
+
+
+class FeedbackRequest(BaseModel):
+    """A thumbs up/down rating of an assistant answer, optionally one citation.
+
+    Denormalized rather than trace_id-only: the client already holds the question,
+    answer, and cited filenames for the turn being rated, and TraceStore's ring
+    buffer can evict trace_id before this ever reaches durable storage.
+    """
+
+    trace_id: str | None = None
+    question: str = Field(min_length=1, max_length=4000)
+    answer_excerpt: str = Field(min_length=1, max_length=2000)
+    cited_filenames: list[str] = Field(default_factory=list, max_length=50)
+    rating: Literal["up", "down"]
+    # Set only when the rating targets one specific citation (its [n] source_number
+    # as shown in the answer), rather than the answer as a whole.
+    citation_source_number: int | None = Field(default=None, ge=1)
+
+
+class FeedbackResponse(BaseModel):
+    """Confirmation that a feedback rating was recorded."""
+
+    id: str
 
 
 class DocumentChunkResponse(BaseModel):

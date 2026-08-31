@@ -115,14 +115,24 @@ class DocumentChunk:
     chunk_id: str
     text: str
     ordinal: int = 1
+    # Document-level metadata, the same value stamped onto every chunk of one ingest
+    # (redundant per-point storage, same tradeoff as `filename` itself) — set by
+    # IngestService.ingest, which is the first place both the upload time and the raw
+    # byte count are known. None on chunks built directly in tests/other call sites
+    # that skip that stamping, and permanently None on points ingested before this
+    # field existed (their stored payload simply lacks the key).
+    byte_size: int | None = None
+    uploaded_at: float | None = None
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
+    PAYLOAD_BYTE_SIZE_KEY: ClassVar[str] = "byte_size"
+    PAYLOAD_UPLOADED_AT_KEY: ClassVar[str] = "uploaded_at"
 
-    def to_payload(self) -> dict[str, str | int]:
+    def to_payload(self) -> dict[str, str | int | float]:
         """Return the Qdrant payload shape needed for grounded citations."""
 
-        return {
+        payload: dict[str, str | int | float] = {
             "filename": self.filename,
             "page": self.page,
             "section": self.section,
@@ -130,6 +140,11 @@ class DocumentChunk:
             self.PAYLOAD_TEXT_KEY: self.text,
             self.PAYLOAD_ORDINAL_KEY: self.ordinal,
         }
+        if self.byte_size is not None:
+            payload[self.PAYLOAD_BYTE_SIZE_KEY] = self.byte_size
+        if self.uploaded_at is not None:
+            payload[self.PAYLOAD_UPLOADED_AT_KEY] = self.uploaded_at
+        return payload
 
 
 def parse_document_bytes(

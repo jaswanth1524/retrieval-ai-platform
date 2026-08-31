@@ -17,19 +17,33 @@ question_stage_seconds = Histogram(
 
 questions_total = Counter(
     "docrag_questions_total",
-    "Total questions answered, labeled by outcome.",
-    labelnames=("outcome",),
+    "Total questions answered, labeled by outcome and (for outcome=error) error_type.",
+    labelnames=("outcome", "error_type"),
 )
 
 ingest_jobs_total = Counter(
     "docrag_ingest_jobs_total",
-    "Total background ingestion jobs, labeled by outcome.",
-    labelnames=("outcome",),
+    "Total background ingestion jobs, labeled by outcome and (for outcome=failed) error_type.",
+    labelnames=("outcome", "error_type"),
 )
 
 ingest_chunks_total = Counter(
     "docrag_ingest_chunks_total",
     "Total document chunks successfully indexed.",
+)
+
+# error_type is "" for non-error outcomes — sum(...) by (outcome) still aggregates
+# cleanly across it, and a scraper only cares about the breakdown on the error path.
+NO_ERROR_TYPE = ""
+
+ingest_jobs_evicted_total = Counter(
+    "docrag_ingest_jobs_evicted_total",
+    "Ingest jobs silently dropped from the in-memory store past its retention cap.",
+)
+
+traces_evicted_total = Counter(
+    "docrag_traces_evicted_total",
+    "Query traces silently dropped from the in-memory ring buffer past its retention cap.",
 )
 
 

@@ -53,7 +53,9 @@ CITATION_RETRY_REMINDER = (
 )
 
 # Phrases that signal the model already declared the context insufficient — a valid
-# no-citation answer that must not trigger a citation retry.
+# no-citation answer that must not trigger a citation retry. Matched against
+# _normalize_negation'd text, so only spelled-out forms need to be listed here;
+# contractions ("don't", "can't") are expanded to match before comparison.
 _INSUFFICIENCY_HINTS = (
     "enough information",
     "insufficient",
@@ -61,6 +63,21 @@ _INSUFFICIENCY_HINTS = (
     "does not contain",
     "cannot answer",
 )
+
+
+def _normalize_negation(text: str) -> str:
+    """Expand contractions so hint matching doesn't require every surface form.
+
+    Order matters: ``can't`` is irregular (the generic rule alone would produce
+    "ca not"), so it's special-cased before the generic ``n't`` -> " not" rule runs.
+    The generic rule also mangles irregular contractions outside our hint vocabulary
+    (``won't`` -> "wo not", ``shan't`` -> "sha not") but none of _INSUFFICIENCY_HINTS
+    is reachable through a mangled stem, so those false expansions are harmless.
+    """
+
+    text = text.replace("’", "'")  # curly apostrophe, common in LLM output
+    text = re.sub(r"\bcan't\b", "cannot", text)
+    return re.sub(r"n't\b", " not", text)
 
 
 class GenerationError(RuntimeError):
@@ -442,7 +459,7 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 
     if source_count <= 0 or _CITATION_RE.search(answer):
         return False
-    lowered = answer.lower()
+    lowered = _normalize_negation(answer.lower())
     return not any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
 
 

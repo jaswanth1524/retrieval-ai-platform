@@ -6,7 +6,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 from qdrant_client import QdrantClient, models
 
-from api.repository import VectorRepository, reciprocal_rank_fusion
+from api.repository import DocumentMetadata, VectorRepository, reciprocal_rank_fusion
 from api.settings import AppSettings
 
 
@@ -38,20 +38,31 @@ def scored_point(chunk_id: str, score: float) -> models.ScoredPoint:
     )
 
 
-def make_point(point_id: str, filename: str) -> models.PointStruct:
+def make_point(
+    point_id: str,
+    filename: str,
+    page: int = 1,
+    byte_size: int | None = None,
+    uploaded_at: float | None = None,
+) -> models.PointStruct:
+    payload: dict[str, str | int | float] = {
+        "filename": filename,
+        "page": page,
+        "section": "Intro",
+        "chunk_id": point_id,
+        "text": "hello",
+    }
+    if byte_size is not None:
+        payload["byte_size"] = byte_size
+    if uploaded_at is not None:
+        payload["uploaded_at"] = uploaded_at
     return models.PointStruct(
         id=str(uuid5(NAMESPACE_URL, point_id)),
         vector={
             "dense": [0.1, 0.2, 0.3],
             "sparse": models.SparseVector(indices=[1], values=[0.5]),
         },
-        payload={
-            "filename": filename,
-            "page": 1,
-            "section": "Intro",
-            "chunk_id": point_id,
-            "text": "hello",
-        },
+        payload=payload,
     )
 
 
@@ -177,6 +188,54 @@ def test_vector_repository_filename_chunk_counts_empty_for_empty_collection() ->
     repository.ensure_ready(settings)
 
     assert repository.filename_chunk_counts(settings) == {}
+
+
+def test_vector_repository_filename_metadata_aggregates_page_count_and_stamped_fields() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(
+        settings,
+        [
+            make_point("p1", "guide.md", page=1, byte_size=2048, uploaded_at=1700000000.0),
+            make_point("p2", "guide.md", page=3, byte_size=2048, uploaded_at=1700000000.0),
+            make_point("p3", "guide.md", page=2, byte_size=2048, uploaded_at=1700000000.0),
+        ],
+    )
+
+    metadata = repository.filename_metadata(settings)
+
+    assert metadata == {
+        "guide.md": DocumentMetadata(
+            chunk_count=3, page_count=3, byte_size=2048, uploaded_at=1700000000.0
+        )
+    }
+
+
+def test_vector_repository_filename_metadata_nulls_stamped_fields_for_legacy_points() -> None:
+    """A point ingested before byte_size/uploaded_at existed has neither key in its
+    payload at all — this must not crash, and both fields must come back None rather
+    than some default like 0."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(settings, [make_point("p1", "old.md", page=1)])
+
+    metadata = repository.filename_metadata(settings)
+
+    assert metadata["old.md"] == DocumentMetadata(
+        chunk_count=1, page_count=1, byte_size=None, uploaded_at=None
+    )
+
+
+def test_vector_repository_filename_metadata_empty_for_empty_collection() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.ensure_ready(settings)
+
+    assert repository.filename_metadata(settings) == {}
 
 
 def make_ordinal_point(

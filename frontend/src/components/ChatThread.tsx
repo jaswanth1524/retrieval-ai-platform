@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { CitationResponse } from '../api/types';
-import ChatMessage, { type ChatTurn } from './ChatMessage';
+import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
 
@@ -10,6 +10,8 @@ interface ChatThreadProps {
   engineerMode: boolean;
   currentModelLabel?: string;
   onRetry?: (question: string) => void;
+  feedbackEnabled?: boolean;
+  onFeedback?: (payload: FeedbackPayload) => void;
   onOpenSource?: (filename: string, chunkId: string) => void;
   onCitationHover?: (citation: CitationResponse) => void;
   onCitationLeave?: () => void;
@@ -20,12 +22,27 @@ interface ChatThreadProps {
 // scrolled up to re-read is not yanked back down.
 const PIN_THRESHOLD_PX = 48;
 
+// The question a "Regenerate" click on an assistant turn should re-ask. Read from the
+// nearest preceding user turn by array position rather than stored on the assistant
+// turn itself — turns are strictly alternating in the normal flow, but searching
+// backward is also correct if an error turn ever lands in between, and it avoids
+// growing the persisted localStorage v2 chat-history schema for a value that's always
+// reconstructible from position.
+function findPrecedingUserQuestion(turns: ChatTurn[], index: number): string | undefined {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (turns[i].role === 'user') return turns[i].content;
+  }
+  return undefined;
+}
+
 function ChatThread({
   turns,
   pending,
   engineerMode,
   currentModelLabel,
   onRetry,
+  feedbackEnabled,
+  onFeedback,
   onOpenSource,
   onCitationHover,
   onCitationLeave,
@@ -97,7 +114,7 @@ function ChatThread({
       data-testid="chat-thread"
     >
       <div className="chat-thread__rail">
-        {turns.map((turn) => (
+        {turns.map((turn, index) => (
           <ChatMessage
             key={turn.id}
             turn={turn}
@@ -105,6 +122,11 @@ function ChatThread({
             currentModelLabel={currentModelLabel}
             streamStage={pending && turn.id === lastTurn?.id && turn.role === 'assistant' ? 'generating answer…' : undefined}
             onRetry={onRetry}
+            regenerateQuestion={
+              turn.role === 'assistant' ? findPrecedingUserQuestion(turns, index) : undefined
+            }
+            feedbackEnabled={feedbackEnabled}
+            onFeedback={onFeedback}
             onOpenSource={onOpenSource}
             onCitationHover={onCitationHover}
             onCitationLeave={onCitationLeave}

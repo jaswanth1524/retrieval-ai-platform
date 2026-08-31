@@ -191,6 +191,20 @@ def test_ingest_service_parses_chunks_and_indexes_them() -> None:
     assert outcome.collection_name == "pipeline_documents"
 
 
+def test_ingest_service_stamps_byte_size_and_upload_time_on_every_chunk() -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    service = IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings)
+    content = b"Intro\nalpha beta"
+
+    service.ingest("guide.txt", content)
+
+    metadata = repository.filename_metadata(settings)["guide.txt"]
+    assert metadata.byte_size == len(content)
+    assert metadata.uploaded_at is not None
+    assert metadata.uploaded_at > 0
+
+
 def test_rag_pipeline_answers_from_ingested_document() -> None:
     settings = make_settings()
     client = QdrantClient(":memory:")

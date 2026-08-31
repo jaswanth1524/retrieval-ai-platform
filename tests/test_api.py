@@ -6,6 +6,7 @@ import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,12 +27,27 @@ from api.dependencies import (
     get_reranker,
     get_token_counter,
 )
+from api.documents import EmptyDocumentError
 from api.embeddings import EmbeddedText
-from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
-from api.ingestion import filename_write_lock
-from api.main import create_app, run_model_warmup
-from api.qdrant_schema import EMBEDDING_MODEL_TAG_KEY, dense_vectors_config, sparse_vectors_config
+from api.generation import ChatMessage, GenerationConfigError, GenerationError, LiteLLMGenerator
+from api.ingestion import IngestionError, filename_write_lock
+from api.jobs import SqliteIngestJobStore
+from api.main import (
+    _ingest_error_type,
+    _job_error_message,
+    _question_error_type,
+    create_app,
+    run_model_warmup,
+)
+from api.qdrant_schema import (
+    EMBEDDING_MODEL_TAG_KEY,
+    CollectionSchemaError,
+    VectorStoreUnavailableError,
+    dense_vectors_config,
+    sparse_vectors_config,
+)
 from api.reranking import RerankingError
+from api.retrieval import RetrievalConfigError, RetrievalError, RetrievalPayloadError
 from api.settings import AppSettings
 
 
@@ -823,6 +839,58 @@ def test_document_job_status_returns_404_for_unknown_job(api_context: ApiTestCon
     assert "does-not-exist" in response.json()["detail"]
 
 
+def test_sqlite_job_store_backend_survives_a_real_upload_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end proof the job_store_backend="sqlite" DI wiring actually works, not
+    just SqliteIngestJobStore in isolation: upload through the real API, then open a
+    brand-new store instance pointed at the same file — simulating the process
+    restarting between the ingest completing and the client's next poll — and confirm
+    the job is still readable.
+
+    get_ingest_job_store() (api/dependencies.py) reads settings via a direct
+    get_app_settings() call, not FastAPI's Depends — same as the warmup tests above,
+    that call has to be patched at the name each module actually holds.
+    """
+
+    clear_dependency_caches()
+    db_path = str(tmp_path / "jobs.db")
+    settings = make_settings(job_store_backend="sqlite", job_store_path=db_path)
+    qdrant = QdrantClient(":memory:")
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+
+    try:
+        with TestClient(app) as client:
+            status = _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")
+        assert status["state"] == "done"
+        job_id = status["job_id"]
+    finally:
+        # Undo the monkeypatches now (not at test end) so clear_dependency_caches()
+        # below calls the real, cache_clear-bearing get_app_settings — it resolves
+        # that name through this module's own dependencies.py, which is still patched
+        # to a bare lambda until this point.
+        monkeypatch.undo()
+        clear_dependency_caches()
+
+    # A fresh store instance, as a new process would create — proves persistence,
+    # not just that the same in-memory object answered its own question.
+    reloaded_store = SqliteIngestJobStore(path=db_path, max_retained=50)
+    reloaded = reloaded_store.get(job_id)
+    assert reloaded is not None
+    assert reloaded.state == "done"
+    assert reloaded.result == status["result"]
+
+
 def test_list_documents_returns_indexed_filenames(api_context: ApiTestContext) -> None:
     assert _upload_and_wait(api_context.client, "a.txt", b"alpha")["state"] == "done"
     assert _upload_and_wait(api_context.client, "b.txt", b"beta")["state"] == "done"
@@ -831,6 +899,19 @@ def test_list_documents_returns_indexed_filenames(api_context: ApiTestContext) -
 
     assert response.status_code == 200
     assert response.json()["filenames"] == ["a.txt", "b.txt"]
+
+
+def test_list_documents_includes_page_count_and_upload_metadata(
+    api_context: ApiTestContext,
+) -> None:
+    content = b"alpha beta gamma"
+    assert _upload_and_wait(api_context.client, "a.txt", content)["state"] == "done"
+
+    body = api_context.client.get("/documents").json()
+
+    assert body["page_counts"]["a.txt"] == 1
+    assert body["byte_sizes"]["a.txt"] == len(content)
+    assert body["uploaded_ats"]["a.txt"] > 0
 
 
 def test_list_documents_empty_for_no_uploads(api_context: ApiTestContext) -> None:
@@ -921,6 +1002,142 @@ def test_document_content_returns_404_for_unknown_filename(api_context: ApiTestC
     response = api_context.client.get("/documents/missing.md/content")
 
     assert response.status_code == 404
+
+
+def test_document_original_returns_404_when_raw_storage_is_off(
+    api_context: ApiTestContext,
+) -> None:
+    """raw_document_dir is unset by default (make_settings() doesn't set it) — the
+    same 404 a client would get for a genuinely unknown filename, not a distinct
+    "feature unavailable" response."""
+
+    assert _upload_and_wait(api_context.client, "guide.txt", b"alpha")["state"] == "done"
+
+    response = api_context.client.get("/documents/guide.txt/original")
+
+    assert response.status_code == 404
+
+
+def test_document_original_returns_the_exact_uploaded_bytes_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: raw_document_dir set -> upload -> GET .../original returns the
+    identical bytes, and deleting the document removes the stored original too.
+
+    get_raw_document_store() (api/dependencies.py) reads settings via a direct
+    get_app_settings() call, not FastAPI's Depends — same pattern as the sqlite job
+    store test above, so the patch has to target the name each module actually holds.
+    """
+
+    clear_dependency_caches()
+    settings = make_settings(raw_document_dir=str(tmp_path))
+    qdrant = QdrantClient(":memory:")
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+
+    content = b"the exact original bytes\nwith a newline"
+    try:
+        with TestClient(app) as client:
+            assert _upload_and_wait(client, "guide.txt", content)["state"] == "done"
+
+            response = client.get("/documents/guide.txt/original")
+            assert response.status_code == 200
+            assert response.content == content
+            assert 'filename="guide.txt"' in response.headers["content-disposition"]
+
+            delete_response = client.delete("/documents/guide.txt")
+            assert delete_response.status_code == 200
+
+            after_delete = client.get("/documents/guide.txt/original")
+            assert after_delete.status_code == 404
+    finally:
+        monkeypatch.undo()
+        clear_dependency_caches()
+
+
+def test_feedback_returns_404_when_disabled(api_context: ApiTestContext) -> None:
+    # feedback_enabled is False by default (make_settings() doesn't set it) — same
+    # 404 shape as any other absent route, not a distinct "feature unavailable" body.
+    response = api_context.client.post(
+        "/feedback",
+        json={"question": "q", "answer_excerpt": "a", "rating": "up"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_feedback_records_a_rating_and_survives_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: feedback_enabled=True -> POST /feedback -> a brand-new
+    FeedbackStore instance pointed at the same file can read it back — simulating a
+    process restart between submission and any later inspection of the data.
+
+    get_feedback_store() (api/dependencies.py) reads settings via a direct
+    get_app_settings() call, not FastAPI's Depends — same pattern as the sqlite job
+    store and raw-document-store tests above.
+    """
+
+    clear_dependency_caches()
+    db_path = str(tmp_path / "feedback.db")
+    settings = make_settings(feedback_enabled=True, feedback_store_path=db_path)
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: QdrantClient(":memory:")
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/feedback",
+                json={
+                    "trace_id": "trace-1",
+                    "question": "What is DocRAG?",
+                    "answer_excerpt": "A self-hostable document Q&A system [1].",
+                    "cited_filenames": ["docrag.md"],
+                    "rating": "up",
+                    "citation_source_number": 1,
+                },
+            )
+            assert response.status_code == 201
+            feedback_id = response.json()["id"]
+    finally:
+        monkeypatch.undo()
+        clear_dependency_caches()
+
+    from api.feedback import FeedbackStore
+
+    reloaded = FeedbackStore(db_path).list_recent()
+    assert len(reloaded) == 1
+    assert reloaded[0].id == feedback_id
+    assert reloaded[0].question == "What is DocRAG?"
+    assert reloaded[0].cited_filenames == ["docrag.md"]
+    assert reloaded[0].citation_source_number == 1
+
+
+def test_feedback_rejects_an_invalid_rating(api_context: ApiTestContext) -> None:
+    response = api_context.client.post(
+        "/feedback",
+        json={"question": "q", "answer_excerpt": "a", "rating": "sideways"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_metrics_endpoint_exposes_prometheus_text(api_context: ApiTestContext) -> None:
@@ -1258,4 +1475,43 @@ def test_api_key_non_ascii_configured_key_matches_utf8_header() -> None:
 
     assert matching.status_code == 200, matching.text
     assert mismatched.status_code == 401, mismatched.text
+
+
+def test_job_error_message_keeps_known_domain_error_text() -> None:
+    exc = EmptyDocumentError("Document has no extractable text to chunk.")
+    assert _job_error_message(exc) == "Document has no extractable text to chunk."
+
+
+def test_job_error_message_redacts_unexpected_exception_text() -> None:
+    """An exception type the ingest path never anticipated (a bare KeyError, an SDK
+    internal error, ...) may carry a path/config value in its str() — that must not
+    reach the client verbatim; the logger.warning at the raise site keeps the detail
+    server-side."""
+
+    exc = ValueError("unexpected: /internal/config/path leaked here")
+    message = _job_error_message(exc)
+    assert message == "Ingestion failed due to an unexpected server error."
+    assert "/internal/config/path" not in message
+
+
+def test_ingest_error_type_classifies_known_domain_errors() -> None:
+    assert _ingest_error_type(EmptyDocumentError("x")) == "document"
+    assert _ingest_error_type(IngestionError("x")) == "ingestion"
+    assert _ingest_error_type(VectorStoreUnavailableError("x")) == "vector_store_unavailable"
+    assert _ingest_error_type(CollectionSchemaError("x")) == "collection_schema"
+    assert _ingest_error_type(ValueError("x")) == "unexpected"
+
+
+def test_question_error_type_prefers_the_most_specific_subclass() -> None:
+    """RetrievalPayloadError/RetrievalConfigError and GenerationConfigError are
+    subclasses of RetrievalError/GenerationError respectively — a parent-first check
+    would misclassify every subclass instance as its broader parent."""
+
+    assert _question_error_type(RetrievalPayloadError("x")) == "retrieval_payload"
+    assert _question_error_type(RetrievalConfigError("x")) == "retrieval_config"
+    assert _question_error_type(RetrievalError("x")) == "retrieval"
+    assert _question_error_type(GenerationConfigError("x")) == "generation_config"
+    assert _question_error_type(GenerationError("x")) == "generation"
+    assert _question_error_type(RerankingError("x")) == "reranking"
+    assert _question_error_type(ValueError("x")) == "unexpected"
 

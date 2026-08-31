@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Protocol
 
-from fastapi import Depends, FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -22,6 +23,7 @@ from starlette.staticfiles import StaticFiles
 from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
+    get_feedback_store,
     get_ingest_executor,
     get_ingest_job_store,
     get_ingest_service,
@@ -29,18 +31,21 @@ from api.dependencies import (
     get_qdrant_client,
     get_qdrant_reachability_checker,
     get_rag_pipeline,
+    get_raw_document_store,
     get_reranker,
     get_trace_store,
     get_vector_repository,
     require_api_key,
 )
-from api.documents import DocumentError, DocumentNotFoundError
+from api.documents import DocumentError, DocumentNotFoundError, normalize_filename
 from api.embeddings import EmbeddedText, EmbeddingError
+from api.feedback import FeedbackStore
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
 from api.ingestion import IngestionError, filename_write_lock
-from api.jobs import IngestJobStore, JobNotFoundError
+from api.jobs import JobNotFoundError, JobStore
 from api.logging_config import configure_logging
 from api.metrics import (
+    NO_ERROR_TYPE,
     ingest_chunks_total,
     ingest_jobs_total,
     observe_question_timings,
@@ -48,9 +53,10 @@ from api.metrics import (
 )
 from api.pipeline import AnswerOverrides, IngestService, RagPipeline
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
+from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.reranking import RerankingError
-from api.retrieval import RetrievalError, RetrievalPayloadError
+from api.retrieval import RetrievalConfigError, RetrievalError, RetrievalPayloadError
 from api.schemas import (
     REQUEST_MAX_CONTEXT_CHUNKS_MAX,
     REQUEST_RERANK_TOP_K_MAX,
@@ -63,6 +69,8 @@ from api.schemas import (
     DocumentJobAcceptedResponse,
     DocumentJobStatusResponse,
     DocumentListResponse,
+    FeedbackRequest,
+    FeedbackResponse,
     HealthResponse,
     HistoryMessageRequest,
     PromptMessageResponse,
@@ -92,7 +100,9 @@ QdrantCheckDep = Annotated[
     Callable[[QdrantClient], bool], Depends(get_qdrant_reachability_checker)
 ]
 VectorRepositoryDep = Annotated[VectorRepository, Depends(get_vector_repository)]
-IngestJobStoreDep = Annotated[IngestJobStore, Depends(get_ingest_job_store)]
+IngestJobStoreDep = Annotated[JobStore, Depends(get_ingest_job_store)]
+RawDocumentStoreDep = Annotated[RawDocumentStore | None, Depends(get_raw_document_store)]
+FeedbackStoreDep = Annotated[FeedbackStore | None, Depends(get_feedback_store)]
 IngestExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_ingest_executor)]
 TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
 
@@ -231,8 +241,70 @@ def create_app() -> FastAPI:
     return app
 
 
+# Domain errors IngestService.ingest can actually raise (documents.py's DocumentError
+# tree, ingestion.py, embeddings.py, qdrant_schema.py) — these carry a message that's
+# safe and useful to return to a polling client. Anything else is an exception the
+# ingest path wasn't built to anticipate, so its str() may carry internal detail
+# (a path, a config value) that shouldn't leave the server; it gets a generic message
+# instead, with the real detail already captured by the logger.warning below.
+_INGEST_USER_FACING_ERRORS: tuple[type[Exception], ...] = (
+    DocumentError,
+    IngestionError,
+    EmbeddingError,
+    CollectionSchemaError,
+    VectorStoreUnavailableError,
+)
+
+
+def _job_error_message(exc: Exception) -> str:
+    if isinstance(exc, _INGEST_USER_FACING_ERRORS):
+        return str(exc)
+    return "Ingestion failed due to an unexpected server error."
+
+
+def _ingest_error_type(exc: Exception) -> str:
+    """Coarse error_type label for docrag_ingest_jobs_total{outcome="failed"}."""
+
+    if isinstance(exc, DocumentError):
+        return "document"
+    if isinstance(exc, IngestionError):
+        return "ingestion"
+    if isinstance(exc, EmbeddingError):
+        return "embedding"
+    if isinstance(exc, CollectionSchemaError):
+        return "collection_schema"
+    if isinstance(exc, VectorStoreUnavailableError):
+        return "vector_store_unavailable"
+    return "unexpected"
+
+
+# Ordered most-specific-first: several of these are subclasses of one another
+# (RetrievalPayloadError/RetrievalConfigError < RetrievalError,
+# GenerationConfigError < GenerationError), so a parent check must not run first.
+_QUESTION_ERROR_TYPES: tuple[tuple[type[Exception], str], ...] = (
+    (RetrievalPayloadError, "retrieval_payload"),
+    (RetrievalConfigError, "retrieval_config"),
+    (RetrievalError, "retrieval"),
+    (GenerationConfigError, "generation_config"),
+    (GenerationError, "generation"),
+    (RerankingError, "reranking"),
+    (EmbeddingError, "embedding"),
+    (VectorStoreUnavailableError, "vector_store_unavailable"),
+    (CollectionSchemaError, "collection_schema"),
+)
+
+
+def _question_error_type(exc: Exception) -> str:
+    """Coarse error_type label for docrag_questions_total{outcome="error"}."""
+
+    for exc_type, label in _QUESTION_ERROR_TYPES:
+        if isinstance(exc, exc_type):
+            return label
+    return "unexpected"
+
+
 def _run_ingest_job(
-    job_store: IngestJobStore,
+    job_store: JobStore,
     job_id: str,
     ingest_service: IngestService,
     filename: str,
@@ -254,11 +326,11 @@ def _run_ingest_job(
         outcome = ingest_service.ingest(filename, content, on_progress)
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
-        ingest_jobs_total.labels(outcome="failed").inc()
-        job_store.update(job_id, state="failed", error=str(exc))
+        ingest_jobs_total.labels(outcome="failed", error_type=_ingest_error_type(exc)).inc()
+        job_store.update(job_id, state="failed", error=_job_error_message(exc))
         return
 
-    ingest_jobs_total.labels(outcome="done").inc()
+    ingest_jobs_total.labels(outcome="done", error_type=NO_ERROR_TYPE).inc()
     ingest_chunks_total.inc(outcome.chunks_ingested)
     job_store.update(
         job_id,
@@ -480,8 +552,22 @@ def register_routes(app: FastAPI) -> None:
     def list_documents(
         repository: VectorRepositoryDep, settings: SettingsDep
     ) -> DocumentListResponse:
-        counts = repository.filename_chunk_counts(settings)
-        return DocumentListResponse(filenames=sorted(counts), chunk_counts=counts)
+        metadata = repository.filename_metadata(settings)
+        return DocumentListResponse(
+            filenames=sorted(metadata),
+            chunk_counts={name: meta.chunk_count for name, meta in metadata.items()},
+            page_counts={name: meta.page_count for name, meta in metadata.items()},
+            byte_sizes={
+                name: meta.byte_size
+                for name, meta in metadata.items()
+                if meta.byte_size is not None
+            },
+            uploaded_ats={
+                name: meta.uploaded_at
+                for name, meta in metadata.items()
+                if meta.uploaded_at is not None
+            },
+        )
 
     @app.post(
         "/documents",
@@ -494,10 +580,13 @@ def register_routes(app: FastAPI) -> None:
         settings: SettingsDep,
         job_store: IngestJobStoreDep,
         executor: IngestExecutorDep,
+        raw_store: RawDocumentStoreDep,
         file: Annotated[UploadFile, File()],
     ) -> DocumentJobAcceptedResponse:
         content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
         filename = file.filename or ""
+        if raw_store is not None:
+            raw_store.save(filename, content)
         job = job_store.create(filename)
         # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
         # it survives independently of this request/response cycle — the client can
@@ -511,7 +600,10 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def delete_document(
-        filename: str, repository: VectorRepositoryDep, settings: SettingsDep
+        filename: str,
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        raw_store: RawDocumentStoreDep,
     ) -> DocumentDeleteResponse:
         # Filenames are always basenames (normalize_filename strips any path
         # component at upload time), so a plain path segment is sufficient — a
@@ -521,12 +613,15 @@ def register_routes(app: FastAPI) -> None:
         # Same lock the ingest path takes: snapshot-then-delete is a read-modify-write,
         # so without it a delete landing between a concurrent ingest's upsert and its
         # stale-cleanup would remove the points that ingest just wrote, and the ingest
-        # would still report success.
+        # would still report success. The raw copy (when stored) is removed under the
+        # same lock, or a deleted document's original bytes would accumulate forever.
         with filename_write_lock(filename):
             point_ids = repository.point_ids_for_filename(settings, filename)
             if not point_ids:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
             repository.delete_by_ids(settings, point_ids)
+            if raw_store is not None:
+                raw_store.delete(filename)
         return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
 
     # Guarded like its sibling document routes: the response carries the filename (and
@@ -572,6 +667,48 @@ def register_routes(app: FastAPI) -> None:
         chunks = [_content_chunk(payload) for payload in payloads]
         return DocumentContentResponse(filename=filename, chunks=chunks)
 
+    # Guarded at least as strictly as GET /documents/{filename}/content above: raw
+    # original bytes are strictly more sensitive than derived chunk text. Returns 404
+    # both when raw_document_dir is unset (feature off) and when it's set but this
+    # particular filename predates the feature or was never stored — the client sees
+    # the same "not found" either way, not a distinct "feature unavailable" state.
+    @app.get("/documents/{filename}/original", dependencies=[Depends(require_api_key)])
+    def document_original(filename: str, raw_store: RawDocumentStoreDep) -> Response:
+        content = raw_store.read(filename) if raw_store is not None else None
+        if content is None:
+            raise DocumentNotFoundError(f"No stored original for '{filename}'.")
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        safe_filename = normalize_filename(filename)
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+        )
+
+    # Off by default (AppSettings.feedback_enabled) — a deployment that hasn't
+    # opted in gets the same 404 shape as any other absent route, not a distinct
+    # "feature unavailable" response.
+    @app.post(
+        "/feedback",
+        response_model=FeedbackResponse,
+        status_code=201,
+        dependencies=[Depends(require_api_key)],
+    )
+    def submit_feedback(
+        request: FeedbackRequest, feedback_store: FeedbackStoreDep
+    ) -> FeedbackResponse:
+        if feedback_store is None:
+            raise HTTPException(status_code=404, detail="Feedback capture is not enabled.")
+        feedback = feedback_store.add(
+            trace_id=request.trace_id,
+            question=request.question,
+            answer_excerpt=request.answer_excerpt,
+            cited_filenames=request.cited_filenames,
+            rating=request.rating,
+            citation_source_number=request.citation_source_number,
+        )
+        return FeedbackResponse(id=feedback.id)
+
     @app.get("/traces", response_model=TraceListResponse, dependencies=[Depends(require_api_key)])
     def list_traces(trace_store: TraceStoreDep) -> TraceListResponse:
         return TraceListResponse(
@@ -608,10 +745,10 @@ def register_routes(app: FastAPI) -> None:
                 filenames=request.filenames,
                 history=_history_messages(request.history),
             )
-        except Exception:
-            questions_total.labels(outcome="error").inc()
+        except Exception as exc:
+            questions_total.labels(outcome="error", error_type=_question_error_type(exc)).inc()
             raise
-        questions_total.labels(outcome="ok").inc()
+        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
         if grounded.timings is not None:
             timings = _timings_dict(grounded.timings)
             observe_question_timings(timings)
@@ -662,7 +799,7 @@ def register_routes(app: FastAPI) -> None:
                     history=_history_messages(request.history),
                 ):
                     if event["type"] == "done":
-                        questions_total.labels(outcome="ok").inc()
+                        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
                         observe_question_timings(event["timings"])
                         _log_question(
                             provider=request.llm_provider,
@@ -671,7 +808,9 @@ def register_routes(app: FastAPI) -> None:
                         )
                     yield _sse_event(dict(event))
             except Exception as exc:
-                questions_total.labels(outcome="error").inc()
+                questions_total.labels(
+                    outcome="error", error_type=_question_error_type(exc)
+                ).inc()
                 yield _sse_event({"type": "error", "detail": str(exc)})
 
         return StreamingResponse(event_source(), media_type="text/event-stream")
@@ -703,6 +842,7 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         rerank_top_k_limit=min(REQUEST_RERANK_TOP_K_MAX, int(settings.fused_top_n)),
         max_context_chunks_limit=REQUEST_MAX_CONTEXT_CHUNKS_MAX,
         llm_temperature_max=REQUEST_TEMPERATURE_MAX,
+        feedback_enabled=settings.feedback_enabled,
     )
 
 
