@@ -209,7 +209,7 @@ local because it needs models, a corpus, and (for `answer`) an LLM.
 - `api/generation.py`: grounded prompt construction, conversation-history condensing, and LiteLLM generation/streaming adapter for Ollama/OpenAI.
 - `api/pipeline.py`: orchestrates retrieve → rerank → generate and parse → chunk → embed → index behind single calls.
 - `api/tracing.py`: in-memory per-query debug trace store.
-- `api/jobs.py`: in-memory background job tracking for document ingestion.
+- `api/jobs.py`: background job tracking for document ingestion — in-memory by default, or sqlite-backed (surviving a restart) when `JOB_STORE_BACKEND=sqlite`.
 - `api/provider_health.py`: reachability probes for Qdrant and Ollama, used by `/health/ready` and `/config`.
 - `api/metrics.py`: Prometheus counters/histograms for question and ingest latency (`GET /metrics`).
 - `api/main.py`: the FastAPI app — health/readiness, config, document upload/listing/deletion/job-status, trace, and question-answering (including streaming) endpoints.

@@ -12,6 +12,7 @@ export default defineConfig({
       '/documents': 'http://localhost:8000',
       '/questions': 'http://localhost:8000',
       '/traces': 'http://localhost:8000',
+      '/feedback': 'http://localhost:8000',
     },
   },
   test: {

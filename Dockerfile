@@ -23,6 +23,14 @@ COPY --from=frontend-build /frontend/dist ./frontend/dist
 # runtime (WARMUP_MODELS or the first real query both trigger a model download).
 RUN useradd --create-home --uid 1000 app
 ENV HOME=/home/app
+# /app/data is where JOB_STORE_PATH, RAW_DOCUMENT_DIR and FEEDBACK_STORE_PATH all
+# default to, and it must exist in the image owned by `app` for either of the two
+# ways it gets used to work: without a mount, the running (non-root) process cannot
+# mkdir it inside root-owned /app; with the docker-compose volume mounted here,
+# Docker seeds a new named volume from the image directory — including its
+# ownership — so a root-owned or absent /app/data yields a volume the process
+# cannot write either.
+RUN mkdir -p /app/data && chown app:app /app/data
 USER app
 
 EXPOSE 8000

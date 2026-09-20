@@ -126,3 +126,64 @@ describe('DocumentViewer', () => {
     });
   });
 });
+
+describe('DocumentViewer dialog behaviour', () => {
+  // This component declared role="dialog" aria-modal="true" while implementing none of
+  // what that promises — it had an Escape listener and nothing else. These pin the
+  // three behaviours useDialog provides, which the other two modals already had.
+  it('moves focus into the panel on open', async () => {
+    getContentMock.mockResolvedValue(CONTENT);
+
+    render(<DocumentViewer filename="guide.md" chunkId={null} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByTestId('viewer-chunk')).toHaveLength(2));
+
+    expect(screen.getByTestId('viewer-close')).toHaveFocus();
+  });
+
+  it('restores focus to whatever opened it on close', async () => {
+    getContentMock.mockResolvedValue(CONTENT);
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+
+    const { unmount } = render(<DocumentViewer filename="guide.md" chunkId={null} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByTestId('viewer-chunk')).toHaveLength(2));
+    expect(opener).not.toHaveFocus();
+
+    unmount();
+
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
+  it('traps Tab inside the dialog', async () => {
+    // A document big enough to window, so the panel has the Load-earlier/later and
+    // Show-all buttons too — with only a close button, first === last and any wrap
+    // assertion passes whether or not a trap exists.
+    getContentMock.mockResolvedValue({
+      filename: 'big.md',
+      chunks: Array.from({ length: 200 }, (_, i) => ({
+        chunk_id: `c${i}`,
+        page: 1,
+        section: 'S',
+        text: `Chunk ${i}.`,
+        chunk_ordinal: i,
+      })),
+    });
+
+    render(<DocumentViewer filename="big.md" chunkId="c100" onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('viewer-load-earlier')).toBeInTheDocument());
+
+    // Shift+Tab off the first focusable wraps to the last one rather than escaping to
+    // the page behind the modal.
+    expect(screen.getByTestId('viewer-close')).toHaveFocus();
+    await userEvent.tab({ shift: true });
+
+    const focusables = Array.from(
+      screen.getByRole('dialog').querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'),
+    );
+    // Otherwise first === last and the wrap assertion below passes without a trap.
+    expect(focusables.length).toBeGreaterThan(1);
+    expect(document.activeElement).toBe(focusables[focusables.length - 1]);
+  });
+});

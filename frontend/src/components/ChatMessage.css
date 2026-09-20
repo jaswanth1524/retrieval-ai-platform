@@ -204,3 +204,19 @@
   padding: 3px 10px;
   cursor: pointer;
 }
+
+/* Screen-reader-only announcement of answer progress. The answer text itself is not a
+   live region: it mutates on every SSE delta, and a polite region over that re-reads
+   the whole answer on each token, which is worse than silence. This announces the
+   discrete state changes instead. */
+.chat-message__status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

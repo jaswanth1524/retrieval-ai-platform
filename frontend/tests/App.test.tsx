@@ -282,6 +282,79 @@ describe('App', () => {
     expect(await screen.findByTestId('trace-tab')).toBeInTheDocument();
   });
 
+  it('releases a pinned trace when the conversation changes', async () => {
+    // pinnedTraceId was set when a trace row was clicked and cleared only by toggling
+    // the inspector shut. inspectedTraceId falls back to it whenever the turns array
+    // no longer contains a matching turn — so after switching conversations the
+    // Retrieval/Trace tabs kept rendering the previous conversation's trace while the
+    // Sources tab (which reads the live turn) correctly went empty.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: [], chunk_counts: {} });
+        if (url.endsWith('/traces')) {
+          return jsonResponse({
+            traces: [
+              {
+                trace_id: 'trace-42',
+                created_at: Date.now() / 1000,
+                question: 'What is in the guide?',
+                mode: 'stream',
+                status: 'ok',
+                llm_provider: 'ollama',
+                total_ms: 2310,
+                candidate_count: 12,
+                kept_count: 6,
+              },
+            ],
+          });
+        }
+        if (url.includes('/traces/trace-42')) {
+          return jsonResponse({
+            trace_id: 'trace-42',
+            created_at: 0,
+            question: 'What is in the guide?',
+            mode: 'stream',
+            status: 'ok',
+            config: null,
+            candidates: [],
+            prompt_messages: null,
+            answer: 'answer',
+            cited_source_numbers: [],
+            timings: {
+              embed_ms: 20,
+              search_ms: 30,
+              rerank_ms: 400,
+              generate_ms: 1800,
+              total_ms: 2310,
+              condense_ms: 0,
+              query_expansion_ms: 0,
+              context_expansion_ms: 0,
+            },
+            error: null,
+          });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+
+    await userEvent.click(screen.getByTestId('rail-traces'));
+    await userEvent.click(await screen.findByTestId('traces-panel-row'));
+    expect(await screen.findByTestId('trace-tab')).toBeInTheDocument();
+
+    // Start a fresh conversation: the pinned trace belongs to the turns we just left.
+    await userEvent.click(screen.getByTestId('rail-chat'));
+    await userEvent.click(screen.getByTestId('context-panel-action'));
+
+    expect(screen.queryByTestId('trace-tab')).not.toBeInTheDocument();
+  });
+
   it('does not fetch the trace — and does not show it as evicted — while the answer is still streaming', async () => {
     // Regression test for a real bug found via live end-to-end testing against real
     // Ollama generation (a real gap of several seconds between events, which a

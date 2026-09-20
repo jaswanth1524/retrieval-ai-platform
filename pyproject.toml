@@ -78,8 +78,10 @@ strict = true
 warn_unreachable = true
 warn_unused_configs = true
 
-# Third-party document parsers without bundled type stubs.
+# Third-party document parsers without bundled type stubs. grpc is here for the same
+# reason: it ships none, and it's only touched to classify Qdrant gRPC transport
+# failures (api/main.py's vector_store_transport_handler).
 [[tool.mypy.overrides]]
-module = ["docx.*", "bs4.*", "pdfplumber.*", "rapidocr_onnxruntime.*"]
+module = ["docx.*", "bs4.*", "pdfplumber.*", "rapidocr_onnxruntime.*", "grpc.*"]
 ignore_missing_imports = true
 

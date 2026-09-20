@@ -27,6 +27,13 @@
   border-bottom: 1px solid var(--rule);
 }
 
+/* .palette__input clears its own outline and has no border, so the focus cue lives on
+   the row. useDialog's Tab trap cycles focus back here from the result list, and
+   without this there was nothing at all to show it had landed. */
+.palette__search:focus-within {
+  border-bottom-color: var(--accent);
+}
+
 .palette__search-glyph {
   color: var(--dim);
   font-size: 14px;

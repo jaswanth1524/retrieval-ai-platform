@@ -152,6 +152,15 @@ function ChatMessage({
             A
           </span>
           <div className="chat-message__answer">
+            <span className="chat-message__status" role="status">
+              {streamStage !== undefined
+                ? showSkeleton
+                  ? streamStage
+                  : 'Answer streaming.'
+                : turn.content
+                  ? 'Answer ready.'
+                  : ''}
+            </span>
             {showSkeleton ? (
               <StreamingSkeleton stage={streamStage} />
             ) : (

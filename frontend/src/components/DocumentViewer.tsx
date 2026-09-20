@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
 import type { DocumentChunkResponse } from '../api/types';
+import { useDialog } from '../hooks/useDialog';
 import './DocumentViewer.css';
 
 interface DocumentViewerProps {
@@ -49,13 +50,12 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
     return () => controller.abort();
   }, [filename]);
 
-  useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [onClose]);
+  // Same hook the command palette and settings modal use. This component declared
+  // role="dialog" aria-modal="true" while only handling Escape — no focus moved in on
+  // open, no Tab trap, no focus restored to the citation that opened it. The hook
+  // re-queries focusables on every Tab, which matters here because the chunk list (and
+  // its Load-earlier/later buttons) only exists after the fetch resolves.
+  const dialogRef = useDialog(true, onClose);
 
   const targetIndex = useMemo(
     () => (chunks && chunkId !== null ? chunks.findIndex((c) => c.chunk_id === chunkId) : -1),
@@ -92,7 +92,13 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
   }, [visibleChunks, chunkId]);
 
   return (
-    <div className="document-viewer" role="dialog" aria-modal="true" aria-label={`Source: ${filename}`}>
+    <div
+      className="document-viewer"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Source: ${filename}`}
+      ref={dialogRef}
+    >
       <div className="document-viewer__backdrop" data-testid="viewer-backdrop" onClick={onClose} />
       <div className="document-viewer__panel">
         <div className="document-viewer__header">
