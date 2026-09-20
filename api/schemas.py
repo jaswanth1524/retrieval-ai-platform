@@ -20,6 +20,11 @@ REQUEST_TEMPERATURE_MAX = 2.0
 REQUEST_HISTORY_MAX_MESSAGES = 12
 REQUEST_HISTORY_MESSAGE_MAX_CHARS = 4000
 
+# Upper bound on the per-request search scope. Generous relative to any realistic
+# self-hosted corpus — this exists to stop an unbounded client-supplied list, not to
+# constrain legitimate scoping.
+REQUEST_FILENAMES_MAX = 500
+
 
 class HealthResponse(BaseModel):
     """Health check response."""
@@ -138,6 +143,28 @@ class FeedbackResponse(BaseModel):
     """Confirmation that a feedback rating was recorded."""
 
     id: str
+
+
+FEEDBACK_LIST_MAX_LIMIT = 500
+
+
+class FeedbackItemResponse(BaseModel):
+    """One recorded rating, as stored — the denormalized row, not a trace_id join."""
+
+    id: str
+    trace_id: str | None
+    question: str
+    answer_excerpt: str
+    cited_filenames: list[str]
+    rating: Literal["up", "down"]
+    citation_source_number: int | None
+    created_at: float
+
+
+class FeedbackListResponse(BaseModel):
+    """Recently recorded ratings, newest first."""
+
+    feedback: list[FeedbackItemResponse]
 
 
 class DocumentChunkResponse(BaseModel):
@@ -275,8 +302,13 @@ class QuestionRequest(BaseModel):
         default=None, ge=REQUEST_TEMPERATURE_MIN, le=REQUEST_TEMPERATURE_MAX
     )
     # Restricts retrieval to these documents only, when given. None/omitted searches
-    # the whole collection — the pre-existing behavior.
-    filenames: list[str] | None = Field(default=None, min_length=1)
+    # the whole collection — the pre-existing behavior. Capped like every other
+    # list-valued request field here: it becomes a Qdrant MatchAny filter that gets
+    # rebuilt once per query variant when query expansion is on, so an unbounded list
+    # is unbounded server-side work driven entirely by the client.
+    filenames: list[str] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
+    )
     # Prior turns of the conversation, oldest first. None/omitted (the pre-existing
     # behavior) skips the condense step entirely — the server itself stores no
     # conversation state, the client resends what it wants remembered each request.

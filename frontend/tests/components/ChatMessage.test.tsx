@@ -437,3 +437,59 @@ describe('ChatMessage', () => {
     });
   });
 });
+
+describe('ChatMessage answer-progress announcement', () => {
+  // The answer text itself is deliberately NOT a live region: it mutates on every SSE
+  // delta, and a polite region over that re-reads the whole answer per token. These
+  // pin the discrete states a screen reader is actually told about instead.
+  it('announces the stage while waiting, then that the answer is ready', () => {
+    const { rerender } = render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: '' })}
+        engineerMode={false}
+        streamStage="retrieving…"
+      />,
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent('retrieving…');
+
+    // Tokens have started landing: still streaming, but the stage skeleton is gone.
+    rerender(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Partial ans' })}
+        engineerMode={false}
+        streamStage="generating…"
+      />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Answer streaming.');
+
+    // Stream finished: streamStage goes undefined.
+    rerender(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Complete answer [1].' })}
+        engineerMode={false}
+      />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Answer ready.');
+  });
+
+  it('does not put the answer text itself in a live region', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Complete answer [1].' })}
+        engineerMode={false}
+      />,
+    );
+
+    // The status node carries the announcement; the markdown node must not, or every
+    // delta re-reads the entire answer.
+    expect(screen.getByRole('status')).not.toHaveTextContent('Complete answer');
+    expect(document.querySelector('.chat-message__markdown')).not.toHaveAttribute('aria-live');
+  });
+
+  it('gives a user turn no status region at all', () => {
+    render(<ChatMessage turn={makeTurn({ role: 'user', content: 'Hi' })} engineerMode={false} />);
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+});

@@ -12,12 +12,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Protocol
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+import grpc
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException
 from starlette.staticfiles import StaticFiles
 
 from api.dependencies import (
@@ -58,6 +60,7 @@ from api.repository import VectorRepository
 from api.reranking import RerankingError
 from api.retrieval import RetrievalConfigError, RetrievalError, RetrievalPayloadError
 from api.schemas import (
+    FEEDBACK_LIST_MAX_LIMIT,
     REQUEST_MAX_CONTEXT_CHUNKS_MAX,
     REQUEST_RERANK_TOP_K_MAX,
     REQUEST_TEMPERATURE_MAX,
@@ -69,6 +72,8 @@ from api.schemas import (
     DocumentJobAcceptedResponse,
     DocumentJobStatusResponse,
     DocumentListResponse,
+    FeedbackItemResponse,
+    FeedbackListResponse,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
@@ -301,6 +306,50 @@ def _question_error_type(exc: Exception) -> str:
         if isinstance(exc, exc_type):
             return label
     return "unexpected"
+
+
+# Derived from _QUESTION_ERROR_TYPES above, which now has two jobs: it orders the
+# metric labels AND decides which messages are safe to return. Adding a type there for
+# labeling silently widens what the streaming route is allowed to send verbatim, so
+# only add types whose str() is an authored, client-safe message.
+#
+# The same domain errors register_exception_handlers maps to authored status codes, so
+# their str() is already what a client sees on the synchronous /questions route. The
+# streaming route needs this set spelled out separately: /questions lets an unanticipated
+# exception fall through to Starlette's default 500 ("Internal Server Error", nothing
+# leaked), but /questions/stream has already committed a 200 by the time it can fail, so
+# it must catch everything — and without an allowlist that means putting an arbitrary
+# str(exc) (a path, a config value) on the wire.
+_QUESTION_USER_FACING_ERRORS: tuple[type[Exception], ...] = tuple(
+    exc_type for exc_type, _ in _QUESTION_ERROR_TYPES
+)
+
+
+# The gRPC status codes that mean "couldn't reach it / gave up waiting" rather than
+# "it answered and said no" — the gRPC-transport equivalent of the REST client's
+# ResponseHandlingException.
+_GRPC_UNAVAILABLE_CODES = frozenset(
+    {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+)
+
+
+def _is_vector_store_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, ResponseHandlingException):
+        return True
+    # grpc.RpcError itself declares no code(); the concrete _InactiveRpcError raised in
+    # practice does, so probe rather than assume.
+    code = getattr(exc, "code", None)
+    return callable(code) and code() in _GRPC_UNAVAILABLE_CODES
+
+
+def _question_error_message(exc: Exception) -> str:
+    if isinstance(exc, _QUESTION_USER_FACING_ERRORS):
+        return str(exc)
+    # A raw transport failure carries no authored message, but "unexpected server
+    # error" would hide an actionable cause the synchronous route names properly.
+    if _is_vector_store_unavailable(exc):
+        return "The vector store is unavailable. Try again shortly."
+    return "The question could not be answered due to an unexpected server error."
 
 
 def _run_ingest_job(
@@ -585,9 +634,14 @@ def register_routes(app: FastAPI) -> None:
     ) -> DocumentJobAcceptedResponse:
         content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
         filename = file.filename or ""
+        # Both of these are synchronous and can do real I/O — raw_store.save is a
+        # write_bytes of up to max_upload_bytes (50 MB by default) and job_store.create
+        # is a sqlite INSERT under JOB_STORE_BACKEND=sqlite. This handler is async, so
+        # calling them directly would block the event loop for that whole duration and
+        # stall every other in-flight request, including other users' streamed answers.
         if raw_store is not None:
-            raw_store.save(filename, content)
-        job = job_store.create(filename)
+            await run_in_threadpool(raw_store.save, filename, content)
+        job = await run_in_threadpool(job_store.create, filename)
         # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
         # it survives independently of this request/response cycle — the client can
         # disconnect and poll the job later without interrupting the work.
@@ -709,6 +763,36 @@ def register_routes(app: FastAPI) -> None:
         )
         return FeedbackResponse(id=feedback.id)
 
+    # The read side of the same feature: without it, captured ratings are reachable
+    # only by opening the sqlite file by hand, which defeats the point of capturing
+    # them (thumbs-down turns are meant to become negative retrieval examples).
+    @app.get(
+        "/feedback",
+        response_model=FeedbackListResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    def list_feedback(
+        feedback_store: FeedbackStoreDep,
+        limit: Annotated[int, Query(ge=1, le=FEEDBACK_LIST_MAX_LIMIT)] = 100,
+    ) -> FeedbackListResponse:
+        if feedback_store is None:
+            raise HTTPException(status_code=404, detail="Feedback capture is not enabled.")
+        return FeedbackListResponse(
+            feedback=[
+                FeedbackItemResponse(
+                    id=item.id,
+                    trace_id=item.trace_id,
+                    question=item.question,
+                    answer_excerpt=item.answer_excerpt,
+                    cited_filenames=item.cited_filenames,
+                    rating=item.rating,
+                    citation_source_number=item.citation_source_number,
+                    created_at=item.created_at,
+                )
+                for item in feedback_store.list_recent(limit)
+            ]
+        )
+
     @app.get("/traces", response_model=TraceListResponse, dependencies=[Depends(require_api_key)])
     def list_traces(trace_store: TraceStoreDep) -> TraceListResponse:
         return TraceListResponse(
@@ -811,7 +895,8 @@ def register_routes(app: FastAPI) -> None:
                 questions_total.labels(
                     outcome="error", error_type=_question_error_type(exc)
                 ).inc()
-                yield _sse_event({"type": "error", "detail": str(exc)})
+                logger.warning("Streamed question failed: %s", exc, exc_info=True)
+                yield _sse_event({"type": "error", "detail": _question_error_message(exc)})
 
         return StreamingResponse(event_source(), media_type="text/event-stream")
 
@@ -856,6 +941,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RetrievalError, bad_request_handler)
     app.add_exception_handler(CollectionSchemaError, conflict_handler)
     app.add_exception_handler(VectorStoreUnavailableError, service_unavailable_handler)
+    app.add_exception_handler(ResponseHandlingException, vector_store_transport_handler)
+    # grpcio is a hard dependency of qdrant-client and nothing else here speaks gRPC,
+    # so this is effectively "any Qdrant gRPC failure" despite the broad type.
+    app.add_exception_handler(grpc.RpcError, vector_store_transport_handler)
     app.add_exception_handler(GenerationConfigError, bad_request_handler)
     app.add_exception_handler(GenerationError, bad_gateway_handler)
     app.add_exception_handler(RerankingError, bad_gateway_handler)
@@ -887,6 +976,42 @@ async def service_unavailable_handler(request: Request, exc: Exception) -> JSONR
     """Return a 503 response when a required backing service is unreachable."""
 
     return error_response(503, exc)
+
+
+async def vector_store_transport_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Map a raw Qdrant transport failure to 503 instead of a bare 500.
+
+    Two gaps, one handler. First, VectorRepository.hybrid_search translates
+    ResponseHandlingException into VectorStoreUnavailableError itself but no other
+    repository method does, and ensure_ready can't cover for them because
+    ensure_collection caches success per client — so an outage starting after the
+    first successful request made GET /documents, GET /documents/{f}/content and
+    DELETE /documents/{f} return bare 500s.
+
+    Second, and found only by running this against a real container: those existing
+    translations are REST-only. Under QDRANT_PREFER_GRPC=true — which docker-compose
+    sets by default — an unreachable Qdrant raises grpc.RpcError, which
+    ResponseHandlingException never matches, so even /questions returned a bare 500 on
+    the project's own default deployment path.
+
+    Messages are fixed rather than str(exc): this is a blanket handler over an
+    exception type the app doesn't own, so it also catches bugs that merely surface as
+    one, where naming the vector store as the cause would be wrong. The real cause is
+    logged.
+    """
+
+    logger.warning("Vector store transport failure: %s", exc, exc_info=True)
+    if _is_vector_store_unavailable(exc):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "The vector store is unavailable. Try again shortly."},
+        )
+    # A gRPC error that isn't a transport failure (a malformed query, say) is a bug,
+    # not an outage — still redacted and logged, but not mislabeled as unavailability.
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "The request failed due to an unexpected vector store error."},
+    )
 
 
 async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:

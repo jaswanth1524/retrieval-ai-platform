@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import grpc
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -1515,3 +1516,256 @@ def test_question_error_type_prefers_the_most_specific_subclass() -> None:
     assert _question_error_type(RerankingError("x")) == "reranking"
     assert _question_error_type(ValueError("x")) == "unexpected"
 
+
+
+class _FakeInactiveRpcError(grpc.RpcError):
+    """Stands in for grpc._channel._InactiveRpcError, which has no public constructor.
+
+    The handler probes for a callable .code() rather than the private concrete class,
+    so this reproduces exactly what it keys on.
+    """
+
+    def __init__(self, code: object) -> None:
+        self._code = code
+
+    def code(self) -> object:
+        return self._code
+
+
+class StreamRaisingGenerator:
+    """Generator whose stream() raises on first iteration, i.e. mid-response.
+
+    The raise lands inside RagPipeline.answer_stream, after /questions/stream has
+    already committed its 200 — the exact window the SSE error frame exists for.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        raise self._exc
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Any:
+        raise self._exc
+        yield ""  # unreachable; makes this a generator function
+
+
+def _stream_error_detail(api_context: ApiTestContext, exc: Exception) -> str:
+    status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert status["state"] == "done"
+    api_context.app.dependency_overrides[get_generator] = lambda: StreamRaisingGenerator(exc)
+
+    response = api_context.client.post("/questions/stream", json={"question": "alpha"})
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    assert events[-1]["type"] == "error"
+    detail = events[-1]["detail"]
+    assert isinstance(detail, str)
+    return detail
+
+
+def test_question_stream_redacts_an_unexpected_exception(api_context: ApiTestContext) -> None:
+    """/questions can let an unanticipated exception fall through to Starlette's
+    default 500, which leaks nothing. /questions/stream cannot — its 200 is already
+    committed — so it catches everything, and without an allowlist that meant putting
+    an arbitrary str(exc) on the wire.
+    """
+
+    detail = _stream_error_detail(
+        api_context, ValueError("unexpected: /internal/config/path leaked here")
+    )
+
+    assert detail == "The question could not be answered due to an unexpected server error."
+    assert "/internal/config/path" not in detail
+
+
+def test_question_stream_keeps_a_known_domain_error_message(
+    api_context: ApiTestContext,
+) -> None:
+    """The redaction must not swallow the messages that are useful and safe — these
+    are the same types register_exception_handlers already returns verbatim on the
+    synchronous route."""
+
+    detail = _stream_error_detail(
+        api_context, GenerationError("Cannot reach Ollama at http://localhost:11434.")
+    )
+
+    assert detail == "Cannot reach Ollama at http://localhost:11434."
+
+
+def test_documents_returns_503_not_500_when_qdrant_drops_after_startup(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only VectorRepository.hybrid_search translates ResponseHandlingException into
+    VectorStoreUnavailableError; filename_metadata and friends let it escape. ensure_ready
+    can't cover for them either, because ensure_collection caches success per client — so
+    an outage that starts after the first successful request was a bare 500 here while
+    /questions correctly reported 503.
+    """
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+
+    def fail_connection(*args: object, **kwargs: object) -> Any:
+        raise ResponseHandlingException(ConnectionError("connection refused"))
+
+    monkeypatch.setattr(api_context.qdrant, "scroll", fail_connection)
+
+    response = api_context.client.get("/documents")
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert isinstance(detail, str)
+    # Fixed message, not str(exc): this is a blanket handler, so it also catches a bug
+    # that merely surfaces as this type, where naming the cause would be wrong.
+    assert "connection refused" not in detail
+
+
+def test_feedback_list_returns_404_when_disabled(api_context: ApiTestContext) -> None:
+    assert api_context.client.get("/feedback").status_code == 404
+
+
+def test_feedback_list_rejects_an_out_of_range_limit(api_context: ApiTestContext) -> None:
+    assert api_context.client.get("/feedback", params={"limit": 0}).status_code == 422
+    assert api_context.client.get("/feedback", params={"limit": 100000}).status_code == 422
+
+
+def test_feedback_list_returns_recorded_ratings_newest_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read side of the feature: FeedbackStore.list_recent was implemented and
+    tested but had no route, so captured ratings were reachable only by opening the
+    sqlite file by hand."""
+
+    clear_dependency_caches()
+    db_path = str(tmp_path / "feedback.db")
+    settings = make_settings(feedback_enabled=True, feedback_store_path=db_path)
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: QdrantClient(":memory:")
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+
+    try:
+        with TestClient(app) as client:
+            for rating in ("up", "down"):
+                assert (
+                    client.post(
+                        "/feedback",
+                        json={
+                            "trace_id": f"trace-{rating}",
+                            "question": f"question {rating}",
+                            "answer_excerpt": f"answer {rating} [1].",
+                            "cited_filenames": ["docrag.md"],
+                            "rating": rating,
+                        },
+                    ).status_code
+                    == 201
+                )
+
+            listed = client.get("/feedback").json()["feedback"]
+            limited = client.get("/feedback", params={"limit": 1}).json()["feedback"]
+    finally:
+        monkeypatch.undo()
+        clear_dependency_caches()
+
+    assert [item["rating"] for item in listed] == ["down", "up"]
+    assert listed[0]["question"] == "question down"
+    assert listed[0]["cited_filenames"] == ["docrag.md"]
+    assert listed[0]["trace_id"] == "trace-down"
+    assert listed[0]["citation_source_number"] is None
+    assert len(limited) == 1
+
+
+def test_question_rejects_a_filenames_scope_above_the_cap(
+    api_context: ApiTestContext,
+) -> None:
+    """filenames becomes a Qdrant MatchAny filter rebuilt once per query variant under
+    query expansion, so an unbounded list is unbounded server work the client chooses.
+    Both sibling list fields in QuestionRequest are already capped."""
+
+    response = api_context.client.post(
+        "/questions",
+        json={"question": "alpha", "filenames": [f"doc-{i}.txt" for i in range(501)]},
+    )
+
+    assert response.status_code == 422
+
+
+def test_metrics_endpoint_exposes_the_question_and_ingest_series(
+    api_context: ApiTestContext,
+) -> None:
+    """The prior test asserted only a 200 and a content-type, so it would have passed
+    against every counter being mislabeled or never incremented — which matters now
+    that outcome/error_type labels exist on both counters."""
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert api_context.client.post("/questions", json={"question": "alpha"}).status_code == 200
+
+    body = api_context.client.get("/metrics").text
+
+    assert 'docrag_questions_total{error_type="",outcome="ok"}' in body
+    assert 'docrag_ingest_jobs_total{error_type="",outcome="done"}' in body
+    for stage in ("embed", "search", "rerank", "generate", "total"):
+        assert f'docrag_question_stage_seconds_sum{{stage="{stage}"}}' in body
+
+
+def test_question_stream_names_the_vector_store_when_it_is_unreachable(
+    api_context: ApiTestContext,
+) -> None:
+    """A raw transport failure carries no authored message, so the generic redaction
+    would report "unexpected server error" for something the synchronous route names
+    properly — hiding an actionable cause from anyone watching the stream."""
+
+    detail = _stream_error_detail(api_context, _FakeInactiveRpcError(grpc.StatusCode.UNAVAILABLE))
+
+    assert detail == "The vector store is unavailable. Try again shortly."
+
+
+def test_documents_returns_503_when_qdrant_grpc_is_unavailable(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by running against a real container, not by reading the code: the
+    existing ResponseHandlingException translations are REST-only. docker-compose sets
+    QDRANT_PREFER_GRPC=true, and on that path an unreachable Qdrant raises
+    grpc.RpcError instead — which ResponseHandlingException never matches, so even
+    /questions returned a bare 500 on the project's own default deployment.
+    """
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+
+    def fail_grpc(*args: object, **kwargs: object) -> Any:
+        raise _FakeInactiveRpcError(grpc.StatusCode.UNAVAILABLE)
+
+    monkeypatch.setattr(api_context.qdrant, "scroll", fail_grpc)
+
+    response = api_context.client.get("/documents")
+
+    assert response.status_code == 503
+    assert "The vector store is unavailable" in response.json()["detail"]
+
+
+def test_a_non_transport_grpc_error_is_a_redacted_500_not_a_false_503(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler is blanket over a type the app doesn't own, so it also catches bugs
+    that merely surface as gRPC errors. Those are still redacted and logged, but must
+    not be reported as the vector store being down."""
+
+    _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+
+    def fail_grpc(*args: object, **kwargs: object) -> Any:
+        raise _FakeInactiveRpcError(grpc.StatusCode.INVALID_ARGUMENT)
+
+    monkeypatch.setattr(api_context.qdrant, "scroll", fail_grpc)
+
+    response = api_context.client.get("/documents")
+
+    assert response.status_code == 500
+    assert "unavailable" not in response.json()["detail"]

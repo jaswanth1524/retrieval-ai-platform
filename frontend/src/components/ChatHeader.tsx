@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { ChatTurn } from './ChatMessage';
-import { chatToJson, chatToMarkdown, downloadFile } from '../utils/exportChat';
+import { chatToMarkdown, downloadFile } from '../utils/exportChat';
 import './ChatHeader.css';
 
 export type ChatMode = 'reader' | 'engineer';
@@ -32,12 +32,11 @@ function ChatHeader({
 }: ChatHeaderProps) {
   const [confirmingClear, setConfirmingClear] = useState(false);
 
-  const handleExport = (format: 'markdown' | 'json') => {
-    if (format === 'markdown') {
-      downloadFile('docrag-chat.md', 'text/markdown', chatToMarkdown(turns));
-    } else {
-      downloadFile('docrag-chat.json', 'application/json', chatToJson(turns));
-    }
+  // Markdown only: the header has one Export button and always passed 'markdown', so
+  // the JSON branch was unreachable. JSON export lives in the command palette
+  // (App.tsx's exportJson), which is the one implementation of it.
+  const handleExport = () => {
+    downloadFile('docrag-chat.md', 'text/markdown', chatToMarkdown(turns));
   };
 
   return (
@@ -49,7 +48,7 @@ function ChatHeader({
           <button
             type="button"
             className="chat-header__action"
-            onClick={() => handleExport('markdown')}
+            onClick={handleExport}
             data-testid="chat-header-export"
           >
             Export

@@ -29,13 +29,15 @@ services:
       WARMUP_MODELS: "true"
       # Same Docker network as Qdrant, so gRPC is reachable without extra config.
       QDRANT_PREFER_GRPC: "true"
-    # Off by default: JOB_STORE_BACKEND=memory and RAW_DOCUMENT_DIR="" (the
-    # .env.example defaults) mean ingest-job status is lost on container recreate and
-    # uploaded originals aren't kept, same as every prior release. To opt into either
-    # (JOB_STORE_BACKEND=sqlite and/or a real RAW_DOCUMENT_DIR=./data/originals in
-    # .env), also uncomment this volume — both features live under /app/data, so one
-    # mount covers both. Must be writable by the container's non-root uid 1000
-    # (Dockerfile creates user `app` with --uid 1000).
+    # Off by default: JOB_STORE_BACKEND=memory, RAW_DOCUMENT_DIR="" and
+    # FEEDBACK_ENABLED=false (the .env.example defaults) mean ingest-job status is lost
+    # on container recreate, uploaded originals aren't kept, and no feedback is
+    # captured — same as every prior release. To opt into any of the three
+    # (JOB_STORE_BACKEND=sqlite, a real RAW_DOCUMENT_DIR=./data/originals, and/or
+    # FEEDBACK_ENABLED=true in .env), also uncomment this volume: all three default to
+    # paths under /app/data, so one mount covers them. The Dockerfile creates
+    # /app/data owned by uid 1000, which is what makes the mounted volume writable by
+    # the non-root process — without that, Docker seeds the volume root-owned.
     # volumes:
     #   - docrag_job_store:/app/data
     extra_hosts:

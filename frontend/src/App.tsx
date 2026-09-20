@@ -122,16 +122,38 @@ function App() {
     pending,
     ask,
     cancel,
-    clear,
+    clear: clearTurns,
     conversations,
     activeConversationId,
-    newConversation,
-    switchConversation,
+    newConversation: createConversation,
+    switchConversation: selectConversation,
     renameConversation,
-    deleteConversation,
+    deleteConversation: removeConversation,
     persistError,
     persistPartial,
   } = useChat();
+
+  // A pinned trace belongs to one conversation's turns, so anything that replaces the
+  // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
+  // Retrieval/Trace tabs fall back to the stale pinnedTraceId and keep rendering the
+  // previous conversation's trace, while the Sources tab (which reads the live turn)
+  // correctly goes empty — one inspector showing two different questions.
+  const clear = () => {
+    setPinnedTraceId(null);
+    clearTurns();
+  };
+  const newConversation = () => {
+    setPinnedTraceId(null);
+    createConversation();
+  };
+  const switchConversation = (id: string) => {
+    setPinnedTraceId(null);
+    selectConversation(id);
+  };
+  const deleteConversation = (id: string) => {
+    setPinnedTraceId(null);
+    removeConversation(id);
+  };
 
   const updateAdvancedOptions = (next: QuestionOverrides) => {
     setAdvancedOptions(next);
