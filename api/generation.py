@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict, cast
@@ -134,6 +135,14 @@ class StageTimings:
     # Neighbour/context expansion after rerank (small-to-big retrieval). 0.0 when
     # context_neighbor_radius is 0.
     context_expansion_ms: float = 0.0
+    # The zero-citation retry's own LLM round trip (see finalize_citations). 0.0 when
+    # it didn't fire. Held apart from generate_ms because the two response modes used
+    # to disagree about it: the sync path ran finalize_citations inside the block
+    # generate_ms measures, while the streaming path ran it after generate_ms was
+    # already stamped — so a retry silently inflated generate_ms in one mode and
+    # vanished into the unaccounted total_ms remainder in the other. Now generate_ms
+    # means "the first generation call" in both, and this is the retry.
+    citation_retry_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -147,6 +156,10 @@ class GroundedAnswer:
     # True when the answer initially lacked citations and a stricter retry supplied
     # them (see needs_citation_retry / retry_uncited_answer).
     citation_retry_used: bool = False
+    # Wall-clock of that retry's LLM call, 0.0 when it didn't fire. Carried out so the
+    # pipeline can subtract it from the block it measures as generate_ms — the retry
+    # happens inside generate_grounded_answer, but it is not generation.
+    citation_retry_ms: float = 0.0
     # The exact message list of the call that produced `answer` — the retry's
     # continuation when citation_retry_used is True. Carried out so tracing records what
     # was really sent instead of re-deriving a prompt that may not be the one used.
@@ -291,6 +304,7 @@ def generate_grounded_answer(
         answer=outcome.answer,
         sources=outcome.cited,
         citation_retry_used=outcome.retry_used,
+        citation_retry_ms=outcome.retry_ms,
         prompt_messages=outcome.prompt_messages,
     )
 
@@ -463,6 +477,59 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
     return not any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
 
 
+# Words that make a follow-up unresolvable on its own — it refers back to something only
+# the prior turns name. Matched as whole words, so "that" fires but "thatch" does not.
+_ANAPHORA_WORDS = frozenset(
+    {
+        "it", "its", "it's", "this", "that", "these", "those", "they", "them", "their",
+        "theirs", "he", "him", "his", "she", "her", "hers", "one", "ones", "same",
+        "above", "previous", "earlier", "former", "latter", "instead", "there", "then",
+        "another", "such", "both", "either", "neither", "else",
+    }
+)
+
+# Function words that carry no retrieval signal, used only to judge whether what is left
+# of a question is substantive enough to retrieve on. Not a general stopword list.
+_LOW_SIGNAL_WORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "so", "also", "about", "of", "for", "to",
+        "in", "on", "at", "by", "with", "from", "as", "is", "are", "was", "were", "be",
+        "been", "do", "does", "did", "can", "could", "will", "would", "should", "may",
+        "might", "must", "have", "has", "had", "what", "which", "who", "whom", "whose",
+        "when", "where", "why", "how", "many", "much", "any", "some", "me", "my", "we",
+        "our", "you", "your", "i", "if", "not", "no", "yes", "please", "tell", "say",
+    }
+)
+
+_WORD_RE = re.compile(r"[a-z][a-z']*")
+
+# Below this many substantive words, a question is too thin to retrieve on by itself
+# ("What about pricing?", "Why?") even with no anaphora, so it still gets condensed.
+_MIN_STANDALONE_CONTENT_WORDS = 3
+
+
+def needs_condense(question: str) -> bool:
+    """True when a follow-up can't stand on its own as a retrieval query.
+
+    The condense step is a full, serial LLM round trip that blocks embedding, search and
+    rerank behind it — measured at 2.5-7.3s against a local model — and a great many
+    follow-ups ("What is the referral bonus amount?") are already perfectly standalone
+    and get rewritten into approximately themselves.
+
+    Deliberately asymmetric about which way it errs. A wrong True costs one cheap LLM
+    call that changes nothing; a wrong False retrieves for a question the embedder can't
+    resolve, which silently degrades the answer. So anything ambiguous condenses: a
+    question is only treated as standalone when it names no anaphora **and** still has
+    enough substantive words left to retrieve on.
+    """
+
+    words = _WORD_RE.findall(question.lower())
+    if any(word in _ANAPHORA_WORDS for word in words):
+        return True
+    content = [word for word in words if word not in _LOW_SIGNAL_WORDS]
+    return len(content) < _MIN_STANDALONE_CONTENT_WORDS
+
+
 def retry_uncited_answer(
     prompt_messages: Sequence[ChatMessage],
     first_answer: str,
@@ -509,6 +576,10 @@ class CitationOutcome:
     cited: list[SourceCitation]
     retry_used: bool
     prompt_messages: list[ChatMessage]
+    # Wall-clock of the retry's LLM round trip, 0.0 when it didn't fire. Measured here
+    # rather than by the callers because this is the only place that knows whether the
+    # call happened at all — and it happens in both response modes.
+    retry_ms: float = 0.0
 
 
 def finalize_citations(
@@ -538,18 +609,28 @@ def finalize_citations(
     cited = cited_sources(answer, all_sources)
     final_messages = list(prompt_messages)
     retry_used = False
+    retry_ms = 0.0
     if (
         not cited
         and settings.citation_retry_enabled
         and needs_citation_retry(answer, len(all_sources))
     ):
+        # Timed around the call itself, not around the `if` — a retry that fails or
+        # still comes back uncited cost just as much wall-clock as one that worked, and
+        # attributing it to generate_ms is what made this stage invisible before.
+        retry_start = time.monotonic()
         retried = retry_uncited_answer(prompt_messages, answer, generator, settings)
+        retry_ms = (time.monotonic() - retry_start) * 1000
         if retried is not None:
             answer, final_messages = retried
             cited = cited_sources(answer, all_sources)
             retry_used = True
     return CitationOutcome(
-        answer=answer, cited=cited, retry_used=retry_used, prompt_messages=final_messages
+        answer=answer,
+        cited=cited,
+        retry_used=retry_used,
+        prompt_messages=final_messages,
+        retry_ms=retry_ms,
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -134,6 +135,16 @@ class EmptyThenAnswerGenerator:
         words = self.answer.split(" ")
         for index, word in enumerate(words):
             yield word if index == len(words) - 1 else word + " "
+
+
+def _without_stage_events(events: list[Any]) -> list[Any]:
+    """Drop `stage` progress frames so positional assertions stay about the payload.
+
+    Stage frames are advisory UI progress and deliberately allowed to grow, so a test
+    that pins `events[0]` to a payload event must filter rather than index around them.
+    """
+
+    return [event for event in events if event["type"] != "stage"]
 
 
 class ListTraceStore:
@@ -456,7 +467,7 @@ def test_rag_pipeline_answer_stream_emits_sources_then_deltas_then_done() -> Non
         settings=settings,
     )
 
-    events = list(pipeline.answer_stream("alpha"))
+    events = _without_stage_events(list(pipeline.answer_stream("alpha")))
 
     assert events[0]["type"] == "sources"
     assert events[0]["sources"][0]["filename"] == "guide.txt"
@@ -483,7 +494,7 @@ def test_rag_pipeline_answer_stream_returns_insufficient_context_for_empty_colle
         settings=settings,
     )
 
-    events = list(pipeline.answer_stream("alpha"))
+    events = _without_stage_events(list(pipeline.answer_stream("alpha")))
 
     assert events[0] == {"type": "sources", "sources": [], "trace_id": None}
     assert events[-1]["type"] == "done"
@@ -693,7 +704,7 @@ def test_rag_pipeline_answer_stream_carries_matching_trace_id_in_sources_and_don
         trace_store=trace_store,
     )
 
-    events = list(pipeline.answer_stream("alpha"))
+    events = _without_stage_events(list(pipeline.answer_stream("alpha")))
 
     sources_event = events[0]
     done_event = events[-1]
@@ -1088,6 +1099,199 @@ def test_streaming_citation_retry_swaps_corrected_answer_into_done() -> None:
     assert done["answer"] == "Alpha is documented [1]."
     assert [source["source_number"] for source in done["sources"]] == [1]
     assert trace_store.traces[0].citation_retry_used is True
+
+
+def test_stream_announces_searching_before_retrieval_starts() -> None:
+    """The `searching` frame must precede `sources`, not accompany it.
+
+    Retrieval measured 25-80s against a real corpus, and the UI previously showed one
+    static label for all of it — a frame that only arrived alongside `sources` would be
+    announcing a stage that had already finished.
+    """
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+    )
+
+    types = [event["type"] for event in pipeline.answer_stream("alpha")]
+
+    assert types[0] == "stage"
+    assert types.index("stage") < types.index("sources")
+    stages = [
+        event["stage"] for event in pipeline.answer_stream("alpha") if event["type"] == "stage"
+    ]
+    # No history, so condense never runs and must not be announced.
+    assert stages == ["searching"]
+
+
+def test_stream_announces_condensing_only_when_the_condense_call_will_run() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+
+    def stages_for(question: str) -> list[str]:
+        pipeline = RagPipeline(
+            repository=repository,
+            embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+            reranker=FakeReranker(),
+            generator=SequencedGenerator(["alpha", "Alpha is documented [1]."]),
+            settings=settings,
+        )
+        return [
+            event["stage"]
+            for event in pipeline.answer_stream(question, history=_HISTORY)
+            if event["type"] == "stage"
+        ]
+
+    assert stages_for("What about the second one?") == ["condensing", "searching"]
+    # Standalone despite the history, so the condense call is skipped — and announcing
+    # a stage that never runs is worse than announcing nothing.
+    assert stages_for("What is the referral bonus amount?") == ["searching"]
+
+
+def test_condense_is_skipped_for_a_standalone_follow_up() -> None:
+    """A self-contained follow-up must not pay the condense LLM round trip.
+
+    Measured at 2.5-7.3s against a local model, fully serial ahead of embed/search/
+    rerank, and for a question like this the rewrite returns approximately the input.
+    """
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    # A single already-cited answer: if condense ran it would consume this call and
+    # generation would take the second, so call_count alone detects the skip.
+    generator = SequencedGenerator(["Alpha is documented [1]."])
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    grounded = pipeline.answer(
+        "What is the annual training budget for engineers?", history=_HISTORY
+    )
+
+    assert grounded.timings is not None
+    assert grounded.timings.condense_ms == 0.0
+    # One call — generation. A condense call would have made it two and, worse, would
+    # have consumed "condensed rewrite" as the answer.
+    assert generator.call_count == 1
+    assert trace_store.traces[0].condensed_question is None
+    # The raw question, not a rewrite, is what retrieval actually embedded.
+    assert grounded.answer == "Alpha is documented [1]."
+
+
+def test_condense_still_runs_for_an_anaphoric_follow_up() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    generator = SequencedGenerator(["alpha coverage details", "Alpha is documented [1]."])
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    grounded = pipeline.answer("How much does it cover?", history=_HISTORY)
+
+    assert grounded.timings is not None
+    assert grounded.timings.condense_ms > 0.0
+    assert trace_store.traces[0].condensed_question == "alpha coverage details"
+
+
+class SlowRetryGenerator(SequencedGenerator):
+    """Like ``SequencedGenerator``, but every ``complete`` call after the first sleeps.
+
+    The first call is the streamed/initial answer; the second is the citation retry. The
+    sleep makes the retry's cost large enough to assert on without timing noise.
+    """
+
+    RETRY_DELAY_SECONDS = 0.05
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        if self.call_count > 0:
+            time.sleep(self.RETRY_DELAY_SECONDS)
+        return super().complete(messages, settings)
+
+
+_RETRY_DELAY_MS = SlowRetryGenerator.RETRY_DELAY_SECONDS * 1000
+
+
+def test_streaming_reports_the_citation_retry_as_its_own_stage() -> None:
+    """The retry's LLM round trip must land in citation_retry_ms, not vanish.
+
+    generate_ms is stamped when the delta loop exits and total_ms only after
+    finalize_citations, so before this the retry fell entirely into the unaccounted
+    total_ms remainder — invisible in the response, the trace, and every metric series.
+    """
+
+    generator = SlowRetryGenerator(["alpha is documented plainly", "Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(ListTraceStore(), generator)
+
+    events = list(pipeline.answer_stream("alpha"))
+    timings = next(event for event in events if event["type"] == "done")["timings"]
+
+    assert timings["citation_retry_ms"] >= _RETRY_DELAY_MS
+    # The retry is not generation: the streamed call didn't sleep, so generate_ms must
+    # stay well clear of the retry's cost.
+    assert timings["generate_ms"] < _RETRY_DELAY_MS
+    assert timings["total_ms"] >= timings["generate_ms"] + timings["citation_retry_ms"]
+
+
+def test_sync_reports_the_citation_retry_as_its_own_stage() -> None:
+    """Same split on the sync path, which had the opposite bug.
+
+    finalize_citations runs inside generate_grounded_answer there, so the retry used to
+    be silently folded into generate_ms — the two response modes disagreed about what
+    generate_ms even meant.
+    """
+
+    generator = SlowRetryGenerator(["alpha is documented plainly", "Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(ListTraceStore(), generator)
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.timings is not None
+    assert grounded.timings.citation_retry_ms >= _RETRY_DELAY_MS
+    assert grounded.timings.generate_ms < _RETRY_DELAY_MS
+
+
+def test_citation_retry_stage_is_zero_when_the_retry_does_not_fire() -> None:
+    generator = SequencedGenerator(["Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(ListTraceStore(), generator)
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.timings is not None
+    assert grounded.timings.citation_retry_ms == 0.0
 
 
 def _retrying_pipeline(

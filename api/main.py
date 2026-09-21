@@ -415,6 +415,7 @@ def _timings_response(timings: StageTimings | None) -> TimingsResponse | None:
         condense_ms=timings.condense_ms,
         query_expansion_ms=timings.query_expansion_ms,
         context_expansion_ms=timings.context_expansion_ms,
+        citation_retry_ms=timings.citation_retry_ms,
     )
 
 
@@ -526,6 +527,7 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "condense_ms": timings.condense_ms,
         "query_expansion_ms": timings.query_expansion_ms,
         "context_expansion_ms": timings.context_expansion_ms,
+        "citation_retry_ms": timings.citation_retry_ms,
     }
 
 

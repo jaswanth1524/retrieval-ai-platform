@@ -200,6 +200,9 @@ class TimingsResponse(BaseModel):
     # Neighbour/context expansion after rerank (small-to-big). 0.0 when
     # CONTEXT_NEIGHBOR_RADIUS is 0. Previously folded into rerank_ms.
     context_expansion_ms: float = 0.0
+    # The zero-citation retry's LLM round trip. 0.0 when it didn't fire, which is the
+    # common case. generate_ms now excludes it in both response modes.
+    citation_retry_ms: float = 0.0
 
 
 class PromptMessageResponse(BaseModel):

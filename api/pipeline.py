@@ -27,6 +27,7 @@ from api.generation import (
     finalize_citations,
     generate_grounded_answer,
     generate_query_variants,
+    needs_condense,
     source_citations,
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
@@ -97,6 +98,23 @@ class SourcesEvent(TypedDict):
     trace_id: str | None
 
 
+class StageEvent(TypedDict):
+    """SSE event: which pipeline stage just started, for the UI's progress indicator.
+
+    Emitted *before* the stage runs, not after — the whole point is telling the reader
+    what the server is doing during the seconds before any token exists. Retrieval can
+    take tens of seconds on a whole-corpus question, and the UI previously showed one
+    static label for all of it.
+
+    ``stage`` is a free-form lowercase label rather than an enum: a client that doesn't
+    recognise one must fall back to its own default, so adding a stage later can never
+    break an older frontend.
+    """
+
+    type: Literal["stage"]
+    stage: str
+
+
 class DeltaEvent(TypedDict):
     """SSE event: one incremental fragment of the generated answer."""
 
@@ -114,7 +132,7 @@ class DoneEvent(TypedDict):
     trace_id: str | None
 
 
-StreamEvent = SourcesEvent | DeltaEvent | DoneEvent
+StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent
 
 
 def _citation_dict(source: SourceCitation) -> dict[str, Any]:
@@ -138,6 +156,7 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "condense_ms": timings.condense_ms,
         "query_expansion_ms": timings.query_expansion_ms,
         "context_expansion_ms": timings.context_expansion_ms,
+        "citation_retry_ms": timings.citation_retry_ms,
     }
 
 
@@ -285,6 +304,23 @@ class RagPipeline:
         cap = int(effective_settings.conversation_max_history_messages)
         return list(history)[-cap:] if cap > 0 else []
 
+    def _will_condense(
+        self,
+        question: str,
+        truncated_history: Sequence[ChatMessage],
+        effective_settings: AppSettings,
+    ) -> bool:
+        """Whether ``_condense_query`` will actually make its LLM call.
+
+        Split out purely so ``answer_stream`` can announce the ``condensing`` stage
+        *before* the call blocks it, without restating the gate — two copies of this
+        condition would drift the first time either side changed.
+        """
+
+        if not truncated_history or not effective_settings.conversation_condense_enabled:
+            return False
+        return needs_condense(question)
+
     def _condense_query(
         self,
         question: str,
@@ -302,7 +338,7 @@ class RagPipeline:
         just proceeds on the raw question, exactly as it did before this feature.
         """
 
-        if not truncated_history or not effective_settings.conversation_condense_enabled:
+        if not self._will_condense(question, truncated_history, effective_settings):
             return question, 0.0, None
 
         condense_start = time.monotonic()
@@ -448,7 +484,12 @@ class RagPipeline:
                 settings=effective_settings,
                 history=truncated_history or None,
             )
-            generate_ms = (time.monotonic() - generate_start) * 1000
+            # generate_grounded_answer runs the zero-citation retry internally, so the
+            # block just timed covers two LLM calls when it fired. Split it back out so
+            # generate_ms means the same thing here as it does on the streaming path.
+            generate_ms = (
+                time.monotonic() - generate_start
+            ) * 1000 - grounded.citation_retry_ms
             total_ms = (time.monotonic() - total_start) * 1000
 
             timings = StageTimings(
@@ -460,6 +501,7 @@ class RagPipeline:
                 condense_ms=condense_ms,
                 query_expansion_ms=phase.query_expansion_ms,
                 context_expansion_ms=phase.context_expansion_ms,
+                citation_retry_ms=grounded.citation_retry_ms,
             )
         except Exception as exc:
             if trace_store is not None and trace_id is not None:
@@ -575,9 +617,15 @@ class RagPipeline:
         try:
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
             truncated_history = self._truncate_history(history, effective_settings)
+            # Announced before the call, and only when it will actually happen — an
+            # unconditional frame would report a stage that never ran for the majority
+            # of questions, which is worse than no frame.
+            if self._will_condense(question, truncated_history, effective_settings):
+                yield {"type": "stage", "stage": "condensing"}
             retrieval_query, condense_ms, condensed_question = self._condense_query(
                 question, truncated_history, effective_settings
             )
+            yield {"type": "stage", "stage": "searching"}
             phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames)
             selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
 
@@ -673,6 +721,7 @@ class RagPipeline:
                 condense_ms=condense_ms,
                 query_expansion_ms=phase.query_expansion_ms,
                 context_expansion_ms=phase.context_expansion_ms,
+                citation_retry_ms=outcome.retry_ms,
             )
             if trace_store is not None and trace_id is not None:
                 trace_store.add(

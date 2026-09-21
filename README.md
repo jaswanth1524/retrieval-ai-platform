@@ -36,13 +36,15 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 
 The question-answering pipeline (`api/pipeline.py`):
 
-1. Optionally condense a follow-up question using client-sent conversation history into a standalone retrieval query (one extra LLM call, skipped when there's no history).
+1. Optionally condense a follow-up question using client-sent conversation history into a standalone retrieval query (one extra LLM call). Skipped when there's no history, and also when the follow-up is already standalone — it names no anaphora (`it`, `that`, `those`, …) and still has enough substantive words to retrieve on. That call is fully serial ahead of retrieval and measured 2.5-7.3s against a local model, so skipping it for "What is the referral bonus amount?" is pure latency saved; anything ambiguous still condenses.
 2. Embed the (condensed) query locally.
 3. Hybrid search: dense + sparse retrieval, fused server-side in Qdrant with RRF `k=60` where supported, else fused in application code.
 4. Cross-encoder rerank the fused top-N candidates; drop anything below `RERANK_MIN_SCORE`.
 5. Expand each surviving chunk's *generation* context with up to `CONTEXT_NEIGHBOR_RADIUS` neighboring chunks (small-to-big retrieval) — citations still point at the original chunk.
-6. Generate an answer through LiteLLM (Ollama or OpenAI) from a context-only, citation-required prompt — streamed over `/questions/stream` or returned whole from `/questions`.
+6. Generate an answer through LiteLLM (Ollama or OpenAI) from a context-only, citation-required prompt — streamed over `/questions/stream` (which also emits `stage` progress frames ahead of each phase, since retrieval can run for tens of seconds before the first token) or returned whole from `/questions`.
 7. Return the answer, citations, per-stage latency timings, and a trace ID.
+
+**Latency.** Cross-encoder reranking dominates: it is linear in `RERANK_CANDIDATES` and on 8 CPU cores in Docker cost ~1.1s per candidate with the default reranker — ~52s of a ~66s question. `RERANK_CANDIDATES` and `RERANKER_MODEL` are the two knobs that matter, and `.env.example` documents both with measured numbers. `GET /traces/{id}` and `docrag_question_stage_seconds{stage=...}` give you the per-stage split for your own corpus; tune from that rather than from these figures.
 
 Document ingestion (`POST /documents`) runs as a background job: the request returns a `job_id` immediately (HTTP 202), and `GET /documents/jobs/{job_id}` reports progress (`queued` → `parsing` → `embedding` → `done`/`failed`) as the document is parsed, chunked, embedded (with filename/section-prefixed contextual text), and indexed in batches, tagged with an embedding-model version so a later model change is detected and queries are refused until re-ingestion. `GET /documents` lists the indexed corpus; `DELETE /documents/{filename}` removes a document's chunks.
 

@@ -64,4 +64,10 @@ def observe_question_timings(timings: dict[str, float]) -> None:
     question_stage_seconds.labels(stage="search").observe(timings["search_ms"] / 1000)
     question_stage_seconds.labels(stage="rerank").observe(timings["rerank_ms"] / 1000)
     question_stage_seconds.labels(stage="generate").observe(timings["generate_ms"] / 1000)
+    # Its own series, not folded into "generate": it is a second LLM round trip that
+    # fires on a minority of questions, so averaging it into generate would smear a
+    # bimodal distribution into one meaningless number.
+    question_stage_seconds.labels(stage="citation_retry").observe(
+        timings.get("citation_retry_ms", 0.0) / 1000
+    )
     question_stage_seconds.labels(stage="total").observe(timings["total_ms"] / 1000)

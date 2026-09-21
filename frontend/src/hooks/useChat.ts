@@ -75,9 +75,26 @@ export interface ConversationSummary {
   turnCount: number;
 }
 
+// Server stage labels mapped to what the reader sees. Anything the server sends that
+// isn't listed here falls back to the generic label, so a new backend stage can never
+// surface a raw protocol string in the UI or break an older frontend.
+const STAGE_LABELS: Record<string, string> = {
+  condensing: 'reading the conversation…',
+  searching: 'searching documents…',
+};
+const DEFAULT_STAGE_LABEL = 'retrieving…';
+
+export function stageLabel(stage: string): string {
+  return STAGE_LABELS[stage] ?? DEFAULT_STAGE_LABEL;
+}
+
 export interface UseChatResult {
   turns: ChatTurn[];
   pending: boolean;
+  // Human-readable label for the stage the in-flight question is on, or null when
+  // nothing is in flight. Driven by real server `stage` events rather than a hardcoded
+  // string, so a 30s retrieval no longer looks identical to a frozen UI.
+  stage: string | null;
   persistError: boolean;
   persistPartial: boolean;
   conversations: ConversationSummary[];
@@ -230,6 +247,7 @@ function loadStorage(): ChatStorageV2 {
 export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
   const [pending, setPending] = useState(false);
+  const [stage, setStage] = useState<string | null>(null);
   // True when the last persist attempt failed even after the reduced-payload retry
   // below — the session is memory-only from that point on until a write succeeds.
   const [persistError, setPersistError] = useState(false);
@@ -354,6 +372,9 @@ export function useChat(): UseChatResult {
 
     setActiveTurns((prev) => [...prev, makeTurn('user', question)]);
     setPending(true);
+    // Seeded before the first server frame arrives so there is never a gap with a
+    // pending request and no label at all.
+    setStage(DEFAULT_STAGE_LABEL);
 
     // The assistant turn is created lazily on the first `sources`/`delta` event so a
     // mid-stream failure before any event arrives renders as a clean error turn.
@@ -376,7 +397,13 @@ export function useChat(): UseChatResult {
         filenames,
         history,
         {
+          onStage: (serverStage) => {
+            setStage(stageLabel(serverStage));
+          },
           onSources: (sources, traceId) => {
+            // Sources land the moment retrieval finishes, which is exactly when
+            // generation starts — no separate server frame needed for it.
+            setStage('generating answer…');
             updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
           },
           onDelta: (text) => {
@@ -406,6 +433,7 @@ export function useChat(): UseChatResult {
     } finally {
       inflightRef.current = null;
       setPending(false);
+      setStage(null);
     }
     // Empty deps: every closed-over value is either a ref (activeConversationRef,
     // inflightRef) or a setState setter (setActiveTurns/setPending), both stable
@@ -476,6 +504,7 @@ export function useChat(): UseChatResult {
   return {
     turns,
     pending,
+    stage,
     persistError,
     persistPartial,
     conversations: summaries,
