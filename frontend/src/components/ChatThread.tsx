@@ -7,6 +7,10 @@ import './ChatThread.css';
 interface ChatThreadProps {
   turns: ChatTurn[];
   pending: boolean;
+  // Live label for the stage the in-flight question is on, from the server's `stage`
+  // SSE frames (see useChat). Optional so a caller that doesn't track it keeps the old
+  // hardcoded labels rather than rendering nothing.
+  stage?: string | null;
   engineerMode: boolean;
   currentModelLabel?: string;
   onRetry?: (question: string) => void;
@@ -38,6 +42,7 @@ function findPrecedingUserQuestion(turns: ChatTurn[], index: number): string | u
 function ChatThread({
   turns,
   pending,
+  stage,
   engineerMode,
   currentModelLabel,
   onRetry,
@@ -120,7 +125,11 @@ function ChatThread({
             turn={turn}
             engineerMode={engineerMode}
             currentModelLabel={currentModelLabel}
-            streamStage={pending && turn.id === lastTurn?.id && turn.role === 'assistant' ? 'generating answer…' : undefined}
+            streamStage={
+              pending && turn.id === lastTurn?.id && turn.role === 'assistant'
+                ? (stage ?? 'generating answer…')
+                : undefined
+            }
             onRetry={onRetry}
             regenerateQuestion={
               turn.role === 'assistant' ? findPrecedingUserQuestion(turns, index) : undefined
@@ -139,7 +148,7 @@ function ChatThread({
                 A
               </span>
               <div className="chat-message__answer">
-                <StreamingSkeleton stage="retrieving…" />
+                <StreamingSkeleton stage={stage ?? 'retrieving…'} />
               </div>
             </div>
           </div>

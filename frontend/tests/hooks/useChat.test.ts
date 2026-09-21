@@ -75,6 +75,55 @@ describe('useChat', () => {
     });
   });
 
+  it('reflects the server stage frames, then generating, then clears', async () => {
+    // Retrieval measured 25-80s against a real corpus while the UI showed one static
+    // label for all of it. These are the real server frames driving a real indicator.
+    let emit!: (fn: (h: QuestionStreamHandlers) => void) => void;
+    let resolveStream!: () => void;
+    askQuestionStreamMock.mockImplementation(
+      (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        emit = (fn) => fn(handlers);
+        return new Promise<void>((resolve) => {
+          resolveStream = () => {
+            handlers.onDone?.('Answer [1].', [], ZERO_TIMINGS, 't');
+            resolve();
+          };
+        });
+      },
+    );
+
+    const { result } = renderHook(() => useChat());
+
+    let askPromise!: Promise<void>;
+    act(() => {
+      askPromise = result.current.ask('What about the second one?');
+    });
+
+    // Seeded before any frame arrives, so there is never a pending request with no label.
+    expect(result.current.stage).toBe('retrieving…');
+
+    act(() => emit((h) => h.onStage?.('condensing')));
+    expect(result.current.stage).toBe('reading the conversation…');
+
+    act(() => emit((h) => h.onStage?.('searching')));
+    expect(result.current.stage).toBe('searching documents…');
+
+    // An unrecognised stage must degrade to the generic label, never surface raw.
+    act(() => emit((h) => h.onStage?.('some-future-stage')));
+    expect(result.current.stage).toBe('retrieving…');
+
+    // Sources arriving is what marks the switch to generation — no server frame for it.
+    act(() => emit((h) => h.onSources?.([], 't')));
+    expect(result.current.stage).toBe('generating answer…');
+
+    await act(async () => {
+      resolveStream();
+      await askPromise;
+    });
+
+    expect(result.current.stage).toBeNull();
+  });
+
   it('keeps the traceId set by the sources event even if the stream then errors', async () => {
     askQuestionStreamMock.mockImplementation(
       async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {

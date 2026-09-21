@@ -162,6 +162,10 @@ function questionRequestBody(
 }
 
 export interface QuestionStreamHandlers {
+  // Which pipeline stage the server just started, before any token exists. Retrieval
+  // can run for tens of seconds on a whole-corpus question, so this is the difference
+  // between a progress indicator and a frozen one.
+  onStage?: (stage: string) => void;
   onSources?: (sources: CitationResponse[], traceId: string | null) => void;
   onDelta?: (text: string) => void;
   onDone?: (
@@ -173,6 +177,7 @@ export interface QuestionStreamHandlers {
 }
 
 type QuestionStreamEvent =
+  | { type: 'stage'; stage: string }
   | { type: 'sources'; sources: CitationResponse[]; trace_id: string | null }
   | { type: 'delta'; text: string }
   | {
@@ -375,7 +380,8 @@ export const api = {
       // and every caller saw an unrecognised error instead of a cancellation.
       try {
         await readSseStream(response, (event) => {
-          if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
+          if (event.type === 'stage') handlers.onStage?.(event.stage);
+          else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
           else if (event.type === 'delta') handlers.onDelta?.(event.text);
           else if (event.type === 'done')
             handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);

@@ -1169,6 +1169,9 @@ def test_question_endpoint_includes_stage_timings(api_context: ApiTestContext) -
         # former and was ordered like the latter.
         "query_expansion_ms",
         "context_expansion_ms",
+        # The zero-citation retry's own LLM round trip, held apart from generate_ms —
+        # the sync path used to fold it in while the streaming path dropped it entirely.
+        "citation_retry_ms",
     }
     assert timings["condense_ms"] == 0.0
     # No history to condense and query expansion is off by default.
@@ -1197,6 +1200,12 @@ def _parse_sse_events(text: str) -> list[dict[str, Any]]:
     return events
 
 
+def _without_stage_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop `stage` progress frames so positional assertions stay about the payload."""
+
+    return [event for event in events if event["type"] != "stage"]
+
+
 def test_question_stream_endpoint_emits_sources_delta_done(
     api_context: ApiTestContext,
 ) -> None:
@@ -1207,7 +1216,7 @@ def test_question_stream_endpoint_emits_sources_delta_done(
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    events = _parse_sse_events(response.text)
+    events = _without_stage_events(_parse_sse_events(response.text))
 
     assert events[0]["type"] == "sources"
     assert events[-1]["type"] == "done"
@@ -1270,7 +1279,7 @@ def test_question_stream_endpoint_trace_id_matches_across_events_and_is_fetchabl
     assert status["state"] == "done"
 
     response = api_context.client.post("/questions/stream", json={"question": "alpha"})
-    events = _parse_sse_events(response.text)
+    events = _without_stage_events(_parse_sse_events(response.text))
 
     trace_id = events[0]["trace_id"]
     assert trace_id

@@ -120,6 +120,7 @@ function App() {
   const {
     turns,
     pending,
+    stage,
     ask,
     cancel,
     clear: clearTurns,
@@ -677,6 +678,7 @@ function App() {
             <ChatThread
               turns={turns}
               pending={pending}
+              stage={stage}
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
