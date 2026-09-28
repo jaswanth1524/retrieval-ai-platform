@@ -34,12 +34,16 @@ services:
     # on container recreate, uploaded originals aren't kept, and no feedback is
     # captured — same as every prior release. To opt into any of the three
     # (JOB_STORE_BACKEND=sqlite, a real RAW_DOCUMENT_DIR=./data/originals, and/or
-    # FEEDBACK_ENABLED=true in .env), also uncomment this volume: all three default to
+    # FEEDBACK_ENABLED=true in .env), also uncomment the docrag_job_store line in
+    # `volumes:` below: all three default to
     # paths under /app/data, so one mount covers them. The Dockerfile creates
     # /app/data owned by uid 1000, which is what makes the mounted volume writable by
     # the non-root process — without that, Docker seeds the volume root-owned.
-    # volumes:
-    #   - docrag_job_store:/app/data
+    volumes:
+      # Downloaded embedding/reranker models (~1.2 GB). Without this every container
+      # recreate — including each `docker compose up --build` — downloads them again.
+      - model_cache:/home/app/.cache
+      # - docrag_job_store:/app/data
     extra_hosts:
       # Lets OLLAMA_BASE_URL=http://host.docker.internal:... resolve on native Linux
       # Docker (Docker Desktop on macOS/Windows already resolves this automatically).
@@ -61,5 +65,6 @@ services:
 
 volumes:
   qdrant_storage:
+  model_cache:
   # Only used if the commented-out mount under the api service is enabled.
   docrag_job_store:

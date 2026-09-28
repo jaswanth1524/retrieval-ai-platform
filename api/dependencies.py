@@ -15,12 +15,12 @@ from api.chunking import TokenCounter, make_token_counter
 from api.embeddings import LocalEmbeddingProvider
 from api.feedback import FeedbackStore
 from api.generation import LiteLLMGenerator
-from api.jobs import IngestJobStore, JobStore, SqliteIngestJobStore
+from api.jobs import IngestBacklog, IngestJobStore, JobStore, SqliteIngestJobStore
 from api.pipeline import IngestService, RagPipeline
 from api.provider_health import check_ollama_reachable, check_qdrant_reachable
 from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
 from api.raw_documents import RawDocumentStore
-from api.repository import VectorRepository
+from api.repository import VectorRepository, clear_hybrid_fallback_cache
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
 from api.tracing import TraceStore
@@ -243,11 +243,19 @@ def get_feedback_store() -> FeedbackStore | None:
 def get_ingest_executor() -> ThreadPoolExecutor:
     """Return the process-wide executor background ingest jobs run on.
 
-    Two workers: enough to overlap ingest of a couple of documents without letting an
-    unbounded queue of uploads exhaust memory competing with query-time model calls.
+    Two workers: enough to overlap ingest of a couple of documents without starving
+    query-time model calls of CPU. Its queue is unbounded; ``get_ingest_backlog`` is
+    what bounds how much accepted-but-unfinished upload data can pile up behind it.
     """
 
     return ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-ingest")
+
+
+@lru_cache
+def get_ingest_backlog() -> IngestBacklog:
+    """Return the process-wide byte budget for queued/in-progress upload content."""
+
+    return IngestBacklog(int(get_app_settings().ingest_max_pending_bytes))
 
 
 def clear_dependency_caches() -> None:
@@ -263,5 +271,7 @@ def clear_dependency_caches() -> None:
     get_raw_document_store.cache_clear()
     get_feedback_store.cache_clear()
     get_ingest_executor.cache_clear()
+    get_ingest_backlog.cache_clear()
     get_trace_store.cache_clear()
     clear_readiness_cache()
+    clear_hybrid_fallback_cache()

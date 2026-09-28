@@ -45,7 +45,9 @@ _ROMAN_NUMERAL_RE = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
 # unchanged (same embedding model), so old and new chunks stay mutually queryable — a
 # hard refusal would punish existing corpora for a quality improvement. Re-uploading a
 # document replaces its chunks (deterministic point IDs + stale-chunk cleanup).
-CHUNKER_VERSION = 2
+# v3: token counts exclude [CLS]/[SEP] per unit (reserved once per chunk instead), so
+# windows fill their budget rather than stopping ~2 tokens short per sentence.
+CHUNKER_VERSION = 3
 
 # Sentence boundaries: whitespace after .!? that precedes a capital/digit (optionally
 # behind an opening quote/bracket), OR a blank line. Windows prefer to break here rather
@@ -156,13 +158,8 @@ def parse_document_bytes(
     None uses the default, keeping the two-argument call working for other formats.
     """
 
-    safe_filename = normalize_filename(filename)
+    safe_filename = validate_upload_filename(filename)
     suffix = PurePosixPath(safe_filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise UnsupportedDocumentError(
-            f"Unsupported document type '{suffix or '<none>'}'. "
-            f"Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}."
-        )
 
     if suffix == ".pdf":
         return parse_pdf_document(safe_filename, content)
@@ -233,7 +230,10 @@ def chunk_sections(
         prefix_tokens = max(
             token_counter.count(f"{filename} › {section.section}\n") for section in group
         )
-        budget = max(1, chunk_size - prefix_tokens)
+        # Counts exclude special tokens; the ones the model wraps around each embedded
+        # string ([CLS]/[SEP]) are reserved once per chunk here.
+        special = int(getattr(token_counter, "special_tokens_per_sequence", 0))
+        budget = max(1, chunk_size - prefix_tokens - special)
 
         units = _sentence_units(group, budget, token_counter)
         for window in _window_units(units, budget, overlap):
@@ -272,11 +272,11 @@ def _sentence_units(
             sentence = " ".join(raw_sentence.split())
             if not sentence:
                 continue
-            for piece in _split_oversized(sentence, budget, token_counter):
+            for piece, tokens in _split_oversized(sentence, budget, token_counter):
                 units.append(
                     _Unit(
                         text=piece,
-                        tokens=token_counter.count(piece),
+                        tokens=tokens,
                         page=section.page,
                         section=section.section,
                     )
@@ -284,36 +284,41 @@ def _sentence_units(
     return units
 
 
-def _split_oversized(sentence: str, budget: int, token_counter: TokenCounter) -> list[str]:
+def _split_oversized(
+    sentence: str, budget: int, token_counter: TokenCounter
+) -> list[tuple[str, int]]:
     """Greedily pack a single sentence's words into <=budget-token pieces.
 
     A sentence within budget is returned unchanged. A single word longer than budget
     is still emitted alone (a word cannot be split) — the only case a unit exceeds
-    budget, and rare enough to accept.
+    budget, and rare enough to accept. Each piece comes back with its token count so
+    the caller doesn't tokenize every sentence a second time.
     """
 
-    if token_counter.count(sentence) <= budget:
-        return [sentence]
+    sentence_tokens = token_counter.count(sentence)
+    if sentence_tokens <= budget:
+        return [(sentence, sentence_tokens)]
 
     # Count each word once and accumulate, rather than re-tokenizing the whole running
     # string per word — that was O(words^2) tokenizer work on exactly the inputs that
     # reach this path (CSV row blocks, wide tables), which are the longest ones.
-    # Per-word counts sum to slightly more than the joined string's real count, so this
-    # errs toward smaller pieces; a final exact check below repairs the common case.
-    pieces: list[str] = []
+    # bge's WordPiece tokenizer pre-splits on whitespace, so (without special tokens)
+    # the per-word sum equals the joined piece's real count; for any tokenizer that
+    # merges across spaces it can only over-estimate, which errs toward smaller pieces.
+    pieces: list[tuple[str, int]] = []
     current: list[str] = []
     current_tokens = 0
     for word in sentence.split():
         word_tokens = token_counter.count(word)
         if current and current_tokens + word_tokens > budget:
-            pieces.append(" ".join(current))
+            pieces.append((" ".join(current), current_tokens))
             current = [word]
             current_tokens = word_tokens
         else:
             current.append(word)
             current_tokens += word_tokens
     if current:
-        pieces.append(" ".join(current))
+        pieces.append((" ".join(current), current_tokens))
     return pieces
 
 
@@ -463,8 +468,22 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
             )
         )
 
-    if not sections and empty_pages:
-        sections = _ocr_pdf_pages(filename, content, empty_pages)
+    if empty_pages:
+        # Every empty page, not only all-empty PDFs: a scanned page bound into an
+        # otherwise digital PDF used to be dropped without a word.
+        try:
+            ocr_sections = _ocr_pdf_pages(filename, content, empty_pages)
+        except EmptyDocumentError:
+            if not sections:
+                raise
+            logger.warning(
+                "PDF %s: pages %s have no text layer and OCR is not installed "
+                "(uv sync --extra ocr); indexing the remaining pages only.",
+                filename,
+                empty_pages,
+            )
+            ocr_sections = []
+        sections = sorted([*sections, *ocr_sections], key=lambda section: section.page)
 
     if not sections:
         raise EmptyDocumentError(f"PDF '{filename}' has no extractable text.")
@@ -484,10 +503,22 @@ def _extract_pdf_tables(content: bytes) -> dict[int, list[str]]:
         result: dict[int, list[str]] = {}
         with pdfplumber.open(BytesIO(content)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
-                blocks = [_table_to_markdown(table) for table in page.extract_tables() if table]
-                blocks = [block for block in blocks if block]
-                if blocks:
-                    result[page_number] = blocks
+                try:
+                    # The default "lines" strategy builds tables only from ruling edges
+                    # (rects, lines, curves); a page with none can't yield one, so skip
+                    # the table finder — most pages of a prose PDF.
+                    if not (page.rects or page.lines or page.curves):
+                        continue
+                    blocks = [
+                        _table_to_markdown(table) for table in page.extract_tables() if table
+                    ]
+                    blocks = [block for block in blocks if block]
+                    if blocks:
+                        result[page_number] = blocks
+                finally:
+                    # Parsed layout objects are cached per page until closed; on a long
+                    # PDF they otherwise accumulate for the whole document.
+                    page.close()
         return result
     except Exception:
         logger.warning("PDF table extraction failed; continuing with text only.", exc_info=True)
@@ -894,12 +925,37 @@ def parse_plain_text_document(filename: str, text: str) -> list[DocumentSection]
 
 
 def normalize_filename(filename: str) -> str:
-    """Return a basename-only upload filename."""
+    """Return a basename-only upload filename.
+
+    "." and ".." survive basename extraction (``PurePosixPath("..").name == ".."``) and
+    name a directory, and control characters (NUL above all) make the OS call itself
+    fail — both used to surface as a 500 from the raw-document store.
+    """
 
     normalized = filename.replace("\\", "/")
     safe_filename = PurePosixPath(normalized).name.strip()
     if not safe_filename:
         raise UnsupportedDocumentError("Document filename is required.")
+    if safe_filename in {".", ".."} or any(ord(char) < 32 for char in safe_filename):
+        raise UnsupportedDocumentError("Document filename is not valid.")
+    return safe_filename
+
+
+def validate_upload_filename(filename: str) -> str:
+    """Normalize ``filename`` and check its type is ingestible, before any work starts.
+
+    Same checks ``parse_document_bytes`` applies, run at upload time so an unusable
+    file is rejected with a 4xx instead of being accepted (202) and failing later in
+    the background job.
+    """
+
+    safe_filename = normalize_filename(filename)
+    suffix = PurePosixPath(safe_filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise UnsupportedDocumentError(
+            f"Unsupported document type '{suffix or '<none>'}'. "
+            f"Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}."
+        )
     return safe_filename
 
 

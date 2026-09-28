@@ -230,6 +230,58 @@ describe('pollDocumentJob', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
+
+  const embedding = { job_id: 'j1', filename: 'a.txt', state: 'embedding', chunks_total: 4, chunks_done: 2, error: null, result: null };
+  const done = { ...embedding, state: 'done', chunks_done: 4 };
+
+  it('backs off between polls up to a 5s ceiling', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(async () => jsonResponse(200, embedding));
+      vi.stubGlobal('fetch', fetchMock);
+      const controller = new AbortController();
+      const promise = api.pollDocumentJob('j1', undefined, controller.signal).catch(() => undefined);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000); // 1s
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1_499);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // second wait is 1.5s
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(60_000);
+      // 2.25s, 3.375s, then capped at 5s: one poll per 5s from here on.
+      const calls = fetchMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(50_000);
+      expect(fetchMock.mock.calls.length - calls).toBe(10);
+      controller.abort();
+      await promise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rides out a few transient poll failures but not a 4xx', async () => {
+    vi.useFakeTimers();
+    try {
+      const sequence = [
+        () => Promise.reject(new TypeError('network down')),
+        async () => jsonResponse(503, { detail: 'busy' }),
+        async () => jsonResponse(200, done),
+      ];
+      let call = 0;
+      vi.stubGlobal('fetch', vi.fn(() => sequence[call++]()));
+      const promise = api.pollDocumentJob('j1');
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(promise).resolves.toMatchObject({ state: 'done' });
+
+      vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(404, { detail: 'Unknown job.' })));
+      await expect(api.pollDocumentJob('gone')).rejects.toMatchObject({ statusCode: 404 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('askQuestionStream', () => {
@@ -357,8 +409,16 @@ describe('askQuestionStream', () => {
     ).rejects.toMatchObject({ name: 'ApiClientError', message: 'Query text is required.' });
   });
 
+  const DONE_FRAME = `data: ${JSON.stringify({
+    type: 'done',
+    answer: '',
+    sources: [],
+    timings: null,
+    trace_id: null,
+  })}\n\n`;
+
   it('includes filenames in the request body only when non-empty', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(sseResponse([]));
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([DONE_FRAME]));
     vi.stubGlobal('fetch', fetchMock);
 
     await api.askQuestionStream('hi', undefined, undefined, ['a.txt'], undefined, {});
@@ -368,7 +428,7 @@ describe('askQuestionStream', () => {
   });
 
   it('includes history in the request body only when non-empty', async () => {
-    const fetchMock = vi.fn(async () => sseResponse([]));
+    const fetchMock = vi.fn(async () => sseResponse([DONE_FRAME]));
     vi.stubGlobal('fetch', fetchMock);
 
     await api.askQuestionStream('hi', undefined, undefined, undefined, [], {});
@@ -388,6 +448,74 @@ describe('askQuestionStream', () => {
       question: 'hi',
       history: [{ role: 'user', content: 'earlier turn' }],
     });
+  });
+});
+
+describe('askQuestionStream termination', () => {
+  function frames(...events: object[]): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const event of events)
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  }
+
+  it('rejects when the stream closes without a done event', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(frames({ type: 'delta', text: 'half an ans' })),
+    );
+    const onDelta = vi.fn();
+
+    await expect(
+      api.askQuestionStream('hi', undefined, undefined, undefined, undefined, { onDelta }),
+    ).rejects.toMatchObject({
+      name: 'ApiClientError',
+      message: 'The answer stream ended before the server finished.',
+    });
+    expect(onDelta).toHaveBeenCalledWith('half an ans');
+  });
+
+  it('bounds silence, not total duration: steady chunks keep a long stream alive', async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let push!: (text: string) => void;
+      let close!: () => void;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          push = (text) => controller.enqueue(encoder.encode(text));
+          close = () => controller.close();
+        },
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(
+          new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+        ),
+      );
+      const onDelta = vi.fn();
+      const pending = api.askQuestionStream('hi', undefined, undefined, undefined, undefined, {
+        onDelta,
+      });
+      // Four minutes of wall clock, never silent for more than a minute at a time.
+      for (let minute = 0; minute < 4; minute += 1) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        push(`data: ${JSON.stringify({ type: 'delta', text: `m${minute} ` })}\n\n`);
+      }
+      push(
+        `data: ${JSON.stringify({ type: 'done', answer: 'ok', sources: [], timings: null, trace_id: null })}\n\n`,
+      );
+      close();
+      await expect(pending).resolves.toBeUndefined();
+      expect(onDelta).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

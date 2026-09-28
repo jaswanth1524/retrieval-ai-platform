@@ -482,7 +482,46 @@ def test_split_oversized_pieces_stay_within_budget() -> None:
     pieces = documents._split_oversized(sentence, 10, counter)
 
     assert len(pieces) > 1
-    for piece in pieces:
+    for piece, tokens in pieces:
         assert counter.count(piece) <= 10, piece
+        # The count handed back is the piece's own, so callers needn't re-tokenize.
+        assert tokens == counter.count(piece)
     # Nothing is dropped or duplicated by the split.
-    assert " ".join(pieces) == sentence
+    assert " ".join(piece for piece, _ in pieces) == sentence
+
+
+def test_hf_token_counter_excludes_special_tokens_and_chunking_reserves_them_once() -> None:
+    """[CLS]/[SEP] used to be counted on every sentence — and on every word of a split
+    sentence, so CSV-style row blocks came out around a third of the intended size."""
+
+    class FakeEncoding:
+        def __init__(self, ids: list[int]) -> None:
+            self.ids = ids
+
+    class FakeTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = True) -> FakeEncoding:
+            words = [1] * len(text.split())
+            return FakeEncoding([101, *words, 102] if add_special_tokens else words)
+
+    from api.chunking import HFTokenCounter
+
+    counter = HFTokenCounter("unused")
+    counter._tokenizer = FakeTokenizer()
+    assert counter.count("one two three") == 3
+    assert counter.special_tokens_per_sequence == 2
+
+    # Budget: 20 - 3 prefix words (filename, ›, section) - 2 specials = 15 words.
+    settings = make_settings(chunk_size_tokens=20, chunk_overlap_tokens=0)
+    row = " ".join(f"cell{i}" for i in range(40))
+    chunks = chunk_sections(
+        [DocumentSection(filename="t.csv", page=1, section="Rows", text=row)], settings, counter
+    )
+    assert [len(chunk.text.split()) for chunk in chunks] == [15, 15, 10]
+
+
+@pytest.mark.parametrize("filename", ["..", ".", "a/..", "bad\x00name.txt", "tab\tname.txt"])
+def test_normalize_filename_rejects_names_the_filesystem_cannot_store(filename: str) -> None:
+    from api.documents import UnsupportedDocumentError, normalize_filename
+
+    with pytest.raises(UnsupportedDocumentError):
+        normalize_filename(filename)

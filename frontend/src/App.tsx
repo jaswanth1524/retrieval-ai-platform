@@ -419,7 +419,14 @@ function App() {
   // 404s; a trace pinned from the trace browser is never mid-stream, so it defaults
   // ready. Found via a real ~19s Ollama generation — a mocked instant SSE stream can't
   // reproduce the gap this guards against.
-  const inspectedTraceReady = inspectedTurn ? inspectedTurn.timings !== null : true;
+  // Only the in-flight turn can be in that gap. A turn that ended without `done`
+  // (cancelled, or failed mid-stream) never gets timings, but the server still wrote an
+  // error trace for it — gating on timings alone left its Inspector stuck forever.
+  const inspectedTurnInFlight =
+    pending && inspectedTurn !== undefined && inspectedTurn.id === turns[turns.length - 1]?.id;
+  const inspectedTraceReady = inspectedTurn
+    ? inspectedTurn.timings !== null || !inspectedTurnInFlight
+    : true;
 
   // Shared by both the input box and a Retry click on a failed turn — retry always
   // uses the CURRENT provider/overrides/scope, not whatever was selected when the
@@ -483,12 +490,30 @@ function App() {
     }
   }, [persistError, persistPartial, pushToast]);
 
+  // Read at keypress time so the listener is registered once. Shortcuts are dispatched
+  // from the command list itself, so every shortcut the palette advertises is bound.
+  const commandsRef = useRef<Command[]>([]);
+  const otherDialogOpenRef = useRef(false);
+  otherDialogOpenRef.current = settingsOpen || sourceView !== null;
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      // Never stack a second dialog over Settings or the document viewer.
+      if (otherDialogOpenRef.current) return;
+      const key = event.key.toLowerCase();
+      if (key === 'k') {
         event.preventDefault();
         setPaletteOpen((prev) => !prev);
+        return;
       }
+      const command = commandsRef.current.find(
+        (candidate) => candidate.shortcut?.slice(1).toLowerCase() === key,
+      );
+      if (!command || command.disabled) return;
+      event.preventDefault();
+      setPaletteOpen(false);
+      command.run();
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
@@ -598,6 +623,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown, exportJson],
   );
+  commandsRef.current = commands;
 
   const handlePanelAction = () => {
     if (rail === 'chat') newConversation();
@@ -729,7 +755,15 @@ function App() {
           overrides={advancedOptions}
           onOverridesChange={updateAdvancedOptions}
           onClose={() => setSettingsOpen(false)}
-          onSaved={() => pushToast({ tone: 'good', title: 'Settings saved' })}
+          onSaved={() => {
+            pushToast({ tone: 'good', title: 'Settings saved' });
+            // A newly entered API key only takes effect on the next request; without
+            // this refetch the "API key required" state and empty corpus stayed until
+            // a manual reload.
+            refreshDocuments().catch((err) => {
+              noteAuthFailure(err);
+            });
+          }}
           disabled={pending}
         />
       )}

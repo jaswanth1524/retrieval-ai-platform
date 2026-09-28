@@ -68,6 +68,7 @@ class LocalEmbeddingProvider:
         self.dense_model = dense_model or TextEmbedding(
             model_name=settings.dense_embedding_model,
             lazy_load=True,
+            threads=settings.embedding_threads or None,
         )
         self.sparse_model = sparse_model or SparseTextEmbedding(
             model_name=settings.sparse_embedding_model,
@@ -79,6 +80,12 @@ class LocalEmbeddingProvider:
         # dependencies.get_embedding_provider), so the pool lives as long as the app;
         # daemon threads let the process exit without an explicit shutdown.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-embed")
+        # Queries get their own pair: ingest submits whole 64-chunk batches to the pool
+        # above, and a question's two tiny embeds queued behind them waited for the
+        # entire batch to finish.
+        self._query_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="docrag-embed-query"
+        )
 
     def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
         """Embed texts with local dense and sparse models.
@@ -134,8 +141,10 @@ class LocalEmbeddingProvider:
         instruction = self.settings.dense_query_instruction
         dense_text = f"{instruction}{text}" if instruction else text
         try:
-            dense_future = self._executor.submit(lambda: list(self.dense_model.embed([dense_text])))
-            sparse_future = self._executor.submit(
+            dense_future = self._query_executor.submit(
+                lambda: list(self.dense_model.embed([dense_text]))
+            )
+            sparse_future = self._query_executor.submit(
                 lambda: list(self.sparse_model.query_embed([text]))
             )
             dense_vectors = [coerce_dense_vector(v) for v in dense_future.result()]

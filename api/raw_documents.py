@@ -10,6 +10,8 @@ stores and serves the bytes.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 from api.documents import normalize_filename
@@ -29,16 +31,36 @@ class RawDocumentStore:
         self._directory.mkdir(parents=True, exist_ok=True)
 
     def save(self, filename: str, content: bytes) -> None:
-        self._path_for(filename).write_bytes(content)
+        """Write atomically: a crash mid-write leaves the previous original intact."""
+
+        target = self._path_for(filename)
+        fd, temp_path = tempfile.mkstemp(dir=self._directory, prefix=".upload-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+            os.replace(temp_path, target)
+        except BaseException:
+            Path(temp_path).unlink(missing_ok=True)
+            raise
 
     def read(self, filename: str) -> bytes | None:
+        path = self.path(filename)
+        return path.read_bytes() if path is not None else None
+
+    def path(self, filename: str) -> Path | None:
+        """Path of the stored original, or None when none is stored."""
+
+        path = self._path_for(filename)
+        return path if path.is_file() else None
+
+    def delete(self, filename: str) -> bool:
+        """Remove the stored original; True when there was one to remove."""
+
         path = self._path_for(filename)
         if not path.is_file():
-            return None
-        return path.read_bytes()
-
-    def delete(self, filename: str) -> None:
-        self._path_for(filename).unlink(missing_ok=True)
+            return False
+        path.unlink(missing_ok=True)
+        return True
 
     def _path_for(self, filename: str) -> Path:
         return self._directory / normalize_filename(filename)

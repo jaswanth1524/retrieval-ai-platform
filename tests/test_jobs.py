@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from api.jobs import IngestJobStore, SqliteIngestJobStore
+from api.jobs import (
+    INTERRUPTED_JOB_ERROR,
+    IngestBacklog,
+    IngestJobStore,
+    SqliteIngestJobStore,
+)
 from api.metrics import ingest_jobs_evicted_total
 
 
@@ -251,3 +256,47 @@ def test_sqlite_job_store_eviction_increments_the_metric(tmp_path: Path) -> None
 
     after = ingest_jobs_evicted_total._value.get()
     assert after - before == 3
+
+
+def test_sqlite_job_store_fails_jobs_a_restart_interrupted(tmp_path: Path) -> None:
+    path = str(tmp_path / "jobs.db")
+    store = SqliteIngestJobStore(path, max_retained=10)
+    running = store.create("a.txt")
+    store.update(running.id, state="embedding", chunks_done=1, chunks_total=4)
+    finished = store.create("b.txt")
+    store.update(finished.id, state="done")
+
+    restarted = SqliteIngestJobStore(path, max_retained=10)
+
+    interrupted = restarted.get(running.id)
+    assert interrupted is not None
+    assert interrupted.state == "failed"
+    assert interrupted.error == INTERRUPTED_JOB_ERROR
+    untouched = restarted.get(finished.id)
+    assert untouched is not None and untouched.state == "done"
+
+
+def test_sqlite_job_store_uses_wal(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = str(tmp_path / "jobs.db")
+    SqliteIngestJobStore(path, max_retained=10)
+
+    connection = sqlite3.connect(path)
+    try:
+        (mode,) = connection.execute("PRAGMA journal_mode").fetchone()
+    finally:
+        connection.close()
+    assert mode == "wal"
+
+
+def test_ingest_backlog_admits_within_budget_and_always_when_empty() -> None:
+    backlog = IngestBacklog(max_bytes=100)
+
+    assert backlog.try_reserve(150)  # empty: admits even an oversized upload
+    assert not backlog.try_reserve(1)
+    backlog.release(150)
+    assert backlog.try_reserve(60)
+    assert backlog.try_reserve(40)
+    assert not backlog.try_reserve(1)
+    assert backlog.pending_bytes == 100

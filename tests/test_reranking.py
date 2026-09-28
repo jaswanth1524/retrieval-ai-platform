@@ -275,3 +275,83 @@ def test_local_cross_encoder_reranker_wraps_model_failure_as_reranking_error() -
     with pytest.raises(RerankingError, match="model download failed"):
         reranker.score("query", ["doc"])
 
+
+
+class CountingCrossEncoder:
+    """Scores each document by its length, recording every batch it was asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def rerank(
+        self, query: str, documents: Iterable[str], batch_size: int = 64, **kwargs: Any
+    ) -> Iterable[float]:
+        docs = list(documents)
+        self.calls.append(docs)
+        return [float(len(doc)) for doc in docs]
+
+
+def test_local_cross_encoder_reranker_reuses_cached_scores_for_a_repeated_query() -> None:
+    model = CountingCrossEncoder()
+    reranker = LocalCrossEncoderReranker(make_settings(), model=model)
+
+    first = reranker.score("query", ["a", "bb", "ccc"])
+    # Regenerate: same query, one new passage in the middle.
+    second = reranker.score("query", ["a", "dddd", "ccc"])
+
+    assert first == [1.0, 2.0, 3.0]
+    assert second == [1.0, 4.0, 3.0]
+    assert model.calls == [["a", "bb", "ccc"], ["dddd"]]
+    # A different query never reuses another query's scores.
+    reranker.score("other", ["a"])
+    assert model.calls[-1] == ["a"]
+
+
+def test_local_cross_encoder_reranker_cache_is_bounded_and_can_be_disabled() -> None:
+    model = CountingCrossEncoder()
+    reranker = LocalCrossEncoderReranker(make_settings(rerank_cache_size=2), model=model)
+    reranker.score("q", ["a", "bb", "ccc"])
+    reranker.score("q", ["a"])  # evicted: only the two most recent survive
+    assert model.calls[-1] == ["a"]
+
+    uncached_model = CountingCrossEncoder()
+    uncached = LocalCrossEncoderReranker(make_settings(rerank_cache_size=0), model=uncached_model)
+    uncached.score("q", ["a"])
+    uncached.score("q", ["a"])
+    assert uncached_model.calls == [["a"], ["a"]]
+
+
+def test_alternate_onnx_export_gets_its_own_cache_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """fastembed reuses an existing repo snapshot once its recorded files verify, so an
+    alternate export sharing the fp32 snapshot dir was never downloaded (verified live:
+    NO_SUCHFILE loading onnx/model_int8.onnx)."""
+
+    from api.reranking import _resolve_model
+
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", str(tmp_path))
+    model = "jinaai/jina-reranker-v2-base-multilingual"
+
+    assert _resolve_model(model, "") == (model, None)
+    name, cache_dir = _resolve_model(model, "onnx/model_int8.onnx")
+    assert name == f"{model}#onnx/model_int8.onnx"
+    assert cache_dir == str(tmp_path / "alternate-onnx" / "onnx_model_int8.onnx")
+    # Registering twice (a second reranker instance) is harmless.
+    assert _resolve_model(model, "onnx/model_int8.onnx")[0] == name
+
+
+def test_auto_onnx_file_picks_int8_for_jina_only() -> None:
+    from api.reranking import _resolve_model
+
+    jina = "jinaai/jina-reranker-v2-base-multilingual"
+    assert _resolve_model(jina, "auto")[0] == f"{jina}#onnx/model_int8.onnx"
+    # Unmeasured models keep fastembed's registered export rather than guessing a path.
+    minilm = "Xenova/ms-marco-MiniLM-L-6-v2"
+    assert _resolve_model(minilm, "auto") == (minilm, None)
+    # "" still forces the registered (fp32) export.
+    assert _resolve_model(jina, "") == (jina, None)
+
+
+def test_reranker_onnx_file_defaults_to_auto() -> None:
+    assert AppSettings(_env_file=None).reranker_onnx_file == "auto"  # type: ignore[call-arg]

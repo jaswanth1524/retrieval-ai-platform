@@ -41,6 +41,14 @@ function Composer({
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
   const [scopeQuery, setScopeQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // The textarea is disabled while a question is in flight, which drops focus; hand it
+  // back when the answer settles so the next question can be typed straight away.
+  const wasPendingRef = useRef(pending);
+  useEffect(() => {
+    if (wasPendingRef.current && !pending && !disabled) textareaRef.current?.focus();
+    wasPendingRef.current = pending;
+  }, [pending, disabled]);
   const scopeButtonRef = useRef<HTMLButtonElement>(null);
   const providerButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -114,6 +122,7 @@ function Composer({
       )}
       <div className="composer__box">
         <textarea
+          ref={textareaRef}
           className="composer__textarea"
           value={value}
           onChange={(event) => setValue(event.target.value)}

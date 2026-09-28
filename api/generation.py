@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -20,6 +21,8 @@ INSUFFICIENT_CONTEXT_ANSWER = (
 )
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+
+_OLLAMA_MODEL_PREFIXES = ("ollama/", "ollama_chat/")
 
 CITATION_EXCERPT_MAX_CHARS = 200
 
@@ -168,6 +171,33 @@ class GroundedAnswer:
     prompt_messages: list[ChatMessage] = field(default_factory=list)
 
 
+def _connection_error(exc: Exception, settings: AppSettings) -> GenerationError:
+    """Translate LiteLLM's connection error, telling a timeout apart from "unreachable".
+
+    LiteLLM reports a request that ran past ``timeout`` as an ``APIConnectionError``
+    whose message carries ``litellm.Timeout`` — so a slow local answer used to come back
+    as "Cannot reach Ollama… start `ollama serve`", sending the user after a server
+    that was up the whole time.
+    """
+
+    if "timed out" in str(exc).lower() or "litellm.timeout" in str(exc).lower():
+        return GenerationError(
+            "The generation provider did not finish within "
+            f"LLM_REQUEST_TIMEOUT_SECONDS={settings.llm_request_timeout_seconds:g}s. "
+            "Local models on modest hardware can need longer — raise that setting."
+        )
+    if settings.llm_provider.lower().strip() == "ollama":
+        return GenerationError(
+            f"Cannot reach Ollama at {settings.ollama_base_url}. Start Ollama "
+            "(`ollama serve`) and confirm OLLAMA_BASE_URL is reachable from "
+            "wherever the API process runs — use http://localhost:11434 when "
+            "the API runs directly on your host, or "
+            "http://host.docker.internal:11434 only when the API itself runs "
+            "inside Docker."
+        )
+    return GenerationError(f"Generation provider request failed: {exc}")
+
+
 class LiteLLMGenerator:
     """Generate answers with LiteLLM while keeping provider selection configurable."""
 
@@ -204,16 +234,7 @@ class LiteLLMGenerator:
                 **provider_kwargs,
             )
         except LiteLLMAPIConnectionError as exc:
-            if settings.llm_provider.lower().strip() == "ollama":
-                raise GenerationError(
-                    f"Cannot reach Ollama at {settings.ollama_base_url}. Start Ollama "
-                    "(`ollama serve`) and confirm OLLAMA_BASE_URL is reachable from "
-                    "wherever the API process runs — use http://localhost:11434 when "
-                    "the API runs directly on your host, or "
-                    "http://host.docker.internal:11434 only when the API itself runs "
-                    "inside Docker."
-                ) from exc
-            raise GenerationError(f"Generation provider request failed: {exc}") from exc
+            raise _connection_error(exc, settings) from exc
         except Exception as exc:
             # LiteLLM/provider SDKs raise many distinct exception types (auth,
             # connection, rate limit, ...); this boundary's job is translating all
@@ -253,16 +274,7 @@ class LiteLLMGenerator:
                 if delta:
                     yield delta
         except LiteLLMAPIConnectionError as exc:
-            if settings.llm_provider.lower().strip() == "ollama":
-                raise GenerationError(
-                    f"Cannot reach Ollama at {settings.ollama_base_url}. Start Ollama "
-                    "(`ollama serve`) and confirm OLLAMA_BASE_URL is reachable from "
-                    "wherever the API process runs — use http://localhost:11434 when "
-                    "the API runs directly on your host, or "
-                    "http://host.docker.internal:11434 only when the API itself runs "
-                    "inside Docker."
-                ) from exc
-            raise GenerationError(f"Generation provider request failed: {exc}") from exc
+            raise _connection_error(exc, settings) from exc
         except Exception as exc:
             raise GenerationError(f"Generation provider request failed: {exc}") from exc
 
@@ -350,6 +362,7 @@ def build_grounded_messages(
                 "Instructions:\n"
                 "- Use only the context above.\n"
                 "- Include citations using source numbers such as [1] or [2].\n"
+                "- Cite inline only; do not end with a list of sources or references.\n"
                 "- If the context is insufficient, say so directly."
             ),
         }
@@ -415,9 +428,12 @@ def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
     """
 
     text = chunk.expanded_text if chunk.expanded_text is not None else chunk.text
+    # No chunk_id here: the response's structured sources already carry it, the model
+    # has no use for a 20-hex id, and seeing one invited it to copy every source's
+    # metadata into a trailing references list — pure decode time on a local model.
     return (
         f"[{index}] filename={chunk.filename}; page={chunk.page}; "
-        f"section={chunk.section}; chunk_id={chunk.chunk_id}\n"
+        f"section={chunk.section}\n"
         f"{text}"
     )
 
@@ -582,6 +598,22 @@ class CitationOutcome:
     retry_ms: float = 0.0
 
 
+def will_retry_citations(
+    answer: str, all_sources: Sequence[SourceCitation], settings: AppSettings
+) -> bool:
+    """Whether ``finalize_citations`` will make its retry call for this answer.
+
+    Split out so the streaming path can announce the retry *before* it blocks, without
+    restating the condition — two copies would drift the first time either changed.
+    """
+
+    return (
+        not cited_sources(answer, all_sources)
+        and settings.citation_retry_enabled
+        and needs_citation_retry(answer, len(all_sources))
+    )
+
+
 def finalize_citations(
     prompt_messages: Sequence[ChatMessage],
     answer: str,
@@ -610,11 +642,7 @@ def finalize_citations(
     final_messages = list(prompt_messages)
     retry_used = False
     retry_ms = 0.0
-    if (
-        not cited
-        and settings.citation_retry_enabled
-        and needs_citation_retry(answer, len(all_sources))
-    ):
+    if will_retry_citations(answer, all_sources, settings):
         # Timed around the call itself, not around the `if` — a retry that fails or
         # still comes back uncited cost just as much wall-clock as one that worked, and
         # attributing it to generate_ms is what made this stage invisible before.
@@ -688,13 +716,21 @@ def generate_query_variants(
     return variants[:count]
 
 
+@functools.lru_cache(maxsize=64)
 def supports_reasoning(model: str) -> bool:
     """True when LiteLLM reports ``model`` as a reasoning model (gpt-5 family, o-series).
 
     Wrapped so an unknown model or an offline metadata lookup degrades to False rather
     than raising — non-reasoning is the safe default (plain max_tokens, no effort knob).
+
+    Ollama models are never asked: LiteLLM resolves an unmapped ``ollama/<tag>`` with an
+    uncached POST to ``/api/show`` on ``OLLAMA_API_BASE``/localhost — not our configured
+    ``ollama_base_url`` — and against an unreachable host that blocked 75s per call, up
+    to four calls per question. Local models keep the plain budget by design anyway.
     """
 
+    if model.startswith(_OLLAMA_MODEL_PREFIXES):
+        return False
     try:
         return bool(litellm.supports_reasoning(model))
     except Exception:
@@ -717,19 +753,27 @@ def effective_max_tokens(settings: AppSettings, model: str) -> int:
     return base
 
 
-def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, str]]:
+def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, str | int]]:
     """Return LiteLLM model name and provider-specific keyword arguments."""
 
     provider = settings.llm_provider.lower().strip()
     if provider == "ollama":
-        return f"ollama/{settings.llm_model}", {
+        # ollama_chat (/api/chat), not ollama (/api/generate): the generate route files
+        # every extra kwarg under "options", where Ollama rejects keep_alive as an
+        # invalid option — so the model unloaded after Ollama's 5-minute default no
+        # matter what was configured — and it flattens messages without the model's
+        # own chat template.
+        ollama_kwargs: dict[str, str | int] = {
             "base_url": settings.ollama_base_url,
             "keep_alive": settings.ollama_keep_alive,
         }
+        if settings.ollama_num_ctx:
+            ollama_kwargs["num_ctx"] = int(settings.ollama_num_ctx)
+        return f"ollama_chat/{settings.llm_model}", ollama_kwargs
     if provider == "openai":
         if not settings.openai_api_key:
             raise GenerationConfigError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
-        kwargs = {"api_key": settings.openai_api_key}
+        kwargs: dict[str, str | int] = {"api_key": settings.openai_api_key}
         effort = settings.openai_reasoning_effort.strip()
         if effort and supports_reasoning(settings.openai_model):
             kwargs["reasoning_effort"] = effort

@@ -68,6 +68,21 @@ class AppSettings(BaseSettings):
     # default of 64 against 50 candidates) happened to violate both rules at once, which
     # is what made the relation look like the cause.
     reranker_batch_size: PositiveInt = 8
+    # Which ONNX export of RERANKER_MODEL to load. "auto" (default): jina-v2's int8
+    # export, fastembed's registered file for any other model. "" : always fastembed's
+    # registered file (jina: fp32 onnx/model.onnx). Anything else: that path in the repo.
+    # int8 jina measured 2.5x faster than fp32 with 40% less memory, 81-83% of the same
+    # top-6 context and no question losing its context (README "Latency").
+    reranker_onnx_file: str = "auto"
+    # ONNX Runtime intra-op threads per session; 0 keeps ORT's default (all cores).
+    # Lowering these makes a lone question SLOWER — their value is stopping ingest
+    # embedding and query-time rerank from oversubscribing the same cores when they
+    # overlap. Leave at 0 unless you run ingest and questions concurrently.
+    embedding_threads: int = Field(default=0, ge=0)
+    reranker_threads: int = Field(default=0, ge=0)
+    # Rerank scores memoized per (query, passage text). Regenerate/Retry re-ask the
+    # identical query, so a hit skips the most expensive stage entirely. 0 disables.
+    rerank_cache_size: int = Field(default=4096, ge=0)
     max_context_chunks: PositiveInt = 6
     # Cross-encoder logits are unbounded and model-specific; sigmoid-normalizing to
     # [0, 1] before comparing against this threshold makes it comparable across
@@ -90,6 +105,11 @@ class AppSettings(BaseSettings):
     # forcing a multi-second reload on the next question. Keeping it resident trades
     # idle RAM for eliminating that reload on every request after the first.
     ollama_keep_alive: str = "30m"
+    # Context window requested from Ollama; 0 leaves it to Ollama. Not a speed knob —
+    # measured on an M1, 8192 vs Ollama's 32768 left prefill/decode speed unchanged
+    # but cut the loaded model from 8.2 GB to 5.3 GB. Too small silently truncates the
+    # front of the prompt (the grounding rules), so leave headroom for history.
+    ollama_num_ctx: int = Field(default=0, ge=0)
     openai_api_key: str | None = Field(default=None)
     openai_model: str = "gpt-4o-mini"
     # Reasoning models (gpt-5 family) spend hidden reasoning tokens out of the same
@@ -125,6 +145,11 @@ class AppSettings(BaseSettings):
     # once, so a single huge document reports incremental job progress and never
     # holds one giant embedding call in memory.
     ingest_batch_size: PositiveInt = 64
+    # Upload bytes allowed to sit queued or in progress at once. Every accepted upload
+    # holds its full content in memory until its ingest job finishes, and the executor
+    # queue itself is unbounded — past this budget uploads get 503 + Retry-After
+    # instead of growing memory without limit. An empty backlog always admits one.
+    ingest_max_pending_bytes: PositiveInt = 512 * 1024 * 1024
 
     # Finished background ingest jobs beyond this count are pruned oldest-first, so
     # a long-running process doesn't accumulate unbounded job history in memory —
@@ -187,9 +212,9 @@ class AppSettings(BaseSettings):
     # this setting directly (not through FastAPI's DI), which sidesteps test fixtures'
     # dependency overrides — an operator-set `true` in a real `.env` would otherwise
     # also trigger real model downloads during local test runs against that same file.
-    # Note: the default reranker (jinaai/jina-reranker-v2-base-multilingual) is ~1.1 GB,
-    # larger than the previous default — enabling warmup or asking the first question
-    # after a config change pays that download cost once.
+    # Note: the default reranker (jina-reranker-v2, int8 export) is ~0.28 GB (~1.1 GB
+    # for fp32) — enabling warmup or asking the first question after a config change
+    # pays that download cost once.
     warmup_models: bool = False
 
     # Per-query debug traces (retrieval candidates, rerank keep/drop decisions, the

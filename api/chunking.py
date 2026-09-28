@@ -21,13 +21,23 @@ _HEURISTIC_TOKENS_PER_WORD = 1.6
 
 
 class TokenCounter(Protocol):
-    """Counts model tokens for a piece of text."""
+    """Counts model tokens for a piece of text, excluding special tokens.
+
+    Implementations may expose ``special_tokens_per_sequence`` (tokens the model adds
+    around each input); chunking reserves that many once per chunk, 0 if absent.
+    """
 
     def count(self, text: str) -> int: ...
 
 
+# [CLS] + [SEP]: what bge (and BERT-family models generally) wrap around each input.
+_BERT_SPECIAL_TOKENS = 2
+
+
 class HeuristicTokenCounter:
     """Word-count-based token estimate; no model, always available."""
+
+    special_tokens_per_sequence = _BERT_SPECIAL_TOKENS
 
     def count(self, text: str) -> int:
         words = len(text.split())
@@ -42,6 +52,8 @@ class HFTokenCounter:
     once) rather than raising — a document must still ingest without network access.
     """
 
+    special_tokens_per_sequence = _BERT_SPECIAL_TOKENS
+
     def __init__(self, model_name: str) -> None:
         self._model_name = model_name
         self._tokenizer: object | None = None
@@ -53,7 +65,13 @@ class HFTokenCounter:
             return self._fallback.count(text)
         if self._tokenizer is None and not self._load():
             return self._fallback.count(text)
-        encode = self._tokenizer.encode(text)  # type: ignore[union-attr]
+        # Without special tokens: [CLS]/[SEP] wrap the whole embedded string once, and
+        # chunking reserves them once in its budget. Counting them per call added 2 to
+        # every sentence (and every word, when an oversized sentence is split word by
+        # word), leaving windows well short of the budget they were sized for.
+        encode = self._tokenizer.encode(  # type: ignore[union-attr]
+            text, add_special_tokens=False
+        )
         return len(encode.ids)
 
     def _load(self) -> bool:

@@ -6,6 +6,9 @@ import CitationCard from './CitationCard';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
 
+const REMARK_PLUGINS = [remarkGfm];
+const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+
 export interface FeedbackPayload {
   rating: FeedbackRating;
   question: string;
@@ -165,7 +168,7 @@ function ChatMessage({
               <StreamingSkeleton stage={streamStage} />
             ) : (
               <div className="chat-message__markdown">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{turn.content}</ReactMarkdown>
               </div>
             )}
             <div className="chat-message__meta-row">
@@ -173,9 +176,7 @@ function ChatMessage({
                 className="chat-message__timestamp mono"
                 dateTime={new Date(turn.timestamp).toISOString()}
               >
-                {new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(
-                  turn.timestamp,
-                )}
+                {TIME_FORMAT.format(turn.timestamp)}
               </time>
               {turn.content && (
                 <button

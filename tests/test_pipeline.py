@@ -9,7 +9,13 @@ from qdrant_client import QdrantClient, models
 
 from api.embeddings import EmbeddedText
 from api.generation import CITATION_RETRY_REMINDER, ChatMessage, GenerationError
-from api.pipeline import AnswerOverrides, IngestService, RagPipeline, expand_with_neighbors
+from api.pipeline import (
+    AnswerOverrides,
+    IngestService,
+    RagPipeline,
+    _strip_overlap,
+    expand_with_neighbors,
+)
 from api.repository import VectorRepository
 from api.reranking import rerank_candidates
 from api.retrieval import RetrievalConfigError, retrieve_candidates
@@ -522,8 +528,7 @@ def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
     reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
     middle = next(chunk for chunk in reranked if chunk.chunk_ordinal == 2)
 
-    expanded = expand_with_neighbors(reranked, repository, settings)
-    expanded_middle = next(chunk for chunk in expanded if chunk.chunk_ordinal == 2)
+    [expanded_middle] = expand_with_neighbors([middle], repository, settings)
 
     assert middle.expanded_text is None
     assert expanded_middle.expanded_text is not None
@@ -539,22 +544,29 @@ def test_expand_with_neighbors_fetches_once_per_filename_not_once_per_chunk() ->
     cannot come back, and re-asserts the merged text so batching didn't change output.
     """
 
-    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=8, chunk_overlap_tokens=0)
+    settings = make_settings(
+        context_neighbor_radius=1, chunk_size_tokens=8, chunk_overlap_tokens=0, rerank_top_k=5
+    )
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
-    embeddings = [make_embedding(1.0) for _ in range(3)]
+    embeddings = [make_embedding(1.0) for _ in range(5)]
     IngestService(
         repository,
         StaticEmbeddingProvider(embeddings),
         settings,
         token_counter=WordTokenCounter(),
-    ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
+    ).ingest(
+        "guide.md",
+        b"# Notes\nOne two three. Four five six. Seven eight nine. Ten eleven twelve. "
+        b"Thirteen fourteen fifteen.",
+    )
 
     candidates = retrieve_candidates(
         repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
     )
     reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
-    assert len(reranked) >= 3, "need several chunks from one file for this to mean anything"
+    by_ordinal = {chunk.chunk_ordinal: chunk for chunk in reranked}
+    selected = [by_ordinal[2], by_ordinal[4]]
 
     calls: list[tuple[str, list[int]]] = []
     real_fetch = repository.fetch_neighbors
@@ -566,18 +578,53 @@ def test_expand_with_neighbors_fetches_once_per_filename_not_once_per_chunk() ->
         return real_fetch(settings_arg, filename, ordinals)
 
     repository.fetch_neighbors = counting_fetch  # type: ignore[method-assign]
-    expanded = expand_with_neighbors(reranked, repository, settings)
+    second, fourth = expand_with_neighbors(selected, repository, settings)
 
-    # One call, because every chunk came from the same document.
-    assert len(calls) == 1, calls
-    assert calls[0][0] == "guide.md"
-    # And it asked for the union of the neighbours, deduplicated and sorted.
-    assert calls[0][1] == sorted(set(calls[0][1]))
+    # One call, because both chunks came from the same document, asking for the union
+    # of their neighbours, deduplicated and sorted.
+    assert calls == [("guide.md", [1, 3, 5])]
 
-    expanded_middle = next(chunk for chunk in expanded if chunk.chunk_ordinal == 2)
-    assert expanded_middle.expanded_text is not None
-    assert "One two three" in expanded_middle.expanded_text
-    assert "Seven eight nine" in expanded_middle.expanded_text
+    text = {ordinal: chunk.text for ordinal, chunk in by_ordinal.items()}
+    assert second.expanded_text == "\n\n".join([text[1], text[2], text[3]])
+    # Ordinal 3 already went out in the higher-ranked block, so it is not sent twice.
+    assert fourth.expanded_text == "\n\n".join([text[4], text[5]])
+
+
+def test_expand_with_neighbors_never_pulls_in_a_chunk_that_has_its_own_block() -> None:
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=8, chunk_overlap_tokens=0)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(
+        repository,
+        StaticEmbeddingProvider([make_embedding(1.0) for _ in range(3)]),
+        settings,
+        token_counter=WordTokenCounter(),
+    ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
+    candidates = retrieve_candidates(
+        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
+    )
+    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    by_ordinal = {chunk.chunk_ordinal: chunk for chunk in reranked}
+
+    first, second = expand_with_neighbors([by_ordinal[1], by_ordinal[2]], repository, settings)
+
+    assert first.expanded_text is None
+    assert second.expanded_text == f"{by_ordinal[2].text}\n\n{by_ordinal[3].text}"
+
+
+def test_strip_overlap_removes_only_the_repeated_sentence_prefix() -> None:
+    previous = "Alpha sentence one here. Shared overlap sentence goes here."
+    following = "Shared overlap sentence goes here. Fresh content follows it."
+
+    assert _strip_overlap(previous, following) == "Fresh content follows it."
+    # No overlap: unchanged.
+    assert _strip_overlap("Totally different text.", following) == following
+    # A coincidental short shared word is not treated as overlap.
+    assert _strip_overlap("ends with the", "the start of something") == "the start of something"
+    # Fully contained in the previous tail: nothing new to send.
+    assert _strip_overlap(previous, "Shared overlap sentence goes here.") == ""
+    # Must match at a word boundary in previous too.
+    assert _strip_overlap("xShared overlap sentence goes here.", following) == following
 
 
 def test_expand_with_neighbors_disabled_by_zero_radius() -> None:
@@ -1159,7 +1206,39 @@ def test_stream_announces_condensing_only_when_the_condense_call_will_run() -> N
     assert stages_for("What about the second one?") == ["condensing", "searching"]
     # Standalone despite the history, so the condense call is skipped — and announcing
     # a stage that never runs is worse than announcing nothing.
-    assert stages_for("What is the referral bonus amount?") == ["searching"]
+    standalone = stages_for("What is the referral bonus amount?")
+    assert "condensing" not in standalone
+    assert standalone[0] == "searching"
+
+
+def test_stream_announces_verifying_citations_only_when_the_retry_will_run() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+
+    def events_for(answers: list[str]) -> list[Any]:
+        pipeline = RagPipeline(
+            repository=repository,
+            embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+            reranker=FakeReranker(),
+            generator=SequencedGenerator(answers),
+            settings=settings,
+        )
+        return list(pipeline.answer_stream("alpha"))
+
+    retried = events_for(["Alpha is documented.", "Alpha is documented [1]."])
+    stages = [event["stage"] for event in retried if event["type"] == "stage"]
+    assert stages == ["searching", "verifying_citations"]
+    types = [event["type"] for event in retried]
+    last_delta = len(types) - 1 - types[::-1].index("delta")
+    assert types.index("stage", last_delta) < types.index("done")
+    assert retried[-1]["answer"] == "Alpha is documented [1]."
+
+    cited = events_for(["Alpha is documented [1]."])
+    assert [event["stage"] for event in cited if event["type"] == "stage"] == ["searching"]
 
 
 def test_condense_is_skipped_for_a_standalone_follow_up() -> None:

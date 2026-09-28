@@ -7,7 +7,7 @@ import logging
 import mimetypes
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Protocol
@@ -16,7 +16,7 @@ import grpc
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException
@@ -26,6 +26,7 @@ from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
     get_feedback_store,
+    get_ingest_backlog,
     get_ingest_executor,
     get_ingest_job_store,
     get_ingest_service,
@@ -35,16 +36,22 @@ from api.dependencies import (
     get_rag_pipeline,
     get_raw_document_store,
     get_reranker,
+    get_token_counter,
     get_trace_store,
     get_vector_repository,
     require_api_key,
 )
-from api.documents import DocumentError, DocumentNotFoundError, normalize_filename
+from api.documents import (
+    DocumentError,
+    DocumentNotFoundError,
+    normalize_filename,
+    validate_upload_filename,
+)
 from api.embeddings import EmbeddedText, EmbeddingError
 from api.feedback import FeedbackStore
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
 from api.ingestion import IngestionError, filename_write_lock
-from api.jobs import JobNotFoundError, JobStore
+from api.jobs import IngestBacklog, JobNotFoundError, JobStore
 from api.logging_config import configure_logging
 from api.metrics import (
     NO_ERROR_TYPE,
@@ -53,7 +60,7 @@ from api.metrics import (
     observe_question_timings,
     questions_total,
 )
-from api.pipeline import AnswerOverrides, IngestService, RagPipeline
+from api.pipeline import AnswerOverrides, IngestService, RagPipeline, timings_dict
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
@@ -109,6 +116,7 @@ IngestJobStoreDep = Annotated[JobStore, Depends(get_ingest_job_store)]
 RawDocumentStoreDep = Annotated[RawDocumentStore | None, Depends(get_raw_document_store)]
 FeedbackStoreDep = Annotated[FeedbackStore | None, Depends(get_feedback_store)]
 IngestExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_ingest_executor)]
+IngestBacklogDep = Annotated[IngestBacklog, Depends(get_ingest_backlog)]
 TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
 
 
@@ -169,32 +177,53 @@ class WarmupReranker(Protocol):
     def score(self, query: str, documents: Sequence[str]) -> list[float]: ...
 
 
+class WarmupTokenCounter(Protocol):
+    """Minimal token-counter surface the warmup step needs."""
+
+    def count(self, text: str) -> int: ...
+
+
 def run_model_warmup(
     embedding_provider: WarmupEmbeddingProvider,
     reranker: WarmupReranker,
+    token_counter: WarmupTokenCounter | None = None,
 ) -> None:
-    """Force both lazy-loaded models to load once, logging duration or failure.
+    """Force the lazy-loaded models to load once, logging duration or failure.
 
     Both models are constructed with ``lazy_load=True``, so the real download/load
     cost is paid on first use, not at construction — this runs that first use at boot
-    instead of on a user's first request. Deliberately never raises: a warmup failure
-    (e.g. a transient network blip fetching a model) must not prevent the app from
-    starting and serving requests that might succeed once the model is retried lazily;
-    it only means the misconfiguration is now visible in the startup log instead of
-    silently deferred.
+    instead of on a user's first request. The chunking tokenizer is a separate fetch
+    (the first upload paid it otherwise). All three load concurrently, and each
+    failure is logged on its own so one bad model name doesn't leave the others cold.
+    Deliberately never raises: a warmup failure (e.g. a transient network blip
+    fetching a model) must not prevent the app from starting and serving requests that
+    might succeed once the model is retried lazily; it only means the
+    misconfiguration is now visible in the startup log instead of silently deferred.
     """
 
+    tasks: dict[str, Callable[[], object]] = {
+        "embedding": lambda: embedding_provider.embed_texts(["warmup"]),
+        "reranker": lambda: reranker.score("warmup", ["warmup"]),
+    }
+    if token_counter is not None:
+        tasks["tokenizer"] = lambda: token_counter.count("warmup")
+
     start = time.monotonic()
-    try:
-        embedding_provider.embed_texts(["warmup"])
-        reranker.score("warmup", ["warmup"])
-    except Exception:
-        logger.exception(
-            "Model warmup failed — this will resurface as an error on the first real "
-            "request instead. Check DENSE_EMBEDDING_MODEL/SPARSE_EMBEDDING_MODEL/"
-            "RERANKER_MODEL."
-        )
-    else:
+    failed = False
+    with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="docrag-warmup") as pool:
+        futures = {name: pool.submit(task) for name, task in tasks.items()}
+    for name, future in futures.items():
+        exc = future.exception()
+        if exc is not None:
+            failed = True
+            logger.error(
+                "Model warmup failed for the %s — this will resurface as an error on the "
+                "first real request instead. Check DENSE_EMBEDDING_MODEL/"
+                "SPARSE_EMBEDDING_MODEL/RERANKER_MODEL.",
+                name,
+                exc_info=exc,
+            )
+    if not failed:
         logger.info("Model warmup completed in %.1fs", time.monotonic() - start)
 
 
@@ -204,7 +233,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     settings = get_app_settings()
     if settings.warmup_models:
-        await run_in_threadpool(run_model_warmup, get_embedding_provider(), get_reranker())
+        await run_in_threadpool(
+            run_model_warmup, get_embedding_provider(), get_reranker(), get_token_counter()
+        )
     yield
 
 
@@ -358,21 +389,46 @@ def _run_ingest_job(
     ingest_service: IngestService,
     filename: str,
     content: bytes,
+    raw_store: RawDocumentStore | None = None,
 ) -> None:
     """Background-executor entry point: parse/chunk/embed/index and update job status.
 
     Runs on ``get_ingest_executor()``'s worker threads, outside any request's
     lifetime — exceptions are caught and recorded on the job rather than raised,
-    since there is no HTTP response left to attach them to.
+    since there is no HTTP response left to attach them to. The original bytes (when
+    ``raw_store`` is set) are saved only after indexing succeeds and under the same
+    filename lock: saving them at upload time left orphans for uploads that then
+    failed, and overwrote the original of a still-indexed older version.
     """
-
-    job_store.update(job_id, state="parsing")
 
     def on_progress(done: int, total: int) -> None:
         job_store.update(job_id, state="embedding", chunks_done=done, chunks_total=total)
 
+    def save_original() -> None:
+        if raw_store is None:
+            return
+        try:
+            raw_store.save(filename, content)
+        except OSError:
+            # The index is already updated; failing the job would report a document
+            # as not indexed when it is. The original is an opt-in extra — but a
+            # previous version's original must not outlive the index it described, or
+            # /original would serve bytes that no longer match what is indexed. No
+            # original (404) beats a wrong one.
+            logger.exception("Indexed %r but could not store its original bytes.", filename)
+            try:
+                raw_store.delete(filename)
+            except OSError:
+                logger.exception(
+                    "Could not remove the outdated original of %r either; "
+                    "GET /documents/%s/original may serve the previous version.",
+                    filename,
+                    filename,
+                )
+
     try:
-        outcome = ingest_service.ingest(filename, content, on_progress)
+        job_store.update(job_id, state="parsing")
+        outcome = ingest_service.ingest(filename, content, on_progress, save_original)
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
         ingest_jobs_total.labels(outcome="failed", error_type=_ingest_error_type(exc)).inc()
@@ -393,6 +449,24 @@ def _run_ingest_job(
             "collection_name": outcome.collection_name,
         },
     )
+
+
+def _finish_ingest_future(
+    future: Future[None], backlog: IngestBacklog, size: int, job_id: str
+) -> None:
+    """Release the job's backlog bytes, and surface anything that escaped the job.
+
+    ``_run_ingest_job`` records failures on the job, but the job store itself can fail
+    while doing so (sqlite disk full); nothing observed the future, so that left the
+    job stuck in a non-terminal state with nothing in the log.
+    """
+
+    backlog.release(size)
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.error("Ingest job %s crashed outside its own error handling.", job_id, exc_info=exc)
 
 
 def _sse_event(payload: dict[str, object]) -> str:
@@ -517,20 +591,6 @@ def _trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
     )
 
 
-def _timings_dict(timings: StageTimings) -> dict[str, float]:
-    return {
-        "embed_ms": timings.embed_ms,
-        "search_ms": timings.search_ms,
-        "rerank_ms": timings.rerank_ms,
-        "generate_ms": timings.generate_ms,
-        "total_ms": timings.total_ms,
-        "condense_ms": timings.condense_ms,
-        "query_expansion_ms": timings.query_expansion_ms,
-        "context_expansion_ms": timings.context_expansion_ms,
-        "citation_retry_ms": timings.citation_retry_ms,
-    }
-
-
 def _log_question(
     *, provider: str | None, source_count: int, timings: dict[str, float]
 ) -> None:
@@ -538,14 +598,17 @@ def _log_question(
 
     logger.info(
         "question answered provider=%s sources=%d condense_ms=%.1f embed_ms=%.1f "
-        "search_ms=%.1f rerank_ms=%.1f generate_ms=%.1f total_ms=%.1f",
+        "search_ms=%.1f rerank_ms=%.1f context_expansion_ms=%.1f generate_ms=%.1f "
+        "citation_retry_ms=%.1f total_ms=%.1f",
         provider or "default",
         source_count,
         timings.get("condense_ms", 0.0),
         timings["embed_ms"],
         timings["search_ms"],
         timings["rerank_ms"],
+        timings.get("context_expansion_ms", 0.0),
         timings["generate_ms"],
+        timings.get("citation_retry_ms", 0.0),
         timings["total_ms"],
     )
 
@@ -631,23 +694,38 @@ def register_routes(app: FastAPI) -> None:
         settings: SettingsDep,
         job_store: IngestJobStoreDep,
         executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
         raw_store: RawDocumentStoreDep,
         file: Annotated[UploadFile, File()],
     ) -> DocumentJobAcceptedResponse:
+        # Rejected here, not in the background job: an unusable name or type used to
+        # be accepted with a 202 and only fail once the client polled the job.
+        filename = validate_upload_filename(file.filename or "")
         content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
-        filename = file.filename or ""
-        # Both of these are synchronous and can do real I/O — raw_store.save is a
-        # write_bytes of up to max_upload_bytes (50 MB by default) and job_store.create
-        # is a sqlite INSERT under JOB_STORE_BACKEND=sqlite. This handler is async, so
-        # calling them directly would block the event loop for that whole duration and
-        # stall every other in-flight request, including other users' streamed answers.
-        if raw_store is not None:
-            await run_in_threadpool(raw_store.save, filename, content)
-        job = await run_in_threadpool(job_store.create, filename)
-        # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
-        # it survives independently of this request/response cycle — the client can
-        # disconnect and poll the job later without interrupting the work.
-        executor.submit(_run_ingest_job, job_store, job.id, ingest_service, filename, content)
+        size = len(content)
+        if not backlog.try_reserve(size):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Too many documents are already waiting to be indexed. "
+                    "Retry once some of them finish."
+                ),
+                headers={"Retry-After": "15"},
+            )
+        try:
+            # job_store.create is a sqlite INSERT under JOB_STORE_BACKEND=sqlite; off the
+            # event loop so it can't stall other in-flight requests.
+            job = await run_in_threadpool(job_store.create, filename)
+            # Ingestion runs on a dedicated executor (not FastAPI's request threadpool)
+            # so it survives independently of this request/response cycle — the client
+            # can disconnect and poll the job later without interrupting the work.
+            future = executor.submit(
+                _run_ingest_job, job_store, job.id, ingest_service, filename, content, raw_store
+            )
+        except BaseException:
+            backlog.release(size)
+            raise
+        future.add_done_callback(lambda done: _finish_ingest_future(done, backlog, size, job.id))
         return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
 
     @app.delete(
@@ -673,11 +751,13 @@ def register_routes(app: FastAPI) -> None:
         # same lock, or a deleted document's original bytes would accumulate forever.
         with filename_write_lock(filename):
             point_ids = repository.point_ids_for_filename(settings, filename)
-            if not point_ids:
+            if point_ids:
+                repository.delete_by_ids(settings, point_ids)
+            # Also when no points remain: an original orphaned by an earlier failed
+            # ingest was otherwise undeletable, since the 404 came first.
+            removed_original = raw_store.delete(filename) if raw_store is not None else False
+            if not point_ids and not removed_original:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-            repository.delete_by_ids(settings, point_ids)
-            if raw_store is not None:
-                raw_store.delete(filename)
         return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
 
     # Guarded like its sibling document routes: the response carries the filename (and
@@ -730,15 +810,18 @@ def register_routes(app: FastAPI) -> None:
     # the same "not found" either way, not a distinct "feature unavailable" state.
     @app.get("/documents/{filename}/original", dependencies=[Depends(require_api_key)])
     def document_original(filename: str, raw_store: RawDocumentStoreDep) -> Response:
-        content = raw_store.read(filename) if raw_store is not None else None
-        if content is None:
+        path = raw_store.path(filename) if raw_store is not None else None
+        if path is None:
             raise DocumentNotFoundError(f"No stored original for '{filename}'.")
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        safe_filename = normalize_filename(filename)
-        return Response(
-            content=content,
+        # FileResponse streams from disk (the whole file was read into memory before)
+        # and RFC 5987-encodes the name: a hand-built latin-1 header 500'd on any
+        # non-Latin-1 filename and broke on one containing a quote.
+        return FileResponse(
+            path,
             media_type=media_type,
-            headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+            filename=normalize_filename(filename),
+            headers={"X-Content-Type-Options": "nosniff"},
         )
 
     # Off by default (AppSettings.feedback_enabled) — a deployment that hasn't
@@ -836,7 +919,7 @@ def register_routes(app: FastAPI) -> None:
             raise
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
         if grounded.timings is not None:
-            timings = _timings_dict(grounded.timings)
+            timings = timings_dict(grounded.timings)
             observe_question_timings(timings)
             _log_question(
                 provider=request.llm_provider,

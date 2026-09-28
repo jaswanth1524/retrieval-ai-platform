@@ -139,6 +139,35 @@ def test_retrieve_candidates_falls_back_to_manual_rrf(
     assert results[0].score == pytest.approx(1 / 60 + 1 / 60)
 
 
+def test_manual_fusion_fallback_is_remembered_per_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once a server rejects the hybrid query shape, later questions skip the doomed
+    round trip — it failed identically on every question before."""
+
+    settings = make_settings()
+    client = seed_collection(settings)
+    repository = VectorRepository(client)
+    original_query_points = client.query_points
+    hybrid_attempts = 0
+
+    def query_points(*args: Any, **kwargs: Any) -> object:
+        nonlocal hybrid_attempts
+        if kwargs.get("prefetch") is not None:
+            hybrid_attempts += 1
+            raise _unexpected_response(400)
+        return original_query_points(*args, **kwargs)
+
+    monkeypatch.setattr(client, "query_points", query_points)
+    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
+
+    first = retrieve_candidates(repository, settings, "alpha", query_provider)
+    second = retrieve_candidates(VectorRepository(client), settings, "alpha", query_provider)
+
+    assert hybrid_attempts == 1
+    assert [r.chunk_id for r in first] == [r.chunk_id for r in second] == ["c1", "c3", "c2"]
+
+
 def test_retrieve_candidates_does_not_fall_back_on_real_query_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
