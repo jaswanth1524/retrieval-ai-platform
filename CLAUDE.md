@@ -94,7 +94,7 @@ Full stack:
 docker compose up              # Qdrant + API (API builds and serves frontend/dist)
 ```
 
-CI (`.github/workflows/ci.yml`) runs three jobs: backend (`uv sync --extra dev` → `pytest` → `ruff check .` → `mypy api` → import the `eval` extra → validate the sample eval dataset), frontend (`npm ci` → `npm run test` → `npm run build` → `npm run lint`), and a build-only Docker image job. The Playwright E2E suite (`frontend/e2e/`, `npm run e2e`) is not in CI yet: it serves the production build via `vite preview` and mocks every API route with `page.route` (`e2e/fixtures.ts`'s `MockApi`, incl. SSE streams), so it needs no Qdrant/models/LLM; its auto fixture fails any test that logs a console error.
+CI (`.github/workflows/ci.yml`) runs four jobs: backend (`uv sync --extra dev` → `pytest` → `ruff check .` → `mypy api` → import the `eval` extra → validate the sample eval dataset), frontend (`npm ci` → `npm run test` → `npm run build` → `npm run lint`), e2e (after frontend passes: cached Chromium → `npm run e2e`, report + traces uploaded as an artifact on failure), and a build-only Docker image job. The Playwright E2E suite (`frontend/e2e/`) serves the production build via `vite preview` and mocks every API route with `page.route` (`e2e/fixtures.ts`'s `MockApi`, incl. SSE streams), so it needs no Qdrant/models/LLM; its auto fixture fails any test that logs a console error.
 
 Optional eval extra: `uv sync --extra eval` then `uv run python -m eval.ragas_runner path/to/dataset.json --output results.json`.
 
