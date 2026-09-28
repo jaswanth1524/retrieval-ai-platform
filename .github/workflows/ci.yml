@@ -69,12 +69,69 @@ jobs:
       - name: Lint
         run: npm run lint
 
+  e2e:
+    # After the cheaper frontend gates, so a type/lint/unit failure surfaces first.
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-chromium
+
+      - name: Install Chromium
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Chromium system dependencies
+        # The browser binary is cached; the OS libraries it links against are not.
+        if: steps.browser-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: E2E (production build, mocked API)
+        # playwright.config.ts's webServer builds and serves the prod bundle; the API
+        # is mocked per test, so no Qdrant, models or LLM are needed. CI=true (set by
+        # Actions) turns on forbidOnly, 1 retry to detect flakes, and the HTML report.
+        run: npm run e2e
+
+      - name: Upload Playwright report and traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-evidence
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 7
+
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Build-only: running the image would pull the ~1.1 GB reranker + embedding
-      # models, which isn't worth paying for on every CI run.
+      # Build-only: running the image would download the reranker + embedding models,
+      # which isn't worth paying for on every CI run.
       - name: Build image
         run: docker build -t docrag:ci .
