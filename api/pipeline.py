@@ -29,6 +29,7 @@ from api.generation import (
     generate_query_variants,
     needs_condense,
     source_citations,
+    will_retry_citations,
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
@@ -146,7 +147,7 @@ def _citation_dict(source: SourceCitation) -> dict[str, Any]:
     }
 
 
-def _timings_dict(timings: StageTimings) -> dict[str, float]:
+def timings_dict(timings: StageTimings) -> dict[str, float]:
     return {
         "embed_ms": timings.embed_ms,
         "search_ms": timings.search_ms,
@@ -158,6 +159,32 @@ def _timings_dict(timings: StageTimings) -> dict[str, float]:
         "context_expansion_ms": timings.context_expansion_ms,
         "citation_retry_ms": timings.citation_retry_ms,
     }
+
+
+# Below this, a suffix/prefix match between adjacent chunks is more likely a
+# coincidence (a shared "the"/"and") than the sentence overlap chunking wrote.
+_MIN_OVERLAP_CHARS = 20
+
+
+def _strip_overlap(previous: str, following: str) -> str:
+    """Drop the prefix of ``following`` that repeats the tail of ``previous``.
+
+    Adjacent chunks share ``chunk_overlap_tokens`` of whole trailing sentences (chunks
+    are space-joined sentences), so a word-boundary suffix/prefix match finds exactly
+    the text written twice. Returns "" when ``following`` lies entirely inside that
+    tail, and ``following`` unchanged when no overlap is found.
+    """
+
+    limit = min(len(previous), len(following))
+    for end in range(limit, _MIN_OVERLAP_CHARS - 1, -1):
+        if end < len(following) and not following[end].isspace():
+            continue
+        start = len(previous) - end
+        if start > 0 and not previous[start - 1].isspace():
+            continue
+        if previous.endswith(following[:end]):
+            return following[end:].lstrip()
+    return following
 
 
 def expand_with_neighbors(
@@ -175,6 +202,11 @@ def expand_with_neighbors(
     surviving chunks are usually a handful drawn from one or two documents, so a
     per-chunk round trip meant up to ``rerank_top_k`` sequential Qdrant scrolls on every
     question for data one query per file could return.
+
+    Every prompt token costs prefill time, so no text is sent twice: a neighbour that is
+    itself one of ``chunks`` (it gets its own block) or already appeared in a
+    higher-ranked chunk's block is skipped, and the overlap chunking repeats at each
+    boundary between consecutive ordinals is trimmed.
     """
 
     radius = int(settings.context_neighbor_radius)
@@ -189,16 +221,28 @@ def expand_with_neighbors(
             if delta != 0 and chunk.chunk_ordinal + delta >= 1
         ]
 
+    emitted: set[tuple[str, int]] = {
+        (chunk.filename, chunk.chunk_ordinal)
+        for chunk in chunks
+        if chunk.chunk_ordinal is not None
+    }
+
     # Union every chunk's neighbour ordinals per filename, then one fetch per filename.
     ordinals_by_file: dict[str, set[int]] = {}
     for chunk in chunks:
         if chunk.chunk_ordinal is None:
             continue
-        ordinals_by_file.setdefault(chunk.filename, set()).update(wanted_ordinals(chunk))
+        ordinals_by_file.setdefault(chunk.filename, set()).update(
+            ordinal
+            for ordinal in wanted_ordinals(chunk)
+            if (chunk.filename, ordinal) not in emitted
+        )
 
     # (filename, ordinal) -> text, so each chunk can pick its own neighbours back out.
     neighbor_text: dict[tuple[str, int], str] = {}
     for filename, ordinals in ordinals_by_file.items():
+        if not ordinals:
+            continue
         for point in repository.fetch_neighbors(settings, filename, sorted(ordinals)):
             payload = point.payload or {}
             ordinal = payload.get("chunk_ordinal")
@@ -211,24 +255,28 @@ def expand_with_neighbors(
         if chunk.chunk_ordinal is None:
             expanded.append(chunk)
             continue
-        neighbor_texts = sorted(
-            (ordinal, neighbor_text[(chunk.filename, ordinal)])
-            for ordinal in wanted_ordinals(chunk)
-            if (chunk.filename, ordinal) in neighbor_text
-        )
-        if not neighbor_texts:
+        neighbors: list[tuple[int, str]] = []
+        for ordinal in wanted_ordinals(chunk):
+            key = (chunk.filename, ordinal)
+            if key in emitted or key not in neighbor_text:
+                continue
+            emitted.add(key)
+            neighbors.append((ordinal, neighbor_text[key]))
+        if not neighbors:
             expanded.append(chunk)
             continue
 
+        parts = sorted([*neighbors, (chunk.chunk_ordinal, chunk.text)])
         merged_parts: list[str] = []
-        inserted_self = False
-        for ordinal_value, text in neighbor_texts:
-            if not inserted_self and ordinal_value > chunk.chunk_ordinal:
-                merged_parts.append(chunk.text)
-                inserted_self = True
-            merged_parts.append(str(text))
-        if not inserted_self:
-            merged_parts.append(chunk.text)
+        previous: tuple[int, str] | None = None
+        for ordinal, text in parts:
+            if previous is not None and ordinal == previous[0] + 1:
+                trimmed = _strip_overlap(previous[1], text)
+            else:
+                trimmed = text
+            if trimmed:
+                merged_parts.append(trimmed)
+            previous = (ordinal, text)
         expanded.append(replace(chunk, expanded_text="\n\n".join(merged_parts)))
     return expanded
 
@@ -421,10 +469,16 @@ class RagPipeline:
 
         # Timed apart from rerank: neighbour expansion is a Qdrant round trip, not model
         # scoring, and folding it into rerank_ms hid it from every latency breakdown.
+        # Only the max_context_chunks prefix reaches the prompt, so only it is expanded;
+        # the tail stays in the list unexpanded because traces report it as kept.
         context_expansion_start = time.monotonic()
-        expanded = expand_with_neighbors(
-            diverse_outcome.kept, self._repository, effective_settings
-        )
+        context_limit = int(effective_settings.max_context_chunks)
+        expanded = [
+            *expand_with_neighbors(
+                diverse_outcome.kept[:context_limit], self._repository, effective_settings
+            ),
+            *diverse_outcome.kept[context_limit:],
+        ]
         context_expansion_ms = (time.monotonic() - context_expansion_start) * 1000
 
         return RetrievalPhase(
@@ -552,7 +606,7 @@ class RagPipeline:
                     prompt_messages=prompt_messages,
                     answer=grounded.answer,
                     cited_source_numbers=[source.source_number for source in grounded.sources],
-                    timings=_timings_dict(timings),
+                    timings=timings_dict(timings),
                     error=None,
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
@@ -662,7 +716,7 @@ class RagPipeline:
                             prompt_messages=None,
                             answer=INSUFFICIENT_CONTEXT_ANSWER,
                             cited_source_numbers=[],
-                            timings=_timings_dict(timings),
+                            timings=timings_dict(timings),
                             error=None,
                             condensed_question=condensed_question,
                             history_message_count=len(truncated_history),
@@ -674,7 +728,7 @@ class RagPipeline:
                     "type": "done",
                     "answer": INSUFFICIENT_CONTEXT_ANSWER,
                     "sources": [],
-                    "timings": _timings_dict(timings),
+                    "timings": timings_dict(timings),
                     "trace_id": trace_id,
                 }
                 return
@@ -686,7 +740,9 @@ class RagPipeline:
                 "trace_id": trace_id,
             }
 
-            messages = build_grounded_messages(question, selected, truncated_history or None)
+            messages = build_grounded_messages(
+                question.strip(), selected, truncated_history or None
+            )
             generate_start = time.monotonic()
             for delta in self._generator.stream(messages, effective_settings):
                 parts.append(delta)
@@ -704,6 +760,10 @@ class RagPipeline:
             # streamed content with `done.answer`, so it snaps to the cited version.
             # finalize_citations is the same helper generate_grounded_answer (sync path)
             # uses, so the retry-trigger condition can't drift between response modes.
+            # The retry is a whole unstreamed generation after the last delta; without
+            # this frame the UI sits on its streaming label with nothing moving.
+            if will_retry_citations(answer, all_sources, effective_settings):
+                yield {"type": "stage", "stage": "verifying_citations"}
             outcome = finalize_citations(
                 messages, answer, all_sources, self._generator, effective_settings
             )
@@ -747,7 +807,7 @@ class RagPipeline:
                         prompt_messages=list(outcome.prompt_messages),
                         answer=answer,
                         cited_source_numbers=[source.source_number for source in cited],
-                        timings=_timings_dict(timings),
+                        timings=timings_dict(timings),
                         error=None,
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
@@ -760,7 +820,7 @@ class RagPipeline:
                 "type": "done",
                 "answer": answer,
                 "sources": [_citation_dict(source) for source in cited],
-                "timings": _timings_dict(timings),
+                "timings": timings_dict(timings),
                 "trace_id": trace_id,
             }
         except Exception as exc:
@@ -810,8 +870,13 @@ class IngestService:
         filename: str,
         content: bytes,
         on_progress: Callable[[int, int], None] | None = None,
+        on_indexed: Callable[[], None] | None = None,
     ) -> DocumentIngestOutcome:
-        """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop."""
+        """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
+
+        ``on_indexed`` runs under the filename write lock once indexing succeeded (see
+        ``ingest_chunks``).
+        """
 
         sections = parse_document_bytes(filename, content, self._settings)
         chunks = chunk_sections(sections, self._settings, self._token_counter)
@@ -830,7 +895,12 @@ class IngestService:
             CHUNKER_VERSION,
         )
         result: IngestResult = ingest_chunks(
-            self._repository, self._settings, chunks, self._embedding_provider, on_progress
+            self._repository,
+            self._settings,
+            chunks,
+            self._embedding_provider,
+            on_progress,
+            on_indexed,
         )
         return DocumentIngestOutcome(
             filename=sections[0].filename,

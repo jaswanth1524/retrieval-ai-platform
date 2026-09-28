@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
 import type { HistoryMessage, LlmProvider, QuestionOverrides } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
@@ -81,6 +81,7 @@ export interface ConversationSummary {
 const STAGE_LABELS: Record<string, string> = {
   condensing: 'reading the conversation…',
   searching: 'searching documents…',
+  verifying_citations: 'checking citations…',
 };
 const DEFAULT_STAGE_LABEL = 'retrieving…';
 
@@ -334,8 +335,11 @@ export function useChat(): UseChatResult {
     };
   }, []);
 
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
+
   // Apply a turns-updater to the active conversation, bumping its updatedAt.
-  const setActiveTurns = (update: (turns: ChatTurn[]) => ChatTurn[]) => {
+  const setActiveTurns = useCallback((update: (turns: ChatTurn[]) => ChatTurn[]) => {
     setStorage((prev) => {
       const targetId = prev.activeConversationId ?? prev.conversations[0]?.id ?? null;
       return {
@@ -356,7 +360,7 @@ export function useChat(): UseChatResult {
         }),
       };
     });
-  };
+  }, []);
 
   const ask = useCallback(async (
     question: string,
@@ -389,6 +393,22 @@ export function useChat(): UseChatResult {
       });
     };
 
+    // Deltas are coalesced into one state update per animation frame. Each update
+    // re-renders the streaming message, whose markdown is re-parsed over the whole
+    // answer so far — per token that is quadratic in answer length on a fast provider.
+    let bufferedDelta = '';
+    let frameId: number | null = null;
+    const flushDelta = () => {
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId);
+        frameId = null;
+      }
+      if (!bufferedDelta) return;
+      const text = bufferedDelta;
+      bufferedDelta = '';
+      updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }));
+    };
+
     try {
       await api.askQuestionStream(
         question,
@@ -407,15 +427,18 @@ export function useChat(): UseChatResult {
             updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
           },
           onDelta: (text) => {
-            updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }));
+            bufferedDelta += text;
+            if (frameId === null) frameId = requestAnimationFrame(flushDelta);
           },
           onDone: (answer, sources, timings, traceId) => {
+            flushDelta();
             updateAssistantTurn((turn) => ({ ...turn, content: answer, sources, timings, traceId }));
           },
         },
         controller.signal,
       );
     } catch (err) {
+      flushDelta();
       // A user-initiated Stop aborts `controller`; a timeout aborts askQuestionStream's
       // own private controller instead, leaving this one untouched. So the flag is true
       // only for a deliberate cancel — where whatever streamed so far should simply
@@ -431,26 +454,27 @@ export function useChat(): UseChatResult {
         setActiveTurns((prev) => [...prev, { ...makeTurn('error', message), question }]);
       }
     } finally {
+      flushDelta();
       inflightRef.current = null;
       setPending(false);
       setStage(null);
     }
-    // Empty deps: every closed-over value is either a ref (activeConversationRef,
-    // inflightRef) or a setState setter (setActiveTurns/setPending), both stable
-    // across renders regardless — see the comment on activeConversationRef above.
+    // Only refs and stable setters are closed over — see activeConversationRef above.
+  }, [setActiveTurns]);
+
+  // Stable identities (pending is read through a ref) so components receiving these
+  // don't re-render on every streamed delta.
+  const cancel = useCallback(() => {
+    inflightRef.current?.abort();
   }, []);
 
-  const cancel = () => {
-    inflightRef.current?.abort();
-  };
-
-  const clear = () => {
-    if (pending) return;
+  const clear = useCallback(() => {
+    if (pendingRef.current) return;
     setActiveTurns(() => []);
-  };
+  }, [setActiveTurns]);
 
-  const newConversation = () => {
-    if (pending) return;
+  const newConversation = useCallback(() => {
+    if (pendingRef.current) return;
     setStorage((prev) => {
       // Reuse an already-empty active conversation instead of stacking blanks.
       const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
@@ -459,18 +483,18 @@ export function useChat(): UseChatResult {
       const conversations = [conversation, ...prev.conversations].slice(0, MAX_CONVERSATIONS);
       return { ...prev, activeConversationId: conversation.id, conversations };
     });
-  };
+  }, []);
 
-  const switchConversation = (id: string) => {
-    if (pending) return;
+  const switchConversation = useCallback((id: string) => {
+    if (pendingRef.current) return;
     setStorage((prev) =>
       prev.conversations.some((conversation) => conversation.id === id)
         ? { ...prev, activeConversationId: id }
         : prev,
     );
-  };
+  }, []);
 
-  const renameConversation = (id: string, title: string) => {
+  const renameConversation = useCallback((id: string, title: string) => {
     const trimmed = title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX_CHARS);
     if (!trimmed) return;
     setStorage((prev) => ({
@@ -479,10 +503,10 @@ export function useChat(): UseChatResult {
         conversation.id === id ? { ...conversation, title: trimmed } : conversation,
       ),
     }));
-  };
+  }, []);
 
-  const deleteConversation = (id: string) => {
-    if (pending) return;
+  const deleteConversation = useCallback((id: string) => {
+    if (pendingRef.current) return;
     setStorage((prev) => {
       const remaining = prev.conversations.filter((conversation) => conversation.id !== id);
       if (remaining.length === 0) return emptyStorage();
@@ -490,16 +514,20 @@ export function useChat(): UseChatResult {
         prev.activeConversationId === id ? remaining[0].id : prev.activeConversationId;
       return { ...prev, activeConversationId: activeId, conversations: remaining };
     });
-  };
+  }, []);
 
-  const summaries: ConversationSummary[] = [...conversations]
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map((conversation) => ({
-      id: conversation.id,
-      title: conversation.title,
-      updatedAt: conversation.updatedAt,
-      turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
-    }));
+  const summaries: ConversationSummary[] = useMemo(
+    () =>
+      [...conversations]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .map((conversation) => ({
+          id: conversation.id,
+          title: conversation.title,
+          updatedAt: conversation.updatedAt,
+          turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
+        })),
+    [conversations],
+  );
 
   return {
     turns,

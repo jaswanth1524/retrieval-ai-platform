@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import grpc
 import pytest
@@ -22,6 +23,7 @@ from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
     get_generator,
+    get_ingest_backlog,
     get_ollama_reachability_checker,
     get_qdrant_client,
     get_qdrant_reachability_checker,
@@ -32,7 +34,7 @@ from api.documents import EmptyDocumentError
 from api.embeddings import EmbeddedText
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, LiteLLMGenerator
 from api.ingestion import IngestionError, filename_write_lock
-from api.jobs import SqliteIngestJobStore
+from api.jobs import IngestBacklog, SqliteIngestJobStore
 from api.main import (
     _ingest_error_type,
     _job_error_message,
@@ -361,15 +363,58 @@ def test_document_upload_rejects_file_over_size_limit() -> None:
 
 
 def test_document_upload_rejects_unsupported_file(api_context: ApiTestContext) -> None:
-    """Parsing happens inside the background job, so the upload itself is still
-    accepted (202) — the unsupported-type failure surfaces on the job status."""
+    """Rejected at upload time with a 400 — it used to be accepted (202) and only fail
+    once the client polled the background job."""
 
-    status = _upload_and_wait(
-        api_context.client, "archive.zip", b"not supported", "application/zip"
+    response = api_context.client.post(
+        "/documents", files={"file": ("archive.zip", b"not supported", "application/zip")}
     )
 
-    assert status["state"] == "failed"
-    assert "Unsupported document type" in status["error"]
+    assert response.status_code == 400
+    assert "Unsupported document type" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("filename", ["..", "."])
+def test_document_upload_rejects_unusable_filenames(
+    api_context: ApiTestContext, filename: str
+) -> None:
+    response = api_context.client.post(
+        "/documents", files={"file": (filename, b"alpha", "text/plain")}
+    )
+
+    assert response.status_code == 400
+
+
+def test_document_upload_returns_503_when_the_ingest_backlog_is_full(
+    api_context: ApiTestContext,
+) -> None:
+    backlog = IngestBacklog(max_bytes=10)
+    assert backlog.try_reserve(6)  # something already waiting
+    api_context.app.dependency_overrides[get_ingest_backlog] = lambda: backlog
+
+    response = api_context.client.post(
+        "/documents", files={"file": ("guide.txt", b"0123456789", "text/plain")}
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"]
+    # Rejected uploads reserve nothing.
+    assert backlog.pending_bytes == 6
+
+
+def test_document_upload_releases_its_backlog_bytes_when_the_job_finishes(
+    api_context: ApiTestContext,
+) -> None:
+    backlog = IngestBacklog(max_bytes=1024)
+    api_context.app.dependency_overrides[get_ingest_backlog] = lambda: backlog
+
+    assert _upload_and_wait(api_context.client, "guide.txt", b"alpha beta")["state"] == "done"
+
+    for _ in range(200):
+        if backlog.pending_bytes == 0:
+            break
+        time.sleep(0.01)
+    assert backlog.pending_bytes == 0
 
 
 def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -> None:
@@ -791,8 +836,11 @@ def test_run_model_warmup_swallows_failures_instead_of_raising() -> None:
         def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
             raise RuntimeError("model download failed")
 
-    # Must not raise — a warmup failure is logged, not fatal to app startup.
-    run_model_warmup(RaisingEmbeddingProvider(), FakeReranker())
+    reranker = FakeReranker()
+    # Must not raise — a warmup failure is logged, not fatal to app startup — and one
+    # model failing must not leave the others cold.
+    run_model_warmup(RaisingEmbeddingProvider(), reranker)
+    assert reranker.seen_documents == ["warmup"]
 
 
 def test_lifespan_runs_warmup_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -807,6 +855,14 @@ def test_lifespan_runs_warmup_when_enabled(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
     monkeypatch.setattr("api.main.get_embedding_provider", lambda: embeddings)
     monkeypatch.setattr("api.main.get_reranker", lambda: reranker)
+    counted: list[str] = []
+
+    class RecordingTokenCounter:
+        def count(self, text: str) -> int:
+            counted.append(text)
+            return 1
+
+    monkeypatch.setattr("api.main.get_token_counter", lambda: RecordingTokenCounter())
 
     app = create_app()
     with TestClient(app):
@@ -814,6 +870,8 @@ def test_lifespan_runs_warmup_when_enabled(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert embeddings.seen_text_batches == [["warmup"]]
     assert reranker.seen_documents == ["warmup"]
+    # The chunking tokenizer is warmed too, so the first upload doesn't fetch it.
+    assert counted == ["warmup"]
     clear_dependency_caches()
 
 
@@ -1063,6 +1121,79 @@ def test_document_original_returns_the_exact_uploaded_bytes_when_enabled(
     finally:
         monkeypatch.undo()
         clear_dependency_caches()
+
+
+@contextmanager
+def _raw_storage_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[TestClient]:
+    clear_dependency_caches()
+    settings = make_settings(raw_document_dir=str(tmp_path))
+    qdrant = QdrantClient(":memory:")
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: FakeGenerator()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    try:
+        with TestClient(app) as client:
+            yield client
+    finally:
+        monkeypatch.undo()
+        clear_dependency_caches()
+
+
+def test_document_original_serves_a_non_latin1_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-built latin-1 Content-Disposition header 500'd on names like these."""
+
+    filename = "日本 notes.txt"
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, filename, b"alpha beta")["state"] == "done"
+
+        response = client.get(f"/documents/{quote(filename)}/original")
+
+        assert response.status_code == 200
+        assert response.content == b"alpha beta"
+        assert "filename*=utf-8''" in response.headers["content-disposition"]
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_failed_ingest_does_not_store_or_replace_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "guide.txt", b"version one")["state"] == "done"
+        # Whitespace-only: parses to nothing, so this ingest fails.
+        assert _upload_and_wait(client, "guide.txt", b"   \n  ")["state"] == "failed"
+        assert _upload_and_wait(client, "empty.txt", b"   ")["state"] == "failed"
+
+        # The still-indexed version keeps its original; the failed upload left none.
+        assert client.get("/documents/guide.txt/original").content == b"version one"
+        assert client.get("/documents/empty.txt/original").status_code == 404
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["guide.txt"]
+
+
+def test_delete_removes_an_orphaned_original_with_no_indexed_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An original left behind by an older release's failed ingest was undeletable:
+    DELETE 404'd on "no points" before it reached the stored file."""
+
+    (tmp_path / "orphan.txt").write_bytes(b"leftover")
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        response = client.delete("/documents/orphan.txt")
+
+        assert response.status_code == 200
+        assert response.json()["points_deleted"] == 0
+        assert client.delete("/documents/orphan.txt").status_code == 404
+    assert not (tmp_path / "orphan.txt").exists()
 
 
 def test_feedback_returns_404_when_disabled(api_context: ApiTestContext) -> None:

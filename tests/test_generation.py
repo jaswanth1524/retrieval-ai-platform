@@ -124,7 +124,8 @@ def test_build_grounded_messages_requires_context_only_and_citations() -> None:
     assert "If the context is insufficient" in messages[0]["content"]
     user_prompt = messages[1]["content"]
     assert "How do I run it?" in user_prompt
-    assert "[1] filename=guide.md; page=3; section=Setup; chunk_id=c1" in user_prompt
+    assert "[1] filename=guide.md; page=3; section=Setup\n" in user_prompt
+    assert "chunk_id" not in user_prompt
     assert "Run docker compose up." in user_prompt
 
 
@@ -298,7 +299,7 @@ def test_litellm_generator_uses_ollama_configuration() -> None:
 
     assert answer == "Answer [1]."
     assert completion_client.kwargs is not None
-    assert completion_client.kwargs["model"] == "ollama/llama3.1:8b"
+    assert completion_client.kwargs["model"] == "ollama_chat/llama3.1:8b"
     assert completion_client.kwargs["base_url"] == "http://ollama:11434"
     assert completion_client.kwargs["temperature"] == 0
     assert completion_client.kwargs["max_tokens"] == 512
@@ -521,8 +522,34 @@ def test_completion_model_and_kwargs_passes_ollama_keep_alive() -> None:
         make_settings(llm_provider="ollama", ollama_keep_alive="45m")
     )
 
-    assert model == "ollama/llama3.1:8b"
+    assert model == "ollama_chat/llama3.1:8b"
     assert kwargs["keep_alive"] == "45m"
+    assert "num_ctx" not in kwargs
+
+
+def test_completion_model_and_kwargs_passes_ollama_num_ctx_only_when_set() -> None:
+    _, kwargs = completion_model_and_kwargs(
+        make_settings(llm_provider="ollama", ollama_num_ctx=8192)
+    )
+
+    assert kwargs["num_ctx"] == 8192
+
+
+def test_supports_reasoning_never_consults_litellm_for_ollama_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+
+    from api.generation import supports_reasoning
+
+    def fail(model: str) -> bool:
+        raise AssertionError(f"litellm.supports_reasoning called for {model}")
+
+    monkeypatch.setattr(litellm, "supports_reasoning", fail)
+    supports_reasoning.cache_clear()
+
+    assert supports_reasoning("ollama/llama3.1:8b") is False
+    assert supports_reasoning("ollama_chat/qwen2.5:latest") is False
 
 
 class FakeStreamCompletionClient:
@@ -565,6 +592,36 @@ def test_litellm_generator_stream_wraps_connection_failure_for_ollama() -> None:
     generator = LiteLLMGenerator(settings, completion_client=RaisingStreamClient())
 
     with pytest.raises(GenerationError, match="ollama serve"):
+        list(generator.stream([{"role": "user", "content": "Hi"}], settings))
+
+
+class RaisingTimeoutClient:
+    """What LiteLLM actually raises when a request outruns ``timeout`` (verified live)."""
+
+    def __call__(self, **kwargs: Any) -> object:
+        from litellm.exceptions import APIConnectionError
+
+        raise APIConnectionError(
+            message=(
+                "Ollama_chatException - litellm.Timeout: "
+                "Connection timed out after 60.0 seconds."
+            ),
+            model="ollama_chat/llama3.1:8b",
+            llm_provider="ollama",
+        )
+
+
+def test_timeout_is_not_reported_as_an_unreachable_ollama() -> None:
+    """A slow answer must read as a timeout, not "Cannot reach Ollama" plus advice to
+    start a server that was running the whole time."""
+
+    settings = make_settings(llm_provider="ollama", llm_request_timeout_seconds=60)
+    generator = LiteLLMGenerator(settings, completion_client=RaisingTimeoutClient())
+
+    with pytest.raises(GenerationError, match="LLM_REQUEST_TIMEOUT_SECONDS=60s") as info:
+        generator.complete([{"role": "user", "content": "Hi"}], settings)
+    assert "ollama serve" not in str(info.value)
+    with pytest.raises(GenerationError, match="LLM_REQUEST_TIMEOUT_SECONDS=60s"):
         list(generator.stream([{"role": "user", "content": "Hi"}], settings))
 
 

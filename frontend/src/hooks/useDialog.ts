@@ -17,6 +17,12 @@ export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDiv
   const containerRef = useRef<HTMLDivElement>(null);
   // Captured at open time, because by close time the opener may no longer be focused.
   const openerRef = useRef<HTMLElement | null>(null);
+  // Read through a ref so the effect depends on `open` alone. Callers pass inline
+  // arrows; with onClose in the deps every parent re-render (upload polling, streaming,
+  // toasts) ran the cleanup — refocusing the opener — then refocused the first control,
+  // yanking focus out of whatever field the user was typing in.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -29,7 +35,7 @@ export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDiv
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== 'Tab' || !containerRef.current) return;
@@ -59,7 +65,7 @@ export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDiv
       const opener = openerRef.current;
       if (opener && document.contains(opener)) opener.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   return containerRef;
 }

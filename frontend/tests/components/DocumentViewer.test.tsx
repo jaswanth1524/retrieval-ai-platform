@@ -21,6 +21,11 @@ const CONTENT = {
   ],
 };
 
+// Large-document renders are the slowest thing in the suite; on a loaded machine the
+// settle took longer than waitFor's 1s default and failed intermittently. Same
+// assertions, just room to finish — not retries.
+const SLOW_RENDER = { timeout: 5_000 };
+
 describe('DocumentViewer', () => {
   it('fetches and renders document chunks, marking the target', async () => {
     getContentMock.mockResolvedValue(CONTENT);
@@ -62,7 +67,7 @@ describe('DocumentViewer', () => {
     return { chunk_id: `c${i}`, page: 1, section: 'Body', text: `Chunk ${i}`, chunk_ordinal: i };
   }
 
-  describe('windowing on a large document', () => {
+  describe('windowing on a large document', { timeout: 15_000 }, () => {
     const BIG_CONTENT = {
       filename: 'big.md',
       chunks: Array.from({ length: 500 }, (_, i) => makeChunk(i)),
@@ -75,7 +80,10 @@ describe('DocumentViewer', () => {
 
       render(<DocumentViewer filename="big.md" chunkId="c400" onClose={vi.fn()} />);
 
-      await waitFor(() => expect(screen.getAllByTestId('viewer-chunk').length).toBeLessThan(500));
+      await waitFor(
+        () => expect(screen.getAllByTestId('viewer-chunk').length).toBeLessThan(500),
+        SLOW_RENDER,
+      );
       const rendered = screen.getAllByTestId('viewer-chunk');
 
       const target = rendered.find((c) => c.textContent?.includes('Chunk 400'));
@@ -91,7 +99,10 @@ describe('DocumentViewer', () => {
       // fetch resolving triggers an unwindowed render for one tick before the
       // centering effect settles, and the Load-earlier button only appears once
       // windowed.
-      await waitFor(() => expect(screen.getByTestId('viewer-load-earlier')).toBeInTheDocument());
+      await waitFor(
+        () => expect(screen.getByTestId('viewer-load-earlier')).toBeInTheDocument(),
+        SLOW_RENDER,
+      );
 
       const before = screen.getAllByTestId('viewer-chunk').length;
       await userEvent.click(screen.getByTestId('viewer-load-earlier'));
@@ -112,7 +123,10 @@ describe('DocumentViewer', () => {
       // Same reasoning as above: wait for the settled windowed render before asserting
       // Chunk 480 is absent, or this could observe the transient unwindowed render
       // that (briefly) contains every chunk.
-      await waitFor(() => expect(screen.getAllByTestId('viewer-chunk').length).toBeLessThan(500));
+      await waitFor(
+        () => expect(screen.getAllByTestId('viewer-chunk').length).toBeLessThan(500),
+        SLOW_RENDER,
+      );
       expect(screen.queryByText('Chunk 480')).not.toBeInTheDocument();
 
       rerender(<DocumentViewer filename="big.md" chunkId="c480" onClose={vi.fn()} />);
@@ -122,7 +136,7 @@ describe('DocumentViewer', () => {
           .getAllByTestId('viewer-chunk')
           .find((c) => c.textContent?.includes('Chunk 480'));
         expect(target?.className).toContain('document-viewer__chunk--target');
-      });
+      }, SLOW_RENDER);
     });
   });
 });
@@ -172,7 +186,10 @@ describe('DocumentViewer dialog behaviour', () => {
     });
 
     render(<DocumentViewer filename="big.md" chunkId="c100" onClose={vi.fn()} />);
-    await waitFor(() => expect(screen.getByTestId('viewer-load-earlier')).toBeInTheDocument());
+    await waitFor(
+      () => expect(screen.getByTestId('viewer-load-earlier')).toBeInTheDocument(),
+      SLOW_RENDER,
+    );
 
     // Shift+Tab off the first focusable wraps to the last one rather than escaping to
     // the page behind the modal.

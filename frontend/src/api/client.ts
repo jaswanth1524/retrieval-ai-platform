@@ -139,8 +139,27 @@ export async function extractErrorDetail(response: Response): Promise<string> {
 // routinely takes 70+ seconds; health/config use the short DEFAULT_TIMEOUT_MS.
 const LONG_RUNNING_TIMEOUT_MS = 120_000;
 
-// How often to poll a background ingest job's status.
-const JOB_POLL_INTERVAL_MS = 1_000;
+// A streamed answer can stay silent for a long stretch legitimately — rerank before
+// the first frame (measured 46-74s on CPU), prefill before the first token, the
+// unstreamed citation retry — so this bounds *silence*, re-armed on every chunk, not
+// the whole answer. A fixed cap on the whole stream cut off default-config answers
+// that measured 102-122s end to end while they were still streaming.
+const STREAM_IDLE_TIMEOUT_MS = 180_000;
+
+// Background ingest job polling: starts at 1s, backs off to 5s. With 2 ingest workers
+// a large drop queues most jobs, and a flat 1s interval polled each of them every
+// second for the whole wait.
+const JOB_POLL_INITIAL_MS = 1_000;
+const JOB_POLL_MAX_MS = 5_000;
+// Consecutive transient failures (network blip, 5xx) tolerated before the upload is
+// reported failed — the job keeps running server-side regardless, so one dropped poll
+// used to show "failed" for a file that then appeared indexed.
+const JOB_POLL_MAX_TRANSIENT_FAILURES = 3;
+
+function isTransientPollError(err: unknown): boolean {
+  if (!(err instanceof ApiClientError)) return false;
+  return err.statusCode === undefined || err.statusCode >= 500;
+}
 
 function questionRequestBody(
   question: string,
@@ -192,6 +211,7 @@ type QuestionStreamEvent =
 async function readSseStream(
   response: Response,
   onEvent: (event: QuestionStreamEvent) => void,
+  onChunk?: () => void,
 ): Promise<void> {
   if (!response.body) {
     throw new ApiClientError('Streaming response had no body.');
@@ -203,6 +223,7 @@ async function readSseStream(
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      onChunk?.();
       buffer += decoder.decode(value, { stream: true });
       let separatorIndex = buffer.indexOf('\n\n');
       while (separatorIndex !== -1) {
@@ -244,9 +265,6 @@ export const api = {
       signal,
     });
   },
-
-  getDocumentJob: (jobId: string, signal?: AbortSignal) =>
-    request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, { signal }),
 
   deleteDocument: (filename: string, signal?: AbortSignal) =>
     request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
@@ -290,14 +308,28 @@ export const api = {
     onProgress?: (status: DocumentJobStatusResponse) => void,
     signal?: AbortSignal,
   ): Promise<DocumentJobStatusResponse> => {
+    let intervalMs = JOB_POLL_INITIAL_MS;
+    let transientFailures = 0;
     while (true) {
-      const status = await request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, {
-        signal,
-      });
-      onProgress?.(status);
-      if (status.state === 'done' || status.state === 'failed') {
-        return status;
+      let status: DocumentJobStatusResponse | null = null;
+      try {
+        status = await request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, {
+          signal,
+        });
+        transientFailures = 0;
+      } catch (err) {
+        if (signal?.aborted || !isTransientPollError(err)) throw err;
+        transientFailures += 1;
+        if (transientFailures > JOB_POLL_MAX_TRANSIENT_FAILURES) throw err;
       }
+      if (status) {
+        onProgress?.(status);
+        if (status.state === 'done' || status.state === 'failed') {
+          return status;
+        }
+      }
+      const waitMs = intervalMs;
+      intervalMs = Math.min(Math.round(intervalMs * 1.5), JOB_POLL_MAX_MS);
       await new Promise((resolve, reject) => {
         // `{ once: true }` only removes the listener if it FIRES. When the timeout wins
         // — which is every tick of a normal ingest — the listener stays attached, so a
@@ -309,7 +341,7 @@ export const api = {
         const timeoutId = setTimeout(() => {
           signal?.removeEventListener('abort', onAbort);
           resolve(undefined);
-        }, JOB_POLL_INTERVAL_MS);
+        }, waitMs);
         signal?.addEventListener('abort', onAbort, { once: true });
       });
     }
@@ -348,9 +380,14 @@ export const api = {
     signal?: AbortSignal,
   ): Promise<void> => {
     const timeoutController = new AbortController();
-    const timeoutId = setTimeout(() => timeoutController.abort(), LONG_RUNNING_TIMEOUT_MS);
+    let timeoutId = setTimeout(() => timeoutController.abort(), STREAM_IDLE_TIMEOUT_MS);
+    const resetIdleTimeout = () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => timeoutController.abort(), STREAM_IDLE_TIMEOUT_MS);
+    };
     const abortFromCaller = () => timeoutController.abort();
     signal?.addEventListener('abort', abortFromCaller);
+    let sawDone = false;
 
     try {
       let response: Response;
@@ -379,14 +416,19 @@ export const api = {
       // reader.read() — outside the try/catch above — so it used to escape unwrapped
       // and every caller saw an unrecognised error instead of a cancellation.
       try {
-        await readSseStream(response, (event) => {
-          if (event.type === 'stage') handlers.onStage?.(event.stage);
-          else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
-          else if (event.type === 'delta') handlers.onDelta?.(event.text);
-          else if (event.type === 'done')
-            handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);
-          else if (event.type === 'error') throw new ApiClientError(event.detail);
-        });
+        await readSseStream(
+          response,
+          (event) => {
+            if (event.type === 'stage') handlers.onStage?.(event.stage);
+            else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
+            else if (event.type === 'delta') handlers.onDelta?.(event.text);
+            else if (event.type === 'done') {
+              sawDone = true;
+              handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);
+            } else if (event.type === 'error') throw new ApiClientError(event.detail);
+          },
+          resetIdleTimeout,
+        );
       } catch (err) {
         // A backend `error` event already threw the right thing — don't re-wrap it.
         if (err instanceof ApiClientError) throw err;
@@ -394,6 +436,11 @@ export const api = {
           throw new ApiClientError('Request timed out or was cancelled.');
         }
         throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+      }
+      // A connection that closes cleanly without `done` (a proxy timeout, a server
+      // restart) used to resolve as success — an answer with no error and no retry.
+      if (!sawDone) {
+        throw new ApiClientError('The answer stream ended before the server finished.');
       }
     } finally {
       clearTimeout(timeoutId);

@@ -116,6 +116,7 @@ def ingest_chunks(
     chunks: Sequence[DocumentChunk],
     embedding_provider: EmbeddingProvider,
     on_progress: Callable[[int, int], None] | None = None,
+    on_indexed: Callable[[], None] | None = None,
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
@@ -126,6 +127,10 @@ def ingest_chunks(
     first batch is written, and only IDs absent from every new batch are deleted
     afterward — a failure partway through a multi-batch ingest still leaves whatever
     batches already succeeded correctly indexed, never wiped.
+
+    ``on_indexed`` runs once the new version is fully written, still inside the
+    filename lock — for side effects that must be atomic with the index (the stored
+    original), so a concurrent DELETE can't interleave with them.
     """
 
     if not chunks:
@@ -196,6 +201,9 @@ def ingest_chunks(
                     f"remove {len(stale_ids)} stale chunk(s) from the previous version. "
                     "Re-ingesting again will complete the cleanup."
                 ) from exc
+
+        if on_indexed is not None:
+            on_indexed()
 
         return IngestResult(
             collection_name=settings.qdrant_collection,

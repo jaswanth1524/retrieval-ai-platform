@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from weakref import WeakSet
 
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
@@ -23,6 +24,17 @@ from api.settings import AppSettings
 # combination doesn't support prefetch+RRF" rather than a real query failure — only
 # these should trigger the manual-fusion fallback; anything else is a real error.
 _RRF_UNSUPPORTED_STATUS_CODES = frozenset({400, 404, 501})
+
+# Clients whose server has already rejected the server-side hybrid query. Remembered
+# per process so every later question goes straight to manual fusion instead of paying
+# a failed round trip first; keyed weakly by client so a new client re-probes.
+_server_side_hybrid_unsupported: WeakSet[QdrantClient] = WeakSet()
+
+
+def clear_hybrid_fallback_cache() -> None:
+    """Forget which clients needed the manual-fusion fallback (tests, reloads)."""
+
+    _server_side_hybrid_unsupported.clear()
 
 
 @dataclass(frozen=True)
@@ -64,6 +76,8 @@ class VectorRepository:
         self.ensure_ready(settings)
         query_filter = _filename_filter(filenames)
         try:
+            if self._client in _server_side_hybrid_unsupported:
+                return self._manual_hybrid_query(settings, query_embedding, query_filter)
             try:
                 return self._server_side_hybrid_query(settings, query_embedding, query_filter)
             except UnexpectedResponse as exc:
@@ -73,6 +87,7 @@ class VectorRepository:
                     # more confusing failure and hide the actual cause.
                     raise
                 # Older Qdrant servers may not support server-side prefetch + RRF.
+                _server_side_hybrid_unsupported.add(self._client)
                 return self._manual_hybrid_query(settings, query_embedding, query_filter)
         except ResponseHandlingException as exc:
             raise VectorStoreUnavailableError(f"Qdrant is unreachable: {exc}") from exc

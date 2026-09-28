@@ -142,7 +142,7 @@ function ChatThread({
           />
         ))}
         {awaitingFirstEvent && (
-          <div className="chat-message" data-testid="chat-pending">
+          <div className="chat-message" data-testid="chat-pending" role="status" aria-live="polite">
             <div className="chat-message__row">
               <span className="chat-message__gutter chat-message__gutter--answer" aria-hidden="true">
                 A

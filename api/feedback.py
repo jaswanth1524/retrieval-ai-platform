@@ -19,10 +19,13 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Literal
+
+from api.sqlite_store import enable_wal, sqlite_transaction
 
 FeedbackRating = Literal["up", "down"]
 
@@ -55,6 +58,7 @@ class FeedbackStore:
         self._path = path
         self._lock = Lock()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        enable_wal(path)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -71,8 +75,8 @@ class FeedbackStore:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._path)
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
+        return sqlite_transaction(self._path)
 
     def add(
         self,

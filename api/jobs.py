@@ -21,12 +21,14 @@ import sqlite3
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol
 
 from api.metrics import ingest_jobs_evicted_total
+from api.sqlite_store import enable_wal, sqlite_transaction
 
 JobState = Literal["queued", "parsing", "embedding", "done", "failed"]
 
@@ -35,6 +37,10 @@ class JobNotFoundError(RuntimeError):
     """Raised when a job id has no known job (never existed, or was pruned)."""
 
 TERMINAL_STATES: frozenset[JobState] = frozenset({"done", "failed"})
+
+INTERRUPTED_JOB_ERROR = (
+    "The server restarted before this document finished indexing. Upload it again."
+)
 
 
 @dataclass
@@ -56,6 +62,34 @@ class IngestJob:
     # with a default, so existing IngestJobStore construction/tests are unaffected.
     created_at_wall: float = field(default_factory=time.time)
 
+
+class IngestBacklog:
+    """Byte budget for uploads accepted but not yet finished ingesting.
+
+    ``try_reserve`` never blocks: the upload route answers 503 instead of waiting. An
+    empty backlog always admits, so a single upload larger than the budget still runs.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._pending = 0
+        self._lock = Lock()
+
+    def try_reserve(self, size: int) -> bool:
+        with self._lock:
+            if self._pending and self._pending + size > self._max_bytes:
+                return False
+            self._pending += size
+            return True
+
+    def release(self, size: int) -> None:
+        with self._lock:
+            self._pending = max(0, self._pending - size)
+
+    @property
+    def pending_bytes(self) -> int:
+        with self._lock:
+            return self._pending
 
 class JobStore(Protocol):
     """Minimal surface ``api.main`` needs to track background ingest jobs."""
@@ -174,6 +208,7 @@ class SqliteIngestJobStore:
         self._max_retained = max_retained
         self._lock = Lock()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        enable_wal(path)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -189,9 +224,17 @@ class SqliteIngestJobStore:
                 )
                 """
             )
+            # Only this process runs jobs (one uvicorn worker), so anything still
+            # non-terminal at startup belonged to a process that died mid-ingest. Left
+            # as-is, a client polling it would wait forever.
+            terminal = ", ".join("?" for _ in TERMINAL_STATES)
+            conn.execute(
+                f"UPDATE jobs SET state = 'failed', error = ? WHERE state NOT IN ({terminal})",
+                (INTERRUPTED_JOB_ERROR, *TERMINAL_STATES),
+            )
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._path)
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
+        return sqlite_transaction(self._path)
 
     def create(self, filename: str) -> IngestJob:
         job = IngestJob(id=str(uuid.uuid4()), filename=filename)

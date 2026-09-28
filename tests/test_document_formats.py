@@ -7,6 +7,7 @@ import pytest
 
 import api.documents as documents
 from api.documents import (
+    DocumentSection,
     EmptyDocumentError,
     _table_to_markdown,
     parse_document_bytes,
@@ -167,3 +168,89 @@ def test_table_to_markdown_handles_ragged_rows_and_none_cells() -> None:
 def test_table_to_markdown_empty_returns_empty_string() -> None:
     assert _table_to_markdown([[None, None]]) == ""
     assert _table_to_markdown([]) == ""
+
+
+class _MixedReader:
+    """Page 1 has a text layer, page 2 is a scanned image with none."""
+
+    def __init__(self, stream: object) -> None:
+        class TextPage:
+            def extract_text(self) -> str:
+                return "Digital page text."
+
+        class ScannedPage:
+            def extract_text(self) -> str:
+                return ""
+
+        self.pages = [TextPage(), ScannedPage()]
+
+
+def test_parse_pdf_ocrs_scanned_pages_inside_a_mixed_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(documents, "PdfReader", _MixedReader)
+    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content: {})
+    ocr_calls: list[list[int]] = []
+
+    def fake_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
+        ocr_calls.append(pages)
+        return [DocumentSection(filename=filename, page=2, section="Scan", text="OCR text.")]
+
+    monkeypatch.setattr(documents, "_ocr_pdf_pages", fake_ocr)
+
+    sections = parse_document_bytes("mixed.pdf", b"not a real pdf")
+
+    assert ocr_calls == [[2]]
+    assert [(section.page, section.text) for section in sections] == [
+        (1, "Digital page text."),
+        (2, "OCR text."),
+    ]
+
+
+def test_parse_pdf_mixed_without_ocr_extra_keeps_the_text_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(documents, "PdfReader", _MixedReader)
+    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content: {})
+
+    sections = parse_document_bytes("mixed.pdf", b"not a real pdf")
+
+    assert [section.page for section in sections] == [1]
+
+
+def test_extract_pdf_tables_skips_pages_without_ruling_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+
+    class FakePage:
+        def __init__(self, number: int, has_edges: bool) -> None:
+            self.number = number
+            self.rects = [object()] if has_edges else []
+            self.lines: list[object] = []
+            self.curves: list[object] = []
+
+        def extract_tables(self) -> list[list[list[str]]]:
+            if not self.rects:
+                raise AssertionError(f"table finder ran on edge-less page {self.number}")
+            return [[["metric", "value"], ["latency", "5ms"]]]
+
+        def close(self) -> None:
+            closed.append(self.number)
+
+    class FakePdf:
+        pages = [FakePage(1, has_edges=False), FakePage(2, has_edges=True)]
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    import pdfplumber
+
+    monkeypatch.setattr(pdfplumber, "open", lambda stream: FakePdf())
+
+    tables = documents._extract_pdf_tables(b"pdf")
+
+    assert list(tables) == [2]
+    assert "latency | 5ms" in tables[2][0]
+    assert closed == [1, 2]

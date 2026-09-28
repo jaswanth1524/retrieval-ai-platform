@@ -44,7 +44,15 @@ The question-answering pipeline (`api/pipeline.py`):
 6. Generate an answer through LiteLLM (Ollama or OpenAI) from a context-only, citation-required prompt — streamed over `/questions/stream` (which also emits `stage` progress frames ahead of each phase, since retrieval can run for tens of seconds before the first token) or returned whole from `/questions`.
 7. Return the answer, citations, per-stage latency timings, and a trace ID.
 
-**Latency.** Cross-encoder reranking dominates: it is linear in `RERANK_CANDIDATES` and on 8 CPU cores in Docker cost ~1.1s per candidate with the default reranker — ~52s of a ~66s question. `RERANK_CANDIDATES` and `RERANKER_MODEL` are the two knobs that matter, and `.env.example` documents both with measured numbers. `GET /traces/{id}` and `docrag_question_stage_seconds{stage=...}` give you the per-stage split for your own corpus; tune from that rather than from these figures.
+**Latency.** Two stages dominate: cross-encoder reranking (linear in `RERANK_CANDIDATES`) and, on a local model, LLM prefill (linear in prompt tokens). Measured on a 7-document, 158-chunk corpus, Apple M1 (Docker 8 CPUs) with `qwen2.5` via Ollama on Metal (~80 tok/s prefill, ~9 tok/s decode):
+
+| Reranker (`RERANKER_MODEL` / `RERANKER_ONNX_FILE`) | 20 candidates | 50 candidates | Peak RSS | Top-6 context vs jina fp32 | Questions left with no context (of 7) |
+|---|---|---|---|---|---|
+| jina-v2 fp32 (`RERANKER_ONNX_FILE=`) | 11.7s | 31.2s | 2.3 GB | — | 0 |
+| jina-v2 int8 (default, `RERANKER_ONNX_FILE=auto`) | 4.6s | 12.7s | 1.4 GB | 81-83% overlap | 0 |
+| `Xenova/ms-marco-MiniLM-L-6-v2` | 1.7s | 4.3s | 0.8 GB | 43-45% overlap | 2 (incl. the Spanish one) |
+
+Faster rerankers change *which* chunks reach the model, and MiniLM is English-only — pick with `GET /traces/{id}` on your own corpus, not these figures. On the generation side, `CONTEXT_NEIGHBOR_RADIUS=0` cut the median question from 40s to 22s on that M1 by more than halving the prompt, at the cost of narrower context per chunk (it also changes what the diversity filter drops). `GET /traces/{id}` and `docrag_question_stage_seconds{stage=...}` give the per-stage split for your hardware.
 
 Document ingestion (`POST /documents`) runs as a background job: the request returns a `job_id` immediately (HTTP 202), and `GET /documents/jobs/{job_id}` reports progress (`queued` → `parsing` → `embedding` → `done`/`failed`) as the document is parsed, chunked, embedded (with filename/section-prefixed contextual text), and indexed in batches, tagged with an embedding-model version so a later model change is detected and queries are refused until re-ingestion. `GET /documents` lists the indexed corpus; `DELETE /documents/{filename}` removes a document's chunks.
 
@@ -83,12 +91,14 @@ uv run uvicorn api.main:app --reload      # API alone, against localhost Qdrant/
 npm --prefix frontend run dev             # Vite dev server, proxies API calls to :8000
 ```
 
-> **Note:** the default reranker (`jinaai/jina-reranker-v2-base-multilingual`) is
-> ~1.1 GB and downloads once on first use (or at boot if `WARMUP_MODELS=true`) —
-> the first question after a fresh install pays that one-time download cost.
+> **Note:** the default reranker (`jinaai/jina-reranker-v2-base-multilingual`, int8
+> export) is ~0.28 GB (the fp32 export, `RERANKER_ONNX_FILE=`, is ~1.1 GB) and downloads
+> once on first use (or at boot if `WARMUP_MODELS=true`) into the `model_cache` volume,
+> so container recreates don't download it again.
 >
-> It is also the memory floor: answering a question peaks around **2.7 GB** in the API
-> container, so give Docker at least **4 GB** (Docker Desktop → Settings → Resources).
+> It is also the memory floor: reranking peaked around **1.4 GB** with the int8 default
+> and **2.7 GB** with fp32, so give Docker at least **4 GB** (Docker Desktop → Settings →
+> Resources).
 > That peak is reached when the model loads, so a container that boots and answers one
 > question has already hit its high-water mark. If you raise `RERANKER_BATCH_SIZE` above
 > `RERANK_CANDIDATES`, the reranker scores every candidate in one forward pass instead
@@ -113,6 +123,9 @@ npm ci                         # install deps (matches CI)
 npm run test                   # vitest run (all tests)
 npm run build                  # tsc -b && vite build -> frontend/dist
 npm run lint                   # oxlint
+npx playwright install chromium   # once: browser for the E2E suite
+npm run e2e                    # Playwright E2E: prod build + mocked API (desktop + mobile smoke)
+npm run e2e:smoke              # @smoke specs only
 ```
 
 CI (`.github/workflows/ci.yml`) runs three independent jobs on every push/PR: backend (pytest → ruff → mypy → eval-dataset validation), frontend (vitest → build → lint), and a Docker build smoke check.

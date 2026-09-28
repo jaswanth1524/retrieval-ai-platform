@@ -32,6 +32,11 @@ export function downloadFile(filename: string, mimeType: string, content: string
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
+  // Some browsers ignore a click on a detached anchor, and revoking the URL in the
+  // same tick can cancel the download before it starts.
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }

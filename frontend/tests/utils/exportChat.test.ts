@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import { chatToJson, chatToMarkdown, downloadFile } from '../../src/utils/exportChat';
 
@@ -54,9 +54,18 @@ describe('downloadFile', () => {
   let createObjectURL: ReturnType<typeof vi.fn>;
   let revokeObjectURL: ReturnType<typeof vi.fn>;
   let capturedBlob: Blob | undefined;
+  let clickedAnchors: HTMLAnchorElement[];
 
   beforeEach(() => {
     capturedBlob = undefined;
+    clickedAnchors = [];
+    // A real click on an attached anchor makes jsdom attempt a navigation it doesn't
+    // implement; record the click instead of performing it.
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clickedAnchors.push(this);
+    });
     createObjectURL = vi.fn((blob: Blob) => {
       capturedBlob = blob;
       return 'blob:mock-url';
@@ -65,6 +74,10 @@ describe('downloadFile', () => {
     // jsdom has no createObjectURL/revokeObjectURL implementation.
     URL.createObjectURL = createObjectURL as unknown as typeof URL.createObjectURL;
     URL.revokeObjectURL = revokeObjectURL as unknown as typeof URL.revokeObjectURL;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('creates a Blob whose type is the mimeType and whose body is the content', async () => {
@@ -81,8 +94,21 @@ describe('downloadFile', () => {
     expect(body).not.toBe('text/markdown');
   });
 
-  it('revokes the object URL after triggering the download', () => {
-    downloadFile('chat.json', 'application/json', '{}');
-    expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
+  it('revokes the object URL only after the click has been handled', () => {
+    vi.useFakeTimers();
+    try {
+      downloadFile('chat.json', 'application/json', '{}');
+      expect(clickedAnchors).toHaveLength(1);
+      expect(clickedAnchors[0].download).toBe('chat.json');
+      expect(clickedAnchors[0].href).toBe('blob:mock-url');
+      // Same-tick revocation can cancel the download before it starts.
+      expect(revokeObjectURL).not.toHaveBeenCalled();
+      vi.runAllTimers();
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
+      // The temporary anchor doesn't linger in the document.
+      expect(document.querySelector('a[download]')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

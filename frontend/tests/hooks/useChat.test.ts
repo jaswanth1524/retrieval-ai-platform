@@ -54,6 +54,11 @@ describe('useChat', () => {
     expect(result.current.pending).toBe(true);
     expect(result.current.turns).toHaveLength(2);
     expect(result.current.turns[0]).toMatchObject({ role: 'user', content: 'How do I run it?' });
+    // Deltas are coalesced per animation frame rather than applied one render each.
+    expect(result.current.turns[1]).toMatchObject({ role: 'assistant', content: '' });
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    });
     expect(result.current.turns[1]).toMatchObject({
       role: 'assistant',
       content: 'Run docker compose up.',
@@ -115,6 +120,10 @@ describe('useChat', () => {
     // Sources arriving is what marks the switch to generation — no server frame for it.
     act(() => emit((h) => h.onSources?.([], 't')));
     expect(result.current.stage).toBe('generating answer…');
+
+    // After the last token, the server's zero-citation retry announces itself.
+    act(() => emit((h) => h.onStage?.('verifying_citations')));
+    expect(result.current.stage).toBe('checking citations…');
 
     await act(async () => {
       resolveStream();
