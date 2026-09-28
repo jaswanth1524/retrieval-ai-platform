@@ -411,8 +411,20 @@ def _run_ingest_job(
             raw_store.save(filename, content)
         except OSError:
             # The index is already updated; failing the job would report a document
-            # as not indexed when it is. The original is an opt-in extra.
+            # as not indexed when it is. The original is an opt-in extra — but a
+            # previous version's original must not outlive the index it described, or
+            # /original would serve bytes that no longer match what is indexed. No
+            # original (404) beats a wrong one.
             logger.exception("Indexed %r but could not store its original bytes.", filename)
+            try:
+                raw_store.delete(filename)
+            except OSError:
+                logger.exception(
+                    "Could not remove the outdated original of %r either; "
+                    "GET /documents/%s/original may serve the previous version.",
+                    filename,
+                    filename,
+                )
 
     try:
         job_store.update(job_id, state="parsing")

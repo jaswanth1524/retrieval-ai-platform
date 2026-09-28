@@ -1180,6 +1180,30 @@ def test_failed_ingest_does_not_store_or_replace_the_original(
     assert sorted(path.name for path in tmp_path.iterdir()) == ["guide.txt"]
 
 
+def test_failed_original_save_drops_the_previous_original_instead_of_serving_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-upload indexes fine but storing its bytes fails (disk full): the previous
+    version's original must not keep being served as if it matched the index."""
+
+    from api.raw_documents import RawDocumentStore
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "guide.txt", b"version one")["state"] == "done"
+
+        def disk_full(self: RawDocumentStore, filename: str, content: bytes) -> None:
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(RawDocumentStore, "save", disk_full)
+        status = _upload_and_wait(client, "guide.txt", b"version two, indexed")
+
+        # The index did update, so the job still reports success...
+        assert status["state"] == "done"
+        # ...and the stale original is gone rather than silently mismatched.
+        assert client.get("/documents/guide.txt/original").status_code == 404
+    assert not (tmp_path / "guide.txt").exists()
+
+
 def test_delete_removes_an_orphaned_original_with_no_indexed_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

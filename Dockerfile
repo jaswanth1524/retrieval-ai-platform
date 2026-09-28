@@ -21,6 +21,9 @@ COPY pyproject.toml uv.lock ./
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen
 COPY api/ ./api/
+# UV_COMPILE_BYTECODE only covers what uv sync installs, and `package = false` keeps
+# api/ out of that — compile the app's own modules here, for the same reason.
+RUN /app/.venv/bin/python -m compileall -q api
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 # Non-root: created after uv sync/COPY so the venv/app dir is owned by root at build

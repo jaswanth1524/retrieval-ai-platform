@@ -78,6 +78,10 @@ export class MockApi {
   /** Successive GET /documents/jobs/{id} responses; the last one repeats. */
   jobSteps: JobStep[] = [];
   private jobPolls = 0;
+  /** URLs a test deliberately answered with a 4xx/5xx. */
+  readonly intentionalFailures = new Set<string>();
+  /** API requests nothing here handles — a spec or app regression, never expected. */
+  readonly unmocked: string[] = [];
 
   async install(page: Page): Promise<void> {
     await page.route(
@@ -90,6 +94,12 @@ export class MockApi {
     return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
   }
 
+  /** Serve a response a test configured; an error status there is the scenario. */
+  private configured(route: Route, status: number, body: object): Promise<void> {
+    if (status >= 400) this.intentionalFailures.add(route.request().url());
+    return this.json(route, status, body);
+  }
+
   private async handle(route: Route): Promise<void> {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -98,7 +108,22 @@ export class MockApi {
     if (path === '/health') return this.json(route, 200, { status: 'ok' });
     if (path === '/config') return this.json(route, 200, CONFIG);
     if (path === '/traces') return this.json(route, 200, { traces: [] });
-    if (path.startsWith('/traces/')) return this.json(route, 404, { detail: 'Trace not found.' });
+    if (path.startsWith('/traces/')) {
+      return this.json(route, 200, {
+        trace_id: path.slice('/traces/'.length),
+        created_at: 0,
+        question: '',
+        mode: 'stream',
+        status: 'ok',
+        config: null,
+        candidates: [],
+        prompt_messages: null,
+        answer: null,
+        cited_source_numbers: [],
+        timings: null,
+        error: null,
+      });
+    }
 
     if (path === '/questions/stream' && method === 'POST') {
       if (typeof this.stream === 'function') return this.stream(route);
@@ -117,7 +142,7 @@ export class MockApi {
         body: { job_id: 'job-1', filename, state: 'queued' },
       };
       if (response.status === 202) this.pendingFilename = filename;
-      return this.json(route, response.status, response.body ?? {});
+      return this.configured(route, response.status, response.body ?? {});
     }
 
     if (path.startsWith('/documents/jobs/')) {
@@ -131,9 +156,10 @@ export class MockApi {
         this.documents = [...this.documents, this.pendingFilename];
         this.pendingFilename = null;
       }
-      return this.json(route, step.status, body);
+      return this.configured(route, step.status, body);
     }
 
+    this.unmocked.push(`${method} ${path}`);
     return this.json(route, 404, { detail: `Unmocked ${method} ${path}` });
   }
 
@@ -158,18 +184,22 @@ export const test = base.extend<Fixtures>({
   // Every spec fails on a console error or uncaught exception, not just on its own
   // assertions — a green run should mean the page stayed clean the whole time.
   consoleErrors: [
-    async ({ page }, provide) => {
+    async ({ page, api }, provide) => {
       const errors: string[] = [];
       page.on('console', (message) => {
-        // The browser's own log line for a mocked 4xx/5xx — those responses are the
-        // scenario under test, not an app error. Everything else still fails.
         if (message.type() !== 'error') return;
-        if (/^Failed to load resource: the server responded with a status of \d+/.test(message.text())) return;
+        // The browser logs its own line for every 4xx/5xx. Only the responses a test
+        // configured as failures are exempt — an unexpected 401/404 still fails.
+        const resourceStatus = /^Failed to load resource: the server responded with a status of \d+/;
+        if (resourceStatus.test(message.text()) && api.intentionalFailures.has(message.location().url)) {
+          return;
+        }
         errors.push(message.text());
       });
       page.on('pageerror', (error) => errors.push(`pageerror: ${error.message}`));
       await provide(errors);
       expect(errors, 'console errors during the test').toEqual([]);
+      expect(api.unmocked, 'API requests the mock does not handle').toEqual([]);
     },
     { auto: true },
   ],
