@@ -7,18 +7,30 @@ typing, so callers never import ``qdrant_client`` directly.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from weakref import WeakSet
+from threading import Lock
+from typing import Any, Literal
+from weakref import WeakKeyDictionary, WeakSet
 
+import grpc
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.http.models.models import QueryResponse
 
+from api.corpus import corpus_generation
 from api.embeddings import EmbeddedText
-from api.qdrant_schema import VectorStoreUnavailableError, ensure_collection
+from api.qdrant_schema import (
+    VectorStoreUnavailableError,
+    ensure_collection,
+    forget_collection,
+)
 from api.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 # Status codes from a server-side RRF query that indicate "this Qdrant server/client
 # combination doesn't support prefetch+RRF" rather than a real query failure — only
@@ -29,6 +41,22 @@ _RRF_UNSUPPORTED_STATUS_CODES = frozenset({400, 404, 501})
 # per process so every later question goes straight to manual fusion instead of paying
 # a failed round trip first; keyed weakly by client so a new client re-probes.
 _server_side_hybrid_unsupported: WeakSet[QdrantClient] = WeakSet()
+
+
+# filename_metadata's cache: client -> collection -> (corpus generation, time, result).
+_METADATA_TTL_SECONDS = 30.0
+_metadata_lock = Lock()
+_metadata_cache: WeakKeyDictionary[
+    QdrantClient, dict[str, tuple[int, float, dict[str, DocumentMetadata]]]
+]
+_metadata_cache = WeakKeyDictionary()
+
+
+def clear_metadata_cache() -> None:
+    """Forget every cached document listing (tests, reloads)."""
+
+    with _metadata_lock:
+        _metadata_cache.clear()
 
 
 def clear_hybrid_fallback_cache() -> None:
@@ -52,6 +80,8 @@ class DocumentMetadata:
     # the field (legacy). A re-ingest that failed partway can leave old-version points
     # behind, so the minimum — not whichever point came first — decides staleness.
     chunker_version: int | None = None
+    # Union of tags across the filename's points (they are normally all the same).
+    tags: tuple[str, ...] = ()
 
 
 _SCROLL_PAGE_SIZE = 256
@@ -69,6 +99,27 @@ class VectorRepository:
     def __init__(self, client: QdrantClient) -> None:
         self._client = client
 
+    def _call(self, settings: AppSettings, method: str, *args: Any, **kwargs: Any) -> Any:
+        """Call a Qdrant client method, recovering once from a collection deleted underneath.
+
+        Readiness is cached per process, so a collection dropped out of band (a reset,
+        a manual delete) used to 500 every request until a restart. Now the cache entry
+        is dropped, the collection recreated empty, and the call retried once.
+        """
+
+        try:
+            return getattr(self._client, method)(*args, **kwargs)
+        except (UnexpectedResponse, grpc.RpcError, ValueError) as exc:
+            if not _is_missing_collection(exc):
+                raise
+            logger.warning(
+                "Collection %r disappeared while in use; recreating it.",
+                settings.qdrant_collection,
+            )
+            forget_collection(self._client, settings)
+            self.ensure_ready(settings)
+            return getattr(self._client, method)(*args, **kwargs)
+
     def ensure_ready(self, settings: AppSettings) -> None:
         """Create or validate the collection. Cheap after the first call (cached)."""
 
@@ -79,15 +130,17 @@ class VectorRepository:
         settings: AppSettings,
         query_embedding: EmbeddedText,
         filenames: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
     ) -> list[models.ScoredPoint]:
         """Fused dense+sparse candidates: server-side RRF, falling back to manual fusion.
 
-        ``filenames``, when given, restricts both the dense and sparse legs to those
-        documents before fusion (a payload filter on the indexed ``filename`` field).
+        ``filenames`` and ``tags``, when given, restrict both the dense and sparse legs
+        before fusion (payload filters on the indexed ``filename`` / ``tags`` fields):
+        a document must match one of the filenames *and* carry one of the tags.
         """
 
         self.ensure_ready(settings)
-        query_filter = _filename_filter(filenames)
+        query_filter = _scope_filter(filenames, tags)
         try:
             if self._client in _server_side_hybrid_unsupported:
                 return self._manual_hybrid_query(settings, query_embedding, query_filter)
@@ -109,7 +162,9 @@ class VectorRepository:
         """Index points into the collection."""
 
         self.ensure_ready(settings)
-        self._client.upsert(
+        self._call(
+            settings,
+            "upsert",
             collection_name=settings.qdrant_collection,
             points=list(points),
             wait=True,
@@ -126,7 +181,9 @@ class VectorRepository:
 
         offset: models.ExtendedPointId | None = None
         while True:
-            points, offset = self._client.scroll(
+            points, offset = self._call(
+                settings,
+                "scroll",
                 collection_name=settings.qdrant_collection,
                 scroll_filter=scroll_filter,
                 with_payload=with_payload,
@@ -154,9 +211,7 @@ class VectorRepository:
             )
         ]
 
-    def chunks_for_filename(
-        self, settings: AppSettings, filename: str
-    ) -> list[dict[str, object]]:
+    def chunks_for_filename(self, settings: AppSettings, filename: str) -> list[dict[str, object]]:
         """Return all payloads for a filename, ordered by ``chunk_ordinal``.
 
         Backs the document-content endpoint (reconstruct a document from its chunks for
@@ -174,6 +229,71 @@ class VectorRepository:
         payloads.sort(key=_chunk_ordinal_sort_key)
         return payloads
 
+    def chunk_count_for_filename(self, settings: AppSettings, filename: str) -> int:
+        """How many points one document has (an exact count, no payloads read)."""
+
+        self.ensure_ready(settings)
+        result = self._call(
+            settings,
+            "count",
+            collection_name=settings.qdrant_collection,
+            count_filter=_single_filename_filter(filename),
+            exact=True,
+        )
+        return int(result.count)
+
+    def chunk_ordinal_of(self, settings: AppSettings, filename: str, chunk_id: str) -> int | None:
+        """The ordinal of one chunk of a document, or None when it doesn't exist."""
+
+        self.ensure_ready(settings)
+        points, _ = self._call(
+            settings,
+            "scroll",
+            collection_name=settings.qdrant_collection,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(key="filename", match=models.MatchValue(value=filename)),
+                    models.FieldCondition(key="chunk_id", match=models.MatchValue(value=chunk_id)),
+                ]
+            ),
+            with_payload=["chunk_ordinal"],
+            with_vectors=False,
+            limit=1,
+        )
+        ordinal = points[0].payload.get("chunk_ordinal") if points and points[0].payload else None
+        return ordinal if isinstance(ordinal, int) and not isinstance(ordinal, bool) else None
+
+    def chunks_in_ordinal_range(
+        self, settings: AppSettings, filename: str, start: int, end: int
+    ) -> list[dict[str, object]]:
+        """Payloads of chunks ``start``..``end`` (inclusive, 1-based ordinals), in order.
+
+        One page of a document for the source viewer: a range filter on the indexed
+        ``chunk_ordinal`` rather than the whole document scrolled and sliced.
+        """
+
+        self.ensure_ready(settings)
+        payloads = [
+            point.payload
+            for point in self._scroll_all(
+                settings,
+                with_payload=True,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="filename", match=models.MatchValue(value=filename)
+                        ),
+                        models.FieldCondition(
+                            key="chunk_ordinal", range=models.Range(gte=start, lte=end)
+                        ),
+                    ]
+                ),
+            )
+            if point.payload
+        ]
+        payloads.sort(key=_chunk_ordinal_sort_key)
+        return payloads
+
     def filename_chunk_counts(self, settings: AppSettings) -> dict[str, int]:
         """Return each indexed filename's chunk count, for the corpus panel and its footer total."""
 
@@ -185,6 +305,33 @@ class VectorRepository:
         return dict(counts)
 
     def filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
+        """Every document's metadata, served from a per-collection cache between changes.
+
+        Reading it means scrolling every point's payload — the whole collection — and the
+        UI asks after every upload, delete and page load. The result depends only on the
+        corpus, so it is kept until the corpus generation moves (any ingest, delete or
+        tag change in this process) or ``_METADATA_TTL_SECONDS`` passes (another
+        process's writes).
+        """
+
+        generation = corpus_generation()
+        now = time.monotonic()
+        with _metadata_lock:
+            cached = _metadata_cache.get(self._client, {}).get(settings.qdrant_collection)
+        if cached is not None:
+            cached_generation, stored_at, metadata = cached
+            if cached_generation == generation and now - stored_at < _METADATA_TTL_SECONDS:
+                return dict(metadata)
+        metadata = self._scan_filename_metadata(settings)
+        with _metadata_lock:
+            _metadata_cache.setdefault(self._client, {})[settings.qdrant_collection] = (
+                generation,
+                now,
+                metadata,
+            )
+        return dict(metadata)
+
+    def _scan_filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
         """Return each indexed filename's chunk count, page count, byte size, and
         upload time — one scroll, folded together rather than a separate query per
         field (which would turn a page-count add into an N+1 against the corpus list).
@@ -204,9 +351,17 @@ class VectorRepository:
         uploaded_at: dict[str, float] = {}
         min_version: dict[str, int] = {}
         unversioned: set[str] = set()
+        tags: dict[str, dict[str, None]] = {}
         for point in self._scroll_all(
             settings,
-            with_payload=["filename", "page", "byte_size", "uploaded_at", "chunker_version"],
+            with_payload=[
+                "filename",
+                "page",
+                "byte_size",
+                "uploaded_at",
+                "chunker_version",
+                "tags",
+            ],
         ):
             if not point.payload:
                 continue
@@ -228,6 +383,10 @@ class VectorRepository:
                 min_version[filename] = min(min_version.get(filename, version), version)
             else:
                 unversioned.add(filename)
+            point_tags = point.payload.get("tags")
+            if isinstance(point_tags, list):
+                ordered = tags.setdefault(filename, {})
+                ordered.update((tag, None) for tag in point_tags if isinstance(tag, str))
         return {
             filename: DocumentMetadata(
                 chunk_count=count,
@@ -235,6 +394,7 @@ class VectorRepository:
                 byte_size=byte_size.get(filename),
                 uploaded_at=uploaded_at.get(filename),
                 chunker_version=None if filename in unversioned else min_version.get(filename),
+                tags=tuple(tags.get(filename, {})),
             )
             for filename, count in chunk_counts.items()
         }
@@ -243,7 +403,9 @@ class VectorRepository:
         """The stored upload time of an indexed document (one point read), or None."""
 
         self.ensure_ready(settings)
-        points, _ = self._client.scroll(
+        points, _ = self._call(
+            settings,
+            "scroll",
             collection_name=settings.qdrant_collection,
             scroll_filter=_single_filename_filter(filename),
             with_payload=["uploaded_at"],
@@ -252,6 +414,37 @@ class VectorRepository:
         )
         stamp = points[0].payload.get("uploaded_at") if points and points[0].payload else None
         return float(stamp) if isinstance(stamp, int | float) else None
+
+    def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]:
+        """The tags stored on an indexed document (one point read), or ``()``."""
+
+        self.ensure_ready(settings)
+        points, _ = self._call(
+            settings,
+            "scroll",
+            collection_name=settings.qdrant_collection,
+            scroll_filter=_single_filename_filter(filename),
+            with_payload=["tags"],
+            with_vectors=False,
+            limit=1,
+        )
+        stored = points[0].payload.get("tags") if points and points[0].payload else None
+        if not isinstance(stored, list):
+            return ()
+        return tuple(tag for tag in stored if isinstance(tag, str))
+
+    def set_tags(self, settings: AppSettings, filename: str, tags: Sequence[str]) -> None:
+        """Replace a document's tags on every one of its points. Payload-only: no re-embed."""
+
+        self.ensure_ready(settings)
+        self._call(
+            settings,
+            "set_payload",
+            collection_name=settings.qdrant_collection,
+            payload={"tags": list(tags)},
+            points=_single_filename_filter(filename),
+            wait=True,
+        )
 
     def list_filenames(self, settings: AppSettings) -> list[str]:
         """Return the distinct filenames currently indexed, for per-document filtering."""
@@ -265,7 +458,9 @@ class VectorRepository:
         if not point_ids:
             return
         self.ensure_ready(settings)
-        self._client.delete(
+        self._call(
+            settings,
+            "delete",
             collection_name=settings.qdrant_collection,
             points_selector=models.PointIdsList(points=list(point_ids)),
             wait=True,
@@ -277,7 +472,9 @@ class VectorRepository:
         query_embedding: EmbeddedText,
         query_filter: models.Filter | None,
     ) -> list[models.ScoredPoint]:
-        response = self._client.query_points(
+        response = self._call(
+            settings,
+            "query_points",
             collection_name=settings.qdrant_collection,
             prefetch=[
                 models.Prefetch(
@@ -300,32 +497,52 @@ class VectorRepository:
         )
         return _response_points(response)
 
+    def search_leg(
+        self,
+        settings: AppSettings,
+        query_embedding: EmbeddedText,
+        leg: Literal["dense", "sparse"],
+        query_filter: models.Filter | None = None,
+    ) -> list[models.ScoredPoint]:
+        """One side of the hybrid search on its own — for fusion, and for evaluation."""
+
+        if leg == "dense":
+            response = self._call(
+                settings,
+                "query_points",
+                collection_name=settings.qdrant_collection,
+                query=query_embedding.dense,
+                using=settings.qdrant_dense_vector_name,
+                limit=int(settings.dense_retrieval_limit),
+                query_filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+            )
+        else:
+            response = self._call(
+                settings,
+                "query_points",
+                collection_name=settings.qdrant_collection,
+                query=query_embedding.sparse,
+                using=settings.qdrant_sparse_vector_name,
+                limit=int(settings.sparse_retrieval_limit),
+                query_filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+            )
+        return _response_points(response)
+
     def _manual_hybrid_query(
         self,
         settings: AppSettings,
         query_embedding: EmbeddedText,
         query_filter: models.Filter | None,
     ) -> list[models.ScoredPoint]:
-        dense_response = self._client.query_points(
-            collection_name=settings.qdrant_collection,
-            query=query_embedding.dense,
-            using=settings.qdrant_dense_vector_name,
-            limit=int(settings.dense_retrieval_limit),
-            query_filter=query_filter,
-            with_payload=True,
-            with_vectors=False,
-        )
-        sparse_response = self._client.query_points(
-            collection_name=settings.qdrant_collection,
-            query=query_embedding.sparse,
-            using=settings.qdrant_sparse_vector_name,
-            limit=int(settings.sparse_retrieval_limit),
-            query_filter=query_filter,
-            with_payload=True,
-            with_vectors=False,
-        )
         return reciprocal_rank_fusion(
-            [_response_points(dense_response), _response_points(sparse_response)],
+            [
+                self.search_leg(settings, query_embedding, "dense", query_filter),
+                self.search_leg(settings, query_embedding, "sparse", query_filter),
+            ],
             k=int(settings.rrf_k),
             limit=int(settings.fused_top_n),
         )
@@ -341,7 +558,9 @@ class VectorRepository:
         if not ordinals:
             return []
         self.ensure_ready(settings)
-        points, _ = self._client.scroll(
+        points, _ = self._call(
+            settings,
+            "scroll",
             collection_name=settings.qdrant_collection,
             scroll_filter=models.Filter(
                 must=[
@@ -361,14 +580,32 @@ class VectorRepository:
         ]
 
 
-def _filename_filter(filenames: Sequence[str] | None) -> models.Filter | None:
-    """Build a payload filter restricting search to specific filenames, or None."""
-
-    if not filenames:
-        return None
-    return models.Filter(
-        must=[models.FieldCondition(key="filename", match=models.MatchAny(any=list(filenames)))]
+def _is_missing_collection(exc: BaseException) -> bool:
+    if isinstance(exc, UnexpectedResponse):
+        return exc.status_code == 404 and b"doesn't exist" in (exc.content or b"")
+    if isinstance(exc, grpc.RpcError):
+        code = getattr(exc, "code", None)
+        return callable(code) and code() == grpc.StatusCode.NOT_FOUND
+    # The in-process (":memory:") client says it this way.
+    message = str(exc)
+    return (
+        isinstance(exc, ValueError) and message.startswith("Collection ") and "not found" in message
     )
+
+
+def _scope_filter(
+    filenames: Sequence[str] | None, tags: Sequence[str] | None = None
+) -> models.Filter | None:
+    """Build a payload filter restricting search to filenames and/or tags, or None."""
+
+    must: list[models.Condition] = []
+    if filenames:
+        must.append(
+            models.FieldCondition(key="filename", match=models.MatchAny(any=list(filenames)))
+        )
+    if tags:
+        must.append(models.FieldCondition(key="tags", match=models.MatchAny(any=list(tags))))
+    return models.Filter(must=must) if must else None
 
 
 def _chunk_ordinal_sort_key(payload: dict[str, object]) -> tuple[int, int]:

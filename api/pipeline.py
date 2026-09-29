@@ -8,9 +8,17 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
+from api.answer_cache import (
+    AnswerCache,
+    CachedAnswer,
+    CacheKey,
+    answer_cache_key,
+    bump_corpus_generation,
+)
 from api.chunking import HeuristicTokenCounter, TokenCounter
 from api.diversity import select_diverse
 from api.documents import CHUNKER_VERSION, chunk_sections, parse_document_bytes
@@ -25,6 +33,7 @@ from api.generation import (
     build_grounded_messages,
     condense_question,
     finalize_citations,
+    fit_prompt_to_context_window,
     generate_grounded_answer,
     generate_query_variants,
     needs_condense,
@@ -131,9 +140,36 @@ class DoneEvent(TypedDict):
     sources: list[dict[str, Any]]
     timings: dict[str, float]
     trace_id: str | None
+    # Present (True) only when the answer came from the answer cache.
+    cached: NotRequired[bool]
 
 
 StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent
+
+
+# Query-expansion variants are embedded and searched side by side: four sequential
+# embed+search round trips were the whole cost of turning expansion on.
+_VARIANT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="docrag-variants")
+
+
+def _map_concurrently[T, R](function: Callable[[T], R], items: Sequence[T]) -> list[R]:
+    """``[function(item) for item in items]``, in parallel when there is more than one."""
+
+    if len(items) <= 1:
+        return [function(item) for item in items]
+    return list(_VARIANT_EXECUTOR.map(function, items))
+
+
+def _cached_timings(started: float) -> StageTimings:
+    """Timings for an answer served from the cache: no stage ran."""
+
+    return StageTimings(
+        embed_ms=0.0,
+        search_ms=0.0,
+        rerank_ms=0.0,
+        generate_ms=0.0,
+        total_ms=(time.monotonic() - started) * 1000,
+    )
 
 
 def _citation_dict(source: SourceCitation) -> dict[str, Any]:
@@ -234,9 +270,7 @@ def expand_with_neighbors(
         ]
 
     emitted: set[tuple[str, int]] = {
-        (chunk.filename, chunk.chunk_ordinal)
-        for chunk in chunks
-        if chunk.chunk_ordinal is not None
+        (chunk.filename, chunk.chunk_ordinal) for chunk in chunks if chunk.chunk_ordinal is not None
     }
 
     # Union every chunk's neighbour ordinals per filename, then one fetch per filename.
@@ -304,8 +338,11 @@ class RagPipeline:
         generator: ChatGenerator,
         settings: AppSettings,
         trace_store: TraceSink | None = None,
+        answer_cache: AnswerCache | None = None,
     ) -> None:
         self._repository = repository
+        # None disables answer caching (ANSWER_CACHE_SIZE=0).
+        self._answer_cache = answer_cache
         self._embedding_provider = embedding_provider
         self._reranker = reranker
         self._generator = generator
@@ -315,9 +352,7 @@ class RagPipeline:
         # tracing costs nothing when the operator has turned it off.
         self._trace_store = trace_store
 
-    def _effective_settings(
-        self, overrides: AnswerOverrides
-    ) -> AppSettings:
+    def _effective_settings(self, overrides: AnswerOverrides) -> AppSettings:
         """Fold per-request overrides into a settings copy without mutating the base."""
 
         settings = self._settings
@@ -420,6 +455,7 @@ class RagPipeline:
         question: str,
         effective_settings: AppSettings,
         filenames: Sequence[str] | None,
+        tags: Sequence[str] | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
 
@@ -449,14 +485,18 @@ class RagPipeline:
         queries = [normalized_query, *variants]
 
         embed_start = time.monotonic()
-        query_embeddings = [embed_query(query, self._embedding_provider) for query in queries]
+        query_embeddings = _map_concurrently(
+            lambda query: embed_query(query, self._embedding_provider), queries
+        )
         embed_ms = (time.monotonic() - embed_start) * 1000
 
         search_start = time.monotonic()
-        result_lists = [
-            self._repository.hybrid_search(effective_settings, embedding, filenames)
-            for embedding in query_embeddings
-        ]
+        result_lists = _map_concurrently(
+            lambda embedding: self._repository.hybrid_search(
+                effective_settings, embedding, filenames, tags
+            ),
+            query_embeddings,
+        )
         points = (
             result_lists[0]
             if len(result_lists) == 1
@@ -506,12 +546,124 @@ class RagPipeline:
             query_variants=variants,
         )
 
+    def retrieve(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None = None,
+        filenames: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
+    ) -> RetrievalPhase:
+        """Retrieval exactly as ``answer`` runs it — query expansion, hybrid search,
+        rerank, diversity filter, neighbour expansion — without generating. The eval
+        harness scores this, so it measures the pipeline users actually get."""
+
+        effective_settings = self._effective_settings(overrides or AnswerOverrides())
+        return self._retrieve_and_rerank(question, effective_settings, filenames, tags)
+
+    def _cache_key(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        history: Sequence[ChatMessage] | None,
+    ) -> CacheKey | None:
+        """The answer-cache key for this request, or None when it must not be cached."""
+
+        if self._answer_cache is None or history or not question.strip():
+            return None
+        try:
+            settings = self._effective_settings(overrides or AnswerOverrides())
+        except RetrievalConfigError:
+            return None  # the uncached path raises it with its proper handling
+        return answer_cache_key(question, settings, filenames, tags)
+
     def answer(
         self,
         question: str,
         overrides: AnswerOverrides | None = None,
         filenames: Sequence[str] | None = None,
         history: Sequence[ChatMessage] | None = None,
+        *,
+        tags: Sequence[str] | None = None,
+        use_cache: bool = True,
+    ) -> GroundedAnswer:
+        """``_answer_uncached``, served from the answer cache when it has this question.
+
+        ``use_cache=False`` (Regenerate) skips the lookup but still stores the new
+        answer, so the next plain ask gets the regenerated one.
+        """
+
+        started = time.monotonic()
+        key = self._cache_key(question, overrides, filenames, tags, history)
+        if key is not None and use_cache and self._answer_cache is not None:
+            hit = self._answer_cache.get(key)
+            if hit is not None:
+                return GroundedAnswer(
+                    answer=hit.answer,
+                    sources=list(hit.sources),
+                    timings=_cached_timings(started),
+                    trace_id=hit.trace_id,
+                    cached=True,
+                )
+        grounded = self._answer_uncached(question, overrides, filenames, history, tags)
+        if key is not None and self._answer_cache is not None:
+            self._answer_cache.put(
+                key, CachedAnswer(grounded.answer, tuple(grounded.sources), grounded.trace_id)
+            )
+        return grounded
+
+    def answer_stream(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None = None,
+        filenames: Sequence[str] | None = None,
+        history: Sequence[ChatMessage] | None = None,
+        *,
+        tags: Sequence[str] | None = None,
+        use_cache: bool = True,
+    ) -> Iterator[StreamEvent]:
+        """``_answer_stream_uncached``, replayed from the answer cache on a hit."""
+
+        started = time.monotonic()
+        key = self._cache_key(question, overrides, filenames, tags, history)
+        if key is not None and use_cache and self._answer_cache is not None:
+            hit = self._answer_cache.get(key)
+            if hit is not None:
+                sources = [_citation_dict(source) for source in hit.sources]
+                yield {"type": "sources", "sources": sources, "trace_id": hit.trace_id}
+                yield {"type": "delta", "text": hit.answer}
+                yield {
+                    "type": "done",
+                    "answer": hit.answer,
+                    "sources": sources,
+                    "timings": timings_dict(_cached_timings(started)),
+                    "trace_id": hit.trace_id,
+                    "cached": True,
+                }
+                return
+        done: DoneEvent | None = None
+        for event in self._answer_stream_uncached(question, overrides, filenames, history, tags):
+            if event["type"] == "done":
+                done = event
+            yield event
+        if key is not None and done is not None and self._answer_cache is not None:
+            self._answer_cache.put(
+                key,
+                CachedAnswer(
+                    done["answer"],
+                    tuple(SourceCitation(**source) for source in done["sources"]),
+                    done["trace_id"],
+                ),
+            )
+
+    def _answer_uncached(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None = None,
+        filenames: Sequence[str] | None = None,
+        history: Sequence[ChatMessage] | None = None,
+        tags: Sequence[str] | None = None,
     ) -> GroundedAnswer:
         """Retrieve, rerank, and generate a grounded, cited answer.
 
@@ -539,23 +691,27 @@ class RagPipeline:
             retrieval_query, condense_ms, condensed_question = self._condense_query(
                 question, truncated_history, effective_settings
             )
-            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames)
-            selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
+            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames, tags)
+            fitted = fit_prompt_to_context_window(
+                question.strip(),
+                phase.context_chunks[: int(effective_settings.max_context_chunks)],
+                truncated_history,
+                effective_settings,
+            )
+            selected = fitted.context_chunks
 
             generate_start = time.monotonic()
             grounded = generate_grounded_answer(
                 query=question,
-                context_chunks=phase.context_chunks,
+                context_chunks=selected,
                 generator=self._generator,
                 settings=effective_settings,
-                history=truncated_history or None,
+                history=fitted.history or None,
             )
             # generate_grounded_answer runs the zero-citation retry internally, so the
             # block just timed covers two LLM calls when it fired. Split it back out so
             # generate_ms means the same thing here as it does on the streaming path.
-            generate_ms = (
-                time.monotonic() - generate_start
-            ) * 1000 - grounded.citation_retry_ms
+            generate_ms = (time.monotonic() - generate_start) * 1000 - grounded.citation_retry_ms
             total_ms = (time.monotonic() - total_start) * 1000
 
             timings = StageTimings(
@@ -614,6 +770,7 @@ class RagPipeline:
                         selected,
                         min_score=float(effective_settings.rerank_min_score),
                         diversity_dropped_ids=phase.diversity_dropped_ids,
+                        context_budget_dropped_ids=fitted.dropped_point_ids,
                     ),
                     prompt_messages=prompt_messages,
                     answer=grounded.answer,
@@ -628,12 +785,13 @@ class RagPipeline:
             )
         return replace(grounded, timings=timings, trace_id=trace_id)
 
-    def answer_stream(
+    def _answer_stream_uncached(
         self,
         question: str,
         overrides: AnswerOverrides | None = None,
         filenames: Sequence[str] | None = None,
         history: Sequence[ChatMessage] | None = None,
+        tags: Sequence[str] | None = None,
     ) -> Iterator[StreamEvent]:
         """Stream a grounded answer as SSE-ready events: sources, deltas, then done.
 
@@ -692,8 +850,14 @@ class RagPipeline:
                 question, truncated_history, effective_settings
             )
             yield {"type": "stage", "stage": "searching"}
-            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames)
-            selected = list(phase.context_chunks[: int(effective_settings.max_context_chunks)])
+            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames, tags)
+            fitted = fit_prompt_to_context_window(
+                question.strip(),
+                phase.context_chunks[: int(effective_settings.max_context_chunks)],
+                truncated_history,
+                effective_settings,
+            )
+            selected = fitted.context_chunks
 
             if not selected:
                 yield {"type": "sources", "sources": [], "trace_id": trace_id}
@@ -752,9 +916,7 @@ class RagPipeline:
                 "trace_id": trace_id,
             }
 
-            messages = build_grounded_messages(
-                question.strip(), selected, truncated_history or None
-            )
+            messages = build_grounded_messages(question.strip(), selected, fitted.history or None)
             generate_start = time.monotonic()
             for delta in self._generator.stream(messages, effective_settings):
                 parts.append(delta)
@@ -811,6 +973,7 @@ class RagPipeline:
                             selected,
                             min_score=float(effective_settings.rerank_min_score),
                             diversity_dropped_ids=phase.diversity_dropped_ids,
+                            context_budget_dropped_ids=fitted.dropped_point_ids,
                         ),
                         # outcome.prompt_messages, not the `messages` that were streamed:
                         # when the citation retry fired, the streamed answer was replaced
@@ -916,15 +1079,23 @@ class IngestService:
             len(chunks),
             CHUNKER_VERSION,
         )
-        result: IngestResult = ingest_chunks(
-            self._repository,
-            self._settings,
-            chunks,
-            self._embedding_provider,
-            on_progress,
-            on_indexed,
-            precondition,
-        )
+        try:
+            result: IngestResult = ingest_chunks(
+                self._repository,
+                self._settings,
+                chunks,
+                self._embedding_provider,
+                on_progress,
+                on_indexed,
+                precondition,
+                # A re-upload or re-index replaces the document's points; its tags are
+                # a property of the document, not of one upload, so they carry over.
+                carry_tags=True,
+            )
+        finally:
+            # Even a failed ingest may have written points; cached answers could
+            # describe a corpus that no longer exists either way.
+            bump_corpus_generation()
         return DocumentIngestOutcome(
             filename=sections[0].filename,
             sections_parsed=len(sections),

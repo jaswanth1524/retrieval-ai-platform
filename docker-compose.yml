@@ -3,21 +3,55 @@ services:
     # Pinned: server-side hybrid (prefetch + RRF fusion) depends on the Qdrant version,
     # and :latest silently changed it under an existing install on every pull.
     image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.1}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Loopback only: the API reaches Qdrant over the compose network, and these ports
+    # exist for running the API directly on the host (`uv run uvicorn ...`). Published
+    # on 0.0.0.0 they let anyone on the LAN read or drop the collection, with no key —
+    # around API_KEY entirely.
     ports:
-      - "${QDRANT_PORT:-6333}:6333"
-      - "${QDRANT_GRPC_PORT:-6334}:6334"
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"
+    # To require a key (set QDRANT_API_KEY in .env too, so the API sends it):
+    # environment:
+    #   QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
     volumes:
       - qdrant_storage:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/127.0.0.1/6333'"]
+      # /readyz (open even with an API key) answers 200 once collections are loaded; an
+      # open TCP port only proved the process had started.
+      test:
+        - CMD-SHELL
+        - >-
+          timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333
+          && printf "GET /readyz HTTP/1.0\r\n\r\n" >&3
+          && read -r _ status _ <&3 && [ "$$status" = 200 ]'
       interval: 10s
-      timeout: 5s
-      retries: 6
+      timeout: 6s
+      retries: 12
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Optional uv extras baked into the image, e.g. UV_EXTRAS=ocr for scanned PDFs.
+        UV_EXTRAS: ${UV_EXTRAS:-}
+    restart: unless-stopped
+    # Hardened: the image is immutable at runtime. Writable places are only the model
+    # cache volume, /app/data when its volume is mounted, and a tmpfs /tmp (upload
+    # spooling). No Linux capabilities and no privilege gain: the process needs neither.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The reranker's peak is ~2.7 GB (see README "Latency"). A cap keeps a runaway
+    # request from taking the whole Docker VM down with it; restart brings it back.
+    mem_limit: ${API_MEM_LIMIT:-4g}
     env_file:
       - .env.example
       # Optional local override — copy .env.example to .env and set real secrets
@@ -59,7 +93,11 @@ services:
       test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
       interval: 30s
       timeout: 5s
-      start_period: 120s
+      # First boot downloads the models (~0.5 GB) before /health answers; on a slow
+      # link 120s marked a healthy container unhealthy. start_interval probes often
+      # during that window, so a fast boot still reports healthy quickly.
+      start_period: 600s
+      start_interval: 5s
       retries: 3
     depends_on:
       qdrant:

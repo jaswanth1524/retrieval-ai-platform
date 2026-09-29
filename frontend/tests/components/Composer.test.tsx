@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import Composer from '../../src/components/Composer';
@@ -81,6 +81,88 @@ describe('Composer', () => {
     await userEvent.type(screen.getByTestId('question-textarea'), '   {Enter}');
 
     expect(props.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('does not send on the Enter that confirms an IME composition', () => {
+    const props = baseProps();
+    render(<Composer {...props} />);
+    const textarea = screen.getByTestId('question-textarea');
+    fireEvent.change(textarea, { target: { value: '日本' } });
+
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+    fireEvent.keyDown(textarea, { key: 'Enter', keyCode: 229 });
+    expect(props.onSubmit).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(props.onSubmit).toHaveBeenCalledWith('日本');
+  });
+
+  it('stays editable while an answer streams, but holds the send', async () => {
+    const props = baseProps({ pending: true });
+    render(<Composer {...props} />);
+    const textarea = screen.getByTestId('question-textarea');
+
+    expect(textarea).toBeEnabled();
+    await userEvent.type(textarea, 'next question{Enter}');
+
+    expect(textarea).toHaveValue('next question');
+    expect(props.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('scopes by tag from the popover, and "All documents" clears tags too', async () => {
+    const onSelectedTagsChange = vi.fn();
+    const onSelectedFilenamesChange = vi.fn();
+    render(
+      <Composer
+        {...baseProps({
+          availableTags: ['legal', 'hr'],
+          selectedTags: ['hr'],
+          onSelectedTagsChange,
+          onSelectedFilenamesChange,
+        })}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    await userEvent.click(screen.getByLabelText('#legal'));
+    expect(onSelectedTagsChange).toHaveBeenCalledWith(['hr', 'legal']);
+
+    await userEvent.click(screen.getByTestId('scope-all'));
+    expect(onSelectedTagsChange).toHaveBeenLastCalledWith([]);
+    expect(onSelectedFilenamesChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it('Escape in the question box stops a streaming answer', async () => {
+    const props = baseProps({ pending: true });
+    render(<Composer {...props} />);
+
+    screen.getByTestId('question-textarea').focus();
+    await userEvent.keyboard('{Escape}');
+
+    expect(props.onCancel).toHaveBeenCalledOnce();
+  });
+
+  it('"/" outside a text field focuses the question box', async () => {
+    render(<Composer {...baseProps()} />);
+    (document.activeElement as HTMLElement | null)?.blur();
+
+    await userEvent.keyboard('/');
+
+    expect(screen.getByTestId('question-textarea')).toHaveFocus();
+    expect(screen.getByTestId('question-textarea')).toHaveValue('');
+  });
+
+  it('offers a configured OpenAI-compatible server as a provider', async () => {
+    const props = baseProps({
+      config: makeConfig({ openai_compatible_available: true, openai_compatible_model: 'qwen2.5' }),
+    });
+    render(<Composer {...props} />);
+
+    await userEvent.click(screen.getByTestId('composer-provider-button'));
+    await userEvent.click(screen.getByTestId('provider-openai-compatible'));
+
+    expect(props.onProviderChange).toHaveBeenCalledWith('openai_compatible');
+    expect(screen.getByText(/qwen2\.5/)).toBeInTheDocument();
   });
 
   it('disables the textarea and submit button when disabled', () => {
@@ -254,7 +336,7 @@ describe('Composer', () => {
       render(<Composer {...baseProps({ config: makeConfig({ openai_available: true }) })} />);
 
       const scopeButton = screen.getByTestId('composer-scope-button');
-      expect(scopeButton).toHaveAttribute('aria-haspopup', 'true');
+      expect(scopeButton).toHaveAttribute('aria-haspopup', 'dialog');
       expect(scopeButton).toHaveAttribute('aria-expanded', 'false');
 
       await userEvent.click(scopeButton);

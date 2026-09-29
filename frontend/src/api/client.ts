@@ -6,12 +6,14 @@ import type {
   DocumentJobStatusResponse,
   DocumentListResponse,
   DocumentReindexAllResponse,
+  DocumentTagsResponse,
   FeedbackRequest,
   FeedbackResponse,
   HealthResponse,
   HistoryMessage,
   LlmProvider,
   PublicConfigResponse,
+  QuestionOptions,
   QuestionOverrides,
   QuestionResponse,
   TimingsResponse,
@@ -21,12 +23,20 @@ import type {
 
 export class ApiClientError extends Error {
   statusCode?: number;
+  /** Seconds from the response's Retry-After header (a 503 the server expects to clear). */
+  retryAfterSeconds?: number;
 
-  constructor(message: string, statusCode?: number) {
+  constructor(message: string, statusCode?: number, retryAfterSeconds?: number) {
     super(message);
     this.name = 'ApiClientError';
     this.statusCode = statusCode;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+function retryAfterSeconds(response: Response): number | undefined {
+  const value = Number(response.headers.get('Retry-After'));
+  return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
@@ -77,6 +87,8 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
   // request too, without losing the timeout's independent ability to cancel it.
   const abortFromCaller = () => timeoutController.abort();
   callerSignal?.addEventListener('abort', abortFromCaller);
+  // A signal aborted before the call never fires 'abort' again, so the request ran.
+  if (callerSignal?.aborted) timeoutController.abort();
 
   let response: Response;
   try {
@@ -95,7 +107,11 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
     callerSignal?.removeEventListener('abort', abortFromCaller);
   }
   if (!response.ok) {
-    throw new ApiClientError(await extractErrorDetail(response), response.status);
+    throw new ApiClientError(
+      await extractErrorDetail(response),
+      response.status,
+      retryAfterSeconds(response),
+    );
   }
   try {
     return (await response.json()) as T;
@@ -168,6 +184,7 @@ function questionRequestBody(
   overrides?: QuestionOverrides,
   filenames?: string[],
   history?: HistoryMessage[],
+  options?: QuestionOptions,
 ): Record<string, unknown> {
   // Only include a field when it's set, so an unset value exercises the backend's
   // `| None` default (base provider/settings) rather than pinning a value.
@@ -178,7 +195,17 @@ function questionRequestBody(
   if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
   if (filenames && filenames.length > 0) body.filenames = filenames;
   if (history && history.length > 0) body.history = history;
+  if (options?.tags && options.tags.length > 0) body.tags = options.tags;
+  if (options?.bypassCache) body.use_cache = false;
   return body;
+}
+
+/** A page of GET /documents/{filename}/content. */
+export interface ContentPage {
+  around?: string;
+  radius?: number;
+  start?: number;
+  end?: number;
 }
 
 export interface QuestionStreamHandlers {
@@ -193,6 +220,7 @@ export interface QuestionStreamHandlers {
     sources: CitationResponse[],
     timings: TimingsResponse | null,
     traceId: string | null,
+    cached?: boolean,
   ) => void;
 }
 
@@ -206,6 +234,7 @@ type QuestionStreamEvent =
       sources: CitationResponse[];
       timings: TimingsResponse;
       trace_id: string | null;
+      cached?: boolean;
     }
   | { type: 'error'; detail: string };
 
@@ -279,6 +308,32 @@ export const api = {
   reindexStaleDocuments: (signal?: AbortSignal) =>
     request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal }),
 
+  // Replaces a document's tags (an empty list clears them). Payload-only on the server.
+  setDocumentTags: (filename: string, tags: string[], signal?: AbortSignal) =>
+    request<DocumentTagsResponse>(`/documents/${encodeURIComponent(filename)}/tags`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags }),
+      signal,
+    }),
+
+  // The whole-corpus backup zip (manifest, stored originals, feedback). Needs the full
+  // API key when one is set. Returns the file and the name the server suggested.
+  exportCorpus: async (): Promise<{ blob: Blob; filename: string }> => {
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}/export`, { headers: authHeaders() });
+    } catch (err) {
+      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+    }
+    if (!response.ok) {
+      throw new ApiClientError(await extractErrorDetail(response), response.status);
+    }
+    const disposition = response.headers.get('Content-Disposition') ?? '';
+    const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'docrag-export.zip';
+    return { blob: await response.blob(), filename };
+  },
+
   deleteDocument: (filename: string, signal?: AbortSignal) =>
     request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
       method: 'DELETE',
@@ -289,11 +344,20 @@ export const api = {
   // viewer. A separate, opt-in GET /documents/{filename}/original route serves the
   // literal uploaded bytes when the server has raw storage enabled (no client
   // wrapper here yet — nothing in the UI surfaces it).
-  getDocumentContent: (filename: string, signal?: AbortSignal) =>
-    request<DocumentContentResponse>(
-      `/documents/${encodeURIComponent(filename)}/content`,
+  // With no page, the whole document; `around` + `radius` for the chunks either side
+  // of a cited one, or `start`/`end` (1-based ordinals, inclusive) for a range.
+  getDocumentContent: (filename: string, signal?: AbortSignal, page: ContentPage = {}) => {
+    const query = new URLSearchParams();
+    if (page.around !== undefined) query.set('around', page.around);
+    if (page.radius !== undefined) query.set('radius', String(page.radius));
+    if (page.start !== undefined) query.set('start', String(page.start));
+    if (page.end !== undefined) query.set('end', String(page.end));
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    return request<DocumentContentResponse>(
+      `/documents/${encodeURIComponent(filename)}/content${suffix}`,
       { signal },
-    ),
+    );
+  },
 
   submitFeedback: (body: FeedbackRequest, signal?: AbortSignal) =>
     request<FeedbackResponse>('/feedback', {
@@ -307,7 +371,7 @@ export const api = {
   // since the full prompt + candidate list can be tens of KB per question and most
   // turns are never inspected.
   getTrace: (traceId: string, signal?: AbortSignal) =>
-    request<TraceDetailResponse>(`/traces/${traceId}`, { signal }),
+    request<TraceDetailResponse>(`/traces/${encodeURIComponent(traceId)}`, { signal }),
 
   // Lists recent query traces (newest first) for the trace history browser.
   listTraces: (signal?: AbortSignal) =>
@@ -367,12 +431,13 @@ export const api = {
     signal?: AbortSignal,
     filenames?: string[],
     history?: HistoryMessage[],
+    options?: QuestionOptions,
   ) =>
     request<QuestionResponse>('/questions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(
-        questionRequestBody(question, llmProvider, overrides, filenames, history),
+        questionRequestBody(question, llmProvider, overrides, filenames, history, options),
       ),
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
@@ -391,6 +456,7 @@ export const api = {
     history: HistoryMessage[] | undefined,
     handlers: QuestionStreamHandlers,
     signal?: AbortSignal,
+    options?: QuestionOptions,
   ): Promise<void> => {
     const timeoutController = new AbortController();
     let timeoutId = setTimeout(() => timeoutController.abort(), STREAM_IDLE_TIMEOUT_MS);
@@ -409,7 +475,7 @@ export const api = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify(
-            questionRequestBody(question, llmProvider, overrides, filenames, history),
+            questionRequestBody(question, llmProvider, overrides, filenames, history, options),
           ),
           signal: timeoutController.signal,
         });
@@ -421,7 +487,11 @@ export const api = {
       }
 
       if (!response.ok) {
-        throw new ApiClientError(await extractErrorDetail(response), response.status);
+        throw new ApiClientError(
+      await extractErrorDetail(response),
+      response.status,
+      retryAfterSeconds(response),
+    );
       }
 
       // Body reading needs the same error translation the fetch above already has.
@@ -437,7 +507,13 @@ export const api = {
             else if (event.type === 'delta') handlers.onDelta?.(event.text);
             else if (event.type === 'done') {
               sawDone = true;
-              handlers.onDone?.(event.answer, event.sources, event.timings, event.trace_id);
+              handlers.onDone?.(
+                event.answer,
+                event.sources,
+                event.timings,
+                event.trace_id,
+                event.cached ?? false,
+              );
             } else if (event.type === 'error') throw new ApiClientError(event.detail);
           },
           resetIdleTimeout,

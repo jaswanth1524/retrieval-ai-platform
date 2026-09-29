@@ -57,4 +57,23 @@ describe('TracesPanel', () => {
     await userEvent.click(screen.getByTestId('traces-panel-row'));
     expect(onSelect).toHaveBeenCalledWith('abc123');
   });
+
+  it('flags traces that errored or found no context', () => {
+    render(
+      <TracesPanel
+        traces={[
+          makeTrace({ trace_id: 'a', status: 'ok' }),
+          makeTrace({ trace_id: 'b', status: 'error' }),
+          makeTrace({ trace_id: 'c', status: 'insufficient_context' }),
+        ]}
+        error={null}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByTestId('traces-panel-status').map((node) => node.textContent)).toEqual([
+      'error',
+      'no context',
+    ]);
+  });
 });

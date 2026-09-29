@@ -6,6 +6,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from api.documents import MAX_TAGS_PER_DOCUMENT
+from api.tracing import TRACE_DROP_REASONS
+
 # Bounds for per-question retrieval/generation overrides accepted by QuestionRequest.
 # rrf_k and fused_top_n stay server-only (hybrid retrieval / RRF fusion is spec-pinned
 # by CLAUDE.md) — only these three fields are ever user-adjustable per request.
@@ -72,6 +75,9 @@ class PublicConfigResponse(BaseModel):
     feedback_enabled: bool
     # RAW_DOCUMENT_DIR is set: originals are stored, so documents can be re-indexed.
     raw_documents_enabled: bool = False
+    # OPENAI_COMPATIBLE_BASE_URL and _MODEL are set (the server itself isn't probed).
+    openai_compatible_available: bool = False
+    openai_compatible_model: str = ""
 
 
 class DocumentIngestResponse(BaseModel):
@@ -119,6 +125,19 @@ class DocumentListResponse(BaseModel):
     stale_filenames: list[str] = []
     # Have a stored original (RAW_DOCUMENT_DIR), so POST /documents/{f}/reindex works.
     reindexable_filenames: list[str] = []
+    # Tagged documents only (PATCH /documents/{f}/tags); an untagged one is absent.
+    tags: dict[str, list[str]] = {}
+
+
+class DocumentTagsRequest(BaseModel):
+    """Replace a document's tags. An empty list removes them all."""
+
+    tags: list[str] = Field(max_length=MAX_TAGS_PER_DOCUMENT)
+
+
+class DocumentTagsResponse(BaseModel):
+    filename: str
+    tags: list[str]
 
 
 class DocumentReindexAllResponse(BaseModel):
@@ -197,6 +216,10 @@ class DocumentContentResponse(BaseModel):
 
     filename: str
     chunks: list[DocumentChunkResponse]
+    # Every chunk the document has; with `around` or `start`/`end`, `chunks` is a page.
+    total_chunks: int | None = None
+    # With `around`: whether that chunk still exists (a re-index changes chunk ids).
+    target_found: bool | None = None
 
 
 class TimingsResponse(BaseModel):
@@ -250,7 +273,11 @@ class TraceCandidateResponse(BaseModel):
     retrieval_score: float
     rerank_score: float | None
     kept: bool
-    drop_reason: Literal["below_min_score", "near_duplicate", "top_k_cut", "not_scored"] | None
+    # Declared extensible: traces gain drop reasons as retrieval gains stages, and a
+    # client should show an unknown one as-is (the UI does) rather than reject it.
+    drop_reason: str | None = Field(
+        json_schema_extra={"x-extensible-enum": list(TRACE_DROP_REASONS)}
+    )
     selected_for_context: bool
     neighbor_expanded: bool
 
@@ -311,11 +338,9 @@ class QuestionRequest(BaseModel):
     """Question-answering request."""
 
     question: str = Field(min_length=1, max_length=4000)
-    llm_provider: Literal["ollama", "openai"] | None = None
+    llm_provider: Literal["ollama", "openai", "openai_compatible"] | None = None
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
-    max_context_chunks: int | None = Field(
-        default=None, ge=1, le=REQUEST_MAX_CONTEXT_CHUNKS_MAX
-    )
+    max_context_chunks: int | None = Field(default=None, ge=1, le=REQUEST_MAX_CONTEXT_CHUNKS_MAX)
     llm_temperature: float | None = Field(
         default=None, ge=REQUEST_TEMPERATURE_MIN, le=REQUEST_TEMPERATURE_MAX
     )
@@ -333,6 +358,11 @@ class QuestionRequest(BaseModel):
     history: list[HistoryMessageRequest] | None = Field(
         default=None, max_length=REQUEST_HISTORY_MAX_MESSAGES
     )
+    # Restricts retrieval to documents carrying any of these tags (and, with
+    # `filenames`, also to those files).
+    tags: list[str] | None = Field(default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT)
+    # False skips the answer cache's lookup (Regenerate); the new answer is still cached.
+    use_cache: bool = True
 
     @model_validator(mode="after")
     def _validate_context_within_rerank(self) -> QuestionRequest:
@@ -367,4 +397,5 @@ class QuestionResponse(BaseModel):
     sources: list[CitationResponse]
     timings: TimingsResponse | None = None
     trace_id: str | None = None
-
+    # Served from the answer cache: no retrieval or generation ran for this request.
+    cached: bool = False

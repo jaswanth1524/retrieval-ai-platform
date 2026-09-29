@@ -21,6 +21,11 @@ questions_total = Counter(
     labelnames=("outcome", "error_type"),
 )
 
+answer_cache_hits_total = Counter(
+    "docrag_answer_cache_hits_total",
+    "Questions answered from the answer cache (not counted in the stage histograms).",
+)
+
 ingest_jobs_total = Counter(
     "docrag_ingest_jobs_total",
     "Total background ingestion jobs, labeled by outcome and (for outcome=failed) error_type.",

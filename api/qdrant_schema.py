@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from threading import Lock
 from weakref import WeakKeyDictionary
@@ -11,6 +12,8 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 
 from api.settings import AppSettings
 
+logger = logging.getLogger(__name__)
+
 EMBEDDING_MODEL_TAG_KEY = "embedding_model_tag"
 PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
     ("filename", models.PayloadSchemaType.KEYWORD),
@@ -18,6 +21,8 @@ PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
     ("section", models.PayloadSchemaType.KEYWORD),
     ("chunk_id", models.PayloadSchemaType.KEYWORD),
     ("chunk_ordinal", models.PayloadSchemaType.INTEGER),
+    # Question scope by document tag (PATCH /documents/{filename}/tags).
+    ("tags", models.PayloadSchemaType.KEYWORD),
 )
 
 
@@ -59,7 +64,11 @@ class CollectionReady:
 def make_qdrant_client(settings: AppSettings) -> QdrantClient:
     """Create a Qdrant client from application settings."""
 
-    return QdrantClient(url=settings.qdrant_url, prefer_grpc=settings.qdrant_prefer_grpc)
+    return QdrantClient(
+        url=settings.qdrant_url,
+        prefer_grpc=settings.qdrant_prefer_grpc,
+        api_key=settings.qdrant_api_key or None,
+    )
 
 
 def dense_vectors_config(settings: AppSettings) -> dict[str, models.VectorParams]:
@@ -74,9 +83,45 @@ def dense_vectors_config(settings: AppSettings) -> dict[str, models.VectorParams
 
 
 def sparse_vectors_config(settings: AppSettings) -> dict[str, models.SparseVectorParams]:
-    """Return the named sparse vector config for the DocRAG collection."""
+    """Return the named sparse vector config for the DocRAG collection.
 
-    return {settings.qdrant_sparse_vector_name: models.SparseVectorParams()}
+    IDF is applied by Qdrant at query time, from the collection's own document
+    frequencies: fastembed's BM25 vectors carry only the term-frequency half of the
+    formula and are documented to need ``modifier=idf``. Without it the sparse leg
+    ranked by term frequency alone, so "the" weighed as much as a rare, distinctive term.
+    """
+
+    return {
+        settings.qdrant_sparse_vector_name: models.SparseVectorParams(modifier=models.Modifier.IDF)
+    }
+
+
+def ensure_sparse_idf(
+    client: QdrantClient,
+    settings: AppSettings,
+    collection_info: models.CollectionInfo,
+) -> None:
+    """Turn on the IDF modifier for a collection created before it was set.
+
+    In place and cheap: the stored vectors are unchanged (IDF is computed at query
+    time), so no re-embedding and no ``embedding_model_tag`` bump. Reverting is the
+    same call with ``Modifier.NONE``.
+    """
+
+    sparse = (collection_info.config.params.sparse_vectors or {}).get(
+        settings.qdrant_sparse_vector_name
+    )
+    if sparse is None or sparse.modifier == models.Modifier.IDF:
+        return
+    client.update_collection(
+        collection_name=settings.qdrant_collection,
+        sparse_vectors_config=sparse_vectors_config(settings),
+    )
+    logger.info(
+        "Enabled the IDF modifier on sparse vector %r of collection %r (BM25 scoring).",
+        settings.qdrant_sparse_vector_name,
+        settings.qdrant_collection,
+    )
 
 
 def collection_metadata(settings: AppSettings) -> dict[str, str]:
@@ -162,6 +207,20 @@ def ensure_collection(client: QdrantClient, settings: AppSettings) -> Collection
         return ready
 
 
+def forget_collection(client: QdrantClient, settings: AppSettings) -> None:
+    """Drop the cached readiness of one collection, so the next call re-checks Qdrant."""
+
+    with _ensure_collection_lock:
+        _readiness_cache.get(client, {}).pop(
+            (
+                settings.qdrant_collection,
+                settings.embedding_model_tag,
+                settings.sparse_embedding_model,
+            ),
+            None,
+        )
+
+
 def clear_readiness_cache() -> None:
     """Clear the process-wide collection-readiness cache (used by tests)."""
 
@@ -208,6 +267,7 @@ def _ensure_collection_against_qdrant(
     collection_info = client.get_collection(collection_name)
     validate_collection_schema(collection_info, settings)
     ensure_payload_indexes(client, collection_name, collection_info)
+    ensure_sparse_idf(client, settings, collection_info)
     return CollectionReady(
         collection_name=collection_name,
         created=False,

@@ -80,3 +80,19 @@ test('after a chunker upgrade, every stale document re-indexes in one go', async
   await expect(page.getByTestId('corpus-panel-item').filter({ hasText: 'older chunking' })).toHaveCount(0);
   await expect(page.getByTestId('corpus-panel-item')).toHaveCount(3);
 });
+
+test('an upload turned away by a full indexing queue waits and goes through', async ({ page, api }) => {
+  api.uploadsQueueFull = 1;
+  await page.getByTestId('rail-corpus').click();
+  await page.getByTestId('upload-input').setInputFiles({
+    name: 'queued.md',
+    mimeType: 'text/markdown',
+    buffer: Buffer.from('# Queued'),
+  });
+  await page.getByTestId('upload-button').click();
+
+  await expect(page.getByText('waiting for room in the indexing queue…')).toBeVisible();
+  await expect(
+    page.getByTestId('corpus-panel-item').filter({ hasText: 'queued.md' }).getByLabel('Delete queued.md'),
+  ).toBeVisible();
+});

@@ -6,11 +6,13 @@ import secrets
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, Header, HTTPException, status
 from qdrant_client import QdrantClient
 
+from api.admission import QuestionSlots
+from api.answer_cache import AnswerCache
 from api.chunking import TokenCounter, make_token_counter
 from api.embeddings import LocalEmbeddingProvider
 from api.feedback import FeedbackStore
@@ -24,7 +26,11 @@ from api.provider_health import (
 )
 from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
 from api.raw_documents import RawDocumentStore
-from api.repository import VectorRepository, clear_hybrid_fallback_cache
+from api.repository import (
+    VectorRepository,
+    clear_hybrid_fallback_cache,
+    clear_metadata_cache,
+)
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
 from api.tracing import TraceStore
@@ -96,6 +102,36 @@ def get_qdrant_reachability_checker() -> Callable[[QdrantClient], bool]:
     return check_qdrant_reachable
 
 
+def api_key_matches(settings: AppSettings, supplied: bytes) -> bool:
+    """Whether ``supplied`` (the X-API-Key header's wire bytes) is the full key."""
+
+    return secrets.compare_digest(supplied, settings.api_key.encode("utf-8"))
+
+
+KeyAccess = Literal["full", "read", "none"]
+
+
+def key_access(settings: AppSettings, supplied: bytes | None) -> KeyAccess:
+    """What ``supplied`` (the X-API-Key header's wire bytes) unlocks.
+
+    Shared by the ``require_*`` dependencies and ``api.request_guard``, which sees raw
+    header bytes before Starlette decodes them. See ``require_api_key`` for why this
+    compares bytes. Both keys are always compared, so timing doesn't say which matched.
+    """
+
+    if supplied is None:
+        return "none"
+    full = api_key_matches(settings, supplied)
+    read = bool(settings.api_read_key) and secrets.compare_digest(
+        supplied, settings.api_read_key.encode("utf-8")
+    )
+    return "full" if full else "read" if read else "none"
+
+
+def _supplied(x_api_key: str | None) -> bytes | None:
+    return x_api_key.encode("latin-1", "replace") if x_api_key else None
+
+
 def require_api_key(
     settings: Annotated[AppSettings, Depends(get_app_settings)],
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
@@ -118,13 +154,32 @@ def require_api_key(
 
     if not settings.api_key:
         return
-    if not x_api_key or not secrets.compare_digest(
-        x_api_key.encode("latin-1", "replace"), settings.api_key.encode("utf-8")
-    ):
+    if key_access(settings, _supplied(x_api_key)) == "none":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid API key.",
         )
+
+
+def require_full_key(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> None:
+    """``require_api_key`` for routes that change the corpus or expose operator data:
+    the read-only key (API_READ_KEY) gets a 403 here."""
+
+    if not settings.api_key:
+        return
+    access = key_access(settings, _supplied(x_api_key))
+    if access == "none":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid API key."
+        )
+    if access == "read":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=READ_ONLY_KEY_ERROR)
+
+
+READ_ONLY_KEY_ERROR = "This API key is read-only; changing documents needs the full API key."
 
 
 def get_vector_repository(
@@ -160,6 +215,7 @@ def get_rag_pipeline(
     generator: Annotated[LiteLLMGenerator, Depends(get_generator)],
     settings: Annotated[AppSettings, Depends(get_app_settings)],
     trace_store: Annotated[TraceStore, Depends(get_trace_store)],
+    answer_cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
 ) -> RagPipeline:
     """Return the query orchestration seam: retrieve -> rerank -> generate."""
 
@@ -172,7 +228,40 @@ def get_rag_pipeline(
         # The gate reads the *injected* settings (not a direct get_app_settings()
         # call) so a test overriding get_app_settings controls trace_enabled too.
         trace_store=trace_store if settings.trace_enabled else None,
+        answer_cache=answer_cache,
     )
+
+
+@lru_cache
+def _question_slots_for(limit: int) -> QuestionSlots:
+    return QuestionSlots(limit)
+
+
+def get_question_slots(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+) -> QuestionSlots:
+    """The process-wide question concurrency cap (MAX_CONCURRENT_QUESTIONS)."""
+
+    return _question_slots_for(int(settings.max_concurrent_questions))
+
+
+@lru_cache
+def _answer_cache_for(max_entries: int, ttl_seconds: float) -> AnswerCache:
+    return AnswerCache(max_entries, ttl_seconds)
+
+
+def get_answer_cache(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+) -> AnswerCache | None:
+    """Return the process-wide answer cache, or None when ANSWER_CACHE_SIZE is 0.
+
+    A sub-dependency of the injected settings (not a direct get_app_settings() call),
+    so a test overriding the settings controls whether caching is on.
+    """
+
+    if settings.answer_cache_size <= 0:
+        return None
+    return _answer_cache_for(settings.answer_cache_size, settings.answer_cache_ttl_seconds)
 
 
 @lru_cache
@@ -242,7 +331,9 @@ def get_feedback_store() -> FeedbackStore | None:
     """
 
     settings = get_app_settings()
-    return FeedbackStore(settings.feedback_store_path) if settings.feedback_enabled else None
+    if not settings.feedback_enabled:
+        return None
+    return FeedbackStore(settings.feedback_store_path, max_rows=int(settings.feedback_max_rows))
 
 
 @lru_cache
@@ -259,9 +350,13 @@ def get_ingest_executor() -> ThreadPoolExecutor:
 
 @lru_cache
 def get_ingest_backlog() -> IngestBacklog:
-    """Return the process-wide byte budget for queued/in-progress upload content."""
+    """Return the process-wide byte and job budget for queued/in-progress uploads."""
 
-    return IngestBacklog(int(get_app_settings().ingest_max_pending_bytes))
+    settings = get_app_settings()
+    return IngestBacklog(
+        int(settings.ingest_max_pending_bytes),
+        max_jobs=int(settings.ingest_jobs_max_retained),
+    )
 
 
 def shutdown_executors() -> None:
@@ -298,6 +393,9 @@ def clear_dependency_caches() -> None:
     get_ingest_executor.cache_clear()
     get_ingest_backlog.cache_clear()
     get_trace_store.cache_clear()
+    _answer_cache_for.cache_clear()
+    _question_slots_for.cache_clear()
     clear_readiness_cache()
     clear_ollama_reachability_cache()
     clear_hybrid_fallback_cache()
+    clear_metadata_cache()

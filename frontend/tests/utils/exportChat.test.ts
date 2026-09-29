@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatTurn } from '../../src/components/ChatMessage';
-import { chatToJson, chatToMarkdown, downloadFile } from '../../src/utils/exportChat';
+import { chatToJson, chatToMarkdown, withCitationFootnotes, downloadFile } from '../../src/utils/exportChat';
 
 function makeTurn(overrides: Partial<ChatTurn> = {}): ChatTurn {
   return {
@@ -110,5 +110,14 @@ describe('downloadFile', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('withCitationFootnotes', () => {
+  it('appends each source as a footnote line, and leaves an unsourced answer alone', () => {
+    const source = { source_number: 2, filename: 'b.md', page: 1, section: 'Setup', chunk_id: 'c', text: '' };
+
+    expect(withCitationFootnotes('Run it [2].', [source])).toBe('Run it [2].\n\n[2] b.md · p.1 · Setup');
+    expect(withCitationFootnotes('No sources.', [])).toBe('No sources.');
   });
 });

@@ -57,3 +57,17 @@
   color: var(--rail-dim);
   margin: 0;
 }
+
+.traces-panel__status {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+.traces-panel__status--error {
+  color: var(--bad);
+}
+
+.traces-panel__status--insufficient_context {
+  color: var(--warn);
+}

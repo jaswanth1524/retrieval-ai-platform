@@ -19,7 +19,16 @@ COPY pyproject.toml uv.lock ./
 # The cache mount keeps downloaded wheels across builds, so a uv.lock change doesn't
 # re-download everything; copy mode because the mount is a different filesystem.
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen
+# Space-separated uv extras to install, e.g. `--build-arg UV_EXTRAS=ocr` (compose:
+# UV_EXTRAS=ocr in .env). OCR's opencv links against libGL/glib, absent from slim.
+ARG UV_EXTRAS=""
+RUN if printf '%s\n' $UV_EXTRAS | grep -qx ocr; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen $(for extra in $UV_EXTRAS; do printf -- '--extra %s ' "$extra"; done)
 COPY api/ ./api/
 # UV_COMPILE_BYTECODE only covers what uv sync installs, and `package = false` keeps
 # api/ out of that — compile the app's own modules here, for the same reason.
@@ -52,8 +61,8 @@ EXPOSE 8000
 
 # No curl/wget in the slim image — a stdlib urllib check instead. start-period is
 # generous because WARMUP_MODELS=true downloads the reranker (~0.28 GB int8, ~1.1 GB fp32)
-# on first boot.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+# on first boot, before /health answers.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --start-interval=5s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
 
 # Run the venv's uvicorn directly rather than `uv run` — the runtime user has no

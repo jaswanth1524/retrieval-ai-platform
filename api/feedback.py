@@ -54,8 +54,11 @@ class FeedbackStore:
     across threads, and requests can arrive concurrently.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, max_rows: int | None = None) -> None:
         self._path = path
+        # Oldest rows are pruned past this on insert. POST /feedback is open whenever
+        # API_KEY is unset, so without a cap any caller could grow the file forever.
+        self._max_rows = max_rows
         self._lock = Lock()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         enable_wal(path)
@@ -113,6 +116,12 @@ class FeedbackStore:
                     feedback.created_at,
                 ),
             )
+            if self._max_rows is not None:
+                conn.execute(
+                    "DELETE FROM feedback WHERE rowid <= "
+                    "(SELECT rowid FROM feedback ORDER BY rowid DESC LIMIT 1 OFFSET ?)",
+                    (self._max_rows,),
+                )
         return feedback
 
     def list_recent(self, limit: int = 100) -> list[Feedback]:

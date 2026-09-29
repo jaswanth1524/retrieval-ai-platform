@@ -14,6 +14,9 @@ interface ChatThreadProps {
   engineerMode: boolean;
   currentModelLabel?: string;
   onRetry?: (question: string) => void;
+  // Regenerate (skips the answer cache); falls back to onRetry when absent.
+  onRegenerate?: (question: string) => void;
+  onEditQuestion?: (turnId: string, question: string) => void;
   feedbackEnabled?: boolean;
   onFeedback?: (payload: FeedbackPayload) => void;
   onOpenSource?: (filename: string, chunkId: string) => void;
@@ -35,11 +38,15 @@ const PIN_THRESHOLD_PX = 48;
 // backward is also correct if an error turn ever lands in between, and it avoids
 // growing the persisted localStorage v2 chat-history schema for a value that's always
 // reconstructible from position.
-function findPrecedingUserQuestion(turns: ChatTurn[], index: number): string | undefined {
-  for (let i = index - 1; i >= 0; i -= 1) {
-    if (turns[i].role === 'user') return turns[i].content;
-  }
-  return undefined;
+// One pass over the thread: searching backward from every assistant turn made each
+// render quadratic in conversation length.
+function precedingUserQuestions(turns: ChatTurn[]): (string | undefined)[] {
+  let lastQuestion: string | undefined;
+  return turns.map((turn) => {
+    const preceding = lastQuestion;
+    if (turn.role === 'user') lastQuestion = turn.content;
+    return preceding;
+  });
 }
 
 function ChatThread({
@@ -49,6 +56,8 @@ function ChatThread({
   engineerMode,
   currentModelLabel,
   onRetry,
+  onRegenerate,
+  onEditQuestion,
   feedbackEnabled,
   onFeedback,
   onOpenSource,
@@ -118,6 +127,7 @@ function ChatThread({
   // useChat), so while pending is true but the last turn is still the user's question,
   // there's no ChatTurn yet to attach a skeleton to — render a placeholder in its slot.
   const awaitingFirstEvent = pending && lastTurn?.role !== 'assistant';
+  const questions = precedingUserQuestions(turns);
 
   return (
     <div
@@ -139,9 +149,10 @@ function ChatThread({
                 : undefined
             }
             onRetry={onRetry}
-            regenerateQuestion={
-              turn.role === 'assistant' ? findPrecedingUserQuestion(turns, index) : undefined
-            }
+            onRegenerate={onRegenerate}
+            onEditQuestion={onEditQuestion}
+            regenerateQuestion={turn.role === 'assistant' ? questions[index] : undefined}
+            busy={pending}
             feedbackEnabled={feedbackEnabled}
             onFeedback={onFeedback}
             onOpenSource={onOpenSource}

@@ -249,3 +249,71 @@ def test_ensure_collection_concurrent_cold_calls_create_only_once(
     # which is why every result reports created=True here, not just one).
     assert create_calls == 1
     assert all(result.created for result in results)
+
+
+def test_make_qdrant_client_sends_the_configured_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    import api.qdrant_schema as qdrant_schema
+
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(qdrant_schema, "QdrantClient", lambda **kwargs: captured.append(kwargs))
+
+    qdrant_schema.make_qdrant_client(
+        AppSettings(_env_file=None, qdrant_api_key="qdrant-secret")  # type: ignore[call-arg]
+    )
+    qdrant_schema.make_qdrant_client(AppSettings(_env_file=None))  # type: ignore[call-arg]
+
+    assert captured[0]["api_key"] == "qdrant-secret"
+    assert captured[1]["api_key"] is None
+
+
+def test_new_collections_score_bm25_with_idf() -> None:
+    clear_readiness_cache()
+    client = QdrantClient(":memory:")
+    settings = make_settings()
+
+    ensure_collection(client, settings)
+
+    sparse = client.get_collection(settings.qdrant_collection).config.params.sparse_vectors
+    assert sparse is not None
+    assert sparse[settings.qdrant_sparse_vector_name].modifier == models.Modifier.IDF
+
+
+def test_an_existing_collection_without_idf_is_migrated_in_place() -> None:
+    """Collections created before the modifier keep their points and gain IDF — no
+    re-embedding and no refusal, since the stored vectors are unchanged."""
+
+    clear_readiness_cache()
+    client = QdrantClient(":memory:")
+    settings = make_settings()
+    client.create_collection(
+        collection_name=settings.qdrant_collection,
+        vectors_config=dense_vectors_config(settings),
+        sparse_vectors_config={settings.qdrant_sparse_vector_name: models.SparseVectorParams()},
+        metadata=collection_metadata(settings),
+    )
+    client.upsert(
+        settings.qdrant_collection,
+        [
+            models.PointStruct(
+                id=1,
+                vector={
+                    settings.qdrant_dense_vector_name: [1.0, 0.0, 0.0, 0.0],
+                    settings.qdrant_sparse_vector_name: models.SparseVector(
+                        indices=[1], values=[1.0]
+                    ),
+                },
+            )
+        ],
+    )
+
+    ready = ensure_collection(client, settings)
+
+    info = client.get_collection(settings.qdrant_collection)
+    assert ready.created is False
+    assert info.points_count == 1
+    assert info.config.params.sparse_vectors is not None
+    assert (
+        info.config.params.sparse_vectors[settings.qdrant_sparse_vector_name].modifier
+        == models.Modifier.IDF
+    )
+    clear_readiness_cache()

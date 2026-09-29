@@ -2,12 +2,19 @@
 
 Two modes:
 
-* ``retrieval`` — embed + hybrid-search + rerank each question and score the ranked
-  filenames / chunk_ids against labeled relevant sets (hit@k, recall@k, MRR). No LLM.
+* ``retrieval`` — run retrieval exactly as the API does (``RagPipeline.retrieve``: query
+  expansion when enabled, hybrid search, rerank, diversity filter) and score the ranked
+  filenames / chunk_ids against labeled relevant sets (hit@k, recall@k, MRR). No LLM
+  unless query expansion is on. ``--arm`` scores an earlier stage instead (``fused``,
+  ``dense``, ``sparse``), so a change can be traced to the stage it helped or hurt.
   Optionally fails against a committed baseline for regression gating.
-* ``answer`` — run the full pipeline (retrieval + neighbor expansion + generation) and
-  write ``{question, answer, contexts, reference}`` rows directly consumable by
-  ``eval.ragas_runner`` for offline RAGAS scoring.
+* ``answer`` — run the full pipeline (retrieval + neighbor expansion + prompt fitting +
+  generation) and write ``{question, answer, contexts, reference}`` rows directly
+  consumable by ``eval.ragas_runner`` for offline RAGAS scoring.
+* ``validate`` — check a dataset's shape only (CI runs this; no Qdrant or models).
+
+``eval/corpus/`` holds the documents the sample dataset is labeled against; ingest it
+into a fresh collection before running against ``eval/baselines/``.
 
 Both modes need a running Qdrant with an ingested corpus (and ``answer`` also an LLM),
 so this is a **local** tool, not a CI step. CI unit-tests ``eval.metrics`` and this
@@ -25,14 +32,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from api.generation import ChatGenerator, generate_grounded_answer
-from api.pipeline import expand_with_neighbors
-from api.reranking import Reranker, rerank_candidates_detailed
+from api.documents import CHUNKER_VERSION
+from api.generation import (
+    ChatGenerator,
+    ChatMessage,
+    fit_prompt_to_context_window,
+    generate_grounded_answer,
+)
+from api.pipeline import RagPipeline
+from api.reranking import Reranker
 from api.retrieval import QueryEmbeddingProvider, embed_query, points_to_chunks
 from api.settings import AppSettings, get_settings
-from eval.metrics import aggregate, compare_to_baseline, score_ranking
+from eval.metrics import aggregate, baseline_shape_problems, compare_to_baseline, score_ranking
 
 DEFAULT_KS: tuple[int, ...] = (1, 3, 5, 8)
+# reranked is what the API serves; the others score one earlier stage on its own.
+ARMS: tuple[str, ...] = ("reranked", "fused", "dense", "sparse")
+
+
+class _NoGenerator:
+    """Stands in when no LLM is configured: retrieval needs one only for query expansion."""
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        raise RuntimeError("Query expansion needs an LLM; pass a generator.")
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Any:
+        raise RuntimeError("Query expansion needs an LLM; pass a generator.")
 
 
 class HarnessDataError(ValueError):
@@ -96,6 +121,22 @@ class Collaborators:
         self.generator: ChatGenerator = LiteLLMGenerator(settings)
 
 
+def _pipeline(
+    repository: Any,
+    embedding_provider: QueryEmbeddingProvider,
+    reranker: Reranker,
+    settings: AppSettings,
+    generator: ChatGenerator | None,
+) -> RagPipeline:
+    return RagPipeline(
+        repository=repository,
+        embedding_provider=embedding_provider,
+        reranker=reranker,
+        generator=generator or _NoGenerator(),
+        settings=settings,
+    )
+
+
 def rank_for_question(
     question: str,
     *,
@@ -104,18 +145,27 @@ def rank_for_question(
     reranker: Reranker,
     settings: AppSettings,
     filenames: Sequence[str] | None = None,
+    arm: str = "reranked",
+    generator: ChatGenerator | None = None,
 ) -> RankedResult:
-    """Embed, hybrid-search, and rerank one question — return the kept ranking."""
+    """The ranking one question gets from ``arm`` (default: what the API serves)."""
 
-    embedding = embed_query(question, embedding_provider)
-    points = repository.hybrid_search(settings, embedding, filenames)
-    candidates = points_to_chunks(points)
-    outcome = rerank_candidates_detailed(
-        query=question, candidates=candidates, reranker=reranker, settings=settings
+    if arm in ("dense", "sparse"):
+        embedding = embed_query(question, embedding_provider)
+        chunks = points_to_chunks(repository.search_leg(settings, embedding, arm))
+        return RankedResult(
+            filenames=[chunk.filename for chunk in chunks],
+            chunk_ids=[chunk.chunk_id for chunk in chunks],
+        )
+    if arm not in ("reranked", "fused"):
+        raise ValueError(f"Unknown arm '{arm}'; expected one of {', '.join(ARMS)}.")
+    phase = _pipeline(repository, embedding_provider, reranker, settings, generator).retrieve(
+        question, filenames=filenames
     )
+    ranked = phase.fused_candidates if arm == "fused" else phase.context_chunks
     return RankedResult(
-        filenames=[chunk.filename for chunk in outcome.kept],
-        chunk_ids=[chunk.chunk_id for chunk in outcome.kept],
+        filenames=[chunk.filename for chunk in ranked],
+        chunk_ids=[chunk.chunk_id for chunk in ranked],
     )
 
 
@@ -130,21 +180,22 @@ def answer_for_question(
 ) -> AnswerRow:
     """Run the full pipeline for one question and return a RAGAS-shaped row."""
 
-    embedding = embed_query(example.question, embedding_provider)
-    points = repository.hybrid_search(settings, embedding, None)
-    candidates = points_to_chunks(points)
-    outcome = rerank_candidates_detailed(
-        query=example.question, candidates=candidates, reranker=reranker, settings=settings
+    phase = _pipeline(repository, embedding_provider, reranker, settings, generator).retrieve(
+        example.question
     )
-    expanded = expand_with_neighbors(outcome.kept, repository, settings)
+    fitted = fit_prompt_to_context_window(
+        example.question,
+        phase.context_chunks[: int(settings.max_context_chunks)],
+        None,
+        settings,
+    )
     grounded = generate_grounded_answer(
         query=example.question,
-        context_chunks=expanded,
+        context_chunks=fitted.context_chunks,
         generator=generator,
         settings=settings,
     )
-    limit = int(settings.max_context_chunks)
-    contexts = [chunk.expanded_text or chunk.text for chunk in expanded[:limit]]
+    contexts = [chunk.expanded_text or chunk.text for chunk in fitted.context_chunks]
     return AnswerRow(
         question=example.question,
         answer=grounded.answer,
@@ -216,10 +267,25 @@ def _string_set(value: Any, index: int, field: str) -> frozenset[str]:
     return frozenset(item.strip() for item in value if item.strip())
 
 
+def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
+    """What a baseline was measured with, so a comparison can say what changed."""
+
+    return {
+        "arm": arm,
+        "embedding_model_tag": settings.embedding_model_tag,
+        "sparse_embedding_model": settings.sparse_embedding_model,
+        "reranker_model": settings.reranker_model,
+        "chunker_version": CHUNKER_VERSION,
+        "rerank_top_k": int(settings.rerank_top_k),
+        "query_expansion_enabled": bool(settings.query_expansion_enabled),
+    }
+
+
 def run_retrieval_eval(
     examples: Sequence[RetrievalExample],
     collaborators: Collaborators,
     ks: Sequence[int],
+    arm: str = "reranked",
 ) -> dict[str, Any]:
     """Score every example's filename ranking (and chunk ranking when labeled)."""
 
@@ -233,6 +299,8 @@ def run_retrieval_eval(
             embedding_provider=collaborators.embedding_provider,
             reranker=collaborators.reranker,
             settings=collaborators.settings,
+            arm=arm,
+            generator=getattr(collaborators, "generator", None),
         )
         entry: dict[str, Any] = {"question": example.question}
         if example.relevant_filenames:
@@ -246,6 +314,7 @@ def run_retrieval_eval(
         per_question.append(entry)
 
     return {
+        "fingerprint": settings_fingerprint(collaborators.settings, arm),
         "k_values": list(ks),
         "question_count": len(examples),
         "aggregate": {
@@ -275,6 +344,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retrieval.add_argument("--output", type=Path, help="Optional JSON results path.")
     retrieval.add_argument(
+        "--arm",
+        choices=ARMS,
+        default="reranked",
+        help="Stage to score: reranked (what the API serves, default), fused, dense, sparse.",
+    )
+    retrieval.add_argument(
         "--baseline", type=Path, help="Baseline results JSON to compare against."
     )
     retrieval.add_argument(
@@ -283,6 +358,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="Max allowed drop per metric vs baseline before failing (default 0.05).",
     )
+
+    ingest = sub.add_parser("ingest", help="Index every document in a directory.")
+    ingest.add_argument("directory", type=Path, help="e.g. eval/corpus")
+
+    validate = sub.add_parser("validate", help="Check a dataset's shape only (no Qdrant).")
+    validate.add_argument("dataset", type=Path, help="Path to .json or .jsonl labeled dataset.")
 
     answer = sub.add_parser("answer", help="Generate answers for RAGAS scoring.")
     answer.add_argument("dataset", type=Path, help="Path to .json or .jsonl labeled dataset.")
@@ -296,17 +377,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "ingest":
+        return ingest_directory(args.directory, get_settings())
+
     try:
         examples = load_retrieval_dataset(args.dataset)
     except HarnessDataError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if args.command == "validate":
+        labeled = sum(1 for e in examples if e.relevant_filenames or e.relevant_chunk_ids)
+        print(f"{len(examples)} examples, {labeled} labeled: OK")
+        return 0 if labeled else 2
+
     settings = get_settings()
 
     if args.command == "retrieval":
         ks = tuple(args.ks) if args.ks else DEFAULT_KS
-        results = run_retrieval_eval(examples, Collaborators(settings), ks)
+        results = run_retrieval_eval(examples, Collaborators(settings), ks, args.arm)
         _emit(results, args.output)
         if args.baseline is not None:
             return _check_baseline(results, args.baseline, args.max_regression)
@@ -330,6 +419,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def ingest_directory(directory: Path, settings: AppSettings) -> int:
+    """Index each file in ``directory`` (sorted) into the configured collection."""
+
+    from api.chunking import make_token_counter
+    from api.embeddings import LocalEmbeddingProvider
+    from api.pipeline import IngestService
+    from api.qdrant_schema import make_qdrant_client
+    from api.repository import VectorRepository
+
+    files = sorted(path for path in directory.iterdir() if path.is_file())
+    if not files:
+        print(f"error: no files in {directory}", file=sys.stderr)
+        return 2
+    service = IngestService(
+        VectorRepository(make_qdrant_client(settings)),
+        LocalEmbeddingProvider(settings),
+        settings,
+        make_token_counter(settings.dense_embedding_model),
+    )
+    for path in files:
+        outcome = service.ingest(path.name, path.read_bytes())
+        print(f"{outcome.filename}: {outcome.chunks_ingested} chunks")
+    return 0
+
+
 def _emit(results: dict[str, Any], output: Path | None) -> None:
     payload = json.dumps(results, indent=2, sort_keys=True)
     if output is not None:
@@ -344,7 +458,25 @@ def _check_baseline(results: dict[str, Any], baseline_path: Path, max_regression
     except (OSError, json.JSONDecodeError) as exc:
         print(f"error: could not read baseline: {exc}", file=sys.stderr)
         return 2
-    baseline_agg = baseline.get("aggregate", {}) if isinstance(baseline, dict) else {}
+    if not isinstance(baseline, dict):
+        print("error: baseline is not a results object", file=sys.stderr)
+        return 2
+    # A baseline from a different dataset, cutoffs or stage compares nothing: every
+    # mismatched metric used to be skipped and the gate passed on no evidence at all.
+    problems = baseline_shape_problems(results, baseline)
+    if problems:
+        print("baseline is not comparable to this run:", file=sys.stderr)
+        for message in problems:
+            print(f"  {message}", file=sys.stderr)
+        return 2
+    changed = {
+        key: (baseline.get("fingerprint", {}).get(key), value)
+        for key, value in results.get("fingerprint", {}).items()
+        if baseline.get("fingerprint", {}).get(key) != value
+    }
+    for key, (before, after) in changed.items():
+        print(f"note: {key} changed since the baseline: {before!r} -> {after!r}")
+    baseline_agg = baseline.get("aggregate", {})
     regressions: list[str] = []
     for level in ("filename", "chunk"):
         regressions.extend(

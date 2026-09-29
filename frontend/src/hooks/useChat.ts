@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
-import type { HistoryMessage, LlmProvider, QuestionOverrides } from '../api/types';
+import type {
+  FeedbackRating,
+  HistoryMessage,
+  LlmProvider,
+  QuestionOptions,
+  QuestionOverrides,
+} from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
+import { newId } from '../utils/id';
+import { chatStoreAvailable, loadChatStore, saveChatStore } from './chatStore';
 
 // Mirrors the server's own REQUEST_HISTORY_MAX_MESSAGES cap (api/schemas.py) — kept
 // in sync so a client-side trim never silently disagrees with what the server would
@@ -45,7 +53,11 @@ function truncateForHistory(content: string): string {
 export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
   const candidates = turns
     .filter((turn): turn is ChatTurn & { role: 'user' | 'assistant' } =>
-      (turn.role === 'user' || turn.role === 'assistant') && turn.content.trim().length > 0,
+      (turn.role === 'user' || turn.role === 'assistant') &&
+      turn.content.trim().length > 0 &&
+      // A stopped answer is a fragment; sent back as history it reads to the model as
+      // what it actually concluded.
+      !turn.stopped,
     )
     .slice(-HISTORY_MAX_MESSAGES);
 
@@ -60,12 +72,23 @@ export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
   return withinBudget;
 }
 
+/** Which documents a conversation's questions search. Empty lists mean "everything". */
+export interface ConversationScope {
+  filenames: string[];
+  tags: string[];
+}
+
+export const EMPTY_SCOPE: ConversationScope = { filenames: [], tags: [] };
+
 export interface Conversation {
   id: string;
   title: string;
   createdAt: number;
   updatedAt: number;
   turns: ChatTurn[];
+  // Per conversation, so a follow-up in another conversation can't silently search
+  // the documents this one was scoped to. Absent on conversations saved before it.
+  scope?: ConversationScope;
 }
 
 export interface ConversationSummary {
@@ -100,23 +123,44 @@ export interface UseChatResult {
   persistPartial: boolean;
   conversations: ConversationSummary[];
   activeConversationId: string | null;
+  // The active conversation's search scope.
+  scope: ConversationScope;
+  /** A scope, or an updater of the current one — updaters compose, so two setters
+   *  called in the same tick (clear files, then clear tags) don't undo each other. */
+  setScope: (scope: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => void;
+  /** Drop names that are no longer indexed from every conversation's scope. */
+  pruneScopes: (indexedFilenames: string[]) => void;
   ask: (
     question: string,
     provider?: LlmProvider,
     overrides?: QuestionOverrides,
     filenames?: string[],
+    options?: QuestionOptions,
   ) => Promise<void>;
+  /** Ask `question` in place of an earlier user turn, in a new conversation forked
+   *  just before it — the original conversation stays as it was. */
+  editAndResend: (
+    turnId: string,
+    question: string,
+    provider?: LlmProvider,
+    overrides?: QuestionOverrides,
+    filenames?: string[],
+    options?: QuestionOptions,
+  ) => Promise<void>;
+  /** Add a conversation from a JSON export; false when the file holds no turns. */
+  importConversation: (raw: unknown, title?: string) => boolean;
   cancel: () => void;
   clear: () => void;
   newConversation: () => void;
   switchConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
   deleteConversation: (id: string) => void;
+  setTurnFeedback: (turnId: string, rating: FeedbackRating) => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
   return {
-    id: crypto.randomUUID(),
+    id: newId(),
     role,
     content,
     sources,
@@ -134,8 +178,12 @@ const CHAT_STORAGE_VERSION = 2;
 const CHAT_STORAGE_MAX_TURNS = 100;
 const MAX_CONVERSATIONS = 20;
 const TITLE_MAX_CHARS = 60;
+// Each source carries its full chunk text (~2 KB), up to 8 per answer, and it was the
+// bulk of what filled the ~5 MB quota. Only the most recent turns keep it on disk; older
+// ones keep the citation (file, page, section, chunk id), which is what opens the viewer.
+const PERSISTED_SOURCE_TEXT_TURNS = 6;
 
-interface ChatStorageV2 {
+export interface ChatStorageV2 {
   version: 2;
   activeConversationId: string | null;
   conversations: Conversation[];
@@ -162,7 +210,136 @@ function deriveTitle(turns: ChatTurn[]): string {
 
 function emptyConversation(): Conversation {
   const now = Date.now();
-  return { id: crypto.randomUUID(), title: 'New chat', createdAt: now, updatedAt: now, turns: [] };
+  return { id: newId(), title: 'New chat', createdAt: now, updatedAt: now, turns: [] };
+}
+
+function byRecentUse(a: Conversation, b: Conversation): number {
+  return b.updatedAt - a.updatedAt;
+}
+
+/** A conversation as written to disk: the last `maxTurns` turns, with source text kept
+ * only on the most recent few (see PERSISTED_SOURCE_TEXT_TURNS). */
+function compactForStorage(conversation: Conversation, maxTurns: number): Conversation {
+  const turns = conversation.turns.slice(-maxTurns);
+  const keepTextFrom = turns.length - PERSISTED_SOURCE_TEXT_TURNS;
+  return {
+    ...conversation,
+    turns: turns.map((turn, index) =>
+      index >= keepTextFrom || turn.sources.every((source) => !source.text)
+        ? turn
+        : { ...turn, sources: turn.sources.map((source) => ({ ...source, text: '' })) },
+    ),
+  };
+}
+
+type PersistOutcome = 'saved' | 'partial' | 'failed';
+
+/** Write the store to localStorage, falling back to the active conversation alone. */
+function persistStorage(storage: ChatStorageV2): PersistOutcome {
+  const { conversations, activeConversationId } = storage;
+  const onlyEmpty = conversations.length === 1 && conversations[0].turns.length === 0;
+  if (onlyEmpty) {
+    try {
+      localStorage.removeItem(CHAT_STORAGE_KEY);
+    } catch {
+      // Nothing more to do if even a removeItem fails.
+    }
+    return 'saved';
+  }
+  const payloadFor = (convos: Conversation[], maxTurns: number) =>
+    JSON.stringify({
+      version: CHAT_STORAGE_VERSION,
+      activeConversationId,
+      conversations: convos.map((conversation) => compactForStorage(conversation, maxTurns)),
+    });
+  try {
+    localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(conversations, CHAT_STORAGE_MAX_TURNS));
+    return 'saved';
+  } catch {
+    // Quota most likely exceeded. Retry once with only the active conversation and a
+    // shorter tail rather than freezing at the last successful write with no signal —
+    // this still drops older conversations from disk but keeps the current one saved.
+    const reduced = conversations.filter((c) => c.id === activeConversationId);
+    if (reduced.length === 0) {
+      // No active match to fall back to. Writing the reduced payload here would
+      // persist an empty conversations array, which loadStorage reads back as
+      // "nothing saved" — a silent wipe reported as success. Fail loudly instead.
+      return 'failed';
+    }
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(reduced, 20));
+      // The write succeeded but every other conversation, and all but the last 20
+      // turns of this one, are now absent from disk — its own signal, not a clean save.
+      return 'partial';
+    } catch {
+      return 'failed';
+    }
+  }
+}
+
+/** ``incoming`` with passage text put back from ``mine`` where it was stripped.
+ *
+ * Another tab's localStorage copy drops old passage text; merged over this tab's full
+ * copy as-is, the next IndexedDB save would have stored the stripped version. */
+function keepPassageText(incoming: Conversation, mine: Conversation): Conversation {
+  const mineById = new Map(mine.turns.map((turn) => [turn.id, turn]));
+  let restored = false;
+  const turns = incoming.turns.map((turn) => {
+    const own = mineById.get(turn.id);
+    if (!own || turn.sources.length !== own.sources.length) return turn;
+    if (!turn.sources.some((source, index) => !source.text && own.sources[index].text)) return turn;
+    restored = true;
+    return {
+      ...turn,
+      sources: turn.sources.map((source, index) =>
+        source.text ? source : { ...source, text: own.sources[index].text },
+      ),
+    };
+  });
+  return restored ? { ...incoming, turns } : incoming;
+}
+
+/** Fold another tab's saved conversations into this tab's, newest copy of each winning.
+ *
+ * Every tab used to rewrite the whole blob from its own memory, so asking in tab B
+ * erased what tab A had just saved. A conversation deleted in the other tab survives
+ * here if this tab still has it — losing a delete beats losing a conversation. */
+export function mergeConversations(
+  local: ChatStorageV2,
+  incoming: Conversation[],
+  // IndexedDB's copy of a conversation is the complete one (localStorage's drops old
+  // passage text), so on equal timestamps it wins.
+  preferIncomingOnTie = false,
+): ChatStorageV2 {
+  const byId = new Map(local.conversations.map((conversation) => [conversation.id, conversation]));
+  let changed = false;
+  for (const conversation of incoming) {
+    const mine = byId.get(conversation.id);
+    if (
+      !mine ||
+      conversation.updatedAt > mine.updatedAt ||
+      (preferIncomingOnTie && conversation.updatedAt === mine.updatedAt)
+    ) {
+      byId.set(conversation.id, mine ? keepPassageText(conversation, mine) : conversation);
+      changed = true;
+    }
+  }
+  if (!changed) return local;
+  const conversations = [...byId.values()].sort(byRecentUse).slice(0, MAX_CONVERSATIONS);
+  const activeConversationId = conversations.some((c) => c.id === local.activeConversationId)
+    ? local.activeConversationId
+    : conversations[0].id;
+  return { ...local, activeConversationId, conversations };
+}
+
+/** The conversations in a saved v2 payload (either store), or null when unreadable. */
+function parseConversations(value: unknown): Conversation[] | null {
+  if (!value || typeof value !== 'object') return null;
+  const parsed = value as { version?: number; conversations?: unknown };
+  if (parsed.version !== 2 || !Array.isArray(parsed.conversations)) return null;
+  return parsed.conversations
+    .map(sanitizeConversation)
+    .filter((conversation): conversation is Conversation => conversation !== null);
 }
 
 function emptyStorage(): ChatStorageV2 {
@@ -181,7 +358,16 @@ function sanitizeConversation(value: unknown): Conversation | null {
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
     turns,
+    scope: sanitizeScope(raw.scope),
   };
+}
+
+function sanitizeScope(value: unknown): ConversationScope | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Partial<ConversationScope>;
+  const strings = (list: unknown) =>
+    Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : [];
+  return { filenames: strings(raw.filenames), tags: strings(raw.tags) };
 }
 
 // Logs an unreadable or unrecognized-shape persisted value before it's replaced with an
@@ -228,7 +414,7 @@ function loadStorage(): ChatStorageV2 {
       const turns = parsed.turns.filter(isChatTurn);
       if (turns.length === 0) return emptyStorage();
       const conversation: Conversation = {
-        id: crypto.randomUUID(),
+        id: newId(),
         title: deriveTitle(turns),
         createdAt: turns[0].timestamp,
         updatedAt: turns[turns.length - 1].timestamp,
@@ -271,59 +457,96 @@ export function useChat(): UseChatResult {
   const activeConversationRef = useRef(activeConversation);
   activeConversationRef.current = activeConversation;
 
+  const storageRef = useRef(storage);
+  storageRef.current = storage;
+  // IndexedDB holds the full history (see chatStore.ts). Nothing is written there until
+  // it has been read: saving first would replace it with localStorage's compact copy.
+  const [chatStoreReady, setChatStoreReady] = useState(() => !chatStoreAvailable());
+
+  useEffect(() => {
+    if (chatStoreReady) return;
+    let cancelled = false;
+    void loadChatStore().then((raw) => {
+      if (cancelled) return;
+      const incoming = parseConversations(raw);
+      if (incoming && incoming.length > 0) {
+        setStorage((prev) => mergeConversations(prev, incoming, true));
+      }
+      setChatStoreReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Once, on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // The assistant turn being streamed right now, if any — see the pagehide flush.
+  const streamingTurnIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     // Skip writes while a stream is in flight — the assistant turn's content mutates
-    // on every delta, and persisting each one would thrash localStorage.
+    // on every delta, and persisting each one would thrash localStorage. `pagehide`
+    // below covers a reload or navigation that lands mid-stream.
     if (pending) return;
-    const onlyEmpty = conversations.length === 1 && conversations[0].turns.length === 0;
-    if (onlyEmpty) {
-      try {
-        localStorage.removeItem(CHAT_STORAGE_KEY);
+    const outcome = persistStorage(storage);
+    setPersistError(outcome === 'failed');
+    setPersistPartial(outcome === 'partial');
+    if (!chatStoreReady || !chatStoreAvailable()) return;
+    let current = true;
+    void saveChatStore(storage).then((saved) => {
+      // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
+      if (saved && current) {
         setPersistError(false);
-      } catch {
-        // Nothing more to do if even a removeItem fails.
+        setPersistPartial(false);
       }
-      return;
-    }
-    const payloadFor = (convos: Conversation[], maxTurns: number) =>
-      JSON.stringify({
-        version: CHAT_STORAGE_VERSION,
-        activeConversationId,
-        conversations: convos.map((conversation) => ({
-          ...conversation,
-          turns: conversation.turns.slice(-maxTurns),
-        })),
-      });
-    try {
-      localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(conversations, CHAT_STORAGE_MAX_TURNS));
-      setPersistError(false);
-      setPersistPartial(false);
-    } catch {
-      // Quota most likely exceeded. Retry once with only the active conversation and a
-      // shorter tail rather than freezing at the last successful write with no signal —
-      // this still drops older conversations from disk but keeps the current one saved.
-      const reduced = conversations.filter((c) => c.id === activeConversationId);
-      if (reduced.length === 0) {
-        // No active match to fall back to. Writing the reduced payload here would
-        // persist an empty conversations array, which loadStorage reads back as
-        // "nothing saved" — a silent wipe reported as success. Fail loudly instead.
-        setPersistError(true);
-        return;
-      }
+    });
+    return () => {
+      current = false;
+    };
+  }, [storage, pending, chatStoreReady]);
+
+  useEffect(() => {
+    // A reload, a link followed in this tab, or a closed tab during a 1-2 minute answer
+    // used to lose the question and everything streamed so far.
+    // The answer being streamed is cut off by the unload, so it is saved as stopped:
+    // saved as-is it read as finished after the reload, and went back as history.
+    const flush = () => {
+      const turnId = streamingTurnIdRef.current;
+      const current = storageRef.current;
+      const snapshot =
+        turnId === null
+          ? current
+          : {
+              ...current,
+              conversations: current.conversations.map((conversation) => ({
+                ...conversation,
+                turns: conversation.turns.map((turn) =>
+                  turn.id === turnId ? { ...turn, stopped: true } : turn,
+                ),
+              })),
+            };
+      persistStorage(snapshot);
+      // Best effort: the page may be gone before this commits; localStorage has it.
+      if (chatStoreAvailable()) void saveChatStore(snapshot);
+    };
+    window.addEventListener('pagehide', flush);
+    return () => window.removeEventListener('pagehide', flush);
+  }, []);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== CHAT_STORAGE_KEY || !event.newValue) return;
       try {
-        localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(reduced, 20));
-        setPersistError(false);
-        // The write succeeded but every other conversation, and all but the last 20
-        // turns of this one, are now absent from disk. Reporting a clean save here
-        // would be a lie the user only discovers after a reload, so this gets its own
-        // signal rather than being folded into persistError (which means "nothing
-        // was saved at all") or silently swallowed.
-        setPersistPartial(true);
+        const incoming = parseConversations(JSON.parse(event.newValue));
+        if (!incoming) return;
+        setStorage((prev) => mergeConversations(prev, incoming));
       } catch {
-        setPersistError(true);
+        // Another tab wrote something unreadable; keep what this tab has.
       }
-    }
-  }, [storage, pending, conversations, activeConversationId]);
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   // Tracks the in-flight question's controller: doubles as a reentrancy guard and lets
   // unmount cancel a hung request.
@@ -338,8 +561,10 @@ export function useChat(): UseChatResult {
   const pendingRef = useRef(pending);
   pendingRef.current = pending;
 
-  // Apply a turns-updater to the active conversation, bumping its updatedAt.
-  const setActiveTurns = useCallback((update: (turns: ChatTurn[]) => ChatTurn[]) => {
+  // Apply a turns-updater to the active conversation. `touch` bumps its updatedAt; a
+  // streamed delta doesn't, so the conversation list (sorted by it) doesn't re-render
+  // on every frame of an answer.
+  const setActiveTurns = useCallback((update: (turns: ChatTurn[]) => ChatTurn[], touch = true) => {
     setStorage((prev) => {
       const targetId = prev.activeConversationId ?? prev.conversations[0]?.id ?? null;
       return {
@@ -355,24 +580,24 @@ export function useChat(): UseChatResult {
             turns: nextTurns,
             title:
               conversation.title === 'New chat' ? deriveTitle(nextTurns) : conversation.title,
-            updatedAt: Date.now(),
+            updatedAt: touch ? Date.now() : conversation.updatedAt,
           };
         }),
       };
     });
   }, []);
 
-  const ask = useCallback(async (
+  const runAsk = useCallback(async (
     question: string,
+    history: HistoryMessage[],
     provider?: LlmProvider,
     overrides?: QuestionOverrides,
     filenames?: string[],
+    options?: QuestionOptions,
   ) => {
     if (inflightRef.current) return;
     const controller = new AbortController();
     inflightRef.current = controller;
-
-    const history = buildHistory(activeConversationRef.current?.turns ?? []);
 
     setActiveTurns((prev) => [...prev, makeTurn('user', question)]);
     setPending(true);
@@ -382,15 +607,16 @@ export function useChat(): UseChatResult {
 
     // The assistant turn is created lazily on the first `sources`/`delta` event so a
     // mid-stream failure before any event arrives renders as a clean error turn.
-    const assistantTurnId = crypto.randomUUID();
-    const updateAssistantTurn = (update: (turn: ChatTurn) => ChatTurn) => {
+    const assistantTurnId = newId();
+    streamingTurnIdRef.current = assistantTurnId;
+    const updateAssistantTurn = (update: (turn: ChatTurn) => ChatTurn, touch = true) => {
       setActiveTurns((prev) => {
         const existing = prev.find((turn) => turn.id === assistantTurnId);
         if (!existing) {
           return [...prev, update({ ...makeTurn('assistant', ''), id: assistantTurnId })];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
-      });
+      }, touch);
     };
 
     // Deltas are coalesced into one state update per animation frame. Each update
@@ -406,7 +632,7 @@ export function useChat(): UseChatResult {
       if (!bufferedDelta) return;
       const text = bufferedDelta;
       bufferedDelta = '';
-      updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }));
+      updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false);
     };
 
     try {
@@ -430,12 +656,20 @@ export function useChat(): UseChatResult {
             bufferedDelta += text;
             if (frameId === null) frameId = requestAnimationFrame(flushDelta);
           },
-          onDone: (answer, sources, timings, traceId) => {
+          onDone: (answer, sources, timings, traceId, cached) => {
             flushDelta();
-            updateAssistantTurn((turn) => ({ ...turn, content: answer, sources, timings, traceId }));
+            updateAssistantTurn((turn) => ({
+              ...turn,
+              content: answer,
+              sources,
+              timings,
+              traceId,
+              ...(cached ? { cached: true } : {}),
+            }));
           },
         },
         controller.signal,
+        options,
       );
     } catch (err) {
       flushDelta();
@@ -445,9 +679,12 @@ export function useChat(): UseChatResult {
       // stand, with no error row claiming the request failed.
       if (controller.signal.aborted) {
         // Drop a content-less assistant turn: cancelling after `sources` but before the
-        // first delta would otherwise leave an empty answer bubble behind.
+        // first delta would otherwise leave an empty answer bubble behind. A partial one
+        // is kept but marked, so after a reload it doesn't read as a finished answer.
         setActiveTurns((prev) =>
-          prev.filter((turn) => turn.id !== assistantTurnId || turn.content !== ''),
+          prev
+            .filter((turn) => turn.id !== assistantTurnId || turn.content !== '')
+            .map((turn) => (turn.id === assistantTurnId ? { ...turn, stopped: true } : turn)),
         );
       } else {
         const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
@@ -455,12 +692,131 @@ export function useChat(): UseChatResult {
       }
     } finally {
       flushDelta();
+      streamingTurnIdRef.current = null;
       inflightRef.current = null;
       setPending(false);
       setStage(null);
     }
     // Only refs and stable setters are closed over — see activeConversationRef above.
   }, [setActiveTurns]);
+
+  const ask = useCallback(
+    (
+      question: string,
+      provider?: LlmProvider,
+      overrides?: QuestionOverrides,
+      filenames?: string[],
+      options?: QuestionOptions,
+    ) =>
+      runAsk(
+        question,
+        buildHistory(activeConversationRef.current?.turns ?? []),
+        provider,
+        overrides,
+        filenames,
+        options,
+      ),
+    [runAsk],
+  );
+
+  const editAndResend = useCallback(
+    async (
+      turnId: string,
+      question: string,
+      provider?: LlmProvider,
+      overrides?: QuestionOverrides,
+      filenames?: string[],
+      options?: QuestionOptions,
+    ) => {
+      if (inflightRef.current) return;
+      const source = activeConversationRef.current;
+      const index = source?.turns.findIndex((turn) => turn.id === turnId) ?? -1;
+      if (!source || index < 0 || source.turns[index].role !== 'user') return;
+      const prior = source.turns.slice(0, index);
+      const now = Date.now();
+      const fork: Conversation = {
+        id: newId(),
+        title: prior.some((turn) => turn.role === 'user')
+          ? `${source.title} (edited)`.slice(0, TITLE_MAX_CHARS)
+          : 'New chat',
+        createdAt: now,
+        updatedAt: now,
+        turns: prior,
+        scope: source.scope,
+      };
+      setStorage((prev) => ({
+        ...prev,
+        activeConversationId: fork.id,
+        conversations: [fork, ...[...prev.conversations].sort(byRecentUse)].slice(
+          0,
+          MAX_CONVERSATIONS,
+        ),
+      }));
+      // runAsk's updates target the active conversation through state updaters, which
+      // run after the fork above — so the question lands in the fork.
+      await runAsk(question, buildHistory(prior), provider, overrides, filenames, options);
+    },
+    [runAsk],
+  );
+
+  const importConversation = useCallback((raw: unknown, title?: string) => {
+    const candidate = Array.isArray(raw) ? { turns: raw } : raw;
+    if (!candidate || typeof candidate !== 'object') return false;
+    const record = candidate as Partial<Conversation>;
+    if (!Array.isArray(record.turns)) return false;
+    // Fresh turn ids: importing the same file twice must not produce clashing keys.
+    const turns = record.turns.filter(isChatTurn).map((turn) => ({ ...turn, id: newId() }));
+    if (turns.length === 0) return false;
+    const now = Date.now();
+    const conversation: Conversation = {
+      id: newId(),
+      title: (title ?? '').trim().slice(0, TITLE_MAX_CHARS) || deriveTitle(turns),
+      createdAt: now,
+      updatedAt: now,
+      turns,
+    };
+    setStorage((prev) => ({
+      ...prev,
+      activeConversationId: conversation.id,
+      conversations: [conversation, ...[...prev.conversations].sort(byRecentUse)].slice(
+        0,
+        MAX_CONVERSATIONS,
+      ),
+    }));
+    return true;
+  }, []);
+
+  const setScope = useCallback(
+    (next: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => {
+      setStorage((prev) => ({
+        ...prev,
+        conversations: prev.conversations.map((conversation) =>
+          conversation.id === prev.activeConversationId
+            ? {
+                ...conversation,
+                scope: typeof next === 'function' ? next(conversation.scope ?? EMPTY_SCOPE) : next,
+              }
+            : conversation,
+        ),
+      }));
+    },
+    [],
+  );
+
+  const pruneScopes = useCallback((indexedFilenames: string[]) => {
+    const indexed = new Set(indexedFilenames);
+    setStorage((prev) => {
+      let changed = false;
+      const conversations = prev.conversations.map((conversation) => {
+        const filenames = conversation.scope?.filenames ?? [];
+        const kept = filenames.filter((name) => indexed.has(name));
+        if (kept.length === filenames.length) return conversation;
+        changed = true;
+        return { ...conversation, scope: { tags: conversation.scope?.tags ?? [], filenames: kept } };
+      });
+      return changed ? { ...prev, conversations } : prev;
+    });
+  }, []);
 
   // Stable identities (pending is read through a ref) so components receiving these
   // don't re-render on every streamed delta.
@@ -470,8 +826,16 @@ export function useChat(): UseChatResult {
 
   const clear = useCallback(() => {
     if (pendingRef.current) return;
-    setActiveTurns(() => []);
-  }, [setActiveTurns]);
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) =>
+        conversation.id === prev.activeConversationId
+          ? // The title came from the first question, which is gone now.
+            { ...conversation, turns: [], title: 'New chat', updatedAt: Date.now() }
+          : conversation,
+      ),
+    }));
+  }, []);
 
   const newConversation = useCallback(() => {
     if (pendingRef.current) return;
@@ -480,7 +844,12 @@ export function useChat(): UseChatResult {
       const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
       if (active && active.turns.length === 0) return prev;
       const conversation = emptyConversation();
-      const conversations = [conversation, ...prev.conversations].slice(0, MAX_CONVERSATIONS);
+      // Past the cap, the least recently *used* conversation goes — not the oldest
+      // created, which dropped a conversation still in daily use.
+      const conversations = [conversation, ...[...prev.conversations].sort(byRecentUse)].slice(
+        0,
+        MAX_CONVERSATIONS,
+      );
       return { ...prev, activeConversationId: conversation.id, conversations };
     });
   }, []);
@@ -511,26 +880,63 @@ export function useChat(): UseChatResult {
       const remaining = prev.conversations.filter((conversation) => conversation.id !== id);
       if (remaining.length === 0) return emptyStorage();
       const activeId =
-        prev.activeConversationId === id ? remaining[0].id : prev.activeConversationId;
+        prev.activeConversationId === id
+          ? [...remaining].sort(byRecentUse)[0].id
+          : prev.activeConversationId;
       return { ...prev, activeConversationId: activeId, conversations: remaining };
     });
   }, []);
 
-  const summaries: ConversationSummary[] = useMemo(
-    () =>
-      [...conversations]
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .map((conversation) => ({
-          id: conversation.id,
-          title: conversation.title,
-          updatedAt: conversation.updatedAt,
-          turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
-        })),
-    [conversations],
-  );
+  const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating) => {
+    // Stored on the turn, so a rating survives a reload or a conversation switch and
+    // the buttons can't send a duplicate row for the same answer.
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) =>
+        conversation.turns.some((turn) => turn.id === turnId)
+          ? {
+              ...conversation,
+              turns: conversation.turns.map((turn) =>
+                turn.id === turnId ? { ...turn, feedback: rating } : turn,
+              ),
+            }
+          : conversation,
+      ),
+    }));
+  }, []);
+
+  // Keeps the previous array when nothing the list shows changed: `conversations` is a
+  // new array on every streamed frame, and a new summaries array re-rendered the list.
+  const summariesRef = useRef<ConversationSummary[]>([]);
+  const summaries: ConversationSummary[] = useMemo(() => {
+    const next = [...conversations].sort(byRecentUse).map((conversation) => ({
+      id: conversation.id,
+      title: conversation.title,
+      updatedAt: conversation.updatedAt,
+      turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
+    }));
+    const prev = summariesRef.current;
+    const same =
+      prev.length === next.length &&
+      prev.every(
+        (summary, index) =>
+          summary.id === next[index].id &&
+          summary.title === next[index].title &&
+          summary.updatedAt === next[index].updatedAt &&
+          summary.turnCount === next[index].turnCount,
+      );
+    if (same) return prev;
+    summariesRef.current = next;
+    return next;
+  }, [conversations]);
 
   return {
     turns,
+    scope: activeConversation?.scope ?? EMPTY_SCOPE,
+    setScope,
+    pruneScopes,
+    editAndResend,
+    importConversation,
     pending,
     stage,
     persistError,
@@ -544,5 +950,6 @@ export function useChat(): UseChatResult {
     switchConversation,
     renameConversation,
     deleteConversation,
+    setTurnFeedback,
   };
 }

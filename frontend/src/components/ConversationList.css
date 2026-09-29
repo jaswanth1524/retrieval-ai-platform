@@ -187,3 +187,16 @@
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+.conversation-list__search {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--ink);
+}

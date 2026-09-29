@@ -64,3 +64,16 @@ test('picking a trace swaps the panel drawer for the inspector drawer', async ({
   await expect(inspector).toBeVisible();
   await expect(inspector.getByRole('tab', { name: 'trace' })).toHaveAttribute('aria-selected', 'true');
 });
+
+test('the upload shortcut opens the corpus drawer, so the picked files are visible', async ({
+  page,
+}) => {
+  const chooser = page.waitForEvent('filechooser');
+  await page.keyboard.press('ControlOrMeta+u');
+  await (await chooser).setFiles({ name: 'notes.md', mimeType: 'text/markdown', buffer: Buffer.from('# Notes') });
+
+  const drawer = page.getByRole('dialog', { name: 'Corpus' });
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByText('notes.md')).toBeVisible();
+  await expect(drawer.getByTestId('upload-button')).toBeVisible();
+});

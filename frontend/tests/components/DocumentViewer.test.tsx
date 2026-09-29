@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import DocumentViewer from '../../src/components/DocumentViewer';
 import { api } from '../../src/api/client';
+import type { ContentPage } from '../../src/api/client';
 
 vi.mock('../../src/api/client', async () => {
   const actual = await vi.importActual<typeof import('../../src/api/client')>('../../src/api/client');
@@ -26,6 +27,38 @@ const CONTENT = {
 // assertions, just room to finish — not retries.
 const SLOW_RENDER = { timeout: 5_000 };
 
+function makeChunk(i: number): { chunk_id: string; page: number; section: string; text: string; chunk_ordinal: number } {
+  return { chunk_id: `c${i}`, page: 1, section: 'Body', text: `Chunk ${i}`, chunk_ordinal: i + 1 };
+}
+
+/** Answers like the server: whole document without a page, else by ordinal. */
+function servePaged(chunks: ReturnType<typeof makeChunk>[]) {
+  return async (filename: string, _signal?: AbortSignal, page: ContentPage = {}) => {
+    if (page.around === undefined && page.start === undefined && page.end === undefined) {
+      return { filename, chunks, total_chunks: chunks.length };
+    }
+    let first: number;
+    let last: number;
+    let target_found: boolean | undefined;
+    if (page.around !== undefined) {
+      const hit = chunks.find((chunk) => chunk.chunk_id === page.around);
+      target_found = hit !== undefined;
+      const center = hit?.chunk_ordinal ?? 1;
+      first = Math.max(1, center - (page.radius ?? 30));
+      last = center + (page.radius ?? 30);
+    } else {
+      first = page.start ?? 1;
+      last = page.end ?? first + 200;
+    }
+    return {
+      filename,
+      chunks: chunks.filter((chunk) => chunk.chunk_ordinal >= first && chunk.chunk_ordinal <= last),
+      total_chunks: chunks.length,
+      target_found,
+    };
+  };
+}
+
 describe('DocumentViewer', () => {
   it('fetches and renders document chunks, marking the target', async () => {
     getContentMock.mockResolvedValue(CONTENT);
@@ -33,9 +66,29 @@ describe('DocumentViewer', () => {
     render(<DocumentViewer filename="guide.md" chunkId="c2" onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getAllByTestId('viewer-chunk')).toHaveLength(2));
-    expect(getContentMock).toHaveBeenCalledWith('guide.md', expect.anything());
+    expect(getContentMock).toHaveBeenCalledWith('guide.md', expect.anything(), {
+      around: 'c2',
+      radius: 30,
+    });
     const target = screen.getAllByTestId('viewer-chunk').find((c) => c.textContent?.includes('Second chunk.'));
     expect(target?.className).toContain('document-viewer__chunk--target');
+  });
+
+  it('explains when the cited passage no longer exists after a re-index', async () => {
+    getContentMock.mockResolvedValue(CONTENT);
+
+    render(<DocumentViewer filename="guide.md" chunkId="gone" onClose={vi.fn()} />);
+
+    expect(await screen.findByTestId('viewer-passage-missing')).toHaveTextContent('re-indexed');
+  });
+
+  it('shows no such notice when the cited passage is found', async () => {
+    getContentMock.mockResolvedValue(CONTENT);
+
+    render(<DocumentViewer filename="guide.md" chunkId="c1" onClose={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getAllByTestId('viewer-chunk')).toHaveLength(2));
+    expect(screen.queryByTestId('viewer-passage-missing')).not.toBeInTheDocument();
   });
 
   it('closes on the close button and Escape', async () => {
@@ -63,10 +116,6 @@ describe('DocumentViewer', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('nope');
   });
 
-  function makeChunk(i: number): { chunk_id: string; page: number; section: string; text: string; chunk_ordinal: number } {
-    return { chunk_id: `c${i}`, page: 1, section: 'Body', text: `Chunk ${i}`, chunk_ordinal: i };
-  }
-
   describe('windowing on a large document', { timeout: 15_000 }, () => {
     const BIG_CONTENT = {
       filename: 'big.md',
@@ -76,7 +125,7 @@ describe('DocumentViewer', () => {
     it('renders far fewer than every chunk, with the deep target still present', async () => {
       // Regression guard: a naive "render the first N" would put a citation deep in a
       // large document (here, chunk 400 of 500) out of reach entirely.
-      getContentMock.mockResolvedValue(BIG_CONTENT);
+      getContentMock.mockImplementation(servePaged(BIG_CONTENT.chunks));
 
       render(<DocumentViewer filename="big.md" chunkId="c400" onClose={vi.fn()} />);
 
@@ -92,7 +141,7 @@ describe('DocumentViewer', () => {
     });
 
     it('expands the window on Load earlier / Load later, and Show all renders everything', async () => {
-      getContentMock.mockResolvedValue(BIG_CONTENT);
+      getContentMock.mockImplementation(servePaged(BIG_CONTENT.chunks));
 
       render(<DocumentViewer filename="big.md" chunkId="c400" onClose={vi.fn()} />);
       // Wait for the windowed render specifically, not just "some chunks exist" — the
@@ -114,10 +163,25 @@ describe('DocumentViewer', () => {
       expect(screen.queryByTestId('viewer-load-later')).not.toBeInTheDocument();
     });
 
+    it('asks the server for a page around the cited chunk, not the whole document', async () => {
+      getContentMock.mockImplementation(servePaged(BIG_CONTENT.chunks));
+
+      render(<DocumentViewer filename="big.md" chunkId="c400" onClose={vi.fn()} />);
+
+      await screen.findByText('Chunk 400');
+      expect(getContentMock).toHaveBeenCalledWith('big.md', expect.anything(), {
+        around: 'c400',
+        radius: 30,
+      });
+      expect(screen.getAllByTestId('viewer-chunk')).toHaveLength(61);
+      expect(screen.getByTestId('viewer-load-earlier')).toHaveTextContent('370 hidden');
+      expect(screen.getByTestId('viewer-load-later')).toHaveTextContent('69 hidden');
+    });
+
     it('re-centers the window on a new citation into the same open document', async () => {
       // App.tsx doesn't remount DocumentViewer when the reader clicks a different
       // citation for a document that's already open — only the chunkId prop changes.
-      getContentMock.mockResolvedValue(BIG_CONTENT);
+      getContentMock.mockImplementation(servePaged(BIG_CONTENT.chunks));
 
       const { rerender } = render(<DocumentViewer filename="big.md" chunkId="c10" onClose={vi.fn()} />);
       // Same reasoning as above: wait for the settled windowed render before asserting
@@ -174,16 +238,7 @@ describe('DocumentViewer dialog behaviour', () => {
     // A document big enough to window, so the panel has the Load-earlier/later and
     // Show-all buttons too — with only a close button, first === last and any wrap
     // assertion passes whether or not a trap exists.
-    getContentMock.mockResolvedValue({
-      filename: 'big.md',
-      chunks: Array.from({ length: 200 }, (_, i) => ({
-        chunk_id: `c${i}`,
-        page: 1,
-        section: 'S',
-        text: `Chunk ${i}.`,
-        chunk_ordinal: i,
-      })),
-    });
+    getContentMock.mockImplementation(servePaged(Array.from({ length: 200 }, (_, i) => makeChunk(i))));
 
     render(<DocumentViewer filename="big.md" chunkId="c100" onClose={vi.fn()} />);
     await waitFor(

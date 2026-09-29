@@ -1,3 +1,4 @@
+import type { CitationResponse } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 
 const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -11,13 +12,24 @@ function speakerLabel(role: ChatTurn['role']): string {
   return 'Error';
 }
 
+function citationLines(sources: CitationResponse[]): string {
+  return sources
+    .map((s) => `[${s.source_number}] ${s.filename} · p.${s.page} · ${s.section}`)
+    .join('\n');
+}
+
+/** `content` followed by its sources as footnotes — what Copy puts on the clipboard,
+ * so the answer's [n] markers don't dangle. Same lines the Markdown export writes. */
+export function withCitationFootnotes(content: string, sources: CitationResponse[]): string {
+  return [content, citationLines(sources)].filter(Boolean).join('\n\n');
+}
+
 export function chatToMarkdown(turns: ChatTurn[]): string {
   const blocks = turns.map((turn) => {
     const heading = `## ${speakerLabel(turn.role)} (${TIME_FORMATTER.format(turn.timestamp)})`;
-    const sources = turn.sources
-      .map((s) => `[${s.source_number}] ${s.filename} · p.${s.page} · ${s.section}`)
-      .join('\n');
-    return [heading, turn.content, sources].filter(Boolean).join('\n\n');
+    return [heading, withCitationFootnotes(turn.content, turn.sources)]
+      .filter(Boolean)
+      .join('\n\n');
   });
   return blocks.join('\n\n---\n\n');
 }
@@ -26,8 +38,8 @@ export function chatToJson(turns: ChatTurn[]): string {
   return JSON.stringify(turns, null, 2);
 }
 
-export function downloadFile(filename: string, mimeType: string, content: string): void {
-  const blob = new Blob([content], { type: mimeType });
+export function downloadFile(filename: string, mimeType: string, content: string | Blob): void {
+  const blob = content instanceof Blob ? content : new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;

@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildHistory, useChat } from '../../src/hooks/useChat';
+import { buildHistory, mergeConversations, useChat } from '../../src/hooks/useChat';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import { ApiClientError, api } from '../../src/api/client';
 import type { QuestionStreamHandlers } from '../../src/api/client';
@@ -691,5 +691,346 @@ describe('buildHistory', () => {
     expect(history[0].content.length).toBeLessThanOrEqual(4000);
     expect(history[0].content.startsWith('a b')).toBe(true);
     expect(history[0].content.endsWith('…')).toBe(true);
+  });
+});
+
+describe('useChat storage robustness', () => {
+  function savedTurn(id: string, role: ChatTurn['role'], content: string, sourceText = ''): ChatTurn {
+    return {
+      id,
+      role,
+      content,
+      sources: sourceText
+        ? [{ source_number: 1, filename: 'a.pdf', page: 1, section: 'S', chunk_id: 'c1', text: sourceText }]
+        : [],
+      timestamp: 1,
+      timings: null,
+      traceId: null,
+    };
+  }
+
+  function seed(conversations: { id: string; updatedAt: number; turns?: ChatTurn[] }[]) {
+    localStorage.setItem(
+      'docrag-chat-history',
+      JSON.stringify({
+        version: 2,
+        activeConversationId: conversations[0].id,
+        conversations: conversations.map((c) => ({
+          title: c.id,
+          createdAt: 0,
+          turns: [savedTurn(`${c.id}-q`, 'user', `question ${c.id}`)],
+          ...c,
+        })),
+      }),
+    );
+  }
+
+  function saved(): { activeConversationId: string; conversations: { id: string; title: string; turns: ChatTurn[] }[] } {
+    return JSON.parse(localStorage.getItem('docrag-chat-history') ?? 'null');
+  }
+
+  it('works where crypto.randomUUID is unavailable (plain HTTP on a LAN address)', () => {
+    vi.stubGlobal('crypto', { getRandomValues: globalThis.crypto.getRandomValues.bind(globalThis.crypto) });
+    try {
+      const { result } = renderHook(() => useChat());
+      expect(result.current.activeConversationId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('drops the least recently used conversation past the cap, not the oldest created', () => {
+    // 20 conversations; "daily" was created first but used most recently.
+    const conversations = Array.from({ length: 20 }, (_, i) => ({ id: `c${i}`, updatedAt: 100 + i }));
+    conversations[0] = { id: 'daily', updatedAt: 10_000 };
+    seed(conversations);
+
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.newConversation());
+
+    const ids = result.current.conversations.map((c) => c.id);
+    expect(ids).toContain('daily');
+    expect(ids).not.toContain('c1');
+    expect(ids).toHaveLength(20);
+  });
+
+  it('keeps passage text only on the most recent turns when saving', () => {
+    const turns = Array.from({ length: 10 }, (_, i) => savedTurn(`t${i}`, 'assistant', `a${i}`, `passage ${i}`));
+    seed([{ id: 'c', updatedAt: 1, turns }]);
+
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.renameConversation('c', 'renamed'));
+
+    const persisted = saved().conversations[0].turns;
+    expect(persisted[0].sources[0]).toMatchObject({ chunk_id: 'c1', text: '' });
+    expect(persisted[9].sources[0].text).toBe('passage 9');
+    // In memory nothing is lost.
+    expect(result.current.turns[0].sources[0].text).toBe('passage 0');
+  });
+
+  it("merges another tab's saved conversations instead of overwriting them", () => {
+    seed([{ id: 'mine', updatedAt: 5 }]);
+    const { result } = renderHook(() => useChat());
+
+    const otherTab = JSON.stringify({
+      version: 2,
+      activeConversationId: 'theirs',
+      conversations: [
+        { id: 'theirs', title: 'theirs', createdAt: 0, updatedAt: 9, turns: [savedTurn('x', 'user', 'hi')] },
+      ],
+    });
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: 'docrag-chat-history', newValue: otherTab }));
+    });
+
+    expect(result.current.conversations.map((c) => c.id)).toEqual(['theirs', 'mine']);
+    // This tab stays where it was.
+    expect(result.current.activeConversationId).toBe('mine');
+    expect(saved().conversations.map((c) => c.id).sort()).toEqual(['mine', 'theirs']);
+  });
+
+  it('saves an in-flight question when the page is hidden mid-answer', () => {
+    askQuestionStreamMock.mockImplementation(() => new Promise<void>(() => {}));
+    const { result } = renderHook(() => useChat());
+
+    act(() => {
+      void result.current.ask('Will this survive a reload?');
+    });
+    expect(localStorage.getItem('docrag-chat-history')).toBeNull();
+
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    expect(saved().conversations[0].turns[0]).toMatchObject({
+      role: 'user',
+      content: 'Will this survive a reload?',
+    });
+  });
+
+  it('resets the title on Clear, so the next question names the conversation', () => {
+    seed([{ id: 'c', updatedAt: 1 }]);
+    const { result } = renderHook(() => useChat());
+
+    act(() => result.current.clear());
+
+    expect(result.current.conversations[0].title).toBe('New chat');
+  });
+
+  it('stores a feedback rating on its turn', () => {
+    seed([{ id: 'c', updatedAt: 1, turns: [savedTurn('q', 'user', 'Q'), savedTurn('a', 'assistant', 'A')] }]);
+    const { result } = renderHook(() => useChat());
+
+    act(() => result.current.setTurnFeedback('a', 'up'));
+
+    expect(result.current.turns[1].feedback).toBe('up');
+    expect(saved().conversations[0].turns[1].feedback).toBe('up');
+  });
+
+  it('does not re-render the conversation list for streamed deltas', async () => {
+    let handlers!: QuestionStreamHandlers;
+    askQuestionStreamMock.mockImplementation((_q, _p, _o, _f, _h, h: QuestionStreamHandlers) => {
+      handlers = h;
+      return new Promise<void>(() => {});
+    });
+    const { result } = renderHook(() => useChat());
+    act(() => {
+      void result.current.ask('Q');
+    });
+    act(() => handlers.onSources?.([], null));
+    const before = result.current.conversations;
+
+    act(() => handlers.onDelta?.('more text'));
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    });
+
+    expect(result.current.turns[1].content).toBe('more text');
+    expect(result.current.conversations).toBe(before);
+  });
+});
+
+describe('useChat feature pack', () => {
+  function answeringStream(answer: string, cached = false) {
+    askQuestionStreamMock.mockImplementation(async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+      handlers.onSources?.([], null);
+      handlers.onDone?.(answer, [], ZERO_TIMINGS, null, cached);
+    });
+  }
+
+  it('passes question options through and marks cached answers', async () => {
+    answeringStream('From cache.', true);
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('Q', 'ollama', undefined, ['a.pdf'], { tags: ['legal'], bypassCache: true });
+    });
+
+    const call = askQuestionStreamMock.mock.calls[0];
+    expect(call[3]).toEqual(['a.pdf']);
+    expect(call[7]).toEqual({ tags: ['legal'], bypassCache: true });
+    expect(result.current.turns[1]).toMatchObject({ content: 'From cache.', cached: true });
+  });
+
+  it('edits a question into a new conversation, leaving the original intact', async () => {
+    answeringStream('First answer.');
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('First question');
+    });
+    const originalId = result.current.activeConversationId;
+    const questionId = result.current.turns[0].id;
+
+    answeringStream('Edited answer.');
+    await act(async () => {
+      await result.current.editAndResend(questionId, 'Edited question');
+    });
+
+    expect(result.current.activeConversationId).not.toBe(originalId);
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['Edited question', 'Edited answer.']);
+    // Forked before the first question: no history rides along.
+    expect(askQuestionStreamMock.mock.calls[1][4]).toEqual([]);
+    act(() => result.current.switchConversation(originalId!));
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['First question', 'First answer.']);
+  });
+
+  it('marks a stopped partial answer and leaves it out of the next history', async () => {
+    askQuestionStreamMock.mockImplementation(
+      (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers, signal?: AbortSignal) =>
+        new Promise<void>((_resolve, reject) => {
+          handlers.onSources?.([], null);
+          handlers.onDelta?.('Partial');
+          signal?.addEventListener('abort', () => reject(new ApiClientError('cancelled')));
+        }),
+    );
+    const { result } = renderHook(() => useChat());
+    let pendingAsk!: Promise<void>;
+    act(() => {
+      pendingAsk = result.current.ask('Q');
+    });
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    });
+    await act(async () => {
+      result.current.cancel();
+      await pendingAsk;
+    });
+
+    expect(result.current.turns[1]).toMatchObject({ content: 'Partial', stopped: true });
+    expect(buildHistory(result.current.turns)).toEqual([{ role: 'user', content: 'Q' }]);
+  });
+
+  it('imports a JSON export as a new conversation with fresh ids', () => {
+    const { result } = renderHook(() => useChat());
+    const exported: ChatTurn[] = [
+      { id: 'x', role: 'user', content: 'Imported Q', sources: [], timestamp: 1, timings: null, traceId: null },
+      { id: 'y', role: 'assistant', content: 'Imported A', sources: [], timestamp: 2, timings: null, traceId: null },
+    ];
+
+    let ok = false;
+    act(() => {
+      ok = result.current.importConversation(exported);
+    });
+
+    expect(ok).toBe(true);
+    expect(result.current.conversations[0].title).toBe('Imported Q');
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['Imported Q', 'Imported A']);
+    expect(result.current.turns[0].id).not.toBe('x');
+    expect(result.current.importConversation({ nope: true })).toBe(false);
+    expect(result.current.importConversation([{ role: 'bogus' }])).toBe(false);
+  });
+
+  it('keeps a search scope per conversation and prunes deleted documents from all of them', () => {
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.setScope({ filenames: ['a.pdf', 'b.pdf'], tags: ['legal'] }));
+    const scopedId = result.current.activeConversationId!;
+    // A new conversation needs a turn in the scoped one first (empty ones are reused).
+    act(() => result.current.importConversation([
+      { id: 'q', role: 'user', content: 'Other', sources: [], timestamp: 1, timings: null, traceId: null },
+    ]));
+
+    expect(result.current.scope).toEqual({ filenames: [], tags: [] });
+
+    act(() => result.current.pruneScopes(['b.pdf']));
+    act(() => result.current.switchConversation(scopedId));
+    expect(result.current.scope).toEqual({ filenames: ['b.pdf'], tags: ['legal'] });
+  });
+});
+
+describe('useChat scope updates', () => {
+  it('applies two scope updaters in one tick without one undoing the other', () => {
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.setScope({ filenames: ['a.pdf'], tags: ['legal'] }));
+
+    // What "All documents" does: clear the files, then the tags, back to back.
+    act(() => {
+      result.current.setScope((prev) => ({ ...prev, filenames: [] }));
+      result.current.setScope((prev) => ({ ...prev, tags: [] }));
+    });
+
+    expect(result.current.scope).toEqual({ filenames: [], tags: [] });
+  });
+});
+
+describe('useChat reload mid-answer', () => {
+  it('saves a partial answer as stopped when the page is hidden mid-stream', async () => {
+    let handlers!: QuestionStreamHandlers;
+    askQuestionStreamMock.mockImplementation((_q, _p, _o, _f, _h, h: QuestionStreamHandlers) => {
+      handlers = h;
+      return new Promise<void>(() => {});
+    });
+    const { result } = renderHook(() => useChat());
+    act(() => {
+      void result.current.ask('Q');
+    });
+    act(() => handlers.onSources?.([], null));
+    act(() => handlers.onDelta?.('Half an ans'));
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    const saved = JSON.parse(localStorage.getItem('docrag-chat-history') ?? 'null');
+    expect(saved.conversations[0].turns[1]).toMatchObject({ content: 'Half an ans', stopped: true });
+    // In memory the answer is still streaming, not stopped.
+    expect(result.current.turns[1].stopped).toBeUndefined();
+  });
+});
+
+describe('mergeConversations', () => {
+  it("keeps this tab's passage text when another tab's compact copy is newer", () => {
+    const source = (text: string) => ({
+      source_number: 1,
+      filename: 'a.pdf',
+      page: 1,
+      section: 'S',
+      chunk_id: 'c',
+      text,
+    });
+    const answer = (text: string): ChatTurn => ({
+      id: 'a',
+      role: 'assistant',
+      content: 'A',
+      sources: [source(text)],
+      timestamp: 1,
+      timings: null,
+      traceId: null,
+    });
+    const local = {
+      version: 2 as const,
+      activeConversationId: 'c1',
+      conversations: [{ id: 'c1', title: 'T', createdAt: 1, updatedAt: 5, turns: [answer('full text')] }],
+    };
+    const fromOtherTab = [{ id: 'c1', title: 'T', createdAt: 1, updatedAt: 9, turns: [answer('')] }];
+
+    const merged = mergeConversations(local, fromOtherTab);
+
+    expect(merged.conversations[0].updatedAt).toBe(9);
+    expect(merged.conversations[0].turns[0].sources[0].text).toBe('full text');
   });
 });

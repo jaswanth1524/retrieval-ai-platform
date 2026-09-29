@@ -154,4 +154,24 @@ describe('ConversationList', () => {
     await userEvent.type(input, 'Renamed{Enter}');
     expect(props.onRename).toHaveBeenCalledWith('c1', 'Renamed');
   });
+
+  it('filters a long list by title, always keeping the active conversation', async () => {
+    const many = Array.from({ length: 7 }, (_, i) => ({
+      id: `c${i}`,
+      title: i === 3 ? 'Contract caps' : `Chat ${i}`,
+      updatedAt: i,
+      turnCount: 1,
+    }));
+    setup({ conversations: many, activeId: 'c0' });
+
+    await userEvent.type(screen.getByTestId('conversation-search'), 'contract');
+
+    const titles = screen.getAllByTestId('conversation-select').map((row) => row.getAttribute('title'));
+    expect(titles).toEqual(['Chat 0', 'Contract caps']);
+  });
+
+  it('shows no search box for a short list', () => {
+    setup();
+    expect(screen.queryByTestId('conversation-search')).not.toBeInTheDocument();
+  });
 });

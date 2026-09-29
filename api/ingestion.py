@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import models
 
-from api.documents import DocumentChunk, EmptyDocumentError
+from api.documents import DocumentChunk, EmptyDocumentError, contextual_text
 from api.embeddings import EmbeddedText, EmbeddingError
 from api.settings import AppSettings
 
@@ -47,6 +47,8 @@ class WriteRepository(Protocol):
     def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]: ...
 
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None: ...
+
+    def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,60 @@ def filename_write_lock(filename: str) -> Iterator[None]:
                 del _filename_locks[filename]
 
 
+class IngestSequencer:
+    """Stops an older ingest of a filename from overwriting a newer one.
+
+    Ingests of one filename are serialized by ``filename_write_lock``, but in the order
+    they *reach* the lock — after parsing and embedding — not the order they were
+    admitted. So a large v1 upload finishing after a small v2, or a queued re-index of
+    the old original finishing after a fresh re-upload, would put the older content
+    back. Every ingest takes a sequence number at admission; one that reaches the lock
+    after a newer ingest of the same filename has been applied is refused.
+
+    "Applied" (not "admitted") is what counts, so a newer upload that then fails doesn't
+    also block the older one. Entries are dropped once a filename has no ingest in
+    flight, so the registry tracks in-flight work only.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._next = 0
+        self._in_flight: dict[str, int] = {}
+        self._applied: dict[str, int] = {}
+
+    def admit(self, filename: str) -> int:
+        with self._lock:
+            self._next += 1
+            self._in_flight[filename] = self._in_flight.get(filename, 0) + 1
+            return self._next
+
+    def check(self, filename: str, sequence: int) -> None:
+        """Raise if a newer ingest of ``filename`` was applied. Call under its lock."""
+
+        with self._lock:
+            if self._applied.get(filename, 0) > sequence:
+                raise IngestionError(
+                    f"A newer version of '{filename}' was indexed while this one was "
+                    "waiting; kept the newer version."
+                )
+
+    def mark_applied(self, filename: str, sequence: int) -> None:
+        with self._lock:
+            self._applied[filename] = max(self._applied.get(filename, 0), sequence)
+
+    def release(self, filename: str) -> None:
+        with self._lock:
+            remaining = self._in_flight.get(filename, 0) - 1
+            if remaining > 0:
+                self._in_flight[filename] = remaining
+                return
+            self._in_flight.pop(filename, None)
+            self._applied.pop(filename, None)
+
+
+ingest_sequencer = IngestSequencer()
+
+
 def ingest_chunks(
     repository: WriteRepository,
     settings: AppSettings,
@@ -118,6 +174,7 @@ def ingest_chunks(
     on_progress: Callable[[int, int], None] | None = None,
     on_indexed: Callable[[], None] | None = None,
     precondition: Callable[[], None] | None = None,
+    carry_tags: bool = False,
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
@@ -136,6 +193,11 @@ def ingest_chunks(
     ``precondition`` runs first thing under the same lock and aborts the ingest by
     raising — a re-index checks there that its document wasn't deleted while the job
     waited in the queue, since a DELETE in that window would otherwise be undone.
+
+    ``carry_tags`` stamps each chunk with its document's current tags, read under the
+    same lock ``PATCH /documents/{filename}/tags`` takes — read any earlier and a tag
+    change landing while this ingest parsed or queued was overwritten by the old tags.
+    Tags aren't part of the embedded text, so this never changes a vector.
     """
 
     if not chunks:
@@ -155,6 +217,12 @@ def ingest_chunks(
 
         if precondition is not None:
             precondition()
+
+        if carry_tags:
+            current_tags = {
+                filename: repository.tags_for_filename(settings, filename) for filename in filenames
+            }
+            chunks = [replace(chunk, tags=current_tags[chunk.filename]) for chunk in chunks]
 
         # Snapshot each filename's currently-indexed point IDs *before* upserting —
         # this is what "stale" gets computed against once the new points are written.
@@ -232,7 +300,7 @@ def _contextual_embedding_text(chunk: DocumentChunk) -> str:
     bare chunk of body text wouldn't otherwise surface.
     """
 
-    return f"{chunk.filename} › {chunk.section}\n{chunk.text}"
+    return contextual_text(chunk.filename, chunk.section, chunk.text)
 
 
 def build_point(

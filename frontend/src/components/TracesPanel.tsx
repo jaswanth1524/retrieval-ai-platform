@@ -49,6 +49,14 @@ function TracesPanel({ traces, error, onSelect }: TracesPanelProps) {
           <span className="traces-panel__meta mono">
             <span className={latencyClass(trace.total_ms)}>{formatLatency(trace.total_ms)}</span>
             <span>{trace.llm_provider ?? '—'}</span>
+            {trace.status !== 'ok' && (
+              <span
+                className={`traces-panel__status traces-panel__status--${trace.status}`}
+                data-testid="traces-panel-status"
+              >
+                {trace.status === 'error' ? 'error' : 'no context'}
+              </span>
+            )}
             <span className="traces-panel__spacer" />
             <span>{formatRelativeTime(trace.created_at * 1000)}</span>
           </span>

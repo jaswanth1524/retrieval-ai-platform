@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import Literal, Protocol
+from typing import Literal, Protocol, get_args
 
 from api.generation import ChatMessage
 from api.metrics import traces_evicted_total
@@ -22,7 +22,12 @@ from api.retrieval import RetrievedChunk
 
 TraceStatus = Literal["ok", "insufficient_context", "error"]
 TraceMode = Literal["sync", "stream"]
-DropReason = Literal["below_min_score", "near_duplicate", "top_k_cut", "not_scored"]
+# context_budget: kept by the reranker but left out of the prompt so it would fit the
+# model's context window (api.generation.fit_prompt_to_context_window).
+DropReason = Literal[
+    "below_min_score", "near_duplicate", "top_k_cut", "not_scored", "context_budget"
+]
+TRACE_DROP_REASONS: tuple[str, ...] = get_args(DropReason)
 
 
 class TraceNotFoundError(RuntimeError):
@@ -138,6 +143,7 @@ def build_trace_candidates(
     *,
     min_score: float,
     diversity_dropped_ids: AbstractSet[str] = frozenset(),
+    context_budget_dropped_ids: AbstractSet[str] = frozenset(),
 ) -> list[TraceCandidate]:
     """Join the fused, scored, kept, and context-selected candidate lists by point id.
 
@@ -151,9 +157,7 @@ def build_trace_candidates(
     scored_by_id = {chunk.point_id: chunk for chunk in scored_chunks}
     kept_ids = {chunk.point_id for chunk in kept_chunks}
     selected_ids = {chunk.point_id for chunk in selected_chunks}
-    expanded_ids = {
-        chunk.point_id for chunk in selected_chunks if chunk.expanded_text is not None
-    }
+    expanded_ids = {chunk.point_id for chunk in selected_chunks if chunk.expanded_text is not None}
 
     result: list[TraceCandidate] = []
     for candidate in fused_candidates:
@@ -170,6 +174,8 @@ def build_trace_candidates(
                 drop_reason = "near_duplicate"
             else:
                 drop_reason = "top_k_cut"
+        elif candidate.point_id in context_budget_dropped_ids:
+            drop_reason = "context_budget"
         result.append(
             TraceCandidate(
                 point_id=candidate.point_id,

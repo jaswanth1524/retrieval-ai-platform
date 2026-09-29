@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import Field, PositiveInt, field_validator
+from pydantic import Field, PositiveInt, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
@@ -25,6 +25,10 @@ class AppSettings(BaseSettings):
     # meaningful at query volume, free to enable since the client already exposes both
     # transports over the same connection details.
     qdrant_prefer_grpc: bool = False
+    # Qdrant's own API key (the server's QDRANT__SERVICE__API_KEY). Empty (default)
+    # sends none. Without it anyone who can reach Qdrant's port reads or drops the
+    # collection directly, around API_KEY entirely.
+    qdrant_api_key: str = ""
 
     dense_embedding_model: str = "BAAI/bge-small-en-v1.5"
     sparse_embedding_model: str = "Qdrant/BM25"
@@ -110,7 +114,28 @@ class AppSettings(BaseSettings):
     # but cut the loaded model from 8.2 GB to 5.3 GB. Too small silently truncates the
     # front of the prompt (the grounding rules), so leave headroom for history.
     ollama_num_ctx: int = Field(default=0, ge=0)
+    # The model's context window in tokens, for fitting the prompt into it. 0 (default)
+    # uses OLLAMA_NUM_CTX when the provider is Ollama and that is set, else no fitting.
+    # When known, the prompt drops the lowest-ranked context and then the oldest
+    # history until it fits with LLM_MAX_TOKENS to spare — an over-long prompt had its
+    # *front* (the grounding rules) silently cut by the model server.
+    llm_context_window: int = Field(default=0, ge=0)
+    # Finished answers kept for repeat questions (api/answer_cache.py); 0 turns the
+    # cache off. Invalidated by every ingest, delete and tag change, and expired after
+    # the TTL. Questions with conversation history are never cached.
+    # Questions answered at once; past it a question gets 429 + Retry-After at once
+    # instead of holding a request thread for a minute (api/admission.py). 0 = no cap.
+    max_concurrent_questions: int = Field(default=4, ge=0)
+    answer_cache_size: int = Field(default=256, ge=0)
+    answer_cache_ttl_seconds: float = Field(default=3600.0, gt=0.0)
     openai_api_key: str | None = Field(default=None)
+    # Any server speaking the OpenAI chat-completions API — vLLM, llama.cpp's server,
+    # LM Studio, LocalAI — selected with LLM_PROVIDER=openai_compatible (or per request).
+    # Self-hostable like Ollama; the base URL is the one ending in /v1. The key is
+    # optional: most local servers accept anything.
+    openai_compatible_base_url: str = ""
+    openai_compatible_model: str = ""
+    openai_compatible_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     # Reasoning models (gpt-5 family) spend hidden reasoning tokens out of the same
     # max_completion_tokens budget as the visible answer. "low" keeps that spend modest
@@ -185,6 +210,8 @@ class AppSettings(BaseSettings):
     # whether the operator has also opted the job store into sqlite persistence.
     feedback_enabled: bool = False
     feedback_store_path: str = "./data/feedback.db"
+    # Oldest ratings are dropped past this many rows (~6 KB each at most).
+    feedback_max_rows: PositiveInt = 50_000
 
     # After rerank, each selected chunk's context is expanded with up to this many
     # neighboring chunks (by chunk_ordinal) on each side from the same document —
@@ -255,17 +282,33 @@ class AppSettings(BaseSettings):
     citation_retry_enabled: bool = True
 
     # Optional single shared API key. Empty (the default) keeps every route fully open,
-    # preserving the zero-config self-host story. When set, mutating/query routes
-    # require a matching X-API-Key header (see api/dependencies.py's require_api_key);
-    # /health and /health/ready stay unauthenticated so container healthchecks and
-    # probes keep working either way. Not multi-user auth — one key for the whole API.
+    # preserving the zero-config self-host story. When set, every route except
+    # /health, /health/ready and /config — reads included — requires a matching
+    # X-API-Key header (api/dependencies.py's require_api_key, and api/main.py's
+    # middleware, which checks it before a request body is read). Not multi-user auth —
+    # one key for the whole API.
     api_key: str = ""
+    # Optional second, read-only key (needs API_KEY set too): it can ask questions and
+    # read documents, traces and jobs, but not upload, delete, re-index, tag, export,
+    # or read feedback/metrics — those need API_KEY (403 for the read key). For sharing
+    # the UI with people who should use the corpus but not change it.
+    api_read_key: str = ""
 
     # Verbosity of the application's own loggers (the "api" and "eval" namespaces).
     # api/logging_config.py consumes this via dictConfig at app construction; without
     # it the root logger's WARNING default silences every logger.info in the codebase
     # (request logs, ingest progress, warmup notices).
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def _read_key_needs_a_full_key(self) -> "AppSettings":
+        # With only a read key, the "admin" routes would have no key at all: anyone
+        # could change the corpus that readers need a key to look at.
+        if self.api_read_key and not self.api_key:
+            raise ValueError("API_READ_KEY needs API_KEY set as well.")
+        if self.api_read_key and self.api_read_key == self.api_key:
+            raise ValueError("API_READ_KEY must differ from API_KEY.")
+        return self
 
     @field_validator("log_level", mode="before")
     @classmethod

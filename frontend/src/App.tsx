@@ -30,6 +30,7 @@ import { useChat } from './hooks/useChat';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
+import { newId } from './utils/id';
 
 // Dialogs and the inspector render only on demand, so they load on demand too: the
 // first paint (thread + composer) no longer waits on their code.
@@ -39,6 +40,8 @@ const Inspector = lazy(() => import('./components/Inspector'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
+// With the server's 15 s Retry-After, about 10 minutes of waiting for a full queue.
+const UPLOAD_QUEUE_MAX_ATTEMPTS = 40;
 const MODE_STORAGE_KEY = 'docrag-mode';
 const EMPTY_OVERRIDES: QuestionOverrides = {
   rerankTopK: null,
@@ -62,6 +65,24 @@ function loadPersistedOverrides(): QuestionOverrides {
   }
 }
 
+/** Drop saved overrides the server would now reject.
+ *
+ * Overrides are saved in the browser, limits live on the server: an operator lowering
+ * FUSED_TOP_N below a saved "Rerank top K" made every question fail with a 422 — and
+ * the slider, clamped by the browser to the new max, couldn't show why. */
+function clampOverrides(
+  overrides: QuestionOverrides,
+  config: PublicConfigResponse,
+): QuestionOverrides {
+  const within = (value: number | null, max: number, min = 1) =>
+    value !== null && (value < min || value > max) ? null : value;
+  return {
+    rerankTopK: within(overrides.rerankTopK, config.rerank_top_k_limit),
+    maxContextChunks: within(overrides.maxContextChunks, config.max_context_chunks_limit),
+    llmTemperature: within(overrides.llmTemperature, config.llm_temperature_max, 0),
+  };
+}
+
 function loadPersistedMode(): ChatMode {
   try {
     return localStorage.getItem(MODE_STORAGE_KEY) === 'engineer' ? 'engineer' : 'reader';
@@ -76,10 +97,19 @@ const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
   traces: { title: 'Traces', actionLabel: 'Refresh' },
 };
 
-function scopeLabel(indexedFilenames: string[], selectedFilenames: string[]): string {
-  if (selectedFilenames.length === 0) return `All ${indexedFilenames.length} documents`;
-  if (selectedFilenames.length === 1) return selectedFilenames[0];
-  return `${selectedFilenames.length} documents`;
+function scopeLabel(
+  indexedFilenames: string[],
+  selectedFilenames: string[],
+  selectedTags: string[] = [],
+): string {
+  const tagPart = selectedTags.length > 0 ? ` · #${selectedTags.join(' #')}` : '';
+  if (selectedFilenames.length === 0) {
+    return selectedTags.length > 0
+      ? `Tagged${tagPart}`
+      : `All ${indexedFilenames.length} documents`;
+  }
+  if (selectedFilenames.length === 1) return `${selectedFilenames[0]}${tagPart}`;
+  return `${selectedFilenames.length} documents${tagPart}`;
 }
 
 function App() {
@@ -90,7 +120,7 @@ function App() {
   const [reindexableFilenames, setReindexableFilenames] = useState<string[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
-  const [selectedFilenames, setSelectedFilenames] = useState<string[]>([]);
+  const [documentTags, setDocumentTags] = useState<Record<string, string[]>>({});
   // The full corpus currently indexed in Qdrant (across all sessions). Both the
   // corpus-management panel and the search-scope filter operate over this one list,
   // so any indexed document is scopable regardless of which session uploaded it.
@@ -142,7 +172,19 @@ function App() {
     deleteConversation: removeConversation,
     persistError,
     persistPartial,
+    setTurnFeedback,
+    scope,
+    setScope,
+    pruneScopes,
+    editAndResend,
+    importConversation,
   } = useChat();
+  // The search scope belongs to the active conversation (see useChat).
+  const selectedFilenames = scope.filenames;
+  const selectedTags = scope.tags;
+  const setSelectedFilenames = (filenames: string[]) =>
+    setScope((prev) => ({ ...prev, filenames }));
+  const setSelectedTags = (tags: string[]) => setScope((prev) => ({ ...prev, tags }));
 
   // A pinned trace belongs to one conversation's turns, so anything that replaces the
   // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
@@ -200,6 +242,11 @@ function App() {
   const refreshDocuments = async (signal?: AbortSignal) => {
     const documents = await api.listDocuments(signal);
     setIndexedFilenames(documents.filenames);
+    // A document deleted elsewhere (another tab, the API) stayed in scope: the header
+    // still named it and the popover — which lists only indexed files — couldn't
+    // uncheck it.
+    pruneScopes(documents.filenames);
+    setDocumentTags(documents.tags ?? {});
     setChunkCounts(documents.chunk_counts ?? {});
     setPageCounts(documents.page_counts ?? {});
     setByteSizes(documents.byte_sizes ?? {});
@@ -236,9 +283,29 @@ function App() {
         const configResult = await api.config(controller.signal);
         if (cancelled) return;
         setConfig(configResult);
+        setAdvancedOptions((prev) => {
+          const clamped = clampOverrides(prev, configResult);
+          const changed =
+            clamped.rerankTopK !== prev.rerankTopK ||
+            clamped.maxContextChunks !== prev.maxContextChunks ||
+            clamped.llmTemperature !== prev.llmTemperature;
+          if (!changed) return prev;
+          try {
+            localStorage.setItem(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(clamped));
+          } catch {
+            // Best-effort; the clamped value applies for this session either way.
+          }
+          return clamped;
+        });
         // Sync the dropdown to the server's default provider once config loads.
         if (configResult.llm_provider === 'openai' && configResult.openai_available) {
           setSelectedProvider('openai');
+        }
+        if (
+          configResult.llm_provider === 'openai_compatible' &&
+          configResult.openai_compatible_available
+        ) {
+          setSelectedProvider('openai_compatible');
         }
         // Ollama is the hardcoded default above, but if it's unreachable and OpenAI
         // is configured, don't leave the user stuck on a provider that will 502.
@@ -270,6 +337,8 @@ function App() {
       // Aborting releases the in-flight request instead of just ignoring its result.
       controller.abort();
     };
+    // Boot once. refreshDocuments reads only setters and useChat's stable pruneScopes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadTraces = (signal?: AbortSignal) => {
@@ -329,9 +398,42 @@ function App() {
 
   // Starts one ingest job (an upload, or a re-index of a stored original) and follows
   // it to the end, reflecting progress on the UploadItem `id`.
+  // A 503 with Retry-After means the server's indexing queue is full (byte or job cap)
+  // and will drain: wait and try again rather than fail every file past the cap.
+  const startWhenQueueHasRoom = async (
+    id: string,
+    start: () => Promise<DocumentJobAcceptedResponse>,
+  ): Promise<DocumentJobAcceptedResponse> => {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await start();
+      } catch (err) {
+        const waitSeconds = err instanceof ApiClientError ? err.retryAfterSeconds : undefined;
+        if (
+          !(err instanceof ApiClientError) ||
+          err.statusCode !== 503 ||
+          waitSeconds === undefined ||
+          attempt >= UPLOAD_QUEUE_MAX_ATTEMPTS
+        ) {
+          throw err;
+        }
+        setUploads((prev) =>
+          prev.map((item) =>
+            item.id === id
+              ? { ...item, progress: { state: 'waiting', chunksDone: 0, chunksTotal: 0 } }
+              : item,
+          ),
+        );
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(Math.max(waitSeconds, 1), 30) * 1000),
+        );
+      }
+    }
+  };
+
   const runIngestJob = async (id: string, start: () => Promise<DocumentJobAcceptedResponse>) => {
     try {
-      const accepted = await start();
+      const accepted = await startWhenQueueHasRoom(id, start);
       const status = await api.pollDocumentJob(accepted.job_id, (jobStatus) => {
         setUploads((prev) =>
           prev.map((item) =>
@@ -396,7 +498,7 @@ function App() {
   };
 
   const handleReindex = async (filename: string) => {
-    const id = crypto.randomUUID();
+    const id = newId();
     setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true }]);
     await runIngestJob(id, () => api.reindexDocument(filename));
     await refreshAfterIngest();
@@ -424,7 +526,7 @@ function App() {
       });
     }
     const items: UploadItem[] = response.jobs.map((job) => ({
-      id: crypto.randomUUID(),
+      id: newId(),
       filename: job.filename,
       status: 'uploading',
       reindex: true,
@@ -438,7 +540,7 @@ function App() {
 
   const handleUpload = async (files: File[]) => {
     const newItems: UploadItem[] = files.map((file) => ({
-      id: crypto.randomUUID(),
+      id: newId(),
       filename: file.name,
       status: 'uploading',
       file,
@@ -474,13 +576,45 @@ function App() {
     await api.deleteDocument(filename);
     // A deleted document can never remain in the corpus or the active search scope.
     setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
-    setSelectedFilenames((prev) => prev.filter((name) => name !== filename));
-    setChunkCounts((prev) => {
+    pruneScopes(indexedFilenames.filter((name) => name !== filename));
+    const without = (prev: Record<string, number>) => {
+      if (!(filename in prev)) return prev;
+      const next = { ...prev };
+      delete next[filename];
+      return next;
+    };
+    setChunkCounts(without);
+    setPageCounts(without);
+    setByteSizes(without);
+    setUploadedAts(without);
+    setStaleFilenames((prev) => prev.filter((name) => name !== filename));
+    setReindexableFilenames((prev) => prev.filter((name) => name !== filename));
+    setDocumentTags((prev) => {
+      if (!(filename in prev)) return prev;
       const next = { ...prev };
       delete next[filename];
       return next;
     });
   };
+
+  const handleSetTags = async (filename: string, tags: string[]) => {
+    const result = await api.setDocumentTags(filename, tags);
+    setDocumentTags((prev) => {
+      const next = { ...prev };
+      if (result.tags.length > 0) next[filename] = result.tags;
+      else delete next[filename];
+      return next;
+    });
+  };
+
+  // Every tag in use, for the composer's scope popover.
+  const availableTags = useMemo(
+    () =>
+      [...new Set(Object.values(documentTags).flat())].sort((a, b) =>
+        a.localeCompare(b, undefined, { sensitivity: 'base' }),
+      ),
+    [documentTags],
+  );
 
   const apiReachable = apiStatus === 'ok';
   const noDocs = indexedFilenames.length === 0;
@@ -500,7 +634,9 @@ function App() {
   const currentModelLabel = config
     ? selectedProvider === 'ollama'
       ? config.llm_model
-      : config.openai_model
+      : selectedProvider === 'openai_compatible'
+        ? config.openai_compatible_model || 'OpenAI-compatible'
+        : config.openai_model
     : undefined;
 
   // The turn the inspector describes: the one pinned by a trace-row click, else the
@@ -534,15 +670,29 @@ function App() {
   // useCallback (not a plain const) because this is passed down as ChatMessage's
   // onRetry prop through ChatThread — an unstable reference here would defeat
   // React.memo(ChatMessage) and reintroduce a full-list re-render on every SSE delta.
+  const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
   const askQuestion = useCallback(
     (question: string) =>
-      ask(
-        question,
-        selectedProvider,
-        advancedOptions,
-        selectedFilenames.length > 0 ? selectedFilenames : undefined,
-      ),
-    [ask, selectedProvider, advancedOptions, selectedFilenames],
+      ask(question, selectedProvider, advancedOptions, scopeFilenames, { tags: selectedTags }),
+    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags],
+  );
+  // Regenerate must produce a new answer, not the cached copy of the one on screen.
+  const regenerateQuestion = useCallback(
+    (question: string) =>
+      ask(question, selectedProvider, advancedOptions, scopeFilenames, {
+        tags: selectedTags,
+        bypassCache: true,
+      }),
+    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags],
+  );
+  const editQuestion = useCallback(
+    (turnId: string, question: string) => {
+      setPinnedTraceId(null);
+      return editAndResend(turnId, question, selectedProvider, advancedOptions, scopeFilenames, {
+        tags: selectedTags,
+      });
+    },
+    [editAndResend, selectedProvider, advancedOptions, scopeFilenames, selectedTags],
   );
 
   // Same reasoning as askQuestion above — passed to both ChatThread and Inspector.
@@ -556,6 +706,7 @@ function App() {
   // confirmed or retried on failure — ChatMessage already shows the pick optimistically
   // (see its feedbackGiven state) before this even resolves.
   const handleFeedback = useCallback((payload: FeedbackPayload) => {
+    setTurnFeedback(payload.turnId, payload.rating);
     void api
       .submitFeedback({
         trace_id: payload.traceId,
@@ -568,7 +719,7 @@ function App() {
       .catch(() => {
         // Best-effort — nothing in the UI depends on this succeeding.
       });
-  }, []);
+  }, [setTurnFeedback]);
 
   // Persistence problems arrive as state flags, not events, so they are surfaced with
   // stable ids — a re-render must refresh the same notice rather than stack duplicates.
@@ -579,6 +730,7 @@ function App() {
         tone: 'bad',
         title: "Chat history couldn't be saved",
         body: "Storage may be full — this session won't be here after a reload.",
+        sticky: true,
       });
     } else if (persistPartial) {
       pushToast({
@@ -586,9 +738,13 @@ function App() {
         tone: 'warn',
         title: 'Only this conversation was saved',
         body: 'Browser storage is full. Export anything you need to keep.',
+        sticky: true,
       });
     }
-  }, [persistError, persistPartial, pushToast]);
+    // Sticky, so they must be withdrawn once a later save fully succeeds.
+    if (!persistError) dismissToast('persist-error');
+    if (!persistPartial) dismissToast('persist-partial');
+  }, [persistError, persistPartial, pushToast, dismissToast]);
 
   // Read at keypress time so the listener is registered once. Shortcuts are dispatched
   // from the command list itself, so every shortcut the palette advertises is bound.
@@ -659,6 +815,9 @@ function App() {
         shortcut: '⌘U',
         run: () => {
           setRail('corpus');
+          // On a narrow screen the panel is a closed drawer: the picked files were staged
+          // out of sight, still waiting on an Upload click nobody could see.
+          if (panelCollapsed) setPanelDrawerOpen(true);
           // The panel has to render before its hidden file input can be clicked.
           requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
         },
@@ -717,18 +876,88 @@ function App() {
         },
       },
       {
+        id: 'export-corpus',
+        glyph: '⇩',
+        label: 'Download a backup of all documents (zip)',
+        run: () => {
+          api
+            .exportCorpus()
+            .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
+            .catch((err) =>
+              pushToast({
+                tone: 'bad',
+                title: 'Backup failed',
+                body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
+              }),
+            );
+        },
+      },
+      {
+        id: 'import-json',
+        glyph: '⇧',
+        label: 'Import a conversation (JSON export)',
+        run: () => importInputRef.current?.click(),
+        disabled: pending,
+      },
+      {
         id: 'clear',
         glyph: '✕',
         label: 'Clear this conversation',
         run: clear,
         disabled: pending || turns.length === 0,
       },
+      // Every saved conversation, so the palette doubles as conversation search.
+      ...conversations
+        .filter((conversation) => conversation.id !== activeConversationId)
+        .map((conversation) => ({
+          id: `conversation-${conversation.id}`,
+          glyph: '☰',
+          label: `Open: ${conversation.title}`,
+          run: () => switchConversation(conversation.id),
+          disabled: pending,
+        })),
     ],
     // toggleTheme/clear/newConversation are stable enough for a menu rebuilt on open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown, exportJson, panelCollapsed],
+    [
+      pending,
+      config,
+      inspectorOpen,
+      mode,
+      theme,
+      turns.length,
+      exportMarkdown,
+      exportJson,
+      panelCollapsed,
+      conversations,
+      activeConversationId,
+    ],
   );
   commandsRef.current = commands;
+
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const handleImportFile = async (file: File) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      parsed = null;
+    }
+    const imported = parsed !== null && importConversation(parsed);
+    pushToast(
+      imported
+        ? { tone: 'good', title: 'Conversation imported', body: file.name }
+        : {
+            tone: 'bad',
+            title: "Couldn't import that file",
+            body: 'Choose a conversation exported as JSON from DocRAG.',
+          },
+    );
+    if (imported) {
+      setPinnedTraceId(null);
+      setRail('chat');
+    }
+  };
 
   const handlePanelAction = () => {
     if (rail === 'chat') {
@@ -740,6 +969,18 @@ function App() {
 
   return (
     <div className="app-shell">
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".json,application/json"
+        hidden
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = '';
+          if (file) void handleImportFile(file);
+        }}
+        data-testid="import-conversation-input"
+      />
       <IconRail
         active={rail}
         onSelect={handleRailSelect}
@@ -791,6 +1032,8 @@ function App() {
             onReindexAllStale={
               config?.raw_documents_enabled ? () => void handleReindexAllStale() : undefined
             }
+            tags={documentTags}
+            onSetTags={handleSetTags}
           />
         )}
         {rail === 'traces' && (
@@ -805,12 +1048,14 @@ function App() {
         ) : (
           <>
             <ChatHeader
+              key={activeConversationId ?? 'none'}
               title={activeConversation?.title ?? 'New chat'}
-              scopeLabel={scopeLabel(indexedFilenames, selectedFilenames)}
+              scopeLabel={scopeLabel(indexedFilenames, selectedFilenames, selectedTags)}
               mode={mode}
               onSetMode={setMode}
               turns={turns}
               onClear={clear}
+              onExport={exportMarkdown}
               disabled={pending}
               onOpenPalette={() => setPaletteOpen(true)}
               inspectorOpen={inspectorOpen}
@@ -829,6 +1074,8 @@ function App() {
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
+              onRegenerate={regenerateQuestion}
+              onEditQuestion={editQuestion}
               feedbackEnabled={config?.feedback_enabled}
               onFeedback={handleFeedback}
               onOpenSource={handleOpenSource}
@@ -840,14 +1087,17 @@ function App() {
             <ToastRow toasts={toasts} onDismiss={dismissToast} />
             <Composer
               onSubmit={askQuestion}
-              disabled={!apiReachable || pending || noDocs}
+              disabled={!apiReachable || noDocs}
               hint={composerHint}
               pending={pending}
               onCancel={cancel}
-              scopeLabel={scopeLabel(indexedFilenames, selectedFilenames)}
+              scopeLabel={scopeLabel(indexedFilenames, selectedFilenames, selectedTags)}
               indexedFilenames={indexedFilenames}
               selectedFilenames={selectedFilenames}
               onSelectedFilenamesChange={setSelectedFilenames}
+              availableTags={availableTags}
+              selectedTags={selectedTags}
+              onSelectedTagsChange={setSelectedTags}
               config={config}
               provider={selectedProvider}
               onProviderChange={setSelectedProvider}

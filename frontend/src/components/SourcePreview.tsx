@@ -16,7 +16,11 @@ function SourcePreview({ citation }: SourcePreviewProps) {
             p.{citation.page} &middot; {citation.section}
           </span>
         </div>
-        <p className="source-preview__quote">{citation.text}</p>
+        <p className="source-preview__quote">
+          {/* Older turns are saved without the passage text (see useChat); the citation
+              still opens the document at this passage. */}
+          {citation.text || 'Open the source to read this passage.'}
+        </p>
       </div>
     </div>
   );

@@ -36,6 +36,7 @@ JobState = Literal["queued", "parsing", "embedding", "done", "failed"]
 class JobNotFoundError(RuntimeError):
     """Raised when a job id has no known job (never existed, or was pruned)."""
 
+
 TERMINAL_STATES: frozenset[JobState] = frozenset({"done", "failed"})
 
 INTERRUPTED_JOB_ERROR = (
@@ -64,32 +65,43 @@ class IngestJob:
 
 
 class IngestBacklog:
-    """Byte budget for uploads accepted but not yet finished ingesting.
+    """Byte and job budget for uploads accepted but not yet finished ingesting.
 
     ``try_reserve`` never blocks: the upload route answers 503 instead of waiting. An
     empty backlog always admits, so a single upload larger than the budget still runs.
+
+    ``max_jobs`` caps how many jobs can be in flight at once. It is sized to the job
+    store's retention cap: past it the store would evict a job that is still queued, and
+    a client polling that job would see a 404 for work that is still going to run.
     """
 
-    def __init__(self, max_bytes: int) -> None:
+    def __init__(self, max_bytes: int, max_jobs: int | None = None) -> None:
         self._max_bytes = max_bytes
+        self._max_jobs = max_jobs
         self._pending = 0
+        self._jobs = 0
         self._lock = Lock()
 
     def try_reserve(self, size: int) -> bool:
         with self._lock:
             if self._pending and self._pending + size > self._max_bytes:
                 return False
+            if self._max_jobs is not None and self._jobs >= self._max_jobs:
+                return False
             self._pending += size
+            self._jobs += 1
             return True
 
     def release(self, size: int) -> None:
         with self._lock:
             self._pending = max(0, self._pending - size)
+            self._jobs = max(0, self._jobs - 1)
 
     @property
     def pending_bytes(self) -> int:
         with self._lock:
             return self._pending
+
 
 class JobStore(Protocol):
     """Minimal surface ``api.main`` needs to track background ingest jobs."""
@@ -141,12 +153,11 @@ class IngestJobStore:
     def _prune_finished_locked(self) -> None:
         """Evict oldest-first to stay within the cap, finished jobs first.
 
-        Finished jobs go first because nobody is polling them any more. But the store
-        must not grow without bound when none have finished: uploads are client-driven
-        and the executor has only two workers, so a burst leaves a long queue of
-        non-terminal jobs. Past the cap those are evicted too, oldest first — a client
-        polling an evicted job gets a 404 (``JobNotFoundError``), which is the same
-        answer it already gets for a job pruned after completion.
+        Finished jobs go first because nobody is polling them any more. Non-terminal
+        jobs are evicted only as a last resort: ``IngestBacklog``'s job cap (sized to
+        this one in ``api.dependencies``) keeps in-flight jobs within it, so this only
+        fires for a store built without that cap. A client polling an evicted job gets
+        a 404 (``JobNotFoundError``).
         """
 
         overflow = len(self._jobs) - self._max_retained

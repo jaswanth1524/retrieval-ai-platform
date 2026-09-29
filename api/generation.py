@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import functools
+import logging
 import re
 import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import litellm
+from litellm import exceptions as litellm_exceptions
 from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
@@ -158,6 +161,8 @@ class GroundedAnswer:
     sources: list[SourceCitation]
     timings: StageTimings | None = None
     trace_id: str | None = None
+    # Served from api.answer_cache rather than generated for this request.
+    cached: bool = False
     # True when the answer initially lacked citations and a stricter retry supplied
     # them (see needs_citation_retry / retry_uncited_answer).
     citation_retry_used: bool = False
@@ -203,6 +208,70 @@ def _is_request_timeout(exc: BaseException) -> bool:
     return "timed out" in message or "litellm.timeout" in message
 
 
+logger = logging.getLogger(__name__)
+
+# Fixed, user-facing reasons per provider failure. The provider's own message goes to
+# the log only: it reached every Q&A caller verbatim, and LiteLLM's messages can carry
+# the request URL (with any credentials in it) and provider account details.
+_PROVIDER_FAILURE_REASONS: tuple[tuple[type[Exception], str], ...] = (
+    (
+        litellm_exceptions.AuthenticationError,
+        "the provider rejected its credentials (check OPENAI_API_KEY)",
+    ),
+    (
+        litellm_exceptions.PermissionDeniedError,
+        "the provider denied access to this model",
+    ),
+    (litellm_exceptions.RateLimitError, "the provider is rate limiting requests; retry shortly"),
+    (
+        litellm_exceptions.NotFoundError,
+        "the provider does not know this model (check LLM_MODEL / OPENAI_MODEL)",
+    ),
+    (
+        litellm_exceptions.ContextWindowExceededError,
+        "the prompt is longer than the model's context window; ask with fewer context chunks",
+    ),
+    (litellm_exceptions.ContentPolicyViolationError, "the provider refused the request"),
+    (litellm_exceptions.BadRequestError, "the provider rejected the request"),
+    (
+        litellm_exceptions.ServiceUnavailableError,
+        "the provider is unavailable; retry shortly",
+    ),
+)
+
+
+def _never_connected(exc: BaseException) -> bool:
+    """Whether the request never reached the server (refused, unresolvable, unroutable).
+
+    LiteLLM's ``openai/`` route reports a refused connection as ``InternalServerError``,
+    not ``APIConnectionError``; only the cause chain says what happened.
+    """
+
+    return any(isinstance(link, httpx.ConnectError) for link in _exception_chain(exc))
+
+
+def _provider_failure(exc: Exception) -> GenerationError:
+    """A ``GenerationError`` naming the kind of failure, not the provider's raw text."""
+
+    logger.warning("Generation provider request failed.", exc_info=exc)
+    reason = next(
+        (text for kind, text in _PROVIDER_FAILURE_REASONS if isinstance(exc, kind)),
+        f"{type(exc).__name__}; see the server log for details",
+    )
+    return GenerationError(f"Generation provider request failed: {reason}.")
+
+
+def redact_url(url: str) -> str:
+    """``url`` without any ``user:password@`` part, for messages a client can see."""
+
+    parts = urlsplit(url)
+    if parts.username is None and parts.password is None:
+        return url
+    host = parts.hostname or ""
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
 def _connection_error(exc: Exception, settings: AppSettings) -> GenerationError:
     """Translate LiteLLM's connection/timeout errors, telling "too slow" apart from "unreachable".
 
@@ -218,14 +287,22 @@ def _connection_error(exc: Exception, settings: AppSettings) -> GenerationError:
         )
     if settings.llm_provider.lower().strip() == "ollama":
         return GenerationError(
-            f"Cannot reach Ollama at {settings.ollama_base_url}. Start Ollama "
+            f"Cannot reach Ollama at {redact_url(settings.ollama_base_url)}. Start Ollama "
             "(`ollama serve`) and confirm OLLAMA_BASE_URL is reachable from "
             "wherever the API process runs — use http://localhost:11434 when "
             "the API runs directly on your host, or "
             "http://host.docker.internal:11434 only when the API itself runs "
             "inside Docker."
         )
-    return GenerationError(f"Generation provider request failed: {exc}")
+    if settings.llm_provider.lower().strip() == "openai_compatible":
+        logger.warning("OpenAI-compatible server unreachable.", exc_info=exc)
+        return GenerationError(
+            "Cannot reach the OpenAI-compatible server at "
+            f"{redact_url(settings.openai_compatible_base_url)}. Check that it is running "
+            "and that OPENAI_COMPATIBLE_BASE_URL (ending in /v1) is reachable from "
+            "wherever the API process runs."
+        )
+    return _provider_failure(exc)
 
 
 class LiteLLMGenerator:
@@ -270,7 +347,9 @@ class LiteLLMGenerator:
             # connection, rate limit, ...); this boundary's job is translating all
             # of them into our domain error so main.py maps them to a clean 502
             # instead of an opaque 500.
-            raise GenerationError(f"Generation provider request failed: {exc}") from exc
+            if _never_connected(exc):
+                raise _connection_error(exc, settings) from exc
+            raise _provider_failure(exc) from exc
         return extract_completion_text(response)
 
     def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterator[str]:
@@ -306,7 +385,9 @@ class LiteLLMGenerator:
         except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
             raise _connection_error(exc, settings) from exc
         except Exception as exc:
-            raise GenerationError(f"Generation provider request failed: {exc}") from exc
+            if _never_connected(exc):
+                raise _connection_error(exc, settings) from exc
+            raise _provider_failure(exc) from exc
 
 
 class ChatGenerator(Protocol):
@@ -365,8 +446,7 @@ def build_grounded_messages(
     """
 
     context = "\n\n".join(
-        format_context_chunk(index, chunk)
-        for index, chunk in enumerate(context_chunks, start=1)
+        format_context_chunk(index, chunk) for index, chunk in enumerate(context_chunks, start=1)
     )
     system_content = (
         "You are DocRAG, a document question-answering assistant. "
@@ -401,6 +481,92 @@ def build_grounded_messages(
     return messages
 
 
+# Deliberately low (English runs ~4 characters per token under the llama and GPT
+# tokenizers), so the estimate is high and a fitted prompt errs toward fitting.
+_CHARS_PER_TOKEN_ESTIMATE = 3
+_PER_MESSAGE_TOKEN_OVERHEAD = 8
+_CONTEXT_WINDOW_MARGIN_TOKENS = 64
+
+
+def context_window_tokens(settings: AppSettings) -> int:
+    """The generation model's context window, or 0 when unknown (no fitting)."""
+
+    if settings.llm_context_window > 0:
+        return int(settings.llm_context_window)
+    if settings.llm_provider.lower().strip() == "ollama" and settings.ollama_num_ctx > 0:
+        return int(settings.ollama_num_ctx)
+    return 0
+
+
+def estimate_prompt_tokens(messages: Sequence[ChatMessage]) -> int:
+    return sum(
+        -(-len(message["content"]) // _CHARS_PER_TOKEN_ESTIMATE) + _PER_MESSAGE_TOKEN_OVERHEAD
+        for message in messages
+    )
+
+
+@dataclass(frozen=True)
+class FittedPrompt:
+    """What ``fit_prompt_to_context_window`` kept, and what it had to leave out."""
+
+    context_chunks: list[RerankedChunk]
+    history: list[ChatMessage]
+    dropped_point_ids: frozenset[str] = frozenset()
+    dropped_history_messages: int = 0
+
+
+def fit_prompt_to_context_window(
+    query: str,
+    context_chunks: Sequence[RerankedChunk],
+    history: Sequence[ChatMessage] | None,
+    settings: AppSettings,
+) -> FittedPrompt:
+    """Trim the prompt so it fits the model's context window with the answer to spare.
+
+    Context goes first, from the lowest-ranked end, down to one chunk — the owner-approved
+    order: a follow-up keeps its conversation, and the best-ranked sources stay. Then
+    the oldest history. A no-op when the window is unknown (see ``context_window_tokens``).
+    """
+
+    chunks = list(context_chunks)
+    kept_history = list(history or [])
+    window = context_window_tokens(settings)
+    if window <= 0:
+        return FittedPrompt(chunks, kept_history)
+    model, _ = completion_model_and_kwargs(settings)
+    budget = window - effective_max_tokens(settings, model) - _CONTEXT_WINDOW_MARGIN_TOKENS
+    dropped: list[str] = []
+    dropped_history = 0
+
+    def size() -> int:
+        return estimate_prompt_tokens(build_grounded_messages(query, chunks, kept_history or None))
+
+    while size() > budget:
+        if len(chunks) > 1:
+            dropped.append(chunks.pop().point_id)
+        elif kept_history:
+            kept_history.pop(0)
+            dropped_history += 1
+        else:
+            # One chunk and no history still don't fit: send it anyway rather than
+            # answer from nothing; the operator's window is simply too small.
+            logger.warning(
+                "The prompt exceeds the %d-token context window even with one source; "
+                "raise OLLAMA_NUM_CTX / LLM_CONTEXT_WINDOW.",
+                window,
+            )
+            break
+    if dropped or dropped_history:
+        logger.info(
+            "Fitted the prompt to a %d-token window: dropped %d source(s) and %d "
+            "history message(s).",
+            window,
+            len(dropped),
+            dropped_history,
+        )
+    return FittedPrompt(chunks, kept_history, frozenset(dropped), dropped_history)
+
+
 def build_condense_messages(
     question: str,
     history: Sequence[ChatMessage],
@@ -415,11 +581,7 @@ def build_condense_messages(
         {"role": "system", "content": CONDENSE_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": (
-                f"{transcript}\n\n"
-                f"Follow-up question: {question}\n\n"
-                "Standalone question:"
-            ),
+            "content": (f"{transcript}\n\nFollow-up question: {question}\n\nStandalone question:"),
         },
     ]
 
@@ -463,9 +625,7 @@ def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
     # has no use for a 20-hex id, and seeing one invited it to copy every source's
     # metadata into a trailing references list — pure decode time on a local model.
     return (
-        f"[{index}] filename={chunk.filename}; page={chunk.page}; "
-        f"section={chunk.section}\n"
-        f"{text}"
+        f"[{index}] filename={chunk.filename}; page={chunk.page}; section={chunk.section}\n{text}"
     )
 
 
@@ -528,10 +688,40 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 # the prior turns name. Matched as whole words, so "that" fires but "thatch" does not.
 _ANAPHORA_WORDS = frozenset(
     {
-        "it", "its", "it's", "this", "that", "these", "those", "they", "them", "their",
-        "theirs", "he", "him", "his", "she", "her", "hers", "one", "ones", "same",
-        "above", "previous", "earlier", "former", "latter", "instead", "there", "then",
-        "another", "such", "both", "either", "neither", "else",
+        "it",
+        "its",
+        "it's",
+        "this",
+        "that",
+        "these",
+        "those",
+        "they",
+        "them",
+        "their",
+        "theirs",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "hers",
+        "one",
+        "ones",
+        "same",
+        "above",
+        "previous",
+        "earlier",
+        "former",
+        "latter",
+        "instead",
+        "there",
+        "then",
+        "another",
+        "such",
+        "both",
+        "either",
+        "neither",
+        "else",
     }
 )
 
@@ -539,12 +729,72 @@ _ANAPHORA_WORDS = frozenset(
 # of a question is substantive enough to retrieve on. Not a general stopword list.
 _LOW_SIGNAL_WORDS = frozenset(
     {
-        "a", "an", "the", "and", "or", "but", "so", "also", "about", "of", "for", "to",
-        "in", "on", "at", "by", "with", "from", "as", "is", "are", "was", "were", "be",
-        "been", "do", "does", "did", "can", "could", "will", "would", "should", "may",
-        "might", "must", "have", "has", "had", "what", "which", "who", "whom", "whose",
-        "when", "where", "why", "how", "many", "much", "any", "some", "me", "my", "we",
-        "our", "you", "your", "i", "if", "not", "no", "yes", "please", "tell", "say",
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "so",
+        "also",
+        "about",
+        "of",
+        "for",
+        "to",
+        "in",
+        "on",
+        "at",
+        "by",
+        "with",
+        "from",
+        "as",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "will",
+        "would",
+        "should",
+        "may",
+        "might",
+        "must",
+        "have",
+        "has",
+        "had",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "when",
+        "where",
+        "why",
+        "how",
+        "many",
+        "much",
+        "any",
+        "some",
+        "me",
+        "my",
+        "we",
+        "our",
+        "you",
+        "your",
+        "i",
+        "if",
+        "not",
+        "no",
+        "yes",
+        "please",
+        "tell",
+        "say",
     }
 )
 
@@ -701,8 +951,7 @@ def build_expansion_messages(question: str, count: int) -> list[ChatMessage]:
         {
             "role": "user",
             "content": (
-                f"Query: {question}\n\n"
-                f"Write {count} alternative search queries, one per line:"
+                f"Query: {question}\n\nWrite {count} alternative search queries, one per line:"
             ),
         },
     ]
@@ -760,7 +1009,9 @@ def supports_reasoning(model: str) -> bool:
     to four calls per question. Local models keep the plain budget by design anyway.
     """
 
-    if model.startswith(_OLLAMA_MODEL_PREFIXES):
+    # openai/<name> is a model served by an OpenAI-compatible server, not OpenAI: its
+    # name says nothing LiteLLM's metadata could know about.
+    if model.startswith((*_OLLAMA_MODEL_PREFIXES, "openai/")):
         return False
     try:
         return bool(litellm.supports_reasoning(model))
@@ -809,6 +1060,18 @@ def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, s
         if effort and supports_reasoning(settings.openai_model):
             kwargs["reasoning_effort"] = effort
         return settings.openai_model, kwargs
+    if provider == "openai_compatible":
+        if not settings.openai_compatible_base_url or not settings.openai_compatible_model:
+            raise GenerationConfigError(
+                "OPENAI_COMPATIBLE_BASE_URL and OPENAI_COMPATIBLE_MODEL are required when "
+                "LLM_PROVIDER=openai_compatible."
+            )
+        # LiteLLM's openai/ route with a custom api_base: the OpenAI wire protocol
+        # against any server. The client insists on some key; local servers ignore it.
+        return f"openai/{settings.openai_compatible_model}", {
+            "api_base": settings.openai_compatible_base_url,
+            "api_key": settings.openai_compatible_api_key or "not-needed",
+        }
     raise GenerationConfigError(f"Unsupported LLM_PROVIDER '{settings.llm_provider}'.")
 
 
@@ -849,4 +1112,3 @@ def read_value(source: object, key: str) -> object:
     if isinstance(source, dict):
         return source.get(key)
     return getattr(source, key, None)
-

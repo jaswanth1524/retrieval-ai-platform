@@ -44,9 +44,7 @@ def jaccard(a: AbstractSet[str], b: AbstractSet[str]) -> float:
     return len(a & b) / union if union else 0.0
 
 
-def select_diverse(
-    outcome: RerankOutcome, settings: AppSettings
-) -> tuple[RerankOutcome, set[str]]:
+def select_diverse(outcome: RerankOutcome, settings: AppSettings) -> tuple[RerankOutcome, set[str]]:
     """Filter ``outcome.kept`` for diversity, returning the new outcome + dropped ids.
 
     Iterates the min-score-cleared, rerank-ordered candidates (``outcome.scored``),

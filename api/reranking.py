@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from fastembed.common.model_description import ModelSource
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 
+from api.documents import contextual_text
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
 
@@ -100,9 +101,7 @@ def _resolve_model(model: str, onnx_file: str) -> tuple[str, str | None]:
             TextCrossEncoder.add_custom_model(
                 model=name, sources=ModelSource(hf=model), model_file=onnx_file
             )
-    base = os.getenv(
-        "FASTEMBED_CACHE_PATH", os.path.join(tempfile.gettempdir(), "fastembed_cache")
-    )
+    base = os.getenv("FASTEMBED_CACHE_PATH", os.path.join(tempfile.gettempdir(), "fastembed_cache"))
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", onnx_file)
     return name, os.path.join(base, "alternate-onnx", slug)
 
@@ -116,9 +115,7 @@ class LocalCrossEncoderReranker:
         model: CrossEncoderModel | None = None,
     ) -> None:
         self.settings = settings
-        model_name, cache_dir = _resolve_model(
-            settings.reranker_model, settings.reranker_onnx_file
-        )
+        model_name, cache_dir = _resolve_model(settings.reranker_model, settings.reranker_onnx_file)
         self.model = model or TextCrossEncoder(
             model_name=model_name,
             cache_dir=cache_dir,
@@ -154,8 +151,7 @@ class LocalCrossEncoderReranker:
             fresh = self._score_uncached(query, [documents[index] for index in missing])
             if len(fresh) != len(missing):
                 raise RerankingError(
-                    f"Reranker score count mismatch: got {len(fresh)}, "
-                    f"expected {len(missing)}."
+                    f"Reranker score count mismatch: got {len(fresh)}, expected {len(missing)}."
                 )
             for index, value in zip(missing, fresh, strict=True):
                 scores[index] = value
@@ -253,7 +249,12 @@ def rerank_candidates_detailed(
     rerank_top_k = int(settings.rerank_top_k)
     min_score = float(settings.rerank_min_score)
     candidates_to_score = list(candidates[:candidates_considered])
-    documents = [candidate.text for candidate in candidates_to_score]
+    # Scored with the same "filename › section" prefix the chunk was embedded with, so
+    # the reranker can't discard a match that rested on the document or heading name.
+    documents = [
+        contextual_text(candidate.filename, candidate.section, candidate.text)
+        for candidate in candidates_to_score
+    ]
     scores = reranker.score(normalized_query, documents)
 
     if len(scores) != len(candidates_to_score):
@@ -282,4 +283,3 @@ def rerank_candidates_detailed(
     )
     filtered = [chunk for chunk in sorted_chunks if chunk.rerank_score >= min_score]
     return RerankOutcome(scored=sorted_chunks, kept=filtered[:rerank_top_k])
-

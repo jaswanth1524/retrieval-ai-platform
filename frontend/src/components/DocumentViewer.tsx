@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
-import type { DocumentChunkResponse } from '../api/types';
+import type { ContentPage } from '../api/client';
+import type { DocumentChunkResponse, DocumentContentResponse } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
 import './DocumentViewer.css';
 
@@ -10,45 +11,75 @@ interface DocumentViewerProps {
   onClose: () => void;
 }
 
-// Chunks either side of the cited target rendered on first paint. A naive "render the
-// first N" would put the target chunk out of reach for a citation deep in a large
-// document (e.g. chunk 400 of 500) — centering on it keeps click-through correct
-// regardless of document size.
+// Chunks either side of the cited target fetched on open, and fetched per Load
+// earlier/later. The server pages by ordinal (GET /documents/{f}/content?around=), so a
+// citation deep in a large document costs one small page, not the whole document.
 const WINDOW_RADIUS = 30;
 
+interface Loaded {
+  chunks: DocumentChunkResponse[];
+  total: number;
+  targetFound: boolean | null;
+}
+
+function ordinalOf(chunk: DocumentChunkResponse | undefined): number | null {
+  return chunk?.chunk_ordinal ?? null;
+}
+
 function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
-  const [chunks, setChunks] = useState<DocumentChunkResponse[] | null>(null);
+  const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // null = windowed to the default range below; set once the reader expands a bound
-  // or asks to see everything.
-  const [windowStart, setWindowStart] = useState(0);
-  const [windowEnd, setWindowEnd] = useState<number | null>(null);
-  const [showAll, setShowAll] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const targetRef = useRef<HTMLDivElement>(null);
   // Which chunkId the viewer last auto-scrolled to. Compared against the current
   // chunkId (not a boolean) so scrolling fires exactly once per distinct target: not
-  // on every window expansion (which would yank the reader back to the target after
+  // on every page loaded (which would yank the reader back to the target after
   // they've scrolled elsewhere), but still again when App.tsx points the same open
   // viewer at a different citation in the same document (no remount — see below).
   const lastScrolledChunkIdRef = useRef<string | null>(null);
+  const loadedRef = useRef<Loaded | null>(null);
+  loadedRef.current = loaded;
+  const controllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
+  const fetchPage = (options: ContentPage, apply: (content: DocumentContentResponse) => void) => {
+    controllerRef.current?.abort();
     const controller = new AbortController();
-    setChunks(null);
-    setError(null);
-    setWindowStart(0);
-    setWindowEnd(null);
-    setShowAll(false);
-    lastScrolledChunkIdRef.current = null;
-    api
-      .getDocumentContent(filename, controller.signal)
-      .then((content) => setChunks(content.chunks))
+    controllerRef.current = controller;
+    return api
+      .getDocumentContent(filename, controller.signal, options)
+      .then((content) => {
+        if (!controller.signal.aborted) apply(content);
+      })
       .catch((err) => {
         if (controller.signal.aborted) return;
         setError(err instanceof ApiClientError ? err.message : 'Could not load document.');
       });
-    return () => controller.abort();
-  }, [filename]);
+  };
+
+  // (Re)load around the target when the document or the cited chunk changes — unless
+  // that chunk is already on screen (a second citation into the same open document).
+  useEffect(() => {
+    const current = loadedRef.current;
+    if (current && current.chunks.some((chunk) => chunk.chunk_id === chunkId)) return;
+    setLoaded(null);
+    setError(null);
+    lastScrolledChunkIdRef.current = null;
+    const page: ContentPage = chunkId
+      ? { around: chunkId, radius: WINDOW_RADIUS }
+      : { start: 1, end: 2 * WINDOW_RADIUS + 1 };
+    void fetchPage(page, (content) =>
+      setLoaded({
+        chunks: content.chunks,
+        total: content.total_chunks ?? content.chunks.length,
+        // An older server ignores the paging and sends everything: look for it here.
+        targetFound:
+          content.target_found ??
+          (chunkId ? content.chunks.some((chunk) => chunk.chunk_id === chunkId) : null),
+      }),
+    );
+    return () => controllerRef.current?.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filename, chunkId]);
 
   // Same hook the command palette and settings modal use. This component declared
   // role="dialog" aria-modal="true" while only handling Escape — no focus moved in on
@@ -57,39 +88,41 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
   // its Load-earlier/later buttons) only exists after the fetch resolves.
   const dialogRef = useDialog(true, onClose);
 
-  const targetIndex = useMemo(
-    () => (chunks && chunkId !== null ? chunks.findIndex((c) => c.chunk_id === chunkId) : -1),
-    [chunks, chunkId],
-  );
+  const chunks = loaded?.chunks ?? null;
+  const first = ordinalOf(chunks?.[0]);
+  const last = ordinalOf(chunks?.[chunks.length - 1]);
+  // Legacy points without ordinals can't be paged: the server sent them all.
+  const hiddenBefore = chunks && first !== null ? first - 1 : 0;
+  const hiddenAfter = chunks && loaded && last !== null ? Math.max(0, loaded.total - last) : 0;
 
-  // Center the window on the target once chunks arrive, and re-center if the reader
-  // clicks a different citation into an already-open viewer for the same document
-  // (App.tsx doesn't remount DocumentViewer for that — only `chunkId` changes). Reads
-  // windowStart/windowEnd from the latest render rather than listing them as deps, so
-  // a manual Load-earlier/later expansion that already covers the new target is left
-  // alone instead of being reset every time the effect happens to re-run.
-  useEffect(() => {
-    if (!chunks) return;
-    const center = targetIndex >= 0 ? targetIndex : 0;
-    const alreadyWindowed = windowEnd !== null;
-    const inWindow = alreadyWindowed && center >= windowStart && center < (windowEnd as number);
-    if (inWindow) return;
-    setWindowStart(Math.max(0, center - WINDOW_RADIUS));
-    setWindowEnd(Math.min(chunks.length, center + WINDOW_RADIUS + 1));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chunks, targetIndex]);
-
-  const visibleChunks = useMemo(() => {
-    if (!chunks) return [];
-    if (showAll) return chunks;
-    return chunks.slice(windowStart, windowEnd ?? chunks.length);
-  }, [chunks, showAll, windowStart, windowEnd]);
+  const loadMore = (direction: 'earlier' | 'later' | 'all') => {
+    if (!loaded || first === null || last === null) return;
+    setLoadingMore(true);
+    const options: ContentPage =
+      direction === 'earlier'
+        ? { start: Math.max(1, first - WINDOW_RADIUS), end: first - 1 }
+        : direction === 'later'
+          ? { start: last + 1, end: last + WINDOW_RADIUS }
+          : {};
+    void fetchPage(options, (content) => {
+      setLoaded((prev) => {
+        if (!prev) return prev;
+        const merged =
+          direction === 'all'
+            ? content.chunks
+            : direction === 'earlier'
+              ? [...content.chunks, ...prev.chunks]
+              : [...prev.chunks, ...content.chunks];
+        return { ...prev, chunks: merged, total: content.total_chunks ?? prev.total };
+      });
+    }).finally(() => setLoadingMore(false));
+  };
 
   useEffect(() => {
     if (!targetRef.current || lastScrolledChunkIdRef.current === chunkId) return;
     targetRef.current.scrollIntoView({ block: 'center' });
     lastScrolledChunkIdRef.current = chunkId;
-  }, [visibleChunks, chunkId]);
+  }, [chunks, chunkId]);
 
   return (
     <div
@@ -116,17 +149,27 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
         <div className="document-viewer__body">
           {error && <p className="document-viewer__error" role="alert">{error}</p>}
           {!error && chunks === null && <p className="document-viewer__loading">Loading…</p>}
-          {chunks && !showAll && windowStart > 0 && (
+          {/* Chunk ids hash the chunk text, so a re-index or re-upload since the answer
+              leaves the citation pointing at a passage that no longer exists. Opening at
+              the top with nothing highlighted read as a broken link. */}
+          {chunks && chunkId !== null && loaded?.targetFound === false && (
+            <p className="document-viewer__notice" role="status" data-testid="viewer-passage-missing">
+              This passage changed since the answer was written — the document has been
+              re-indexed. Showing the document from the start.
+            </p>
+          )}
+          {chunks && hiddenBefore > 0 && (
             <button
               type="button"
               className="document-viewer__load-more"
-              onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_RADIUS))}
+              onClick={() => loadMore('earlier')}
+              disabled={loadingMore}
               data-testid="viewer-load-earlier"
             >
-              Load earlier ({windowStart} hidden)
+              Load earlier ({hiddenBefore} hidden)
             </button>
           )}
-          {visibleChunks.map((chunk) => {
+          {(chunks ?? []).map((chunk) => {
             const isTarget = chunkId !== null && chunk.chunk_id === chunkId;
             return (
               <div
@@ -144,24 +187,26 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
               </div>
             );
           })}
-          {chunks && !showAll && windowEnd !== null && windowEnd < chunks.length && (
+          {chunks && hiddenAfter > 0 && (
             <button
               type="button"
               className="document-viewer__load-more"
-              onClick={() => setWindowEnd(Math.min(chunks.length, (windowEnd ?? 0) + WINDOW_RADIUS))}
+              onClick={() => loadMore('later')}
+              disabled={loadingMore}
               data-testid="viewer-load-later"
             >
-              Load later ({chunks.length - windowEnd} hidden)
+              Load later ({hiddenAfter} hidden)
             </button>
           )}
-          {chunks && !showAll && chunks.length > visibleChunks.length && (
+          {chunks && loaded && hiddenBefore + hiddenAfter > 0 && (
             <button
               type="button"
               className="document-viewer__show-all"
-              onClick={() => setShowAll(true)}
+              onClick={() => loadMore('all')}
+              disabled={loadingMore}
               data-testid="viewer-show-all"
             >
-              Show all {chunks.length} chunks
+              Show all {loaded.total} chunks
             </button>
           )}
         </div>

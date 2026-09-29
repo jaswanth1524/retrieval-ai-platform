@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 from collections.abc import Iterator, Sequence
@@ -54,7 +55,10 @@ CHUNKER_VERSION = 3
 # behind an opening quote/bracket), OR a blank line. Windows prefer to break here rather
 # than mid-sentence. Not linguistically perfect (abbreviations, decimals) — a pragmatic
 # heuristic that keeps most chunk edges on real sentence ends.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])|\n{2,}")
+# Latin sentence ends need a following space and capital; CJK full-width ones (。！？)
+# end a sentence on their own — CJK has no spaces, so without them a whole Chinese or
+# Japanese paragraph was one "sentence".
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])|(?<=[。！？])\s*|\n{2,}")
 
 
 class DocumentError(ValueError):
@@ -130,17 +134,21 @@ class DocumentChunk:
     # algorithm can be found and re-indexed from its stored original. None (key absent)
     # on points indexed before it was stamped — those count as stale.
     chunker_version: int | None = None
+    # Document-level labels (PATCH /documents/{filename}/tags), stamped on every chunk
+    # so a question can be scoped by tag with the same payload filter as by filename.
+    tags: tuple[str, ...] = ()
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
     PAYLOAD_BYTE_SIZE_KEY: ClassVar[str] = "byte_size"
     PAYLOAD_UPLOADED_AT_KEY: ClassVar[str] = "uploaded_at"
     PAYLOAD_CHUNKER_VERSION_KEY: ClassVar[str] = "chunker_version"
+    PAYLOAD_TAGS_KEY: ClassVar[str] = "tags"
 
-    def to_payload(self) -> dict[str, str | int | float]:
+    def to_payload(self) -> dict[str, str | int | float | list[str]]:
         """Return the Qdrant payload shape needed for grounded citations."""
 
-        payload: dict[str, str | int | float] = {
+        payload: dict[str, str | int | float | list[str]] = {
             "filename": self.filename,
             "page": self.page,
             "section": self.section,
@@ -154,6 +162,8 @@ class DocumentChunk:
             payload[self.PAYLOAD_UPLOADED_AT_KEY] = self.uploaded_at
         if self.chunker_version is not None:
             payload[self.PAYLOAD_CHUNKER_VERSION_KEY] = self.chunker_version
+        if self.tags:
+            payload[self.PAYLOAD_TAGS_KEY] = list(self.tags)
         return payload
 
 
@@ -297,10 +307,11 @@ def _split_oversized(
 ) -> list[tuple[str, int]]:
     """Greedily pack a single sentence's words into <=budget-token pieces.
 
-    A sentence within budget is returned unchanged. A single word longer than budget
-    is still emitted alone (a word cannot be split) — the only case a unit exceeds
-    budget, and rare enough to accept. Each piece comes back with its token count so
-    the caller doesn't tokenize every sentence a second time.
+    A sentence within budget is returned unchanged. A "word" longer than budget — a
+    base64 blob, a long URL, a run of unspaced CJK — is cut by characters (see
+    ``_split_long_word``); it used to be emitted whole and silently truncated by the
+    embedder at 512 tokens. Each piece comes back with its token count so the caller
+    doesn't tokenize every sentence a second time.
     """
 
     sentence_tokens = token_counter.count(sentence)
@@ -316,8 +327,14 @@ def _split_oversized(
     pieces: list[tuple[str, int]] = []
     current: list[str] = []
     current_tokens = 0
+    words: list[tuple[str, int]] = []
     for word in sentence.split():
         word_tokens = token_counter.count(word)
+        if word_tokens > budget:
+            words.extend(_split_long_word(word, budget, token_counter))
+        else:
+            words.append((word, word_tokens))
+    for word, word_tokens in words:
         if current and current_tokens + word_tokens > budget:
             pieces.append((" ".join(current), current_tokens))
             current = [word]
@@ -327,6 +344,28 @@ def _split_oversized(
             current_tokens += word_tokens
     if current:
         pieces.append((" ".join(current), current_tokens))
+    return pieces
+
+
+def _split_long_word(word: str, budget: int, token_counter: TokenCounter) -> list[tuple[str, int]]:
+    """Cut one over-budget run of characters into pieces of at most ``budget`` tokens."""
+
+    pieces: list[tuple[str, int]] = []
+    rest = word
+    while rest:
+        total = token_counter.count(rest)
+        if total <= budget:
+            pieces.append((rest, total))
+            break
+        # Start from the proportional guess and shrink until it fits; each piece takes
+        # at least one character, so this always advances.
+        length = max(1, len(rest) * budget // total)
+        piece_tokens = token_counter.count(rest[:length])
+        while length > 1 and piece_tokens > budget:
+            length = max(1, length * budget // max(piece_tokens, 1) - 1)
+            piece_tokens = token_counter.count(rest[:length])
+        pieces.append((rest[:length], piece_tokens))
+        rest = rest[length:]
     return pieces
 
 
@@ -433,9 +472,7 @@ def _merge_semantic_run(
         merged.append(replace(section, text=text))
     if pending:
         if merged:
-            merged[-1] = replace(
-                merged[-1], text=merged[-1].text + "\n\n" + "\n\n".join(pending)
-            )
+            merged[-1] = replace(merged[-1], text=merged[-1].text + "\n\n" + "\n\n".join(pending))
         else:
             merged.append(replace(run[-1], text="\n\n".join(pending)))
     return merged
@@ -453,13 +490,33 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
         reader = PdfReader(BytesIO(content))
     except Exception as exc:  # pypdf raises several parser-specific exceptions.
         raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
+    if reader.is_encrypted:
+        # An owner-password-only PDF opens with the empty user password; anything else
+        # can't be read, and used to fail as an "unexpected server error".
+        try:
+            decrypted = reader.decrypt("")
+        except Exception as exc:
+            raise DocumentParseError(f"PDF '{filename}' is password-protected.") from exc
+        if not decrypted:
+            raise DocumentParseError(f"PDF '{filename}' is password-protected.")
 
-    tables_by_page = _extract_pdf_tables(content)
+    tables_by_page = _extract_pdf_tables(content, _pages_that_draw_lines(reader))
 
     sections: list[DocumentSection] = []
     empty_pages: list[int] = []
     for page_number, page in enumerate(reader.pages, start=1):
-        text = normalize_text(page.extract_text() or "")
+        try:
+            text = normalize_text(page.extract_text() or "")
+        except Exception:
+            # One malformed content stream shouldn't fail the whole document; the page
+            # goes to OCR like a page with no text layer.
+            logger.warning(
+                "PDF %s: could not extract text from page %d.",
+                filename,
+                page_number,
+                exc_info=True,
+            )
+            text = ""
         table_blocks = tables_by_page.get(page_number, [])
         if table_blocks:
             table_text = "\n\n".join(f"[Table]\n{block}" for block in table_blocks)
@@ -511,28 +568,58 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
     return sections
 
 
-def _extract_pdf_tables(content: bytes) -> dict[int, list[str]]:
+# Content-stream operators that draw a rectangle or a line, plus XObject paints (a
+# form can draw either). A table's ruling edges need one of them; text doesn't.
+_RULING_OPERATOR_RE = re.compile(rb"(?<![A-Za-z])(?:re|l|Do)(?![A-Za-z])")
+
+
+def _pages_that_draw_lines(reader: PdfReader) -> set[int] | None:
+    """1-based pages whose content stream draws rectangles, lines or XObjects.
+
+    A cheap byte scan of the stream pypdf already decoded — laying a page out with
+    pdfplumber just to learn it has no ruling edges parsed most prose PDFs twice.
+    Over-inclusive by design (an "l" inside a text string counts): a false positive
+    only costs the old full check. None when a stream can't be read: check every page.
+    """
+
+    pages: set[int] = set()
+    try:
+        for page_number, page in enumerate(reader.pages, start=1):
+            contents = page.get_contents()
+            if contents is None:
+                continue
+            if _RULING_OPERATOR_RE.search(contents.get_data()):
+                pages.add(page_number)
+    except Exception:
+        return None
+    return pages
+
+
+def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[int, list[str]]:
     """Return page-number -> rendered Markdown tables. Best-effort: failure -> {}.
 
     Table extraction is enrichment, never a parse gate — any pdfplumber error (or a
-    page with no tables) simply yields no table text for that document/page.
+    page with no tables) simply yields no table text for that document/page. ``pages``
+    limits the work to those 1-based pages (None: all of them).
     """
 
+    if pages is not None and not pages:
+        return {}
     try:
         import pdfplumber
 
         result: dict[int, list[str]] = {}
         with pdfplumber.open(BytesIO(content)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
+                if pages is not None and page_number not in pages:
+                    continue
                 try:
                     # The default "lines" strategy builds tables only from ruling edges
                     # (rects, lines, curves); a page with none can't yield one, so skip
                     # the table finder — most pages of a prose PDF.
                     if not (page.rects or page.lines or page.curves):
                         continue
-                    blocks = [
-                        _table_to_markdown(table) for table in page.extract_tables() if table
-                    ]
+                    blocks = [_table_to_markdown(table) for table in page.extract_tables() if table]
                     blocks = [block for block in blocks if block]
                     if blocks:
                         result[page_number] = blocks
@@ -705,10 +792,7 @@ def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
             else:
                 buffer.append(text)
         elif isinstance(block, Table):
-            rows = [
-                " | ".join(cell.text.strip() for cell in row.cells)
-                for row in block.rows
-            ]
+            rows = [" | ".join(cell.text.strip() for cell in row.cells) for row in block.rows]
             table_text = "\n".join(row for row in rows if row.strip())
             if table_text:
                 buffer.append(table_text)
@@ -742,6 +826,7 @@ def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
     """Extract readable HTML text, splitting on h1-h6 into semantic sections."""
 
     from bs4 import BeautifulSoup
+    from bs4.element import CData, PreformattedString
 
     soup = BeautifulSoup(text, "html.parser")
     for element in soup(list(_HTML_STRIP_TAGS)):
@@ -774,6 +859,10 @@ def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
             current_section = element.get_text(" ", strip=True)[:120] or DEFAULT_SECTION
             buffer = []
         elif name is None:  # NavigableString
+            # Comments, doctypes and processing instructions aren't rendered text: an
+            # invisible <!-- ... --> would otherwise reach the prompt as a source.
+            if isinstance(element, PreformattedString) and not isinstance(element, CData):
+                continue
             chunk = str(element).strip()
             if chunk:
                 buffer.append(chunk)
@@ -784,9 +873,7 @@ def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
         whole = normalize_text(soup.get_text(" ", strip=True))
         if not whole:
             raise EmptyDocumentError(f"HTML '{filename}' has no extractable text.")
-        return [
-            DocumentSection(filename=filename, page=1, section=current_section, text=whole)
-        ]
+        return [DocumentSection(filename=filename, page=1, section=current_section, text=whole)]
     return sections
 
 
@@ -798,17 +885,22 @@ def parse_csv_document(
     import csv
 
     rows_per_section = (
-        int(settings.csv_rows_per_section) if settings is not None
+        int(settings.csv_rows_per_section)
+        if settings is not None
         else _DEFAULT_CSV_ROWS_PER_SECTION
     )
-    lines = text.splitlines()
     try:
         dialect = csv.Sniffer().sniff(text[:2048])
         delimiter = dialect.delimiter
     except csv.Error:
         delimiter = ","
-    reader = csv.reader(lines, delimiter=delimiter)
-    records = [row for row in reader if any(cell.strip() for cell in row)]
+    # A stream with newline="", as the csv module requires: str.splitlines() cut quoted
+    # multi-line cells apart and also split on \u2028/\x0c inside a cell.
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+    try:
+        records = [row for row in reader if any(cell.strip() for cell in row)]
+    except csv.Error as exc:  # e.g. a field past csv.field_size_limit()
+        raise DocumentParseError(f"Could not parse CSV '{filename}': {exc}") from exc
     if not records:
         raise EmptyDocumentError(f"CSV '{filename}' has no rows.")
 
@@ -835,9 +927,7 @@ def parse_csv_document(
         first_row = start + 2  # 1-based, and row 1 is the header
         last_row = start + len(group) + 1
         label = f"Rows {first_row}-{last_row}"
-        sections.append(
-            DocumentSection(filename=filename, page=1, section=label, text=text_block)
-        )
+        sections.append(DocumentSection(filename=filename, page=1, section=label, text=text_block))
     if not sections:
         raise EmptyDocumentError(f"CSV '{filename}' has no data rows.")
     return sections
@@ -976,6 +1066,43 @@ def parse_plain_text_document(filename: str, text: str) -> list[DocumentSection]
         DocumentSection(filename=filename, page=1, section=infer_section(paragraph), text=paragraph)
         for paragraph in paragraphs
     ]
+
+
+MAX_TAGS_PER_DOCUMENT = 20
+MAX_TAG_LENGTH = 40
+
+
+def normalize_tags(tags: Sequence[str]) -> tuple[str, ...]:
+    """Trimmed, whitespace-collapsed, de-duplicated (case-insensitively), in given order.
+
+    Raises ``UnsupportedDocumentError`` (a 400) for an empty or over-long tag, or too
+    many of them.
+    """
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in tags:
+        tag = " ".join(raw.split())
+        if not tag or len(tag) > MAX_TAG_LENGTH or any(ord(char) < 32 for char in tag):
+            raise UnsupportedDocumentError(f"Tags must be 1-{MAX_TAG_LENGTH} printable characters.")
+        if tag.casefold() in seen:
+            continue
+        seen.add(tag.casefold())
+        result.append(tag)
+    if len(result) > MAX_TAGS_PER_DOCUMENT:
+        raise UnsupportedDocumentError(f"A document can have at most {MAX_TAGS_PER_DOCUMENT} tags.")
+    return tuple(result)
+
+
+def contextual_text(filename: str, section: str, text: str) -> str:
+    """``text`` prefixed with where it came from, as the embedders and reranker see it.
+
+    One definition for both stages: the dense and sparse models embed chunks with this
+    prefix, and the cross-encoder scores the same string, so a question naming a
+    document or heading keeps that signal at the stage that applies rerank_min_score.
+    """
+
+    return f"{filename} › {section}\n{text}"
 
 
 def normalize_filename(filename: str) -> str:

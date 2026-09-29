@@ -119,8 +119,14 @@ def run_ragas_evaluation(
     evaluate_func: Callable[..., Any] | None = None,
     dataset_factory: Callable[[list[dict[str, Any]]], Any] | None = None,
     metric_objects: Sequence[Any] | None = None,
+    llm: Any | None = None,
+    embeddings: Any | None = None,
 ) -> Any:
-    """Run RAGAS evaluation on prepared examples."""
+    """Run RAGAS evaluation on prepared examples.
+
+    ``llm``/``embeddings`` are RAGAS wrappers (see ``load_judges``); None leaves RAGAS
+    on its own default, which is OpenAI and needs OPENAI_API_KEY.
+    """
 
     rows = [example.to_ragas_row() for example in require_examples(list(examples))]
 
@@ -128,12 +134,70 @@ def run_ragas_evaluation(
         evaluate_func, dataset_factory, metric_objects = load_ragas_runtime(metric_names)
 
     dataset = dataset_factory(rows)
+    judges: dict[str, Any] = {}
+    if llm is not None:
+        judges["llm"] = llm
+    if embeddings is not None:
+        judges["embeddings"] = embeddings
     return evaluate_func(
         dataset=dataset,
         metrics=list(metric_objects),
         raise_exceptions=False,
         show_progress=False,
+        **judges,
     )
+
+
+def load_judges(llm_model: str | None, embeddings: str | None) -> tuple[Any, Any]:
+    """RAGAS judge wrappers: an LLM through LiteLLM, and optionally local embeddings.
+
+    ``llm_model`` is any LiteLLM model string (``ollama_chat/qwen2.5``,
+    ``gpt-4o-mini``), so scoring can stay on the machine. ``embeddings="fastembed"``
+    uses the same local dense model DocRAG embeds with.
+    """
+
+    llm = None
+    embedder = None
+    try:
+        if llm_model:
+            from langchain_community.chat_models import ChatLiteLLM
+            from ragas.llms import LangchainLLMWrapper
+
+            llm = LangchainLLMWrapper(ChatLiteLLM(model=llm_model, temperature=0))
+        if embeddings == "fastembed":
+            from langchain_community.embeddings import FastEmbedEmbeddings
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+
+            embedder = LangchainEmbeddingsWrapper(
+                FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+            )
+    except ImportError as exc:
+        raise RagasUnavailableError(
+            "The judge wrappers need the eval extra (uv sync --extra eval)."
+        ) from exc
+    return llm, embedder
+
+
+def all_scores_missing(payload: Mapping[str, Any]) -> bool:
+    """True when RAGAS produced no usable score at all.
+
+    ``raise_exceptions=False`` turns every failed judge call (no OPENAI_API_KEY, an
+    unreachable model) into NaN, so a run that scored nothing looked like it worked.
+    """
+
+    rows = payload.get("rows")
+    values: list[Any] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, Mapping):
+                values.extend(
+                    value
+                    for key, value in row.items()
+                    if isinstance(value, int | float) and key not in ("index",)
+                )
+    else:
+        values = [value for value in payload.values() if isinstance(value, int | float)]
+    return not values or all(value != value for value in values)  # NaN != NaN
 
 
 def load_ragas_runtime(
@@ -249,6 +313,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, help="Optional JSON output path.")
     parser.add_argument(
+        "--llm",
+        help=(
+            "LiteLLM model the metrics use as judge, e.g. ollama_chat/qwen2.5 (local) or "
+            "gpt-4o-mini. Default: RAGAS's own OpenAI default, which needs OPENAI_API_KEY."
+        ),
+    )
+    parser.add_argument(
+        "--embeddings",
+        choices=("fastembed",),
+        help="Local embeddings for the metrics that need them (default: OpenAI's).",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help=(
@@ -279,11 +355,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         examples = load_examples(args.dataset)
         metric_names = parse_metric_names(args.metrics)
-        result = run_ragas_evaluation(examples, metric_names=metric_names)
+        llm, embeddings = load_judges(args.llm, args.embeddings)
+        result = run_ragas_evaluation(
+            examples, metric_names=metric_names, llm=llm, embeddings=embeddings
+        )
         payload = result_to_jsonable(result)
     except (EvaluationDataError, RagasUnavailableError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if all_scores_missing(payload):
+        print(
+            "error: RAGAS returned no scores (every judge call failed). Without --llm it "
+            "uses OpenAI and needs OPENAI_API_KEY; see the log above.",
+            file=sys.stderr,
+        )
+        return 1
 
     output = json.dumps(payload, indent=2, sort_keys=True)
     if args.output:
@@ -295,4 +381,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
