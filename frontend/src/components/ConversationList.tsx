@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { ConversationSummary } from '../hooks/useChat';
 import { formatRelativeTimeAgo } from '../utils/relativeTime';
@@ -24,6 +24,18 @@ function ConversationList({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  // Row index to put focus back on once a confirmed delete has re-rendered the list;
+  // the focused Delete button unmounts with its row, dropping focus to <body>.
+  const refocusIndexRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const index = refocusIndexRef.current;
+    if (index === null) return;
+    refocusIndexRef.current = null;
+    const rows = listRef.current?.querySelectorAll<HTMLElement>('.conversation-list__select');
+    if (rows && rows.length > 0) rows[Math.min(index, rows.length - 1)].focus();
+  }, [conversations]);
 
   // A confirm dropped mid-flow (switched conversation, or the row it belonged to
   // vanished) should never linger — deliberately not keyed on `conversations` itself,
@@ -50,13 +62,16 @@ function ConversationList({
   };
 
   const handleConfirmKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'Escape') setConfirmingDeleteId(null);
+    if (event.key !== 'Escape') return;
+    // Cancels the confirm only — not the narrow-screen drawer the list may sit in.
+    event.stopPropagation();
+    setConfirmingDeleteId(null);
   };
 
   return (
-    <>
-      {conversations.map((conversation) => (
-        <div key={conversation.id} className="conversation-list__row-wrap" data-testid="conversation-item">
+    <ul ref={listRef} className="conversation-list" aria-label="Conversations">
+      {conversations.map((conversation, index) => (
+        <li key={conversation.id} className="conversation-list__row-wrap" data-testid="conversation-item">
           {confirmingDeleteId === conversation.id ? (
             <div className="conversation-list__confirm" onKeyDown={handleConfirmKeyDown}>
               <span className="conversation-list__confirm-text">Delete this conversation?</span>
@@ -73,6 +88,7 @@ function ConversationList({
                   type="button"
                   className="conversation-list__confirm-delete"
                   onClick={() => {
+                    refocusIndexRef.current = index;
                     onDelete(conversation.id);
                     setConfirmingDeleteId(null);
                   }}
@@ -92,6 +108,7 @@ function ConversationList({
               onKeyDown={(event) => {
                 if (event.key === 'Enter') commitEditing();
                 if (event.key === 'Escape') {
+                  event.stopPropagation();
                   setEditingId(null);
                   setDraftTitle('');
                 }
@@ -111,6 +128,7 @@ function ConversationList({
                 onDoubleClick={() => startEditing(conversation)}
                 disabled={disabled}
                 title={conversation.title}
+                aria-current={conversation.id === activeId ? 'true' : undefined}
                 data-testid="conversation-select"
               >
                 <span className="conversation-list__title">{conversation.title}</span>
@@ -124,6 +142,7 @@ function ConversationList({
                   type="button"
                   className="conversation-list__row-action"
                   onClick={() => startEditing(conversation)}
+                  disabled={disabled}
                   aria-label={`Rename ${conversation.title}`}
                 >
                   ✎
@@ -140,9 +159,9 @@ function ConversationList({
               </span>
             </div>
           )}
-        </div>
+        </li>
       ))}
-    </>
+    </ul>
   );
 }
 

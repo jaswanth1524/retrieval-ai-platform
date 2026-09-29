@@ -164,19 +164,30 @@ def timings_dict(timings: StageTimings) -> dict[str, float]:
 # Below this, a suffix/prefix match between adjacent chunks is more likely a
 # coincidence (a shared "the"/"and") than the sentence overlap chunking wrote.
 _MIN_OVERLAP_CHARS = 20
+# Upper bound on characters per dense-model token, used only to cap how much text an
+# overlap can span. Real text averages ~4; this is generous so a genuine overlap of
+# long words is never missed.
+_MAX_CHARS_PER_TOKEN = 10
 
 
-def _strip_overlap(previous: str, following: str) -> str:
+def _strip_overlap(previous: str, following: str, overlap_tokens: int) -> str:
     """Drop the prefix of ``following`` that repeats the tail of ``previous``.
 
-    Adjacent chunks share ``chunk_overlap_tokens`` of whole trailing sentences (chunks
-    are space-joined sentences), so a word-boundary suffix/prefix match finds exactly
-    the text written twice. Returns "" when ``following`` lies entirely inside that
-    tail, and ``following`` unchanged when no overlap is found.
+    Adjacent chunks share up to ``overlap_tokens`` of whole trailing sentences (chunks
+    are space-joined sentences), so a word-boundary suffix/prefix match finds the text
+    written twice. Returns "" when ``following`` lies entirely inside that tail, and
+    ``following`` unchanged when no overlap is found (or chunking used none).
+
+    The *shortest* match wins and the match is capped near the configured overlap:
+    in repetitive text (identical CSV rows, log lines) several lengths match, and
+    over-trimming would silently drop real content while under-trimming only resends
+    a line the model already saw.
     """
 
-    limit = min(len(previous), len(following))
-    for end in range(limit, _MIN_OVERLAP_CHARS - 1, -1):
+    if overlap_tokens <= 0:
+        return following
+    limit = min(len(previous), len(following), overlap_tokens * _MAX_CHARS_PER_TOKEN)
+    for end in range(_MIN_OVERLAP_CHARS, limit + 1):
         if end < len(following) and not following[end].isspace():
             continue
         start = len(previous) - end
@@ -212,6 +223,7 @@ def expand_with_neighbors(
     radius = int(settings.context_neighbor_radius)
     if radius <= 0:
         return list(chunks)
+    overlap_tokens = int(settings.chunk_overlap_tokens)
 
     def wanted_ordinals(chunk: RerankedChunk) -> list[int]:
         assert chunk.chunk_ordinal is not None
@@ -271,7 +283,7 @@ def expand_with_neighbors(
         previous: tuple[int, str] | None = None
         for ordinal, text in parts:
             if previous is not None and ordinal == previous[0] + 1:
-                trimmed = _strip_overlap(previous[1], text)
+                trimmed = _strip_overlap(previous[1], text, overlap_tokens)
             else:
                 trimmed = text
             if trimmed:
@@ -871,11 +883,15 @@ class IngestService:
         content: bytes,
         on_progress: Callable[[int, int], None] | None = None,
         on_indexed: Callable[[], None] | None = None,
+        uploaded_at: float | None = None,
+        precondition: Callable[[], None] | None = None,
     ) -> DocumentIngestOutcome:
         """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
 
         ``on_indexed`` runs under the filename write lock once indexing succeeded (see
-        ``ingest_chunks``).
+        ``ingest_chunks``). ``uploaded_at`` overrides the upload stamp — a re-index of a
+        stored original keeps the document's original upload time rather than "now".
+        ``precondition`` is checked under that lock before anything is written.
         """
 
         sections = parse_document_bytes(filename, content, self._settings)
@@ -883,10 +899,16 @@ class IngestService:
         # Stamped here (not in chunk_sections) because this is the first point in the
         # pipeline that has both the raw upload's byte count and the upload instant —
         # chunking itself works purely from parsed text.
-        upload_stamp = time.time()
+        upload_stamp = uploaded_at if uploaded_at is not None else time.time()
         upload_size = len(content)
         chunks = [
-            replace(chunk, byte_size=upload_size, uploaded_at=upload_stamp) for chunk in chunks
+            replace(
+                chunk,
+                byte_size=upload_size,
+                uploaded_at=upload_stamp,
+                chunker_version=CHUNKER_VERSION,
+            )
+            for chunk in chunks
         ]
         logger.info(
             "Chunked %s into %d chunks (chunker v%d).",
@@ -901,6 +923,7 @@ class IngestService:
             self._embedding_provider,
             on_progress,
             on_indexed,
+            precondition,
         )
         return DocumentIngestOutcome(
             filename=sections[0].filename,

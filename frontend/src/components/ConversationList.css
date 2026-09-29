@@ -1,3 +1,12 @@
+.conversation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
 .conversation-list__row-wrap {
   display: flex;
 }
@@ -67,6 +76,14 @@
 .conversation-list__row:hover .conversation-list__row-actions,
 .conversation-list__row:focus-within .conversation-list__row-actions {
   opacity: 1;
+}
+
+/* Touch screens have no hover: without this, rename/delete were invisible until a tap
+   happened to focus the row. */
+@media (hover: none) {
+  .conversation-list__row-actions {
+    opacity: 1;
+  }
 }
 
 .conversation-list__row-action {

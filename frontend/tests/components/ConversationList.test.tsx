@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import ConversationList from '../../src/components/ConversationList';
@@ -34,6 +34,44 @@ describe('ConversationList', () => {
     expect(rows[0]).toHaveTextContent('4 turns');
     expect(rows[1]).toHaveTextContent('9 turns');
     expect(rows[0].closest('.conversation-list__row')).toHaveClass('conversation-list__row--active');
+  });
+
+  it('is a labelled list that exposes the active conversation to assistive tech', () => {
+    setup();
+    const list = screen.getByRole('list', { name: 'Conversations' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+    const rows = screen.getAllByTestId('conversation-select');
+    expect(rows[0]).toHaveAttribute('aria-current', 'true');
+    expect(rows[1]).not.toHaveAttribute('aria-current');
+  });
+
+  it('keeps keyboard focus in the list after a confirmed delete', async () => {
+    const onDelete = vi.fn();
+    const { rerender } = render(
+      <ConversationList
+        conversations={CONVERSATIONS}
+        activeId="c1"
+        onSwitch={vi.fn()}
+        onRename={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Delete First chat' }));
+    await userEvent.click(screen.getByTestId('conversation-delete-confirm'));
+    expect(onDelete).toHaveBeenCalledWith('c1');
+
+    rerender(
+      <ConversationList
+        conversations={CONVERSATIONS.slice(1)}
+        activeId="c2"
+        onSwitch={vi.fn()}
+        onRename={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    // The focused Delete button unmounted with its row; focus lands on the row that
+    // took its place instead of falling back to <body>.
+    expect(screen.getByTestId('conversation-select')).toHaveFocus();
   });
 
   it('fires onSwitch with the conversation id', async () => {

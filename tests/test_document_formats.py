@@ -216,6 +216,96 @@ def test_parse_pdf_mixed_without_ocr_extra_keeps_the_text_pages(
     assert [section.page for section in sections] == [1]
 
 
+def test_parse_pdf_mixed_keeps_text_pages_when_ocr_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OCR running on a mixed PDF is new; its failure must not fail a document that
+    ingested fine before (its text pages)."""
+
+    monkeypatch.setattr(documents, "PdfReader", _MixedReader)
+    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content: {})
+
+    def broken_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
+        raise RuntimeError("onnxruntime could not load the detection model")
+
+    monkeypatch.setattr(documents, "_ocr_pdf_pages", broken_ocr)
+
+    sections = parse_document_bytes("mixed.pdf", b"not a real pdf")
+
+    assert [section.page for section in sections] == [1]
+
+
+def test_parse_pdf_fully_scanned_still_fails_when_ocr_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyReader:
+        def __init__(self, stream: object) -> None:
+            class EmptyPage:
+                def extract_text(self) -> str:
+                    return ""
+
+            self.pages = [EmptyPage()]
+
+    monkeypatch.setattr(documents, "PdfReader", EmptyReader)
+    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content: {})
+
+    def broken_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(documents, "_ocr_pdf_pages", broken_ocr)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        parse_document_bytes("scanned.pdf", b"not a real pdf")
+
+
+def test_ocr_pdf_pages_skips_a_page_whose_ocr_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-page isolation: page 2 raising inside OCR still returns page 3's text."""
+
+    import sys
+    import types
+
+    import numpy as np
+
+    class FakeImage:
+        def __init__(self, page_number: int) -> None:
+            self.original = np.full((2, 2), page_number, dtype=np.uint8)
+
+    class FakePage:
+        def __init__(self, page_number: int) -> None:
+            self.page_number = page_number
+
+        def to_image(self, resolution: int) -> FakeImage:
+            if self.page_number == 2:
+                raise ValueError("unsupported image colorspace")
+            return FakeImage(self.page_number)
+
+    class FakePdf:
+        pages = [FakePage(1), FakePage(2), FakePage(3)]
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_engine(image: Any) -> tuple[list[Any], float]:
+        return [[None, f"Scanned text of page {int(image[0][0])}."]], 0.0
+
+    fake_pdfplumber = types.ModuleType("pdfplumber")
+    fake_pdfplumber.open = lambda stream: FakePdf()  # type: ignore[attr-defined]
+    fake_rapidocr = types.ModuleType("rapidocr_onnxruntime")
+    fake_rapidocr.RapidOCR = object  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pdfplumber", fake_pdfplumber)
+    monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", fake_rapidocr)
+    monkeypatch.setattr(documents, "_get_ocr_engine", lambda engine_cls: fake_engine)
+
+    sections = documents._ocr_pdf_pages("scan.pdf", b"%PDF", [2, 3])
+
+    assert [(section.page, section.text) for section in sections] == [
+        (3, "Scanned text of page 3."),
+    ]
+
+
 def test_extract_pdf_tables_skips_pages_without_ruling_edges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,3 +344,33 @@ def test_extract_pdf_tables_skips_pages_without_ruling_edges(
     assert list(tables) == [2]
     assert "latency | 5ms" in tables[2][0]
     assert closed == [1, 2]
+
+
+def test_parse_docx_refuses_a_zip_bomb_before_inflating_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upload cap bounds compressed bytes only; a small DOCX declaring huge members
+    must be refused from the zip directory, before python-docx inflates anything."""
+
+    import zipfile
+
+    monkeypatch.setattr(documents, "DOCX_MAX_EXPANDED_BYTES", 1024 * 1024)
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"\0" * (2 * 1024 * 1024))
+    content = buffer.getvalue()
+    assert len(content) < 64 * 1024  # compresses to almost nothing
+
+    def must_not_inflate(stream: object) -> None:
+        raise AssertionError("python-docx was handed the bomb")
+
+    import docx
+
+    monkeypatch.setattr(docx, "Document", must_not_inflate)
+    with pytest.raises(documents.DocumentParseError, match="over the 1 MiB limit"):
+        parse_document_bytes("bomb.docx", content)
+
+
+def test_parse_docx_that_is_not_a_zip_is_a_parse_error() -> None:
+    with pytest.raises(documents.DocumentParseError, match="Could not parse DOCX"):
+        parse_document_bytes("broken.docx", b"not a zip at all")

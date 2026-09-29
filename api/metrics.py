@@ -27,6 +27,17 @@ ingest_jobs_total = Counter(
     labelnames=("outcome", "error_type"),
 )
 
+# Whole-job wall clock (parse through the last upsert), successful or not. Ingest of a
+# large PDF on CPU runs minutes, so the buckets reach well past the question ones.
+INGEST_LATENCY_BUCKETS = (0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200)
+
+ingest_job_seconds = Histogram(
+    "docrag_ingest_job_seconds",
+    "Wall-clock time of each background ingestion job, labeled by outcome.",
+    labelnames=("outcome",),
+    buckets=INGEST_LATENCY_BUCKETS,
+)
+
 ingest_chunks_total = Counter(
     "docrag_ingest_chunks_total",
     "Total document chunks successfully indexed.",

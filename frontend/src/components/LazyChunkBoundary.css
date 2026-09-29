@@ -1,0 +1,26 @@
+.lazy-chunk-boundary {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 95;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 10px 14px;
+  border: 1px solid var(--rule-hi);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 8px 24px rgba(12, 10, 8, 0.3);
+}
+
+.lazy-chunk-boundary button {
+  border: 1px solid var(--rule-hi);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 2px 8px;
+}

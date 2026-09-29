@@ -616,15 +616,47 @@ def test_strip_overlap_removes_only_the_repeated_sentence_prefix() -> None:
     previous = "Alpha sentence one here. Shared overlap sentence goes here."
     following = "Shared overlap sentence goes here. Fresh content follows it."
 
-    assert _strip_overlap(previous, following) == "Fresh content follows it."
+    assert _strip_overlap(previous, following, 20) == "Fresh content follows it."
     # No overlap: unchanged.
-    assert _strip_overlap("Totally different text.", following) == following
+    assert _strip_overlap("Totally different text.", following, 20) == following
     # A coincidental short shared word is not treated as overlap.
-    assert _strip_overlap("ends with the", "the start of something") == "the start of something"
+    assert _strip_overlap("ends with the", "the start of something", 20) == (
+        "the start of something"
+    )
     # Fully contained in the previous tail: nothing new to send.
-    assert _strip_overlap(previous, "Shared overlap sentence goes here.") == ""
+    assert _strip_overlap(previous, "Shared overlap sentence goes here.", 20) == ""
     # Must match at a word boundary in previous too.
-    assert _strip_overlap("xShared overlap sentence goes here.", following) == following
+    assert _strip_overlap("xShared overlap sentence goes here.", following, 20) == following
+
+
+def test_strip_overlap_never_drops_a_genuinely_repeated_line() -> None:
+    """Units [A, X, X, X, C] windowed 3-wide with 1-unit overlap give "A X X" and
+    "X X C": only one X is shared. Taking the longest match used to trim "X X" and
+    lose a real row (duplicate CSV rows, repeated log lines)."""
+
+    row = "status=ok latency=5ms region=eu."
+    previous = f"Header row here. {row} {row}"
+    following = f"{row} {row} Closing row here."
+
+    assert _strip_overlap(previous, following, 12) == f"{row} Closing row here."
+
+
+def test_strip_overlap_is_a_no_op_without_chunk_overlap() -> None:
+    """With CHUNK_OVERLAP_TOKENS=0 nothing is written twice, so any match is a
+    coincidence (a repeated heading) and must be kept."""
+
+    previous = "Intro text. Shared overlap sentence goes here."
+    following = "Shared overlap sentence goes here. More."
+
+    assert _strip_overlap(previous, following, 0) == following
+
+
+def test_strip_overlap_caps_the_match_near_the_configured_overlap() -> None:
+    previous = "Start. " + "word " * 40 + "end of a long shared passage."
+    following = "word " * 40 + "end of a long shared passage. New text."
+
+    # 2 overlap tokens can't span ~230 characters: that match is a coincidence.
+    assert _strip_overlap(previous, following, 2) == following
 
 
 def test_expand_with_neighbors_disabled_by_zero_radius() -> None:

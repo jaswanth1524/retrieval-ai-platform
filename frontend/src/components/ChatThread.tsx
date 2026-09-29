@@ -19,6 +19,9 @@ interface ChatThreadProps {
   onOpenSource?: (filename: string, chunkId: string) => void;
   onCitationHover?: (citation: CitationResponse) => void;
   onCitationLeave?: () => void;
+  /** Indexed documents available to ask about. The empty state told users to upload
+   *  one even when the corpus already had some. Optional (0) for older callers. */
+  documentCount?: number;
 }
 
 // How close to the bottom still counts as "following along". Wide enough to survive
@@ -51,6 +54,7 @@ function ChatThread({
   onOpenSource,
   onCitationHover,
   onCitationLeave,
+  documentCount = 0,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Whether the view should keep tracking the bottom. A ref, not state, so a scroll
@@ -100,7 +104,11 @@ function ChatThread({
   if (turns.length === 0 && !pending) {
     return (
       <div className="chat-thread chat-thread--empty">
-        <p>Upload a document, then ask a question about it.</p>
+        <p>
+          {documentCount > 0
+            ? `Ask a question about your ${documentCount === 1 ? 'document' : `${documentCount} documents`}.`
+            : 'Upload a document, then ask a question about it.'}
+        </p>
       </div>
     );
   }

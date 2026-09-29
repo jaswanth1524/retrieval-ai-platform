@@ -4,6 +4,19 @@ import { configDefaults, defineConfig } from 'vitest/config';
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        // Third-party code changes far less often than app code; separate chunks keep
+        // a returning browser's cached copy valid across app-only deploys.
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) return 'react';
+          return 'vendor';
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {

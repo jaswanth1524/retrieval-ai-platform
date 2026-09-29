@@ -27,6 +27,140 @@ function setup(overrides: Partial<Parameters<typeof CorpusPanel>[0]> = {}) {
 }
 
 describe('CorpusPanel', () => {
+  it('shows a re-upload of an indexed document as that document re-indexing', () => {
+    // A re-upload's name is already indexed, and in-flight cards used to be filtered
+    // out by name — so replacing a document showed no progress at all.
+    setup({
+      filenames: ['a.txt'],
+      chunkCounts: { 'a.txt': 3 },
+      uploads: [
+        {
+          id: 'u1',
+          filename: 'a.txt',
+          status: 'uploading',
+          progress: { state: 'embedding', chunksDone: 2, chunksTotal: 4 },
+        },
+      ],
+    });
+
+    const items = screen.getAllByTestId('corpus-panel-item');
+    expect(items).toHaveLength(1);
+    expect(items[0]).toHaveTextContent('re-indexing 50%');
+  });
+
+  it('focuses Cancel on a delete confirm, and Escape backs out of it', async () => {
+    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 3 } });
+
+    await userEvent.click(screen.getByLabelText('Delete a.txt'));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Delete a.txt')).toBeInTheDocument();
+  });
+
+  it('exposes indexing progress as a progressbar', () => {
+    setup({
+      uploads: [
+        {
+          id: 'u1',
+          filename: 'b.txt',
+          status: 'uploading',
+          progress: { state: 'embedding', chunksDone: 1, chunksTotal: 4 },
+        },
+      ],
+    });
+    expect(screen.getByRole('progressbar', { name: 'Indexing b.txt' })).toHaveAttribute(
+      'aria-valuenow',
+      '25',
+    );
+  });
+
+  it('offers re-index on documents with a stored original and flags stale ones', async () => {
+    const onReindex = vi.fn();
+    setup({
+      filenames: ['old.md', 'new.md', 'no-original.md'],
+      chunkCounts: { 'old.md': 2, 'new.md': 2, 'no-original.md': 2 },
+      staleFilenames: ['old.md', 'no-original.md'],
+      reindexableFilenames: ['old.md', 'new.md'],
+      onReindex,
+    });
+
+    const [oldCard, newCard, noOriginal] = screen.getAllByTestId('corpus-panel-item');
+    expect(oldCard).toHaveTextContent('older chunking');
+    expect(newCard).not.toHaveTextContent('older chunking');
+    // Stale but nothing to re-index from: neither a label the user can't clear nor a
+    // button that would 404.
+    expect(noOriginal).not.toHaveTextContent('older chunking');
+    expect(screen.queryByRole('button', { name: 'Re-index no-original.md' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Re-index old.md' }));
+    expect(onReindex).toHaveBeenCalledWith('old.md');
+    expect(screen.getByRole('button', { name: 'Re-index new.md' })).toBeInTheDocument();
+  });
+
+  it('offers a single bulk re-index once more than one document is stale', async () => {
+    const onReindexAllStale = vi.fn();
+    const props = {
+      filenames: ['a.md', 'b.md'],
+      chunkCounts: { 'a.md': 1, 'b.md': 1 },
+      reindexableFilenames: ['a.md', 'b.md'],
+      onReindex: vi.fn(),
+      onReindexAllStale,
+    };
+    const { unmount } = render(<CorpusPanel {...props} uploads={[]} onUpload={vi.fn()} onDelete={vi.fn()} staleFilenames={['a.md']} />);
+    // One stale document: its own ↻ is enough.
+    expect(screen.queryByTestId('reindex-all-stale')).not.toBeInTheDocument();
+    unmount();
+
+    render(<CorpusPanel {...props} uploads={[]} onUpload={vi.fn()} onDelete={vi.fn()} staleFilenames={['a.md', 'b.md']} />);
+    await userEvent.click(screen.getByTestId('reindex-all-stale'));
+    expect(onReindexAllStale).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('reindex-all-stale')).toHaveTextContent('Re-index 2 documents');
+  });
+
+  it('hides re-index and the stale label entirely when the server keeps no originals', () => {
+    setup({
+      filenames: ['a.md'],
+      chunkCounts: { 'a.md': 1 },
+      staleFilenames: ['a.md'],
+      reindexableFilenames: ['a.md'],
+    });
+    expect(screen.queryByRole('button', { name: 'Re-index a.md' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('corpus-panel-item')).not.toHaveTextContent('older chunking');
+  });
+
+  it('lets a failed upload be retried or dismissed', async () => {
+    const onRetryUpload = vi.fn();
+    const onDismissUpload = vi.fn();
+    setup({
+      filenames: ['a.txt'],
+      chunkCounts: { 'a.txt': 3 },
+      uploads: [
+        {
+          id: 'u1',
+          filename: 'a.txt',
+          status: 'error',
+          error: 'Indexing failed.',
+          file: makeFile('a.txt', 10),
+        },
+        { id: 'u2', filename: 'b.txt', status: 'error', error: 'Rejected.' },
+      ],
+      onRetryUpload,
+      onDismissUpload,
+    });
+
+    // A failed re-upload leaves the previous version indexed: both cards show.
+    expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(3);
+    expect(screen.getByLabelText('Delete a.txt')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry a.txt' }));
+    expect(onRetryUpload).toHaveBeenCalledWith('u1');
+    // No file kept (e.g. restored from an older state): dismiss only.
+    expect(screen.queryByRole('button', { name: 'Retry b.txt' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss b.txt' }));
+    expect(onDismissUpload).toHaveBeenCalledWith('u2');
+  });
+
   it('renders the dropzone with no cards when there are no indexed documents', () => {
     setup();
     expect(screen.getByTestId('upload-dropzone')).toBeInTheDocument();

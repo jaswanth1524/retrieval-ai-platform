@@ -11,7 +11,7 @@ This task plan follows the requested build order and the architecture implied by
 ## Milestone 2: Project Scaffold
 
 - Add `pyproject.toml` for Python 3.12 and `uv`.
-- Create the planned directories: `api/`, `ui/`, `eval/`, and `tests/`.
+- Create the planned directories: `api/`, `ui/` (since replaced by `frontend/`), `eval/`, and `tests/`.
 - Add `docker-compose.yml` for the one-command local run path.
 - Keep services configurable through `.env`.
 - Status: scaffold created without application feature code.
@@ -73,13 +73,13 @@ This task plan follows the requested build order and the architecture implied by
 - Return clear errors for embedding model mismatches, missing indexes, and insufficient context.
 - Status: FastAPI app, public config, document upload/ingest, question-answering endpoint, and domain error mapping added.
 
-## Milestone 10: Streamlit UI
+## Milestone 10: Browser UI
 
 - Provide document upload from the browser.
 - Provide a question input and answer display.
 - Show citations with filename, page, section, and chunk_id.
 - Surface configuration and readiness errors clearly.
-- Status: Streamlit UI and typed API client added.
+- Status: originally a Streamlit UI; replaced by the React + Vite + TypeScript app in `frontend/`, built and served by the API as static files (single origin). See `CLAUDE.md` "Current State" for everything shipped since.
 
 ## Milestone 11: Evaluation
 
@@ -103,4 +103,4 @@ This task plan follows the requested build order and the architecture implied by
 - `jinaai/jina-reranker-v2-base-multilingual` (~1.1 GB) may require more CPU and memory than the dense embedding model.
 - RESOLVED: `BAAI/bge-reranker-v2-m3` is not listed as a supported model by FastEmbed's `TextCrossEncoder` at any released version (confirmed against `main`, not just the pinned `0.8.0`) — not a version-lag issue. Owner approved swapping the default to `jinaai/jina-reranker-v2-base-multilingual`, the strongest model FastEmbed does support.
 - RAGAS evaluation can require an evaluator LLM for some metrics; evaluation remains optional and separate from the core local workflow.
-- The currently resolved RAGAS dependency set fails to import because `ragas 0.4.3` expects `langchain_community.chat_models.vertexai`, which is absent from `langchain-community 0.4.2`; the evaluation runner lazy-loads RAGAS and reports this setup error without breaking the core app.
+- RESOLVED: `ragas 0.4.3` imports `langchain_community.chat_models.vertexai`, which `langchain-community 0.4` removed; the `eval` extra pins `langchain-community<0.4` and CI smoke-imports `ragas` so the break can't return silently.

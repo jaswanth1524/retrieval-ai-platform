@@ -138,7 +138,8 @@ describe('App', () => {
     await screen.findByText('api ok');
 
     await userEvent.keyboard('{Meta>}k{/Meta}');
-    expect(screen.getByTestId('command-palette')).toBeInTheDocument();
+    // Lazy-loaded: the first open resolves its chunk before rendering.
+    expect(await screen.findByTestId('command-palette')).toBeInTheDocument();
 
     // Same chord closes it again.
     await userEvent.keyboard('{Meta>}k{/Meta}');
@@ -206,7 +207,7 @@ describe('App', () => {
 
     expect(screen.queryByTestId('inspector')).not.toBeInTheDocument();
     await userEvent.click(screen.getByTestId('toggle-inspector'));
-    expect(screen.getByTestId('inspector')).toBeInTheDocument();
+    expect(await screen.findByTestId('inspector')).toBeInTheDocument();
 
     await userEvent.click(screen.getByTestId('inspector-close'));
     expect(screen.queryByTestId('inspector')).not.toBeInTheDocument();
@@ -277,7 +278,7 @@ describe('App', () => {
     await userEvent.click(screen.getByTestId('rail-traces'));
     await userEvent.click(await screen.findByTestId('traces-panel-row'));
 
-    expect(screen.getByTestId('inspector')).toBeInTheDocument();
+    expect(await screen.findByTestId('inspector')).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: /engineer/i })).toBeChecked();
     expect(await screen.findByTestId('trace-tab')).toBeInTheDocument();
   });

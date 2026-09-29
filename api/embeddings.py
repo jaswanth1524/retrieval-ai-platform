@@ -77,8 +77,9 @@ class LocalEmbeddingProvider:
         # One long-lived pair of workers instead of a fresh pool per call. Every query
         # embeds, so spawning and joining two OS threads was pure per-request overhead
         # on the hot path. The provider is a process-wide singleton (see
-        # dependencies.get_embedding_provider), so the pool lives as long as the app;
-        # daemon threads let the process exit without an explicit shutdown.
+        # dependencies.get_embedding_provider), so the pool lives as long as the app.
+        # It is never shut down: an ingest still running at app shutdown embeds its
+        # remaining batches here; idle workers exit with the interpreter.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-embed")
         # Queries get their own pair: ingest submits whole 64-chunk batches to the pool
         # above, and a question's two tiny embeds queued behind them waited for the

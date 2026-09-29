@@ -18,6 +18,8 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
       - name: Install dependencies
         run: uv sync --extra dev
@@ -41,6 +43,14 @@ jobs:
 
       - name: Validate eval dataset
         run: uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
+
+      - name: Audit runtime dependencies
+        # What the image ships (core deps) plus the optional OCR extra — the parsers
+        # here read untrusted uploads. The eval extra is excluded: it never ships, and
+        # ragas carries advisories with no fixed release to move to.
+        run: |
+          uv export --frozen --extra ocr --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
+          uvx pip-audit --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
 
   frontend:
     runs-on: ubuntu-latest
@@ -68,6 +78,11 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      - name: Audit runtime dependencies
+        # Runtime packages only (what the browser loads); build/test tooling advisories
+        # never reach a user and are left to Dependabot.
+        run: npm audit --omit=dev --audit-level=high
 
   e2e:
     # After the cheaper frontend gates, so a type/lint/unit failure surfaces first.

@@ -24,6 +24,7 @@ from api.dependencies import (
     get_embedding_provider,
     get_generator,
     get_ingest_backlog,
+    get_ingest_job_store,
     get_ollama_reachability_checker,
     get_qdrant_client,
     get_qdrant_reachability_checker,
@@ -415,6 +416,113 @@ def test_document_upload_releases_its_backlog_bytes_when_the_job_finishes(
             break
         time.sleep(0.01)
     assert backlog.pending_bytes == 0
+
+
+def test_document_upload_during_shutdown_fails_the_job_and_frees_its_bytes(
+    api_context: ApiTestContext,
+) -> None:
+    """An executor that is already shut down used to leave the created job "queued"
+    forever and answer with an unhandled 500."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from api.dependencies import get_ingest_executor
+    from api.jobs import IngestJobStore
+
+    stopped = ThreadPoolExecutor(max_workers=1)
+    stopped.shutdown()
+    backlog = IngestBacklog(max_bytes=1024)
+    job_store = IngestJobStore(max_retained=10)
+    api_context.app.dependency_overrides[get_ingest_executor] = lambda: stopped
+    api_context.app.dependency_overrides[get_ingest_backlog] = lambda: backlog
+    api_context.app.dependency_overrides[get_ingest_job_store] = lambda: job_store
+
+    response = api_context.client.post(
+        "/documents", files={"file": ("guide.txt", b"alpha beta", "text/plain")}
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"]
+    assert backlog.pending_bytes == 0
+    jobs = list(job_store._jobs.values())
+    assert [job.state for job in jobs] == ["failed"]
+    assert "shutting down" in (jobs[0].error or "")
+
+
+def test_lifespan_exit_shuts_the_ingest_pool_down_and_a_new_lifespan_rebuilds_it(
+    api_context: ApiTestContext,
+) -> None:
+    """The pools are lru_cached singletons: shutting one down without clearing its cache
+    handed the next lifespan (a reload, the next TestClient) a dead pool."""
+
+    from api.dependencies import get_ingest_executor
+
+    with TestClient(api_context.app) as client:
+        assert _upload_and_wait(client, "one.txt", b"alpha")["state"] == "done"
+        first_pool = get_ingest_executor()
+    assert first_pool._shutdown
+
+    assert _upload_and_wait(api_context.client, "two.txt", b"beta")["state"] == "done"
+    assert get_ingest_executor() is not first_pool
+
+
+def test_shutdown_lets_a_running_ingest_finish(api_context: ApiTestContext) -> None:
+    """Shutdown cancels only *queued* jobs. One already embedding must still complete —
+    a redeploy mid-upload would otherwise leave half a new version next to the old."""
+
+    import threading
+
+    from api.dependencies import shutdown_executors
+
+    embedding_started = threading.Event()
+    release = threading.Event()
+    inner = api_context.embeddings
+
+    class BlockingEmbeddings:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            embedding_started.set()
+            assert release.wait(5)
+            return inner.embed_texts(texts)
+
+    api_context.app.dependency_overrides[get_embedding_provider] = lambda: BlockingEmbeddings()
+    response = api_context.client.post(
+        "/documents", files={"file": ("slow.txt", b"alpha beta", "text/plain")}
+    )
+    job_id = response.json()["job_id"]
+    assert embedding_started.wait(5)
+
+    shutdown_executors()
+    release.set()
+
+    for _ in range(200):
+        state = api_context.client.get(f"/documents/jobs/{job_id}").json()["state"]
+        if state in ("done", "failed"):
+            break
+        time.sleep(0.01)
+    assert state == "done"
+
+
+def test_a_queued_job_cancelled_by_shutdown_is_failed_and_frees_its_bytes() -> None:
+    from concurrent.futures import Future
+
+    from api.jobs import INTERRUPTED_JOB_ERROR, IngestJobStore
+    from api.main import _finish_ingest_future
+
+    backlog = IngestBacklog(max_bytes=100)
+    assert backlog.try_reserve(40)
+    job_store = IngestJobStore(max_retained=10)
+    job = job_store.create("queued.txt")
+    future: Future[None] = Future()
+    future.add_done_callback(
+        lambda done: _finish_ingest_future(done, backlog, 40, job_store, job.id)
+    )
+
+    assert future.cancel()
+
+    assert backlog.pending_bytes == 0
+    finished = job_store.get(job.id)
+    assert finished is not None
+    assert (finished.state, finished.error) == ("failed", INTERRUPTED_JOB_ERROR)
 
 
 def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -> None:
@@ -1148,6 +1256,41 @@ def _raw_storage_client(
         clear_dependency_caches()
 
 
+def test_document_original_deleted_after_the_existence_check_is_a_404_not_a_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race: path() saw the file, a concurrent DELETE removed it, then the response
+    went to open it. FileResponse opened it only while sending, so that was a 500."""
+
+    from api.raw_documents import RawDocumentStore
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "guide.txt", b"alpha beta")["state"] == "done"
+        stale_path = tmp_path / "guide.txt"
+        stale_path.unlink()  # the DELETE that won the race
+        monkeypatch.setattr(RawDocumentStore, "path", lambda self, filename: stale_path)
+
+        response = client.get("/documents/guide.txt/original")
+
+        assert response.status_code == 404
+
+
+def test_document_original_streams_with_its_length_and_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"x" * 200_000  # several stream blocks
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "big.txt", content)["state"] == "done"
+
+        response = client.get("/documents/big.txt/original")
+
+        assert response.status_code == 200
+        assert response.content == content
+        assert response.headers["content-length"] == str(len(content))
+        assert response.headers["content-type"].startswith("text/plain")
+        assert 'filename="big.txt"' in response.headers["content-disposition"]
+
+
 def test_document_original_serves_a_non_latin1_filename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1529,6 +1672,8 @@ def test_api_key_set_rejects_protected_routes_without_header() -> None:
         content_response = client.get("/documents/guide.txt/content")
         job_response = client.get("/documents/jobs/any-id")
         metrics_response = client.get("/metrics")
+        reindex_response = client.post("/documents/guide.txt/reindex")
+        reindex_all_response = client.post("/documents/reindex")
 
     # Open either way: liveness/readiness probes and the UI's boot request, which has to
     # succeed before the user has anywhere to type a key.
@@ -1547,6 +1692,8 @@ def test_api_key_set_rejects_protected_routes_without_header() -> None:
     # Counters disclose usage volume and corpus growth; an operator who set a key did
     # not intend to publish those.
     assert metrics_response.status_code == 401
+    assert reindex_response.status_code == 401
+    assert reindex_all_response.status_code == 401
 
 
 def test_api_key_set_accepts_protected_routes_with_matching_header() -> None:
@@ -1876,6 +2023,7 @@ def test_metrics_endpoint_exposes_the_question_and_ingest_series(
 
     assert 'docrag_questions_total{error_type="",outcome="ok"}' in body
     assert 'docrag_ingest_jobs_total{error_type="",outcome="done"}' in body
+    assert 'docrag_ingest_job_seconds_count{outcome="done"}' in body
     for stage in ("embed", "search", "rerank", "generate", "total"):
         assert f'docrag_question_stage_seconds_sum{{stage="{stage}"}}' in body
 
@@ -1933,3 +2081,132 @@ def test_a_non_transport_grpc_error_is_a_redacted_500_not_a_false_503(
 
     assert response.status_code == 500
     assert "unavailable" not in response.json()["detail"]
+
+
+def _wait_for_job(client: TestClient, job_id: str) -> dict[str, Any]:
+    for _ in range(300):
+        status: dict[str, Any] = client.get(f"/documents/jobs/{job_id}").json()
+        if status["state"] in ("done", "failed"):
+            return status
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} never finished")
+
+
+def test_reindex_rechunks_a_stale_document_from_its_original_and_keeps_its_upload_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import api.pipeline as pipeline_module
+    from api.documents import CHUNKER_VERSION
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        # Indexed by an older chunker, as a corpus from before a CHUNKER_VERSION bump is.
+        with pytest.MonkeyPatch.context() as older_chunker:
+            older_chunker.setattr(pipeline_module, "CHUNKER_VERSION", CHUNKER_VERSION - 1)
+            uploaded = _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta gamma")
+            assert uploaded["state"] == "done"
+        listing = client.get("/documents").json()
+        assert listing["stale_filenames"] == ["guide.txt"]
+        assert listing["reindexable_filenames"] == ["guide.txt"]
+        uploaded_at = listing["uploaded_ats"]["guide.txt"]
+
+        response = client.post("/documents/guide.txt/reindex")
+        assert response.status_code == 202
+        assert response.json()["filename"] == "guide.txt"
+        assert _wait_for_job(client, response.json()["job_id"])["state"] == "done"
+
+        listing = client.get("/documents").json()
+        assert listing["stale_filenames"] == []
+        # A re-index is not a new upload: the document keeps its original timestamp.
+        assert listing["uploaded_ats"]["guide.txt"] == uploaded_at
+        # The original is untouched and still served.
+        assert client.get("/documents/guide.txt/original").content == b"Intro\nalpha beta gamma"
+
+
+def test_reindex_all_requeues_only_stale_documents_with_originals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import api.pipeline as pipeline_module
+    from api.documents import CHUNKER_VERSION
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        with pytest.MonkeyPatch.context() as older_chunker:
+            older_chunker.setattr(pipeline_module, "CHUNKER_VERSION", CHUNKER_VERSION - 1)
+            assert _upload_and_wait(client, "old.txt", b"Intro\nalpha")["state"] == "done"
+        assert _upload_and_wait(client, "current.txt", b"Intro\nbeta")["state"] == "done"
+
+        response = client.post("/documents/reindex")
+
+        assert response.status_code == 202
+        body = response.json()
+        assert [job["filename"] for job in body["jobs"]] == ["old.txt"]
+        assert body["deferred"] == []
+        assert _wait_for_job(client, body["jobs"][0]["job_id"])["state"] == "done"
+        assert client.get("/documents").json()["stale_filenames"] == []
+
+
+def test_reindex_all_defers_what_the_backlog_cannot_take(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import api.pipeline as pipeline_module
+    from api.documents import CHUNKER_VERSION
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        with pytest.MonkeyPatch.context() as older_chunker:
+            older_chunker.setattr(pipeline_module, "CHUNKER_VERSION", CHUNKER_VERSION - 1)
+            assert _upload_and_wait(client, "old.txt", b"Intro\nalpha")["state"] == "done"
+        full = IngestBacklog(max_bytes=4)
+        assert full.try_reserve(4)
+        client.app.dependency_overrides[get_ingest_backlog] = lambda: full  # type: ignore[attr-defined]
+
+        response = client.post("/documents/reindex")
+
+        assert response.status_code == 202
+        assert response.json() == {"jobs": [], "deferred": ["old.txt"]}
+
+
+def test_reindex_is_a_409_without_raw_storage(api_context: ApiTestContext) -> None:
+    off = api_context.client.post("/documents/guide.txt/reindex")
+    assert off.status_code == 409
+    assert "RAW_DOCUMENT_DIR" in off.json()["detail"]
+    assert api_context.client.post("/documents/reindex").status_code == 409
+    assert api_context.client.get("/config").json()["raw_documents_enabled"] is False
+
+
+def test_reindex_is_a_404_without_a_stored_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert client.get("/config").json()["raw_documents_enabled"] is True
+        assert client.post("/documents/never-uploaded.txt/reindex").status_code == 404
+
+
+def test_a_delete_while_a_reindex_is_queued_stays_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-index read the original at enqueue time; without the precondition a DELETE
+    landing while it waited in the queue was silently undone when the job ran."""
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from api.dependencies import get_ingest_executor
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+        single = ThreadPoolExecutor(max_workers=1)
+        busy = threading.Event()
+        single.submit(busy.wait, 5)  # the one worker is busy: the re-index queues
+        client.app.dependency_overrides[get_ingest_executor] = lambda: single  # type: ignore[attr-defined]
+        try:
+            job_id = client.post("/documents/guide.txt/reindex").json()["job_id"]
+            assert client.delete("/documents/guide.txt").status_code == 200
+            busy.set()
+
+            job = _wait_for_job(client, job_id)
+        finally:
+            busy.set()
+            single.shutdown(wait=True)
+
+        assert job["state"] == "failed"
+        assert "deleted before its re-index ran" in job["error"]
+        assert "guide.txt" not in client.get("/documents").json()["filenames"]

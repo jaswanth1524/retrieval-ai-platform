@@ -79,3 +79,38 @@ def test_check_qdrant_reachable_true_for_a_live_client() -> None:
 
 def test_check_qdrant_reachable_false_on_any_exception() -> None:
     assert check_qdrant_reachable(RaisingQdrantClient()) is False  # type: ignore[arg-type]
+
+
+def test_cached_ollama_check_probes_once_per_ttl_per_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """/config is unauthenticated: each call used to send its own outbound probe (up to a
+    1.5s block when Ollama is down)."""
+
+    import api.provider_health as provider_health
+
+    provider_health.clear_ollama_reachability_cache()
+    probed: list[str] = []
+
+    def fake_get(url: str, timeout: float) -> httpx.Response:
+        probed.append(url)
+        return httpx.Response(status_code=200, request=httpx.Request("GET", url))
+
+    now = [1000.0]
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(provider_health.time, "monotonic", lambda: now[0])
+    check = provider_health.check_ollama_reachable_cached
+
+    assert check(make_settings()) is True
+    assert check(make_settings()) is True
+    assert len(probed) == 1
+    # A different base URL is its own entry.
+    assert check(make_settings(ollama_base_url="http://other:11434")) is True
+    assert len(probed) == 2
+    # Past the TTL, Ollama is probed live again.
+    now[0] += provider_health.OLLAMA_REACHABILITY_TTL_SECONDS + 0.1
+    assert check(make_settings()) is True
+    assert len(probed) == 3
+
+    provider_health.clear_ollama_reachability_cache()
+    assert check(make_settings()) is True
+    assert len(probed) == 4
+    provider_health.clear_ollama_reachability_cache()

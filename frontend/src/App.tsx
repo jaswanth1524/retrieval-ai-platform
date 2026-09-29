@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from './api/client';
 import type {
   ApiStatus,
   CitationResponse,
+  DocumentJobAcceptedResponse,
   LlmProvider,
   PublicConfigResponse,
   QuestionOverrides,
@@ -12,19 +13,16 @@ import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
 import type { FeedbackPayload } from './components/ChatMessage';
-import CommandPalette from './components/CommandPalette';
 import type { Command } from './components/CommandPalette';
 import Composer from './components/Composer';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
 import CorpusPanel from './components/CorpusPanel';
 import type { UploadItem } from './components/CorpusPanel';
-import DocumentViewer from './components/DocumentViewer';
 import IconRail from './components/IconRail';
+import LazyChunkBoundary from './components/LazyChunkBoundary';
 import type { RailPanel } from './components/IconRail';
-import Inspector from './components/Inspector';
 import type { InspectorTab } from './components/Inspector';
-import SettingsModal from './components/SettingsModal';
 import SourcePreview from './components/SourcePreview';
 import ToastRow from './components/ToastRow';
 import TracesPanel from './components/TracesPanel';
@@ -32,6 +30,13 @@ import { useChat } from './hooks/useChat';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
+
+// Dialogs and the inspector render only on demand, so they load on demand too: the
+// first paint (thread + composer) no longer waits on their code.
+const CommandPalette = lazy(() => import('./components/CommandPalette'));
+const DocumentViewer = lazy(() => import('./components/DocumentViewer'));
+const Inspector = lazy(() => import('./components/Inspector'));
+const SettingsModal = lazy(() => import('./components/SettingsModal'));
 
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
 const MODE_STORAGE_KEY = 'docrag-mode';
@@ -81,6 +86,8 @@ function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking');
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [staleFilenames, setStaleFilenames] = useState<string[]>([]);
+  const [reindexableFilenames, setReindexableFilenames] = useState<string[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
   const [selectedFilenames, setSelectedFilenames] = useState<string[]>([]);
@@ -108,7 +115,10 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
-  const { tooNarrowForInspector, roomyEnoughForInspector } = useResponsiveLayout();
+  const { tooNarrowForInspector, roomyEnoughForInspector, panelCollapsed } = useResponsiveLayout();
+  // Narrow screens only: whether the context panel's drawer is showing. On wider screens
+  // the panel is a grid column and this is ignored.
+  const [panelDrawerOpen, setPanelDrawerOpen] = useState(false);
   // Which turn the inspector is describing. null follows the newest assistant turn,
   // so the panel keeps up with the conversation on its own; clicking a trace row pins
   // it to that specific turn instead.
@@ -194,6 +204,8 @@ function App() {
     setPageCounts(documents.page_counts ?? {});
     setByteSizes(documents.byte_sizes ?? {});
     setUploadedAts(documents.uploaded_ats ?? {});
+    setStaleFilenames(documents.stale_filenames ?? []);
+    setReindexableFilenames(documents.reindexable_filenames ?? []);
     // A key that used to be rejected now works — clear the banner.
     setApiStatus((prev) => (prev === 'unauthorized' ? 'ok' : prev));
   };
@@ -290,6 +302,22 @@ function App() {
     // Opening a trace is an explicit request to see the inspector, so it outranks the
     // width rule the same way a manual toggle does.
     setInspectorForced(true);
+    // On a narrow screen the inspector opens as a drawer; the panel drawer the trace was
+    // picked from would otherwise sit on top of it.
+    setPanelDrawerOpen(false);
+  };
+
+  // Widening past the breakpoint turns the drawer back into a column; forget that it was
+  // open so narrowing again later doesn't pop it up unasked.
+  useEffect(() => {
+    if (!panelCollapsed) setPanelDrawerOpen(false);
+  }, [panelCollapsed]);
+
+  // Rail click: on narrow screens it also opens the drawer, and clicking the panel that
+  // is already showing closes it again (the rail is the drawer's toggle).
+  const handleRailSelect = (panel: RailPanel) => {
+    if (panelCollapsed) setPanelDrawerOpen((open) => !(open && panel === rail));
+    setRail(panel);
   };
 
   // Width-driven open/close, deferring to the user once they have taken a position.
@@ -299,9 +327,11 @@ function App() {
     else if (roomyEnoughForInspector) setInspectorOpen(true);
   }, [inspectorForced, tooNarrowForInspector, roomyEnoughForInspector]);
 
-  const uploadOne = async (file: File, id: string) => {
+  // Starts one ingest job (an upload, or a re-index of a stored original) and follows
+  // it to the end, reflecting progress on the UploadItem `id`.
+  const runIngestJob = async (id: string, start: () => Promise<DocumentJobAcceptedResponse>) => {
     try {
-      const accepted = await api.uploadDocument(file);
+      const accepted = await start();
       const status = await api.pollDocumentJob(accepted.job_id, (jobStatus) => {
         setUploads((prev) =>
           prev.map((item) =>
@@ -330,7 +360,10 @@ function App() {
       }
       setUploads((prev) =>
         prev.map((item) =>
-          item.id === id ? { ...item, status: 'success', result: status.result ?? undefined } : item,
+          // The file is only kept for a retry; drop it so its bytes can be freed.
+          item.id === id
+            ? { ...item, status: 'success', result: status.result ?? undefined, file: undefined }
+            : item,
         ),
       );
       const filename = status.result?.filename;
@@ -351,23 +384,90 @@ function App() {
     }
   };
 
-  const handleUpload = async (files: File[]) => {
-    const newItems: UploadItem[] = files.map((file) => ({
-      id: crypto.randomUUID(),
-      filename: file.name,
-      status: 'uploading',
-    }));
-    setUploads((prev) => [...prev, ...newItems]);
-    await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
-    // Once for the whole batch, not once per file. Chunk counts live server-side and
-    // GET /documents scrolls the entire collection to compute them, so refreshing
-    // inside uploadOne meant a 20-file drop triggered 20 full-collection scans.
+  const uploadOne = (file: File, id: string) => runIngestJob(id, () => api.uploadDocument(file));
+
+  const refreshAfterIngest = async () => {
     try {
       await refreshDocuments();
     } catch (err) {
       // Non-fatal — counts just stay stale until the next refresh.
       noteAuthFailure(err);
     }
+  };
+
+  const handleReindex = async (filename: string) => {
+    const id = crypto.randomUUID();
+    setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true }]);
+    await runIngestJob(id, () => api.reindexDocument(filename));
+    await refreshAfterIngest();
+  };
+
+  const handleReindexAllStale = async () => {
+    let response;
+    try {
+      response = await api.reindexStaleDocuments();
+    } catch (err) {
+      if (!noteAuthFailure(err)) {
+        pushToast({
+          tone: 'bad',
+          title: 'Re-index failed',
+          body: err instanceof ApiClientError ? err.message : 'Could not start re-indexing.',
+        });
+      }
+      return;
+    }
+    if (response.deferred.length > 0) {
+      pushToast({
+        tone: 'warn',
+        title: `${response.deferred.length} document${response.deferred.length === 1 ? '' : 's'} not started`,
+        body: 'The indexing queue is full. Re-index the rest once these finish.',
+      });
+    }
+    const items: UploadItem[] = response.jobs.map((job) => ({
+      id: crypto.randomUUID(),
+      filename: job.filename,
+      status: 'uploading',
+      reindex: true,
+    }));
+    setUploads((prev) => [...prev, ...items]);
+    await Promise.allSettled(
+      response.jobs.map((job, index) => runIngestJob(items[index].id, () => Promise.resolve(job))),
+    );
+    await refreshAfterIngest();
+  };
+
+  const handleUpload = async (files: File[]) => {
+    const newItems: UploadItem[] = files.map((file) => ({
+      id: crypto.randomUUID(),
+      filename: file.name,
+      status: 'uploading',
+      file,
+    }));
+    setUploads((prev) => [...prev, ...newItems]);
+    await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
+    // Once for the whole batch, not once per file. Chunk counts live server-side and
+    // GET /documents scrolls the entire collection to compute them, so refreshing
+    // inside uploadOne meant a 20-file drop triggered 20 full-collection scans.
+    await refreshAfterIngest();
+  };
+
+  const handleRetryUpload = async (id: string) => {
+    const item = uploads.find((candidate) => candidate.id === id);
+    if (!item || (!item.file && !item.reindex)) return;
+    setUploads((prev) =>
+      prev.map((candidate) =>
+        candidate.id === id
+          ? { ...candidate, status: 'uploading', error: undefined, progress: undefined }
+          : candidate,
+      ),
+    );
+    const { file, filename } = item;
+    await runIngestJob(id, () => (file ? api.uploadDocument(file) : api.reindexDocument(filename)));
+    await refreshAfterIngest();
+  };
+
+  const handleDismissUpload = (id: string) => {
+    setUploads((prev) => prev.filter((item) => item.id !== id));
   };
 
   const handleDeleteDocument = async (filename: string) => {
@@ -498,18 +598,19 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
       // Never stack a second dialog over Settings or the document viewer.
       if (otherDialogOpenRef.current) return;
-      const key = event.key.toLowerCase();
-      if (key === 'k') {
+      const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;
+      if (key === 'K' && !event.shiftKey) {
         event.preventDefault();
         setPaletteOpen((prev) => !prev);
         return;
       }
-      const command = commandsRef.current.find(
-        (candidate) => candidate.shortcut?.slice(1).toLowerCase() === key,
-      );
+      // Same notation the palette displays ("⌘U", "⌘⇧O"), so what it advertises and
+      // what is bound can't drift apart.
+      const combo = `⌘${event.shiftKey ? '⇧' : ''}${key}`;
+      const command = commandsRef.current.find((candidate) => candidate.shortcut === combo);
       if (!command || command.disabled) return;
       event.preventDefault();
       setPaletteOpen(false);
@@ -543,7 +644,8 @@ function App() {
         id: 'new-conversation',
         glyph: '＋',
         label: 'New conversation',
-        shortcut: '⌘N',
+        // Not ⌘N: browsers reserve it (new window) and never deliver it to the page.
+        shortcut: '⌘⇧O',
         run: () => {
           setRail('chat');
           newConversation();
@@ -609,7 +711,10 @@ function App() {
         id: 'traces',
         glyph: '◔',
         label: 'Browse traces',
-        run: () => setRail('traces'),
+        run: () => {
+          setRail('traces');
+          if (panelCollapsed) setPanelDrawerOpen(true);
+        },
       },
       {
         id: 'clear',
@@ -621,13 +726,15 @@ function App() {
     ],
     // toggleTheme/clear/newConversation are stable enough for a menu rebuilt on open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown, exportJson],
+    [pending, config, inspectorOpen, mode, theme, turns.length, exportMarkdown, exportJson, panelCollapsed],
   );
   commandsRef.current = commands;
 
   const handlePanelAction = () => {
-    if (rail === 'chat') newConversation();
-    else if (rail === 'corpus') corpusBrowseInputRef.current?.click();
+    if (rail === 'chat') {
+      newConversation();
+      setPanelDrawerOpen(false);
+    } else if (rail === 'corpus') corpusBrowseInputRef.current?.click();
     else loadTraces();
   };
 
@@ -635,7 +742,7 @@ function App() {
     <div className="app-shell">
       <IconRail
         active={rail}
-        onSelect={setRail}
+        onSelect={handleRailSelect}
         theme={theme}
         onToggleTheme={toggleTheme}
         onOpenSettings={() => setSettingsOpen(true)}
@@ -646,12 +753,18 @@ function App() {
         onAction={handlePanelAction}
         apiStatus={apiStatus}
         chunkTotal={chunkTotal}
+        drawer={panelCollapsed}
+        drawerOpen={panelDrawerOpen}
+        onCloseDrawer={() => setPanelDrawerOpen(false)}
       >
         {rail === 'chat' && (
           <ConversationList
             conversations={conversations}
             activeId={activeConversationId}
-            onSwitch={switchConversation}
+            onSwitch={(id) => {
+              switchConversation(id);
+              setPanelDrawerOpen(false);
+            }}
             onRename={renameConversation}
             onDelete={deleteConversation}
             disabled={pending}
@@ -670,6 +783,14 @@ function App() {
             maxUploadBytes={config?.max_upload_bytes}
             disabled={pending}
             browseInputRef={corpusBrowseInputRef}
+            onRetryUpload={(id) => void handleRetryUpload(id)}
+            onDismissUpload={handleDismissUpload}
+            staleFilenames={staleFilenames}
+            reindexableFilenames={reindexableFilenames}
+            onReindex={config?.raw_documents_enabled ? (name) => void handleReindex(name) : undefined}
+            onReindexAllStale={
+              config?.raw_documents_enabled ? () => void handleReindexAllStale() : undefined
+            }
           />
         )}
         {rail === 'traces' && (
@@ -713,6 +834,7 @@ function App() {
               onOpenSource={handleOpenSource}
               onCitationHover={setHoveredCitation}
               onCitationLeave={handleCitationLeave}
+              documentCount={indexedFilenames.length}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
             <ToastRow toasts={toasts} onDismiss={dismissToast} />
@@ -734,46 +856,58 @@ function App() {
           </>
         )}
       </main>
-      {inspectorOpen && apiStatus !== 'error' && (
-        <Inspector
-          engineerMode={mode === 'engineer'}
-          tab={inspectorTab}
-          onTabChange={setInspectorTab}
-          onClose={() => setInspectorOpen(false)}
-          sources={inspectedTurn?.sources ?? []}
-          traceId={inspectedTraceId ?? null}
-          traceReady={inspectedTraceReady}
-          onOpenSource={handleOpenSource}
-        />
-      )}
-      {paletteOpen && (
-        <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />
-      )}
-      {settingsOpen && config && (
-        <SettingsModal
-          config={config}
-          overrides={advancedOptions}
-          onOverridesChange={updateAdvancedOptions}
-          onClose={() => setSettingsOpen(false)}
-          onSaved={() => {
-            pushToast({ tone: 'good', title: 'Settings saved' });
-            // A newly entered API key only takes effect on the next request; without
-            // this refetch the "API key required" state and empty corpus stayed until
-            // a manual reload.
-            refreshDocuments().catch((err) => {
-              noteAuthFailure(err);
-            });
-          }}
-          disabled={pending}
-        />
-      )}
-      {sourceView && (
-        <DocumentViewer
-          filename={sourceView.filename}
-          chunkId={sourceView.chunkId}
-          onClose={() => setSourceView(null)}
-        />
-      )}
+      <LazyChunkBoundary
+        onDismiss={() => {
+          setInspectorOpen(false);
+          setPaletteOpen(false);
+          setSettingsOpen(false);
+          setSourceView(null);
+        }}
+      >
+        <Suspense fallback={null}>
+          {inspectorOpen && apiStatus !== 'error' && (
+            <Inspector
+              engineerMode={mode === 'engineer'}
+              tab={inspectorTab}
+              onTabChange={setInspectorTab}
+              onClose={() => setInspectorOpen(false)}
+              sources={inspectedTurn?.sources ?? []}
+              traceId={inspectedTraceId ?? null}
+              traceReady={inspectedTraceReady}
+              onOpenSource={handleOpenSource}
+              overlay={tooNarrowForInspector}
+            />
+          )}
+          {paletteOpen && (
+            <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />
+          )}
+          {settingsOpen && config && (
+            <SettingsModal
+              config={config}
+              overrides={advancedOptions}
+              onOverridesChange={updateAdvancedOptions}
+              onClose={() => setSettingsOpen(false)}
+              onSaved={() => {
+                pushToast({ tone: 'good', title: 'Settings saved' });
+                // A newly entered API key only takes effect on the next request; without
+                // this refetch the "API key required" state and empty corpus stayed until
+                // a manual reload.
+                refreshDocuments().catch((err) => {
+                  noteAuthFailure(err);
+                });
+              }}
+              disabled={pending}
+            />
+          )}
+          {sourceView && (
+            <DocumentViewer
+              filename={sourceView.filename}
+              chunkId={sourceView.chunkId}
+              onClose={() => setSourceView(null)}
+            />
+          )}
+        </Suspense>
+      </LazyChunkBoundary>
     </div>
   );
 }

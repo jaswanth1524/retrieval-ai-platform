@@ -278,8 +278,18 @@ def test_ingest_chunks_wraps_stale_cleanup_failure_distinctly() -> None:
     provider = FakeEmbeddingProvider([make_embedding(0.2)])
     edited = make_chunk(chunk_id="new", text="edited text")
 
+    indexed_hook_calls: list[str] = []
     with pytest.raises(IngestionError, match="failed to remove"):
-        ingest_chunks(failing_repository, settings, [edited], provider)
+        ingest_chunks(
+            failing_repository,
+            settings,
+            [edited],
+            provider,
+            on_indexed=lambda: indexed_hook_calls.append("indexed"),
+        )
+    # The new version is live, so its on_indexed hook (which stores the original bytes)
+    # must still have run — skipping it kept /original serving the previous version.
+    assert indexed_hook_calls == ["indexed"]
 
     records, _ = client.scroll(
         collection_name=settings.qdrant_collection,

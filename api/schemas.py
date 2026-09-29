@@ -70,6 +70,8 @@ class PublicConfigResponse(BaseModel):
     max_context_chunks_limit: int
     llm_temperature_max: float
     feedback_enabled: bool
+    # RAW_DOCUMENT_DIR is set: originals are stored, so documents can be re-indexed.
+    raw_documents_enabled: bool = False
 
 
 class DocumentIngestResponse(BaseModel):
@@ -112,6 +114,19 @@ class DocumentListResponse(BaseModel):
     # a null value — since neither field exists in any of its points' payloads.
     byte_sizes: dict[str, int] = {}
     uploaded_ats: dict[str, float] = {}
+    # Indexed by an older chunker (or before the version was recorded) — re-indexing
+    # them applies the current chunking.
+    stale_filenames: list[str] = []
+    # Have a stored original (RAW_DOCUMENT_DIR), so POST /documents/{f}/reindex works.
+    reindexable_filenames: list[str] = []
+
+
+class DocumentReindexAllResponse(BaseModel):
+    """Result of re-indexing every stale document that has a stored original."""
+
+    jobs: list[DocumentJobAcceptedResponse]
+    # Stale and re-indexable, but the ingest backlog was full; retry later.
+    deferred: list[str] = []
 
 
 class DocumentDeleteResponse(BaseModel):

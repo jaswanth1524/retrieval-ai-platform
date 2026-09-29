@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -40,8 +41,10 @@ from api.dependencies import (
     get_trace_store,
     get_vector_repository,
     require_api_key,
+    shutdown_executors,
 )
 from api.documents import (
+    CHUNKER_VERSION,
     DocumentError,
     DocumentNotFoundError,
     normalize_filename,
@@ -51,11 +54,12 @@ from api.embeddings import EmbeddedText, EmbeddingError
 from api.feedback import FeedbackStore
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
 from api.ingestion import IngestionError, filename_write_lock
-from api.jobs import IngestBacklog, JobNotFoundError, JobStore
+from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobNotFoundError, JobStore
 from api.logging_config import configure_logging
 from api.metrics import (
     NO_ERROR_TYPE,
     ingest_chunks_total,
+    ingest_job_seconds,
     ingest_jobs_total,
     observe_question_timings,
     questions_total,
@@ -79,6 +83,7 @@ from api.schemas import (
     DocumentJobAcceptedResponse,
     DocumentJobStatusResponse,
     DocumentListResponse,
+    DocumentReindexAllResponse,
     FeedbackItemResponse,
     FeedbackListResponse,
     FeedbackRequest,
@@ -237,6 +242,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             run_model_warmup, get_embedding_provider(), get_reranker(), get_token_counter()
         )
     yield
+    shutdown_executors()
 
 
 def create_app() -> FastAPI:
@@ -290,6 +296,9 @@ _INGEST_USER_FACING_ERRORS: tuple[type[Exception], ...] = (
     CollectionSchemaError,
     VectorStoreUnavailableError,
 )
+
+
+_SHUTTING_DOWN_ERROR = "The server is shutting down and could not start indexing. Retry the upload."
 
 
 def _job_error_message(exc: Exception) -> str:
@@ -390,6 +399,8 @@ def _run_ingest_job(
     filename: str,
     content: bytes,
     raw_store: RawDocumentStore | None = None,
+    uploaded_at: float | None = None,
+    precondition: Callable[[], None] | None = None,
 ) -> None:
     """Background-executor entry point: parse/chunk/embed/index and update job status.
 
@@ -426,15 +437,25 @@ def _run_ingest_job(
                     filename,
                 )
 
+    started = time.monotonic()
     try:
         job_store.update(job_id, state="parsing")
-        outcome = ingest_service.ingest(filename, content, on_progress, save_original)
+        outcome = ingest_service.ingest(
+            filename,
+            content,
+            on_progress,
+            save_original,
+            uploaded_at=uploaded_at,
+            precondition=precondition,
+        )
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
+        ingest_job_seconds.labels(outcome="failed").observe(time.monotonic() - started)
         ingest_jobs_total.labels(outcome="failed", error_type=_ingest_error_type(exc)).inc()
         job_store.update(job_id, state="failed", error=_job_error_message(exc))
         return
 
+    ingest_job_seconds.labels(outcome="done").observe(time.monotonic() - started)
     ingest_jobs_total.labels(outcome="done", error_type=NO_ERROR_TYPE).inc()
     ingest_chunks_total.inc(outcome.chunks_ingested)
     job_store.update(
@@ -451,18 +472,124 @@ def _run_ingest_job(
     )
 
 
+_ORIGINAL_CHUNK_BYTES = 64 * 1024
+
+_BACKLOG_FULL_ERROR = (
+    "Too many documents are already waiting to be indexed. Retry once some of them finish."
+)
+
+
+def _enqueue_ingest(
+    *,
+    job_store: JobStore,
+    executor: ThreadPoolExecutor,
+    backlog: IngestBacklog,
+    ingest_service: IngestService,
+    filename: str,
+    content: bytes,
+    raw_store: RawDocumentStore | None,
+    uploaded_at: float | None = None,
+    precondition: Callable[[], None] | None = None,
+) -> DocumentJobAcceptedResponse:
+    """Admit ``content`` against the backlog, create its job, and start it. Blocking.
+
+    Shared by upload and re-index so both get the same backlog 503, the same
+    shutting-down handling, and the same done-callback that frees the bytes.
+    """
+
+    size = len(content)
+    if not backlog.try_reserve(size):
+        raise HTTPException(
+            status_code=503, detail=_BACKLOG_FULL_ERROR, headers={"Retry-After": "15"}
+        )
+    try:
+        job = job_store.create(filename)
+    except BaseException:
+        backlog.release(size)
+        raise
+    try:
+        # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
+        # it survives independently of this request/response cycle — the client can
+        # disconnect and poll the job later without interrupting the work.
+        future = executor.submit(
+            _run_ingest_job,
+            job_store,
+            job.id,
+            ingest_service,
+            filename,
+            content,
+            raw_store,
+            uploaded_at,
+            precondition,
+        )
+    except RuntimeError as exc:
+        # The executor is shut down (the process is stopping). The job already exists,
+        # so fail it rather than leave it "queued" forever for a poller.
+        backlog.release(size)
+        job_store.update(job.id, state="failed", error=_SHUTTING_DOWN_ERROR)
+        raise HTTPException(
+            status_code=503, detail=_SHUTTING_DOWN_ERROR, headers={"Retry-After": "15"}
+        ) from exc
+    except BaseException:
+        backlog.release(size)
+        job_store.update(job.id, state="failed", error="Could not start indexing.")
+        raise
+    future.add_done_callback(
+        lambda done: _finish_ingest_future(done, backlog, size, job_store, job.id)
+    )
+    return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
+
+
+def _original_still_stored(store: RawDocumentStore, filename: str) -> Callable[[], None]:
+    """A re-index precondition: fail if the document was deleted while queued.
+
+    Checked under the filename lock DELETE also takes (and DELETE removes the original
+    under it), so "original gone" means the delete landed first — re-indexing anyway
+    would silently bring the deleted document back.
+    """
+
+    def check() -> None:
+        if store.path(filename) is None:
+            raise IngestionError(
+                f"'{filename}' was deleted before its re-index ran; nothing was re-indexed."
+            )
+
+    return check
+
+
+def _require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
+    """The raw store, or a 409: re-indexing reads originals only kept when it's on."""
+
+    if raw_store is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Re-indexing needs stored originals: set RAW_DOCUMENT_DIR, then upload "
+                "documents again once so their originals are kept."
+            ),
+        )
+    return raw_store
+
+
 def _finish_ingest_future(
-    future: Future[None], backlog: IngestBacklog, size: int, job_id: str
+    future: Future[None], backlog: IngestBacklog, size: int, job_store: JobStore, job_id: str
 ) -> None:
     """Release the job's backlog bytes, and surface anything that escaped the job.
 
     ``_run_ingest_job`` records failures on the job, but the job store itself can fail
     while doing so (sqlite disk full); nothing observed the future, so that left the
     job stuck in a non-terminal state with nothing in the log.
+
+    A cancelled future is a job shutdown dropped from the queue before it started; it
+    is failed here so a client still polling this process doesn't see "queued" forever.
     """
 
     backlog.release(size)
     if future.cancelled():
+        try:
+            job_store.update(job_id, state="failed", error=INTERRUPTED_JOB_ERROR)
+        except Exception:
+            logger.exception("Could not mark cancelled ingest job %s as failed.", job_id)
         return
     exc = future.exception()
     if exc is not None:
@@ -664,7 +791,7 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def list_documents(
-        repository: VectorRepositoryDep, settings: SettingsDep
+        repository: VectorRepositoryDep, settings: SettingsDep, raw_store: RawDocumentStoreDep
     ) -> DocumentListResponse:
         metadata = repository.filename_metadata(settings)
         return DocumentListResponse(
@@ -681,6 +808,16 @@ def register_routes(app: FastAPI) -> None:
                 for name, meta in metadata.items()
                 if meta.uploaded_at is not None
             },
+            stale_filenames=sorted(
+                name
+                for name, meta in metadata.items()
+                if meta.chunker_version is None or meta.chunker_version < CHUNKER_VERSION
+            ),
+            reindexable_filenames=sorted(
+                name
+                for name in metadata
+                if raw_store is not None and raw_store.path(name) is not None
+            ),
         )
 
     @app.post(
@@ -702,31 +839,101 @@ def register_routes(app: FastAPI) -> None:
         # be accepted with a 202 and only fail once the client polled the job.
         filename = validate_upload_filename(file.filename or "")
         content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
-        size = len(content)
-        if not backlog.try_reserve(size):
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Too many documents are already waiting to be indexed. "
-                    "Retry once some of them finish."
-                ),
-                headers={"Retry-After": "15"},
-            )
-        try:
-            # job_store.create is a sqlite INSERT under JOB_STORE_BACKEND=sqlite; off the
-            # event loop so it can't stall other in-flight requests.
-            job = await run_in_threadpool(job_store.create, filename)
-            # Ingestion runs on a dedicated executor (not FastAPI's request threadpool)
-            # so it survives independently of this request/response cycle — the client
-            # can disconnect and poll the job later without interrupting the work.
-            future = executor.submit(
-                _run_ingest_job, job_store, job.id, ingest_service, filename, content, raw_store
-            )
-        except BaseException:
-            backlog.release(size)
-            raise
-        future.add_done_callback(lambda done: _finish_ingest_future(done, backlog, size, job.id))
-        return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
+        # job_store.create is a sqlite INSERT under JOB_STORE_BACKEND=sqlite; off the
+        # event loop so it can't stall other in-flight requests.
+        return await run_in_threadpool(
+            _enqueue_ingest,
+            job_store=job_store,
+            executor=executor,
+            backlog=backlog,
+            ingest_service=ingest_service,
+            filename=filename,
+            content=content,
+            raw_store=raw_store,
+        )
+
+    # Re-chunks and re-embeds a document from its stored original (RAW_DOCUMENT_DIR),
+    # so a chunking/embedding change applies without the user re-uploading. Same job
+    # flow as an upload: 202 + a job id to poll.
+    @app.post(
+        "/documents/reindex",
+        response_model=DocumentReindexAllResponse,
+        status_code=202,
+        dependencies=[Depends(require_api_key)],
+    )
+    def reindex_stale_documents(
+        repository: VectorRepositoryDep,
+        ingest_service: IngestServiceDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+    ) -> DocumentReindexAllResponse:
+        store = _require_raw_store(raw_store)
+        metadata = repository.filename_metadata(settings)
+        jobs: list[DocumentJobAcceptedResponse] = []
+        deferred: list[str] = []
+        for name, meta in sorted(metadata.items()):
+            if meta.chunker_version is not None and meta.chunker_version >= CHUNKER_VERSION:
+                continue
+            content = store.read(name)
+            if content is None:
+                continue
+            try:
+                jobs.append(
+                    _enqueue_ingest(
+                        job_store=job_store,
+                        executor=executor,
+                        backlog=backlog,
+                        ingest_service=ingest_service,
+                        filename=name,
+                        content=content,
+                        raw_store=None,
+                        uploaded_at=meta.uploaded_at,
+                        precondition=_original_still_stored(store, name),
+                    )
+                )
+            except HTTPException as exc:
+                if exc.status_code != 503:
+                    raise
+                deferred.append(name)
+        return DocumentReindexAllResponse(jobs=jobs, deferred=deferred)
+
+    @app.post(
+        "/documents/{filename}/reindex",
+        response_model=DocumentJobAcceptedResponse,
+        status_code=202,
+        dependencies=[Depends(require_api_key)],
+    )
+    def reindex_document(
+        filename: str,
+        repository: VectorRepositoryDep,
+        ingest_service: IngestServiceDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+    ) -> DocumentJobAcceptedResponse:
+        store = _require_raw_store(raw_store)
+        name = normalize_filename(filename)
+        content = store.read(name)
+        if content is None:
+            raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
+        return _enqueue_ingest(
+            job_store=job_store,
+            executor=executor,
+            backlog=backlog,
+            ingest_service=ingest_service,
+            filename=name,
+            content=content,
+            # The original is already stored, byte-identical. Passing the store would
+            # re-save it, and a failed save deletes it — losing the only copy.
+            raw_store=None,
+            uploaded_at=repository.uploaded_at_for_filename(settings, name),
+            precondition=_original_still_stored(store, name),
+        )
 
     @app.delete(
         "/documents/{filename}",
@@ -813,16 +1020,38 @@ def register_routes(app: FastAPI) -> None:
         path = raw_store.path(filename) if raw_store is not None else None
         if path is None:
             raise DocumentNotFoundError(f"No stored original for '{filename}'.")
+        # Open before building the response. FileResponse re-stats and opens the path
+        # only when the response is sent, so a DELETE landing in between turned this
+        # 404 into a 500; an already-open handle keeps streaming the bytes it opened
+        # even if the file is unlinked meanwhile.
+        try:
+            handle = path.open("rb")
+        except FileNotFoundError:
+            raise DocumentNotFoundError(f"No stored original for '{filename}'.") from None
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        # FileResponse streams from disk (the whole file was read into memory before)
-        # and RFC 5987-encodes the name: a hand-built latin-1 header 500'd on any
+        # Headers from FileResponse (given the stat, it does no I/O of its own): it
+        # RFC 5987-encodes the name — a hand-built latin-1 header 500'd on any
         # non-Latin-1 filename and broke on one containing a quote.
-        return FileResponse(
+        template = FileResponse(
             path,
             media_type=media_type,
             filename=normalize_filename(filename),
+            stat_result=os.fstat(handle.fileno()),
             headers={"X-Content-Type-Options": "nosniff"},
         )
+        headers = {
+            name: value
+            for name, value in template.headers.items()
+            # Ranges need seeking the streamed body can't do; its own type is set below.
+            if name not in ("accept-ranges", "content-type")
+        }
+
+        def chunks() -> Iterator[bytes]:
+            with handle:
+                while block := handle.read(_ORIGINAL_CHUNK_BYTES):
+                    yield block
+
+        return StreamingResponse(chunks(), media_type=media_type, headers=headers)
 
     # Off by default (AppSettings.feedback_enabled) — a deployment that hasn't
     # opted in gets the same 404 shape as any other absent route, not a distinct
@@ -1013,6 +1242,7 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         max_context_chunks_limit=REQUEST_MAX_CONTEXT_CHUNKS_MAX,
         llm_temperature_max=REQUEST_TEMPERATURE_MAX,
         feedback_enabled=settings.feedback_enabled,
+        raw_documents_enabled=bool(settings.raw_document_dir),
     )
 
 

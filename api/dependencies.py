@@ -17,7 +17,11 @@ from api.feedback import FeedbackStore
 from api.generation import LiteLLMGenerator
 from api.jobs import IngestBacklog, IngestJobStore, JobStore, SqliteIngestJobStore
 from api.pipeline import IngestService, RagPipeline
-from api.provider_health import check_ollama_reachable, check_qdrant_reachable
+from api.provider_health import (
+    check_ollama_reachable_cached,
+    check_qdrant_reachable,
+    clear_ollama_reachability_cache,
+)
 from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository, clear_hybrid_fallback_cache
@@ -72,12 +76,14 @@ def get_generator() -> LiteLLMGenerator:
 def get_ollama_reachability_checker() -> Callable[[AppSettings], bool]:
     """Return the Ollama-reachability probe.
 
-    Not cached: Ollama can start or stop between requests, so ``/config`` must probe
-    live each time. Exposed as a dependency (rather than a direct import in main.py)
-    so tests can override it without hitting a real localhost:11434.
+    The result is remembered per base URL for ``OLLAMA_REACHABILITY_TTL_SECONDS`` —
+    long enough that the unauthenticated ``/config`` can't be used to fan out probes,
+    short enough that starting or stopping Ollama shows up promptly. Exposed as a
+    dependency (rather than a direct import in main.py) so tests can override it
+    without hitting a real localhost:11434.
     """
 
-    return check_ollama_reachable
+    return check_ollama_reachable_cached
 
 
 def get_qdrant_reachability_checker() -> Callable[[QdrantClient], bool]:
@@ -258,6 +264,25 @@ def get_ingest_backlog() -> IngestBacklog:
     return IngestBacklog(int(get_app_settings().ingest_max_pending_bytes))
 
 
+def shutdown_executors() -> None:
+    """Stop the ingest pool at app shutdown (the lifespan's exit).
+
+    Queued ingest jobs are cancelled — their done callbacks release backlog bytes and
+    fail the job — while running ones finish (``wait=False`` returns at once, and the
+    interpreter joins pool threads before exiting). Only a pool that was actually built
+    is touched, and its cache is cleared afterwards, so a later lifespan (the next
+    TestClient, a reload) builds a fresh pool instead of reusing a dead one.
+
+    The embedding provider's pools are deliberately *not* shut down: a running ingest
+    job still embeds its remaining batches through them, and shutting them down failed
+    that job halfway. Its idle workers cost nothing and exit with the interpreter.
+    """
+
+    if get_ingest_executor.cache_info().currsize:
+        get_ingest_executor().shutdown(wait=False, cancel_futures=True)
+        get_ingest_executor.cache_clear()
+
+
 def clear_dependency_caches() -> None:
     """Clear dependency caches for tests and process reloads."""
 
@@ -274,4 +299,5 @@ def clear_dependency_caches() -> None:
     get_ingest_backlog.cache_clear()
     get_trace_store.cache_clear()
     clear_readiness_cache()
+    clear_ollama_reachability_cache()
     clear_hybrid_fallback_cache()

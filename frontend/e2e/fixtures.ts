@@ -17,6 +17,21 @@ export const TIMINGS = {
   citation_retry_ms: 0,
 };
 
+/** A GET /traces row, as the trace browser lists it. */
+export function traceSummary(traceId = 'trace-1', question = 'What is DocRAG?') {
+  return {
+    trace_id: traceId,
+    created_at: Date.now() / 1000,
+    question,
+    mode: 'stream',
+    status: 'ok',
+    llm_provider: 'ollama',
+    total_ms: 460,
+    candidate_count: 12,
+    kept_count: 6,
+  };
+}
+
 export const GUIDE_SOURCE = {
   source_number: 1,
   filename: 'guide.md',
@@ -61,6 +76,7 @@ const CONFIG = {
   max_context_chunks_limit: 20,
   llm_temperature_max: 2,
   feedback_enabled: false,
+  raw_documents_enabled: false,
 };
 
 type JobStep = { status: number; body?: object };
@@ -71,13 +87,26 @@ type JobStep = { status: number; body?: object };
  */
 export class MockApi {
   documents: string[] = ['guide.md'];
+  /** Rows for GET /traces (the trace browser). */
+  traces: object[] = [];
+  /** Merged over the default /config body (e.g. raw_documents_enabled). */
+  config: Partial<typeof CONFIG> = {};
+  /** When set, every guarded route answers 401 unless X-API-Key matches. */
+  apiKey: string | null = null;
+  /** Indexed by an older chunker / have a stored original (GET /documents). */
+  staleFilenames: string[] = [];
+  reindexableFilenames: string[] = [];
+  /** Every POST /questions/stream body the app sent, oldest first. */
+  readonly questionBodies: Record<string, unknown>[] = [];
   /** Body for POST /questions/stream, or a function for held/custom streams. */
   stream: string | ((route: Route) => Promise<void>) = answerStream();
   /** Response for POST /documents; default accepts the upload as job "job-1". */
   uploadResponse: JobStep | null = null;
   /** Successive GET /documents/jobs/{id} responses; the last one repeats. */
   jobSteps: JobStep[] = [];
-  private jobPolls = 0;
+  /** In-flight ingest jobs by id: the file each one indexes and how often it was polled.
+   *  Every job walks `jobSteps` on its own, so a bulk re-index runs several at once. */
+  private readonly jobs = new Map<string, { filename: string; polls: number }>();
   /** URLs a test deliberately answered with a 4xx/5xx. */
   readonly intentionalFailures = new Set<string>();
   /** API requests nothing here handles — a spec or app regression, never expected. */
@@ -106,8 +135,11 @@ export class MockApi {
     const method = request.method();
 
     if (path === '/health') return this.json(route, 200, { status: 'ok' });
-    if (path === '/config') return this.json(route, 200, CONFIG);
-    if (path === '/traces') return this.json(route, 200, { traces: [] });
+    if (path === '/config') return this.json(route, 200, { ...CONFIG, ...this.config });
+    if (this.apiKey !== null && request.headers()['x-api-key'] !== this.apiKey) {
+      return this.configured(route, 401, { detail: 'Missing or invalid API key.' });
+    }
+    if (path === '/traces') return this.json(route, 200, { traces: this.traces });
     if (path.startsWith('/traces/')) {
       return this.json(route, 200, {
         trace_id: path.slice('/traces/'.length),
@@ -126,49 +158,98 @@ export class MockApi {
     }
 
     if (path === '/questions/stream' && method === 'POST') {
+      this.questionBodies.push(JSON.parse(request.postData() ?? '{}') as Record<string, unknown>);
       if (typeof this.stream === 'function') return this.stream(route);
       return route.fulfill({ status: 200, contentType: 'text/event-stream', body: this.stream });
     }
 
     if (path === '/documents' && method === 'GET') {
       const counts = Object.fromEntries(this.documents.map((name) => [name, 1]));
-      return this.json(route, 200, { filenames: this.documents, chunk_counts: counts });
+      return this.json(route, 200, {
+        filenames: this.documents,
+        chunk_counts: counts,
+        stale_filenames: this.staleFilenames.filter((name) => this.documents.includes(name)),
+        reindexable_filenames: this.reindexableFilenames.filter((name) =>
+          this.documents.includes(name),
+        ),
+      });
     }
 
     if (path === '/documents' && method === 'POST') {
       const filename = /filename="([^"]+)"/.exec(request.postData() ?? '')?.[1] ?? 'upload.txt';
-      const response = this.uploadResponse ?? {
-        status: 202,
-        body: { job_id: 'job-1', filename, state: 'queued' },
-      };
-      if (response.status === 202) this.pendingFilename = filename;
-      return this.configured(route, response.status, response.body ?? {});
+      if (this.uploadResponse) {
+        const { status, body } = this.uploadResponse;
+        return this.configured(route, status, body ?? {});
+      }
+      return this.json(route, 202, this.startJob(filename));
     }
 
     if (path.startsWith('/documents/jobs/')) {
-      const step = this.jobSteps[Math.min(this.jobPolls, this.jobSteps.length - 1)] ?? {
+      const jobId = path.slice('/documents/jobs/'.length);
+      const job = this.jobs.get(jobId);
+      if (!job) return this.configured(route, 404, { detail: `Unknown job '${jobId}'.` });
+      const step = this.jobSteps[Math.min(job.polls, this.jobSteps.length - 1)] ?? {
         status: 200,
         body: this.jobBody('done'),
       };
-      this.jobPolls += 1;
-      const body = step.body ?? {};
-      if ((body as { state?: string }).state === 'done' && this.pendingFilename) {
-        this.documents = [...this.documents, this.pendingFilename];
-        this.pendingFilename = null;
+      job.polls += 1;
+      const body: Record<string, unknown> = { ...step.body, job_id: jobId, filename: job.filename };
+      if (body.state === 'done') {
+        if (!this.documents.includes(job.filename)) this.documents = [...this.documents, job.filename];
+        this.staleFilenames = this.staleFilenames.filter((name) => name !== job.filename);
       }
       return this.configured(route, step.status, body);
+    }
+
+    if (path === '/documents/reindex' && method === 'POST') {
+      const due = this.staleFilenames.filter(
+        (name) => this.documents.includes(name) && this.reindexableFilenames.includes(name),
+      );
+      return this.json(route, 202, { jobs: due.map((name) => this.startJob(name)), deferred: [] });
+    }
+
+    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex))?$/.exec(path);
+    if (documentRoute) {
+      const filename = decodeURIComponent(documentRoute[1]);
+      const action = documentRoute[2];
+      if (!this.documents.includes(filename)) {
+        return this.configured(route, 404, { detail: `No indexed document named '${filename}'.` });
+      }
+      if (!action && method === 'DELETE') {
+        this.documents = this.documents.filter((name) => name !== filename);
+        return this.json(route, 200, { filename, points_deleted: 1 });
+      }
+      if (action === 'content' && method === 'GET') {
+        return this.json(route, 200, {
+          filename,
+          chunks: [
+            { chunk_id: 'c0', page: 1, section: 'Intro', text: 'DocRAG overview.', chunk_ordinal: 1 },
+            { chunk_id: GUIDE_SOURCE.chunk_id, page: 1, section: GUIDE_SOURCE.section, text: GUIDE_SOURCE.text, chunk_ordinal: 2 },
+          ],
+        });
+      }
+      if (action === 'reindex' && method === 'POST') {
+        return this.json(route, 202, this.startJob(filename));
+      }
+    }
+
+    if (path === '/feedback' && method === 'POST') {
+      return this.json(route, 201, { id: 1 });
     }
 
     this.unmocked.push(`${method} ${path}`);
     return this.json(route, 404, { detail: `Unmocked ${method} ${path}` });
   }
 
-  private pendingFilename: string | null = null;
+  private startJob(filename: string) {
+    const jobId = `job-${this.jobs.size + 1}`;
+    this.jobs.set(jobId, { filename, polls: 0 });
+    return { job_id: jobId, filename, state: 'queued' as const };
+  }
 
+  /** A job-status body; the handler fills in the polled job's own id and filename. */
   jobBody(state: 'queued' | 'parsing' | 'embedding' | 'done' | 'failed', error: string | null = null) {
     return {
-      job_id: 'job-1',
-      filename: this.pendingFilename ?? 'upload.txt',
       state,
       chunks_total: 4,
       chunks_done: state === 'done' ? 4 : 1,
