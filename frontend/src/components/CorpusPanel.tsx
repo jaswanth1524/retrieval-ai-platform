@@ -21,6 +21,10 @@ export interface UploadItem {
   progress?: UploadProgress;
   result?: DocumentIngestResponse;
   error?: string;
+  /** Kept until the upload succeeds or is dismissed, so a failed one can be retried. */
+  file?: File;
+  /** A re-index of the stored original rather than an upload — retried the same way. */
+  reindex?: boolean;
 }
 
 interface RejectedFile {
@@ -47,6 +51,15 @@ interface CorpusPanelProps {
   disabled?: boolean;
   // Lets the context panel's header "Upload" action open this same file dialog.
   browseInputRef?: RefObject<HTMLInputElement | null>;
+  onRetryUpload?: (uploadId: string) => void;
+  onDismissUpload?: (uploadId: string) => void;
+  /** Indexed by an older chunker. */
+  staleFilenames?: string[];
+  /** Have a stored original the server can re-index from. */
+  reindexableFilenames?: string[];
+  onReindex?: (filename: string) => void;
+  /** Re-index every stale document that has a stored original, in one request. */
+  onReindexAllStale?: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -65,8 +78,14 @@ function progressPercent(progress?: UploadProgress): number {
 }
 
 interface DocCard {
+  key: string;
   filename: string;
+  /** Set for cards backed by an upload (in flight or failed) rather than the index. */
+  uploadId?: string;
+  canRetry?: boolean;
   status: 'indexed' | 'indexing' | 'failed';
+  stale?: boolean;
+  canReindex?: boolean;
   detail: string;
   pct: number;
   error?: string;
@@ -84,6 +103,12 @@ function CorpusPanel({
   maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES,
   disabled,
   browseInputRef,
+  onRetryUpload,
+  onDismissUpload,
+  staleFilenames = [],
+  reindexableFilenames = [],
+  onReindex,
+  onReindexAllStale,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFile[]>([]);
@@ -154,7 +179,12 @@ function CorpusPanel({
     }
   };
 
-  const indexedCards: DocCard[] = filenames.map((filename) => {
+  // An upload in flight for an already-indexed name (a re-upload) takes that document's
+  // card over, so its progress shows; the index keeps serving the previous version.
+  const inFlightNames = new Set(
+    uploads.filter((item) => item.status === 'uploading').map((item) => item.filename),
+  );
+  const indexedCards: DocCard[] = filenames.filter((filename) => !inFlightNames.has(filename)).map((filename) => {
     const parts = [`${chunkCounts[filename] ?? 0} chunks`];
     const pages = pageCounts[filename];
     if (pages) parts.push(`${pages} page${pages === 1 ? '' : 's'}`);
@@ -162,31 +192,52 @@ function CorpusPanel({
     if (bytes !== undefined) parts.push(formatBytes(bytes));
     const uploadedAt = uploadedAts[filename];
     if (uploadedAt !== undefined) parts.push(formatRelativeTime(uploadedAt * 1000));
+    const canReindex = onReindex !== undefined && reindexableFilenames.includes(filename);
+    // Only flagged when it can be acted on. Without a stored original there is nothing
+    // to re-index from, and a document indexed before versions were recorded counts as
+    // stale even if the current chunker produced it — a label the user can't clear.
+    const stale = canReindex && staleFilenames.includes(filename);
+    if (stale) parts.push('older chunking');
     return {
+      key: `doc:${filename}`,
       filename,
+      stale,
+      canReindex,
       status: 'indexed' as const,
       detail: parts.join(' · '),
       pct: 100,
     };
   });
 
-  // Only in-flight/failed uploads not yet reflected in `filenames` — a successful
-  // upload's filename lands in `filenames` on the same render its status flips to
-  // 'success', so without this filter it would render twice.
-  const inFlightCards: DocCard[] = uploads
-    .filter((item) => item.status !== 'success' && !filenames.includes(item.filename))
-    .map((item) =>
-      item.status === 'error'
-        ? { filename: item.filename, status: 'failed', detail: item.error ?? 'Ingestion failed.', pct: 0, error: item.error }
+  // In-flight and failed uploads — including re-uploads of an indexed name, whose
+  // failure leaves the previous version indexed (that card stays alongside). A
+  // successful upload is shown by its indexed card, so it's left out here.
+  const uploadCards: DocCard[] = uploads
+    .filter((item) => item.status !== 'success')
+    .map((item) => {
+      const reindexing = filenames.includes(item.filename);
+      return item.status === 'error'
+        ? {
+            key: `upload:${item.id}`,
+            uploadId: item.id,
+            canRetry: item.file !== undefined || item.reindex === true,
+            filename: item.filename,
+            status: 'failed',
+            detail: item.error ?? 'Ingestion failed.',
+            pct: 0,
+            error: item.error,
+          }
         : {
+            key: `upload:${item.id}`,
+            uploadId: item.id,
             filename: item.filename,
             status: 'indexing',
-            detail: `indexing ${progressPercent(item.progress)}%`,
+            detail: `${reindexing ? 're-indexing' : 'indexing'} ${progressPercent(item.progress)}%`,
             pct: progressPercent(item.progress),
-          },
-    );
+          };
+    });
 
-  const cards = [...indexedCards, ...inFlightCards];
+  const cards = [...indexedCards, ...uploadCards];
   const trimmedQuery = searchQuery.trim().toLowerCase();
   const filteredCards =
     trimmedQuery === ''
@@ -257,6 +308,20 @@ function CorpusPanel({
         </div>
       )}
 
+      {/* One card's ↻ is enough for one document; after a chunker upgrade every
+          document is stale at once, and clicking each in turn doesn't scale. */}
+      {onReindexAllStale && indexedCards.filter((card) => card.stale).length > 1 && (
+        <button
+          type="button"
+          className="corpus-panel__reindex-all"
+          onClick={onReindexAllStale}
+          disabled={disabled}
+          data-testid="reindex-all-stale"
+        >
+          ↻ Re-index {indexedCards.filter((card) => card.stale).length} documents with older chunking
+        </button>
+      )}
+
       {cards.length > 0 && (
         <input
           type="search"
@@ -274,12 +339,20 @@ function CorpusPanel({
       )}
 
       {filteredCards.map((card) => (
-        <article key={card.filename} className="corpus-panel__card" data-testid="corpus-panel-item">
+        <article key={card.key} className="corpus-panel__card" data-testid="corpus-panel-item">
           <div className="corpus-panel__card-top">
             <span className="corpus-panel__ext">{extensionOf(card.filename)}</span>
             <span className="corpus-panel__name">{card.filename}</span>
             {confirming === card.filename ? (
-              <div className="corpus-panel__confirm">
+              <div
+                className="corpus-panel__confirm"
+                onKeyDown={(event) => {
+                  if (event.key !== 'Escape') return;
+                  // Cancels the confirm only — not the drawer this panel may sit in.
+                  event.stopPropagation();
+                  setConfirming(null);
+                }}
+              >
                 <span>Delete?</span>
                 <button
                   type="button"
@@ -289,12 +362,35 @@ function CorpusPanel({
                 >
                   {deleting === card.filename ? '…' : 'Confirm'}
                 </button>
-                <button type="button" className="corpus-panel__confirm-no" onClick={() => setConfirming(null)}>
+                {/* Focus the safe choice, as ConversationList does: the ✕ that opened
+                    this confirm just unmounted, which dropped focus to <body>. */}
+                <button
+                  type="button"
+                  className="corpus-panel__confirm-no"
+                  autoFocus
+                  onClick={() => setConfirming(null)}
+                >
                   Cancel
                 </button>
               </div>
-            ) : (
-              card.status === 'indexed' && (
+            ) : card.status === 'indexed' ? (
+              <div className="corpus-panel__card-actions">
+                {card.canReindex && (
+                  <button
+                    type="button"
+                    className={`corpus-panel__reindex${card.stale ? ' corpus-panel__reindex--stale' : ''}`}
+                    onClick={() => onReindex?.(card.filename)}
+                    disabled={disabled}
+                    aria-label={`Re-index ${card.filename}`}
+                    title={
+                      card.stale
+                        ? 'Indexed by an older chunker — re-index from the stored original'
+                        : 'Re-index from the stored original'
+                    }
+                  >
+                    ↻
+                  </button>
+                )}
                 <button
                   type="button"
                   className="corpus-panel__remove"
@@ -304,15 +400,53 @@ function CorpusPanel({
                 >
                   ✕
                 </button>
+              </div>
+            ) : (
+              card.status === 'failed' &&
+              card.uploadId !== undefined && (
+                <div className="corpus-panel__failed-actions">
+                  {card.canRetry && onRetryUpload && (
+                    <button
+                      type="button"
+                      className="corpus-panel__retry"
+                      onClick={() => onRetryUpload(card.uploadId!)}
+                      disabled={disabled}
+                      aria-label={`Retry ${card.filename}`}
+                    >
+                      Retry
+                    </button>
+                  )}
+                  {onDismissUpload && (
+                    <button
+                      type="button"
+                      className="corpus-panel__remove"
+                      onClick={() => onDismissUpload(card.uploadId!)}
+                      aria-label={`Dismiss ${card.filename}`}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               )
             )}
           </div>
           <div className="corpus-panel__status">
             <span className={`corpus-panel__dot corpus-panel__dot--${card.status}`} aria-hidden="true" />
-            <span>{card.status === 'failed' ? `failed — ${card.detail}` : card.detail}</span>
+            {card.status === 'failed' ? (
+              <span role="status">{`failed — ${card.detail}`}</span>
+            ) : (
+              <span>{card.detail}</span>
+            )}
           </div>
           {card.status === 'indexing' && (
-            <div className="corpus-panel__bar">
+            <div
+              className="corpus-panel__bar"
+              role="progressbar"
+              aria-label={`Indexing ${card.filename}`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={card.pct}
+            >
               <div className="corpus-panel__bar-fill" style={{ width: `${card.pct}%` }} />
             </div>
           )}

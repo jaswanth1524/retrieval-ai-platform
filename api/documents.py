@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from threading import Lock
 from typing import Any, ClassVar, Literal, cast
+from zipfile import BadZipFile, ZipFile
 
 from pypdf import PdfReader
 
@@ -125,11 +126,16 @@ class DocumentChunk:
     # field existed (their stored payload simply lacks the key).
     byte_size: int | None = None
     uploaded_at: float | None = None
+    # CHUNKER_VERSION that produced this chunk, so a document chunked by an older
+    # algorithm can be found and re-indexed from its stored original. None (key absent)
+    # on points indexed before it was stamped — those count as stale.
+    chunker_version: int | None = None
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
     PAYLOAD_BYTE_SIZE_KEY: ClassVar[str] = "byte_size"
     PAYLOAD_UPLOADED_AT_KEY: ClassVar[str] = "uploaded_at"
+    PAYLOAD_CHUNKER_VERSION_KEY: ClassVar[str] = "chunker_version"
 
     def to_payload(self) -> dict[str, str | int | float]:
         """Return the Qdrant payload shape needed for grounded citations."""
@@ -146,6 +152,8 @@ class DocumentChunk:
             payload[self.PAYLOAD_BYTE_SIZE_KEY] = self.byte_size
         if self.uploaded_at is not None:
             payload[self.PAYLOAD_UPLOADED_AT_KEY] = self.uploaded_at
+        if self.chunker_version is not None:
+            payload[self.PAYLOAD_CHUNKER_VERSION_KEY] = self.chunker_version
         return payload
 
 
@@ -483,6 +491,19 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
                 empty_pages,
             )
             ocr_sections = []
+        except Exception:
+            # OCR itself broke (engine load, unreadable PDF for the rasterizer). A fully
+            # scanned PDF has nothing else to offer, so that still fails; a mixed one
+            # keeps its text pages, as it did before its empty pages were OCR'd.
+            if not sections:
+                raise
+            logger.warning(
+                "PDF %s: OCR failed for pages %s; indexing the remaining pages only.",
+                filename,
+                empty_pages,
+                exc_info=True,
+            )
+            ocr_sections = []
         sections = sorted([*sections, *ocr_sections], key=lambda section: section.page)
 
     if not sections:
@@ -564,10 +585,21 @@ def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> li
         for page_number in page_numbers:
             if page_number > len(pdf.pages):
                 continue
-            image = pdf.pages[page_number - 1].to_image(resolution=200)
-            import numpy as np
+            try:
+                image = pdf.pages[page_number - 1].to_image(resolution=200)
+                import numpy as np
 
-            ocr_result, _ = engine(np.array(image.original))
+                ocr_result, _ = engine(np.array(image.original))
+            except Exception:
+                # One unreadable image page must not fail the whole document — before
+                # mixed PDFs were OCR'd, such a page was simply skipped.
+                logger.warning(
+                    "PDF %s: OCR failed on page %d; skipping it.",
+                    filename,
+                    page_number,
+                    exc_info=True,
+                )
+                continue
             text = normalize_text("\n".join(line[1] for line in (ocr_result or [])))
             if text:
                 sections.append(
@@ -604,6 +636,27 @@ _HTML_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _DEFAULT_CSV_ROWS_PER_SECTION = 50
 
 
+# A DOCX is a zip that python-docx inflates entirely into memory. MAX_UPLOAD_BYTES caps
+# the compressed size only, so a few-MB upload declaring gigabytes of XML would OOM the
+# ingest worker. Real documents (images included) sit far below this.
+DOCX_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
+
+
+def _check_docx_expanded_size(filename: str, content: bytes) -> None:
+    """Refuse a DOCX whose members would inflate past ``DOCX_MAX_EXPANDED_BYTES``."""
+
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            expanded = sum(member.file_size for member in archive.infolist())
+    except BadZipFile as exc:
+        raise DocumentParseError(f"Could not parse DOCX '{filename}'.") from exc
+    if expanded > DOCX_MAX_EXPANDED_BYTES:
+        raise DocumentParseError(
+            f"DOCX '{filename}' expands to {expanded // (1024 * 1024)} MiB, over the "
+            f"{DOCX_MAX_EXPANDED_BYTES // (1024 * 1024)} MiB limit."
+        )
+
+
 def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
     """Extract DOCX text, using heading styles as semantic section boundaries.
 
@@ -616,6 +669,7 @@ def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
+    _check_docx_expanded_size(filename, content)
     try:
         document = Document(BytesIO(content))
     except Exception as exc:

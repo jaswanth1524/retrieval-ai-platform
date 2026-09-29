@@ -24,6 +24,16 @@ describe('ChatThread', () => {
     expect(screen.getByText('Upload a document, then ask a question about it.')).toBeInTheDocument();
   });
 
+  it('invites a question instead of an upload once documents are indexed', () => {
+    const { rerender } = render(
+      <ChatThread turns={[]} pending={false} engineerMode={false} documentCount={2} />,
+    );
+    expect(screen.getByText('Ask a question about your 2 documents.')).toBeInTheDocument();
+
+    rerender(<ChatThread turns={[]} pending={false} engineerMode={false} documentCount={1} />);
+    expect(screen.getByText('Ask a question about your document.')).toBeInTheDocument();
+  });
+
   it('renders each turn in order', () => {
     const turns = [makeTurn({ id: 'a', content: 'First' }), makeTurn({ id: 'b', content: 'Second' })];
     render(<ChatThread turns={turns} pending={false} engineerMode={false} />);

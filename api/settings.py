@@ -172,8 +172,9 @@ class AppSettings(BaseSettings):
     # chunking/embedding change needs every document manually re-uploaded. Setting
     # this to a directory keeps a copy of each upload (keyed by its normalized
     # basename filename) and exposes it via GET /documents/{filename}/original. Same
-    # writable-directory/volume requirement as job_store_path. Re-indexing from these
-    # originals isn't implemented — this only stores them.
+    # writable-directory/volume requirement as job_store_path. It also enables
+    # POST /documents/{filename}/reindex (and the bulk POST /documents/reindex), which
+    # re-chunk and re-embed a document from its stored original.
     raw_document_dir: str | None = None
 
     # False (default): no answer-feedback capture, matching every prior release. When

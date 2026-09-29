@@ -117,6 +117,7 @@ def ingest_chunks(
     embedding_provider: EmbeddingProvider,
     on_progress: Callable[[int, int], None] | None = None,
     on_indexed: Callable[[], None] | None = None,
+    precondition: Callable[[], None] | None = None,
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
@@ -128,9 +129,13 @@ def ingest_chunks(
     afterward — a failure partway through a multi-batch ingest still leaves whatever
     batches already succeeded correctly indexed, never wiped.
 
-    ``on_indexed`` runs once the new version is fully written, still inside the
-    filename lock — for side effects that must be atomic with the index (the stored
-    original), so a concurrent DELETE can't interleave with them.
+    ``on_indexed`` runs once the new version is fully written (before stale cleanup),
+    still inside the filename lock — for side effects that must be atomic with the
+    index (the stored original), so a concurrent DELETE can't interleave with them.
+
+    ``precondition`` runs first thing under the same lock and aborts the ingest by
+    raising — a re-index checks there that its document wasn't deleted while the job
+    waited in the queue, since a DELETE in that window would otherwise be undone.
     """
 
     if not chunks:
@@ -147,6 +152,9 @@ def ingest_chunks(
     with ExitStack() as locks:
         for filename in filenames:
             locks.enter_context(filename_write_lock(filename))
+
+        if precondition is not None:
+            precondition()
 
         # Snapshot each filename's currently-indexed point IDs *before* upserting —
         # this is what "stale" gets computed against once the new points are written.
@@ -191,6 +199,12 @@ def ingest_chunks(
             if on_progress is not None:
                 on_progress(min(start + batch_size, total), total)
 
+        # Every batch of the new version is live from here on, so its original bytes
+        # belong to it now — before stale cleanup, whose failure still leaves the new
+        # version indexed (and would otherwise keep serving the previous original).
+        if on_indexed is not None:
+            on_indexed()
+
         stale_ids = stale_candidate_ids - new_ids
         if stale_ids:
             try:
@@ -201,9 +215,6 @@ def ingest_chunks(
                     f"remove {len(stale_ids)} stale chunk(s) from the previous version. "
                     "Re-ingesting again will complete the cleanup."
                 ) from exc
-
-        if on_indexed is not None:
-            on_indexed()
 
         return IngestResult(
             collection_name=settings.qdrant_collection,

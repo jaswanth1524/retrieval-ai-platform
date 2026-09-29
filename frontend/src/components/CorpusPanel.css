@@ -245,3 +245,71 @@
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+.corpus-panel__failed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.corpus-panel__retry {
+  border: 1px solid var(--rule-hi);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--rail-text);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 1px 6px;
+}
+
+.corpus-panel__retry:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* The file input is visually hidden inside the dropzone, so keyboard focus on it was
+   invisible; outline the zone it stands for instead. */
+.corpus-panel__dropzone:has(.corpus-panel__input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.corpus-panel__card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.corpus-panel__reindex {
+  border: none;
+  background: transparent;
+  color: var(--rail-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.corpus-panel__reindex--stale {
+  color: var(--warn);
+}
+
+.corpus-panel__reindex:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.corpus-panel__reindex-all {
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--warn);
+  cursor: pointer;
+  font-size: 11.5px;
+  padding: 5px 8px;
+  text-align: left;
+}
+
+.corpus-panel__reindex-all:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.04);
+}

@@ -41,6 +41,18 @@ test('every shortcut the palette advertises is bound, and none stack over Settin
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
 
+  // Upload opens the file picker; New conversation clears the thread.
+  const chooser = page.waitForEvent('filechooser');
+  await page.keyboard.press('ControlOrMeta+u');
+  await chooser;
+
+  const box = page.getByTestId('question-textarea');
+  await box.fill('What retrieval strategy does DocRAG use?');
+  await box.press('Enter');
+  await expect(page.getByText('DocRAG uses hybrid retrieval')).toBeVisible();
+  await page.keyboard.press('ControlOrMeta+Shift+o');
+  await expect(page.getByText('DocRAG uses hybrid retrieval')).toHaveCount(0);
+
   await page.keyboard.press('ControlOrMeta+Comma');
   await expect(page.getByTestId('settings-modal')).toBeVisible();
   await page.keyboard.press('ControlOrMeta+k');

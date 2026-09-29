@@ -2,7 +2,8 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiClientError } from '../../src/api/client';
-import Inspector from '../../src/components/Inspector';
+import { useState } from 'react';
+import Inspector, { type InspectorTab } from '../../src/components/Inspector';
 import { clearTraceCache } from '../../src/hooks/useTrace';
 import type { CitationResponse, TraceCandidateResponse, TraceDetailResponse } from '../../src/api/types';
 
@@ -232,5 +233,54 @@ describe('Inspector', () => {
     await userEvent.click(screen.getByTestId('inspector-close'));
 
     expect(props.onClose).toHaveBeenCalled();
+  });
+});
+
+describe('Inspector tabs keyboard', () => {
+  beforeEach(() => {
+    getTrace.mockReset();
+    clearTraceCache();
+  });
+
+  function StatefulInspector({ overlay = false, onClose = vi.fn() }) {
+    const [tab, setTab] = useState<InspectorTab>('sources');
+    return (
+      <Inspector
+        engineerMode
+        tab={tab}
+        onTabChange={setTab}
+        onClose={onClose}
+        sources={[makeSource()]}
+        traceId={null}
+        overlay={overlay}
+      />
+    );
+  }
+
+  it('moves between tabs with the arrow keys and keeps one tab stop', async () => {
+    render(<StatefulInspector />);
+    const sources = screen.getByRole('tab', { name: 'sources' });
+    expect(sources).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('tab', { name: 'trace' })).toHaveAttribute('tabindex', '-1');
+    // The panel names the tab that labels it.
+    expect(screen.getByRole('tabpanel')).toHaveAccessibleName('sources');
+
+    sources.focus();
+    await userEvent.keyboard('{ArrowRight}');
+    expect(screen.getByRole('tab', { name: 'retrieval' })).toHaveFocus();
+    expect(screen.getByRole('tab', { name: 'retrieval' })).toHaveAttribute('aria-selected', 'true');
+    await userEvent.keyboard('{ArrowLeft}{ArrowLeft}');
+    expect(screen.getByRole('tab', { name: 'trace' })).toHaveFocus();
+    await userEvent.keyboard('{Home}');
+    expect(sources).toHaveFocus();
+  });
+
+  it('is a modal dialog when shown as a narrow-screen overlay', async () => {
+    const onClose = vi.fn();
+    render(<StatefulInspector overlay onClose={onClose} />);
+
+    expect(screen.getByRole('dialog', { name: 'Inspector' })).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId('inspector-backdrop'));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

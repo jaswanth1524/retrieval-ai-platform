@@ -92,8 +92,35 @@
   flex: 1;
 }
 
+/* Narrow screens: the panel leaves the grid (its column collapses to 0, global.css) and
+   opens as a drawer beside the rail instead — otherwise the rail's buttons did nothing
+   visible and there was no way to upload, switch conversations or browse traces. */
 @media (max-width: 860px) {
   .context-panel {
     display: none;
+  }
+
+  .context-panel--drawer-open {
+    display: flex;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: var(--w-rail);
+    z-index: 45;
+    /* Always leave a deliberate 48px of backdrop on the right as the tap-outside-to-
+       close target (a fixed width left only an accidental ~18px sliver at 390px, and
+       filling the width left no way to tap out at all). Capped on tablets. */
+    width: min(360px, calc(100vw - var(--w-rail) - 48px));
+    box-shadow: 8px 0 24px rgba(12, 10, 8, 0.35);
+    animation: dr-in 0.16s ease-out;
+  }
+}
+
+/* The rail stays usable above the drawer's backdrop: it is the drawer's toggle (tap the
+   open panel again to close) and its switcher (tap another panel to swap). */
+@media (max-width: 860px) {
+  .app-shell:has(.context-panel--drawer-open) .icon-rail {
+    position: relative;
+    z-index: 45;
   }
 }

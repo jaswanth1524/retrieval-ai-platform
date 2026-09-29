@@ -437,10 +437,16 @@
   overflow-y: auto;
 }
 
-/* The inspector is the first thing to go when width is scarce — the chat column has a
-   340px floor and the panel already collapsed at 860px. */
-@media (max-width: 1120px) {
-  .inspector {
-    display: none;
-  }
+/* The inspector is the first column to go when width is scarce — the chat column has a
+   340px floor. Below this it opens (only on request) as a drawer over the chat instead
+   of vanishing, so the header toggle and a trace click still show something. */
+.inspector--overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 46;
+  width: min(var(--w-inspector), 100vw);
+  box-shadow: -8px 0 24px rgba(12, 10, 8, 0.35);
+  animation: dr-in 0.16s ease-out;
 }

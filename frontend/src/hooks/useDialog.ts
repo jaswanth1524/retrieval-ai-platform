@@ -4,7 +4,13 @@ import type { RefObject } from 'react';
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-/** Modal behaviour shared by the command palette and the settings modal.
+// Open dialogs, innermost last. Several can be open at once (the document viewer opened
+// from the inspector drawer), and only the innermost may react to Escape or trap Tab —
+// otherwise one Escape closed both, and the outer trap pulled focus out of the inner.
+const openDialogs: symbol[] = [];
+
+/** Modal behaviour shared by the command palette, the settings modal, the document
+ *  viewer and the narrow-screen drawers.
  *
  * Three things, all of which are the difference between a dialog and a div that looks
  * like one: focus moves into it on open, Tab cannot escape it while it is open, and
@@ -13,8 +19,11 @@ const FOCUSABLE =
  *
  * Returns a ref to put on the dialog container.
  */
-export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDivElement | null> {
-  const containerRef = useRef<HTMLDivElement>(null);
+export function useDialog<T extends HTMLElement = HTMLDivElement>(
+  open: boolean,
+  onClose: () => void,
+): RefObject<T | null> {
+  const containerRef = useRef<T>(null);
   // Captured at open time, because by close time the opener may no longer be focused.
   const openerRef = useRef<HTMLElement | null>(null);
   // Read through a ref so the effect depends on `open` alone. Callers pass inline
@@ -26,6 +35,8 @@ export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDiv
 
   useEffect(() => {
     if (!open) return;
+    const id = Symbol('dialog');
+    openDialogs.push(id);
     openerRef.current = document.activeElement as HTMLElement | null;
 
     const container = containerRef.current;
@@ -33,6 +44,7 @@ export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDiv
     focusables?.[0]?.focus();
 
     const handleKey = (event: KeyboardEvent) => {
+      if (openDialogs[openDialogs.length - 1] !== id) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         onCloseRef.current();
@@ -60,6 +72,7 @@ export function useDialog(open: boolean, onClose: () => void): RefObject<HTMLDiv
     document.addEventListener('keydown', handleKey);
     return () => {
       document.removeEventListener('keydown', handleKey);
+      openDialogs.splice(openDialogs.indexOf(id), 1);
       // Only restore if the opener is still in the document — it may have been
       // unmounted by whatever the dialog just did.
       const opener = openerRef.current;

@@ -1,12 +1,12 @@
 # DocRAG Improvement Recommendations — Audit #2
 
-> **Status banner (2026-07-14):** this audit predates the conversation-memory,
-> document-management, chat-UX, and ops/quality milestone (per `CLAUDE.md`'s
-> Current State). Several findings below are now stale/resolved — see the inline
-> annotations on C3 and D2 — kept in place rather than deleted, since this file
-> documents decision history `CLAUDE.md` still references (e.g. the reranker-swap
-> approval in A2). Treat the rest of this document as a historical snapshot, not
-> a current punch list.
+> **Status (2026-09-28): historical — every actionable item below is implemented.**
+> A1 (`_env_file=None` in test settings), A3 (`max_length=4000` questions), A5 (live
+> regions/alerts), B1 (guarded `localStorage`), B2 (Stop), B4/B5 (upsert-then-delete-stale
+> ingest), B6 (startup warmup), C1-C3 (tests + CI) all shipped; A4/B3/C2 name components
+> the workspace redesign replaced. Only D3's `ChunkConfigError`-is-400 note remains, by
+> choice. Kept as decision history (e.g. the reranker swap approved in A2). For current
+> state see `CLAUDE.md` "Current State", not this file.
 
 Second full-codebase audit, done after all 12 actionable items from audit #1 (previous version of
 this doc) were implemented and shipped, plus the `drop_params` gpt-5 fix and the frontend dark/light

@@ -31,6 +31,8 @@ export interface PublicConfigResponse {
   max_context_chunks_limit: number;
   llm_temperature_max: number;
   feedback_enabled: boolean;
+  /** RAW_DOCUMENT_DIR is set: originals are kept, so documents can be re-indexed. */
+  raw_documents_enabled?: boolean;
 }
 
 export interface QuestionOverrides {
@@ -54,6 +56,12 @@ export interface DocumentJobAcceptedResponse {
   state: 'queued';
 }
 
+export interface DocumentReindexAllResponse {
+  jobs: DocumentJobAcceptedResponse[];
+  /** Stale and re-indexable, but the ingest backlog was full — retry later. */
+  deferred: string[];
+}
+
 export interface DocumentJobStatusResponse {
   job_id: string;
   filename: string;
@@ -72,6 +80,10 @@ export interface DocumentListResponse {
   // ingested before byte_size/uploaded_at were stamped at ingest time.
   byte_sizes?: Record<string, number>;
   uploaded_ats?: Record<string, number>;
+  /** Indexed by an older chunker; re-indexing applies the current one. */
+  stale_filenames?: string[];
+  /** Have a stored original, so POST /documents/{f}/reindex works. */
+  reindexable_filenames?: string[];
 }
 
 export interface DocumentDeleteResponse {

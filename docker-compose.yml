@@ -1,6 +1,8 @@
 services:
   qdrant:
-    image: ${QDRANT_IMAGE:-qdrant/qdrant:latest}
+    # Pinned: server-side hybrid (prefetch + RRF fusion) depends on the Qdrant version,
+    # and :latest silently changed it under an existing install on every pull.
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.1}
     ports:
       - "${QDRANT_PORT:-6333}:6333"
       - "${QDRANT_GRPC_PORT:-6334}:6334"

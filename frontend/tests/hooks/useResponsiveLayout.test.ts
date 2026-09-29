@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   INSPECTOR_COLLAPSE_PX,
   INSPECTOR_RESTORE_PX,
+  PANEL_COLLAPSE_PX,
   useResponsiveLayout,
 } from '../../src/hooks/useResponsiveLayout';
 
@@ -90,10 +91,22 @@ describe('useResponsiveLayout', () => {
     expect(result.current.roomyEnoughForInspector).toBe(false);
   });
 
+  it('collapses the context panel into a drawer at and below its breakpoint', () => {
+    const media = installMatchMedia(PANEL_COLLAPSE_PX + 1);
+    const { result } = renderHook(() => useResponsiveLayout());
+    expect(result.current.panelCollapsed).toBe(false);
+
+    act(() => media.resizeTo(PANEL_COLLAPSE_PX));
+    expect(result.current.panelCollapsed).toBe(true);
+
+    act(() => media.resizeTo(1440));
+    expect(result.current.panelCollapsed).toBe(false);
+  });
+
   it('removes its listeners on unmount', () => {
     const media = installMatchMedia(1440);
     const { unmount } = renderHook(() => useResponsiveLayout());
-    expect(media.listenerCount()).toBe(2);
+    expect(media.listenerCount()).toBe(3);
 
     unmount();
 

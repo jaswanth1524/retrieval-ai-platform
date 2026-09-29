@@ -313,3 +313,66 @@ def test_vector_repository_chunks_for_filename_empty_for_unknown_file() -> None:
     repository.upsert(settings, [make_point("p1", "guide.md")])
 
     assert repository.chunks_for_filename(settings, "missing.md") == []
+
+
+def test_vector_repository_scrolls_page_by_page_across_every_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every whole-collection/per-file reader shares one paging loop; with a page size
+    of 2 and 5 points, a reader that stopped after the first page would under-count."""
+
+    import api.repository as repository_module
+
+    monkeypatch.setattr(repository_module, "_SCROLL_PAGE_SIZE", 2)
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(
+        settings,
+        [make_ordinal_point(f"g{n}", "guide.md", n, f"text {n}") for n in range(1, 6)]
+        + [make_ordinal_point("o1", "other.md", 1, "other")],
+    )
+
+    assert len(repository.point_ids_for_filename(settings, "guide.md")) == 5
+    assert [p["chunk_ordinal"] for p in repository.chunks_for_filename(settings, "guide.md")] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert repository.filename_chunk_counts(settings) == {"guide.md": 5, "other.md": 1}
+    assert repository.filename_metadata(settings)["guide.md"].chunk_count == 5
+
+
+def test_filename_metadata_reports_the_oldest_chunker_version_and_legacy_as_none() -> None:
+    """Staleness uses the minimum: a re-ingest that failed partway leaves old-version
+    points beside new ones, and any point without the field is legacy."""
+
+    def versioned(point_id: str, filename: str, version: int | None) -> models.PointStruct:
+        point = make_point(point_id, filename, uploaded_at=100.0)
+        assert point.payload is not None
+        if version is not None:
+            point.payload["chunker_version"] = version
+        return point
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(
+        settings,
+        [
+            versioned("a1", "current.md", 3),
+            versioned("a2", "current.md", 3),
+            versioned("b1", "mixed.md", 3),
+            versioned("b2", "mixed.md", 2),
+            versioned("c1", "legacy.md", 3),
+            versioned("c2", "legacy.md", None),
+        ],
+    )
+
+    metadata = repository.filename_metadata(settings)
+
+    assert metadata["current.md"].chunker_version == 3
+    assert metadata["mixed.md"].chunker_version == 2
+    assert metadata["legacy.md"].chunker_version is None
+    assert repository.uploaded_at_for_filename(settings, "mixed.md") == 100.0
+    assert repository.uploaded_at_for_filename(settings, "absent.md") is None

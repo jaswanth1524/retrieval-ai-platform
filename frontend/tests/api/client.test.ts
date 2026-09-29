@@ -182,6 +182,37 @@ describe('deleteDocument', () => {
   });
 });
 
+describe('reindexDocument', () => {
+  it('POSTs to the encoded per-document reindex route', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(202, { job_id: 'j1', filename: 'a b.md', state: 'queued' }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const accepted = await api.reindexDocument('a b.md');
+
+    expect(accepted.job_id).toBe('j1');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toMatch(/\/documents\/a%20b\.md\/reindex$/);
+    expect(init.method).toBe('POST');
+  });
+});
+
+describe('reindexStaleDocuments', () => {
+  it('POSTs to the bulk reindex route and returns jobs plus deferrals', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(202, { jobs: [{ job_id: 'j1', filename: 'a.md', state: 'queued' }], deferred: ['b.md'] }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.reindexStaleDocuments();
+
+    expect(result.deferred).toEqual(['b.md']);
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/documents\/reindex$/);
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+  });
+});
+
 describe('getDocumentContent', () => {
   it('requests the encoded content path', async () => {
     const fetchMock = vi
@@ -478,6 +509,59 @@ describe('askQuestionStream termination', () => {
       message: 'The answer stream ended before the server finished.',
     });
     expect(onDelta).toHaveBeenCalledWith('half an ans');
+  });
+
+  it('ignores a connection reset that lands after the done event', async () => {
+    const encoder = new TextEncoder();
+    const done = { type: 'done', answer: 'Full answer.', sources: [], timings: null, trace_id: 't1' };
+    const stream = new ReadableStream<Uint8Array>({
+      // error() discards queued chunks, so fail on the *next* pull — after the
+      // reader has consumed the done frame, as a real reset would.
+      start(controller) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`));
+      },
+      pull(controller) {
+        if (controller.desiredSize !== null && controller.desiredSize > 0) {
+          controller.error(new TypeError('network error'));
+        }
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+      ),
+    );
+    const onDone = vi.fn();
+
+    await expect(
+      api.askQuestionStream('hi', undefined, undefined, undefined, undefined, { onDone }),
+    ).resolves.toBeUndefined();
+    expect(onDone).toHaveBeenCalledWith('Full answer.', [], null, 't1');
+  });
+
+  it('still rejects a connection reset before the done event', async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'delta', text: 'pa' })}\n\n`));
+      },
+      pull(controller) {
+        if (controller.desiredSize !== null && controller.desiredSize > 0) {
+          controller.error(new TypeError('network error'));
+        }
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+      ),
+    );
+
+    await expect(
+      api.askQuestionStream('hi', undefined, undefined, undefined, undefined, {}),
+    ).rejects.toMatchObject({ name: 'ApiClientError' });
   });
 
   it('bounds silence, not total duration: steady chunks keep a long stream alive', async () => {

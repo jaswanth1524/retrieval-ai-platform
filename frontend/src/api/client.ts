@@ -5,6 +5,7 @@ import type {
   DocumentJobAcceptedResponse,
   DocumentJobStatusResponse,
   DocumentListResponse,
+  DocumentReindexAllResponse,
   FeedbackRequest,
   FeedbackResponse,
   HealthResponse,
@@ -266,6 +267,18 @@ export const api = {
     });
   },
 
+  // Re-chunks and re-embeds a document from its stored original; poll the job like an
+  // upload's. 409 when the server keeps no originals, 404 when this one has none.
+  reindexDocument: (filename: string, signal?: AbortSignal) =>
+    request<DocumentJobAcceptedResponse>(`/documents/${encodeURIComponent(filename)}/reindex`, {
+      method: 'POST',
+      signal,
+    }),
+
+  // Re-indexes every document chunked by an older chunker that has a stored original.
+  reindexStaleDocuments: (signal?: AbortSignal) =>
+    request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal }),
+
   deleteDocument: (filename: string, signal?: AbortSignal) =>
     request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
       method: 'DELETE',
@@ -430,6 +443,9 @@ export const api = {
           resetIdleTimeout,
         );
       } catch (err) {
+        // The answer is already complete and delivered: a connection reset while the
+        // server closes the stream must not stack an error turn under it.
+        if (sawDone) return;
         // A backend `error` event already threw the right thing — don't re-wrap it.
         if (err instanceof ApiClientError) throw err;
         if (timeoutController.signal.aborted) {

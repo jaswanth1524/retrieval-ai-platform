@@ -8,7 +8,7 @@ typing, so callers never import ``qdrant_client`` directly.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from weakref import WeakSet
 
@@ -48,6 +48,19 @@ class DocumentMetadata:
     # forced by a re-ingest.
     byte_size: int | None
     uploaded_at: float | None
+    # Oldest chunker version among the filename's points; None when any point predates
+    # the field (legacy). A re-ingest that failed partway can leave old-version points
+    # behind, so the minimum — not whichever point came first — decides staleness.
+    chunker_version: int | None = None
+
+
+_SCROLL_PAGE_SIZE = 256
+
+
+def _single_filename_filter(filename: str) -> models.Filter:
+    return models.Filter(
+        must=[models.FieldCondition(key="filename", match=models.MatchValue(value=filename))]
+    )
 
 
 class VectorRepository:
@@ -102,6 +115,29 @@ class VectorRepository:
             wait=True,
         )
 
+    def _scroll_all(
+        self,
+        settings: AppSettings,
+        *,
+        with_payload: bool | list[str],
+        scroll_filter: models.Filter | None = None,
+    ) -> Iterator[models.Record]:
+        """Yield every point matching ``scroll_filter``, paging through the collection."""
+
+        offset: models.ExtendedPointId | None = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=scroll_filter,
+                with_payload=with_payload,
+                with_vectors=False,
+                limit=_SCROLL_PAGE_SIZE,
+                offset=offset,
+            )
+            yield from points
+            if offset is None:
+                return
+
     def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]:
         """Return all point IDs currently indexed for a filename.
 
@@ -111,28 +147,12 @@ class VectorRepository:
         """
 
         self.ensure_ready(settings)
-        ids: list[str] = []
-        offset: models.ExtendedPointId | None = None
-        while True:
-            points, offset = self._client.scroll(
-                collection_name=settings.qdrant_collection,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="filename",
-                            match=models.MatchValue(value=filename),
-                        )
-                    ]
-                ),
-                with_payload=False,
-                with_vectors=False,
-                limit=256,
-                offset=offset,
+        return [
+            str(point.id)
+            for point in self._scroll_all(
+                settings, scroll_filter=_single_filename_filter(filename), with_payload=False
             )
-            ids.extend(str(point.id) for point in points)
-            if offset is None:
-                break
-        return ids
+        ]
 
     def chunks_for_filename(
         self, settings: AppSettings, filename: str
@@ -144,27 +164,13 @@ class VectorRepository:
         """
 
         self.ensure_ready(settings)
-        payloads: list[dict[str, object]] = []
-        offset: models.ExtendedPointId | None = None
-        while True:
-            points, offset = self._client.scroll(
-                collection_name=settings.qdrant_collection,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="filename",
-                            match=models.MatchValue(value=filename),
-                        )
-                    ]
-                ),
-                with_payload=True,
-                with_vectors=False,
-                limit=256,
-                offset=offset,
+        payloads: list[dict[str, object]] = [
+            point.payload
+            for point in self._scroll_all(
+                settings, scroll_filter=_single_filename_filter(filename), with_payload=True
             )
-            payloads.extend(point.payload for point in points if point.payload)
-            if offset is None:
-                break
+            if point.payload
+        ]
         payloads.sort(key=_chunk_ordinal_sort_key)
         return payloads
 
@@ -173,20 +179,9 @@ class VectorRepository:
 
         self.ensure_ready(settings)
         counts: Counter[str] = Counter()
-        offset: models.ExtendedPointId | None = None
-        while True:
-            points, offset = self._client.scroll(
-                collection_name=settings.qdrant_collection,
-                with_payload=["filename"],
-                with_vectors=False,
-                limit=256,
-                offset=offset,
-            )
-            for point in points:
-                if point.payload and isinstance(point.payload.get("filename"), str):
-                    counts[point.payload["filename"]] += 1
-            if offset is None:
-                break
+        for point in self._scroll_all(settings, with_payload=["filename"]):
+            if point.payload and isinstance(point.payload.get("filename"), str):
+                counts[point.payload["filename"]] += 1
         return dict(counts)
 
     def filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
@@ -207,42 +202,56 @@ class VectorRepository:
         max_page: dict[str, int] = {}
         byte_size: dict[str, int] = {}
         uploaded_at: dict[str, float] = {}
-        offset: models.ExtendedPointId | None = None
-        while True:
-            points, offset = self._client.scroll(
-                collection_name=settings.qdrant_collection,
-                with_payload=["filename", "page", "byte_size", "uploaded_at"],
-                with_vectors=False,
-                limit=256,
-                offset=offset,
-            )
-            for point in points:
-                if not point.payload:
-                    continue
-                filename = point.payload.get("filename")
-                if not isinstance(filename, str):
-                    continue
-                chunk_counts[filename] += 1
-                page = point.payload.get("page")
-                if isinstance(page, int):
-                    max_page[filename] = max(max_page.get(filename, 0), page)
-                size = point.payload.get("byte_size")
-                if isinstance(size, int) and filename not in byte_size:
-                    byte_size[filename] = size
-                stamp = point.payload.get("uploaded_at")
-                if isinstance(stamp, int | float) and filename not in uploaded_at:
-                    uploaded_at[filename] = float(stamp)
-            if offset is None:
-                break
+        min_version: dict[str, int] = {}
+        unversioned: set[str] = set()
+        for point in self._scroll_all(
+            settings,
+            with_payload=["filename", "page", "byte_size", "uploaded_at", "chunker_version"],
+        ):
+            if not point.payload:
+                continue
+            filename = point.payload.get("filename")
+            if not isinstance(filename, str):
+                continue
+            chunk_counts[filename] += 1
+            page = point.payload.get("page")
+            if isinstance(page, int):
+                max_page[filename] = max(max_page.get(filename, 0), page)
+            size = point.payload.get("byte_size")
+            if isinstance(size, int) and filename not in byte_size:
+                byte_size[filename] = size
+            stamp = point.payload.get("uploaded_at")
+            if isinstance(stamp, int | float) and filename not in uploaded_at:
+                uploaded_at[filename] = float(stamp)
+            version = point.payload.get("chunker_version")
+            if isinstance(version, int) and not isinstance(version, bool):
+                min_version[filename] = min(min_version.get(filename, version), version)
+            else:
+                unversioned.add(filename)
         return {
             filename: DocumentMetadata(
                 chunk_count=count,
                 page_count=max_page.get(filename, 0),
                 byte_size=byte_size.get(filename),
                 uploaded_at=uploaded_at.get(filename),
+                chunker_version=None if filename in unversioned else min_version.get(filename),
             )
             for filename, count in chunk_counts.items()
         }
+
+    def uploaded_at_for_filename(self, settings: AppSettings, filename: str) -> float | None:
+        """The stored upload time of an indexed document (one point read), or None."""
+
+        self.ensure_ready(settings)
+        points, _ = self._client.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=_single_filename_filter(filename),
+            with_payload=["uploaded_at"],
+            with_vectors=False,
+            limit=1,
+        )
+        stamp = points[0].payload.get("uploaded_at") if points and points[0].payload else None
+        return float(stamp) if isinstance(stamp, int | float) else None
 
     def list_filenames(self, settings: AppSettings) -> list[str]:
         """Return the distinct filenames currently indexed, for per-document filtering."""
