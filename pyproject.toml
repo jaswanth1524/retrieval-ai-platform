@@ -10,11 +10,11 @@ authors = [
   { name = "DocRAG contributors" }
 ]
 dependencies = [
-  "fastapi>=0.115",
-  "fastembed>=0.4",
-  "litellm>=1.50",
-  "prometheus-client>=0.25.0",
-  "pydantic-settings>=2.6",
+  "fastapi>=0.141.1",
+  "fastembed>=0.8.1",
+  "litellm>=1.102.1",
+  "prometheus-client>=0.26.0",
+  "pydantic-settings>=2.15.0",
   "pypdf>=5.0",
   # Document format parsers. python-docx: the only maintained pure-Python DOCX reader,
   # needed for heading structure (citation sections). beautifulsoup4: robust HTML text
@@ -24,12 +24,12 @@ dependencies = [
   "python-docx>=1.1",
   "beautifulsoup4>=4.12",
   "pdfplumber>=0.11",
-  "python-dotenv>=1.0",
+  "python-dotenv>=1.2.3",
   "python-multipart>=0.0.12",
-  "qdrant-client>=1.12",
+  "qdrant-client>=1.19.1",
   # Already present transitively via fastembed; declared explicitly because the chunker
   # loads the dense model's tokenizer directly to count subword tokens (api/chunking.py).
-  "tokenizers>=0.20",
+  "tokenizers>=0.23.2",
   "uvicorn[standard]>=0.32",
 ]
 
@@ -40,7 +40,7 @@ eval = [
   # load (ragas/llms/base.py), but that submodule was removed in langchain-community
   # 0.4 — an unpinned install resolves to 0.4.x and `import ragas` crashes with
   # ModuleNotFoundError. Pin to the last 0.3.x line, which still ships it.
-  "langchain-community>=0.3,<0.4",
+  "langchain-community>=0.4.2,<0.5",
 ]
 # Optional OCR for scanned/image PDFs. Pure-Python ONNX (onnxruntime is already a
 # fastembed dependency); when absent, scanned PDFs fail with a message pointing here.
@@ -54,8 +54,8 @@ test = [
 ]
 dev = [
   "docrag[eval,test]",
-  "mypy>=1.13",
-  "ruff>=0.7",
+  "mypy>=2.3.1",
+  "ruff>=0.16.9",
 ]
 
 [tool.uv]
