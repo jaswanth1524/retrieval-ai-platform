@@ -86,7 +86,12 @@ def test_rerank_candidates_sorts_by_cross_encoder_score_and_truncates() -> None:
     results = rerank_candidates("  setup docs  ", candidates, reranker, settings)
 
     assert reranker.seen_query == "setup docs"
-    assert reranker.seen_documents == ["first", "second", "third"]
+    # Scored as they were embedded: prefixed with filename and section.
+    assert reranker.seen_documents == [
+        "guide.md › Setup\nfirst",
+        "guide.md › Setup\nsecond",
+        "guide.md › Setup\nthird",
+    ]
     assert [result.chunk_id for result in results] == ["c2", "c3"]
     assert results[0].retrieval_score == 0.8
     assert results[0].rerank_score == pytest.approx(_sigmoid(0.95))
@@ -107,7 +112,7 @@ def test_rerank_candidates_scores_only_rerank_candidates_setting() -> None:
 
     results = rerank_candidates("query", candidates, reranker, settings)
 
-    assert reranker.seen_documents == ["first", "second"]
+    assert reranker.seen_documents == ["guide.md › Setup\nfirst", "guide.md › Setup\nsecond"]
     assert [result.chunk_id for result in results] == ["c2", "c1"]
 
 
@@ -122,7 +127,7 @@ def test_rerank_candidates_rerank_candidates_setting_never_exceeds_fused_top_n()
 
     results = rerank_candidates("query", candidates, reranker, settings)
 
-    assert reranker.seen_documents == ["first", "second"]
+    assert reranker.seen_documents == ["guide.md › Setup\nfirst", "guide.md › Setup\nsecond"]
     assert [result.chunk_id for result in results] == ["c2", "c1"]
 
 
@@ -137,7 +142,7 @@ def test_rerank_candidates_scores_only_fused_top_n() -> None:
 
     results = rerank_candidates("query", candidates, reranker, settings)
 
-    assert reranker.seen_documents == ["first", "second"]
+    assert reranker.seen_documents == ["guide.md › Setup\nfirst", "guide.md › Setup\nsecond"]
     assert [result.chunk_id for result in results] == ["c2", "c1"]
 
 
@@ -274,7 +279,6 @@ def test_local_cross_encoder_reranker_wraps_model_failure_as_reranking_error() -
 
     with pytest.raises(RerankingError, match="model download failed"):
         reranker.score("query", ["doc"])
-
 
 
 class CountingCrossEncoder:

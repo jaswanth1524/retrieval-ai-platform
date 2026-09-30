@@ -96,12 +96,18 @@ export class MockApi {
   /** Indexed by an older chunker / have a stored original (GET /documents). */
   staleFilenames: string[] = [];
   reindexableFilenames: string[] = [];
+  /** Each tagged document's tags (GET /documents, PATCH /documents/{f}/tags). */
+  tags: Record<string, string[]> = {};
+  /** Chunks for GET /documents/{f}/content; null serves the default two (incl. GUIDE_SOURCE). */
+  contentChunks: object[] | null = null;
   /** Every POST /questions/stream body the app sent, oldest first. */
   readonly questionBodies: Record<string, unknown>[] = [];
   /** Body for POST /questions/stream, or a function for held/custom streams. */
   stream: string | ((route: Route) => Promise<void>) = answerStream();
   /** Response for POST /documents; default accepts the upload as job "job-1". */
   uploadResponse: JobStep | null = null;
+  /** How many uploads to turn away first with 503 + Retry-After (a full indexing queue). */
+  uploadsQueueFull = 0;
   /** Successive GET /documents/jobs/{id} responses; the last one repeats. */
   jobSteps: JobStep[] = [];
   /** In-flight ingest jobs by id: the file each one indexes and how often it was polled.
@@ -172,6 +178,7 @@ export class MockApi {
         reindexable_filenames: this.reindexableFilenames.filter((name) =>
           this.documents.includes(name),
         ),
+        tags: this.tags,
       });
     }
 
@@ -180,6 +187,16 @@ export class MockApi {
       if (this.uploadResponse) {
         const { status, body } = this.uploadResponse;
         return this.configured(route, status, body ?? {});
+      }
+      if (this.uploadsQueueFull > 0) {
+        this.uploadsQueueFull -= 1;
+        this.intentionalFailures.add(request.url());
+        return route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          headers: { 'Retry-After': '1' },
+          body: JSON.stringify({ detail: 'Too many documents are already waiting to be indexed.' }),
+        });
       }
       return this.json(route, 202, this.startJob(filename));
     }
@@ -208,7 +225,7 @@ export class MockApi {
       return this.json(route, 202, { jobs: due.map((name) => this.startJob(name)), deferred: [] });
     }
 
-    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex))?$/.exec(path);
+    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags))?$/.exec(path);
     if (documentRoute) {
       const filename = decodeURIComponent(documentRoute[1]);
       const action = documentRoute[2];
@@ -220,13 +237,41 @@ export class MockApi {
         return this.json(route, 200, { filename, points_deleted: 1 });
       }
       if (action === 'content' && method === 'GET') {
+        const all = (this.contentChunks ?? [
+          { chunk_id: 'c0', page: 1, section: 'Intro', text: 'DocRAG overview.', chunk_ordinal: 1 },
+          { chunk_id: GUIDE_SOURCE.chunk_id, page: 1, section: GUIDE_SOURCE.section, text: GUIDE_SOURCE.text, chunk_ordinal: 2 },
+        ]) as { chunk_id: string; chunk_ordinal: number }[];
+        // Pages like the server: `around` + `radius`, or `start`/`end` ordinals.
+        const params = new URL(request.url()).searchParams;
+        const around = params.get('around');
+        if (around === null && !params.has('start') && !params.has('end')) {
+          return this.json(route, 200, { filename, chunks: all, total_chunks: all.length });
+        }
+        let first: number;
+        let last: number;
+        let targetFound: boolean | null = null;
+        if (around !== null) {
+          const hit = all.find((chunk) => chunk.chunk_id === around);
+          targetFound = hit !== undefined;
+          const radius = Number(params.get('radius') ?? 30);
+          first = Math.max(1, (hit?.chunk_ordinal ?? 1) - radius);
+          last = (hit?.chunk_ordinal ?? 1) + radius;
+        } else {
+          first = Number(params.get('start') ?? 1);
+          last = Number(params.get('end') ?? first + 200);
+        }
         return this.json(route, 200, {
           filename,
-          chunks: [
-            { chunk_id: 'c0', page: 1, section: 'Intro', text: 'DocRAG overview.', chunk_ordinal: 1 },
-            { chunk_id: GUIDE_SOURCE.chunk_id, page: 1, section: GUIDE_SOURCE.section, text: GUIDE_SOURCE.text, chunk_ordinal: 2 },
-          ],
+          chunks: all.filter((chunk) => chunk.chunk_ordinal >= first && chunk.chunk_ordinal <= last),
+          total_chunks: all.length,
+          target_found: targetFound,
         });
+      }
+      if (action === 'tags' && method === 'PATCH') {
+        const { tags } = JSON.parse(request.postData() ?? '{}') as { tags: string[] };
+        if (tags.length > 0) this.tags[filename] = tags;
+        else delete this.tags[filename];
+        return this.json(route, 200, { filename, tags });
       }
       if (action === 'reindex' && method === 'POST') {
         return this.json(route, 202, this.startJob(filename));

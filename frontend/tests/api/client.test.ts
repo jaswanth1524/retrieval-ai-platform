@@ -69,6 +69,38 @@ describe('api client', () => {
     expect(body).toEqual({ question: 'hi', llm_provider: 'openai' });
   });
 
+  it('sends tags and use_cache=false only when asked to', async () => {
+    // A fresh Response per call: a body can only be read once.
+    const fetchMock = vi.fn(async () => jsonResponse(200, { answer: 'x', sources: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.askQuestion('hi', undefined, undefined, undefined, undefined, undefined, {
+      tags: ['legal'],
+      bypassCache: true,
+    });
+    await api.askQuestion('hi', undefined, undefined, undefined, undefined, undefined, { tags: [] });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toEqual({
+      question: 'hi',
+      tags: ['legal'],
+      use_cache: false,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual({ question: 'hi' });
+  });
+
+  it('replaces a document\'s tags with a PATCH', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { filename: 'a b.pdf', tags: ['x'] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.setDocumentTags('a b.pdf', ['x']);
+
+    expect(result.tags).toEqual(['x']);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/documents/a%20b.pdf/tags');
+    expect(init.method).toBe('PATCH');
+    expect(JSON.parse(String(init.body))).toEqual({ tags: ['x'] });
+  });
+
   it('omits llm_provider from the body when no provider is passed', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
     vi.stubGlobal('fetch', fetchMock);
@@ -363,6 +395,7 @@ describe('askQuestionStream', () => {
       [],
       { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
       'trace-1',
+      false,
     );
   });
 
@@ -537,7 +570,7 @@ describe('askQuestionStream termination', () => {
     await expect(
       api.askQuestionStream('hi', undefined, undefined, undefined, undefined, { onDone }),
     ).resolves.toBeUndefined();
-    expect(onDone).toHaveBeenCalledWith('Full answer.', [], null, 't1');
+    expect(onDone).toHaveBeenCalledWith('Full answer.', [], null, 't1', false);
   });
 
   it('still rejects a connection reset before the done event', async () => {
@@ -626,5 +659,53 @@ describe('getTrace', () => {
 
     expect(result).toEqual(detail);
     expect(String(fetchMock.mock.calls[0][0])).toContain('/traces/trace-1');
+  });
+});
+
+describe('Retry-After', () => {
+  it('carries a 503 Retry-After on the error, so a full queue can be waited out', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ detail: 'Queue full.' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', 'Retry-After': '15' },
+        }),
+      ),
+    );
+
+    const error = await api.listDocuments().catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect((error as ApiClientError).statusCode).toBe(503);
+    expect((error as ApiClientError).retryAfterSeconds).toBe(15);
+  });
+});
+
+describe('exportCorpus', () => {
+  it('returns the zip and the filename the server suggested', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response('PK', {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/zip',
+            'Content-Disposition': 'attachment; filename="docrag-export-20260929.zip"',
+          },
+        }),
+      ),
+    );
+
+    const result = await api.exportCorpus();
+
+    expect(result.filename).toBe('docrag-export-20260929.zip');
+    expect(await result.blob.text()).toBe('PK');
+  });
+
+  it('reports a read-only key refusal', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(403, { detail: 'This API key is read-only.' })));
+
+    await expect(api.exportCorpus()).rejects.toMatchObject({ statusCode: 403 });
   });
 });

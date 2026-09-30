@@ -20,6 +20,10 @@ interface ComposerProps {
   provider: LlmProvider;
   onProviderChange: (provider: LlmProvider) => void;
   providerLabel: string;
+  /** Every tag in use across the corpus. */
+  availableTags?: string[];
+  selectedTags?: string[];
+  onSelectedTagsChange?: (tags: string[]) => void;
 }
 
 function Composer({
@@ -36,19 +40,39 @@ function Composer({
   provider,
   onProviderChange,
   providerLabel,
+  availableTags = [],
+  selectedTags = [],
+  onSelectedTagsChange,
 }: ComposerProps) {
   const [value, setValue] = useState('');
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
   const [scopeQuery, setScopeQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // The textarea is disabled while a question is in flight, which drops focus; hand it
-  // back when the answer settles so the next question can be typed straight away.
+  // Hand focus back when an answer settles (a click on Stop moved it to the button), so
+  // the next question can be typed straight away.
   const wasPendingRef = useRef(pending);
   useEffect(() => {
     if (wasPendingRef.current && !pending && !disabled) textareaRef.current?.focus();
     wasPendingRef.current = pending;
   }, [pending, disabled]);
+  // "/" anywhere outside a text field jumps to the question box, as in most chat apps.
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]') ||
+        document.querySelector('[aria-modal="true"]')
+      ) {
+        return;
+      }
+      event.preventDefault();
+      textareaRef.current?.focus();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
   const scopeButtonRef = useRef<HTMLButtonElement>(null);
   const providerButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -75,18 +99,37 @@ function Composer({
     };
   }, [openPopover]);
 
+  // The textarea stays editable while an answer streams (it can take a minute or two);
+  // only sending is held until it finishes.
   const submit = () => {
     const trimmed = value.trim();
-    if (!trimmed || disabled) return;
+    if (!trimmed || disabled || pending) return;
     onSubmit(trimmed);
     setValue('');
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Enter while an IME is composing (Japanese, Chinese, Korean) confirms the candidate;
+    // treating it as "send" submitted half-typed questions. 229 is Safari's composing code.
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    // Esc in the question box stops the answer being written, like the Stop button.
+    if (event.key === 'Escape' && pending && !openPopover) {
+      event.preventDefault();
+      onCancel();
+      return;
+    }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       submit();
     }
+  };
+
+  const toggleTag = (tag: string) => {
+    onSelectedTagsChange?.(
+      selectedTags.includes(tag)
+        ? selectedTags.filter((name) => name !== tag)
+        : [...selectedTags, tag],
+    );
   };
 
   const toggleFilename = (filename: string) => {
@@ -144,7 +187,7 @@ function Composer({
                 setScopeQuery('');
               }}
               disabled={indexedFilenames.length === 0}
-              aria-haspopup="true"
+              aria-haspopup="dialog"
               aria-expanded={openPopover === 'scope'}
               aria-controls="composer-scope-popover"
               ref={scopeButtonRef}
@@ -163,8 +206,11 @@ function Composer({
                 <label className="composer__popover-item">
                   <input
                     type="checkbox"
-                    checked={selectedFilenames.length === 0}
-                    onChange={() => onSelectedFilenamesChange([])}
+                    checked={selectedFilenames.length === 0 && selectedTags.length === 0}
+                    onChange={() => {
+                      onSelectedFilenamesChange([]);
+                      onSelectedTagsChange?.([]);
+                    }}
                     data-testid="scope-all"
                   />
                   <span>All documents</span>
@@ -179,6 +225,20 @@ function Composer({
                     onChange={(event) => setScopeQuery(event.target.value)}
                     data-testid="composer-scope-search"
                   />
+                )}
+                {availableTags.length > 0 && onSelectedTagsChange && (
+                  <div className="composer__popover-tags" role="group" aria-label="Tags">
+                    {availableTags.map((tag) => (
+                      <label key={tag} className="composer__popover-item" data-testid="scope-tag">
+                        <input
+                          type="checkbox"
+                          checked={selectedTags.includes(tag)}
+                          onChange={() => toggleTag(tag)}
+                        />
+                        <span>#{tag}</span>
+                      </label>
+                    ))}
+                  </div>
                 )}
                 {visibleFilenames.map((filename) => (
                   <label key={filename} className="composer__popover-item" data-testid="scope-item">
@@ -199,7 +259,7 @@ function Composer({
               className="composer__chip"
               onClick={() => setOpenPopover((prev) => (prev === 'provider' ? null : 'provider'))}
               disabled={!config}
-              aria-haspopup="true"
+              aria-haspopup="dialog"
               aria-expanded={openPopover === 'provider'}
               aria-controls="composer-provider-popover"
               ref={providerButtonRef}
@@ -239,6 +299,18 @@ function Composer({
                   <span>OpenAI &middot; {config.openai_model}</span>
                 </label>
                 {!openaiEnabled && <p className="composer__popover-note">Set OPENAI_API_KEY to enable.</p>}
+                {config.openai_compatible_available && (
+                  <label className="composer__popover-item">
+                    <input
+                      type="radio"
+                      name="composer-provider"
+                      checked={provider === 'openai_compatible'}
+                      onChange={() => onProviderChange('openai_compatible')}
+                      data-testid="provider-openai-compatible"
+                    />
+                    <span>Self-hosted &middot; {config.openai_compatible_model}</span>
+                  </label>
+                )}
               </div>
             )}
           </div>

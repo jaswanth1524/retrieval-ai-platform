@@ -119,3 +119,19 @@ def test_survives_a_process_restart(tmp_path: Path) -> None:
     assert len(recent) == 1
     assert recent[0].id == feedback.id
     assert recent[0].cited_filenames == ["doc.md"]
+
+
+def test_feedback_store_prunes_the_oldest_rows_past_its_cap(tmp_path: Path) -> None:
+    store = FeedbackStore(str(tmp_path / "feedback.db"), max_rows=3)
+
+    for index in range(5):
+        store.add(
+            trace_id=None,
+            question=f"q{index}",
+            answer_excerpt="a",
+            cited_filenames=[],
+            rating="up",
+            citation_source_number=None,
+        )
+
+    assert [row.question for row in store.list_recent()] == ["q4", "q3", "q2"]

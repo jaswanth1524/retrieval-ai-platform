@@ -313,3 +313,56 @@
 .corpus-panel__reindex-all:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.04);
 }
+
+.corpus-panel__tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.corpus-panel__tag {
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+}
+
+.corpus-panel__tags-button {
+  font-size: 11px;
+  color: var(--dim);
+  background: none;
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius-sm);
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.corpus-panel__tags-button:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.corpus-panel__tags-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.corpus-panel__tags-input {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  border: 1px solid var(--rule-hi);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.corpus-panel__tags-error {
+  font-size: 11px;
+  color: var(--bad);
+}

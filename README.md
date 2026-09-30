@@ -4,7 +4,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 
 ## Features
 
-- **Hybrid retrieval**: dense semantic search (`BAAI/bge-small-en-v1.5`) and sparse BM25 search (`Qdrant/BM25`), fused with Reciprocal Rank Fusion (`k=60`), then reranked with a cross-encoder (`jinaai/jina-reranker-v2-base-multilingual`). Queries are embedded symmetrically to the corpus (bge query instruction on the dense side, BM25's query-side encoding on the sparse side), and a post-rerank diversity filter drops near-duplicate chunks so context slots go to distinct passages.
+- **Hybrid retrieval**: dense semantic search (`BAAI/bge-small-en-v1.5`) and sparse BM25 search (`Qdrant/BM25`, scored with Qdrant's IDF modifier so rare terms outweigh common ones), fused with Reciprocal Rank Fusion (`k=60`), then reranked with a cross-encoder (`jinaai/jina-reranker-v2-base-multilingual`). Queries are embedded symmetrically to the corpus (bge query instruction on the dense side, BM25's query-side encoding on the sparse side), and a post-rerank diversity filter drops near-duplicate chunks so context slots go to distinct passages.
 - **Token-aware chunking**: chunks are sized by the dense model's real subword tokens (not word counts) and split on sentence boundaries, so an embedded chunk never silently overflows the model's 512-token limit.
 - **Broad format support**: PDF (with table extraction and optional OCR for scanned pages), DOCX, HTML, CSV, TXT, and Markdown. OCR is an optional extra (`uv sync --extra ocr`).
 - **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder.
@@ -13,13 +13,17 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Multi-conversation chat**: named conversations with new/switch/rename/delete, persisted locally across reloads (older single-thread history migrates automatically).
 - **Document management**: upload documents, track background ingestion progress (failed uploads can be retried or dismissed), list the full indexed corpus, and delete a document's chunks.
 - **Re-index from stored originals** (opt-in): with `RAW_DOCUMENT_DIR` set, the original upload is kept and a document can be re-chunked and re-embedded without re-uploading it — `POST /documents/{filename}/reindex`, or `POST /documents/reindex` for every document chunked by an older chunker version (the corpus panel flags those and offers a ↻ button).
-- **Source viewer**: click a citation to open the source document reconstructed from its chunks, scrolled to and highlighting the cited passage.
-- **Per-document search scope**: restrict a question to a chosen subset of the indexed corpus.
+- **Source viewer**: click a citation to open the source document reconstructed from its chunks, scrolled to and highlighting the cited passage. It fetches a page around the citation (`GET /documents/{filename}/content?around=<chunk_id>&radius=N`, or `start`/`end` ordinals) rather than the whole document, and says so when a re-index has replaced the cited passage.
+- **Per-document search scope and tags**: restrict a question to a chosen subset of the indexed corpus, or tag documents (`PATCH /documents/{filename}/tags`, edited inline in the corpus panel — no re-embedding) and scope by tag. Each conversation keeps its own scope.
+- **Answer cache**: a repeated question (same scope, settings and corpus) is answered instantly from an in-process cache instead of re-running retrieval and the LLM; any upload, delete or tag change invalidates it, and Regenerate always asks again (`ANSWER_CACHE_SIZE`, `ANSWER_CACHE_TTL_SECONDS`).
+- **Context-window fitting**: with `OLLAMA_NUM_CTX` or `LLM_CONTEXT_WINDOW` set, the prompt drops the lowest-ranked sources and then the oldest history until it fits with room for the answer, instead of letting the model server silently cut the grounding rules off its front. The trace records what was left out.
 - **Per-query debug traces**: every question's retrieval candidates, rerank keep/drop decisions, the exact LLM prompt, and stage timings are recorded and browsable via `GET /traces`, a per-message drawer, and a trace-history browser in the UI.
-- **Chat UX**: markdown-rendered answers (images in answers are never loaded — only their alt text shows, so a poisoned document can't make the browser fetch a URL), copy-to-clipboard, retry on failure, chat export (Markdown/JSON), keyboard shortcuts (⌘K palette, ⌘⇧O new chat, ⌘U upload, ⌘, settings, ⌘J theme), and a responsive layout with a light/dark theme — on narrow screens the side panel and the inspector open as drawers.
-- **Evaluation harness**: retrieval-quality metrics (hit@k, recall@k, MRR) over a labeled dataset with a baseline regression gate, plus an answer-generation mode feeding the RAGAS runner (`eval/harness.py`, local-only).
+- **Chat UX**: markdown-rendered answers (images in answers are never loaded — only their alt text shows, so a poisoned document can't make the browser fetch a URL; links open in a new tab), copy-to-clipboard with the citations as footnotes, retry on failure, edit a question and ask again in a forked conversation, chat export (Markdown/JSON) and JSON import, conversation search (list and ⌘K palette), keyboard shortcuts (⌘K palette, ⌘⇧O new chat, ⌘U upload, ⌘, settings, ⌘J theme, `/` focus the question box, Esc stop the answer), and a responsive layout with a light/dark theme that follows the OS until you pick one — on narrow screens the side panel and the inspector open as drawers. Works over plain HTTP on a LAN address, and several tabs share one history. History lives in IndexedDB (localStorage keeps a compact copy for first paint), so it isn't capped by localStorage's ~5 MB.
+- **Evaluation harness**: retrieval-quality metrics (hit@k, recall@k, MRR) over a labeled dataset — measured on the same retrieval path the API runs, per stage (`--arm reranked|fused|dense|sparse`) — with a fixture corpus, a committed baseline and a regression gate that refuses to compare mismatched runs, plus an answer-generation mode feeding the RAGAS runner (`eval/harness.py`, local-only; RAGAS can judge with a local model via `--llm`).
+- **Access and limits**: an optional shared `API_KEY`, plus an optional read-only `API_READ_KEY` for people who should ask questions but not change the corpus (403 on uploads, deletes, re-index, tags, export, feedback and metrics). Unauthorized or oversized requests are refused before their body is read. At most `MAX_CONCURRENT_QUESTIONS` questions run at once; past that a question gets 429 + `Retry-After`, and uploads past the indexing queue's limit wait and retry on their own.
+- **Backup export**: `GET /export` (full key; "Download a backup" in the ⌘K palette) returns a zip with a manifest of every document (tags, upload time, chunker version), the stored originals and the feedback rows.
 - **Observability**: configurable application logging (`LOG_LEVEL`), `GET /metrics` (Prometheus), `GET /health` (liveness), `GET /health/ready` (readiness — probes Qdrant and the generation provider).
-- **Provider flexibility**: local Ollama by default; OpenAI is an optional, user-selectable alternative for generation only — embeddings always stay local.
+- **Provider flexibility**: local Ollama by default; any self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio — `LLM_PROVIDER=openai_compatible`) or OpenAI itself are user-selectable alternatives for generation only — embeddings always stay local. Provider errors reach clients as a short reason, never the provider's raw message.
 
 ## Stack
 
@@ -40,7 +44,7 @@ The question-answering pipeline (`api/pipeline.py`):
 1. Optionally condense a follow-up question using client-sent conversation history into a standalone retrieval query (one extra LLM call). Skipped when there's no history, and also when the follow-up is already standalone — it names no anaphora (`it`, `that`, `those`, …) and still has enough substantive words to retrieve on. That call is fully serial ahead of retrieval and measured 2.5-7.3s against a local model, so skipping it for "What is the referral bonus amount?" is pure latency saved; anything ambiguous still condenses.
 2. Embed the (condensed) query locally.
 3. Hybrid search: dense + sparse retrieval, fused server-side in Qdrant with RRF `k=60` where supported, else fused in application code.
-4. Cross-encoder rerank the fused top-N candidates; drop anything below `RERANK_MIN_SCORE`.
+4. Cross-encoder rerank the fused top-N candidates — scored as `filename › section` + text, the same string that was embedded — and drop anything below `RERANK_MIN_SCORE`.
 5. Expand each surviving chunk's *generation* context with up to `CONTEXT_NEIGHBOR_RADIUS` neighboring chunks (small-to-big retrieval) — citations still point at the original chunk.
 6. Generate an answer through LiteLLM (Ollama or OpenAI) from a context-only, citation-required prompt — streamed over `/questions/stream` (which also emits `stage` progress frames ahead of each phase, since retrieval can run for tens of seconds before the first token) or returned whole from `/questions`.
 7. Return the answer, citations, per-stage latency timings, and a trace ID.
@@ -55,7 +59,7 @@ The question-answering pipeline (`api/pipeline.py`):
 
 Faster rerankers change *which* chunks reach the model, and MiniLM is English-only — pick with `GET /traces/{id}` on your own corpus, not these figures. On the generation side, `CONTEXT_NEIGHBOR_RADIUS=0` cut the median question from 40s to 22s on that M1 by more than halving the prompt, at the cost of narrower context per chunk (it also changes what the diversity filter drops). `GET /traces/{id}` and `docrag_question_stage_seconds{stage=...}` give the per-stage split for your hardware.
 
-Document ingestion (`POST /documents`) runs as a background job: the request returns a `job_id` immediately (HTTP 202), and `GET /documents/jobs/{job_id}` reports progress (`queued` → `parsing` → `embedding` → `done`/`failed`) as the document is parsed, chunked, embedded (with filename/section-prefixed contextual text), and indexed in batches, tagged with an embedding-model version so a later model change is detected and queries are refused until re-ingestion. `GET /documents` lists the indexed corpus; `DELETE /documents/{filename}` removes a document's chunks.
+Document ingestion (`POST /documents`) runs as a background job: the request returns a `job_id` immediately (HTTP 202), and `GET /documents/jobs/{job_id}` reports progress (`queued` → `parsing` → `embedding` → `done`/`failed`) as the document is parsed, chunked, embedded (with filename/section-prefixed contextual text), and indexed in batches, tagged with an embedding-model version so a later model change is detected and queries are refused until re-ingestion. `GET /documents` lists the indexed corpus; `DELETE /documents/{filename}` removes a document's chunks (and its stored original, when kept).
 
 Qdrant server-side hybrid query is used where available (with `QDRANT_PREFER_GRPC` to skip REST JSON overhead). If the installed Qdrant server or client doesn't support the needed hybrid query shape, DocRAG fetches dense and sparse results separately and performs RRF in application code.
 
@@ -70,7 +74,7 @@ Qdrant server-side hybrid query is used where available (with `QDRANT_PREFER_GRP
 ├── pyproject.toml
 ├── api/            # FastAPI backend
 ├── frontend/       # React + Vite + TypeScript UI
-├── eval/           # optional RAGAS evaluation runner + sample dataset
+├── eval/           # retrieval harness, RAGAS runner, fixture corpus, datasets, baselines
 └── tests/          # backend test suite
 ```
 
@@ -98,8 +102,18 @@ npm --prefix frontend run dev             # Vite dev server, proxies API calls t
 > so container recreates don't download it again.
 >
 > It is also the memory floor: reranking peaked around **1.4 GB** with the int8 default
-> and **2.7 GB** with fp32, so give Docker at least **4 GB** (Docker Desktop → Settings →
-> Resources).
+> and **2.3-2.7 GB** with fp32 (depending on the corpus), so give Docker at least **4 GB**
+> (Docker Desktop → Settings → Resources). Compose caps the API at `API_MEM_LIMIT`
+> (default `4g`) and restarts it if it is ever killed.
+>
+> Qdrant's ports are published on `127.0.0.1` only. Set `QDRANT_API_KEY` (and uncomment
+> `QDRANT__SERVICE__API_KEY` in `docker-compose.yml`) if anything else can reach them.
+> For scanned PDFs, build the image with OCR: `UV_EXTRAS=ocr docker compose up --build`.
+>
+> The API container runs with a read-only root filesystem, no Linux capabilities and
+> `no-new-privileges`. It writes only to the model cache volume, a tmpfs `/tmp` and, when
+> mounted, the `/app/data` volume — mount that volume before turning on
+> `JOB_STORE_BACKEND=sqlite`, `RAW_DOCUMENT_DIR` or `FEEDBACK_ENABLED`.
 > That peak is reached when the model loads, so a container that boots and answers one
 > question has already hit its high-water mark. If you raise `RERANKER_BATCH_SIZE` above
 > `RERANK_CANDIDATES`, the reranker scores every candidate in one forward pass instead
@@ -114,7 +128,7 @@ Backend (`uv`-managed, from repo root):
 uv sync --extra dev            # install backend + test + lint + typecheck deps
 uv run pytest                  # run backend test suite
 uv run ruff check .            # lint
-uv run mypy api                # typecheck (strict mode, api/ only)
+uv run mypy api eval           # typecheck (strict mode)
 ```
 
 Frontend (`frontend/`, npm-managed):
@@ -129,7 +143,13 @@ npm run e2e                    # Playwright E2E: prod build + mocked API (deskto
 npm run e2e:smoke              # @smoke specs only
 ```
 
-CI (`.github/workflows/ci.yml`) runs three independent jobs on every push/PR: backend (pytest → ruff → mypy → eval-dataset validation), frontend (vitest → build → lint), and a Docker build smoke check.
+CI (`.github/workflows/ci.yml`) runs five jobs on every push/PR, with a read-only token and superseded runs cancelled:
+
+- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest → ruff check → ruff format --check → mypy → import the eval extra → validate both eval datasets → `pip-audit` of the runtime dependencies.
+- **qdrant**: the server-only tests (`tests/test_qdrant_server.py`: server-side hybrid query, IDF, payload indexes, tags) against a `qdrant/qdrant:v1.19.1` service container. They skip locally unless `DOCRAG_TEST_QDRANT_URL` is set.
+- **frontend**: vitest → build → lint → `npm audit --omit=dev`.
+- **e2e**: Playwright against the production build with a mocked API.
+- **docker**: builds the image (layer cache in GitHub Actions) and boots it, probing `/health` and the served UI.
 
 ## Configuration
 
@@ -168,6 +188,11 @@ Run it:
 uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --output results.json
 ```
 
+RAGAS metrics are themselves LLM-judged. By default RAGAS uses OpenAI and needs
+`OPENAI_API_KEY`; to keep scoring local, pass a LiteLLM model and local embeddings:
+`--llm ollama_chat/qwen2.5 --embeddings fastembed`. A run in which every judge call
+failed exits 1 instead of reporting all-NaN scores as a result.
+
 `--metrics` accepts a comma-separated list to override the default four metrics.
 `--validate-only` loads and shape-checks a dataset without running RAGAS (no LLM
 calls, no `ragas`/`datasets` import) — this is what CI runs on every push to keep
@@ -184,15 +209,30 @@ labels to the RAGAS shape:
 {"question": "How does retrieval work?", "reference": "...", "relevant_filenames": ["hybrid.md"], "relevant_chunk_ids": []}
 ```
 
-Score retrieval (hit@k, recall@k, MRR — embeddings + rerank only, no LLM), optionally
-gating against a committed baseline:
+`eval/corpus/` holds the documents the sample dataset is labeled against. Ingest them
+into an empty collection, then score retrieval (hit@k, recall@k, MRR — no LLM unless
+query expansion is on) exactly as the API retrieves (`RagPipeline.retrieve`: rerank,
+diversity filter, neighbour expansion), optionally gating against the committed baseline:
 
 ```bash
+export QDRANT_COLLECTION=docrag_eval LITELLM_MODE=PRODUCTION   # see the note below
+uv run python -m eval.harness ingest eval/corpus
 uv run python -m eval.harness retrieval eval/datasets/retrieval_eval.sample.jsonl \
-  --output eval/baselines/retrieval_baseline.json          # write a baseline
+  --baseline eval/baselines/sample_reranked.json --max-regression 0.05   # gate
 uv run python -m eval.harness retrieval eval/datasets/retrieval_eval.sample.jsonl \
-  --baseline eval/baselines/retrieval_baseline.json --max-regression 0.05   # gate
+  --arm sparse                                   # score one stage: fused, dense, sparse
 ```
+
+A baseline records what it was measured with (arm, models, chunker version); the gate
+refuses a baseline with other cutoffs, another question count or another arm instead of
+passing on no evidence, and notes any setting that changed. A second, harder set lives in
+`eval/corpus_handbook/` (12 policy documents sharing boilerplate, two of them
+distractors) with `eval/datasets/handbook_eval.jsonl` (19 questions) and
+`eval/baselines/handbook_reranked.json`. Both sets still score 1.0 at the filename level
+on every arm — the right document ranks first even without IDF, which only widens its
+margin — so they catch breakage rather than subtle ranking shifts; label your own
+corpus for those. `LITELLM_MODE=PRODUCTION` stops LiteLLM loading the repo's
+`.env` on import, so the run uses exactly the settings you exported.
 
 `answer` mode runs the full pipeline and writes rows the RAGAS runner consumes:
 
@@ -210,6 +250,26 @@ local because it needs models, a corpus, and (for `answer`) an LLM.
 > so a corpus is chunked consistently. Re-uploading replaces a document's chunks
 > automatically.
 
+## Backup and upgrade
+
+Everything DocRAG knows lives in two places:
+
+- **Qdrant** (the `qdrant_storage` volume): the chunks, vectors and tags. Take a snapshot
+  with `curl -X POST http://127.0.0.1:6333/collections/docrag_documents/snapshots` (add
+  `-H "api-key: $QDRANT_API_KEY"` when set); it is written under `/qdrant/snapshots` in
+  the container — copy it out with `docker compose cp qdrant:/qdrant/snapshots ./backup`.
+  Restore by uploading it to `/collections/docrag_documents/snapshots/upload`.
+- **`/app/data`** (the `docrag_job_store` volume, when enabled): the sqlite job store,
+  the feedback database, and stored originals (`RAW_DOCUMENT_DIR`). Back it up with the
+  volume, e.g. `docker run --rm -v <project>_docrag_job_store:/data -v "$PWD":/backup
+  busybox tar czf /backup/docrag-data.tgz -C /data .`.
+
+To upgrade: back up both, pull, then `docker compose up -d --build`. Bump `QDRANT_IMAGE`
+on its own, after a snapshot — Qdrant reads older storage but not newer. Check
+`CHANGELOG.md` for releases that need a re-index (with originals kept, the corpus panel
+offers ↻ on documents chunked by an older chunker). The IDF modifier is applied to an
+existing collection automatically, with no re-ingest.
+
 ## Current Files
 
 - `CLAUDE.md`: operating instructions for future agent work on this repo.
@@ -218,7 +278,13 @@ local because it needs models, a corpus, and (for `answer`) an LLM.
 - `docker-compose.yml`: Qdrant + API services (the API also serves the built frontend).
 - `Dockerfile`: multi-stage build — Node stage builds `frontend/`, Python stage runs the API as a non-root user with a container healthcheck.
 - `api/settings.py`, `api/qdrant_schema.py`: backend configuration and Qdrant collection schema/versioning helpers.
-- `api/documents.py`: document parsing and chunking for PDF, DOCX, HTML, CSV, text, and Markdown.
+- `api/documents.py`, `api/chunking.py`: document parsing (PDF, DOCX, HTML, CSV, text, Markdown) and token-aware chunking.
+- `api/upload.py`, `api/raw_documents.py`: size-capped upload reads, and the opt-in store of original uploads.
+- `api/request_guard.py`: rejects unauthorized or oversized requests before their body is read.
+- `api/answer_cache.py`: in-process cache of finished answers, invalidated by corpus changes.
+- `api/diversity.py`: the post-rerank near-duplicate filter.
+- `api/feedback.py`, `api/sqlite_store.py`: optional answer-feedback store and shared sqlite helpers.
+- `api/dependencies.py`, `api/logging_config.py`: dependency-injection seam and logging setup.
 - `api/embeddings.py`, `api/ingestion.py`: local embedding adapters and Qdrant upsert helpers.
 - `api/retrieval.py`, `api/repository.py`: hybrid dense+sparse retrieval, RRF, and the Qdrant repository seam (search, upsert, delete).
 - `api/reranking.py`: cross-encoder reranking for fused retrieval candidates.
@@ -230,7 +296,9 @@ local because it needs models, a corpus, and (for `answer`) an LLM.
 - `api/metrics.py`: Prometheus counters/histograms for question and ingest latency (`GET /metrics`).
 - `api/main.py`: the FastAPI app — health/readiness, config, document upload/listing/deletion/job-status, trace, and question-answering (including streaming) endpoints.
 - `frontend/`: React + Vite + TypeScript browser UI, built and served by the API in production.
-- `eval/ragas_runner.py`, `eval/datasets/`: optional RAGAS evaluation runner and a runnable sample dataset.
+- `eval/harness.py`, `eval/metrics.py`: live retrieval/answer harness and its metric math.
+- `eval/ragas_runner.py`, `eval/datasets/`, `eval/corpus/`, `eval/baselines/`: optional RAGAS runner, sample datasets, the fixture corpus they are labeled against, and a committed baseline.
+- `CHANGELOG.md`: what changed per release, and whether it needs a re-index.
 
 ## License
 

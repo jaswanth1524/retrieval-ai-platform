@@ -1,0 +1,19 @@
+{"question": "How far ahead does company policy say employees must book flights?", "relevant_filenames": ["travel_policy.md"], "relevant_chunk_ids": []}
+{"question": "What daily meal allowance do employees get abroad under the policy?", "relevant_filenames": ["travel_policy.md"], "relevant_chunk_ids": []}
+{"question": "How long do employees have to submit receipts under company policy?", "relevant_filenames": ["expense_policy.md"], "relevant_chunk_ids": []}
+{"question": "What mileage rate does the company pay employees for a private car?", "relevant_filenames": ["expense_policy.md"], "relevant_chunk_ids": []}
+{"question": "How long must admin console passwords be according to company policy?", "relevant_filenames": ["security_policy.md"], "relevant_chunk_ids": []}
+{"question": "Where should employees report a phishing email under the policy?", "relevant_filenames": ["security_policy.md"], "relevant_chunk_ids": []}
+{"question": "How many days a week does company policy let employees work remotely?", "relevant_filenames": ["remote_work_policy.md"], "relevant_chunk_ids": []}
+{"question": "How big is the home office stipend the company gives employees?", "relevant_filenames": ["remote_work_policy.md"], "relevant_chunk_ids": []}
+{"question": "How many vacation days does the company give full-time employees?", "relevant_filenames": ["leave_policy.md"], "relevant_chunk_ids": []}
+{"question": "How long is paid parental leave for employees under company policy?", "relevant_filenames": ["leave_policy.md"], "relevant_chunk_ids": []}
+{"question": "When must new employees finish compliance training under company policy?", "relevant_filenames": ["onboarding_policy.md"], "relevant_chunk_ids": []}
+{"question": "How many quotes does company policy require for large purchases?", "relevant_filenames": ["procurement_policy.md"], "relevant_chunk_ids": []}
+{"question": "Does company policy require a sanctions screening for new vendors?", "relevant_filenames": ["procurement_policy.md"], "relevant_chunk_ids": []}
+{"question": "How long does the company archive customer invoices under the policy?", "relevant_filenames": ["data_retention_policy.md"], "relevant_chunk_ids": []}
+{"question": "How long does company policy keep backups?", "relevant_filenames": ["data_retention_policy.md"], "relevant_chunk_ids": []}
+{"question": "Which supplier gifts must employees declare under company policy?", "relevant_filenames": ["code_of_conduct.md"], "relevant_chunk_ids": []}
+{"question": "Who handles harassment complaints from employees under the policy?", "relevant_filenames": ["code_of_conduct.md"], "relevant_chunk_ids": []}
+{"question": "How often does the company replace employee laptops?", "relevant_filenames": ["it_equipment_policy.md"], "relevant_chunk_ids": []}
+{"question": "Where can employees install software from under company policy?", "relevant_filenames": ["it_equipment_policy.md"], "relevant_chunk_ids": []}

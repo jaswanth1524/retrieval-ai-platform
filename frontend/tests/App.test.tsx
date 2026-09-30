@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App';
@@ -120,6 +120,33 @@ describe('App', () => {
 
     expect(await screen.findByText('api ok')).toBeInTheDocument();
     expect(screen.getByTestId('question-hint')).toHaveTextContent('Upload a document to start.');
+  });
+
+  it('drops a saved retrieval override the server no longer allows', async () => {
+    localStorage.setItem(
+      'docrag-advanced-options',
+      JSON.stringify({ rerankTopK: 30, maxContextChunks: 4, llmTemperature: null }),
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload({ rerank_top_k_limit: 20 }));
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem('docrag-advanced-options') ?? '{}')).toEqual({
+        rerankTopK: null,
+        maxContextChunks: 4,
+        llmTemperature: null,
+      }),
+    );
   });
 
   it('toggles the command palette with the keyboard shortcut', async () => {

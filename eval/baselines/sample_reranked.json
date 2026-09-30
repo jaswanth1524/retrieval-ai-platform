@@ -1,0 +1,118 @@
+{
+  "aggregate": {
+    "chunk": {},
+    "filename": {
+      "hit@1": 1.0,
+      "hit@3": 1.0,
+      "hit@5": 1.0,
+      "hit@8": 1.0,
+      "mrr": 1.0,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "recall@8": 1.0
+    }
+  },
+  "fingerprint": {
+    "arm": "reranked",
+    "chunker_version": 3,
+    "embedding_model_tag": "fastembed:BAAI/bge-small-en-v1.5",
+    "query_expansion_enabled": false,
+    "rerank_top_k": 8,
+    "reranker_model": "jinaai/jina-reranker-v2-base-multilingual",
+    "sparse_embedding_model": "Qdrant/BM25"
+  },
+  "k_values": [
+    1,
+    3,
+    5,
+    8
+  ],
+  "per_question": [
+    {
+      "filename": {
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "hit@5": 1.0,
+        "hit@8": 1.0,
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "recall@3": 1.0,
+        "recall@5": 1.0,
+        "recall@8": 1.0
+      },
+      "question": "What retrieval strategy does DocRAG use?"
+    },
+    {
+      "filename": {
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "hit@5": 1.0,
+        "hit@8": 1.0,
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "recall@3": 1.0,
+        "recall@5": 1.0,
+        "recall@8": 1.0
+      },
+      "question": "What is the default dense embedding model?"
+    },
+    {
+      "filename": {
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "hit@5": 1.0,
+        "hit@8": 1.0,
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "recall@3": 1.0,
+        "recall@5": 1.0,
+        "recall@8": 1.0
+      },
+      "question": "What must every answer include?"
+    },
+    {
+      "filename": {
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "hit@5": 1.0,
+        "hit@8": 1.0,
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "recall@3": 1.0,
+        "recall@5": 1.0,
+        "recall@8": 1.0
+      },
+      "question": "Which generation provider is the default?"
+    },
+    {
+      "filename": {
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "hit@5": 1.0,
+        "hit@8": 1.0,
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "recall@3": 1.0,
+        "recall@5": 1.0,
+        "recall@8": 1.0
+      },
+      "question": "What happens on an embedding tag mismatch?"
+    },
+    {
+      "filename": {
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "hit@5": 1.0,
+        "hit@8": 1.0,
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "recall@3": 1.0,
+        "recall@5": 1.0,
+        "recall@8": 1.0
+      },
+      "question": "How are follow-up questions handled with conversation memory?"
+    }
+  ],
+  "question_count": 6
+}

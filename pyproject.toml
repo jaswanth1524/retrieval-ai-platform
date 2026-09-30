@@ -3,7 +3,8 @@ name = "docrag"
 version = "0.1.0"
 description = "Self-hostable document Q&A system with hybrid retrieval and grounded citations."
 readme = "README.md"
-requires-python = ">=3.12"
+# CI tests 3.12 and 3.13; the Docker image runs 3.12.
+requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
 authors = [
   { name = "DocRAG contributors" }

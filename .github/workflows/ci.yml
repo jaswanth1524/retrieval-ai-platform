@@ -8,21 +8,40 @@ on:
   # which is exactly when review needs it most.
   pull_request:
 
+# Read-only token: no job here writes to the repository.
+permissions:
+  contents: read
+
+# A new push to the same branch or PR supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the Docker image runs; 3.13 keeps requires-python honest.
+        python-version: ["3.12", "3.13"]
+    name: backend (python ${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        # --locked fails on a uv.lock that has drifted from pyproject.toml; without it
+        # CI quietly re-resolved, while the Docker image (uv sync --frozen) installed
+        # the stale lock as-is.
+        run: uv sync --locked --extra dev
 
       - name: Run tests
         run: uv run pytest
@@ -30,8 +49,11 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Format
+        run: uv run ruff format --check .
+
       - name: Typecheck
-        run: uv run mypy api
+        run: uv run mypy api eval
 
       - name: Import eval extra
         # ragas has previously broken on import alone (an unpinned transitive
@@ -41,10 +63,15 @@ jobs:
         # regression before it reaches "the eval extra silently doesn't work."
         run: uv run python -c "import ragas"
 
-      - name: Validate eval dataset
-        run: uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
+      - name: Validate eval datasets
+        run: |
+          uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
+          uv run python -m eval.harness validate eval/datasets/retrieval_eval.sample.jsonl
+          uv run python -m eval.harness validate eval/datasets/handbook_eval.jsonl
 
       - name: Audit runtime dependencies
+        # Once: the lockfile is the same on every Python version.
+        if: matrix.python-version == '3.12'
         # What the image ships (core deps) plus the optional OCR extra — the parsers
         # here read untrusted uploads. The eval extra is excluded: it never ships, and
         # ragas carries advisories with no fixed release to move to.
@@ -52,8 +79,48 @@ jobs:
           uv export --frozen --extra ocr --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
           uvx pip-audit --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
 
+  qdrant:
+    # The unit suite runs Qdrant in-process (":memory:"), which never exercises the
+    # server's own hybrid query, its IDF modifier, or payload indexes. This runs the
+    # server-only tests against the same Qdrant version compose pins, over REST and gRPC.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+          - 6334:6334
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 60); do
+            curl -fsS http://127.0.0.1:6333/readyz && exit 0
+            sleep 1
+          done
+          exit 1
+
+      - name: Server-only Qdrant tests
+        env:
+          DOCRAG_TEST_QDRANT_URL: http://127.0.0.1:6333
+          DOCRAG_TEST_QDRANT_GRPC_PORT: "6334"
+        run: uv run pytest tests/test_qdrant_server.py -v
+
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -143,10 +210,34 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      # Build-only: running the image would download the reranker + embedding models,
-      # which isn't worth paying for on every CI run.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build image
-        run: docker build -t docrag:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: docrag:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Booted, not just built: a missing runtime dependency or an import error used to
+      # ship unnoticed. WARMUP_MODELS=false keeps model downloads out of CI, and /health
+      # touches neither the models nor Qdrant.
+      - name: Boot image and probe /health
+        run: |
+          docker run -d --name docrag-ci -p 8000:8000 -e WARMUP_MODELS=false docrag:ci
+          for _ in $(seq 60); do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              curl -fsS http://127.0.0.1:8000/ | grep -q '<div id="root">'
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs docrag-ci
+          exit 1

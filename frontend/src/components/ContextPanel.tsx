@@ -66,7 +66,9 @@ function ContextPanel({
           />
           <span>{API_STATUS_LABELS[apiStatus]}</span>
           <span className="context-panel__spacer" />
-          <span>{chunkTotal} chunks</span>
+          <span>
+            {chunkTotal} {chunkTotal === 1 ? 'chunk' : 'chunks'}
+          </span>
         </footer>
       </aside>
     </>

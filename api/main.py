@@ -6,6 +6,8 @@ import json
 import logging
 import mimetypes
 import os
+import queue
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -21,8 +23,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException
+from starlette.background import BackgroundTask
 from starlette.staticfiles import StaticFiles
 
+from api.admission import QuestionSlots, Release
+from api.answer_cache import bump_corpus_generation
 from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
@@ -34,6 +39,7 @@ from api.dependencies import (
     get_ollama_reachability_checker,
     get_qdrant_client,
     get_qdrant_reachability_checker,
+    get_question_slots,
     get_rag_pipeline,
     get_raw_document_store,
     get_reranker,
@@ -41,23 +47,28 @@ from api.dependencies import (
     get_trace_store,
     get_vector_repository,
     require_api_key,
+    require_full_key,
     shutdown_executors,
 )
 from api.documents import (
     CHUNKER_VERSION,
     DocumentError,
     DocumentNotFoundError,
+    UnsupportedDocumentError,
     normalize_filename,
+    normalize_tags,
     validate_upload_filename,
 )
 from api.embeddings import EmbeddedText, EmbeddingError
+from api.export import build_export, iter_file
 from api.feedback import FeedbackStore
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
-from api.ingestion import IngestionError, filename_write_lock
+from api.ingestion import IngestionError, filename_write_lock, ingest_sequencer
 from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobNotFoundError, JobStore
 from api.logging_config import configure_logging
 from api.metrics import (
     NO_ERROR_TYPE,
+    answer_cache_hits_total,
     ingest_chunks_total,
     ingest_job_seconds,
     ingest_jobs_total,
@@ -68,6 +79,7 @@ from api.pipeline import AnswerOverrides, IngestService, RagPipeline, timings_di
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
+from api.request_guard import RequestGuardMiddleware
 from api.reranking import RerankingError
 from api.retrieval import RetrievalConfigError, RetrievalError, RetrievalPayloadError
 from api.schemas import (
@@ -84,6 +96,8 @@ from api.schemas import (
     DocumentJobStatusResponse,
     DocumentListResponse,
     DocumentReindexAllResponse,
+    DocumentTagsRequest,
+    DocumentTagsResponse,
     FeedbackItemResponse,
     FeedbackListResponse,
     FeedbackRequest,
@@ -105,6 +119,7 @@ from api.schemas import (
 from api.settings import AppSettings
 from api.tracing import QueryTrace, TraceNotFoundError, TraceStore
 from api.upload import UploadTooLargeError, read_upload_within_limit
+from api.version import app_version
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +128,14 @@ IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 RagPipelineDep = Annotated[RagPipeline, Depends(get_rag_pipeline)]
 OllamaCheckDep = Annotated[Callable[[AppSettings], bool], Depends(get_ollama_reachability_checker)]
 QdrantClientDep = Annotated[QdrantClient, Depends(get_qdrant_client)]
-QdrantCheckDep = Annotated[
-    Callable[[QdrantClient], bool], Depends(get_qdrant_reachability_checker)
-]
+QdrantCheckDep = Annotated[Callable[[QdrantClient], bool], Depends(get_qdrant_reachability_checker)]
 VectorRepositoryDep = Annotated[VectorRepository, Depends(get_vector_repository)]
 IngestJobStoreDep = Annotated[JobStore, Depends(get_ingest_job_store)]
 RawDocumentStoreDep = Annotated[RawDocumentStore | None, Depends(get_raw_document_store)]
 FeedbackStoreDep = Annotated[FeedbackStore | None, Depends(get_feedback_store)]
 IngestExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_ingest_executor)]
 IngestBacklogDep = Annotated[IngestBacklog, Depends(get_ingest_backlog)]
+QuestionSlotsDep = Annotated[QuestionSlots, Depends(get_question_slots)]
 TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
 
 
@@ -250,17 +264,20 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="DocRAG API",
-        version="0.1.0",
+        version=app_version(),
         description="Self-hostable document Q&A API with hybrid retrieval and citations.",
         lifespan=lifespan,
     )
     settings = get_app_settings()
     configure_logging(settings.log_level)
     warn_on_risky_reranker_config(settings)
+    # Inside CORS (add_middleware wraps outward), so its 401/413 answers still carry CORS
+    # headers for a separately-hosted frontend.
+    app.add_middleware(RequestGuardMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         # X-API-Key is not a CORS-simple header, so a cross-origin request carrying it
         # is preflighted — omitting it here made the middleware answer that preflight
         # with "Disallowed CORS headers" and every authenticated request failed before
@@ -401,6 +418,7 @@ def _run_ingest_job(
     raw_store: RawDocumentStore | None = None,
     uploaded_at: float | None = None,
     precondition: Callable[[], None] | None = None,
+    sequence: int | None = None,
 ) -> None:
     """Background-executor entry point: parse/chunk/embed/index and update job status.
 
@@ -415,7 +433,15 @@ def _run_ingest_job(
     def on_progress(done: int, total: int) -> None:
         job_store.update(job_id, state="embedding", chunks_done=done, chunks_total=total)
 
+    def check_sequence() -> None:
+        if sequence is not None:
+            ingest_sequencer.check(filename, sequence)
+        if precondition is not None:
+            precondition()
+
     def save_original() -> None:
+        if sequence is not None:
+            ingest_sequencer.mark_applied(filename, sequence)
         if raw_store is None:
             return
         try:
@@ -446,7 +472,7 @@ def _run_ingest_job(
             on_progress,
             save_original,
             uploaded_at=uploaded_at,
-            precondition=precondition,
+            precondition=check_sequence,
         )
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
@@ -473,6 +499,8 @@ def _run_ingest_job(
 
 
 _ORIGINAL_CHUNK_BYTES = 64 * 1024
+# A page of /content is at most 2 * this + 1 chunks.
+CONTENT_MAX_RADIUS = 100
 
 _BACKLOG_FULL_ERROR = (
     "Too many documents are already waiting to be indexed. Retry once some of them finish."
@@ -502,10 +530,16 @@ def _enqueue_ingest(
         raise HTTPException(
             status_code=503, detail=_BACKLOG_FULL_ERROR, headers={"Retry-After": "15"}
         )
+    sequence = ingest_sequencer.admit(filename)
+
+    def release() -> None:
+        backlog.release(size)
+        ingest_sequencer.release(filename)
+
     try:
         job = job_store.create(filename)
     except BaseException:
-        backlog.release(size)
+        release()
         raise
     try:
         # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
@@ -521,22 +555,21 @@ def _enqueue_ingest(
             raw_store,
             uploaded_at,
             precondition,
+            sequence,
         )
     except RuntimeError as exc:
         # The executor is shut down (the process is stopping). The job already exists,
         # so fail it rather than leave it "queued" forever for a poller.
-        backlog.release(size)
+        release()
         job_store.update(job.id, state="failed", error=_SHUTTING_DOWN_ERROR)
         raise HTTPException(
             status_code=503, detail=_SHUTTING_DOWN_ERROR, headers={"Retry-After": "15"}
         ) from exc
     except BaseException:
-        backlog.release(size)
+        release()
         job_store.update(job.id, state="failed", error="Could not start indexing.")
         raise
-    future.add_done_callback(
-        lambda done: _finish_ingest_future(done, backlog, size, job_store, job.id)
-    )
+    future.add_done_callback(lambda done: _finish_ingest_future(done, release, job_store, job.id))
     return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
 
 
@@ -557,6 +590,25 @@ def _original_still_stored(store: RawDocumentStore, filename: str) -> Callable[[
     return check
 
 
+def _stored_filename(filename: str) -> str:
+    """``filename`` as a path parameter naming a stored document, or a 404.
+
+    Every stored name went through ``normalize_filename`` at upload, so a name it would
+    change (padding spaces, a backslash path, control characters) was never stored. The
+    raw-document store normalizes on its own, so passing such a name through let
+    ``DELETE /documents/%20a.pdf`` remove ``a.pdf``'s original while holding a lock on,
+    and deleting the points of, a different name.
+    """
+
+    try:
+        name = normalize_filename(filename)
+    except UnsupportedDocumentError:
+        name = ""
+    if name != filename:
+        raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+    return name
+
+
 def _require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
     """The raw store, or a 409: re-indexing reads originals only kept when it's on."""
 
@@ -572,9 +624,9 @@ def _require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
 
 
 def _finish_ingest_future(
-    future: Future[None], backlog: IngestBacklog, size: int, job_store: JobStore, job_id: str
+    future: Future[None], release: Callable[[], None], job_store: JobStore, job_id: str
 ) -> None:
-    """Release the job's backlog bytes, and surface anything that escaped the job.
+    """Release the job's backlog slot, and surface anything that escaped the job.
 
     ``_run_ingest_job`` records failures on the job, but the job store itself can fail
     while doing so (sqlite disk full); nothing observed the future, so that left the
@@ -584,7 +636,7 @@ def _finish_ingest_future(
     is failed here so a client still polling this process doesn't see "queued" forever.
     """
 
-    backlog.release(size)
+    release()
     if future.cancelled():
         try:
             job_store.update(job_id, state="failed", error=INTERRUPTED_JOB_ERROR)
@@ -594,6 +646,73 @@ def _finish_ingest_future(
     exc = future.exception()
     if exc is not None:
         logger.error("Ingest job %s crashed outside its own error handling.", job_id, exc_info=exc)
+
+
+# Comment frames sent while the pipeline is quiet (retrieval and a cold model can take
+# a minute before the first token): a reverse proxy's read timeout (nginx: 60s) would
+# otherwise cut the stream, and the frontend's idle timer resets on any bytes.
+_SSE_KEEPALIVE_SECONDS = 15.0
+_SSE_KEEPALIVE_FRAME = ": ping\n\n"
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+_END_OF_STREAM = object()
+
+
+def _with_keepalive[T](source: Iterator[T], interval: float) -> Iterator[T | None]:
+    """Yield ``source``'s items, and ``None`` whenever ``interval`` passes without one.
+
+    ``source`` runs on its own thread so a blocking step inside it (retrieval, the
+    first token) can't stop the heartbeat. When the consumer stops early (the client
+    disconnected), the producer stops at its next item and closes ``source``, so an
+    abandoned answer doesn't keep generating.
+    """
+
+    items: queue.Queue[object] = queue.Queue()
+    stop = threading.Event()
+
+    def produce() -> None:
+        try:
+            for item in source:
+                if stop.is_set():
+                    break
+                items.put(item)
+        except BaseException as exc:
+            items.put(exc)
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
+            items.put(_END_OF_STREAM)
+
+    threading.Thread(target=produce, name="docrag-sse", daemon=True).start()
+    try:
+        while True:
+            try:
+                item = items.get(timeout=interval)
+            except queue.Empty:
+                yield None
+                continue
+            if item is _END_OF_STREAM:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item  # type: ignore[misc]
+    finally:
+        stop.set()
+
+
+_QUESTIONS_BUSY_ERROR = (
+    "The server is answering as many questions as it can right now. Try again in a moment."
+)
+
+
+def _question_slot(slots: QuestionSlots) -> Release:
+    release = slots.try_acquire()
+    if release is None:
+        questions_total.labels(outcome="error", error_type="busy").inc()
+        raise HTTPException(
+            status_code=429, detail=_QUESTIONS_BUSY_ERROR, headers={"Retry-After": "5"}
+        )
+    return release
 
 
 def _sse_event(payload: dict[str, object]) -> str:
@@ -718,9 +837,7 @@ def _trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
     )
 
 
-def _log_question(
-    *, provider: str | None, source_count: int, timings: dict[str, float]
-) -> None:
+def _log_question(*, provider: str | None, source_count: int, timings: dict[str, float]) -> None:
     """Emit one structured log line per answered question for latency observability."""
 
     logger.info(
@@ -743,8 +860,10 @@ def _log_question(
 def register_routes(app: FastAPI) -> None:
     """Register API routes."""
 
+    # async: it touches nothing blocking, and a sync handler waits for a threadpool
+    # token — so a burst of slow questions holding every token failed the healthcheck.
     @app.get("/health", response_model=HealthResponse)
-    def health() -> HealthResponse:
+    async def health() -> HealthResponse:
         return HealthResponse(status="ok")
 
     @app.get("/health/ready")
@@ -760,9 +879,14 @@ def register_routes(app: FastAPI) -> None:
         # other in-flight requests the way it would inside an async handler.
         qdrant_ok = check_qdrant(qdrant_client)
         provider = settings.llm_provider.lower().strip()
-        provider_ok = (
-            check_ollama(settings) if provider == "ollama" else bool(settings.openai_api_key)
-        )
+        if provider == "ollama":
+            provider_ok = check_ollama(settings)
+        elif provider == "openai_compatible":
+            provider_ok = bool(
+                settings.openai_compatible_base_url and settings.openai_compatible_model
+            )
+        else:
+            provider_ok = bool(settings.openai_api_key)
         body = ReadinessResponse(
             status="ok" if qdrant_ok and provider_ok else "degraded",
             qdrant=qdrant_ok,
@@ -777,7 +901,7 @@ def register_routes(app: FastAPI) -> None:
     # rough corpus growth, and an operator who bothered to set a key did not intend to
     # publish those. A Prometheus scraper needs the header threaded into its scrape
     # config; /health and /health/ready stay open for liveness either way.
-    @app.get("/metrics", dependencies=[Depends(require_api_key)])
+    @app.get("/metrics", dependencies=[Depends(require_full_key)])
     def metrics() -> Response:
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
@@ -818,13 +942,14 @@ def register_routes(app: FastAPI) -> None:
                 for name in metadata
                 if raw_store is not None and raw_store.path(name) is not None
             ),
+            tags={name: list(meta.tags) for name, meta in metadata.items() if meta.tags},
         )
 
     @app.post(
         "/documents",
         response_model=DocumentJobAcceptedResponse,
         status_code=202,
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_full_key)],
     )
     async def upload_document(
         ingest_service: IngestServiceDep,
@@ -859,7 +984,7 @@ def register_routes(app: FastAPI) -> None:
         "/documents/reindex",
         response_model=DocumentReindexAllResponse,
         status_code=202,
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_full_key)],
     )
     def reindex_stale_documents(
         repository: VectorRepositoryDep,
@@ -904,7 +1029,7 @@ def register_routes(app: FastAPI) -> None:
         "/documents/{filename}/reindex",
         response_model=DocumentJobAcceptedResponse,
         status_code=202,
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_full_key)],
     )
     def reindex_document(
         filename: str,
@@ -917,7 +1042,7 @@ def register_routes(app: FastAPI) -> None:
         raw_store: RawDocumentStoreDep,
     ) -> DocumentJobAcceptedResponse:
         store = _require_raw_store(raw_store)
-        name = normalize_filename(filename)
+        name = _stored_filename(filename)
         content = store.read(name)
         if content is None:
             raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
@@ -938,7 +1063,7 @@ def register_routes(app: FastAPI) -> None:
     @app.delete(
         "/documents/{filename}",
         response_model=DocumentDeleteResponse,
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_full_key)],
     )
     def delete_document(
         filename: str,
@@ -956,6 +1081,7 @@ def register_routes(app: FastAPI) -> None:
         # stale-cleanup would remove the points that ingest just wrote, and the ingest
         # would still report success. The raw copy (when stored) is removed under the
         # same lock, or a deleted document's original bytes would accumulate forever.
+        filename = _stored_filename(filename)
         with filename_write_lock(filename):
             point_ids = repository.point_ids_for_filename(settings, filename)
             if point_ids:
@@ -965,7 +1091,33 @@ def register_routes(app: FastAPI) -> None:
             removed_original = raw_store.delete(filename) if raw_store is not None else False
             if not point_ids and not removed_original:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+        if point_ids:
+            bump_corpus_generation()
         return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
+
+    # Payload-only: no re-embedding, so it is instant even for a large document.
+    @app.patch(
+        "/documents/{filename}/tags",
+        response_model=DocumentTagsResponse,
+        dependencies=[Depends(require_full_key)],
+    )
+    def set_document_tags(
+        filename: str,
+        request: DocumentTagsRequest,
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+    ) -> DocumentTagsResponse:
+        filename = _stored_filename(filename)
+        tags = normalize_tags(request.tags)
+        # Under the filename lock ingest also reads tags under (ingest_chunks'
+        # carry_tags), so a re-upload in flight either sees this change or runs after
+        # it and carries it over — it never writes the tags from before it.
+        with filename_write_lock(filename):
+            if not repository.point_ids_for_filename(settings, filename):
+                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+            repository.set_tags(settings, filename, tags)
+        bump_corpus_generation()
+        return DocumentTagsResponse(filename=filename, tags=list(tags))
 
     # Guarded like its sibling document routes: the response carries the filename (and
     # on failure the error text), and the frontend polls this URL once a second during
@@ -1002,13 +1154,50 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def document_content(
-        filename: str, repository: VectorRepositoryDep, settings: SettingsDep
+        filename: str,
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        around: Annotated[str | None, Query(max_length=200)] = None,
+        radius: Annotated[int, Query(ge=0, le=CONTENT_MAX_RADIUS)] = 30,
+        start: Annotated[int | None, Query(ge=1)] = None,
+        end: Annotated[int | None, Query(ge=1)] = None,
     ) -> DocumentContentResponse:
-        payloads = repository.chunks_for_filename(settings, filename)
-        if not payloads:
+        # No parameters: the whole document, as before. `around` (a chunk id) returns
+        # `radius` chunks either side of it; `start`/`end` a range of ordinals. A 50 MB
+        # CSV used to ship every chunk so the viewer could show the few around a citation.
+        filename = _stored_filename(filename)
+        if around is None and start is None and end is None:
+            payloads = repository.chunks_for_filename(settings, filename)
+            if not payloads:
+                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+            return DocumentContentResponse(
+                filename=filename,
+                chunks=[_content_chunk(payload) for payload in payloads],
+                total_chunks=len(payloads),
+            )
+        total = repository.chunk_count_for_filename(settings, filename)
+        if total == 0:
             raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-        chunks = [_content_chunk(payload) for payload in payloads]
-        return DocumentContentResponse(filename=filename, chunks=chunks)
+        target_found: bool | None = None
+        if around is not None:
+            ordinal = repository.chunk_ordinal_of(settings, filename, around)
+            target_found = ordinal is not None
+            # A chunk a re-index replaced: show the start of the document instead.
+            center = ordinal if ordinal is not None else 1
+            first, last = max(1, center - radius), center + radius
+        else:
+            first = start if start is not None else 1
+            last = end if end is not None else first + 2 * CONTENT_MAX_RADIUS
+            if last < first:
+                raise HTTPException(status_code=422, detail="`end` must not be before `start`.")
+            last = min(last, first + 2 * CONTENT_MAX_RADIUS)
+        payloads = repository.chunks_in_ordinal_range(settings, filename, first, last)
+        return DocumentContentResponse(
+            filename=filename,
+            chunks=[_content_chunk(payload) for payload in payloads],
+            total_chunks=total,
+            target_found=target_found,
+        )
 
     # Guarded at least as strictly as GET /documents/{filename}/content above: raw
     # original bytes are strictly more sensitive than derived chunk text. Returns 404
@@ -1017,6 +1206,7 @@ def register_routes(app: FastAPI) -> None:
     # the same "not found" either way, not a distinct "feature unavailable" state.
     @app.get("/documents/{filename}/original", dependencies=[Depends(require_api_key)])
     def document_original(filename: str, raw_store: RawDocumentStoreDep) -> Response:
+        filename = _stored_filename(filename)
         path = raw_store.path(filename) if raw_store is not None else None
         if path is None:
             raise DocumentNotFoundError(f"No stored original for '{filename}'.")
@@ -1035,7 +1225,7 @@ def register_routes(app: FastAPI) -> None:
         template = FileResponse(
             path,
             media_type=media_type,
-            filename=normalize_filename(filename),
+            filename=filename,
             stat_result=os.fstat(handle.fileno()),
             headers={"X-Content-Type-Options": "nosniff"},
         )
@@ -1052,6 +1242,26 @@ def register_routes(app: FastAPI) -> None:
                     yield block
 
         return StreamingResponse(chunks(), media_type=media_type, headers=headers)
+
+    # Everything beyond the vectors, as one zip: manifest, stored originals, feedback.
+    # See api/export.py. Operator data, so the full key only.
+    @app.get("/export", dependencies=[Depends(require_full_key)])
+    def export_corpus(
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        raw_store: RawDocumentStoreDep,
+        feedback_store: FeedbackStoreDep,
+    ) -> StreamingResponse:
+        archive = build_export(settings, repository, raw_store, feedback_store)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        return StreamingResponse(
+            iter_file(archive),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="docrag-export-{stamp}.zip"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     # Off by default (AppSettings.feedback_enabled) — a deployment that hasn't
     # opted in gets the same 404 shape as any other absent route, not a distinct
@@ -1083,7 +1293,7 @@ def register_routes(app: FastAPI) -> None:
     @app.get(
         "/feedback",
         response_model=FeedbackListResponse,
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_full_key)],
     )
     def list_feedback(
         feedback_store: FeedbackStoreDep,
@@ -1130,7 +1340,9 @@ def register_routes(app: FastAPI) -> None:
     def answer_question(
         request: QuestionRequest,
         pipeline: RagPipelineDep,
+        slots: QuestionSlotsDep,
     ) -> QuestionResponse:
+        release = _question_slot(slots)
         try:
             grounded = pipeline.answer(
                 request.question,
@@ -1142,12 +1354,18 @@ def register_routes(app: FastAPI) -> None:
                 ),
                 filenames=request.filenames,
                 history=_history_messages(request.history),
+                tags=request.tags,
+                use_cache=request.use_cache,
             )
         except Exception as exc:
             questions_total.labels(outcome="error", error_type=_question_error_type(exc)).inc()
             raise
+        finally:
+            release()
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-        if grounded.timings is not None:
+        if grounded.cached:
+            answer_cache_hits_total.inc()
+        elif grounded.timings is not None:
             timings = timings_dict(grounded.timings)
             observe_question_timings(timings)
             _log_question(
@@ -1170,13 +1388,17 @@ def register_routes(app: FastAPI) -> None:
             ],
             timings=_timings_response(grounded.timings),
             trace_id=grounded.trace_id,
+            cached=grounded.cached,
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
     def answer_question_stream(
         request: QuestionRequest,
         pipeline: RagPipelineDep,
+        slots: QuestionSlotsDep,
     ) -> StreamingResponse:
+        # Taken here, before the 200 is committed, so a full server can still say 429.
+        release = _question_slot(slots)
         overrides = AnswerOverrides(
             llm_provider=request.llm_provider,
             rerank_top_k=request.rerank_top_k,
@@ -1190,13 +1412,24 @@ def register_routes(app: FastAPI) -> None:
             # — the HTTP status is already committed by the time an error can occur
             # here (partway through an already-started streamed response).
             try:
-                for event in pipeline.answer_stream(
-                    request.question,
-                    overrides,
-                    filenames=request.filenames,
-                    history=_history_messages(request.history),
+                for event in _with_keepalive(
+                    pipeline.answer_stream(
+                        request.question,
+                        overrides,
+                        filenames=request.filenames,
+                        history=_history_messages(request.history),
+                        tags=request.tags,
+                        use_cache=request.use_cache,
+                    ),
+                    _SSE_KEEPALIVE_SECONDS,
                 ):
-                    if event["type"] == "done":
+                    if event is None:
+                        yield _SSE_KEEPALIVE_FRAME
+                        continue
+                    if event["type"] == "done" and event.get("cached"):
+                        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+                        answer_cache_hits_total.inc()
+                    elif event["type"] == "done":
                         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
                         observe_question_timings(event["timings"])
                         _log_question(
@@ -1206,13 +1439,20 @@ def register_routes(app: FastAPI) -> None:
                         )
                     yield _sse_event(dict(event))
             except Exception as exc:
-                questions_total.labels(
-                    outcome="error", error_type=_question_error_type(exc)
-                ).inc()
+                questions_total.labels(outcome="error", error_type=_question_error_type(exc)).inc()
                 logger.warning("Streamed question failed: %s", exc, exc_info=True)
                 yield _sse_event({"type": "error", "detail": _question_error_message(exc)})
+            finally:
+                release()
 
-        return StreamingResponse(event_source(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+            # Also after a disconnect before the first frame, which never runs the
+            # generator (and so never its finally). release() is idempotent.
+            background=BackgroundTask(release),
+        )
 
 
 def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicConfigResponse:
@@ -1243,6 +1483,10 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         llm_temperature_max=REQUEST_TEMPERATURE_MAX,
         feedback_enabled=settings.feedback_enabled,
         raw_documents_enabled=bool(settings.raw_document_dir),
+        openai_compatible_available=bool(
+            settings.openai_compatible_base_url and settings.openai_compatible_model
+        ),
+        openai_compatible_model=settings.openai_compatible_model,
     )
 
 

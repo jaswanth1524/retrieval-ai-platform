@@ -199,7 +199,7 @@ describe('CorpusPanel', () => {
     setup({ filenames: ['legacy.txt'], chunkCounts: { 'legacy.txt': 1 } });
 
     const item = screen.getByTestId('corpus-panel-item');
-    expect(item).toHaveTextContent('1 chunks');
+    expect(item).toHaveTextContent('1 chunk');
     expect(item.textContent).not.toContain('page');
     expect(item.textContent).not.toContain('MB');
   });
@@ -328,6 +328,53 @@ describe('CorpusPanel', () => {
 
     const uploaded = props.onUpload.mock.calls[0][0] as File[];
     expect(uploaded.map((f) => f.name)).toEqual(['b.txt']);
+  });
+
+  it('rejects an unsupported type dropped onto the drop-zone', () => {
+    setup({ maxUploadBytes: 1000 });
+
+    fireEvent.drop(screen.getByTestId('upload-dropzone'), {
+      dataTransfer: dataTransferWith([makeFile('photo.png', 10), makeFile('notes.csv', 10)]),
+    });
+
+    expect(screen.getByText(/photo\.png isn't a supported type/)).toBeInTheDocument();
+    expect(screen.getByText('notes.csv')).toBeInTheDocument();
+  });
+
+  it('opens the delete confirm on one card only when a failed upload shares its name', async () => {
+    setup({
+      filenames: ['a.txt'],
+      chunkCounts: { 'a.txt': 3 },
+      uploads: [{ id: 'u1', filename: 'a.txt', status: 'error', error: 'Indexing failed.' }],
+    });
+
+    await userEvent.click(screen.getByLabelText('Delete a.txt'));
+
+    expect(screen.getAllByRole('button', { name: 'Confirm' })).toHaveLength(1);
+  });
+
+  it('edits a document\'s tags inline and saves them as a list', async () => {
+    const onSetTags = vi.fn().mockResolvedValue(undefined);
+    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 }, tags: { 'a.txt': ['hr'] }, onSetTags });
+
+    expect(screen.getByText('#hr')).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText('Edit tags for a.txt'));
+    const input = screen.getByTestId('corpus-tags-input');
+    await userEvent.clear(input);
+    await userEvent.type(input, 'hr, legal , {Enter}');
+
+    expect(onSetTags).toHaveBeenCalledWith('a.txt', ['hr', 'legal']);
+  });
+
+  it('keeps the tag editor open with the error when saving fails', async () => {
+    const onSetTags = vi.fn().mockRejectedValue(new Error('Tags must be 1-40 printable characters.'));
+    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 }, onSetTags });
+
+    await userEvent.click(screen.getByLabelText('Edit tags for a.txt'));
+    await userEvent.type(screen.getByTestId('corpus-tags-input'), 'x{Enter}');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('printable characters');
+    expect(screen.getByTestId('corpus-tags-input')).toBeInTheDocument();
   });
 
   it('accepts valid files dropped onto the drop-zone', () => {

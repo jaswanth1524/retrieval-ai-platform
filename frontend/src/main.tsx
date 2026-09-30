@@ -14,7 +14,11 @@ try {
 } catch {
   storedTheme = null;
 }
-document.documentElement.dataset.theme = storedTheme === 'light' ? 'light' : 'dark';
+// No saved choice yet: follow the operating system's setting instead of always dark.
+const prefersLight =
+  storedTheme === null && window.matchMedia?.('(prefers-color-scheme: light)').matches;
+document.documentElement.dataset.theme =
+  storedTheme === 'light' || (storedTheme === null && prefersLight) ? 'light' : 'dark';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

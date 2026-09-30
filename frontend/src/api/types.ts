@@ -33,6 +33,9 @@ export interface PublicConfigResponse {
   feedback_enabled: boolean;
   /** RAW_DOCUMENT_DIR is set: originals are kept, so documents can be re-indexed. */
   raw_documents_enabled?: boolean;
+  /** An OpenAI-compatible server (vLLM, llama.cpp, LM Studio) is configured. */
+  openai_compatible_available?: boolean;
+  openai_compatible_model?: string;
 }
 
 export interface QuestionOverrides {
@@ -84,6 +87,13 @@ export interface DocumentListResponse {
   stale_filenames?: string[];
   /** Have a stored original, so POST /documents/{f}/reindex works. */
   reindexable_filenames?: string[];
+  /** Tagged documents only; an untagged one is absent. */
+  tags?: Record<string, string[]>;
+}
+
+export interface DocumentTagsResponse {
+  filename: string;
+  tags: string[];
 }
 
 export interface DocumentDeleteResponse {
@@ -117,6 +127,10 @@ export interface DocumentChunkResponse {
 export interface DocumentContentResponse {
   filename: string;
   chunks: DocumentChunkResponse[];
+  /** Every chunk the document has, when `chunks` is one page of it. */
+  total_chunks?: number | null;
+  /** With `around`: whether that chunk still exists (a re-index changes chunk ids). */
+  target_found?: boolean | null;
 }
 
 export interface CitationResponse {
@@ -153,13 +167,28 @@ export interface QuestionResponse {
   sources: CitationResponse[];
   timings?: TimingsResponse | null;
   trace_id?: string | null;
+  /** Served from the server's answer cache. */
+  cached?: boolean;
 }
 
-export type LlmProvider = 'ollama' | 'openai';
+export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible';
+
+/** Per-question options beyond the retrieval overrides. */
+export interface QuestionOptions {
+  /** Only documents carrying one of these tags. */
+  tags?: string[];
+  /** Skip the server's answer cache (Regenerate). */
+  bypassCache?: boolean;
+}
 
 export type TraceStatus = 'ok' | 'insufficient_context' | 'error';
 export type TraceMode = 'sync' | 'stream';
-export type TraceDropReason = 'below_min_score' | 'near_duplicate' | 'top_k_cut' | 'not_scored';
+export type TraceDropReason =
+  | 'below_min_score'
+  | 'near_duplicate'
+  | 'top_k_cut'
+  | 'not_scored'
+  | 'context_budget';
 
 export interface PromptMessage {
   role: 'system' | 'user' | 'assistant';

@@ -151,4 +151,3 @@ def test_local_embedding_provider_wraps_model_failure_as_embedding_error() -> No
 
     with pytest.raises(EmbeddingError, match="model download failed"):
         provider.embed_texts(["hello"])
-

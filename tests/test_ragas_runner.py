@@ -206,3 +206,33 @@ def test_main_validate_only_never_imports_ragas(
     monkeypatch.setattr(importlib, "import_module", fail_if_called)
 
     assert main([str(SAMPLE_DATASET_PATH), "--validate-only"]) == 0
+
+
+def test_a_run_where_every_judge_call_failed_is_reported_not_passed() -> None:
+    from eval.ragas_runner import all_scores_missing
+
+    nan = float("nan")
+    assert all_scores_missing({"rows": [{"faithfulness": nan, "answer_relevancy": nan}]})
+    assert all_scores_missing({})
+    assert not all_scores_missing({"rows": [{"faithfulness": 0.9, "answer_relevancy": nan}]})
+    assert not all_scores_missing({"faithfulness": 0.8})
+
+
+def test_judges_are_passed_through_to_ragas_only_when_given() -> None:
+    from eval.ragas_runner import EvaluationExample, run_ragas_evaluation
+
+    seen: list[dict[str, object]] = []
+
+    def evaluate(**kwargs: object) -> dict[str, float]:
+        seen.append(kwargs)
+        return {"faithfulness": 1.0}
+
+    example = EvaluationExample.from_mapping(
+        {"question": "q", "answer": "a", "contexts": ["c"], "reference": "r"}
+    )
+    common = {"evaluate_func": evaluate, "dataset_factory": list, "metric_objects": ["m"]}
+    run_ragas_evaluation([example], **common)  # type: ignore[arg-type]
+    run_ragas_evaluation([example], llm="judge", embeddings="emb", **common)  # type: ignore[arg-type]
+
+    assert "llm" not in seen[0] and "embeddings" not in seen[0]
+    assert seen[1]["llm"] == "judge" and seen[1]["embeddings"] == "emb"

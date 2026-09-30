@@ -51,8 +51,18 @@ class FakeRepository:
         settings: AppSettings,
         query_embedding: EmbeddedText,
         filenames: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
     ) -> list[models.ScoredPoint]:
         return self._points
+
+    def search_leg(
+        self, settings: AppSettings, query_embedding: EmbeddedText, leg: str
+    ) -> list[models.ScoredPoint]:
+        # Dense sees the points in order, sparse reversed: the arms must differ.
+        return self._points if leg == "dense" else list(reversed(self._points))
+
+    def fetch_neighbors(self, settings: AppSettings, filename: str, ordinals: Any) -> list[Any]:
+        return []
 
 
 class FakeReranker:
@@ -62,14 +72,18 @@ class FakeReranker:
         self._priority = priority
 
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
-        # Higher score for earlier-priority text; documents are the chunk texts.
+        # Higher score for earlier-priority text; documents are the chunk texts behind
+        # their "filename › section" prefix.
+        texts = [doc.split("\n", 1)[-1] for doc in documents]
         return [
-            float(len(self._priority) - self._priority.index(doc)) if doc in self._priority else 0.0
-            for doc in documents
+            float(len(self._priority) - self._priority.index(text))
+            if text in self._priority
+            else 0.0
+            for text in texts
         ]
 
 
-def _point(chunk_id: str, filename: str) -> models.ScoredPoint:
+def _point(chunk_id: str, filename: str, ordinal: int | None = None) -> models.ScoredPoint:
     return models.ScoredPoint(
         id=str(uuid5(NAMESPACE_URL, chunk_id)),
         version=0,
@@ -80,7 +94,8 @@ def _point(chunk_id: str, filename: str) -> models.ScoredPoint:
             "section": "Body",
             "chunk_id": chunk_id,
             "text": chunk_id,  # text == chunk_id so the fake reranker can key on it
-            "chunk_ordinal": 1,
+            # Distinct by default, so the diversity filter sees no neighbours.
+            "chunk_ordinal": ordinal if ordinal is not None else 10 * int(chunk_id[1:]),
         },
     )
 
@@ -165,3 +180,72 @@ def test_parser_retrieval_defaults() -> None:
     assert args.command == "retrieval"
     assert args.max_regression == 0.05
     assert args.ks is None
+
+
+def test_rank_for_question_applies_the_diversity_filter_like_the_api() -> None:
+    """The harness used to score rerank output directly, so a regression in the
+    near-duplicate filter the API applies next was invisible to it."""
+
+    points = [_point("c1", "a.md", ordinal=4), _point("c2", "a.md", ordinal=5)]
+    result = rank_for_question(
+        "q",
+        repository=FakeRepository(points),
+        embedding_provider=FakeEmbeddingProvider(),
+        reranker=FakeReranker(["c1", "c2"]),
+        settings=make_settings(),
+    )
+    # c2 is c1's ordinal neighbour in the same file: the API keeps one of them.
+    assert result.chunk_ids == ["c1"]
+
+
+def test_each_arm_scores_its_own_stage() -> None:
+    points = [_point("c1", "a.md"), _point("c2", "b.md"), _point("c3", "a.md")]
+
+    def run(arm: str) -> list[str]:
+        return rank_for_question(
+            "q",
+            repository=FakeRepository(points),
+            embedding_provider=FakeEmbeddingProvider(),
+            reranker=FakeReranker(["c3", "c1", "c2"]),
+            settings=make_settings(),
+            arm=arm,
+        ).chunk_ids
+
+    assert run("reranked") == ["c3", "c1", "c2"]
+    assert run("fused") == ["c1", "c2", "c3"]
+    assert run("dense") == ["c1", "c2", "c3"]
+    assert run("sparse") == ["c3", "c2", "c1"]
+    with pytest.raises(ValueError, match="Unknown arm"):
+        run("bogus")
+
+
+def test_baseline_checks_refuse_a_run_they_cannot_compare() -> None:
+    from eval.metrics import baseline_shape_problems
+
+    baseline = {
+        "k_values": [1, 3],
+        "question_count": 5,
+        "fingerprint": {"arm": "reranked"},
+        "aggregate": {"filename": {"hit@1": 0.8}, "chunk": {}},
+    }
+    same = {**baseline, "aggregate": {"filename": {"hit@1": 0.7}, "chunk": {}}}
+
+    assert baseline_shape_problems(same, baseline) == []
+    assert baseline_shape_problems({**same, "k_values": [5]}, baseline)
+    assert baseline_shape_problems({**same, "question_count": 4}, baseline)
+    assert baseline_shape_problems({**same, "fingerprint": {"arm": "dense"}}, baseline)
+    unlabeled = {**same, "aggregate": {"filename": {}, "chunk": {}}}
+    assert "no metric" in baseline_shape_problems(unlabeled, baseline)[0]
+
+
+def test_validate_checks_a_dataset_without_a_database(tmp_path: Path) -> None:
+    from eval.harness import main
+
+    labeled = tmp_path / "labeled.jsonl"
+    labeled.write_text('{"question": "q", "relevant_filenames": ["a.md"]}\n')
+    unlabeled = tmp_path / "unlabeled.jsonl"
+    unlabeled.write_text('{"question": "q"}\n')
+
+    assert main(["validate", str(labeled)]) == 0
+    assert main(["validate", str(unlabeled)]) == 2
+    assert main(["validate", "eval/datasets/retrieval_eval.sample.jsonl"]) == 0

@@ -1,6 +1,6 @@
 import { useState } from 'react';
+import type { KeyboardEvent } from 'react';
 import type { ChatTurn } from './ChatMessage';
-import { chatToMarkdown, downloadFile } from '../utils/exportChat';
 import './ChatHeader.css';
 
 export type ChatMode = 'reader' | 'engineer';
@@ -12,6 +12,9 @@ interface ChatHeaderProps {
   onSetMode: (mode: ChatMode) => void;
   turns: ChatTurn[];
   onClear: () => void;
+  // Markdown export, named after the conversation (App.tsx's exportMarkdown — the same
+  // implementation the command palette runs).
+  onExport: () => void;
   disabled?: boolean;
   onOpenPalette: () => void;
   inspectorOpen: boolean;
@@ -25,18 +28,24 @@ function ChatHeader({
   onSetMode,
   turns,
   onClear,
+  onExport,
   disabled,
   onOpenPalette,
   inspectorOpen,
   onToggleInspector,
 }: ChatHeaderProps) {
+  // App keys this component by conversation, so a pending confirm can't carry over to
+  // a different conversation.
   const [confirmingClear, setConfirmingClear] = useState(false);
 
-  // Markdown only: the header has one Export button and always passed 'markdown', so
-  // the JSON branch was unreachable. JSON export lives in the command palette
-  // (App.tsx's exportJson), which is the one implementation of it.
-  const handleExport = () => {
-    downloadFile('docrag-chat.md', 'text/markdown', chatToMarkdown(turns));
+  // Arrow keys move between the two modes, as in any radio group; only the checked one
+  // is in the tab order.
+  const handleModeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    event.preventDefault();
+    const next: ChatMode = mode === 'reader' ? 'engineer' : 'reader';
+    onSetMode(next);
+    event.currentTarget.querySelector<HTMLButtonElement>(`[data-mode="${next}"]`)?.focus();
   };
 
   return (
@@ -48,16 +57,25 @@ function ChatHeader({
           <button
             type="button"
             className="chat-header__action"
-            onClick={handleExport}
+            onClick={onExport}
             data-testid="chat-header-export"
           >
             Export
           </button>
           {confirmingClear ? (
-            <span className="chat-header__confirm">
+            <span
+              className="chat-header__confirm"
+              onKeyDown={(event) => {
+                if (event.key !== 'Escape') return;
+                event.stopPropagation();
+                setConfirmingClear(false);
+              }}
+            >
               <button
                 type="button"
                 className="chat-header__confirm-yes"
+                // useChat ignores a clear while a question is in flight.
+                disabled={disabled}
                 onClick={() => {
                   onClear();
                   setConfirmingClear(false);
@@ -69,6 +87,7 @@ function ChatHeader({
               <button
                 type="button"
                 className="chat-header__confirm-no"
+                autoFocus
                 onClick={() => setConfirmingClear(false)}
               >
                 Cancel
@@ -88,11 +107,18 @@ function ChatHeader({
         </div>
       )}
       <div className="chat-header__spacer" />
-      <div className="chat-header__mode" role="radiogroup" aria-label="Reader or Engineer mode">
+      <div
+        className="chat-header__mode"
+        role="radiogroup"
+        aria-label="Reader or Engineer mode"
+        onKeyDown={handleModeKeyDown}
+      >
         <button
           type="button"
           role="radio"
           aria-checked={mode === 'reader'}
+          tabIndex={mode === 'reader' ? 0 : -1}
+          data-mode="reader"
           className={`chat-header__mode-btn${mode === 'reader' ? ' chat-header__mode-btn--active' : ''}`}
           onClick={() => onSetMode('reader')}
           data-testid="mode-reader"
@@ -103,6 +129,8 @@ function ChatHeader({
           type="button"
           role="radio"
           aria-checked={mode === 'engineer'}
+          tabIndex={mode === 'engineer' ? 0 : -1}
+          data-mode="engineer"
           className={`chat-header__mode-btn${mode === 'engineer' ? ' chat-header__mode-btn--active' : ''}`}
           onClick={() => onSetMode('engineer')}
           data-testid="mode-engineer"

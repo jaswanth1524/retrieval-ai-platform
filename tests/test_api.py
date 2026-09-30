@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException
 
+from api.admission import QuestionSlots
 from api.chunking import HeuristicTokenCounter
 from api.dependencies import (
     clear_dependency_caches,
@@ -125,7 +126,7 @@ def api_context() -> Generator[ApiTestContext]:
     # from the HF Hub over the network on every ingest-path test.
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
     # Hermetic by default: never let /config make a real network call to Ollama.
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
 
     with TestClient(app) as client:
         yield ApiTestContext(
@@ -202,7 +203,9 @@ def _upload_and_wait(
 
 
 @contextmanager
-def _keyed_client(api_key: str) -> Generator[TestClient]:
+def _keyed_client(
+    api_key: str, extra_overrides: dict[Any, Any] | None = None, **overrides: Any
+) -> Generator[TestClient]:
     """Client for an app with ``api_key`` configured and the standard hermetic overrides.
 
     The ``api_context`` fixture can't serve these tests because ``make_settings()``
@@ -214,7 +217,7 @@ def _keyed_client(api_key: str) -> Generator[TestClient]:
     """
 
     clear_dependency_caches()
-    settings = make_settings(api_key=api_key)
+    settings = make_settings(api_key=api_key, **overrides)
     # Built once and closed over: a `lambda: QdrantClient(":memory:")` would hand every
     # request its own empty store, so an upload and the read that checks it would land in
     # different databases and the read would 404 while looking like an auth failure.
@@ -226,7 +229,8 @@ def _keyed_client(api_key: str) -> Generator[TestClient]:
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
+    app.dependency_overrides.update(extra_overrides or {})
     try:
         with TestClient(app) as client:
             yield client
@@ -244,9 +248,7 @@ def test_health_endpoint(api_context: ApiTestContext) -> None:
 def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
     api_context: ApiTestContext,
 ) -> None:
-    api_context.app.dependency_overrides[get_ollama_reachability_checker] = (
-        lambda: (lambda _: True)
-    )
+    api_context.app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: True
 
     response = api_context.client.get("/health/ready")
 
@@ -274,12 +276,8 @@ def test_health_ready_returns_503_when_generation_provider_unreachable(
 
 
 def test_health_ready_returns_503_when_qdrant_unreachable(api_context: ApiTestContext) -> None:
-    api_context.app.dependency_overrides[get_qdrant_reachability_checker] = (
-        lambda: (lambda _: False)
-    )
-    api_context.app.dependency_overrides[get_ollama_reachability_checker] = (
-        lambda: (lambda _: True)
-    )
+    api_context.app.dependency_overrides[get_qdrant_reachability_checker] = lambda: lambda _: False
+    api_context.app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: True
 
     response = api_context.client.get("/health/ready")
 
@@ -293,9 +291,7 @@ def test_health_endpoint_never_probes_dependencies(api_context: ApiTestContext) 
     def raise_if_called(_client: object) -> bool:
         raise AssertionError("check_qdrant_reachable must not run for /health")
 
-    api_context.app.dependency_overrides[get_qdrant_reachability_checker] = (
-        lambda: raise_if_called
-    )
+    api_context.app.dependency_overrides[get_qdrant_reachability_checker] = lambda: raise_if_called
 
     response = api_context.client.get("/health")
 
@@ -349,7 +345,7 @@ def test_document_upload_rejects_file_over_size_limit() -> None:
     app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     with TestClient(app) as client:
         response = client.post(
             "/documents",
@@ -514,7 +510,7 @@ def test_a_queued_job_cancelled_by_shutdown_is_failed_and_frees_its_bytes() -> N
     job = job_store.create("queued.txt")
     future: Future[None] = Future()
     future.add_done_callback(
-        lambda done: _finish_ingest_future(done, backlog, 40, job_store, job.id)
+        lambda done: _finish_ingest_future(done, lambda: backlog.release(40), job_store, job.id)
     )
 
     assert future.cancel()
@@ -544,7 +540,7 @@ def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -
             "text": "Intro alpha beta",
         }
     ]
-    assert api_context.reranker.seen_documents == ["Intro alpha beta"]
+    assert api_context.reranker.seen_documents == ["guide.txt › Intro\nIntro alpha beta"]
     assert "Intro alpha beta" in api_context.generator.messages[1]["content"]
 
 
@@ -594,9 +590,7 @@ def test_question_endpoint_rejects_more_than_twelve_history_messages(
 ) -> None:
     history = [{"role": "user", "content": f"turn {i}"} for i in range(13)]
 
-    response = api_context.client.post(
-        "/questions", json={"question": "alpha", "history": history}
-    )
+    response = api_context.client.post("/questions", json={"question": "alpha", "history": history})
 
     assert response.status_code == 422
 
@@ -640,9 +634,7 @@ def test_question_endpoint_rejects_rerank_top_k_above_fused_top_n(
     status = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
     assert status["state"] == "done"
 
-    response = api_context.client.post(
-        "/questions", json={"question": "alpha", "rerank_top_k": 45}
-    )
+    response = api_context.client.post("/questions", json={"question": "alpha", "rerank_top_k": 45})
 
     assert response.status_code == 400
     assert "fused_top_n" in response.json()["detail"]
@@ -725,7 +717,7 @@ def test_config_reports_openai_available_when_key_present() -> None:
     settings = make_settings(openai_api_key="sk-test")
     app = create_app()
     app.dependency_overrides[get_app_settings] = lambda: settings
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     with TestClient(app) as client:
         payload = client.get("/config").json()
     clear_dependency_caches()
@@ -740,11 +732,11 @@ def test_config_reports_ollama_available_true_or_false_from_checker() -> None:
     app = create_app()
     app.dependency_overrides[get_app_settings] = lambda: settings
 
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: True)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: True
     with TestClient(app) as client:
         assert client.get("/config").json()["ollama_available"] is True
 
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     with TestClient(app) as client:
         assert client.get("/config").json()["ollama_available"] is False
     clear_dependency_caches()
@@ -755,7 +747,7 @@ def test_config_exposes_override_limit_fields() -> None:
     settings = make_settings(fused_top_n=5)
     app = create_app()
     app.dependency_overrides[get_app_settings] = lambda: settings
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     with TestClient(app) as client:
         payload = client.get("/config").json()
     clear_dependency_caches()
@@ -861,7 +853,7 @@ def _ingested_client(
     app.dependency_overrides[get_embedding_provider] = lambda: embeddings
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: generator
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     client = TestClient(app)
     status = _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")
     assert status["state"] == "done"
@@ -1034,7 +1026,7 @@ def test_sqlite_job_store_backend_survives_a_real_upload_and_restart(
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
 
     try:
         with TestClient(app) as client:
@@ -1209,7 +1201,7 @@ def test_document_original_returns_the_exact_uploaded_bytes_when_enabled(
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
 
     content = b"the exact original bytes\nwith a newline"
     try:
@@ -1232,9 +1224,7 @@ def test_document_original_returns_the_exact_uploaded_bytes_when_enabled(
 
 
 @contextmanager
-def _raw_storage_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Generator[TestClient]:
+def _raw_storage_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
     clear_dependency_caches()
     settings = make_settings(raw_document_dir=str(tmp_path))
     qdrant = QdrantClient(":memory:")
@@ -1247,7 +1237,7 @@ def _raw_storage_client(
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     try:
         with TestClient(app) as client:
             yield client
@@ -1399,7 +1389,7 @@ def test_feedback_records_a_rating_and_survives_a_restart(
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
 
     try:
         with TestClient(app) as client:
@@ -1625,7 +1615,7 @@ def test_question_endpoint_trace_id_null_and_traces_empty_when_tracing_disabled(
     app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
     with TestClient(app) as client:
         _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")
         response = client.post("/questions", json={"question": "alpha"})
@@ -1700,9 +1690,7 @@ def test_api_key_set_accepts_protected_routes_with_matching_header() -> None:
     headers = {"X-API-Key": "secret-key"}
     with _keyed_client("secret-key") as client:
         _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta", headers=headers)
-        questions_response = client.post(
-            "/questions", json={"question": "alpha"}, headers=headers
-        )
+        questions_response = client.post("/questions", json={"question": "alpha"}, headers=headers)
         traces_response = client.get("/traces", headers=headers)
         list_response = client.get("/documents", headers=headers)
         content_response = client.get("/documents/guide.txt/content", headers=headers)
@@ -1826,7 +1814,6 @@ def test_question_error_type_prefers_the_most_specific_subclass() -> None:
     assert _question_error_type(GenerationError("x")) == "generation"
     assert _question_error_type(RerankingError("x")) == "reranking"
     assert _question_error_type(ValueError("x")) == "unexpected"
-
 
 
 class _FakeInactiveRpcError(grpc.RpcError):
@@ -1961,7 +1948,7 @@ def test_feedback_list_returns_recorded_ratings_newest_first(
     app.dependency_overrides[get_reranker] = lambda: FakeReranker()
     app.dependency_overrides[get_generator] = lambda: FakeGenerator()
     app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
-    app.dependency_overrides[get_ollama_reachability_checker] = lambda: (lambda _: False)
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
 
     try:
         with TestClient(app) as client:
@@ -2210,3 +2197,527 @@ def test_a_delete_while_a_reindex_is_queued_stays_deleted(
         assert job["state"] == "failed"
         assert "deleted before its re-index ran" in job["error"]
         assert "guide.txt" not in client.get("/documents").json()["filenames"]
+
+
+def test_a_queued_reindex_does_not_overwrite_a_newer_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-index captured v1's bytes at enqueue; a v2 upload indexed while it waited
+    in the queue must win, or the index silently goes back to v1 while /original serves
+    v2 and nothing flags it (the chunker version is current either way)."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from api.dependencies import get_ingest_executor
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "guide.txt", b"Intro\nversion one")["state"] == "done"
+        single = ThreadPoolExecutor(max_workers=1)
+        busy = threading.Event()
+        single.submit(busy.wait, 5)
+        overrides = client.app.dependency_overrides  # type: ignore[attr-defined]
+        overrides[get_ingest_executor] = lambda: single
+        try:
+            reindex_id = client.post("/documents/guide.txt/reindex").json()["job_id"]
+            # The upload runs on a free executor, so it is applied first.
+            overrides.pop(get_ingest_executor)
+            assert _upload_and_wait(client, "guide.txt", b"Intro\nversion two")["state"] == "done"
+            busy.set()
+            job = _wait_for_job(client, reindex_id)
+        finally:
+            busy.set()
+            single.shutdown(wait=True)
+
+        assert job["state"] == "failed"
+        assert "newer version" in job["error"]
+        chunks = client.get("/documents/guide.txt/content").json()["chunks"]
+        assert "version two" in " ".join(chunk["text"] for chunk in chunks)
+        assert client.get("/documents/guide.txt/original").content == b"Intro\nversion two"
+
+
+def test_the_backlog_caps_in_flight_jobs_at_the_job_store_retention() -> None:
+    backlog = IngestBacklog(max_bytes=1000, max_jobs=2)
+
+    assert backlog.try_reserve(1)
+    assert backlog.try_reserve(1)
+    assert not backlog.try_reserve(1)
+    backlog.release(1)
+    assert backlog.try_reserve(1)
+
+
+def test_more_uploads_than_the_job_store_retains_are_503_not_evicted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past ingest_jobs_max_retained the store evicted still-queued jobs, so a bulk
+    re-index or a big drop handed back job ids that already 404'd — and the UI treats a
+    404 while polling as a failed upload, for work that was still going to run."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from api.dependencies import get_ingest_executor
+
+    clear_dependency_caches()
+    settings = make_settings(ingest_jobs_max_retained=2)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+    app = create_app()
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: QdrantClient(":memory:")
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
+    single = ThreadPoolExecutor(max_workers=1)
+    busy = threading.Event()
+    single.submit(busy.wait, 5)
+    app.dependency_overrides[get_ingest_executor] = lambda: single
+    try:
+        with TestClient(app) as client:
+            accepted = [
+                client.post("/documents", files={"file": (f"doc{i}.txt", b"Intro\nalpha")})
+                for i in range(3)
+            ]
+            assert [response.status_code for response in accepted] == [202, 202, 503]
+            for response in accepted[:2]:
+                job = client.get(f"/documents/jobs/{response.json()['job_id']}")
+                assert job.status_code == 200
+            busy.set()
+    finally:
+        busy.set()
+        single.shutdown(wait=True)
+        monkeypatch.undo()
+        clear_dependency_caches()
+
+
+def test_document_routes_do_not_normalize_a_name_into_another_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The raw store normalizes names itself, so DELETE /documents/%20a.txt used to
+    delete a.txt's original — outside a.txt's lock — while leaving its points."""
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "a.txt", b"Intro\nalpha")["state"] == "done"
+
+        for name in (" a.txt", "x%5Ca.txt"):
+            assert client.delete(f"/documents/{quote(name)}").status_code == 404
+            assert client.get(f"/documents/{quote(name)}/content").status_code == 404
+            assert client.get(f"/documents/{quote(name)}/original").status_code == 404
+            assert client.post(f"/documents/{quote(name)}/reindex").status_code == 404
+
+        assert client.get("/documents/a.txt/original").content == b"Intro\nalpha"
+        assert client.get("/documents").json()["filenames"] == ["a.txt"]
+
+
+def test_question_stream_disables_proxy_buffering(api_context: ApiTestContext) -> None:
+    assert _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha")["state"] == "done"
+
+    response = api_context.client.post("/questions/stream", json={"question": "alpha"})
+
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
+def test_keepalive_pings_while_the_source_is_quiet_and_passes_errors_through() -> None:
+    from api.main import _with_keepalive
+
+    release = threading.Event()
+
+    def slow() -> Generator[str]:
+        yield "first"
+        release.wait(5)
+        yield "second"
+        raise RuntimeError("boom")
+
+    stream = _with_keepalive(slow(), 0.01)
+    assert next(stream) == "first"
+    assert next(stream) is None  # quiet: a heartbeat instead of blocking
+    release.set()
+    rest: list[str | None] = []
+    with pytest.raises(RuntimeError, match="boom"):
+        for item in stream:
+            rest.append(item)
+    assert "second" in rest
+
+
+def test_keepalive_closes_the_source_when_the_client_goes_away() -> None:
+    from api.main import _with_keepalive
+
+    closed = threading.Event()
+    produced = threading.Event()
+
+    def endless() -> Generator[int]:
+        try:
+            count = 0
+            while True:
+                count += 1
+                produced.set()
+                yield count
+        finally:
+            closed.set()
+
+    stream = _with_keepalive(endless(), 1.0)
+    assert next(stream) == 1
+    stream.close()
+
+    assert closed.wait(2)
+
+
+def _count_generations(generator: FakeGenerator) -> list[int]:
+    calls = [0]
+    complete, stream = generator.complete, generator.stream
+
+    def counting_complete(messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        calls[0] += 1
+        return complete(messages, settings)
+
+    def counting_stream(messages: Sequence[ChatMessage], settings: AppSettings) -> Any:
+        calls[0] += 1
+        return stream(messages, settings)
+
+    generator.complete = counting_complete  # type: ignore[method-assign]
+    generator.stream = counting_stream  # type: ignore[method-assign]
+    return calls
+
+
+def test_a_repeated_question_is_answered_from_the_cache(api_context: ApiTestContext) -> None:
+    uploaded = _upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+    assert uploaded["state"] == "done"
+    calls = _count_generations(api_context.generator)
+
+    first = api_context.client.post("/questions", json={"question": "alpha"}).json()
+    second = api_context.client.post("/questions", json={"question": "  ALPHA "}).json()
+
+    assert calls[0] == 1
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert second["answer"] == first["answer"]
+    assert second["sources"] == first["sources"]
+    # The inspector can still show how the original answer was retrieved.
+    assert second["trace_id"] == first["trace_id"]
+
+
+def test_regenerate_bypasses_the_cache_and_a_corpus_change_invalidates_it(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    calls = _count_generations(api_context.generator)
+
+    client.post("/questions", json={"question": "alpha"})
+    regenerated = client.post("/questions", json={"question": "alpha", "use_cache": False})
+    assert regenerated.json()["cached"] is False
+    assert calls[0] == 2
+
+    assert _upload_and_wait(client, "notes.txt", b"Intro\nalpha gamma")["state"] == "done"
+    after_upload = client.post("/questions", json={"question": "alpha"}).json()
+    assert after_upload["cached"] is False
+    assert calls[0] == 3
+
+    assert client.delete("/documents/notes.txt").status_code == 200
+    assert client.post("/questions", json={"question": "alpha"}).json()["cached"] is False
+
+
+def test_a_cached_answer_streams_as_sources_one_delta_and_done(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    client.post("/questions", json={"question": "alpha"})
+
+    events = _without_stage_events(
+        _parse_sse_events(client.post("/questions/stream", json={"question": "alpha"}).text)
+    )
+
+    assert [event["type"] for event in events] == ["sources", "delta", "done"]
+    assert events[-1]["cached"] is True
+    assert events[1]["text"] == events[-1]["answer"]
+
+
+def test_follow_up_questions_with_history_are_never_cached(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+
+    client.post("/questions", json={"question": "alpha", "history": history})
+    again = client.post("/questions", json={"question": "alpha", "history": history}).json()
+
+    assert again["cached"] is False
+
+
+def test_the_cache_can_be_turned_off() -> None:
+    clear_dependency_caches()
+    settings = make_settings(answer_cache_size=0)
+    app = create_app()
+    generator = FakeGenerator()
+    qdrant = QdrantClient(":memory:")
+    app.dependency_overrides[get_app_settings] = lambda: settings
+    app.dependency_overrides[get_qdrant_client] = lambda: qdrant
+    app.dependency_overrides[get_embedding_provider] = lambda: FakeEmbeddingProvider()
+    app.dependency_overrides[get_reranker] = lambda: FakeReranker()
+    app.dependency_overrides[get_generator] = lambda: generator
+    app.dependency_overrides[get_token_counter] = lambda: HeuristicTokenCounter()
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: False
+    try:
+        with TestClient(app) as client:
+            assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha")["state"] == "done"
+            client.post("/questions", json={"question": "alpha"})
+            assert client.post("/questions", json={"question": "alpha"}).json()["cached"] is False
+    finally:
+        clear_dependency_caches()
+
+
+def test_tags_are_set_listed_preserved_on_re_upload_and_scope_questions(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    assert _upload_and_wait(client, "contract.txt", b"Intro\nalpha terms")["state"] == "done"
+    assert _upload_and_wait(client, "notes.txt", b"Intro\nalpha notes")["state"] == "done"
+
+    response = client.patch(
+        "/documents/contract.txt/tags", json={"tags": [" Legal ", "legal", "2026"]}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"filename": "contract.txt", "tags": ["Legal", "2026"]}
+    assert client.get("/documents").json()["tags"] == {"contract.txt": ["Legal", "2026"]}
+
+    scoped = client.post("/questions", json={"question": "alpha", "tags": ["Legal"]}).json()
+    assert {source["filename"] for source in scoped["sources"]} == {"contract.txt"}
+
+    # A re-upload replaces the points; the tags belong to the document and carry over.
+    assert _upload_and_wait(client, "contract.txt", b"Intro\nalpha v2")["state"] == "done"
+    assert client.get("/documents").json()["tags"] == {"contract.txt": ["Legal", "2026"]}
+
+    cleared = client.patch("/documents/contract.txt/tags", json={"tags": []})
+    assert cleared.json()["tags"] == []
+    assert client.get("/documents").json()["tags"] == {}
+
+
+def test_tag_errors_are_4xx(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert _upload_and_wait(client, "a.txt", b"Intro\nalpha")["state"] == "done"
+
+    assert client.patch("/documents/missing.txt/tags", json={"tags": ["x"]}).status_code == 404
+    assert client.patch("/documents/a.txt/tags", json={"tags": ["   "]}).status_code == 400
+    assert client.patch("/documents/a.txt/tags", json={"tags": ["x" * 41]}).status_code == 400
+    too_many = {"tags": [f"t{i}" for i in range(21)]}
+    assert client.patch("/documents/a.txt/tags", json=too_many).status_code == 422
+
+
+def test_config_reports_the_openai_compatible_provider(api_context: ApiTestContext) -> None:
+    payload = api_context.client.get("/config").json()
+    assert payload["openai_compatible_available"] is False
+
+    configured = make_settings(
+        openai_compatible_base_url="http://vllm:8000/v1", openai_compatible_model="qwen"
+    )
+    api_context.app.dependency_overrides[get_app_settings] = lambda: configured
+
+    payload = api_context.client.get("/config").json()
+    assert payload["openai_compatible_available"] is True
+    assert payload["openai_compatible_model"] == "qwen"
+
+
+def test_the_api_version_comes_from_pyproject(api_context: ApiTestContext) -> None:
+    import tomllib
+
+    with open("pyproject.toml", "rb") as handle:
+        expected = tomllib.load(handle)["project"]["version"]
+
+    assert api_context.client.get("/openapi.json").json()["info"]["version"] == expected
+
+
+def test_a_tag_change_made_while_a_re_upload_waits_for_the_lock_survives_it(
+    api_context: ApiTestContext,
+) -> None:
+    """Tags used to be read before the ingest took the filename lock, so a PATCH that
+    got the lock first was overwritten when the re-upload's points replaced the old ones."""
+
+    import api.ingestion as ingestion
+    from api.repository import VectorRepository
+
+    client = api_context.client
+    assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha")["state"] == "done"
+    assert client.patch("/documents/guide.txt/tags", json={"tags": ["old"]}).status_code == 200
+
+    with filename_write_lock("guide.txt"):
+        job_id = client.post(
+            "/documents", files={"file": ("guide.txt", b"Intro\nalpha v2", "text/plain")}
+        ).json()["job_id"]
+        # The ingest has parsed and is now queued on the lock this test holds.
+        for _ in range(500):
+            entry = ingestion._filename_locks.get("guide.txt")
+            if entry is not None and entry.users >= 2:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the re-upload never reached the filename lock")
+        # What PATCH does, as the holder of the lock.
+        VectorRepository(api_context.qdrant).set_tags(api_context.settings, "guide.txt", ["new"])
+
+    assert _wait_for_job(client, job_id)["state"] == "done"
+    assert client.get("/documents").json()["tags"] == {"guide.txt": ["new"]}
+
+
+def test_questions_past_the_concurrency_cap_are_429_with_retry_after(
+    api_context: ApiTestContext,
+) -> None:
+    from api.dependencies import get_question_slots
+
+    client = api_context.client
+    assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    busy = QuestionSlots(1)
+    held = busy.try_acquire()
+    api_context.app.dependency_overrides[get_question_slots] = lambda: busy
+
+    refused = client.post("/questions", json={"question": "alpha", "use_cache": False})
+    refused_stream = client.post("/questions/stream", json={"question": "alpha"})
+
+    assert refused.status_code == 429
+    assert refused.headers["retry-after"] == "5"
+    assert refused_stream.status_code == 429
+    assert held is not None
+    held()
+    # Both answer paths give their slot back, so one-at-a-time questions keep working.
+    for _ in range(2):
+        assert (
+            client.post("/questions", json={"question": "alpha", "use_cache": False}).status_code
+            == 200
+        )
+        assert client.post("/questions/stream", json={"question": "alpha"}).status_code == 200
+
+
+def test_document_content_pages_around_a_chunk_or_by_ordinal_range(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    body = "\n\n".join(
+        f"Section {i}\n" + " ".join(f"word{i}x{j}" for j in range(30)) for i in range(8)
+    )
+    assert _upload_and_wait(client, "long.txt", body.encode())["state"] == "done"
+    everything = client.get("/documents/long.txt/content").json()
+    chunks = everything["chunks"]
+    total = len(chunks)
+    assert total >= 6 and everything["total_chunks"] == total
+    middle = chunks[3]
+
+    around = client.get(
+        "/documents/long.txt/content", params={"around": middle["chunk_id"], "radius": 1}
+    ).json()
+    assert [c["chunk_ordinal"] for c in around["chunks"]] == [3, 4, 5]
+    assert around["total_chunks"] == total and around["target_found"] is True
+
+    missing = client.get(
+        "/documents/long.txt/content", params={"around": "gone", "radius": 1}
+    ).json()
+    assert missing["target_found"] is False
+    assert [c["chunk_ordinal"] for c in missing["chunks"]] == [1, 2]
+
+    page = client.get("/documents/long.txt/content", params={"start": 2, "end": 3}).json()
+    assert [c["chunk_ordinal"] for c in page["chunks"]] == [2, 3]
+
+    bad = client.get("/documents/long.txt/content", params={"start": 5, "end": 2})
+    assert bad.status_code == 422
+    assert client.get("/documents/long.txt/content", params={"radius": 1000}).status_code == 422
+    assert client.get("/documents/none.txt/content", params={"start": 1}).status_code == 404
+
+
+def test_the_read_only_key_can_ask_and_read_but_not_change_anything() -> None:
+    full = {"X-API-Key": "full-key"}
+    read = {"X-API-Key": "read-key"}
+    with _keyed_client("full-key", api_read_key="read-key", feedback_enabled=True) as client:
+        assert _upload_and_wait(client, "a.txt", b"Intro\nalpha", headers=full)["state"] == "done"
+
+        # Reading and asking work with either key.
+        assert client.get("/documents", headers=read).status_code == 200
+        assert client.get("/documents/a.txt/content", headers=read).status_code == 200
+        assert (
+            client.post("/questions", json={"question": "alpha"}, headers=read).status_code == 200
+        )
+        assert client.get("/traces", headers=read).status_code == 200
+
+        # Changing the corpus, and operator data, need the full key.
+        upload = client.post("/documents", files={"file": ("b.txt", b"x")}, headers=read)
+        assert upload.status_code == 403
+        assert "read-only" in upload.json()["detail"]
+        assert client.delete("/documents/a.txt", headers=read).status_code == 403
+        tags = client.patch("/documents/a.txt/tags", json={"tags": ["x"]}, headers=read)
+        assert tags.status_code == 403
+        assert client.post("/documents/a.txt/reindex", headers=read).status_code == 403
+        assert client.get("/metrics", headers=read).status_code == 403
+        assert client.get("/feedback", headers=read).status_code == 403
+
+        assert (
+            client.patch("/documents/a.txt/tags", json={"tags": ["x"]}, headers=full).status_code
+            == 200
+        )
+        assert client.get("/metrics", headers=full).status_code == 200
+        assert client.get("/documents", headers={"X-API-Key": "wrong"}).status_code == 401
+
+
+def test_a_read_key_without_a_full_key_is_a_configuration_error() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="API_READ_KEY needs API_KEY"):
+        make_settings(api_read_key="read-key")
+    with pytest.raises(ValidationError, match="must differ"):
+        make_settings(api_key="same", api_read_key="same")
+
+
+def test_export_zips_the_manifest_originals_and_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import zipfile
+
+    with _raw_storage_client(tmp_path, monkeypatch) as client:
+        assert _upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+        assert client.patch("/documents/guide.txt/tags", json={"tags": ["kb"]}).status_code == 200
+
+        response = client.get("/export")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert "docrag-export-" in response.headers["content-disposition"]
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["embedding_model_tag"] == "test-embedding:v1"
+    [document] = manifest["documents"]
+    assert document["filename"] == "guide.txt"
+    assert document["tags"] == ["kb"]
+    assert document["original"] == "originals/guide.txt"
+    assert archive.read("originals/guide.txt") == b"Intro\nalpha beta"
+    assert "feedback.jsonl" not in archive.namelist()  # feedback is off here
+
+
+def test_export_includes_feedback_when_it_is_on(tmp_path: Path) -> None:
+    import io
+    import zipfile
+
+    from api.dependencies import get_feedback_store
+    from api.feedback import FeedbackStore
+
+    store = FeedbackStore(str(tmp_path / "f.db"))
+    with _keyed_client(
+        "full-key",
+        extra_overrides={get_feedback_store: lambda: store},
+        feedback_enabled=True,
+    ) as client:
+        headers = {"X-API-Key": "full-key"}
+        client.post(
+            "/feedback",
+            headers=headers,
+            json={
+                "trace_id": None,
+                "question": "q",
+                "answer_excerpt": "a",
+                "cited_filenames": [],
+                "rating": "up",
+                "citation_source_number": None,
+            },
+        )
+        assert client.get("/export").status_code == 401
+        response = client.get("/export", headers=headers)
+
+    rows = (
+        zipfile.ZipFile(io.BytesIO(response.content)).read("feedback.jsonl").decode().splitlines()
+    )
+    assert [json.loads(row)["rating"] for row in rows] == ["up"]

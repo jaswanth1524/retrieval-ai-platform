@@ -238,9 +238,7 @@ def test_vector_repository_filename_metadata_empty_for_empty_collection() -> Non
     assert repository.filename_metadata(settings) == {}
 
 
-def make_ordinal_point(
-    point_id: str, filename: str, ordinal: int, text: str
-) -> models.PointStruct:
+def make_ordinal_point(point_id: str, filename: str, ordinal: int, text: str) -> models.PointStruct:
     return models.PointStruct(
         id=str(uuid5(NAMESPACE_URL, point_id)),
         vector={
@@ -376,3 +374,56 @@ def test_filename_metadata_reports_the_oldest_chunker_version_and_legacy_as_none
     assert metadata["legacy.md"].chunker_version is None
     assert repository.uploaded_at_for_filename(settings, "mixed.md") == 100.0
     assert repository.uploaded_at_for_filename(settings, "absent.md") is None
+
+
+def test_a_collection_deleted_under_a_running_process_is_recreated_not_a_500() -> None:
+    """Readiness is cached per process: a collection dropped out of band used to fail
+    every later call until a restart."""
+
+    from api.embeddings import EmbeddedText
+    from api.qdrant_schema import clear_readiness_cache
+
+    clear_readiness_cache()
+    client = QdrantClient(":memory:")
+    settings = make_settings()
+    repository = VectorRepository(client)
+    repository.ensure_ready(settings)
+    client.delete_collection(settings.qdrant_collection)
+
+    assert repository.filename_metadata(settings) == {}
+    assert client.collection_exists(settings.qdrant_collection)
+    client.delete_collection(settings.qdrant_collection)
+    query = EmbeddedText(
+        dense=[1.0] + [0.0] * (settings.qdrant_dense_vector_size - 1),
+        sparse=models.SparseVector(indices=[1], values=[1.0]),
+    )
+    assert repository.hybrid_search(settings, query) == []
+    clear_readiness_cache()
+
+
+def test_the_document_listing_is_cached_until_the_corpus_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.corpus import bump_corpus_generation
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    client = QdrantClient(":memory:")
+    settings = make_settings()
+    repository = VectorRepository(client)
+    scans: list[int] = []
+    scan = repository._scan_filename_metadata
+
+    def counting_scan(settings: AppSettings) -> dict[str, DocumentMetadata]:
+        scans.append(1)
+        return scan(settings)
+
+    monkeypatch.setattr(repository, "_scan_filename_metadata", counting_scan)
+
+    repository.filename_metadata(settings)
+    VectorRepository(client).filename_metadata(settings)  # a new repository, same client
+    assert len(scans) == 1
+    bump_corpus_generation()
+    repository.filename_metadata(settings)
+    assert len(scans) == 2
+    clear_metadata_cache()

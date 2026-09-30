@@ -279,6 +279,7 @@ def test_pdf_parser_preserves_page_numbers(monkeypatch: pytest.MonkeyPatch) -> N
     class FakeReader:
         def __init__(self, stream: object) -> None:
             self.stream = stream
+            self.is_encrypted = False
             self.pages = [
                 FakePage("Intro\nalpha beta"),
                 FakePage(""),
@@ -421,7 +422,6 @@ def test_infer_section_skips_roman_numeral_first_line() -> None:
 
 def test_infer_section_falls_back_to_first_line_when_all_look_like_furniture() -> None:
     assert infer_section("12\n34") == "12"
-
 
 
 def test_chunk_budget_reserves_for_the_longest_section_label_in_the_group() -> None:

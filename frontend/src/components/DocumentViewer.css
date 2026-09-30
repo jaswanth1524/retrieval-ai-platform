@@ -91,6 +91,16 @@
   color: var(--bad);
 }
 
+.document-viewer__notice {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .document-viewer__load-more,
 .document-viewer__show-all {
   align-self: center;

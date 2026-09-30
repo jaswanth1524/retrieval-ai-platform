@@ -67,9 +67,59 @@ describe('ChatMessage', () => {
   });
 
   it('announces error turns to assistive tech via role="alert"', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.' })} engineerMode={false} />);
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'error', content: 'API returned HTTP 502.', timestamp: Date.now() })}
+        engineerMode={false}
+      />,
+    );
 
     expect(screen.getByRole('alert')).toHaveTextContent('API returned HTTP 502.');
+  });
+
+  it('does not re-announce an error saved before this page load', () => {
+    render(
+      <ChatMessage turn={makeTurn({ role: 'error', content: 'Old failure.', timestamp: 0 })} engineerMode={false} />,
+    );
+
+    expect(screen.getByText('Old failure.')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('opens answer links in a new tab without a referrer', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'See [the docs](https://example.com/docs).' })}
+        engineerMode={false}
+      />,
+    );
+
+    const link = screen.getByRole('link', { name: 'the docs' });
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  });
+
+  it('disables Regenerate and Retry while another question is in flight', () => {
+    const { rerender } = render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Answer.' })}
+        engineerMode={false}
+        regenerateQuestion="Q?"
+        onRetry={vi.fn()}
+        busy
+      />,
+    );
+    expect(screen.getByTestId('chat-message-regenerate')).toBeDisabled();
+
+    rerender(
+      <ChatMessage
+        turn={makeTurn({ role: 'error', content: 'Failed.', question: 'Q?' })}
+        engineerMode={false}
+        onRetry={vi.fn()}
+        busy
+      />,
+    );
+    expect(screen.getByTestId('chat-message-retry')).toBeDisabled();
   });
 
   it('renders no per-turn trace drawer — trace detail lives in the inspector now', () => {
@@ -212,6 +262,19 @@ describe('ChatMessage', () => {
 
       expect(writeText).toHaveBeenCalledWith('Answer text.');
       expect(await screen.findByText('Copied')).toBeInTheDocument();
+    });
+
+    it('copies the sources as footnotes, so the [n] markers still resolve', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+      const source = { source_number: 1, filename: 'a.pdf', page: 3, section: 'Terms', chunk_id: 'c', text: 't' };
+
+      render(
+        <ChatMessage turn={makeTurn({ role: 'assistant', content: 'Capped [1].', sources: [source] })} engineerMode={false} />,
+      );
+      await userEvent.click(screen.getByTestId('chat-message-copy'));
+
+      expect(writeText).toHaveBeenCalledWith('Capped [1].\n\n[1] a.pdf · p.3 · Terms');
     });
 
     it('still copies via execCommand when the clipboard API is unavailable', async () => {
@@ -367,6 +430,7 @@ describe('ChatMessage', () => {
       await userEvent.click(screen.getByTestId('chat-message-feedback-up'));
 
       expect(onFeedback).toHaveBeenCalledWith({
+        turnId: 'turn-1',
         rating: 'up',
         question: 'What is the answer?',
         answerExcerpt: 'The answer is 42 [1].',
@@ -395,6 +459,21 @@ describe('ChatMessage', () => {
 
       expect(onFeedback).toHaveBeenCalledTimes(1);
       expect(onFeedback).toHaveBeenCalledWith(expect.objectContaining({ rating: 'down' }));
+    });
+
+    it('keeps a rating saved on the turn, so a remount cannot rate the answer again', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'Answer.', feedback: 'down' })}
+          engineerMode={false}
+          regenerateQuestion="Q?"
+          feedbackEnabled
+          onFeedback={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByTestId('chat-message-feedback-down')).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
     });
 
     it('renders no feedback buttons on the turn actively streaming', () => {
@@ -506,5 +585,65 @@ describe('ChatMessage answer-progress announcement', () => {
     render(<ChatMessage turn={makeTurn({ role: 'user', content: 'Hi' })} engineerMode={false} />);
 
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('edits a question and sends it through onEditQuestion', async () => {
+    const onEditQuestion = vi.fn();
+    render(
+      <ChatMessage
+        turn={makeTurn({ id: 'q1', role: 'user', content: 'Old question' })}
+        engineerMode={false}
+        onEditQuestion={onEditQuestion}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('chat-message-edit'));
+    const input = screen.getByTestId('chat-message-edit-input');
+    await userEvent.clear(input);
+    await userEvent.type(input, 'New question{Enter}');
+
+    expect(onEditQuestion).toHaveBeenCalledWith('q1', 'New question');
+    expect(screen.getByText('Old question')).toBeInTheDocument();
+  });
+
+  it('Escape abandons an edit without sending it', async () => {
+    const onEditQuestion = vi.fn();
+    render(
+      <ChatMessage turn={makeTurn({ role: 'user', content: 'Q' })} engineerMode={false} onEditQuestion={onEditQuestion} />,
+    );
+
+    await userEvent.click(screen.getByTestId('chat-message-edit'));
+    await userEvent.keyboard('{Escape}');
+
+    expect(screen.queryByTestId('chat-message-edit-input')).not.toBeInTheDocument();
+    expect(onEditQuestion).not.toHaveBeenCalled();
+  });
+
+  it('regenerates through onRegenerate (which skips the cache) when given', async () => {
+    const onRetry = vi.fn();
+    const onRegenerate = vi.fn();
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Answer.' })}
+        engineerMode={false}
+        regenerateQuestion="Q?"
+        onRetry={onRetry}
+        onRegenerate={onRegenerate}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('chat-message-regenerate'));
+
+    expect(onRegenerate).toHaveBeenCalledWith('Q?');
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it('labels stopped and cached answers', () => {
+    render(
+      <ChatMessage turn={makeTurn({ role: 'assistant', content: 'Part', stopped: true, cached: true })} engineerMode={false} />,
+    );
+
+    expect(screen.getByTestId('chat-message-stopped')).toBeInTheDocument();
+    expect(screen.getByTestId('chat-message-cached')).toBeInTheDocument();
   });
 });

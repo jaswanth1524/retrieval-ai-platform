@@ -244,7 +244,7 @@ def test_rag_pipeline_answers_from_ingested_document() -> None:
 
     assert grounded.answer == "Alpha is documented [1]."
     assert [source.filename for source in grounded.sources] == ["guide.txt"]
-    assert reranker.seen_documents == ["Intro alpha beta"]
+    assert reranker.seen_documents == ["guide.txt › Intro\nIntro alpha beta"]
     assert "Intro alpha beta" in generator.messages[1]["content"]
     # No override → generation uses the base provider.
     assert generator.seen_provider == "ollama"
@@ -274,17 +274,15 @@ def test_rag_pipeline_provider_override_does_not_mutate_base_settings() -> None:
     assert settings.llm_provider == "ollama"
 
 
-def _ingest_three_matching_docs(
-    repository: VectorRepository, settings: AppSettings
-) -> None:
+def _ingest_three_matching_docs(repository: VectorRepository, settings: AppSettings) -> None:
     for name, text in [
         ("guide1.txt", "First alpha document."),
         ("guide2.txt", "Second alpha document."),
         ("guide3.txt", "Third alpha document."),
     ]:
-        IngestService(
-            repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings
-        ).ingest(name, text.encode())
+        IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+            name, text.encode()
+        )
 
 
 def test_rag_pipeline_max_context_chunks_override_limits_sources() -> None:
@@ -441,9 +439,9 @@ def test_rag_pipeline_answer_filters_by_filenames() -> None:
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
     for name, text in [("a.txt", "alpha in a"), ("b.txt", "alpha in b")]:
-        IngestService(
-            repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings
-        ).ingest(name, text.encode())
+        IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+            name, text.encode()
+        )
 
     pipeline = RagPipeline(
         repository=repository,
@@ -571,9 +569,7 @@ def test_expand_with_neighbors_fetches_once_per_filename_not_once_per_chunk() ->
     calls: list[tuple[str, list[int]]] = []
     real_fetch = repository.fetch_neighbors
 
-    def counting_fetch(
-        settings_arg: AppSettings, filename: str, ordinals: Sequence[int]
-    ) -> Any:
+    def counting_fetch(settings_arg: AppSettings, filename: str, ordinals: Sequence[int]) -> Any:
         calls.append((filename, list(ordinals)))
         return real_fetch(settings_arg, filename, ordinals)
 
@@ -1093,10 +1089,10 @@ class CountingRepository:
         self.inner.ensure_ready(settings)
 
     def hybrid_search(
-        self, settings: AppSettings, query_embedding: Any, filenames: Any = None
+        self, settings: AppSettings, query_embedding: Any, filenames: Any = None, tags: Any = None
     ) -> Any:
         self.search_calls += 1
-        return self.inner.hybrid_search(settings, query_embedding, filenames)
+        return self.inner.hybrid_search(settings, query_embedding, filenames, tags)
 
     def fetch_neighbors(self, settings: AppSettings, filename: str, ordinals: Any) -> Any:
         return self.inner.fetch_neighbors(settings, filename, ordinals)
@@ -1345,7 +1341,9 @@ class SlowRetryGenerator(SequencedGenerator):
     sleep makes the retry's cost large enough to assert on without timing noise.
     """
 
-    RETRY_DELAY_SECONDS = 0.05
+    # Large enough that a loaded CI runner's scheduling jitter on the un-slept call
+    # (asserted to stay below it) cannot reach it.
+    RETRY_DELAY_SECONDS = 0.5
 
     def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
         if self.call_count > 0:
@@ -1405,9 +1403,7 @@ def test_citation_retry_stage_is_zero_when_the_retry_does_not_fire() -> None:
     assert grounded.timings.citation_retry_ms == 0.0
 
 
-def _retrying_pipeline(
-    trace_store: ListTraceStore, generator: SequencedGenerator
-) -> RagPipeline:
+def _retrying_pipeline(trace_store: ListTraceStore, generator: SequencedGenerator) -> RagPipeline:
     settings = make_settings(citation_retry_enabled=True)
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
@@ -1477,3 +1473,76 @@ def test_sync_trace_records_the_plain_prompt_when_no_retry_happens() -> None:
     assert trace.prompt_messages == generator.calls[-1][0]
     assert trace.prompt_messages[-1]["role"] == "user"
     assert CITATION_RETRY_REMINDER not in trace.prompt_messages[-1]["content"]
+
+
+def test_a_prompt_too_big_for_the_context_window_drops_sources_and_says_so_in_the_trace() -> None:
+    from api.documents import DocumentChunk
+    from api.ingestion import ingest_chunks
+
+    settings = make_settings(
+        llm_context_window=1000, llm_max_tokens=256, max_context_chunks=2, context_neighbor_radius=0
+    )
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    # ~500 estimated tokens each, so two don't fit; distinct so neither is a duplicate.
+    texts = ["alpha " * 250, "omega " * 250]
+    ingest_chunks(
+        repository,
+        settings,
+        [
+            DocumentChunk(filename="guide.txt", page=1, section="S", chunk_id=f"c{i}", text=text)
+            for i, text in enumerate(texts)
+        ],
+        StaticEmbeddingProvider([make_embedding(1.0), make_embedding(1.0)]),
+    )
+    traces = ListTraceStore()
+    generator = SequencedGenerator(["Alpha [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        trace_store=traces,
+    )
+
+    events = list(pipeline.answer_stream("alpha"))
+
+    sources = next(event for event in events if event["type"] == "sources")["sources"]
+    assert len(sources) == 1
+    prompt = generator.calls[0][0][-1]["content"]
+    assert "[1] filename=guide.txt" in prompt
+    assert "[2] filename=" not in prompt
+    reasons = [candidate.drop_reason for candidate in traces.traces[0].candidates]
+    assert reasons.count("context_budget") == 1
+
+
+def test_expansion_variants_are_searched_side_by_side() -> None:
+    settings = make_settings(query_expansion_enabled=True, query_expansion_count=3)
+    client = QdrantClient(":memory:")
+    inner = VectorRepository(client)
+    IngestService(inner, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+
+    class SlowRepository(CountingRepository):
+        def hybrid_search(self, *args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.3)
+            return super().hybrid_search(*args, **kwargs)
+
+    slow = SlowRepository(inner)
+    pipeline = RagPipeline(
+        repository=slow,  # type: ignore[arg-type]
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=SequencedGenerator(["one\ntwo\nthree", "Alpha is documented [1]."]),
+        settings=settings,
+    )
+
+    started = time.monotonic()
+    pipeline.answer("alpha", use_cache=False)
+    elapsed = time.monotonic() - started
+
+    assert slow.search_calls == 4
+    # Four 0.3 s searches one after another would take 1.2 s.
+    assert elapsed < 0.9

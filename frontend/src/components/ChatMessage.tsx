@@ -1,7 +1,8 @@
-import { memo, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
+import { withCitationFootnotes } from '../utils/exportChat';
 import CitationCard from './CitationCard';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
@@ -12,10 +13,21 @@ const REMARK_PLUGINS = [remarkGfm];
 // it rendered, no click needed. Show the alt text instead of loading anything.
 const MARKDOWN_COMPONENTS: Components = {
   img: ({ alt }) => (alt ? <span className="chat-message__image-alt">[{alt}]</span> : null),
+  // A link followed in this tab used to unload the app mid-answer. `noreferrer` also
+  // keeps the DocRAG URL out of wherever a document's link points.
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
+  ),
 };
+// Error turns created before this page load are history, not news: announcing each one
+// as an alert on every conversation switch or reload read out stale failures.
+const SESSION_STARTED_AT = Date.now();
 const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 
 export interface FeedbackPayload {
+  turnId: string;
   rating: FeedbackRating;
   question: string;
   answerExcerpt: string;
@@ -34,6 +46,12 @@ export interface ChatTurn {
   // The question that produced this turn — set on error turns only, so a failed
   // question's text isn't lost and can be resubmitted via the Retry button.
   question?: string;
+  // The rating given to this answer, kept on the turn so it survives a reload.
+  feedback?: FeedbackRating;
+  // Stopped by the user partway: the content is a fragment, not the whole answer.
+  stopped?: boolean;
+  // Served from the server's answer cache rather than generated for this question.
+  cached?: boolean;
 }
 
 interface ChatMessageProps {
@@ -43,9 +61,13 @@ interface ChatMessageProps {
   streamStage?: string;
   currentModelLabel?: string;
   onRetry?: (question: string) => void;
+  // Regenerate skips the server's answer cache; onRetry is used when this is absent.
+  onRegenerate?: (question: string) => void;
+  // Edit a user turn and ask again (a fork — the original conversation is kept).
+  onEditQuestion?: (turnId: string, question: string) => void;
   // The question a "Regenerate" click on this (assistant) turn should re-ask —
   // undefined on any turn that isn't a regenerate-able assistant answer. Computed by
-  // ChatThread from array position; see findPrecedingUserQuestion there.
+  // ChatThread from array position; see precedingUserQuestions there.
   regenerateQuestion?: string;
   // Off (undefined/false) unless the server has AppSettings.feedback_enabled set —
   // sourced from PublicConfigResponse.feedback_enabled via App.tsx.
@@ -57,6 +79,8 @@ interface ChatMessageProps {
   onOpenSource?: (filename: string, chunkId: string) => void;
   onCitationHover?: (citation: CitationResponse) => void;
   onCitationLeave?: () => void;
+  // A question is in flight: Regenerate and Retry would be silently ignored by useChat.
+  busy?: boolean;
 }
 
 function formatDuration(totalMs: number): string {
@@ -69,23 +93,30 @@ function ChatMessage({
   streamStage,
   currentModelLabel,
   onRetry,
+  onRegenerate,
+  onEditQuestion,
   regenerateQuestion,
   feedbackEnabled,
   onFeedback,
   onOpenSource,
   onCitationHover,
   onCitationLeave,
+  busy = false,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
   // Sticky once set: a rating is a one-shot action, not a toggle — clicking again
   // would just resubmit the same signal, so the buttons disable after the first pick.
-  const [feedbackGiven, setFeedbackGiven] = useState<FeedbackRating | null>(null);
+  // Seeded from the turn so a remount (reload, conversation switch) can't re-enable them.
+  const [feedbackGiven, setFeedbackGiven] = useState<FeedbackRating | null>(turn.feedback ?? null);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(copyTimerRef.current), []);
 
   const submitFeedback = (rating: FeedbackRating) => {
     if (!regenerateQuestion || !onFeedback) return;
     setFeedbackGiven(rating);
     onFeedback({
+      turnId: turn.id,
       rating,
       question: regenerateQuestion,
       answerExcerpt: turn.content,
@@ -118,26 +149,39 @@ function ChatMessage({
   };
 
   const settle = (ok: boolean) => {
+    clearTimeout(copyTimerRef.current);
     if (ok) {
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
     } else {
       setCopyFailed(true);
-      setTimeout(() => setCopyFailed(false), 1500);
+      copyTimerRef.current = setTimeout(() => setCopyFailed(false), 1500);
     }
   };
 
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(turn.content);
+  const submitEdit = () => {
+    const question = draft.trim();
+    if (!question || !onEditQuestion) return;
+    setEditing(false);
+    onEditQuestion(turn.id, question);
+  };
+
   const handleCopy = () => {
+    // The answer's [n] markers would dangle without their sources, so the copy carries
+    // them as footnotes — the same lines the Markdown export writes.
+    const text = withCitationFootnotes(turn.content, turn.sources);
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(turn.content).then(
+      navigator.clipboard.writeText(text).then(
         () => settle(true),
         // Even in a secure context the write can be denied by permissions policy;
         // fall back rather than reporting failure outright.
-        () => settle(legacyCopy(turn.content)),
+        () => settle(legacyCopy(text)),
       );
       return;
     }
-    settle(legacyCopy(turn.content));
+    settle(legacyCopy(text));
   };
 
   const showSkeleton = streamStage !== undefined && turn.content === '';
@@ -151,7 +195,64 @@ function ChatMessage({
           <span className="chat-message__gutter" aria-hidden="true">
             Q
           </span>
-          <p className="chat-message__question">{turn.content}</p>
+          {editing ? (
+            <form
+              className="chat-message__edit"
+              onSubmit={(event) => {
+                event.preventDefault();
+                submitEdit();
+              }}
+            >
+              <textarea
+                className="chat-message__edit-input"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                  if (event.key === 'Escape') {
+                    event.stopPropagation();
+                    setEditing(false);
+                  } else if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    submitEdit();
+                  }
+                }}
+                aria-label="Edit question"
+                maxLength={4000}
+                rows={2}
+                autoFocus
+                data-testid="chat-message-edit-input"
+              />
+              <div className="chat-message__edit-actions">
+                <button type="submit" disabled={busy || !draft.trim()} data-testid="chat-message-edit-send">
+                  Ask as new chat
+                </button>
+                <button type="button" onClick={() => setEditing(false)}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <>
+              <p className="chat-message__question">{turn.content}</p>
+              {onEditQuestion && (
+                <button
+                  type="button"
+                  className="chat-message__edit-button"
+                  onClick={() => {
+                    setDraft(turn.content);
+                    setEditing(true);
+                  }}
+                  disabled={busy}
+                  aria-label="Edit this question"
+                  title="Edit and ask again in a new chat"
+                  data-testid="chat-message-edit"
+                >
+                  ✎
+                </button>
+              )}
+            </>
+          )}
         </div>
       )}
 
@@ -180,6 +281,20 @@ function ChatMessage({
               </div>
             )}
             <div className="chat-message__meta-row">
+              {turn.stopped && (
+                <span className="chat-message__flag" data-testid="chat-message-stopped">
+                  stopped
+                </span>
+              )}
+              {turn.cached && (
+                <span
+                  className="chat-message__flag"
+                  title="Answered from the server's cache — Regenerate asks again"
+                  data-testid="chat-message-cached"
+                >
+                  cached
+                </span>
+              )}
               <time
                 className="chat-message__timestamp mono"
                 dateTime={new Date(turn.timestamp).toISOString()}
@@ -200,7 +315,8 @@ function ChatMessage({
                 <button
                   type="button"
                   className="chat-message__regenerate"
-                  onClick={() => onRetry(regenerateQuestion)}
+                  disabled={busy}
+                  onClick={() => (onRegenerate ?? onRetry)(regenerateQuestion)}
                   data-testid="chat-message-regenerate"
                 >
                   Regenerate
@@ -266,12 +382,16 @@ function ChatMessage({
           <span className="chat-message__gutter chat-message__gutter--error" aria-hidden="true">
             !
           </span>
-          <div className="chat-message__error" role="alert">
+          <div
+            className="chat-message__error"
+            role={turn.timestamp >= SESSION_STARTED_AT ? 'alert' : undefined}
+          >
             {turn.content}
             {turn.question && onRetry && (
               <button
                 type="button"
                 className="chat-message__retry"
+                disabled={busy}
                 onClick={() => onRetry(turn.question!)}
                 data-testid="chat-message-retry"
               >

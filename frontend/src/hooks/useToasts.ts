@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { newId } from '../utils/id';
 
 export type ToastTone = 'info' | 'good' | 'warn' | 'bad';
 
@@ -9,10 +10,13 @@ export interface Toast {
   tone: ToastTone;
 }
 
+export type ToastInput = Omit<Toast, 'id'> & { id?: string; sticky?: boolean };
+
 export interface UseToastsResult {
   toasts: Toast[];
-  /** Show a toast; returns its id so a caller can dismiss it early. */
-  push: (toast: Omit<Toast, 'id'> & { id?: string }) => string;
+  /** Show a toast; returns its id so a caller can dismiss it early. A `sticky` toast
+   * stays until dismissed — for warnings that must not vanish while the user looks away. */
+  push: (toast: ToastInput) => string;
   dismiss: (id: string) => void;
 }
 
@@ -42,17 +46,21 @@ export function useToasts(): UseToastsResult {
   }, []);
 
   const push = useCallback(
-    (toast: Omit<Toast, 'id'> & { id?: string }) => {
+    (toast: ToastInput) => {
       // A caller-supplied id makes a toast idempotent: a persistence failure that
       // re-renders repeatedly should replace its own notice, not stack up dozens.
-      const id = toast.id ?? crypto.randomUUID();
+      const id = toast.id ?? newId();
       const existing = timers.current.get(id);
-      if (existing !== undefined) clearTimeout(existing);
+      if (existing !== undefined) {
+        clearTimeout(existing);
+        timers.current.delete(id);
+      }
 
       setToasts((prev) => [
         ...prev.filter((candidate) => candidate.id !== id),
         { id, title: toast.title, body: toast.body, tone: toast.tone },
       ]);
+      if (toast.sticky) return id;
       timers.current.set(
         id,
         setTimeout(() => {

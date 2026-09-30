@@ -9,7 +9,8 @@ import './CorpusPanel.css';
 type UploadItemStatus = 'uploading' | 'success' | 'error';
 
 interface UploadProgress {
-  state: IngestJobState;
+  // 'waiting': the server's indexing queue was full (503); retrying after its Retry-After.
+  state: IngestJobState | 'waiting';
   chunksDone: number;
   chunksTotal: number;
 }
@@ -35,6 +36,8 @@ interface RejectedFile {
 // Matches the backend's AppSettings.max_upload_bytes default — used only until
 // /config has loaded and supplies the server's actual configured limit.
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+// Mirrors api/documents.py SUPPORTED_EXTENSIONS.
+const ACCEPTED_EXTENSIONS = ['.pdf', '.txt', '.md', '.markdown', '.docx', '.html', '.htm', '.csv'];
 
 interface CorpusPanelProps {
   filenames: string[];
@@ -60,6 +63,98 @@ interface CorpusPanelProps {
   onReindex?: (filename: string) => void;
   /** Re-index every stale document that has a stored original, in one request. */
   onReindexAllStale?: () => void;
+  /** Each tagged document's tags. */
+  tags?: Record<string, string[]>;
+  /** Replace a document's tags; rejects with a message to show on failure. */
+  onSetTags?: (filename: string, tags: string[]) => Promise<void>;
+}
+
+interface TagEditorProps {
+  filename: string;
+  tags: string[];
+  disabled?: boolean;
+  onSave: (filename: string, tags: string[]) => Promise<void>;
+}
+
+/** A document's tags as chips, edited inline as a comma-separated list. */
+function TagEditor({ filename, tags, disabled, onSave }: TagEditorProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    const next = draft
+      .split(',')
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave(filename, next);
+      setEditing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save tags.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="corpus-panel__tags-edit">
+        <input
+          type="text"
+          className="corpus-panel__tags-input"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              void save();
+            } else if (event.key === 'Escape') {
+              // Cancels the edit only — not the drawer this panel may sit in.
+              event.stopPropagation();
+              setEditing(false);
+            }
+          }}
+          placeholder="legal, 2026"
+          aria-label={`Tags for ${filename}, comma separated`}
+          disabled={saving}
+          autoFocus
+          data-testid="corpus-tags-input"
+        />
+        {error && (
+          <span className="corpus-panel__tags-error" role="alert">
+            {error}
+          </span>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="corpus-panel__tags" data-testid="corpus-tags">
+      {tags.map((tag) => (
+        <span key={tag} className="corpus-panel__tag">
+          #{tag}
+        </span>
+      ))}
+      <button
+        type="button"
+        className="corpus-panel__tags-button"
+        onClick={() => {
+          setDraft(tags.join(', '));
+          setError(null);
+          setEditing(true);
+        }}
+        disabled={disabled}
+        aria-label={`Edit tags for ${filename}`}
+        data-testid="corpus-tags-edit"
+      >
+        {tags.length > 0 ? '✎' : '+ tag'}
+      </button>
+    </div>
+  );
 }
 
 function formatBytes(bytes: number): string {
@@ -109,6 +204,8 @@ function CorpusPanel({
   reindexableFilenames = [],
   onReindex,
   onReindexAllStale,
+  tags = {},
+  onSetTags,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFile[]>([]);
@@ -126,7 +223,15 @@ function CorpusPanel({
     const accepted: File[] = [];
     const rejected: RejectedFile[] = [];
     Array.from(fileList).forEach((file) => {
-      if (file.size > maxUploadBytes) {
+      // The input's `accept` filters the picker only; a drop bypasses it, and an
+      // unsupported file used to cost a round trip to learn the server rejects it.
+      const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+      if (!file.name.includes('.') || !ACCEPTED_EXTENSIONS.includes(extension)) {
+        rejected.push({
+          filename: file.name,
+          message: `${file.name} isn't a supported type (${ACCEPTED_EXTENSIONS.join(' ')}).`,
+        });
+      } else if (file.size > maxUploadBytes) {
         rejected.push({
           filename: file.name,
           message: `${file.name} is too large (${formatBytes(file.size)}). Maximum is ${formatBytes(maxUploadBytes)}.`,
@@ -185,7 +290,8 @@ function CorpusPanel({
     uploads.filter((item) => item.status === 'uploading').map((item) => item.filename),
   );
   const indexedCards: DocCard[] = filenames.filter((filename) => !inFlightNames.has(filename)).map((filename) => {
-    const parts = [`${chunkCounts[filename] ?? 0} chunks`];
+    const count = chunkCounts[filename] ?? 0;
+    const parts = [`${count} ${count === 1 ? 'chunk' : 'chunks'}`];
     const pages = pageCounts[filename];
     if (pages) parts.push(`${pages} page${pages === 1 ? '' : 's'}`);
     const bytes = byteSizes[filename];
@@ -232,7 +338,10 @@ function CorpusPanel({
             uploadId: item.id,
             filename: item.filename,
             status: 'indexing',
-            detail: `${reindexing ? 're-indexing' : 'indexing'} ${progressPercent(item.progress)}%`,
+            detail:
+              item.progress?.state === 'waiting'
+                ? 'waiting for room in the indexing queue…'
+                : `${reindexing ? 're-indexing' : 'indexing'} ${progressPercent(item.progress)}%`,
             pct: progressPercent(item.progress),
           };
     });
@@ -253,12 +362,12 @@ function CorpusPanel({
         onDrop={handleDrop}
         data-testid="upload-dropzone"
       >
-        Drop files &middot; pdf docx md txt
+        Drop files &middot; pdf docx md txt html csv
         <input
           ref={inputRef}
           type="file"
           className="corpus-panel__input"
-          accept=".pdf,.txt,.md,.markdown,.docx,.html,.htm,.csv"
+          accept={ACCEPTED_EXTENSIONS.join(',')}
           multiple
           onChange={(event) => handleFilesChange(event.target.files)}
           disabled={submitting}
@@ -343,7 +452,7 @@ function CorpusPanel({
           <div className="corpus-panel__card-top">
             <span className="corpus-panel__ext">{extensionOf(card.filename)}</span>
             <span className="corpus-panel__name">{card.filename}</span>
-            {confirming === card.filename ? (
+            {confirming === card.key ? (
               <div
                 className="corpus-panel__confirm"
                 onKeyDown={(event) => {
@@ -394,7 +503,7 @@ function CorpusPanel({
                 <button
                   type="button"
                   className="corpus-panel__remove"
-                  onClick={() => setConfirming(card.filename)}
+                  onClick={() => setConfirming(card.key)}
                   disabled={disabled}
                   aria-label={`Delete ${card.filename}`}
                 >
@@ -449,6 +558,14 @@ function CorpusPanel({
             >
               <div className="corpus-panel__bar-fill" style={{ width: `${card.pct}%` }} />
             </div>
+          )}
+          {card.status === 'indexed' && onSetTags && (
+            <TagEditor
+              filename={card.filename}
+              tags={tags[card.filename] ?? []}
+              disabled={disabled}
+              onSave={onSetTags}
+            />
           )}
         </article>
       ))}

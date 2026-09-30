@@ -234,9 +234,7 @@ def test_sqlite_job_store_survives_a_process_restart(tmp_path: Path) -> None:
     db_path = str(tmp_path / "jobs.db")
     first_process_store = SqliteIngestJobStore(path=db_path, max_retained=50)
     job = first_process_store.create("guide.txt")
-    first_process_store.update(
-        job.id, state="done", chunks_done=5, chunks_total=5, result=result
-    )
+    first_process_store.update(job.id, state="done", chunks_done=5, chunks_total=5, result=result)
     del first_process_store  # the process would have exited here
 
     second_process_store = SqliteIngestJobStore(path=db_path, max_retained=50)

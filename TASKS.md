@@ -4,7 +4,7 @@ This task plan follows the requested build order and the architecture implied by
 
 ## Milestone 1: Planning Artifacts And Spec Review
 
-- Create `AGENTS.md`, `TASKS.md`, `README.md`, `.gitignore`, and `.env.example`.
+- Create the agent operating guide (now `CLAUDE.md`), `TASKS.md`, `README.md`, `.gitignore`, and `.env.example`.
 - Record architecture decisions, repository expectations, validation rules, and known risks.
 - Confirm no application code is created in this milestone.
 
@@ -100,7 +100,7 @@ This task plan follows the requested build order and the architecture implied by
 - The requested repository structure is shown under `docrag/`, while the requested planning files are named without that prefix; this repository now treats the current root as the DocRAG project root.
 - Qdrant server-side hybrid query support depends on the installed Qdrant server/client feature set, so manual RRF fallback is required.
 - First-run FastEmbed model downloads may make the initial one-command run slower.
-- `jinaai/jina-reranker-v2-base-multilingual` (~1.1 GB) may require more CPU and memory than the dense embedding model.
+- `jinaai/jina-reranker-v2-base-multilingual` (~0.28 GB as the default int8 export, ~1.1 GB fp32) may require more CPU and memory than the dense embedding model.
 - RESOLVED: `BAAI/bge-reranker-v2-m3` is not listed as a supported model by FastEmbed's `TextCrossEncoder` at any released version (confirmed against `main`, not just the pinned `0.8.0`) — not a version-lag issue. Owner approved swapping the default to `jinaai/jina-reranker-v2-base-multilingual`, the strongest model FastEmbed does support.
 - RAGAS evaluation can require an evaluator LLM for some metrics; evaluation remains optional and separate from the core local workflow.
 - RESOLVED: `ragas 0.4.3` imports `langchain_community.chat_models.vertexai`, which `langchain-community 0.4` removed; the `eval` extra pins `langchain-community<0.4` and CI smoke-imports `ragas` so the break can't return silently.
