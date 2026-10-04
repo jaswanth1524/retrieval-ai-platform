@@ -8,6 +8,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, NotRequired, TypedDict
@@ -54,7 +55,14 @@ from api.retrieval import (
     points_to_chunks,
 )
 from api.settings import AppSettings
-from api.tracing import QueryTrace, TraceConfig, TraceSink, build_trace_candidates
+from api.tracing import (
+    QueryTrace,
+    TraceConfig,
+    TraceMode,
+    TraceSink,
+    TraceStatus,
+    build_trace_candidates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +406,114 @@ class RagPipeline:
             tags=list(tags) if tags else None,
         )
 
+    def _phase_timings(
+        self,
+        phase: RetrievalPhase,
+        *,
+        total_start: float,
+        condense_ms: float,
+        generate_ms: float = 0.0,
+        citation_retry_ms: float = 0.0,
+    ) -> StageTimings:
+        """Stage timings for a finished question; ``total_ms`` measured now."""
+
+        return StageTimings(
+            embed_ms=phase.embed_ms,
+            search_ms=phase.search_ms,
+            rerank_ms=phase.rerank_ms,
+            generate_ms=generate_ms,
+            total_ms=(time.monotonic() - total_start) * 1000,
+            condense_ms=condense_ms,
+            query_expansion_ms=phase.query_expansion_ms,
+            context_expansion_ms=phase.context_expansion_ms,
+            citation_retry_ms=citation_retry_ms,
+        )
+
+    def _error_trace(
+        self,
+        *,
+        trace_id: str,
+        question: str,
+        mode: TraceMode,
+        effective_settings: AppSettings | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        error: str,
+        answer: str | None,
+        condensed_question: str | None,
+        history_message_count: int,
+    ) -> QueryTrace:
+        """The trace of a question that failed (or was abandoned) before finishing."""
+
+        return QueryTrace(
+            trace_id=trace_id,
+            created_at=time.time(),
+            question=question,
+            mode=mode,
+            status="error",
+            config=self._trace_config(effective_settings, filenames, tags)
+            if effective_settings is not None
+            else None,
+            candidates=[],
+            prompt_messages=None,
+            answer=answer,
+            cited_source_numbers=[],
+            timings=None,
+            error=error,
+            condensed_question=condensed_question,
+            history_message_count=history_message_count,
+        )
+
+    def _finished_trace(
+        self,
+        *,
+        trace_id: str,
+        question: str,
+        mode: TraceMode,
+        status: TraceStatus,
+        effective_settings: AppSettings,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        phase: RetrievalPhase,
+        selected: Sequence[RerankedChunk],
+        context_budget_dropped_ids: AbstractSet[str] = frozenset(),
+        prompt_messages: list[ChatMessage] | None,
+        answer: str,
+        cited_source_numbers: list[int],
+        timings: StageTimings,
+        condensed_question: str | None,
+        history_message_count: int,
+        citation_retry_used: bool = False,
+    ) -> QueryTrace:
+        """The trace of a question that ran to an answer (or to "insufficient context")."""
+
+        return QueryTrace(
+            trace_id=trace_id,
+            created_at=time.time(),
+            question=question,
+            mode=mode,
+            status=status,
+            config=self._trace_config(effective_settings, filenames, tags),
+            candidates=build_trace_candidates(
+                phase.fused_candidates,
+                phase.scored_chunks,
+                phase.context_chunks,
+                selected,
+                min_score=float(effective_settings.rerank_min_score),
+                diversity_dropped_ids=phase.diversity_dropped_ids,
+                context_budget_dropped_ids=context_budget_dropped_ids,
+            ),
+            prompt_messages=prompt_messages,
+            answer=answer,
+            cited_source_numbers=cited_source_numbers,
+            timings=timings_dict(timings),
+            error=None,
+            condensed_question=condensed_question,
+            history_message_count=history_message_count,
+            query_variants=phase.query_variants,
+            citation_retry_used=citation_retry_used,
+        )
+
     def _truncate_history(
         self, history: Sequence[ChatMessage] | None, effective_settings: AppSettings
     ) -> list[ChatMessage]:
@@ -734,39 +850,27 @@ class RagPipeline:
             # block just timed covers two LLM calls when it fired. Split it back out so
             # generate_ms means the same thing here as it does on the streaming path.
             generate_ms = (time.monotonic() - generate_start) * 1000 - grounded.citation_retry_ms
-            total_ms = (time.monotonic() - total_start) * 1000
-
-            timings = StageTimings(
-                embed_ms=phase.embed_ms,
-                search_ms=phase.search_ms,
-                rerank_ms=phase.rerank_ms,
-                generate_ms=generate_ms,
-                total_ms=total_ms,
+            timings = self._phase_timings(
+                phase,
+                total_start=total_start,
                 condense_ms=condense_ms,
-                query_expansion_ms=phase.query_expansion_ms,
-                context_expansion_ms=phase.context_expansion_ms,
+                generate_ms=generate_ms,
                 citation_retry_ms=grounded.citation_retry_ms,
             )
         except Exception as exc:
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
-                    QueryTrace(
+                    self._error_trace(
                         trace_id=trace_id,
-                        created_at=time.time(),
                         question=question,
                         mode="sync",
-                        status="error",
-                        config=self._trace_config(effective_settings, filenames, tags)
-                        if effective_settings is not None
-                        else None,
-                        candidates=[],
-                        prompt_messages=None,
-                        answer=None,
-                        cited_source_numbers=[],
-                        timings=None,
+                        effective_settings=effective_settings,
+                        filenames=filenames,
+                        tags=tags,
                         # Traces are readable with the read-only key: the same rule
                         # as a response body, so no internal detail.
                         error=public_error_message(exc),
+                        answer=None,
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
                     )
@@ -778,32 +882,24 @@ class RagPipeline:
             # build_grounded_messages call would agree today but is a re-derivation that
             # can drift, and it could never reproduce the citation-retry continuation
             # that actually produced the answer when grounded.citation_retry_used is set.
-            prompt_messages = grounded.prompt_messages or None
             trace_store.add(
-                QueryTrace(
+                self._finished_trace(
                     trace_id=trace_id,
-                    created_at=time.time(),
                     question=question,
                     mode="sync",
                     status="ok" if selected else "insufficient_context",
-                    config=self._trace_config(effective_settings, filenames, tags),
-                    candidates=build_trace_candidates(
-                        phase.fused_candidates,
-                        phase.scored_chunks,
-                        phase.context_chunks,
-                        selected,
-                        min_score=float(effective_settings.rerank_min_score),
-                        diversity_dropped_ids=phase.diversity_dropped_ids,
-                        context_budget_dropped_ids=fitted.dropped_point_ids,
-                    ),
-                    prompt_messages=prompt_messages,
+                    effective_settings=effective_settings,
+                    filenames=filenames,
+                    tags=tags,
+                    phase=phase,
+                    selected=selected,
+                    context_budget_dropped_ids=fitted.dropped_point_ids,
+                    prompt_messages=grounded.prompt_messages or None,
                     answer=grounded.answer,
                     cited_source_numbers=[source.source_number for source in grounded.sources],
-                    timings=timings_dict(timings),
-                    error=None,
+                    timings=timings,
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
-                    query_variants=phase.query_variants,
                     citation_retry_used=grounded.citation_retry_used,
                 )
             )
@@ -843,21 +939,15 @@ class RagPipeline:
             if trace_store is None or trace_id is None:
                 return
             trace_store.add(
-                QueryTrace(
+                self._error_trace(
                     trace_id=trace_id,
-                    created_at=time.time(),
                     question=question,
                     mode="stream",
-                    status="error",
-                    config=self._trace_config(effective_settings, filenames, tags)
-                    if effective_settings is not None
-                    else None,
-                    candidates=[],
-                    prompt_messages=None,
-                    answer="".join(parts).strip() or None,
-                    cited_source_numbers=[],
-                    timings=None,
+                    effective_settings=effective_settings,
+                    filenames=filenames,
+                    tags=tags,
                     error=error,
+                    answer="".join(parts).strip() or None,
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
                 )
@@ -888,42 +978,27 @@ class RagPipeline:
 
             if not selected:
                 yield {"type": "sources", "sources": [], "trace_id": trace_id}
-                total_ms = (time.monotonic() - total_start) * 1000
-                timings = StageTimings(
-                    embed_ms=phase.embed_ms,
-                    search_ms=phase.search_ms,
-                    rerank_ms=phase.rerank_ms,
-                    generate_ms=0.0,
-                    total_ms=total_ms,
-                    condense_ms=condense_ms,
-                    query_expansion_ms=phase.query_expansion_ms,
-                    context_expansion_ms=phase.context_expansion_ms,
+                timings = self._phase_timings(
+                    phase, total_start=total_start, condense_ms=condense_ms
                 )
                 if trace_store is not None and trace_id is not None:
                     trace_store.add(
-                        QueryTrace(
+                        self._finished_trace(
                             trace_id=trace_id,
-                            created_at=time.time(),
                             question=question,
                             mode="stream",
                             status="insufficient_context",
-                            config=self._trace_config(effective_settings, filenames, tags),
-                            candidates=build_trace_candidates(
-                                phase.fused_candidates,
-                                phase.scored_chunks,
-                                phase.context_chunks,
-                                [],
-                                min_score=float(effective_settings.rerank_min_score),
-                                diversity_dropped_ids=phase.diversity_dropped_ids,
-                            ),
+                            effective_settings=effective_settings,
+                            filenames=filenames,
+                            tags=tags,
+                            phase=phase,
+                            selected=[],
                             prompt_messages=None,
                             answer=INSUFFICIENT_CONTEXT_ANSWER,
                             cited_source_numbers=[],
-                            timings=timings_dict(timings),
-                            error=None,
+                            timings=timings,
                             condensed_question=condensed_question,
                             history_message_count=len(truncated_history),
-                            query_variants=phase.query_variants,
                         )
                     )
                 finalized = True
@@ -974,36 +1049,26 @@ class RagPipeline:
             cited = outcome.cited
             citation_retry_used = outcome.retry_used
 
-            total_ms = (time.monotonic() - total_start) * 1000
-            timings = StageTimings(
-                embed_ms=phase.embed_ms,
-                search_ms=phase.search_ms,
-                rerank_ms=phase.rerank_ms,
-                generate_ms=generate_ms,
-                total_ms=total_ms,
+            timings = self._phase_timings(
+                phase,
+                total_start=total_start,
                 condense_ms=condense_ms,
-                query_expansion_ms=phase.query_expansion_ms,
-                context_expansion_ms=phase.context_expansion_ms,
+                generate_ms=generate_ms,
                 citation_retry_ms=outcome.retry_ms,
             )
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
-                    QueryTrace(
+                    self._finished_trace(
                         trace_id=trace_id,
-                        created_at=time.time(),
                         question=question,
                         mode="stream",
                         status="ok",
-                        config=self._trace_config(effective_settings, filenames, tags),
-                        candidates=build_trace_candidates(
-                            phase.fused_candidates,
-                            phase.scored_chunks,
-                            phase.context_chunks,
-                            selected,
-                            min_score=float(effective_settings.rerank_min_score),
-                            diversity_dropped_ids=phase.diversity_dropped_ids,
-                            context_budget_dropped_ids=fitted.dropped_point_ids,
-                        ),
+                        effective_settings=effective_settings,
+                        filenames=filenames,
+                        tags=tags,
+                        phase=phase,
+                        selected=selected,
+                        context_budget_dropped_ids=fitted.dropped_point_ids,
                         # outcome.prompt_messages, not the `messages` that were streamed:
                         # when the citation retry fired, the streamed answer was replaced
                         # by the retry's, and the retry's continuation is what produced
@@ -1011,11 +1076,9 @@ class RagPipeline:
                         prompt_messages=list(outcome.prompt_messages),
                         answer=answer,
                         cited_source_numbers=[source.source_number for source in cited],
-                        timings=timings_dict(timings),
-                        error=None,
+                        timings=timings,
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
-                        query_variants=phase.query_variants,
                         citation_retry_used=citation_retry_used,
                     )
                 )
