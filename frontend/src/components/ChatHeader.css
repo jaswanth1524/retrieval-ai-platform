@@ -157,6 +157,25 @@
   .chat-header__palette {
     display: none;
   }
+
+  /* Clear's confirm is two buttons where Clear was one; next to Export it pushed the
+     mode switch off the edge. Export steps aside only while the confirm is open. */
+  .chat-header__actions:has(.chat-header__confirm) .chat-header__action {
+    display: none;
+  }
+
+  .chat-header {
+    gap: 4px;
+    padding: 0 8px;
+  }
+
+  .chat-header__actions {
+    gap: 4px;
+  }
+
+  .chat-header__mode-btn {
+    padding: 5px 7px;
+  }
 }
 
 .chat-header__kbd {
