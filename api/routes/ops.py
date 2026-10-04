@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Header
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from api.dependencies import (
+    key_access,
+    require_api_key,
     require_full_key,
+    supplied_key_bytes,
 )
 from api.routes.deps import OllamaCheckDep, QdrantCheckDep, QdrantClientDep, SettingsDep
 from api.routes.questions import allowed_request_providers
@@ -15,6 +20,7 @@ from api.schemas import (
     REQUEST_MAX_CONTEXT_CHUNKS_MAX,
     REQUEST_RERANK_TOP_K_MAX,
     REQUEST_TEMPERATURE_MAX,
+    AccessResponse,
     HealthResponse,
     PublicConfigResponse,
     ReadinessResponse,
@@ -109,3 +115,15 @@ def register(app: FastAPI) -> None:
     @app.get("/config", response_model=PublicConfigResponse)
     def config(settings: SettingsDep, check_ollama: OllamaCheckDep) -> PublicConfigResponse:
         return public_config(settings, ollama_available=check_ollama(settings))
+
+    # Guarded (any valid key): /config is open, so it can't say which key the caller
+    # holds. The UI asks here to hide what the read-only key would be refused (403).
+    @app.get("/access", response_model=AccessResponse, dependencies=[Depends(require_api_key)])
+    def access(
+        settings: SettingsDep,
+        x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+    ) -> AccessResponse:
+        if not settings.api_key:
+            return AccessResponse(access="open")
+        read_only = key_access(settings, supplied_key_bytes(x_api_key)) == "read"
+        return AccessResponse(access="read" if read_only else "full")

@@ -187,6 +187,8 @@ def ingest_chunks(
     on_indexed: Callable[[], None] | None = None,
     precondition: Callable[[], None] | None = None,
     carry_tags: bool = False,
+    before_first_write: Callable[[], None] | None = None,
+    tags: tuple[str, ...] | None = None,
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
@@ -209,7 +211,12 @@ def ingest_chunks(
     ``carry_tags`` stamps each chunk with its document's current tags, read under the
     same lock ``PATCH /documents/{filename}/tags`` takes — read any earlier and a tag
     change landing while this ingest parsed or queued was overwritten by the old tags.
-    Tags aren't part of the embedded text, so this never changes a vector.
+    Tags aren't part of the embedded text, so this never changes a vector. ``tags``,
+    when given, sets the tags outright instead (a restore from a backup).
+
+    ``before_first_write`` runs once, right before the first batch is upserted, and
+    aborts the ingest by raising — the last point where nothing has changed yet (job
+    cancellation).
     """
 
     if not chunks:
@@ -230,7 +237,9 @@ def ingest_chunks(
         if precondition is not None:
             precondition()
 
-        if carry_tags:
+        if tags is not None:
+            chunks = [replace(chunk, tags=tags) for chunk in chunks]
+        elif carry_tags:
             current_tags = {
                 filename: repository.tags_for_filename(settings, filename) for filename in filenames
             }
@@ -261,6 +270,8 @@ def ingest_chunks(
                 build_point(chunk, embedding, settings)
                 for chunk, embedding in zip(batch, embeddings, strict=True)
             ]
+            if batches_written == 0 and before_first_write is not None:
+                before_first_write()
             try:
                 repository.upsert(settings, points)
             except Exception as exc:

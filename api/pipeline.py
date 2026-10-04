@@ -582,8 +582,13 @@ class RagPipeline:
         filenames: Sequence[str] | None,
         tags: Sequence[str] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        *,
+        for_generation: bool = True,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
+
+        ``for_generation=False`` (search without an answer) skips the two stages that
+        only serve the prompt: LLM query expansion and neighbour expansion.
 
         Inlines ``retrieve_candidates``' steps (rather than calling it as one call)
         so embedding and search can be timed separately for observability.
@@ -601,7 +606,7 @@ class RagPipeline:
         # Left un-timed (query_expansion_ms stays 0.0) when disabled, like condense_ms.
         variants: list[str] = []
         query_expansion_ms = 0.0
-        if effective_settings.query_expansion_enabled:
+        if effective_settings.query_expansion_enabled and for_generation:
             query_expansion_start = time.monotonic()
             variants = generate_query_variants(
                 normalized_query,
@@ -655,12 +660,16 @@ class RagPipeline:
         # the tail stays in the list unexpanded because traces report it as kept.
         context_expansion_start = time.monotonic()
         context_limit = int(effective_settings.max_context_chunks)
-        expanded = [
-            *expand_with_neighbors(
-                diverse_outcome.kept[:context_limit], self._repository, effective_settings
-            ),
-            *diverse_outcome.kept[context_limit:],
-        ]
+        expanded = (
+            [
+                *expand_with_neighbors(
+                    diverse_outcome.kept[:context_limit], self._repository, effective_settings
+                ),
+                *diverse_outcome.kept[context_limit:],
+            ]
+            if for_generation
+            else list(diverse_outcome.kept)
+        )
         context_expansion_ms = (time.monotonic() - context_expansion_start) * 1000
 
         return RetrievalPhase(
@@ -682,13 +691,20 @@ class RagPipeline:
         overrides: AnswerOverrides | None = None,
         filenames: Sequence[str] | None = None,
         tags: Sequence[str] | None = None,
+        *,
+        for_generation: bool = True,
     ) -> RetrievalPhase:
         """Retrieval exactly as ``answer`` runs it — query expansion, hybrid search,
         rerank, diversity filter, neighbour expansion — without generating. The eval
-        harness scores this, so it measures the pipeline users actually get."""
+        harness scores this, so it measures the pipeline users actually get.
+        ``for_generation=False`` is ``POST /search``: the same hybrid search, RRF and
+        rerank, minus the LLM query expansion and the neighbour expansion that only
+        feed a prompt."""
 
         effective_settings = self._effective_settings(overrides or AnswerOverrides())
-        return self._retrieve_and_rerank(question, effective_settings, filenames, tags)
+        return self._retrieve_and_rerank(
+            question, effective_settings, filenames, tags, for_generation=for_generation
+        )
 
     def _cache_key(
         self,
@@ -1143,13 +1159,18 @@ class IngestService:
         on_indexed: Callable[[], None] | None = None,
         uploaded_at: float | None = None,
         precondition: Callable[[], None] | None = None,
+        *,
+        before_first_write: Callable[[], None] | None = None,
+        tags: tuple[str, ...] | None = None,
     ) -> DocumentIngestOutcome:
         """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
 
         ``on_indexed`` runs under the filename write lock once indexing succeeded (see
         ``ingest_chunks``). ``uploaded_at`` overrides the upload stamp — a re-index of a
         stored original keeps the document's original upload time rather than "now".
-        ``precondition`` is checked under that lock before anything is written.
+        ``precondition`` is checked under that lock before anything is written, and
+        ``before_first_write`` right before the first batch lands (see ``ingest_chunks``).
+        ``tags`` sets the document's tags (a restore) instead of carrying its current ones.
         """
 
         sections = parse_document_bytes(filename, content, self._settings)
@@ -1186,6 +1207,8 @@ class IngestService:
                 # A re-upload or re-index replaces the document's points; its tags are
                 # a property of the document, not of one upload, so they carry over.
                 carry_tags=True,
+                before_first_write=before_first_write,
+                tags=tags,
             )
         finally:
             # Even a failed ingest may have written points; cached answers could

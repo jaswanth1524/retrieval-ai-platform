@@ -26,7 +26,7 @@ from api.settings import AppSettings
 # Every route under these prefixes (and /metrics) is key-guarded; see CLAUDE.md. /health,
 # /health/ready, /config and the static frontend stay open.
 GUARDED_PREFIXES = ("/documents", "/questions", "/traces", "/feedback")
-GUARDED_EXACT = frozenset({"/metrics", "/export"})
+GUARDED_EXACT = frozenset({"/metrics", "/export", "/access", "/search", "/import"})
 # Room for the multipart boundary and part headers around an upload's own bytes.
 UPLOAD_OVERHEAD_BYTES = 64 * 1024
 # JSON bodies (a question with its history, feedback) are a few tens of KB at most.
@@ -48,6 +48,8 @@ def needs_full_key(method: str, path: str) -> bool:
 
     if path in ("/metrics", "/export") or (path == "/feedback" and method == "GET"):
         return True
+    if method == "POST" and path == "/import":
+        return True
     if method == "DELETE" and path.startswith("/documents/"):
         return True
     if method == "POST" and path in ("/documents", "/documents/reindex"):
@@ -58,6 +60,8 @@ def needs_full_key(method: str, path: str) -> bool:
 def body_limit(method: str, path: str, settings: AppSettings) -> int:
     if method == "POST" and path == "/documents":
         return int(settings.max_upload_bytes) + UPLOAD_OVERHEAD_BYTES
+    if method == "POST" and path == "/import":
+        return int(settings.max_import_bytes) + UPLOAD_OVERHEAD_BYTES
     return MAX_JSON_BODY_BYTES
 
 

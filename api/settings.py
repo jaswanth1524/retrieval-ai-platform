@@ -154,6 +154,9 @@ class AppSettings(BaseSettings):
     reasoning_token_headroom: PositiveInt = 3072
 
     max_upload_bytes: PositiveInt = 50 * 1024 * 1024
+    # POST /import: the largest backup zip (GET /export) accepted. Each original inside
+    # is still held to max_upload_bytes.
+    max_import_bytes: PositiveInt = 256 * 1024 * 1024
     # Real dense-model subword tokens (api/chunking.py counts with the model's own
     # tokenizer). bge-small hard-truncates at 512 tokens; the chunker reserves headroom
     # for the contextual-embedding prefix and never exceeds this budget, so the embedded

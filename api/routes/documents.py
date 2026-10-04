@@ -25,13 +25,16 @@ from api.documents import (
 )
 from api.export import build_export, iter_file
 from api.ingest_jobs import (
+    JOB_CANCELLED_ERROR,
+    cancel_ingest_job,
     enqueue_ingest,
     original_still_stored,
     require_raw_store,
     stored_filename,
 )
 from api.ingestion import filename_write_lock, ingest_sequencer
-from api.jobs import JobNotFoundError
+from api.jobs import JobNotFoundError, JobStore
+from api.restore import BackupImportError, restore_backup
 from api.routes.deps import (
     FeedbackStoreDep,
     IngestBacklogDep,
@@ -53,6 +56,7 @@ from api.schemas import (
     DocumentReindexAllResponse,
     DocumentTagsRequest,
     DocumentTagsResponse,
+    ImportResponse,
 )
 from api.upload import read_upload_within_limit
 
@@ -61,6 +65,23 @@ _ORIGINAL_CHUNK_BYTES = 64 * 1024
 CONTENT_MAX_RADIUS = 100
 # /content with no paging parameters returns at most this many chunks.
 CONTENT_UNPAGED_MAX_CHUNKS = 2000
+
+
+def _job_status(job_store: JobStore, job_id: str) -> DocumentJobStatusResponse:
+    job = job_store.get(job_id)
+    if job is None:
+        raise JobNotFoundError(f"No ingestion job found with id '{job_id}'.")
+    result = DocumentIngestResponse.model_validate(job.result) if job.result is not None else None
+    return DocumentJobStatusResponse(
+        job_id=job.id,
+        filename=job.filename,
+        state=job.state,
+        chunks_total=job.chunks_total,
+        chunks_done=job.chunks_done,
+        error=job.error,
+        result=result,
+        cancelled=job.error == JOB_CANCELLED_ERROR,
+    )
 
 
 def register(app: FastAPI) -> None:
@@ -305,21 +326,35 @@ def register(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def get_document_job(job_id: str, job_store: IngestJobStoreDep) -> DocumentJobStatusResponse:
-        job = job_store.get(job_id)
-        if job is None:
-            raise JobNotFoundError(f"No ingestion job found with id '{job_id}'.")
-        result = (
-            DocumentIngestResponse.model_validate(job.result) if job.result is not None else None
-        )
-        return DocumentJobStatusResponse(
-            job_id=job.id,
-            filename=job.filename,
-            state=job.state,
-            chunks_total=job.chunks_total,
-            chunks_done=job.chunks_done,
-            error=job.error,
-            result=result,
-        )
+        return _job_status(job_store, job_id)
+
+    # Stops a queued job outright, or a running one at its next checkpoint — but only
+    # before it writes anything: point ids are deterministic, so once a batch is
+    # written the previous version is partly overwritten and can't be restored (409;
+    # delete the document afterwards instead). Changes the corpus, so full key only.
+    @app.delete(
+        "/documents/jobs/{job_id}",
+        response_model=DocumentJobStatusResponse,
+        status_code=202,
+        dependencies=[Depends(require_full_key)],
+    )
+    def cancel_document_job(job_id: str, job_store: IngestJobStoreDep) -> DocumentJobStatusResponse:
+        outcome = cancel_ingest_job(job_id)
+        if outcome == "not_running":
+            # Unknown is a 404 (raised by _job_status); a finished job can't be stopped.
+            status = _job_status(job_store, job_id)
+            raise HTTPException(
+                status_code=409, detail=f"Job '{job_id}' has already {status.state}."
+            )
+        if outcome == "too_late":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This job is already writing to the index and can't be cancelled "
+                    "cleanly. Delete the document once it finishes instead."
+                ),
+            )
+        return _job_status(job_store, job_id)
 
     # Guarded alongside GET /documents: this returns every chunk's raw text, so leaving
     # it open would let an unauthenticated caller list the corpus and then dump it in
@@ -448,4 +483,61 @@ def register(app: FastAPI) -> None:
                 "Content-Disposition": f'attachment; filename="docrag-export-{stamp}.zip"',
                 "X-Content-Type-Options": "nosniff",
             },
+        )
+
+    # The other half of /export: re-ingests each stored original with its tags and
+    # upload time, and adds back the feedback (api/restore.py). Documents already
+    # indexed here are skipped, so importing the same backup twice is harmless and a
+    # deferred one can be finished by importing again. Full key only.
+    @app.post(
+        "/import",
+        response_model=ImportResponse,
+        status_code=202,
+        dependencies=[Depends(require_full_key)],
+    )
+    def import_backup(
+        file: Annotated[UploadFile, File()],
+        repository: VectorRepositoryDep,
+        ingest_service: IngestServiceDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+        feedback_store: FeedbackStoreDep,
+    ) -> ImportResponse:
+        def enqueue(
+            filename: str, content: bytes, uploaded_at: float | None, tags: tuple[str, ...]
+        ) -> DocumentJobAcceptedResponse:
+            return enqueue_ingest(
+                job_store=job_store,
+                executor=executor,
+                backlog=backlog,
+                ingest_service=ingest_service,
+                filename=filename,
+                content=content,
+                raw_store=raw_store,
+                uploaded_at=uploaded_at,
+                tags=tags,
+            )
+
+        try:
+            outcome = restore_backup(
+                file.file,
+                existing_filenames=set(repository.filename_metadata(settings)),
+                max_original_bytes=int(settings.max_upload_bytes),
+                has_room=backlog.has_room,
+                enqueue=enqueue,
+                feedback_store=feedback_store,
+            )
+        except BackupImportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ImportResponse(
+            jobs=outcome.jobs,
+            deferred=outcome.deferred,
+            skipped=outcome.skipped,
+            missing_originals=outcome.missing_originals,
+            rejected=outcome.rejected,
+            feedback_imported=outcome.feedback_imported,
+            feedback_skipped=outcome.feedback_skipped,
         )

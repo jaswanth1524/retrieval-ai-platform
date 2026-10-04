@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Literal
 
 from fastapi import HTTPException
 
@@ -51,6 +53,75 @@ INGEST_USER_FACING_ERRORS: tuple[type[Exception], ...] = (
 
 SHUTTING_DOWN_ERROR = "The server is shutting down and could not start indexing. Retry the upload."
 
+JOB_CANCELLED_ERROR = "Cancelled before anything was indexed; the document is unchanged."
+
+
+class IngestCancelledError(IngestionError):
+    """The job was cancelled at one of its checkpoints, before anything was written."""
+
+
+class JobHandle:
+    """What cancelling a job needs to reach: its future (to drop it from the queue) and
+    a flag its checkpoints read once it runs.
+
+    Cancellation is only clean before the first batch is written: point ids are
+    deterministic, so a new batch overwrites the previous version's points in place and
+    there is no earlier state left to restore. ``begin_write`` closes that window
+    atomically with the flag, so a cancel either lands before it or is refused.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.future: Future[None] | None = None
+        self.cancel_requested = False
+        self.writing = False
+
+    def check_cancelled(self) -> None:
+        with self._lock:
+            if self.cancel_requested:
+                raise IngestCancelledError(JOB_CANCELLED_ERROR)
+
+    def begin_write(self) -> None:
+        with self._lock:
+            if self.cancel_requested:
+                raise IngestCancelledError(JOB_CANCELLED_ERROR)
+            self.writing = True
+
+    def request_cancel(self) -> bool:
+        """False when the job has already started writing (too late to cancel)."""
+
+        with self._lock:
+            if self.writing:
+                return False
+            self.cancel_requested = True
+            return True
+
+
+# In-flight jobs of this process, by id; finished ones are dropped. A single worker
+# process is assumed throughout (locks, sequencer, slots), and this is no different.
+_handles: dict[str, JobHandle] = {}
+_handles_lock = threading.Lock()
+
+
+CancelOutcome = Literal["cancelled", "requested", "too_late", "not_running"]
+
+
+def cancel_ingest_job(job_id: str) -> CancelOutcome:
+    """Cancel a queued job outright, or flag a running one for its next checkpoint."""
+
+    with _handles_lock:
+        handle = _handles.get(job_id)
+    if handle is None:
+        return "not_running"
+    if not handle.request_cancel():
+        return "too_late"
+    future = handle.future
+    # cancel() succeeds only for a job still waiting in the executor's queue; its done
+    # callback (finish_ingest_future) records the cancellation on the job.
+    if future is not None and future.cancel():
+        return "cancelled"
+    return "requested"
+
 
 def job_error_message(exc: Exception) -> str:
     if isinstance(exc, INGEST_USER_FACING_ERRORS):
@@ -84,6 +155,8 @@ def run_ingest_job(
     uploaded_at: float | None = None,
     precondition: Callable[[], None] | None = None,
     sequence: int | None = None,
+    handle: JobHandle | None = None,
+    tags: tuple[str, ...] | None = None,
 ) -> None:
     """Background-executor entry point: parse/chunk/embed/index and update job status.
 
@@ -99,6 +172,8 @@ def run_ingest_job(
         job_store.update(job_id, state="embedding", chunks_done=done, chunks_total=total)
 
     def check_sequence() -> None:
+        if handle is not None:
+            handle.check_cancelled()
         # The re-index precondition first: its "deleted before its re-index ran" names
         # the cause more exactly than the sequencer's generic refusal.
         if precondition is not None:
@@ -132,6 +207,8 @@ def run_ingest_job(
 
     started = time.monotonic()
     try:
+        if handle is not None:
+            handle.check_cancelled()
         job_store.update(job_id, state="parsing")
         outcome = ingest_service.ingest(
             filename,
@@ -140,6 +217,8 @@ def run_ingest_job(
             save_original,
             uploaded_at=uploaded_at,
             precondition=check_sequence,
+            before_first_write=handle.begin_write if handle is not None else None,
+            tags=tags,
         )
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
@@ -181,6 +260,7 @@ def enqueue_ingest(
     raw_store: RawDocumentStore | None,
     uploaded_at: float | None = None,
     precondition: Callable[[], None] | None = None,
+    tags: tuple[str, ...] | None = None,
 ) -> DocumentJobAcceptedResponse:
     """Admit ``content`` against the backlog, create its job, and start it. Blocking.
 
@@ -204,6 +284,14 @@ def enqueue_ingest(
     except BaseException:
         release()
         raise
+    handle = JobHandle()
+    with _handles_lock:
+        _handles[job.id] = handle
+
+    def forget() -> None:
+        with _handles_lock:
+            _handles.pop(job.id, None)
+
     try:
         # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
         # it survives independently of this request/response cycle — the client can
@@ -219,20 +307,30 @@ def enqueue_ingest(
             uploaded_at,
             precondition,
             sequence,
+            handle,
+            tags,
         )
     except RuntimeError as exc:
         # The executor is shut down (the process is stopping). The job already exists,
         # so fail it rather than leave it "queued" forever for a poller.
         release()
+        forget()
         job_store.update(job.id, state="failed", error=SHUTTING_DOWN_ERROR)
         raise HTTPException(
             status_code=503, detail=SHUTTING_DOWN_ERROR, headers={"Retry-After": "15"}
         ) from exc
     except BaseException:
         release()
+        forget()
         job_store.update(job.id, state="failed", error="Could not start indexing.")
         raise
-    future.add_done_callback(lambda done: finish_ingest_future(done, release, job_store, job.id))
+    handle.future = future
+
+    def finished(done: Future[None]) -> None:
+        forget()
+        finish_ingest_future(done, release, job_store, job.id, cancelled=handle.cancel_requested)
+
+    future.add_done_callback(finished)
     return DocumentJobAcceptedResponse(job_id=job.id, filename=filename, state="queued")
 
 
@@ -287,7 +385,12 @@ def require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
 
 
 def finish_ingest_future(
-    future: Future[None], release: Callable[[], None], job_store: JobStore, job_id: str
+    future: Future[None],
+    release: Callable[[], None],
+    job_store: JobStore,
+    job_id: str,
+    *,
+    cancelled: bool = False,
 ) -> None:
     """Release the job's backlog slot, and surface anything that escaped the job.
 
@@ -301,8 +404,10 @@ def finish_ingest_future(
 
     release()
     if future.cancelled():
+        # Cancelled by DELETE /documents/jobs/{id}, or dropped by shutdown.
+        error = JOB_CANCELLED_ERROR if cancelled else INTERRUPTED_JOB_ERROR
         try:
-            job_store.update(job_id, state="failed", error=INTERRUPTED_JOB_ERROR)
+            job_store.update(job_id, state="failed", error=error)
         except Exception:
             logger.exception("Could not mark cancelled ingest job %s as failed.", job_id)
         return

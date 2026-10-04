@@ -30,6 +30,7 @@ from api.routes import documents as documents_routes
 from api.routes import feedback as feedback_routes
 from api.routes import ops as ops_routes
 from api.routes import questions as questions_routes
+from api.routes import search as search_routes
 from api.routes import traces as traces_routes
 from api.settings import AppSettings
 from api.version import app_version
@@ -207,6 +208,7 @@ def register_routes(app: FastAPI) -> None:
     feedback_routes.register(app)
     traces_routes.register(app)
     questions_routes.register(app)
+    search_routes.register(app)
 
 
 app = create_app()
