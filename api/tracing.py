@@ -93,6 +93,8 @@ class QueryTrace:
     query_variants: list[str] = field(default_factory=list)
     # True when the answer initially lacked citations and a stricter retry supplied them.
     citation_retry_used: bool = False
+    # The HTTP request it came from (X-Request-ID), to find its log lines.
+    request_id: str | None = None
 
 
 class TraceSink(Protocol):

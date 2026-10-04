@@ -45,6 +45,7 @@ from api.generation import (
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
 from api.repository import VectorRepository, reciprocal_rank_fusion
+from api.request_id import current_request_id
 from api.reranking import RerankedChunk, Reranker, rerank_candidates_detailed
 from api.retrieval import (
     QueryEmbeddingProvider,
@@ -462,6 +463,7 @@ class RagPipeline:
             error=error,
             condensed_question=condensed_question,
             history_message_count=history_message_count,
+            request_id=current_request_id(),
         )
 
     def _finished_trace(
@@ -512,6 +514,7 @@ class RagPipeline:
             history_message_count=history_message_count,
             query_variants=phase.query_variants,
             citation_retry_used=citation_retry_used,
+            request_id=current_request_id(),
         )
 
     def _truncate_history(

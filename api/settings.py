@@ -314,6 +314,8 @@ class AppSettings(BaseSettings):
     # it the root logger's WARNING default silences every logger.info in the codebase
     # (request logs, ingest progress, warmup notices).
     log_level: str = "INFO"
+    # "json": one JSON object per log line (for a log shipper); "text" otherwise.
+    log_format: Literal["text", "json"] = "text"
 
     @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":

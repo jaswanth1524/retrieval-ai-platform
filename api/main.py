@@ -26,6 +26,7 @@ from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.logging_config import configure_logging
 from api.request_guard import RequestGuardMiddleware
+from api.request_id import RequestIdMiddleware
 from api.routes import documents as documents_routes
 from api.routes import feedback as feedback_routes
 from api.routes import ops as ops_routes
@@ -169,7 +170,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     settings = get_app_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_format)
     warn_on_risky_reranker_config(settings)
     # Inside CORS (add_middleware wraps outward), so its 401/413 answers still carry CORS
     # headers for a separately-hosted frontend.
@@ -185,8 +186,11 @@ def create_app() -> FastAPI:
         # separately-hosted-frontend fallback documented in .env.example) was therefore
         # impossible. The single-origin Docker path never preflights, which is why this
         # went unnoticed.
-        allow_headers=["Content-Type", "X-API-Key"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+        expose_headers=["X-Request-ID"],
     )
+    # Outermost, so even a CORS or guard rejection carries the id it was logged under.
+    app.add_middleware(RequestIdMiddleware)
     register_exception_handlers(app)
     register_routes(app)
 

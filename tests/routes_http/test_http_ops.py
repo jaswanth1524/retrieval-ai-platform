@@ -516,3 +516,27 @@ def test_export_includes_feedback_when_it_is_on(tmp_path: Path) -> None:
         zipfile.ZipFile(io.BytesIO(response.content)).read("feedback.jsonl").decode().splitlines()
     )
     assert [json.loads(row)["rating"] for row in rows] == ["up"]
+
+
+def test_every_response_carries_a_request_id_and_keeps_a_sane_supplied_one(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    generated = client.get("/health").headers["X-Request-ID"]
+    assert len(generated) == 32
+
+    kept = client.get("/health", headers={"X-Request-ID": "lb-123.abc"})
+    assert kept.headers["X-Request-ID"] == "lb-123.abc"
+    replaced = client.get("/health", headers={"X-Request-ID": "bad id\nwith newline"})
+    assert replaced.headers["X-Request-ID"] != "bad id\nwith newline"
+
+
+def test_a_trace_records_the_request_id_of_its_question(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+
+    answer = client.post(
+        "/questions", json={"question": "alpha"}, headers={"X-Request-ID": "ask-1"}
+    ).json()
+
+    assert client.get(f"/traces/{answer['trace_id']}").json()["request_id"] == "ask-1"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 import time
@@ -296,7 +297,9 @@ def enqueue_ingest(
         # Ingestion runs on a dedicated executor (not FastAPI's request threadpool) so
         # it survives independently of this request/response cycle — the client can
         # disconnect and poll the job later without interrupting the work.
+        # In the request's context: the job's log lines carry the upload's request id.
         future = executor.submit(
+            contextvars.copy_context().run,
             run_ingest_job,
             job_store,
             job.id,

@@ -334,6 +334,8 @@ class TraceDetailResponse(BaseModel):
     query_variants: list[str] = Field(default_factory=list)
     # True when a zero-citation answer was retried and the retry supplied citations.
     citation_retry_used: bool = False
+    # The X-Request-ID of the request that asked it, to find its log lines.
+    request_id: str | None = None
 
 
 class HistoryMessageRequest(BaseModel):
