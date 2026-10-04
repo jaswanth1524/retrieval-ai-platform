@@ -66,26 +66,9 @@
   cursor: not-allowed;
 }
 
-.chat-header__confirm {
-  display: flex;
-  gap: 4px;
-}
-
-.chat-header__confirm-yes,
-.chat-header__confirm-no {
-  border: 1px solid var(--rule);
-  background: transparent;
-  color: var(--ink);
-  border-radius: var(--radius-sm);
+.chat-header__confirm button {
   font-family: var(--fm);
   font-size: 10px;
-  padding: 3px 8px;
-  cursor: pointer;
-}
-
-.chat-header__confirm-yes {
-  border-color: var(--bad);
-  color: var(--bad);
 }
 
 .chat-header__spacer {

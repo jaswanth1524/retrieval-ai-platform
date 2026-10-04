@@ -9,6 +9,7 @@ import {
   validateUploads,
 } from '../utils/uploadValidation';
 import type { RejectedFile } from '../utils/uploadValidation';
+import ConfirmInline from './ConfirmInline';
 import './CorpusPanel.css';
 
 // Both are structural details of UploadItem below and have no consumers outside this
@@ -33,16 +34,32 @@ export interface UploadItem {
   file?: File;
   /** A re-index of the stored original rather than an upload — retried the same way. */
   reindex?: boolean;
+  /** Cancel was pressed and hasn't settled yet. */
+  cancelling?: boolean;
+}
+
+/** One indexed document's metadata, from GET /documents. */
+export interface DocumentMeta {
+  chunks: number;
+  // Absent for a document indexed before this metadata was stamped at ingest time —
+  // the detail line simply omits it.
+  pages?: number;
+  bytes?: number;
+  /** Seconds since the epoch. */
+  uploadedAt?: number;
+  /** Indexed by an older chunker. */
+  stale: boolean;
+  /** Has a stored original the server can re-index from (and serve back). */
+  reindexable: boolean;
+  tags: string[];
 }
 
 interface CorpusPanelProps {
+  /** Indexed documents, in display order. */
   filenames: string[];
-  chunkCounts: Record<string, number>;
-  // Absent (not present with a null value) for a filename ingested before this
-  // metadata was stamped at ingest time — the detail line simply omits it.
-  pageCounts?: Record<string, number>;
-  byteSizes?: Record<string, number>;
-  uploadedAts?: Record<string, number>;
+  /** Their metadata. A document indexed moments ago may have none yet (it arrives with
+   *  the next refresh); its card shows what it can. */
+  documents: Record<string, DocumentMeta>;
   uploads: UploadItem[];
   onUpload: (files: File[]) => Promise<void>;
   onDelete: (filename: string) => Promise<void>;
@@ -52,15 +69,11 @@ interface CorpusPanelProps {
   browseInputRef?: RefObject<HTMLInputElement | null>;
   onRetryUpload?: (uploadId: string) => void;
   onDismissUpload?: (uploadId: string) => void;
-  /** Indexed by an older chunker. */
-  staleFilenames?: string[];
-  /** Have a stored original the server can re-index from. */
-  reindexableFilenames?: string[];
+  /** Stop an upload or re-index that is waiting or hasn't started writing yet. */
+  onCancelUpload?: (uploadId: string) => void;
   onReindex?: (filename: string) => void;
   /** Re-index every stale document that has a stored original, in one request. */
   onReindexAllStale?: () => void;
-  /** Each tagged document's tags. */
-  tags?: Record<string, string[]>;
   /** Replace a document's tags; rejects with a message to show on failure. */
   onSetTags?: (filename: string, tags: string[]) => Promise<void>;
   /** The read-only API key: no upload or delete (the server would answer 403). */
@@ -174,6 +187,7 @@ interface DocCard {
   /** Set for cards backed by an upload (in flight or failed) rather than the index. */
   uploadId?: string;
   canRetry?: boolean;
+  cancelling?: boolean;
   status: 'indexed' | 'indexing' | 'failed';
   stale?: boolean;
   canReindex?: boolean;
@@ -185,10 +199,7 @@ interface DocCard {
 
 function CorpusPanel({
   filenames,
-  chunkCounts,
-  pageCounts = {},
-  byteSizes = {},
-  uploadedAts = {},
+  documents,
   uploads,
   onUpload,
   onDelete,
@@ -197,11 +208,9 @@ function CorpusPanel({
   browseInputRef,
   onRetryUpload,
   onDismissUpload,
-  staleFilenames = [],
-  reindexableFilenames = [],
+  onCancelUpload,
   onReindex,
   onReindexAllStale,
-  tags = {},
   onSetTags,
   readOnly = false,
   onOpenOriginal,
@@ -269,26 +278,22 @@ function CorpusPanel({
   const inFlightNames = new Set(
     uploads.filter((item) => item.status === 'uploading').map((item) => item.filename),
   );
-  // Sets, not Array.includes per card: with a large corpus that was a quadratic scan on
-  // every render.
-  const reindexable = useMemo(() => new Set(reindexableFilenames), [reindexableFilenames]);
-  const stale = useMemo(() => new Set(staleFilenames), [staleFilenames]);
+  // A Set, not Array.includes per upload card: with a large corpus that was a quadratic
+  // scan on every render.
   const indexed = useMemo(() => new Set(filenames), [filenames]);
   const indexedCards: DocCard[] = filenames.filter((filename) => !inFlightNames.has(filename)).map((filename) => {
-    const count = chunkCounts[filename] ?? 0;
+    const meta = documents[filename];
+    const count = meta?.chunks ?? 0;
     const parts = [`${count} ${count === 1 ? 'chunk' : 'chunks'}`];
-    const pages = pageCounts[filename];
-    if (pages) parts.push(`${pages} page${pages === 1 ? '' : 's'}`);
-    const bytes = byteSizes[filename];
-    if (bytes !== undefined) parts.push(formatBytes(bytes));
-    const uploadedAt = uploadedAts[filename];
-    if (uploadedAt !== undefined) parts.push(formatRelativeTime(uploadedAt * 1000));
-    const canReindex = onReindex !== undefined && reindexable.has(filename);
-    const hasOriginal = reindexable.has(filename);
+    if (meta?.pages) parts.push(`${meta.pages} page${meta.pages === 1 ? '' : 's'}`);
+    if (meta?.bytes !== undefined) parts.push(formatBytes(meta.bytes));
+    if (meta?.uploadedAt !== undefined) parts.push(formatRelativeTime(meta.uploadedAt * 1000));
+    const hasOriginal = meta?.reindexable ?? false;
+    const canReindex = onReindex !== undefined && hasOriginal;
     // Only flagged when it can be acted on. Without a stored original there is nothing
     // to re-index from, and a document indexed before versions were recorded counts as
     // stale even if the current chunker produced it — a label the user can't clear.
-    const isStale = canReindex && stale.has(filename);
+    const isStale = canReindex && (meta?.stale ?? false);
     if (isStale) parts.push('older chunking');
     return {
       key: `doc:${filename}`,
@@ -325,8 +330,10 @@ function CorpusPanel({
             uploadId: item.id,
             filename: item.filename,
             status: 'indexing',
-            detail:
-              item.progress?.state === 'waiting'
+            cancelling: item.cancelling,
+            detail: item.cancelling
+              ? 'cancelling…'
+              : item.progress?.state === 'waiting'
                 ? 'waiting for room in the indexing queue…'
                 : `${reindexing ? 're-indexing' : 'indexing'} ${progressPercent(item.progress)}%`,
             pct: progressPercent(item.progress),
@@ -447,35 +454,14 @@ function CorpusPanel({
             <span className="corpus-panel__ext">{extensionOf(card.filename)}</span>
             <span className="corpus-panel__name">{card.filename}</span>
             {confirming === card.key ? (
-              <div
+              <ConfirmInline
                 className="corpus-panel__confirm"
-                onKeyDown={(event) => {
-                  if (event.key !== 'Escape') return;
-                  // Cancels the confirm only — not the drawer this panel may sit in.
-                  event.stopPropagation();
-                  setConfirming(null);
-                }}
-              >
-                <span>Delete?</span>
-                <button
-                  type="button"
-                  className="corpus-panel__confirm-yes"
-                  onClick={() => void handleDelete(card.filename)}
-                  disabled={deleting === card.filename}
-                >
-                  {deleting === card.filename ? '…' : 'Confirm'}
-                </button>
-                {/* Focus the safe choice, as ConversationList does: the ✕ that opened
-                    this confirm just unmounted, which dropped focus to <body>. */}
-                <button
-                  type="button"
-                  className="corpus-panel__confirm-no"
-                  autoFocus
-                  onClick={() => setConfirming(null)}
-                >
-                  Cancel
-                </button>
-              </div>
+                prompt="Delete?"
+                confirmLabel="Confirm"
+                onCancel={() => setConfirming(null)}
+                onConfirm={() => void handleDelete(card.filename)}
+                busy={deleting === card.filename}
+              />
             ) : card.status === 'indexed' ? (
               <div className="corpus-panel__card-actions">
                 {card.hasOriginal && onOpenOriginal && (
@@ -517,6 +503,22 @@ function CorpusPanel({
                   </button>
                 )}
               </div>
+            ) : card.status === 'indexing' ? (
+              !readOnly &&
+              onCancelUpload &&
+              card.uploadId !== undefined && (
+                <button
+                  type="button"
+                  className="corpus-panel__cancel"
+                  onClick={() => onCancelUpload(card.uploadId!)}
+                  disabled={card.cancelling}
+                  aria-label={`Cancel indexing ${card.filename}`}
+                  title="Stop before anything is written to the index"
+                  data-testid="corpus-cancel-upload"
+                >
+                  Cancel
+                </button>
+              )
             ) : (
               card.status === 'failed' &&
               card.uploadId !== undefined && (
@@ -569,7 +571,7 @@ function CorpusPanel({
           {card.status === 'indexed' && onSetTags && (
             <TagEditor
               filename={card.filename}
-              tags={tags[card.filename] ?? []}
+              tags={documents[card.filename]?.tags ?? []}
               disabled={disabled}
               onSave={onSetTags}
             />

@@ -34,7 +34,7 @@ test('Stop mid-stream keeps the question and shows no error', async ({ page, api
   });
 
   await ask(page, 'How do uploads report progress?');
-  await expect(page.getByText('retrieving…')).toBeVisible();
+  await expect(page.getByTestId('streaming-skeleton')).toContainText('retrieving…');
   await page.getByRole('button', { name: 'Stop' }).click();
 
   await expect(page.getByTestId('question-textarea')).toBeEnabled();

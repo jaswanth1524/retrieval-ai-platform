@@ -17,6 +17,7 @@ from eval.harness import (
     rank_for_question,
     run_retrieval_eval,
 )
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -28,7 +29,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "rerank_min_score": 0.0,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 class FakeEmbeddingProvider:

@@ -334,6 +334,15 @@ export const api = {
       signal,
     }),
 
+  // Stops an ingest job that is still queued or hasn't written to the index yet (409 once
+  // it has: point ids are deterministic, so a half-written document can't be rolled
+  // back). The job then ends `failed` with `cancelled: true`; keep polling to see it.
+  cancelDocumentJob: (jobId: string, signal?: AbortSignal) =>
+    request<DocumentJobStatusResponse>(`/documents/jobs/${encodeURIComponent(jobId)}`, {
+      method: 'DELETE',
+      signal,
+    }),
+
   // Re-indexes every document chunked by an older chunker that has a stored original.
   reindexStaleDocuments: (signal?: AbortSignal) =>
     request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal }),

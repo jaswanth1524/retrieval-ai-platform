@@ -199,27 +199,12 @@ class RerankOutcome:
 
     ``scored`` is every candidate actually sent to the cross-encoder, sorted
     descending — including ones later dropped by ``rerank_min_score`` or the
-    ``rerank_top_k`` cut. ``kept`` is the same list ``rerank_candidates`` has always
-    returned: filtered and sliced to the top-K.
+    ``rerank_top_k`` cut. ``kept`` is the survivors: filtered and sliced to
+    the top-K.
     """
 
     scored: list[RerankedChunk]
     kept: list[RerankedChunk]
-
-
-def rerank_candidates(
-    query: str,
-    candidates: Sequence[RetrievedChunk],
-    reranker: Reranker,
-    settings: AppSettings,
-) -> list[RerankedChunk]:
-    """Rerank the fused top-N candidates, drop low-relevance ones, keep the top-K.
-
-    Thin wrapper over ``rerank_candidates_detailed`` for callers that only need the
-    survivors — see that function's docstring for the full scoring/filtering rules.
-    """
-
-    return rerank_candidates_detailed(query, candidates, reranker, settings).kept
 
 
 def rerank_candidates_detailed(

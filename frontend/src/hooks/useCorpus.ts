@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
-import type { DocumentJobAcceptedResponse } from '../api/types';
-import type { UploadItem } from '../components/CorpusPanel';
+import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
+import type { DocumentMeta, UploadItem } from '../components/CorpusPanel';
 import { newId } from '../utils/id';
 import { mapWithLimit } from '../utils/pool';
 import type { ToastInput } from './useToasts';
@@ -10,6 +10,27 @@ import type { ToastInput } from './useToasts';
 const UPLOAD_QUEUE_MAX_ATTEMPTS = 40;
 // Uploads sent at once from one batch.
 const UPLOAD_CONCURRENCY = 2;
+
+/** Thrown inside an upload's own flow when Cancel stops it before the server took it. */
+class UploadCancelled extends Error {}
+
+function documentsFrom(response: DocumentListResponse): Record<string, DocumentMeta> {
+  const stale = new Set(response.stale_filenames ?? []);
+  const reindexable = new Set(response.reindexable_filenames ?? []);
+  const documents: Record<string, DocumentMeta> = {};
+  for (const filename of response.filenames) {
+    documents[filename] = {
+      chunks: response.chunk_counts?.[filename] ?? 0,
+      pages: response.page_counts?.[filename],
+      bytes: response.byte_sizes?.[filename],
+      uploadedAt: response.uploaded_ats?.[filename],
+      stale: stale.has(filename),
+      reindexable: reindexable.has(filename),
+      tags: response.tags?.[filename] ?? [],
+    };
+  }
+  return documents;
+}
 
 export interface CorpusCallbacks {
   /** True when it handled the error (a 401), so the caller keeps its own fallback. */
@@ -28,35 +49,35 @@ export function useCorpus(callbacks: CorpusCallbacks) {
   const deps = useRef(callbacks);
   deps.current = callbacks;
   const [uploads, setUploads] = useState<UploadItem[]>([]);
-  const [staleFilenames, setStaleFilenames] = useState<string[]>([]);
-  const [reindexableFilenames, setReindexableFilenames] = useState<string[]>([]);
-  const [documentTags, setDocumentTags] = useState<Record<string, string[]>>({});
   // The full corpus currently indexed in Qdrant (across all sessions). Both the
   // corpus-management panel and the search-scope filter operate over this one list,
   // so any indexed document is scopable regardless of which session uploaded it.
+  // Kept as its own ordered array: object keys would reorder names like "2024".
   const [indexedFilenames, setIndexedFilenames] = useState<string[]>([]);
-  const [chunkCounts, setChunkCounts] = useState<Record<string, number>>({});
-  const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
-  const [byteSizes, setByteSizes] = useState<Record<string, number>>({});
-  const [uploadedAts, setUploadedAts] = useState<Record<string, number>>({});
+  const [documents, setDocuments] = useState<Record<string, DocumentMeta>>({});
   const uploadsRef = useRef(uploads);
   uploadsRef.current = uploads;
 
   const actions = useMemo(() => {
+    // Per upload (by UploadItem id), outside React state so a click can't race a render:
+    // the job the server accepted it as, whether Cancel was pressed before it did, and
+    // how to cut short a wait for room in the queue.
+    const jobIds = new Map<string, string>();
+    const cancelRequested = new Set<string>();
+    const wakeWaiting = new Map<string, () => void>();
+
+    const removeUpload = (id: string) => {
+      setUploads((prev) => prev.filter((item) => item.id !== id));
+    };
+
     const refreshDocuments = async (signal?: AbortSignal) => {
-      const documents = await api.listDocuments(signal);
-      setIndexedFilenames(documents.filenames);
+      const response = await api.listDocuments(signal);
+      setIndexedFilenames(response.filenames);
       // A document deleted elsewhere (another tab, the API) stayed in scope: the header
       // still named it and the popover — which lists only indexed files — couldn't
       // uncheck it.
-      deps.current.pruneScopes(documents.filenames);
-      setDocumentTags(documents.tags ?? {});
-      setChunkCounts(documents.chunk_counts ?? {});
-      setPageCounts(documents.page_counts ?? {});
-      setByteSizes(documents.byte_sizes ?? {});
-      setUploadedAts(documents.uploaded_ats ?? {});
-      setStaleFilenames(documents.stale_filenames ?? []);
-      setReindexableFilenames(documents.reindexable_filenames ?? []);
+      deps.current.pruneScopes(response.filenames);
+      setDocuments(documentsFrom(response));
       // A key that used to be rejected now works — clear the banner.
       deps.current.onAuthRestored();
     };
@@ -71,6 +92,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       start: () => Promise<DocumentJobAcceptedResponse>,
     ): Promise<DocumentJobAcceptedResponse> => {
       for (let attempt = 1; ; attempt += 1) {
+        if (cancelRequested.has(id)) throw new UploadCancelled();
         try {
           return await start();
         } catch (err) {
@@ -90,16 +112,51 @@ export function useCorpus(callbacks: CorpusCallbacks) {
                 : item,
             ),
           );
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.min(Math.max(waitSeconds, 1), 30) * 1000),
-          );
+          // Cancel pressed while this attempt was being sent.
+          if (cancelRequested.has(id)) throw new UploadCancelled();
+          // Cancel wakes this early rather than leaving the card for up to 30 s.
+          await new Promise<void>((resolve) => {
+            const wake = () => {
+              clearTimeout(timer);
+              wakeWaiting.delete(id);
+              resolve();
+            };
+            const timer = setTimeout(wake, Math.min(Math.max(waitSeconds, 1), 30) * 1000);
+            wakeWaiting.set(id, wake);
+          });
         }
       }
     };
 
-    const runIngestJob = async (id: string, start: () => Promise<DocumentJobAcceptedResponse>) => {
+    const requestServerCancel = async (id: string, jobId: string, filename: string) => {
+      try {
+        // The poll below then sees the job end as cancelled.
+        await api.cancelDocumentJob(jobId);
+      } catch (err) {
+        // Already finished: the poll is about to report how.
+        if (err instanceof ApiClientError && err.statusCode === 404) return;
+        setUploads((prev) =>
+          prev.map((item) => (item.id === id ? { ...item, cancelling: false } : item)),
+        );
+        if (deps.current.onAuthFailure(err)) return;
+        deps.current.pushToast({
+          tone: 'warn',
+          title: `Couldn't cancel ${filename}`,
+          body: err instanceof ApiClientError ? err.message : 'The server did not answer.',
+        });
+      }
+    };
+
+    const runIngestJob = async (
+      id: string,
+      filename: string,
+      start: () => Promise<DocumentJobAcceptedResponse>,
+    ) => {
       try {
         const accepted = await startWhenQueueHasRoom(id, start);
+        jobIds.set(id, accepted.job_id);
+        // Cancel pressed while the upload itself was still being sent.
+        if (cancelRequested.has(id)) void requestServerCancel(id, accepted.job_id, filename);
         const status = await api.pollDocumentJob(accepted.job_id, (jobStatus) => {
           setUploads((prev) =>
             prev.map((item) =>
@@ -116,6 +173,11 @@ export function useCorpus(callbacks: CorpusCallbacks) {
             ),
           );
         });
+        if (status.state === 'failed' && status.cancelled) {
+          // What the user asked for; nothing was indexed, so there is nothing to show.
+          removeUpload(id);
+          return;
+        }
         if (status.state === 'failed') {
           setUploads((prev) =>
             prev.map((item) =>
@@ -134,13 +196,17 @@ export function useCorpus(callbacks: CorpusCallbacks) {
               : item,
           ),
         );
-        const filename = status.result?.filename;
-        if (filename) {
+        const indexedName = status.result?.filename;
+        if (indexedName) {
           // Dedupe by name — re-uploading the same filename replaces its chunks
           // server-side, so the corpus list should not grow a second entry for it.
-          setIndexedFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
+          setIndexedFilenames((prev) => (prev.includes(indexedName) ? prev : [...prev, indexedName]));
         }
       } catch (err) {
+        if (err instanceof UploadCancelled) {
+          removeUpload(id);
+          return;
+        }
         deps.current.onAuthFailure(err);
         setUploads((prev) =>
           prev.map((item) =>
@@ -149,10 +215,31 @@ export function useCorpus(callbacks: CorpusCallbacks) {
               : item,
           ),
         );
+      } finally {
+        jobIds.delete(id);
+        cancelRequested.delete(id);
       }
     };
 
-    const uploadOne = (file: File, id: string) => runIngestJob(id, () => api.uploadDocument(file));
+    const uploadOne = (file: File, id: string) =>
+      runIngestJob(id, file.name, () => api.uploadDocument(file));
+
+    // Stops an upload or re-index: before the server has it, locally; after, by asking
+    // the server, which refuses (409) once the job has started writing to the index.
+    const handleCancelUpload = (id: string) => {
+      const item = uploadsRef.current.find((candidate) => candidate.id === id);
+      if (!item || item.status !== 'uploading' || item.cancelling) return;
+      setUploads((prev) =>
+        prev.map((candidate) => (candidate.id === id ? { ...candidate, cancelling: true } : candidate)),
+      );
+      const jobId = jobIds.get(id);
+      if (jobId) {
+        void requestServerCancel(id, jobId, item.filename);
+        return;
+      }
+      cancelRequested.add(id);
+      wakeWaiting.get(id)?.();
+    };
 
     const refreshAfterIngest = async () => {
       try {
@@ -166,7 +253,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     const handleReindex = async (filename: string) => {
       const id = newId();
       setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true }]);
-      await runIngestJob(id, () => api.reindexDocument(filename));
+      await runIngestJob(id, filename, () => api.reindexDocument(filename));
       await refreshAfterIngest();
     };
 
@@ -199,7 +286,9 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }));
       setUploads((prev) => [...prev, ...items]);
       await Promise.allSettled(
-        response.jobs.map((job, index) => runIngestJob(items[index].id, () => Promise.resolve(job))),
+        response.jobs.map((job, index) =>
+          runIngestJob(items[index].id, job.filename, () => Promise.resolve(job)),
+        ),
       );
       await refreshAfterIngest();
     };
@@ -213,7 +302,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }));
       setUploads((prev) => [...prev, ...items]);
       await Promise.allSettled(
-        jobs.map((job, index) => runIngestJob(items[index].id, () => Promise.resolve(job))),
+        jobs.map((job, index) => runIngestJob(items[index].id, job.filename, () => Promise.resolve(job))),
       );
       await refreshAfterIngest();
     };
@@ -246,7 +335,9 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         ),
       );
       const { file, filename } = item;
-      await runIngestJob(id, () => (file ? api.uploadDocument(file) : api.reindexDocument(filename)));
+      await runIngestJob(id, filename, () =>
+        file ? api.uploadDocument(file) : api.reindexDocument(filename),
+      );
       await refreshAfterIngest();
     };
 
@@ -259,19 +350,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       // A deleted document can never remain in the corpus or the active search scope.
       setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
       deps.current.removeFromScopes([filename]);
-      const without = (prev: Record<string, number>) => {
-        if (!(filename in prev)) return prev;
-        const next = { ...prev };
-        delete next[filename];
-        return next;
-      };
-      setChunkCounts(without);
-      setPageCounts(without);
-      setByteSizes(without);
-      setUploadedAts(without);
-      setStaleFilenames((prev) => prev.filter((name) => name !== filename));
-      setReindexableFilenames((prev) => prev.filter((name) => name !== filename));
-      setDocumentTags((prev) => {
+      setDocuments((prev) => {
         if (!(filename in prev)) return prev;
         const next = { ...prev };
         delete next[filename];
@@ -281,12 +360,15 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     const handleSetTags = async (filename: string, tags: string[]) => {
       const result = await api.setDocumentTags(filename, tags);
-      setDocumentTags((prev) => {
-        const next = { ...prev };
-        if (result.tags.length > 0) next[filename] = result.tags;
-        else delete next[filename];
-        return next;
-      });
+      setDocuments((prev) => ({
+        ...prev,
+        // Indexed moments ago and not refreshed yet: the rest arrives with the next
+        // listing.
+        [filename]: {
+          ...(prev[filename] ?? { chunks: 0, stale: false, reindexable: false }),
+          tags: result.tags,
+        },
+      }));
     };
 
     return {
@@ -294,6 +376,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleUpload,
       handleRetryUpload,
       handleDismissUpload,
+      handleCancelUpload,
       handleReindex,
       handleReindexAllStale,
       handleDeleteDocument,
@@ -307,26 +390,20 @@ export function useCorpus(callbacks: CorpusCallbacks) {
   // Every tag in use, for the composer's scope popover.
   const availableTags = useMemo(
     () =>
-      [...new Set(Object.values(documentTags).flat())].sort((a, b) =>
+      [...new Set(Object.values(documents).flatMap((meta) => meta.tags))].sort((a, b) =>
         a.localeCompare(b, undefined, { sensitivity: 'base' }),
       ),
-    [documentTags],
+    [documents],
   );
   const chunkTotal = useMemo(
-    () => Object.values(chunkCounts).reduce((sum, n) => sum + n, 0),
-    [chunkCounts],
+    () => Object.values(documents).reduce((sum, meta) => sum + meta.chunks, 0),
+    [documents],
   );
 
   return {
     uploads,
     indexedFilenames,
-    chunkCounts,
-    pageCounts,
-    byteSizes,
-    uploadedAts,
-    staleFilenames,
-    reindexableFilenames,
-    documentTags,
+    documents,
     availableTags,
     chunkTotal,
     ...actions,

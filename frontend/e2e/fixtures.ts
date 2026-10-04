@@ -118,9 +118,12 @@ export class MockApi {
   importFilenames: string[] = [];
   /** Bodies of every POST /import, for a spec to inspect. */
   readonly imports: string[] = [];
-  /** In-flight ingest jobs by id: the file each one indexes and how often it was polled.
-   *  Every job walks `jobSteps` on its own, so a bulk re-index runs several at once. */
-  private readonly jobs = new Map<string, { filename: string; polls: number }>();
+  /** DELETE /documents/jobs/{id} answers 409 "already writing" instead of cancelling. */
+  cancelTooLate = false;
+  /** In-flight ingest jobs by id: the file each one indexes, how often it was polled and
+   *  whether it was cancelled. Every job walks `jobSteps` on its own, so a bulk re-index
+   *  runs several at once. */
+  private readonly jobs = new Map<string, { filename: string; polls: number; cancelled: boolean }>();
   /** URLs a test deliberately answered with a 4xx/5xx. */
   readonly intentionalFailures = new Set<string>();
   /** API requests nothing here handles — a spec or app regression, never expected. */
@@ -217,6 +220,23 @@ export class MockApi {
       const jobId = path.slice('/documents/jobs/'.length);
       const job = this.jobs.get(jobId);
       if (!job) return this.configured(route, 404, { detail: `Unknown job '${jobId}'.` });
+      if (method === 'DELETE') {
+        if (this.cancelTooLate) {
+          return this.configured(route, 409, {
+            detail: "This job is already writing to the index and can't be cancelled cleanly.",
+          });
+        }
+        job.cancelled = true;
+        return this.json(route, 202, { ...this.jobBody('queued'), job_id: jobId, filename: job.filename });
+      }
+      if (job.cancelled) {
+        return this.json(route, 200, {
+          ...this.jobBody('failed', 'Cancelled before anything was indexed; the document is unchanged.'),
+          cancelled: true,
+          job_id: jobId,
+          filename: job.filename,
+        });
+      }
       const step = this.jobSteps[Math.min(job.polls, this.jobSteps.length - 1)] ?? {
         status: 200,
         body: this.jobBody('done'),
@@ -318,7 +338,7 @@ export class MockApi {
 
   private startJob(filename: string) {
     const jobId = `job-${this.jobs.size + 1}`;
-    this.jobs.set(jobId, { filename, polls: 0 });
+    this.jobs.set(jobId, { filename, polls: 0, cancelled: false });
     return { job_id: jobId, filename, state: 'queued' as const };
   }
 

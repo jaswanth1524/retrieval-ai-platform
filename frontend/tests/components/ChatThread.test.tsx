@@ -242,3 +242,73 @@ describe('ChatThread', () => {
     expect(onRetry).toHaveBeenLastCalledWith('Second question');
   });
 });
+
+describe('ChatThread progress announcement', () => {
+  const question = makeTurn({ id: 'q', role: 'user', content: 'Question' });
+  const answer = (content: string, extra: Partial<ChatTurn> = {}) =>
+    makeTurn({ id: 'a', role: 'assistant', content, ...extra });
+
+  it('announces the stage, then streaming, then that the answer is ready', () => {
+    const { rerender } = render(
+      <ChatThread turns={[question]} pending stage="searching documents…" engineerMode={false} />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('searching documents…');
+
+    rerender(<ChatThread turns={[question, answer('Partial')]} pending engineerMode={false} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Answer streaming.');
+
+    rerender(
+      <ChatThread turns={[question, answer('Complete answer [1].')]} pending={false} engineerMode={false} />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Answer ready.');
+    // One region for the thread, and never the answer text itself.
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(screen.getByRole('status')).not.toHaveTextContent('Complete answer');
+  });
+
+  it('says nothing about answers it did not watch arrive (reload, switching chats)', () => {
+    render(
+      <ChatThread turns={[question, answer('Old answer.')]} pending={false} engineerMode={false} />,
+    );
+
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  });
+
+  it('does not call a stopped answer ready', () => {
+    const { rerender } = render(
+      <ChatThread turns={[question, answer('Part')]} pending engineerMode={false} />,
+    );
+    rerender(
+      <ChatThread
+        turns={[question, answer('Part', { stopped: true })]}
+        pending={false}
+        engineerMode={false}
+      />,
+    );
+
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  });
+
+  it('clears a finished announcement when another conversation is shown', () => {
+    const { rerender } = render(
+      <ChatThread turns={[question, answer('Part')]} pending engineerMode={false} />,
+    );
+    rerender(<ChatThread turns={[question, answer('Done.')]} pending={false} engineerMode={false} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Answer ready.');
+
+    rerender(
+      <ChatThread
+        turns={[makeTurn({ id: 'other-q' }), makeTurn({ id: 'other-a', role: 'assistant', content: 'Earlier.' })]}
+        pending={false}
+        engineerMode={false}
+      />,
+    );
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  });
+
+  it('keeps the region mounted on the empty thread, so the first question is announced', () => {
+    render(<ChatThread turns={[]} pending={false} engineerMode={false} />);
+
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  });
+});

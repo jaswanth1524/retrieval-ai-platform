@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react';
-import type { KeyboardEvent } from 'react';
 import type { ConversationSummary } from '../hooks/useChat';
 import { formatRelativeTimeAgo } from '../utils/relativeTime';
+import ConfirmInline from './ConfirmInline';
 import './ConversationList.css';
 
 // Below this many conversations a search box is clutter; above it, scrolling is slower.
@@ -73,13 +73,6 @@ function ConversationList({
     setDraftTitle('');
   };
 
-  const handleConfirmKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== 'Escape') return;
-    // Cancels the confirm only — not the narrow-screen drawer the list may sit in.
-    event.stopPropagation();
-    setConfirmingDeleteId(null);
-  };
-
   return (
     <>
       {conversations.length > SEARCH_THRESHOLD && (
@@ -97,31 +90,18 @@ function ConversationList({
         {visible.map((conversation, index) => (
           <li key={conversation.id} className="conversation-list__row-wrap" data-testid="conversation-item">
             {confirmingDeleteId === conversation.id ? (
-              <div className="conversation-list__confirm" onKeyDown={handleConfirmKeyDown}>
-                <span className="conversation-list__confirm-text">Delete this conversation?</span>
-                <div className="conversation-list__confirm-actions">
-                  <button
-                    type="button"
-                    className="conversation-list__confirm-cancel"
-                    autoFocus
-                    onClick={() => setConfirmingDeleteId(null)}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    className="conversation-list__confirm-delete"
-                    onClick={() => {
-                      refocusIndexRef.current = index;
-                      onDelete(conversation.id);
-                      setConfirmingDeleteId(null);
-                    }}
-                    data-testid="conversation-delete-confirm"
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
+              <ConfirmInline
+                className="conversation-list__confirm"
+                prompt="Delete this conversation?"
+                confirmLabel="Delete"
+                onCancel={() => setConfirmingDeleteId(null)}
+                onConfirm={() => {
+                  refocusIndexRef.current = index;
+                  onDelete(conversation.id);
+                  setConfirmingDeleteId(null);
+                }}
+                confirmTestId="conversation-delete-confirm"
+              />
             ) : editingId === conversation.id ? (
               <input
                 className="conversation-list__edit"

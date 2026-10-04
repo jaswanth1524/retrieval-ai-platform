@@ -18,9 +18,10 @@ from api.pipeline import (
     expand_with_neighbors,
 )
 from api.repository import VectorRepository
-from api.reranking import rerank_candidates
-from api.retrieval import RetrievalConfigError, retrieve_candidates
+from api.reranking import RerankedChunk, rerank_candidates_detailed
+from api.retrieval import RetrievalConfigError, RetrievalError, points_to_chunks
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 class StaticEmbeddingProvider:
@@ -166,12 +167,7 @@ class ListTraceStore:
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "pipeline_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("pipeline_documents"),
         "chunk_size_tokens": 20,
         "chunk_overlap_tokens": 0,
         "fused_top_n": 5,
@@ -179,7 +175,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "max_context_chunks": 2,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_embedding(value: float) -> EmbeddedText:
@@ -187,6 +183,15 @@ def make_embedding(value: float) -> EmbeddedText:
         dense=[value, 0.0, 0.0],
         sparse=models.SparseVector(indices=[1], values=[1.0]),
     )
+
+
+def search_and_rerank(
+    repository: VectorRepository, settings: AppSettings, query: str
+) -> list[RerankedChunk]:
+    """Hybrid search, then rerank: the primitives ``RagPipeline.retrieve`` composes."""
+
+    candidates = points_to_chunks(repository.hybrid_search(settings, make_embedding(1.0)))
+    return rerank_candidates_detailed(query, candidates, FakeReranker(), settings).kept
 
 
 class WordTokenCounter:
@@ -521,10 +526,7 @@ def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
         token_counter=WordTokenCounter(),
     ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
 
-    candidates = retrieve_candidates(
-        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "one")
     middle = next(chunk for chunk in reranked if chunk.chunk_ordinal == 2)
 
     [expanded_middle] = expand_with_neighbors([middle], repository, settings)
@@ -560,10 +562,7 @@ def test_expand_with_neighbors_fetches_once_per_filename_not_once_per_chunk() ->
         b"Thirteen fourteen fifteen.",
     )
 
-    candidates = retrieve_candidates(
-        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "one")
     by_ordinal = {chunk.chunk_ordinal: chunk for chunk in reranked}
     selected = [by_ordinal[2], by_ordinal[4]]
 
@@ -597,10 +596,7 @@ def test_expand_with_neighbors_never_pulls_in_a_chunk_that_has_its_own_block() -
         settings,
         token_counter=WordTokenCounter(),
     ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
-    candidates = retrieve_candidates(
-        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "one")
     by_ordinal = {chunk.chunk_ordinal: chunk for chunk in reranked}
 
     first, second = expand_with_neighbors([by_ordinal[1], by_ordinal[2]], repository, settings)
@@ -663,10 +659,7 @@ def test_expand_with_neighbors_disabled_by_zero_radius() -> None:
     IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
         "guide.txt", b"Intro alpha beta"
     )
-    candidates = retrieve_candidates(
-        repository, settings, "alpha", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("alpha", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "alpha")
 
     expanded = expand_with_neighbors(reranked, repository, settings)
 
@@ -1590,3 +1583,44 @@ def test_expansion_variants_are_searched_side_by_side() -> None:
 
     assert repository.search_calls == 4
     assert not all_in_flight.broken
+
+
+def test_rag_pipeline_retrieve_rejects_an_empty_query() -> None:
+    settings = make_settings()
+    pipeline = RagPipeline(
+        repository=VectorRepository(QdrantClient(":memory:")),
+        embedding_provider=StaticEmbeddingProvider([]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("unused"),
+        settings=settings,
+    )
+
+    with pytest.raises(RetrievalError, match="Query text"):
+        pipeline.retrieve("   ")
+
+
+def test_rag_pipeline_retrieve_checks_the_collection_before_embedding() -> None:
+    """An embedding-tag mismatch refuses the query without paying for embedding."""
+
+    class RefusingRepository(VectorRepository):
+        def ensure_ready(self, settings: AppSettings) -> None:
+            raise RetrievalError("refused")
+
+        def hybrid_search(self, *args: Any, **kwargs: Any) -> list[models.ScoredPoint]:
+            raise AssertionError("hybrid_search must not run when ensure_ready refuses")
+
+    class FailingEmbeddingProvider:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            raise AssertionError("embedding must not run when ensure_ready refuses")
+
+    settings = make_settings()
+    pipeline = RagPipeline(
+        repository=RefusingRepository(QdrantClient(":memory:")),
+        embedding_provider=FailingEmbeddingProvider(),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("unused"),
+        settings=settings,
+    )
+
+    with pytest.raises(RetrievalError, match="refused"):
+        pipeline.retrieve("alpha")

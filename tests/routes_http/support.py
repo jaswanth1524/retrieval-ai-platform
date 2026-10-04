@@ -32,6 +32,7 @@ from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
 from api.main import create_app
 from api.reranking import RerankingError
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 class FakeEmbeddingProvider:
@@ -88,12 +89,7 @@ class ApiTestContext:
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "api_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("api_documents"),
         "chunk_size_tokens": 20,
         "chunk_overlap_tokens": 0,
         "fused_top_n": 5,
@@ -101,7 +97,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "max_context_chunks": 2,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_embedding(

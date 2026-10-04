@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from './api/client';
 import type {
   AccessLevel,
@@ -14,13 +14,13 @@ import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
 import type { FeedbackPayload } from './components/ChatMessage';
-import type { Command } from './components/CommandPalette';
 import Composer from './components/Composer';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
 import CorpusPanel from './components/CorpusPanel';
 import IconRail from './components/IconRail';
 import LazyChunkBoundary from './components/LazyChunkBoundary';
+import { loadMarkdown } from './components/markdownLoader';
 import type { RailPanel } from './components/IconRail';
 import type { InspectorTab } from './components/Inspector';
 import SourcePreview from './components/SourcePreview';
@@ -28,6 +28,7 @@ import ToastRow from './components/ToastRow';
 import TracesPanel from './components/TracesPanel';
 import FeedbackPanel from './components/FeedbackPanel';
 import { useChat } from './hooks/useChat';
+import { useCommands } from './hooks/useCommands';
 import { useCorpus } from './hooks/useCorpus';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
@@ -190,19 +191,14 @@ function App() {
   const {
     uploads,
     indexedFilenames,
-    chunkCounts,
-    pageCounts,
-    byteSizes,
-    uploadedAts,
-    staleFilenames,
-    reindexableFilenames,
-    documentTags,
+    documents,
     availableTags,
     chunkTotal,
     refreshDocuments,
     handleUpload,
     handleRetryUpload,
     handleDismissUpload,
+    handleCancelUpload,
     handleReindex,
     handleReindexAllStale,
     handleDeleteDocument,
@@ -264,10 +260,10 @@ function App() {
     writeStored(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(next));
   };
 
-  const setMode = (next: ChatMode) => {
+  const setMode = useCallback((next: ChatMode) => {
     setModeState(next);
     writeStored(MODE_STORAGE_KEY, next);
-  };
+  }, []);
 
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'light' : 'dark';
@@ -371,6 +367,18 @@ function App() {
     };
     // Boot once. refreshDocuments reads only setters and useChat's stable pruneScopes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The markdown renderer is its own chunk; fetch it once the first paint is done, so
+  // it is there before the first answer is.
+  useEffect(() => {
+    const preload = () => void loadMarkdown();
+    if (typeof window.requestIdleCallback === 'function') {
+      const handle = window.requestIdleCallback(preload, { timeout: 2000 });
+      return () => window.cancelIdleCallback(handle);
+    }
+    const timer = setTimeout(preload, 200);
+    return () => clearTimeout(timer);
   }, []);
 
   const [feedbackItems, setFeedbackItems] = useState<FeedbackItemResponse[] | null>(null);
@@ -613,222 +621,118 @@ function App() {
     if (!persistPartial) dismissToast('persist-partial');
   }, [persistError, persistPartial, pushToast, dismissToast]);
 
-  // Read at keypress time so the listener is registered once. Shortcuts are dispatched
-  // from the command list itself, so every shortcut the palette advertises is bound.
-  const commandsRef = useRef<Command[]>([]);
-  const otherDialogOpenRef = useRef(false);
-  otherDialogOpenRef.current = settingsOpen || sourceView !== null;
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
-      // Never stack a second dialog over Settings or the document viewer.
-      if (otherDialogOpenRef.current) return;
-      const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;
-      if (key === 'K' && !event.shiftKey) {
-        event.preventDefault();
-        setPaletteOpen((prev) => !prev);
-        return;
-      }
-      // Same notation the palette displays ("⌘U", "⌘⇧O"), so what it advertises and
-      // what is bound can't drift apart.
-      const combo = `⌘${event.shiftKey ? '⇧' : ''}${key}`;
-      const command = commandsRef.current.find((candidate) => candidate.shortcut === combo);
-      if (!command || command.disabled) return;
-      event.preventDefault();
-      setPaletteOpen(false);
-      command.run();
-    };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, []);
+  // Read when clicked or exported rather than closed over: the header's Export and the
+  // palette keep one identity while an answer streams in.
+  const turnsRef = useRef(turns);
+  turnsRef.current = turns;
+  const conversationTitleRef = useRef(activeConversation?.title);
+  conversationTitleRef.current = activeConversation?.title;
 
   const exportMarkdown = useCallback(() => {
-    if (turns.length === 0) return;
+    if (turnsRef.current.length === 0) return;
     downloadFile(
-      `docrag-${activeConversation?.title ?? 'chat'}.md`.replace(/[^\w.-]+/g, '-'),
+      `docrag-${conversationTitleRef.current ?? 'chat'}.md`.replace(/[^\w.-]+/g, '-'),
       'text/markdown',
-      chatToMarkdown(turns),
+      chatToMarkdown(turnsRef.current),
     );
-  }, [turns, activeConversation]);
+  }, []);
 
   const exportJson = useCallback(() => {
-    if (turns.length === 0) return;
+    if (turnsRef.current.length === 0) return;
     downloadFile(
-      `docrag-${activeConversation?.title ?? 'chat'}.json`.replace(/[^\w.-]+/g, '-'),
+      `docrag-${conversationTitleRef.current ?? 'chat'}.json`.replace(/[^\w.-]+/g, '-'),
       'application/json',
-      chatToJson(turns),
+      chatToJson(turnsRef.current),
     );
-  }, [turns, activeConversation]);
+  }, []);
 
-  const commands: Command[] = useMemo(
-    () => [
-      {
-        id: 'new-conversation',
-        glyph: '＋',
-        label: 'New conversation',
-        // Not ⌘N: browsers reserve it (new window) and never deliver it to the page.
-        shortcut: '⌘⇧O',
-        run: () => {
-          setRail('chat');
-          newConversation();
-        },
-        disabled: pending,
-      },
-      {
-        id: 'upload',
-        glyph: '↑',
-        label: 'Upload a document',
-        shortcut: '⌘U',
-        run: () => {
-          setRail('corpus');
-          // On a narrow screen the panel is a closed drawer: the picked files were staged
-          // out of sight, still waiting on an Upload click nobody could see.
-          if (panelCollapsed) setPanelDrawerOpen(true);
-          // The panel has to render before its hidden file input can be clicked.
-          requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
-        },
-      },
-      {
-        id: 'settings',
-        glyph: '⚙',
-        label: 'Open settings',
-        shortcut: '⌘,',
-        run: () => setSettingsOpen(true),
-        disabled: !config,
-      },
-      {
-        id: 'toggle-inspector',
-        glyph: '◧',
-        label: inspectorOpen ? 'Hide inspector' : 'Show inspector',
-        run: () => {
-          setInspectorForced(true);
-          setInspectorOpen((prev) => !prev);
-        },
-      },
-      {
-        id: 'toggle-mode',
-        glyph: '◑',
-        label: mode === 'engineer' ? 'Switch to Reader mode' : 'Switch to Engineer mode',
-        run: () => setMode(mode === 'engineer' ? 'reader' : 'engineer'),
-      },
-      {
-        id: 'toggle-theme',
-        glyph: theme === 'dark' ? '☀' : '☾',
-        label: theme === 'dark' ? 'Use light theme' : 'Use dark theme',
-        shortcut: '⌘J',
-        run: toggleTheme,
-      },
-      {
-        id: 'export',
-        glyph: '⇩',
-        label: 'Export conversation as Markdown',
-        run: exportMarkdown,
-        disabled: turns.length === 0,
-      },
-      {
-        id: 'export-json',
-        glyph: '⇩',
-        label: 'Export conversation as JSON',
-        run: exportJson,
-        disabled: turns.length === 0,
-      },
-      {
-        id: 'traces',
-        glyph: '◔',
-        label: 'Browse traces',
-        run: () => {
-          setRail('traces');
-          if (panelCollapsed) setPanelDrawerOpen(true);
-        },
-      },
-      ...(readOnly
-        ? []
-        : [
-            {
-              id: 'restore-backup',
-              glyph: '⇧',
-              label: 'Restore documents from a backup (zip)',
-              run: () => restoreInputRef.current?.click(),
-              disabled: restoring,
-            },
-            {
-              id: 'export-corpus',
-              glyph: '⇩',
-              label: 'Download a backup of all documents (zip)',
-              // Building the zip can take a while for a large corpus; without a guard every
-              // impatient re-run started another full export on the server.
-              disabled: exportingBackup,
-              run: () => {
-                if (exportingRef.current) return;
-                exportingRef.current = true;
-                setExportingBackup(true);
-                pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
-                api
-                  .exportCorpus()
-                  .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
-                  .catch((err) => {
-                    if (noteAuthFailure(err)) return;
-                    pushToast({
-                      tone: 'bad',
-                      title: 'Backup failed',
-                      body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
-                    });
-                  })
-                  .finally(() => {
-                    exportingRef.current = false;
-                    setExportingBackup(false);
-                  });
-              },
-            },
-          ]),
-      {
-        id: 'import-json',
-        glyph: '⇧',
-        label: 'Import a conversation (JSON export)',
-        run: () => importInputRef.current?.click(),
-        disabled: pending,
-      },
-      {
-        id: 'clear',
-        glyph: '✕',
-        label: 'Clear this conversation',
-        run: clear,
-        disabled: pending || turns.length === 0,
-      },
-      // Every saved conversation, so the palette doubles as conversation search.
-      ...conversations
-        .filter((conversation) => conversation.id !== activeConversationId)
-        .map((conversation) => ({
-          id: `conversation-${conversation.id}`,
-          glyph: '☰',
-          label: `Open: ${conversation.title}`,
-          run: () => switchConversation(conversation.id),
-          disabled: pending,
-        })),
-    ],
-    // toggleTheme/clear/newConversation are stable enough for a menu rebuilt on open.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [
+  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const inspectorOpenRef = useRef(inspectorOpen);
+  inspectorOpenRef.current = inspectorOpen;
+  const toggleInspector = useCallback(() => {
+    // Reopening on a new turn should follow the conversation again rather than
+    // resurface whatever trace row was last clicked.
+    if (!inspectorOpenRef.current) setPinnedTraceId(null);
+    setInspectorForced(true);
+    setInspectorOpen((prev) => !prev);
+  }, []);
+
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  const downloadBackup = () => {
+    if (exportingRef.current) return;
+    exportingRef.current = true;
+    setExportingBackup(true);
+    pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
+    api
+      .exportCorpus()
+      .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
+      .catch((err) => {
+        if (noteAuthFailure(err)) return;
+        pushToast({
+          tone: 'bad',
+          title: 'Backup failed',
+          body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
+        });
+      })
+      .finally(() => {
+        exportingRef.current = false;
+        setExportingBackup(false);
+      });
+  };
+
+  const commands = useCommands(
+    {
       pending,
-      config,
+      configLoaded: config !== null,
       inspectorOpen,
       mode,
       theme,
-      turns.length,
-      exportMarkdown,
-      exportJson,
-      panelCollapsed,
+      hasTurns: turns.length > 0,
       conversations,
       activeConversationId,
-      exportingBackup,
       readOnly,
       restoring,
-    ],
+      exportingBackup,
+    },
+    {
+      newConversation: () => {
+        setRail('chat');
+        newConversation();
+      },
+      upload: () => {
+        setRail('corpus');
+        // On a narrow screen the panel is a closed drawer: the picked files were staged
+        // out of sight, still waiting on an Upload click nobody could see.
+        if (panelCollapsed) setPanelDrawerOpen(true);
+        // The panel has to render before its hidden file input can be clicked.
+        requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
+      },
+      openSettings: () => setSettingsOpen(true),
+      toggleInspector: () => {
+        setInspectorForced(true);
+        setInspectorOpen((prev) => !prev);
+      },
+      setMode,
+      toggleTheme,
+      exportMarkdown,
+      exportJson,
+      browseTraces: () => {
+        setRail('traces');
+        if (panelCollapsed) setPanelDrawerOpen(true);
+      },
+      restoreBackup: () => restoreInputRef.current?.click(),
+      downloadBackup,
+      importConversation: () => importInputRef.current?.click(),
+      clear,
+      switchConversation,
+    },
+    {
+      otherDialogOpen: settingsOpen || sourceView !== null,
+      togglePalette: () => setPaletteOpen((prev) => !prev),
+      closePalette: () => setPaletteOpen(false),
+    },
   );
-  commandsRef.current = commands;
-
-  const importInputRef = useRef<HTMLInputElement>(null);
 
   const handleRestoreFile = async (file: File) => {
     setRestoring(true);
@@ -983,10 +887,7 @@ function App() {
         {rail === 'corpus' && (
           <CorpusPanel
             filenames={indexedFilenames}
-            chunkCounts={chunkCounts}
-            pageCounts={pageCounts}
-            byteSizes={byteSizes}
-            uploadedAts={uploadedAts}
+            documents={documents}
             uploads={uploads}
             onUpload={handleUpload}
             onDelete={handleDeleteDocument}
@@ -995,13 +896,11 @@ function App() {
             browseInputRef={corpusBrowseInputRef}
             onRetryUpload={handleRetryUpload}
             onDismissUpload={handleDismissUpload}
-            staleFilenames={staleFilenames}
-            reindexableFilenames={reindexableFilenames}
+            onCancelUpload={readOnly ? undefined : handleCancelUpload}
             onReindex={config?.raw_documents_enabled && !readOnly ? handleReindex : undefined}
             onReindexAllStale={
               config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
             }
-            tags={documentTags}
             onSetTags={readOnly ? undefined : handleSetTags}
             readOnly={readOnly}
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
@@ -1031,19 +930,13 @@ function App() {
               scopeLabel={scopeLabel(indexedFilenames, selectedFilenames, selectedTags)}
               mode={mode}
               onSetMode={setMode}
-              turns={turns}
+              hasTurns={turns.length > 0}
               onClear={clear}
               onExport={exportMarkdown}
               disabled={pending}
-              onOpenPalette={() => setPaletteOpen(true)}
+              onOpenPalette={openPalette}
               inspectorOpen={inspectorOpen}
-              onToggleInspector={() => {
-                // Reopening on a new turn should follow the conversation again rather
-                // than resurface whatever trace row was last clicked.
-                if (!inspectorOpen) setPinnedTraceId(null);
-                setInspectorForced(true);
-                setInspectorOpen((prev) => !prev);
-              }}
+              onToggleInspector={toggleInspector}
             />
             <ChatThread
               turns={turns}
@@ -1143,7 +1036,7 @@ function App() {
               chunkId={sourceView.chunkId}
               onClose={() => setSourceView(null)}
               onDownloadOriginal={
-                config?.raw_documents_enabled && reindexableFilenames.includes(sourceView.filename)
+                config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
                   ? () => downloadOriginal(sourceView.filename)
                   : undefined
               }

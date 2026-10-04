@@ -10,10 +10,11 @@ from starlette.types import Message, Receive, Scope, Send
 from api.dependencies import get_app_settings
 from api.request_guard import RequestGuardMiddleware, is_guarded_path
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def _settings(**overrides: Any) -> AppSettings:
-    return AppSettings(_env_file=None, **overrides)  # type: ignore[call-arg]
+    return make_test_settings(**overrides)
 
 
 class _Downstream:

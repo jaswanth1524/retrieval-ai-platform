@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import type { ChatTurn } from './ChatMessage';
 import { shortcutLabel } from '../utils/platform';
+import ConfirmInline from './ConfirmInline';
 import './ChatHeader.css';
 
 export type ChatMode = 'reader' | 'engineer';
@@ -11,7 +11,9 @@ interface ChatHeaderProps {
   scopeLabel: string;
   mode: ChatMode;
   onSetMode: (mode: ChatMode) => void;
-  turns: ChatTurn[];
+  /** Export and Clear only show once the conversation has something in it. A boolean,
+   *  not the turns: those change on every streamed token, and this header doesn't. */
+  hasTurns: boolean;
   onClear: () => void;
   // Markdown export, named after the conversation (App.tsx's exportMarkdown — the same
   // implementation the command palette runs).
@@ -27,7 +29,7 @@ function ChatHeader({
   scopeLabel,
   mode,
   onSetMode,
-  turns,
+  hasTurns,
   onClear,
   onExport,
   disabled,
@@ -53,7 +55,7 @@ function ChatHeader({
     <header className="chat-header">
       <h1 className="chat-header__title">{title}</h1>
       <span className="chat-header__scope">{scopeLabel}</span>
-      {turns.length > 0 && (
+      {hasTurns && (
         <div className="chat-header__actions">
           <button
             type="button"
@@ -64,36 +66,19 @@ function ChatHeader({
             Export
           </button>
           {confirmingClear ? (
-            <span
+            <ConfirmInline
+              tone="main"
               className="chat-header__confirm"
-              onKeyDown={(event) => {
-                if (event.key !== 'Escape') return;
-                event.stopPropagation();
+              confirmLabel="Confirm"
+              onCancel={() => setConfirmingClear(false)}
+              onConfirm={() => {
+                onClear();
                 setConfirmingClear(false);
               }}
-            >
-              <button
-                type="button"
-                className="chat-header__confirm-yes"
-                // useChat ignores a clear while a question is in flight.
-                disabled={disabled}
-                onClick={() => {
-                  onClear();
-                  setConfirmingClear(false);
-                }}
-                data-testid="chat-header-clear-confirm"
-              >
-                Confirm
-              </button>
-              <button
-                type="button"
-                className="chat-header__confirm-no"
-                autoFocus
-                onClick={() => setConfirmingClear(false)}
-              >
-                Cancel
-              </button>
-            </span>
+              // useChat ignores a clear while a question is in flight.
+              disabled={disabled}
+              confirmTestId="chat-header-clear-confirm"
+            />
           ) : (
             <button
               type="button"
@@ -159,4 +144,5 @@ function ChatHeader({
   );
 }
 
-export default ChatHeader;
+// Memoized: App re-renders on every streamed token; every prop here is stable then.
+export default memo(ChatHeader);

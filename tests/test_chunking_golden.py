@@ -24,6 +24,7 @@ from docx import Document
 from api.chunking import HeuristicTokenCounter
 from api.documents import chunk_sections, parse_document_bytes
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 from tests.samples import pdf_bytes
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "chunks.json"
@@ -31,9 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _settings() -> AppSettings:
-    return AppSettings(  # type: ignore[call-arg]
-        _env_file=None, chunk_size_tokens=60, chunk_overlap_tokens=10
-    )
+    return make_test_settings(chunk_size_tokens=60, chunk_overlap_tokens=10)
 
 
 def _docx_bytes() -> bytes:

@@ -593,8 +593,8 @@ class RagPipeline:
         ``for_generation=False`` (search without an answer) skips the two stages that
         only serve the prompt: LLM query expansion and neighbour expansion.
 
-        Inlines ``retrieve_candidates``' steps (rather than calling it as one call)
-        so embedding and search can be timed separately for observability.
+        Embedding and search are separate steps so each can be timed for
+        observability.
         ``should_stop`` is checked before the rerank, the costliest stage, and raises
         ``QuestionAbandoned`` when the client has gone.
         """

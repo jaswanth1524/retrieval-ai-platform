@@ -116,76 +116,17 @@
   font-family: var(--fb);
 }
 
+/* Fills the row it replaces; ConfirmInline supplies the buttons. A surface of the
+   rail's own (dark in both themes): --sunk turns light in the light theme, which left
+   the rail-coloured Cancel invisible on it. */
 .conversation-list__confirm {
   flex: 1;
-  display: flex;
-  align-items: center;
   justify-content: space-between;
   gap: 8px;
   padding: 8px 10px;
   border-radius: var(--radius-md);
-  background: var(--sunk);
+  background: rgba(255, 255, 255, 0.06);
   font-size: 11.5px;
-}
-
-.conversation-list__confirm-text {
-  color: var(--rail-text);
-}
-
-.conversation-list__confirm-actions {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.conversation-list__confirm-cancel,
-.conversation-list__confirm-delete {
-  border: 1px solid var(--rail-rule);
-  background: transparent;
-  color: var(--rail-text);
-  border-radius: var(--radius-sm);
-  font-size: 10.5px;
-  padding: 3px 8px;
-  cursor: pointer;
-}
-
-.conversation-list__confirm-delete {
-  border-color: var(--bad);
-  color: var(--bad);
-}
-
-.conversation-list__confirm {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  font-size: 0.75rem;
-  flex: 1;
-}
-
-.conversation-list__confirm-text {
-  color: var(--muted);
-}
-
-.conversation-list__confirm-yes,
-.conversation-list__confirm-no {
-  border: 1px solid var(--rule);
-  background: var(--card);
-  color: var(--ink);
-  border-radius: 0.35rem;
-  font-size: 0.7rem;
-  padding: 0.1rem 0.45rem;
-  cursor: pointer;
-}
-
-.conversation-list__confirm-yes {
-  border-color: var(--bad);
-  color: var(--bad);
-}
-
-.conversation-list__confirm-yes:disabled,
-.conversation-list__confirm-no:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
 }
 
 .conversation-list__search {

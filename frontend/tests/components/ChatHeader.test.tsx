@@ -2,20 +2,6 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import ChatHeader from '../../src/components/ChatHeader';
-import type { ChatTurn } from '../../src/components/ChatMessage';
-
-function makeTurn(overrides: Partial<ChatTurn> = {}): ChatTurn {
-  return {
-    id: 't1',
-    role: 'user',
-    content: 'Hi',
-    sources: [],
-    timestamp: 0,
-    timings: null,
-    traceId: null,
-    ...overrides,
-  };
-}
 
 function baseProps(overrides: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
   return {
@@ -23,7 +9,7 @@ function baseProps(overrides: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
     scopeLabel: 'All 4 documents',
     mode: 'reader' as const,
     onSetMode: vi.fn(),
-    turns: [] as ChatTurn[],
+    hasTurns: false,
     onClear: vi.fn(),
     onExport: vi.fn(),
     onOpenPalette: vi.fn(),
@@ -41,19 +27,19 @@ describe('ChatHeader', () => {
   });
 
   it('hides Clear/Export when there are no turns', () => {
-    render(<ChatHeader {...baseProps({ turns: [] })} />);
+    render(<ChatHeader {...baseProps({ hasTurns: false })} />);
     expect(screen.queryByTestId('chat-header-clear')).not.toBeInTheDocument();
     expect(screen.queryByTestId('chat-header-export')).not.toBeInTheDocument();
   });
 
   it('shows Clear/Export once there are turns', () => {
-    render(<ChatHeader {...baseProps({ turns: [makeTurn()] })} />);
+    render(<ChatHeader {...baseProps({ hasTurns: true })} />);
     expect(screen.getByTestId('chat-header-clear')).toBeInTheDocument();
     expect(screen.getByTestId('chat-header-export')).toBeInTheDocument();
   });
 
   it('requires confirmation before firing onClear', async () => {
-    const props = baseProps({ turns: [makeTurn()] });
+    const props = baseProps({ hasTurns: true });
     render(<ChatHeader {...props} />);
 
     await userEvent.click(screen.getByTestId('chat-header-clear'));
@@ -86,7 +72,7 @@ describe('ChatHeader', () => {
   });
 
   it('focuses Cancel on the clear confirm, and Escape backs out of it', async () => {
-    const props = baseProps({ turns: [makeTurn()] });
+    const props = baseProps({ hasTurns: true });
     render(<ChatHeader {...props} />);
 
     await userEvent.click(screen.getByTestId('chat-header-clear'));
@@ -98,7 +84,7 @@ describe('ChatHeader', () => {
   });
 
   it('disables the clear confirm while a question is in flight', async () => {
-    const props = baseProps({ turns: [makeTurn()] });
+    const props = baseProps({ hasTurns: true });
     const { rerender } = render(<ChatHeader {...props} />);
     await userEvent.click(screen.getByTestId('chat-header-clear'));
 
@@ -108,7 +94,7 @@ describe('ChatHeader', () => {
   });
 
   it('exports through the onExport handler', async () => {
-    const props = baseProps({ turns: [makeTurn()] });
+    const props = baseProps({ hasTurns: true });
     render(<ChatHeader {...props} />);
 
     await userEvent.click(screen.getByTestId('chat-header-export'));

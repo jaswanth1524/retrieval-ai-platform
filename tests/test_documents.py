@@ -20,6 +20,7 @@ from api.documents import (
     parse_markdown_document,
 )
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -29,7 +30,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "min_section_words": 0,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def test_parse_text_document_normalizes_filename_and_metadata() -> None:

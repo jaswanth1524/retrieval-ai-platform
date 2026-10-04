@@ -15,10 +15,11 @@ from api.documents import (
 )
 from api.parsers.pdf import _table_to_markdown
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
-    return AppSettings(_env_file=None, **overrides)  # type: ignore[call-arg]
+    return make_test_settings(**overrides)
 
 
 def _docx_bytes() -> bytes:

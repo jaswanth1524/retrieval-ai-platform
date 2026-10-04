@@ -22,6 +22,7 @@ from api.ingestion import (
 from api.qdrant_schema import CollectionSchemaError
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 class FakeEmbeddingProvider:
@@ -36,15 +37,10 @@ class FakeEmbeddingProvider:
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "ingest_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("ingest_documents"),
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_chunk(

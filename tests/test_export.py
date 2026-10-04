@@ -12,12 +12,12 @@ from api.pipeline import IngestService
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 from tests.routes_http.support import FakeEmbeddingProvider
 
 
 def _settings(**overrides: Any) -> AppSettings:
-    return AppSettings(  # type: ignore[call-arg]
-        _env_file=None,
+    return make_test_settings(
         qdrant_url=":memory:",
         qdrant_collection="export_documents",
         qdrant_dense_vector_size=3,

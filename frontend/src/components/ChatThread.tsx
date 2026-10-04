@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CitationResponse } from '../api/types';
 import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
@@ -31,6 +31,31 @@ interface ChatThreadProps {
 // sub-pixel rounding and the last line's leading, narrow enough that a user who
 // scrolled up to re-read is not yanked back down.
 const PIN_THRESHOLD_PX = 48;
+
+/** What the screen-reader status line says about the question in flight. */
+function progressAnnouncement(
+  pending: boolean,
+  lastTurn: ChatTurn | undefined,
+  stage: string | null | undefined,
+  justFinished: boolean,
+): string {
+  if (pending) {
+    if (lastTurn?.role === 'assistant' && lastTurn.content) return 'Answer streaming.';
+    return stage ?? 'retrieving…';
+  }
+  // A stopped or cut-off answer is not "ready", and a failure is announced by its own
+  // alert.
+  if (
+    justFinished &&
+    lastTurn?.role === 'assistant' &&
+    lastTurn.content &&
+    !lastTurn.stopped &&
+    !lastTurn.incomplete
+  ) {
+    return 'Answer ready.';
+  }
+  return '';
+}
 
 // The question a "Regenerate" click on an assistant turn should re-ask. Read from the
 // nearest preceding user turn by array position rather than stored on the assistant
@@ -78,6 +103,19 @@ function ChatThread({
   // Position, not a timer: deltas can arrive several times per animation frame, so a
   // frame-based guard would swallow genuine user scrolls during a fast stream.
   const autoScrollTopRef = useRef(-1);
+  // Set when a question this thread watched finishes, so "Answer ready." is said once
+  // for a new answer — never for history shown on a reload or conversation switch.
+  const [justFinished, setJustFinished] = useState(false);
+  const wasPendingRef = useRef(pending);
+  useEffect(() => {
+    if (pending) setJustFinished(false);
+    else if (wasPendingRef.current) setJustFinished(true);
+    wasPendingRef.current = pending;
+  }, [pending]);
+  const firstTurnId = turns[0]?.id;
+  useEffect(() => {
+    setJustFinished(false);
+  }, [firstTurnId]);
 
   const handleScroll = () => {
     const element = containerRef.current;
@@ -110,9 +148,21 @@ function ChatThread({
     autoScrollTopRef.current = element.scrollTop;
   }, [turns, pending]);
 
+  const lastTurn = turns[turns.length - 1];
+  // One polite status line for the whole thread, always mounted so the first change is
+  // announced too. The answer text itself is not a live region: it changes on every
+  // streamed token, and a polite region over it re-reads the whole answer each time.
+  // One per message used to leave dozens of regions in a long conversation.
+  const statusRegion = (
+    <span className="chat-thread__status" role="status" data-testid="chat-status">
+      {progressAnnouncement(pending, lastTurn, stage, justFinished)}
+    </span>
+  );
+
   if (turns.length === 0 && !pending) {
     return (
       <div className="chat-thread chat-thread--empty">
+        {statusRegion}
         <p>
           {documentCount > 0
             ? `Ask a question about your ${documentCount === 1 ? 'document' : `${documentCount} documents`}.`
@@ -122,7 +172,6 @@ function ChatThread({
     );
   }
 
-  const lastTurn = turns[turns.length - 1];
   // The assistant turn is created lazily on the first `sources`/`delta` event (see
   // useChat), so while pending is true but the last turn is still the user's question,
   // there's no ChatTurn yet to attach a skeleton to — render a placeholder in its slot.
@@ -136,6 +185,7 @@ function ChatThread({
       onScroll={handleScroll}
       data-testid="chat-thread"
     >
+      {statusRegion}
       <div className="chat-thread__rail">
         {turns.map((turn, index) => (
           <ChatMessage
@@ -161,7 +211,7 @@ function ChatThread({
           />
         ))}
         {awaitingFirstEvent && (
-          <div className="chat-message" data-testid="chat-pending" role="status" aria-live="polite">
+          <div className="chat-message" data-testid="chat-pending">
             <div className="chat-message__row">
               <span className="chat-message__gutter chat-message__gutter--answer" aria-hidden="true">
                 A

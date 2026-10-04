@@ -1,8 +1,8 @@
 """Vector-store repository — the only module that talks to Qdrant for search/writes.
 
-Retrieval and ingestion depend on the ``SearchRepository``/``WriteRepository``
-protocols they declare locally; ``VectorRepository`` satisfies both by structural
-typing, so callers never import ``qdrant_client`` directly.
+Ingestion depends on the ``WriteRepository`` protocol it declares locally, which
+``VectorRepository`` satisfies by structural typing, so callers never import
+``qdrant_client`` directly.
 """
 
 from __future__ import annotations
@@ -294,16 +294,6 @@ class VectorRepository:
         ]
         payloads.sort(key=_chunk_ordinal_sort_key)
         return payloads
-
-    def filename_chunk_counts(self, settings: AppSettings) -> dict[str, int]:
-        """Return each indexed filename's chunk count, for the corpus panel and its footer total."""
-
-        self.ensure_ready(settings)
-        counts: Counter[str] = Counter()
-        for point in self._scroll_all(settings, with_payload=["filename"]):
-            if point.payload and isinstance(point.payload.get("filename"), str):
-                counts[point.payload["filename"]] += 1
-        return dict(counts)
 
     def filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
         """Every document's metadata, served from a per-collection cache between changes.

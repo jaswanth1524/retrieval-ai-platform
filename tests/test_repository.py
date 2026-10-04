@@ -8,19 +8,15 @@ from qdrant_client import QdrantClient, models
 
 from api.repository import DocumentMetadata, VectorRepository, reciprocal_rank_fusion
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "repository_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("repository_documents"),
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def scored_point(chunk_id: str, score: float) -> models.ScoredPoint:
@@ -148,7 +144,7 @@ def test_vector_repository_delete_by_ids_is_a_noop_for_empty_list() -> None:
     assert len(records) == 1
 
 
-def test_vector_repository_list_filenames_returns_distinct_sorted_names() -> None:
+def test_vector_repository_filename_metadata_counts_points_per_file() -> None:
     settings = make_settings()
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
@@ -157,37 +153,9 @@ def test_vector_repository_list_filenames_returns_distinct_sorted_names() -> Non
         [make_point("p1", "b.md"), make_point("p2", "a.md"), make_point("p3", "b.md")],
     )
 
-    assert sorted(repository.filename_chunk_counts(settings)) == ["a.md", "b.md"]
+    metadata = repository.filename_metadata(settings)
 
-
-def test_vector_repository_list_filenames_empty_for_empty_collection() -> None:
-    settings = make_settings()
-    client = QdrantClient(":memory:")
-    repository = VectorRepository(client)
-    repository.ensure_ready(settings)
-
-    assert sorted(repository.filename_chunk_counts(settings)) == []
-
-
-def test_vector_repository_filename_chunk_counts_counts_points_per_file() -> None:
-    settings = make_settings()
-    client = QdrantClient(":memory:")
-    repository = VectorRepository(client)
-    repository.upsert(
-        settings,
-        [make_point("p1", "b.md"), make_point("p2", "a.md"), make_point("p3", "b.md")],
-    )
-
-    assert repository.filename_chunk_counts(settings) == {"a.md": 1, "b.md": 2}
-
-
-def test_vector_repository_filename_chunk_counts_empty_for_empty_collection() -> None:
-    settings = make_settings()
-    client = QdrantClient(":memory:")
-    repository = VectorRepository(client)
-    repository.ensure_ready(settings)
-
-    assert repository.filename_chunk_counts(settings) == {}
+    assert {name: meta.chunk_count for name, meta in metadata.items()} == {"a.md": 1, "b.md": 2}
 
 
 def test_vector_repository_filename_metadata_aggregates_page_count_and_stamped_fields() -> None:
@@ -338,8 +306,11 @@ def test_vector_repository_scrolls_page_by_page_across_every_reader(
         4,
         5,
     ]
-    assert repository.filename_chunk_counts(settings) == {"guide.md": 5, "other.md": 1}
-    assert repository.filename_metadata(settings)["guide.md"].chunk_count == 5
+    metadata = repository.filename_metadata(settings)
+    assert {name: meta.chunk_count for name, meta in metadata.items()} == {
+        "guide.md": 5,
+        "other.md": 1,
+    }
 
 
 def test_filename_metadata_reports_the_oldest_chunker_version_and_legacy_as_none() -> None:

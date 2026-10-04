@@ -1,7 +1,8 @@
 import { render } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import ChatThread from '../../src/components/ChatThread';
 import type { ChatTurn } from '../../src/components/ChatMessage';
+import { loadMarkdown } from '../../src/components/markdownLoader';
 
 // Counts renders of the markdown body, keyed by its content — the streaming turn's
 // content changes every delta (a new key each time, which is expected and not
@@ -29,6 +30,10 @@ function makeTurn(overrides: Partial<ChatTurn>): ChatTurn {
 }
 
 describe('ChatThread memoization', () => {
+  // Loaded (with the stub above) before the first render, as in the app after boot.
+  beforeAll(async () => {
+    await loadMarkdown();
+  });
   beforeEach(() => renderCounts.clear());
   afterEach(() => vi.clearAllMocks());
 

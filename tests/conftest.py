@@ -3,7 +3,8 @@
 Guards test isolation against a real developer ``.env``. Two separate leak paths exist:
 
 1. ``AppSettings`` itself reads ``.env`` (see ``api/settings.py``'s ``env_file=".env"``) —
-   every ``make_settings()`` helper already passes ``_env_file=None`` to disable this.
+   ``tests/factories.py:make_test_settings`` (behind every ``make_settings()`` helper)
+   passes ``_env_file=None`` to disable this.
 2. ``litellm`` calls ``dotenv.load_dotenv()`` at import time (``litellm/__init__.py``),
    which copies real ``.env`` values into the actual process ``os.environ`` as a side
    effect. ``_env_file=None`` does NOT protect against this — pydantic-settings always

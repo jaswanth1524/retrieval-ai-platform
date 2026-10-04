@@ -89,11 +89,14 @@ behaviour except the PDF caps (`MAX_PDF_PAGES=2000`, `MAX_OCR_PAGES=100`).
 - Frontend: a partly streamed answer whose connection fails is marked incomplete and
   kept out of history; dropping a file outside the corpus panel no longer navigates
   away; no duplicate empty "New chat" after a reload; iOS layout uses `100dvh`; the
-  composer no longer pops the keyboard after each answer on touch screens.
+  composer no longer pops the keyboard after each answer on touch screens; the
+  conversation delete confirm's Cancel button is visible in the light theme.
 
 ### Features
 - `POST /search`: ranked passages without an answer (works with the LLM down).
-- `DELETE /documents/jobs/{id}`: cancel an ingest job before it writes anything.
+- `DELETE /documents/jobs/{id}`: cancel an ingest job before it writes anything; the
+  corpus panel's indexing cards have a Cancel button (also stops an upload still waiting
+  for room in the queue).
 - `POST /import`: restore a `/export` backup (originals, tags, upload times, feedback).
 - `GET /access`: which key the caller holds; the UI hides what the read-only key
   can't do.
@@ -108,6 +111,11 @@ behaviour except the PDF caps (`MAX_PDF_PAGES=2000`, `MAX_OCR_PAGES=100`).
 - While streaming, only the markdown block still growing is re-parsed per token.
 - The corpus panel and conversation list no longer re-render on every token.
 - History writes to IndexedDB are coalesced; uploads go two at a time.
+- The markdown renderer is loaded after the first paint, not with the app: the first
+  load fetches 280 KB of JavaScript instead of 435 KB (88 KB gzipped instead of 135 KB).
+- The chat header no longer re-renders on every token.
+- Screen readers hear answer progress from one status line for the thread instead of
+  one region per message (and "Answer ready." only for an answer they watched arrive).
 
 ### Operations
 - Docker: the runtime stage is plain `python:3.12-slim` (no uv); base images pinned
@@ -121,6 +129,11 @@ behaviour except the PDF caps (`MAX_PDF_PAGES=2000`, `MAX_OCR_PAGES=100`).
 - `api/main.py` split into `api/routes/*`, `api/ingest_jobs.py`, `api/sse.py` and
   `api/error_handlers.py`; `api/generation.py` into `api/llm.py`, `api/prompting.py`
   and `api/citations.py`; format parsers into `api/parsers/*`. No API change.
+- Removed `retrieve_candidates`, `rerank_candidates` and `filename_chunk_counts`, used
+  only by tests (which now exercise the production paths); test settings are built by
+  `tests/factories.py`.
+- Frontend: `useCommands` (palette list and shortcuts), `ConfirmInline` (the three
+  inline delete/clear confirms), one metadata record per document in `useCorpus`.
 
 ### Evaluation
 - `relevant_passages` labels (resolved to chunk ids at run time) and nDCG@k.

@@ -7,12 +7,14 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        // Third-party code changes far less often than app code; separate chunks keep
-        // a returning browser's cached copy valid across app-only deploys.
+        // React changes far less often than app code; its own chunk keeps a returning
+        // browser's cached copy valid across app-only deploys. Everything else is left
+        // to Rollup, which puts the markdown renderer's packages in the lazy Markdown
+        // chunk (only that chunk imports them) — a catch-all "vendor" chunk would be
+        // loaded up front the moment any eagerly imported package landed in it.
         manualChunks(id) {
-          if (!id.includes('node_modules')) return undefined;
           if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) return 'react';
-          return 'vendor';
+          return undefined;
         },
       },
     },

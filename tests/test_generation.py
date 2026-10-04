@@ -29,6 +29,7 @@ from api.generation import (
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 class FakeGenerator:
@@ -97,7 +98,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "llm_max_tokens": 512,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_chunk(chunk_id: str, text: str, page: int = 1) -> RerankedChunk:
