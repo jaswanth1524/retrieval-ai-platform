@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -1525,24 +1526,26 @@ def test_expansion_variants_are_searched_side_by_side() -> None:
         "guide.txt", b"Intro\nalpha beta"
     )
 
-    class SlowRepository(CountingRepository):
+    # All four searches (the question plus three variants) must be in flight at once:
+    # run one after another, the first would wait at the barrier alone and break it.
+    # Deterministic, unlike the wall-clock bound this replaced.
+    all_in_flight = threading.Barrier(4, timeout=5)
+
+    class BarrierRepository(CountingRepository):
         def hybrid_search(self, *args: Any, **kwargs: Any) -> Any:
-            time.sleep(0.3)
+            all_in_flight.wait()
             return super().hybrid_search(*args, **kwargs)
 
-    slow = SlowRepository(inner)
+    repository = BarrierRepository(inner)
     pipeline = RagPipeline(
-        repository=slow,  # type: ignore[arg-type]
+        repository=repository,  # type: ignore[arg-type]
         embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
         reranker=FakeReranker(),
         generator=SequencedGenerator(["one\ntwo\nthree", "Alpha is documented [1]."]),
         settings=settings,
     )
 
-    started = time.monotonic()
     pipeline.answer("alpha", use_cache=False)
-    elapsed = time.monotonic() - started
 
-    assert slow.search_calls == 4
-    # Four 0.3 s searches one after another would take 1.2 s.
-    assert elapsed < 0.9
+    assert repository.search_calls == 4
+    assert not all_in_flight.broken

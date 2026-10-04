@@ -44,7 +44,10 @@ jobs:
         run: uv sync --locked --extra dev
 
       - name: Run tests
-        run: uv run pytest
+        # Coverage on one leg only: the numbers are the same on both, and it slows the run.
+        run: >-
+          uv run pytest
+          ${{ matrix.python-version == '3.12' && '--cov=api --cov=eval --cov-report=term-missing:skip-covered' || '' }}
 
       - name: Lint
         run: uv run ruff check .

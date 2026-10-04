@@ -349,12 +349,14 @@ def test_ingest_chunks_serializes_concurrent_ingests_of_the_same_filename() -> N
             self._inner.upsert(settings, points)
             if self._is_a:
                 record("a_upserted")
+                a_holds_the_lock.set()
                 time.sleep(0.2)
 
         def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
             record("a_deleted" if self._is_a else "b_deleted")
             self._inner.delete_by_ids(settings, point_ids)
 
+    a_holds_the_lock = threading.Event()
     repo_a = DelayingRepository(inner, is_a=True)
     repo_b = DelayingRepository(inner, is_a=False)
 
@@ -365,11 +367,10 @@ def test_ingest_chunks_serializes_concurrent_ingests_of_the_same_filename() -> N
         future_a = pool.submit(
             ingest_chunks, repo_a, settings, [chunk_a], FakeEmbeddingProvider([make_embedding(0.1)])
         )
-        # Give A a head start so it reaches its post-upsert sleep (still holding the
-        # lock) before B attempts to start — without this, B could win the race for
-        # the lock instead of A, which would still pass but wouldn't exercise the
-        # intended window.
-        time.sleep(0.05)
+        # Start B only once A is inside its post-upsert window (still holding the lock),
+        # so B really contends for it — otherwise B could win the race for the lock
+        # instead of A, which would still pass but wouldn't exercise the window.
+        assert a_holds_the_lock.wait(timeout=5.0)
         future_b = pool.submit(
             ingest_chunks, repo_b, settings, [chunk_b], FakeEmbeddingProvider([make_embedding(0.2)])
         )
