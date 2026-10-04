@@ -9,7 +9,7 @@ import type {
 } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
-import { chatStoreAvailable, loadChatStore, saveChatStore } from './chatStore';
+import { chatStoreAvailable, clearChatStore, loadChatStore, saveChatStore } from './chatStore';
 
 // Mirrors the server's own REQUEST_HISTORY_MAX_MESSAGES cap (api/schemas.py) — kept
 // in sync so a client-side trim never silently disagrees with what the server would
@@ -56,8 +56,9 @@ export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
       (turn.role === 'user' || turn.role === 'assistant') &&
       turn.content.trim().length > 0 &&
       // A stopped answer is a fragment; sent back as history it reads to the model as
-      // what it actually concluded.
-      !turn.stopped,
+      // what it actually concluded. Same for one cut short by a failed connection.
+      !turn.stopped &&
+      !turn.incomplete,
     )
     .slice(-HISTORY_MAX_MESSAGES);
 
@@ -130,6 +131,9 @@ export interface UseChatResult {
   setScope: (scope: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => void;
   /** Drop names that are no longer indexed from every conversation's scope. */
   pruneScopes: (indexedFilenames: string[]) => void;
+  /** Drop just these filenames from every conversation's scope. Unlike pruneScopes it
+   *  needs no snapshot of the whole corpus, which can be stale by the time it runs. */
+  removeFromScopes: (filenames: string[]) => void;
   ask: (
     question: string,
     provider?: LlmProvider,
@@ -235,10 +239,13 @@ function compactForStorage(conversation: Conversation, maxTurns: number): Conver
 type PersistOutcome = 'saved' | 'partial' | 'failed';
 
 /** Write the store to localStorage, falling back to the active conversation alone. */
+function isOnlyEmpty(storage: ChatStorageV2): boolean {
+  return storage.conversations.length === 1 && storage.conversations[0].turns.length === 0;
+}
+
 function persistStorage(storage: ChatStorageV2): PersistOutcome {
   const { conversations, activeConversationId } = storage;
-  const onlyEmpty = conversations.length === 1 && conversations[0].turns.length === 0;
-  if (onlyEmpty) {
+  if (isOnlyEmpty(storage)) {
     try {
       localStorage.removeItem(CHAT_STORAGE_KEY);
     } catch {
@@ -468,7 +475,9 @@ export function useChat(): UseChatResult {
     let cancelled = false;
     void loadChatStore().then((raw) => {
       if (cancelled) return;
-      const incoming = parseConversations(raw);
+      // An empty conversation holds nothing to restore, and merging one in next to the
+      // fresh one this load already made showed two "New chat" rows.
+      const incoming = parseConversations(raw)?.filter((c) => c.turns.length > 0);
       if (incoming && incoming.length > 0) {
         setStorage((prev) => mergeConversations(prev, incoming, true));
       }
@@ -493,7 +502,9 @@ export function useChat(): UseChatResult {
     setPersistPartial(outcome === 'partial');
     if (!chatStoreReady || !chatStoreAvailable()) return;
     let current = true;
-    void saveChatStore(storage).then((saved) => {
+    // Mirrors persistStorage: a lone empty conversation clears the store rather than
+    // being saved, so it can't come back next to a new one after a reload.
+    void (isOnlyEmpty(storage) ? clearChatStore() : saveChatStore(storage)).then((saved) => {
       // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
       if (saved && current) {
         setPersistError(false);
@@ -688,7 +699,17 @@ export function useChat(): UseChatResult {
         );
       } else {
         const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
-        setActiveTurns((prev) => [...prev, { ...makeTurn('error', message), question }]);
+        // Whatever streamed before the failure is a fragment. Left unmarked it read as a
+        // finished answer: it offered Regenerate and feedback, and went back to the
+        // model as history on the next question.
+        // (An assistant turn with no text yet is kept as it was: it carries the trace
+        // link to the partial server-side trace.)
+        setActiveTurns((prev) => [
+          ...prev.map((turn) =>
+            turn.id === assistantTurnId && turn.content !== '' ? { ...turn, incomplete: true } : turn,
+          ),
+          { ...makeTurn('error', message), question },
+        ]);
       }
     } finally {
       flushDelta();
@@ -803,13 +824,12 @@ export function useChat(): UseChatResult {
     [],
   );
 
-  const pruneScopes = useCallback((indexedFilenames: string[]) => {
-    const indexed = new Set(indexedFilenames);
+  const keepInScopes = useCallback((keep: (filename: string) => boolean) => {
     setStorage((prev) => {
       let changed = false;
       const conversations = prev.conversations.map((conversation) => {
         const filenames = conversation.scope?.filenames ?? [];
-        const kept = filenames.filter((name) => indexed.has(name));
+        const kept = filenames.filter(keep);
         if (kept.length === filenames.length) return conversation;
         changed = true;
         return { ...conversation, scope: { tags: conversation.scope?.tags ?? [], filenames: kept } };
@@ -817,6 +837,22 @@ export function useChat(): UseChatResult {
       return changed ? { ...prev, conversations } : prev;
     });
   }, []);
+
+  const pruneScopes = useCallback(
+    (indexedFilenames: string[]) => {
+      const indexed = new Set(indexedFilenames);
+      keepInScopes((name) => indexed.has(name));
+    },
+    [keepInScopes],
+  );
+
+  const removeFromScopes = useCallback(
+    (filenames: string[]) => {
+      const removed = new Set(filenames);
+      keepInScopes((name) => !removed.has(name));
+    },
+    [keepInScopes],
+  );
 
   // Stable identities (pending is read through a ref) so components receiving these
   // don't re-render on every streamed delta.
@@ -935,6 +971,7 @@ export function useChat(): UseChatResult {
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
     setScope,
     pruneScopes,
+    removeFromScopes,
     editAndResend,
     importConversation,
     pending,

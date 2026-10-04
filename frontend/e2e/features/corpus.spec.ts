@@ -96,3 +96,24 @@ test('an upload turned away by a full indexing queue waits and goes through', as
     page.getByTestId('corpus-panel-item').filter({ hasText: 'queued.md' }).getByLabel('Delete queued.md'),
   ).toBeVisible();
 });
+
+test('a file dropped on the chat uploads instead of the browser opening it', async ({ page }) => {
+  await page.getByTestId('rail-chat').click();
+  const transfer = await page.evaluateHandle(() => {
+    const data = new DataTransfer();
+    data.items.add(new File(['# Dropped'], 'dropped.md', { type: 'text/markdown' }));
+    return data;
+  });
+  const thread = page.locator('.app-main');
+
+  await thread.dispatchEvent('dragenter', { dataTransfer: transfer });
+  await expect(page.getByTestId('app-drop-overlay')).toBeVisible();
+  await thread.dispatchEvent('dragover', { dataTransfer: transfer });
+  await thread.dispatchEvent('drop', { dataTransfer: transfer });
+
+  await expect(page.getByTestId('app-drop-overlay')).toHaveCount(0);
+  await expect(
+    page.getByTestId('corpus-panel-item').filter({ hasText: 'dropped.md' }).getByLabel('Delete dropped.md'),
+  ).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+});

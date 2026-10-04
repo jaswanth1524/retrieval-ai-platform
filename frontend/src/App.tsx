@@ -29,8 +29,10 @@ import TracesPanel from './components/TracesPanel';
 import { useChat } from './hooks/useChat';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
+import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
 import { newId } from './utils/id';
+import { DEFAULT_MAX_UPLOAD_BYTES, validateUploads } from './utils/uploadValidation';
 
 // Dialogs and the inspector render only on demand, so they load on demand too: the
 // first paint (thread + composer) no longer waits on their code.
@@ -145,6 +147,8 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
+  const [exportingBackup, setExportingBackup] = useState(false);
+  const exportingRef = useRef(false);
   const { tooNarrowForInspector, roomyEnoughForInspector, panelCollapsed } = useResponsiveLayout();
   // Narrow screens only: whether the context panel's drawer is showing. On wider screens
   // the panel is a grid column and this is ignored.
@@ -176,6 +180,7 @@ function App() {
     scope,
     setScope,
     pruneScopes,
+    removeFromScopes,
     editAndResend,
     importConversation,
   } = useChat();
@@ -576,7 +581,7 @@ function App() {
     await api.deleteDocument(filename);
     // A deleted document can never remain in the corpus or the active search scope.
     setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
-    pruneScopes(indexedFilenames.filter((name) => name !== filename));
+    removeFromScopes([filename]);
     const without = (prev: Record<string, number>) => {
       if (!(filename in prev)) return prev;
       const next = { ...prev };
@@ -617,6 +622,26 @@ function App() {
   );
 
   const apiReachable = apiStatus === 'ok';
+
+  // Files dropped anywhere outside the corpus panel's own dropzone upload directly
+  // (that dropzone stages them for review instead).
+  const fileDragActive = useWindowFileDrop(apiReachable, (files) => {
+    const { accepted, rejected } = validateUploads(
+      files,
+      config?.max_upload_bytes ?? DEFAULT_MAX_UPLOAD_BYTES,
+    );
+    if (rejected.length > 0) {
+      pushToast({
+        tone: 'warn',
+        title: `${rejected.length} file${rejected.length === 1 ? '' : 's'} not uploaded`,
+        body: rejected.map((item) => item.message).join(' '),
+      });
+    }
+    if (accepted.length > 0) {
+      setRail('corpus');
+      void handleUpload(accepted);
+    }
+  });
   const noDocs = indexedFilenames.length === 0;
   // Auth takes precedence over noDocs: when the corpus list 401s, "no documents" is a
   // symptom, and telling the user to upload one would send them at a call that 401s too.
@@ -879,17 +904,29 @@ function App() {
         id: 'export-corpus',
         glyph: '⇩',
         label: 'Download a backup of all documents (zip)',
+        // Building the zip can take a while for a large corpus; without a guard every
+        // impatient re-run started another full export on the server.
+        disabled: exportingBackup,
         run: () => {
+          if (exportingRef.current) return;
+          exportingRef.current = true;
+          setExportingBackup(true);
+          pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
           api
             .exportCorpus()
             .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
-            .catch((err) =>
+            .catch((err) => {
+              if (noteAuthFailure(err)) return;
               pushToast({
                 tone: 'bad',
                 title: 'Backup failed',
                 body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
-              }),
-            );
+              });
+            })
+            .finally(() => {
+              exportingRef.current = false;
+              setExportingBackup(false);
+            });
         },
       },
       {
@@ -931,6 +968,7 @@ function App() {
       panelCollapsed,
       conversations,
       activeConversationId,
+      exportingBackup,
     ],
   );
   commandsRef.current = commands;
@@ -969,6 +1007,11 @@ function App() {
 
   return (
     <div className="app-shell">
+      {fileDragActive && (
+        <div className="app-drop-overlay" data-testid="app-drop-overlay">
+          <p>Drop to upload</p>
+        </div>
+      )}
       <input
         ref={importInputRef}
         type="file"

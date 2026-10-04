@@ -14,6 +14,8 @@ interface DocumentViewerProps {
 // Chunks either side of the cited target fetched on open, and fetched per Load
 // earlier/later. The server pages by ordinal (GET /documents/{f}/content?around=), so a
 // citation deep in a large document costs one small page, not the whole document.
+// Mirrors CONTENT_UNPAGED_MAX_CHUNKS (api/main.py): the most one unpaged request returns.
+const UNPAGED_MAX_CHUNKS = 2000;
 const WINDOW_RADIUS = 30;
 
 interface Loaded {
@@ -206,7 +208,9 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
               disabled={loadingMore}
               data-testid="viewer-show-all"
             >
-              Show all {loaded.total} chunks
+              {loaded.total > UNPAGED_MAX_CHUNKS
+                ? `Show the first ${UNPAGED_MAX_CHUNKS} chunks`
+                : `Show all ${loaded.total} chunks`}
             </button>
           )}
         </div>

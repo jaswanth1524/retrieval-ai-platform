@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { ChatTurn } from './ChatMessage';
+import { shortcutLabel } from '../utils/platform';
 import './ChatHeader.css';
 
 export type ChatMode = 'reader' | 'engineer';
@@ -141,7 +142,7 @@ function ChatHeader({
       <button type="button" className="chat-header__palette" onClick={onOpenPalette} data-testid="open-palette">
         <span aria-hidden="true">⌕</span>
         <span className="chat-header__palette-label">Search or run a command</span>
-        <kbd className="chat-header__kbd">⌘K</kbd>
+        <kbd className="chat-header__kbd">{shortcutLabel('⌘K')}</kbd>
       </button>
       <button
         type="button"

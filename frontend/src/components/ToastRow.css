@@ -9,6 +9,11 @@
   margin: 0 auto;
 }
 
+/* Kept in the DOM (and the accessibility tree) as an empty live region. */
+.toast-row--empty {
+  padding: 0;
+}
+
 .toast {
   display: flex;
   align-items: flex-start;

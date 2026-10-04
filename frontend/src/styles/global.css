@@ -22,7 +22,27 @@ body {
   grid-template-columns: var(--w-rail) minmax(0, var(--w-panel)) minmax(340px, 1fr) auto;
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+  /* The visible viewport on mobile: iOS Safari's 100vh includes the area behind its
+     toolbar, which pushed the composer below the fold. */
+  height: 100dvh;
   overflow: hidden;
+}
+
+/* Shown while files are dragged over the window (useWindowFileDrop). Pointer events
+   pass through so the drop lands on whatever is underneath. */
+.app-drop-overlay {
+  position: fixed;
+  inset: 12px;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--paper) 85%, transparent);
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 600;
+  pointer-events: none;
 }
 
 .app-shell > * {

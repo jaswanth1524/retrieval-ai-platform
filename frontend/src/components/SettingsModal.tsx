@@ -151,6 +151,15 @@ function SettingsModal({
                   {config.openai_available ? 'key configured' : 'no key'}
                 </span>
               </div>
+              {config.openai_compatible_available && (
+                <div className="settings__provider" data-testid="settings-provider-openai-compatible">
+                  <span className="settings__provider-name">OpenAI-compatible</span>
+                  <span className="settings__provider-model mono">
+                    {config.openai_compatible_model}
+                  </span>
+                  <span className="settings__provider-status mono">configured</span>
+                </div>
+              )}
             </div>
           </section>
 

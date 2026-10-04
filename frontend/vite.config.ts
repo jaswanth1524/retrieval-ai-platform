@@ -26,6 +26,10 @@ export default defineConfig({
       '/questions': 'http://localhost:8000',
       '/traces': 'http://localhost:8000',
       '/feedback': 'http://localhost:8000',
+      // Without these the dev server answered with index.html: "Download a backup"
+      // saved the app's HTML as the zip.
+      '/export': 'http://localhost:8000',
+      '/metrics': 'http://localhost:8000',
     },
   },
   test: {

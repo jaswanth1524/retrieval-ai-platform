@@ -26,6 +26,10 @@ interface ComposerProps {
   onSelectedTagsChange?: (tags: string[]) => void;
 }
 
+function isCoarsePointer(): boolean {
+  return typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+}
+
 function Composer({
   onSubmit,
   disabled,
@@ -50,10 +54,13 @@ function Composer({
   const wrapRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Hand focus back when an answer settles (a click on Stop moved it to the button), so
-  // the next question can be typed straight away.
+  // the next question can be typed straight away. Not on touch screens: focusing there
+  // opens the on-screen keyboard over the answer that just arrived.
   const wasPendingRef = useRef(pending);
   useEffect(() => {
-    if (wasPendingRef.current && !pending && !disabled) textareaRef.current?.focus();
+    if (wasPendingRef.current && !pending && !disabled && !isCoarsePointer()) {
+      textareaRef.current?.focus();
+    }
     wasPendingRef.current = pending;
   }, [pending, disabled]);
   // "/" anywhere outside a text field jumps to the question box, as in most chat apps.

@@ -155,6 +155,30 @@ describe('useChat', () => {
     expect(result.current.turns[2]).toMatchObject({ role: 'error' });
   });
 
+  it('marks a partly streamed answer incomplete when the stream then fails, and keeps it out of history', async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onSources?.([], 'trace-3');
+        handlers.onDelta?.('Alpha is half');
+        throw new ApiClientError('The connection was lost.');
+      },
+    );
+
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('alpha');
+    });
+
+    expect(result.current.turns[1]).toMatchObject({
+      role: 'assistant',
+      content: 'Alpha is half',
+      incomplete: true,
+    });
+    expect(result.current.turns[2]).toMatchObject({ role: 'error', question: 'alpha' });
+    expect(buildHistory(result.current.turns)).toEqual([{ role: 'user', content: 'alpha' }]);
+  });
+
   it('appends an error turn with the ApiClientError message on failure, with no stray assistant turn', async () => {
     askQuestionStreamMock.mockRejectedValue(
       new ApiClientError('Re-ingest documents before querying.', 409),
@@ -960,6 +984,17 @@ describe('useChat feature pack', () => {
 });
 
 describe('useChat scope updates', () => {
+  it('removes only the named documents from scopes, without a corpus snapshot', () => {
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.setScope({ filenames: ['a.pdf', 'new.pdf'], tags: [] }));
+
+    // 'new.pdf' finished uploading while the delete of 'a.pdf' was in flight; a prune
+    // against the pre-delete corpus list would have dropped it too.
+    act(() => result.current.removeFromScopes(['a.pdf']));
+
+    expect(result.current.scope.filenames).toEqual(['new.pdf']);
+  });
+
   it('applies two scope updaters in one tick without one undoing the other', () => {
     const { result } = renderHook(() => useChat());
     act(() => result.current.setScope({ filenames: ['a.pdf'], tags: ['legal'] }));

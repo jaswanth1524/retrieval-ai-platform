@@ -2,6 +2,13 @@ import { useRef, useState } from 'react';
 import type { DragEvent, RefObject } from 'react';
 import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
+import {
+  ACCEPTED_EXTENSIONS,
+  DEFAULT_MAX_UPLOAD_BYTES,
+  formatBytes,
+  validateUploads,
+} from '../utils/uploadValidation';
+import type { RejectedFile } from '../utils/uploadValidation';
 import './CorpusPanel.css';
 
 // Both are structural details of UploadItem below and have no consumers outside this
@@ -27,17 +34,6 @@ export interface UploadItem {
   /** A re-index of the stored original rather than an upload — retried the same way. */
   reindex?: boolean;
 }
-
-interface RejectedFile {
-  filename: string;
-  message: string;
-}
-
-// Matches the backend's AppSettings.max_upload_bytes default — used only until
-// /config has loaded and supplies the server's actual configured limit.
-const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
-// Mirrors api/documents.py SUPPORTED_EXTENSIONS.
-const ACCEPTED_EXTENSIONS = ['.pdf', '.txt', '.md', '.markdown', '.docx', '.html', '.htm', '.csv'];
 
 interface CorpusPanelProps {
   filenames: string[];
@@ -157,10 +153,6 @@ function TagEditor({ filename, tags, disabled, onSave }: TagEditorProps) {
   );
 }
 
-function formatBytes(bytes: number): string {
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf('.');
   return dot === -1 ? '' : filename.slice(dot + 1).toUpperCase();
@@ -220,26 +212,7 @@ function CorpusPanel({
 
   const handleFilesChange = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
-    const accepted: File[] = [];
-    const rejected: RejectedFile[] = [];
-    Array.from(fileList).forEach((file) => {
-      // The input's `accept` filters the picker only; a drop bypasses it, and an
-      // unsupported file used to cost a round trip to learn the server rejects it.
-      const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-      if (!file.name.includes('.') || !ACCEPTED_EXTENSIONS.includes(extension)) {
-        rejected.push({
-          filename: file.name,
-          message: `${file.name} isn't a supported type (${ACCEPTED_EXTENSIONS.join(' ')}).`,
-        });
-      } else if (file.size > maxUploadBytes) {
-        rejected.push({
-          filename: file.name,
-          message: `${file.name} is too large (${formatBytes(file.size)}). Maximum is ${formatBytes(maxUploadBytes)}.`,
-        });
-      } else {
-        accepted.push(file);
-      }
-    });
+    const { accepted, rejected } = validateUploads(Array.from(fileList), maxUploadBytes);
     setRejectedFiles(rejected);
     setStagedFiles((prev) => [...prev, ...accepted]);
   };

@@ -50,6 +50,9 @@ export interface ChatTurn {
   feedback?: FeedbackRating;
   // Stopped by the user partway: the content is a fragment, not the whole answer.
   stopped?: boolean;
+  // Cut off by a failed connection partway: also a fragment (the error turn after it
+  // carries the Retry).
+  incomplete?: boolean;
   // Served from the server's answer cache rather than generated for this question.
   cached?: boolean;
 }
@@ -286,6 +289,15 @@ function ChatMessage({
                   stopped
                 </span>
               )}
+              {turn.incomplete && (
+                <span
+                  className="chat-message__flag"
+                  title="The connection failed before this answer finished"
+                  data-testid="chat-message-incomplete"
+                >
+                  incomplete
+                </span>
+              )}
               {turn.cached && (
                 <span
                   className="chat-message__flag"
@@ -311,7 +323,7 @@ function ChatMessage({
                   {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
                 </button>
               )}
-              {turn.content && regenerateQuestion && onRetry && !streamStage && (
+              {turn.content && regenerateQuestion && onRetry && !streamStage && !turn.incomplete && (
                 <button
                   type="button"
                   className="chat-message__regenerate"
@@ -322,7 +334,12 @@ function ChatMessage({
                   Regenerate
                 </button>
               )}
-              {turn.content && feedbackEnabled && regenerateQuestion && onFeedback && !streamStage && (
+              {turn.content &&
+                feedbackEnabled &&
+                regenerateQuestion &&
+                onFeedback &&
+                !streamStage &&
+                !turn.incomplete && (
                 <div className="chat-message__feedback" role="group" aria-label="Rate this answer">
                   <button
                     type="button"
