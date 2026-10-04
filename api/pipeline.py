@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -798,12 +798,20 @@ class RagPipeline:
                 }
                 return
         done: DoneEvent | None = None
-        for event in self._answer_stream_uncached(
+        events = self._answer_stream_uncached(
             question, overrides, filenames, history, tags, should_stop
-        ):
-            if event["type"] == "done":
-                done = event
-            yield event
+        )
+        try:
+            for event in events:
+                if event["type"] == "done":
+                    done = event
+                yield event
+        finally:
+            # Closing this generator (the client left) must close the inner one now: its
+            # `finally` records the "closed early" trace. Left to garbage collection, it
+            # ran whenever the inner generator was freed — never, while anything (a
+            # tracer, a traceback) still held it.
+            events.close()
         if key is not None and done is not None and self._answer_cache is not None:
             self._answer_cache.put(
                 key,
@@ -932,7 +940,7 @@ class RagPipeline:
         history: Sequence[ChatMessage] | None = None,
         tags: Sequence[str] | None = None,
         should_stop: Callable[[], bool] | None = None,
-    ) -> Iterator[StreamEvent]:
+    ) -> Generator[StreamEvent]:
         """Stream a grounded answer as SSE-ready events: sources, deltas, then done.
 
         Sources are emitted immediately after rerank (before the LLM call starts) so

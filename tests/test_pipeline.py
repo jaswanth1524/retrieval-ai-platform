@@ -816,11 +816,26 @@ def test_rag_pipeline_answer_stream_records_partial_trace_on_mid_stream_error() 
     assert trace.answer == "partial"
 
 
-def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_close() -> None:
+def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A client disconnecting mid-stream closes the generator (GeneratorExit) before
     any `except Exception`/success path runs — the `finally` clause must still record
-    a trace rather than silently dropping it."""
+    a trace rather than silently dropping it.
 
+    The inner (uncached) stream is kept referenced here, as a tracer or a traceback can:
+    closing must reach it directly, not when garbage collection frees it (CI under
+    coverage lost the trace that way)."""
+
+    held: list[Any] = []
+    uncached = RagPipeline._answer_stream_uncached
+
+    def still_referenced(self: RagPipeline, *args: Any, **kwargs: Any) -> Any:
+        events = uncached(self, *args, **kwargs)
+        held.append(events)
+        return events
+
+    monkeypatch.setattr(RagPipeline, "_answer_stream_uncached", still_referenced)
     settings = make_settings()
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
