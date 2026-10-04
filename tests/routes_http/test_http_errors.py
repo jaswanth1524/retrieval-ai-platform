@@ -26,15 +26,12 @@ from api.dependencies import (
     get_token_counter,
 )
 from api.documents import EmptyDocumentError
+from api.errors import question_error_type
 from api.generation import GenerationConfigError, GenerationError
+from api.ingest_jobs import ingest_error_type, job_error_message
 from api.ingestion import IngestionError
 from api.jobs import IngestBacklog
-from api.main import (
-    _ingest_error_type,
-    _job_error_message,
-    _question_error_type,
-    create_app,
-)
+from api.main import create_app
 from api.qdrant_schema import (
     CollectionSchemaError,
     VectorStoreUnavailableError,
@@ -186,7 +183,7 @@ def test_api_key_non_ascii_header_is_401_not_500() -> None:
 
 def test_job_error_message_keeps_known_domain_error_text() -> None:
     exc = EmptyDocumentError("Document has no extractable text to chunk.")
-    assert _job_error_message(exc) == "Document has no extractable text to chunk."
+    assert job_error_message(exc) == "Document has no extractable text to chunk."
 
 
 def test_job_error_message_redacts_unexpected_exception_text() -> None:
@@ -196,17 +193,17 @@ def test_job_error_message_redacts_unexpected_exception_text() -> None:
     server-side."""
 
     exc = ValueError("unexpected: /internal/config/path leaked here")
-    message = _job_error_message(exc)
+    message = job_error_message(exc)
     assert message == "Ingestion failed due to an unexpected server error."
     assert "/internal/config/path" not in message
 
 
 def test_ingest_error_type_classifies_known_domain_errors() -> None:
-    assert _ingest_error_type(EmptyDocumentError("x")) == "document"
-    assert _ingest_error_type(IngestionError("x")) == "ingestion"
-    assert _ingest_error_type(VectorStoreUnavailableError("x")) == "vector_store_unavailable"
-    assert _ingest_error_type(CollectionSchemaError("x")) == "collection_schema"
-    assert _ingest_error_type(ValueError("x")) == "unexpected"
+    assert ingest_error_type(EmptyDocumentError("x")) == "document"
+    assert ingest_error_type(IngestionError("x")) == "ingestion"
+    assert ingest_error_type(VectorStoreUnavailableError("x")) == "vector_store_unavailable"
+    assert ingest_error_type(CollectionSchemaError("x")) == "collection_schema"
+    assert ingest_error_type(ValueError("x")) == "unexpected"
 
 
 def test_question_error_type_prefers_the_most_specific_subclass() -> None:
@@ -214,13 +211,13 @@ def test_question_error_type_prefers_the_most_specific_subclass() -> None:
     subclasses of RetrievalError/GenerationError respectively — a parent-first check
     would misclassify every subclass instance as its broader parent."""
 
-    assert _question_error_type(RetrievalPayloadError("x")) == "retrieval_payload"
-    assert _question_error_type(RetrievalConfigError("x")) == "retrieval_config"
-    assert _question_error_type(RetrievalError("x")) == "retrieval"
-    assert _question_error_type(GenerationConfigError("x")) == "generation_config"
-    assert _question_error_type(GenerationError("x")) == "generation"
-    assert _question_error_type(RerankingError("x")) == "reranking"
-    assert _question_error_type(ValueError("x")) == "unexpected"
+    assert question_error_type(RetrievalPayloadError("x")) == "retrieval_payload"
+    assert question_error_type(RetrievalConfigError("x")) == "retrieval_config"
+    assert question_error_type(RetrievalError("x")) == "retrieval"
+    assert question_error_type(GenerationConfigError("x")) == "generation_config"
+    assert question_error_type(GenerationError("x")) == "generation"
+    assert question_error_type(RerankingError("x")) == "reranking"
+    assert question_error_type(ValueError("x")) == "unexpected"
 
 
 def test_question_stream_redacts_an_unexpected_exception(api_context: ApiTestContext) -> None:

@@ -211,8 +211,8 @@ def test_shutdown_lets_a_running_ingest_finish(api_context: ApiTestContext) -> N
 def test_a_queued_job_cancelled_by_shutdown_is_failed_and_frees_its_bytes() -> None:
     from concurrent.futures import Future
 
+    from api.ingest_jobs import finish_ingest_future
     from api.jobs import INTERRUPTED_JOB_ERROR, IngestJobStore
-    from api.main import _finish_ingest_future
 
     backlog = IngestBacklog(max_bytes=100)
     assert backlog.try_reserve(40)
@@ -220,7 +220,7 @@ def test_a_queued_job_cancelled_by_shutdown_is_failed_and_frees_its_bytes() -> N
     job = job_store.create("queued.txt")
     future: Future[None] = Future()
     future.add_done_callback(
-        lambda done: _finish_ingest_future(done, lambda: backlog.release(40), job_store, job.id)
+        lambda done: finish_ingest_future(done, lambda: backlog.release(40), job_store, job.id)
     )
 
     assert future.cancel()
@@ -886,7 +886,7 @@ def test_document_content_pages_around_a_chunk_or_by_ordinal_range(
 def test_unpaged_document_content_is_capped_but_reports_the_real_total(
     api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("api.main.CONTENT_UNPAGED_MAX_CHUNKS", 3)
+    monkeypatch.setattr("api.routes.documents.CONTENT_UNPAGED_MAX_CHUNKS", 3)
     client = api_context.client
     body = "\n\n".join(
         f"Section {i}\n" + " ".join(f"word{i}x{j}" for j in range(30)) for i in range(8)

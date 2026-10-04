@@ -368,7 +368,7 @@ def test_question_stream_disables_proxy_buffering(api_context: ApiTestContext) -
 
 
 def test_keepalive_pings_while_the_source_is_quiet_and_passes_errors_through() -> None:
-    from api.main import _with_keepalive
+    from api.sse import with_keepalive
 
     release = threading.Event()
 
@@ -378,7 +378,7 @@ def test_keepalive_pings_while_the_source_is_quiet_and_passes_errors_through() -
         yield "second"
         raise RuntimeError("boom")
 
-    stream = _with_keepalive(slow(), 0.01)
+    stream = with_keepalive(slow(), 0.01)
     assert next(stream) == "first"
     assert next(stream) is None  # quiet: a heartbeat instead of blocking
     release.set()
@@ -390,7 +390,7 @@ def test_keepalive_pings_while_the_source_is_quiet_and_passes_errors_through() -
 
 
 def test_keepalive_closes_the_source_when_the_client_goes_away() -> None:
-    from api.main import _with_keepalive
+    from api.sse import with_keepalive
 
     closed = threading.Event()
     produced = threading.Event()
@@ -405,7 +405,7 @@ def test_keepalive_closes_the_source_when_the_client_goes_away() -> None:
         finally:
             closed.set()
 
-    stream = _with_keepalive(endless(), 1.0)
+    stream = with_keepalive(endless(), 1.0)
     assert next(stream) == 1
     stream.close()
 
@@ -417,12 +417,12 @@ def test_a_disconnect_keeps_the_question_slot_until_the_pipeline_really_stops() 
     went on retrieving and reranking; a client reconnecting in a loop could run any
     number of them past MAX_CONCURRENT_QUESTIONS."""
 
-    from api.main import _StreamLease, _with_keepalive
+    from api.sse import StreamLease, with_keepalive
 
     slots = QuestionSlots(1)
     release = slots.try_acquire()
     assert release is not None
-    lease = _StreamLease(release)
+    lease = StreamLease(release)
     in_rerank = threading.Event()
     rerank_done = threading.Event()
 
@@ -432,7 +432,7 @@ def test_a_disconnect_keeps_the_question_slot_until_the_pipeline_really_stops() 
         rerank_done.wait(5)  # a long rerank, not interruptible mid-call
         yield "sources"
 
-    stream = _with_keepalive(pipeline(), 1.0, on_start=lease.hand_off, on_finish=lease.release)
+    stream = with_keepalive(pipeline(), 1.0, on_start=lease.hand_off, on_finish=lease.release)
     assert next(stream) == "searching"
     assert in_rerank.wait(2)
     stream.close()  # the client disconnects mid-rerank
@@ -451,12 +451,12 @@ def test_a_disconnect_keeps_the_question_slot_until_the_pipeline_really_stops() 
 
 
 def test_a_lease_never_handed_off_is_released_by_the_response() -> None:
-    from api.main import _StreamLease
+    from api.sse import StreamLease
 
     slots = QuestionSlots(1)
     release = slots.try_acquire()
     assert release is not None
-    lease = _StreamLease(release)
+    lease = StreamLease(release)
 
     # The client left before the first frame: the generator never ran.
     lease.release_if_not_handed_off()
@@ -469,7 +469,7 @@ def test_a_lease_never_handed_off_is_released_by_the_response() -> None:
 def test_keepalive_runs_the_source_in_the_callers_context() -> None:
     import contextvars
 
-    from api.main import _with_keepalive
+    from api.sse import with_keepalive
 
     marker: contextvars.ContextVar[str] = contextvars.ContextVar("marker", default="unset")
     marker.set("request-123")
@@ -477,7 +477,7 @@ def test_keepalive_runs_the_source_in_the_callers_context() -> None:
     def source() -> Generator[str]:
         yield marker.get()
 
-    assert [item for item in _with_keepalive(source(), 1.0) if item is not None] == ["request-123"]
+    assert [item for item in with_keepalive(source(), 1.0) if item is not None] == ["request-123"]
 
 
 def test_a_repeated_question_is_answered_from_the_cache(api_context: ApiTestContext) -> None:
