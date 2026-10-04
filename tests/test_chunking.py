@@ -43,7 +43,7 @@ class CharTokenCounter:
 
 
 def test_cjk_sentences_end_at_full_width_punctuation() -> None:
-    from api.documents import _SENTENCE_SPLIT_RE
+    from api.chunking import _SENTENCE_SPLIT_RE
 
     parts = [
         part for part in _SENTENCE_SPLIT_RE.split("第一句。第二句！第三句？ Next one. Done") if part
@@ -53,7 +53,7 @@ def test_cjk_sentences_end_at_full_width_punctuation() -> None:
 
 
 def test_an_over_budget_word_is_cut_into_budget_sized_pieces() -> None:
-    from api.documents import _split_oversized
+    from api.chunking import _split_oversized
 
     blob = "QUJD" * 100  # 400 characters, no whitespace: a base64 blob
 

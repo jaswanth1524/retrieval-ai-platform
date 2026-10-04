@@ -6,12 +6,14 @@ from typing import Any
 import pytest
 
 import api.documents as documents
+import api.parsers.docx as docx_parser
+import api.parsers.pdf as pdf_parser
 from api.documents import (
     DocumentSection,
     EmptyDocumentError,
-    _table_to_markdown,
     parse_document_bytes,
 )
+from api.parsers.pdf import _table_to_markdown
 from api.settings import AppSettings
 
 
@@ -95,9 +97,9 @@ def test_parse_pdf_appends_extracted_tables(monkeypatch: pytest.MonkeyPatch) -> 
             self.is_encrypted = False
             self.pages = [FakePage()]
 
-    monkeypatch.setattr(documents, "PdfReader", FakeReader)
+    monkeypatch.setattr(pdf_parser, "PdfReader", FakeReader)
     monkeypatch.setattr(
-        documents,
+        pdf_parser,
         "_extract_pdf_tables",
         lambda content, pages=None: {1: ["| metric | value |\n| --- | --- |\n| latency | 5ms |"]},
     )
@@ -121,8 +123,8 @@ def test_parse_pdf_without_text_and_no_ocr_extra_points_at_install(
             self.is_encrypted = False
             self.pages = [EmptyPage()]
 
-    monkeypatch.setattr(documents, "PdfReader", FakeReader)
-    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content, pages=None: {})
+    monkeypatch.setattr(pdf_parser, "PdfReader", FakeReader)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", lambda content, pages=None: {})
 
     # The rapidocr extra is not installed in the dev environment, so OCR import fails
     # and the error must point the user at the install command.
@@ -142,7 +144,7 @@ def test_parse_pdf_table_extraction_failure_degrades_to_text(
             self.is_encrypted = False
             self.pages = [FakePage()]
 
-    monkeypatch.setattr(documents, "PdfReader", FakeReader)
+    monkeypatch.setattr(pdf_parser, "PdfReader", FakeReader)
     # _extract_pdf_tables opening the fake bytes fails internally and returns {} (a
     # logged, swallowed failure) — the page text must still parse cleanly.
     sections = parse_document_bytes("doc.pdf", b"not a real pdf")
@@ -191,15 +193,15 @@ class _MixedReader:
 
 
 def test_parse_pdf_ocrs_scanned_pages_inside_a_mixed_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(documents, "PdfReader", _MixedReader)
-    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content, pages=None: {})
+    monkeypatch.setattr(pdf_parser, "PdfReader", _MixedReader)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", lambda content, pages=None: {})
     ocr_calls: list[list[int]] = []
 
     def fake_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
         ocr_calls.append(pages)
         return [DocumentSection(filename=filename, page=2, section="Scan", text="OCR text.")]
 
-    monkeypatch.setattr(documents, "_ocr_pdf_pages", fake_ocr)
+    monkeypatch.setattr(pdf_parser, "_ocr_pdf_pages", fake_ocr)
 
     sections = parse_document_bytes("mixed.pdf", b"not a real pdf")
 
@@ -213,8 +215,8 @@ def test_parse_pdf_ocrs_scanned_pages_inside_a_mixed_pdf(monkeypatch: pytest.Mon
 def test_parse_pdf_mixed_without_ocr_extra_keeps_the_text_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(documents, "PdfReader", _MixedReader)
-    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content, pages=None: {})
+    monkeypatch.setattr(pdf_parser, "PdfReader", _MixedReader)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", lambda content, pages=None: {})
 
     sections = parse_document_bytes("mixed.pdf", b"not a real pdf")
 
@@ -227,13 +229,13 @@ def test_parse_pdf_mixed_keeps_text_pages_when_ocr_breaks(
     """OCR running on a mixed PDF is new; its failure must not fail a document that
     ingested fine before (its text pages)."""
 
-    monkeypatch.setattr(documents, "PdfReader", _MixedReader)
-    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content, pages=None: {})
+    monkeypatch.setattr(pdf_parser, "PdfReader", _MixedReader)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", lambda content, pages=None: {})
 
     def broken_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
         raise RuntimeError("onnxruntime could not load the detection model")
 
-    monkeypatch.setattr(documents, "_ocr_pdf_pages", broken_ocr)
+    monkeypatch.setattr(pdf_parser, "_ocr_pdf_pages", broken_ocr)
 
     sections = parse_document_bytes("mixed.pdf", b"not a real pdf")
 
@@ -253,13 +255,13 @@ def test_parse_pdf_fully_scanned_still_fails_when_ocr_breaks(
 
             self.pages = [EmptyPage()]
 
-    monkeypatch.setattr(documents, "PdfReader", EmptyReader)
-    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content, pages=None: {})
+    monkeypatch.setattr(pdf_parser, "PdfReader", EmptyReader)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", lambda content, pages=None: {})
 
     def broken_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(documents, "_ocr_pdf_pages", broken_ocr)
+    monkeypatch.setattr(pdf_parser, "_ocr_pdf_pages", broken_ocr)
 
     with pytest.raises(RuntimeError, match="boom"):
         parse_document_bytes("scanned.pdf", b"not a real pdf")
@@ -304,9 +306,9 @@ def test_ocr_pdf_pages_skips_a_page_whose_ocr_fails(monkeypatch: pytest.MonkeyPa
     fake_rapidocr.RapidOCR = object  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pdfplumber", fake_pdfplumber)
     monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", fake_rapidocr)
-    monkeypatch.setattr(documents, "_get_ocr_engine", lambda engine_cls: fake_engine)
+    monkeypatch.setattr(pdf_parser, "_get_ocr_engine", lambda engine_cls: fake_engine)
 
-    sections = documents._ocr_pdf_pages("scan.pdf", b"%PDF", [2, 3])
+    sections = pdf_parser._ocr_pdf_pages("scan.pdf", b"%PDF", [2, 3])
 
     assert [(section.page, section.text) for section in sections] == [
         (3, "Scanned text of page 3."),
@@ -346,7 +348,7 @@ def test_extract_pdf_tables_skips_pages_without_ruling_edges(
 
     monkeypatch.setattr(pdfplumber, "open", lambda stream: FakePdf())
 
-    tables = documents._extract_pdf_tables(b"pdf")
+    tables = pdf_parser._extract_pdf_tables(b"pdf")
 
     assert list(tables) == [2]
     assert "latency | 5ms" in tables[2][0]
@@ -361,7 +363,7 @@ def test_parse_docx_refuses_a_zip_bomb_before_inflating_it(
 
     import zipfile
 
-    monkeypatch.setattr(documents, "DOCX_MAX_EXPANDED_BYTES", 1024 * 1024)
+    monkeypatch.setattr(docx_parser, "DOCX_MAX_EXPANDED_BYTES", 1024 * 1024)
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("word/document.xml", b"\0" * (2 * 1024 * 1024))
@@ -401,7 +403,7 @@ def test_parse_pdf_with_a_user_password_is_a_parse_error_not_a_crash() -> None:
 
 def test_parse_pdf_with_only_an_owner_password_opens(monkeypatch: pytest.MonkeyPatch) -> None:
     # A blank page has no text; reaching the no-text error proves decryption worked.
-    monkeypatch.setattr(documents, "_ocr_pdf_pages", _no_ocr)
+    monkeypatch.setattr(pdf_parser, "_ocr_pdf_pages", _no_ocr)
 
     with pytest.raises(EmptyDocumentError):
         parse_document_bytes("owner-only.pdf", _encrypted_pdf(""))
@@ -423,15 +425,15 @@ def test_parse_pdf_page_whose_text_extraction_raises_goes_to_ocr(
             self.is_encrypted = False
             self.pages = [_MixedReader(stream).pages[0], BrokenPage()]
 
-    monkeypatch.setattr(documents, "PdfReader", Reader)
-    monkeypatch.setattr(documents, "_extract_pdf_tables", lambda content, pages=None: {})
+    monkeypatch.setattr(pdf_parser, "PdfReader", Reader)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", lambda content, pages=None: {})
     ocr_calls: list[list[int]] = []
 
     def fake_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
         ocr_calls.append(pages)
         return []
 
-    monkeypatch.setattr(documents, "_ocr_pdf_pages", fake_ocr)
+    monkeypatch.setattr(pdf_parser, "_ocr_pdf_pages", fake_ocr)
 
     sections = parse_document_bytes("broken.pdf", b"not a real pdf")
 
@@ -489,7 +491,7 @@ def test_only_pages_that_draw_lines_are_handed_to_the_table_finder() -> None:
         b"10 10 m 90 10 l S",  # a line
     )
 
-    assert documents._pages_that_draw_lines(PdfReader(BytesIO(content))) == {2, 3}
+    assert pdf_parser._pages_that_draw_lines(PdfReader(BytesIO(content))) == {2, 3}
 
 
 def test_a_pdf_with_no_ruling_never_opens_pdfplumber(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -500,7 +502,7 @@ def test_a_pdf_with_no_ruling_never_opens_pdfplumber(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(pdfplumber, "open", refuse)
 
-    assert documents._extract_pdf_tables(b"%PDF", set()) == {}
+    assert pdf_parser._extract_pdf_tables(b"%PDF", set()) == {}
 
 
 def test_a_pdf_over_the_page_limit_is_refused_before_parsing(
@@ -511,7 +513,7 @@ def test_a_pdf_over_the_page_limit_is_refused_before_parsing(
     def no_table_scan(*args: object, **kwargs: object) -> dict[int, list[str]]:
         raise AssertionError("pages were read for a PDF over the limit")
 
-    monkeypatch.setattr(documents, "_extract_pdf_tables", no_table_scan)
+    monkeypatch.setattr(pdf_parser, "_extract_pdf_tables", no_table_scan)
 
     with pytest.raises(documents.DocumentParseError, match="limit is 2"):
         documents.parse_document_bytes(
@@ -533,7 +535,7 @@ def test_only_the_first_max_ocr_pages_scanned_pages_are_ocred(
             for page in pages
         ]
 
-    monkeypatch.setattr(documents, "_ocr_pdf_pages", fake_ocr)
+    monkeypatch.setattr(pdf_parser, "_ocr_pdf_pages", fake_ocr)
 
     sections = documents.parse_document_bytes(
         "scan.pdf", pdf_bytes(["Digital text.", "", "", ""]), make_settings(max_ocr_pages=2)

@@ -2,45 +2,123 @@
 
 from __future__ import annotations
 
-import codecs
-import io
-import logging
-import re
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from hashlib import sha256
-from io import BytesIO
 from pathlib import PurePosixPath
-from threading import Lock
-from typing import Any, ClassVar, Literal, cast
-from zipfile import BadZipFile, ZipFile
+from typing import ClassVar
 
-from pypdf import PdfReader
-
-from api.chunking import TokenCounter
+from api.chunking import (
+    TokenCounter,
+    _group_sections_for_windowing,
+    _sentence_units,
+    _window_units,
+    merge_tiny_semantic_sections,
+)
+from api.parsers.common import (
+    DEFAULT_SECTION,
+    DocumentError,
+    DocumentParseError,
+    DocumentSection,
+    EmptyDocumentError,
+    UnsupportedDocumentError,
+    infer_section,
+    normalize_text,
+)
+from api.parsers.csv import parse_csv_document
+from api.parsers.docx import parse_docx_document
+from api.parsers.html import parse_html_document
+from api.parsers.pdf import parse_pdf_document
+from api.parsers.text import (
+    decode_text_document,
+    looks_like_markdown,
+    parse_markdown_document,
+    parse_plain_text_document,
+)
 from api.settings import AppSettings
 
-logger = logging.getLogger(__name__)
+# Re-exported: the parser types and helpers callers have always imported from here.
+# Deliberately not the parsers' internals (PdfReader, _extract_pdf_tables, ...): a test
+# patching those must patch the parser module that uses them.
+__all__ = [
+    "CHUNKER_VERSION",
+    "DEFAULT_SECTION",
+    "MAX_FILENAME_BYTES",
+    "MAX_TAGS_PER_DOCUMENT",
+    "PARSERS",
+    "SUPPORTED_EXTENSIONS",
+    "ChunkConfigError",
+    "DocumentChunk",
+    "DocumentError",
+    "DocumentNotFoundError",
+    "DocumentParseError",
+    "DocumentSection",
+    "EmptyDocumentError",
+    "UnsupportedDocumentError",
+    "build_chunk_id",
+    "chunk_sections",
+    "contextual_text",
+    "infer_section",
+    "looks_like_markdown",
+    "merge_tiny_semantic_sections",
+    "normalize_filename",
+    "normalize_tags",
+    "normalize_text",
+    "parse_document_bytes",
+    "parse_markdown_document",
+    "validate_upload_filename",
+]
 
-DEFAULT_SECTION = "Document"
-SUPPORTED_EXTENSIONS = frozenset(
-    {".pdf", ".txt", ".md", ".markdown", ".docx", ".html", ".htm", ".csv"}
-)
-_MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
-# Setext H1 only ("Title\n==="). A "---" underline is intentionally not treated as a
-# setext H2 heading — it's ambiguous with a CommonMark thematic break (<hr>).
-_SETEXT_H1_UNDERLINE_RE = re.compile(r"^\s{0,3}=+\s*$")
-# .txt content sniffing: >=2 heading lines is treated as evidence the file is
-# Markdown saved with a .txt extension. One stray "# TODO"-style line in plain prose
-# is too common to trust alone.
-_MIN_MARKDOWN_HEADINGS_FOR_TXT_SNIFF = 2
 
-# infer_section: candidate first-lines that look like page furniture rather than an
-# actual heading, so a PDF page's literal first line (often a page number or footer)
-# doesn't become a meaningless citation section label.
-_DIGITS_ONLY_RE = re.compile(r"^\d+$")
-_PAGE_LABEL_RE = re.compile(r"^page\s+\d+$", re.IGNORECASE)
-_ROMAN_NUMERAL_RE = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
+Parser = Callable[[str, bytes, AppSettings | None], list[DocumentSection]]
+
+
+def _parse_txt(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    text = decode_text_document(filename, content)
+    if looks_like_markdown(text):
+        return parse_markdown_document(filename, text)
+    return parse_plain_text_document(filename, text)
+
+
+def _parse_markdown(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_markdown_document(filename, decode_text_document(filename, content))
+
+
+def _parse_html(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_html_document(filename, decode_text_document(filename, content))
+
+
+def _parse_csv(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_csv_document(filename, decode_text_document(filename, content), settings)
+
+
+def _parse_docx(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_docx_document(filename, content)
+
+
+# One parser per supported suffix (api/parsers/*); adding a format is one entry here.
+PARSERS: dict[str, Parser] = {
+    ".pdf": parse_pdf_document,
+    ".docx": _parse_docx,
+    ".md": _parse_markdown,
+    ".markdown": _parse_markdown,
+    ".html": _parse_html,
+    ".htm": _parse_html,
+    ".csv": _parse_csv,
+    ".txt": _parse_txt,
+}
+SUPPORTED_EXTENSIONS = frozenset(PARSERS)
+
 
 # Chunker output format version — bumped when the chunking algorithm changes in a way
 # that alters chunk contents (v2: token-aware, sentence-boundary windowing). Logged per
@@ -51,31 +129,6 @@ _ROMAN_NUMERAL_RE = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
 # v3: token counts exclude [CLS]/[SEP] per unit (reserved once per chunk instead), so
 # windows fill their budget rather than stopping ~2 tokens short per sentence.
 CHUNKER_VERSION = 3
-
-# Sentence boundaries: whitespace after .!? that precedes a capital/digit (optionally
-# behind an opening quote/bracket), OR a blank line. Windows prefer to break here rather
-# than mid-sentence. Not linguistically perfect (abbreviations, decimals) — a pragmatic
-# heuristic that keeps most chunk edges on real sentence ends.
-# Latin sentence ends need a following space and capital; CJK full-width ones (。！？)
-# end a sentence on their own — CJK has no spaces, so without them a whole Chinese or
-# Japanese paragraph was one "sentence".
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])|(?<=[。！？])\s*|\n{2,}")
-
-
-class DocumentError(ValueError):
-    """Base error for document parsing and chunking failures."""
-
-
-class UnsupportedDocumentError(DocumentError):
-    """Raised when an uploaded document type is not supported."""
-
-
-class EmptyDocumentError(DocumentError):
-    """Raised when a document has no extractable text."""
-
-
-class DocumentParseError(DocumentError):
-    """Raised when a supported document cannot be parsed."""
 
 
 class ChunkConfigError(DocumentError):
@@ -88,23 +141,6 @@ class DocumentNotFoundError(RuntimeError):
     Deliberately not a ``DocumentError`` subclass — that hierarchy maps to 400
     (user-correctable upload errors); "no such indexed document" is a 404.
     """
-
-
-@dataclass(frozen=True)
-class DocumentSection:
-    """Extracted text with source metadata before chunking.
-
-    ``boundary`` marks whether the edge before the *next* section is a physical
-    artifact of the source format (a PDF page break, a plain-text paragraph break —
-    safe for chunk windows to cross with overlap) or a semantic one (a Markdown
-    heading — a real topic break that chunk windows must not cross).
-    """
-
-    filename: str
-    page: int
-    section: str
-    text: str
-    boundary: Literal["physical", "semantic"] = "physical"
 
 
 @dataclass(frozen=True)
@@ -179,32 +215,7 @@ def parse_document_bytes(
 
     safe_filename = validate_upload_filename(filename)
     suffix = PurePosixPath(safe_filename).suffix.lower()
-
-    if suffix == ".pdf":
-        return parse_pdf_document(safe_filename, content, settings)
-    if suffix == ".docx":
-        return parse_docx_document(safe_filename, content)
-
-    text = decode_text_document(safe_filename, content)
-    if suffix in {".md", ".markdown"}:
-        return parse_markdown_document(safe_filename, text)
-    if suffix in {".html", ".htm"}:
-        return parse_html_document(safe_filename, text)
-    if suffix == ".csv":
-        return parse_csv_document(safe_filename, text, settings)
-    if suffix == ".txt" and looks_like_markdown(text):
-        return parse_markdown_document(safe_filename, text)
-    return parse_plain_text_document(safe_filename, text)
-
-
-@dataclass(frozen=True)
-class _Unit:
-    """One sentence (or forced fragment of an oversized sentence) with its metadata."""
-
-    text: str
-    tokens: int
-    page: int
-    section: str
+    return PARSERS[suffix](safe_filename, content, settings)
 
 
 def chunk_sections(
@@ -278,844 +289,9 @@ def chunk_sections(
     return chunks
 
 
-def _sentence_units(
-    group: list[DocumentSection], budget: int, token_counter: TokenCounter
-) -> list[_Unit]:
-    """Flatten a group's sections into sentence units, splitting oversized sentences."""
-
-    units: list[_Unit] = []
-    for section in group:
-        for raw_sentence in _SENTENCE_SPLIT_RE.split(section.text):
-            # Collapse intra-sentence whitespace (newlines, runs of spaces) to single
-            # spaces so chunk text is clean and stable regardless of source formatting.
-            sentence = " ".join(raw_sentence.split())
-            if not sentence:
-                continue
-            for piece, tokens in _split_oversized(sentence, budget, token_counter):
-                units.append(
-                    _Unit(
-                        text=piece,
-                        tokens=tokens,
-                        page=section.page,
-                        section=section.section,
-                    )
-                )
-    return units
-
-
-def _split_oversized(
-    sentence: str, budget: int, token_counter: TokenCounter
-) -> list[tuple[str, int]]:
-    """Greedily pack a single sentence's words into <=budget-token pieces.
-
-    A sentence within budget is returned unchanged. A "word" longer than budget — a
-    base64 blob, a long URL, a run of unspaced CJK — is cut by characters (see
-    ``_split_long_word``); it used to be emitted whole and silently truncated by the
-    embedder at 512 tokens. Each piece comes back with its token count so the caller
-    doesn't tokenize every sentence a second time.
-    """
-
-    sentence_tokens = token_counter.count(sentence)
-    if sentence_tokens <= budget:
-        return [(sentence, sentence_tokens)]
-
-    # Count each word once and accumulate, rather than re-tokenizing the whole running
-    # string per word — that was O(words^2) tokenizer work on exactly the inputs that
-    # reach this path (CSV row blocks, wide tables), which are the longest ones.
-    # bge's WordPiece tokenizer pre-splits on whitespace, so (without special tokens)
-    # the per-word sum equals the joined piece's real count; for any tokenizer that
-    # merges across spaces it can only over-estimate, which errs toward smaller pieces.
-    pieces: list[tuple[str, int]] = []
-    current: list[str] = []
-    current_tokens = 0
-    words: list[tuple[str, int]] = []
-    for word in sentence.split():
-        word_tokens = token_counter.count(word)
-        if word_tokens > budget:
-            words.extend(_split_long_word(word, budget, token_counter))
-        else:
-            words.append((word, word_tokens))
-    for word, word_tokens in words:
-        if current and current_tokens + word_tokens > budget:
-            pieces.append((" ".join(current), current_tokens))
-            current = [word]
-            current_tokens = word_tokens
-        else:
-            current.append(word)
-            current_tokens += word_tokens
-    if current:
-        pieces.append((" ".join(current), current_tokens))
-    return pieces
-
-
-def _split_long_word(word: str, budget: int, token_counter: TokenCounter) -> list[tuple[str, int]]:
-    """Cut one over-budget run of characters into pieces of at most ``budget`` tokens."""
-
-    pieces: list[tuple[str, int]] = []
-    rest = word
-    while rest:
-        total = token_counter.count(rest)
-        if total <= budget:
-            pieces.append((rest, total))
-            break
-        # Start from the proportional guess and shrink until it fits; each piece takes
-        # at least one character, so this always advances.
-        length = max(1, len(rest) * budget // total)
-        piece_tokens = token_counter.count(rest[:length])
-        while length > 1 and piece_tokens > budget:
-            length = max(1, length * budget // max(piece_tokens, 1) - 1)
-            piece_tokens = token_counter.count(rest[:length])
-        pieces.append((rest[:length], piece_tokens))
-        rest = rest[length:]
-    return pieces
-
-
-def _window_units(units: list[_Unit], budget: int, overlap: int) -> list[list[_Unit]]:
-    """Slide a token-bounded window over units with token-bounded overlap.
-
-    Each window holds as many whole units as fit in ``budget`` (always at least one,
-    guaranteeing forward progress). The next window starts by stepping back over the
-    trailing units whose token sum is within ``overlap`` — but never so far that the
-    window fails to advance by at least one unit.
-    """
-
-    windows: list[list[_Unit]] = []
-    start = 0
-    total = len(units)
-    while start < total:
-        end = start
-        window_tokens = 0
-        while end < total and (end == start or window_tokens + units[end].tokens <= budget):
-            window_tokens += units[end].tokens
-            end += 1
-        windows.append(units[start:end])
-        if end >= total:
-            break
-
-        overlap_tokens = 0
-        next_start = end
-        while next_start > start + 1 and overlap_tokens + units[next_start - 1].tokens <= overlap:
-            next_start -= 1
-            overlap_tokens += units[next_start].tokens
-        start = next_start
-
-    return windows
-
-
-def _group_sections_for_windowing(
-    sections: list[DocumentSection],
-) -> list[list[DocumentSection]]:
-    """Group sections into runs that should be windowed as one continuous stream.
-
-    Consecutive same-filename ``physical`` sections merge into one group (chunk
-    overlap crosses the boundary between them); each ``semantic`` section is always
-    its own singleton group (windowed alone, exactly as before this change).
-    """
-
-    groups: list[list[DocumentSection]] = []
-    for section in sections:
-        if (
-            section.boundary == "physical"
-            and groups
-            and groups[-1][-1].boundary == "physical"
-            and groups[-1][-1].filename == section.filename
-        ):
-            groups[-1].append(section)
-        else:
-            groups.append([section])
-    return groups
-
-
-def merge_tiny_semantic_sections(
-    sections: list[DocumentSection],
-    min_words: int,
-) -> list[DocumentSection]:
-    """Fold undersized Markdown heading sections into a neighbor before windowing.
-
-    Only operates on ``boundary == "semantic"`` runs (Markdown headings) — physical
-    sections don't need this, cross-boundary windowing already absorbs short
-    paragraphs/pages into their neighbors.
-    """
-
-    result: list[DocumentSection] = []
-    index = 0
-    while index < len(sections):
-        if sections[index].boundary != "semantic":
-            result.append(sections[index])
-            index += 1
-            continue
-        run_start = index
-        while index < len(sections) and sections[index].boundary == "semantic":
-            index += 1
-        result.extend(_merge_semantic_run(sections[run_start:index], min_words))
-    return result
-
-
-def _merge_semantic_run(
-    run: list[DocumentSection],
-    min_words: int,
-) -> list[DocumentSection]:
-    """Fold sections under ``min_words`` forward into the next section in the run.
-
-    A trailing run of tiny sections with no bigger section after them folds
-    backward into the last merged section instead (or, if the whole run is tiny,
-    collapses into one section under the last section's label).
-    """
-
-    merged: list[DocumentSection] = []
-    pending: list[str] = []
-    for section in run:
-        if len(section.text.split()) < min_words:
-            pending.append(section.text)
-            continue
-        text = "\n\n".join([*pending, section.text]) if pending else section.text
-        pending = []
-        merged.append(replace(section, text=text))
-    if pending:
-        if merged:
-            merged[-1] = replace(merged[-1], text=merged[-1].text + "\n\n" + "\n\n".join(pending))
-        else:
-            merged.append(replace(run[-1], text="\n\n".join(pending)))
-    return merged
-
-
-def parse_pdf_document(
-    filename: str, content: bytes, settings: AppSettings | None = None
-) -> list[DocumentSection]:
-    """Extract text from a PDF, preserving one-based page numbers.
-
-    pypdf provides the text stream; pdfplumber (best-effort) appends any extracted
-    tables as Markdown blocks so table Q&A is answerable. Pages with no extractable
-    text fall back to OCR when the optional ``ocr`` extra is installed, up to
-    ``max_ocr_pages`` of them; a PDF over ``max_pdf_pages`` is refused up front.
-    """
-
-    limits = settings if settings is not None else AppSettings.model_construct()
-    max_pdf_pages = int(limits.max_pdf_pages)
-    max_ocr_pages = int(limits.max_ocr_pages)
-
-    try:
-        reader = PdfReader(BytesIO(content))
-    except Exception as exc:  # pypdf raises several parser-specific exceptions.
-        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
-    if reader.is_encrypted:
-        # An owner-password-only PDF opens with the empty user password; anything else
-        # can't be read, and used to fail as an "unexpected server error".
-        try:
-            decrypted = reader.decrypt("")
-        except Exception as exc:
-            raise DocumentParseError(f"PDF '{filename}' is password-protected.") from exc
-        if not decrypted:
-            raise DocumentParseError(f"PDF '{filename}' is password-protected.")
-    try:
-        page_count = len(reader.pages)
-    except Exception as exc:
-        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
-    if page_count > max_pdf_pages:
-        raise DocumentParseError(
-            f"PDF '{filename}' has {page_count} pages; the limit is {max_pdf_pages} "
-            "(MAX_PDF_PAGES). Split it into smaller files."
-        )
-
-    tables_by_page = _extract_pdf_tables(content, _pages_that_draw_lines(reader))
-
-    sections: list[DocumentSection] = []
-    empty_pages: list[int] = []
-    for page_number, page in enumerate(reader.pages, start=1):
-        try:
-            text = normalize_text(page.extract_text() or "")
-        except Exception:
-            # One malformed content stream shouldn't fail the whole document; the page
-            # goes to OCR like a page with no text layer.
-            logger.warning(
-                "PDF %s: could not extract text from page %d.",
-                filename,
-                page_number,
-                exc_info=True,
-            )
-            text = ""
-        table_blocks = tables_by_page.get(page_number, [])
-        if table_blocks:
-            table_text = "\n\n".join(f"[Table]\n{block}" for block in table_blocks)
-            text = f"{text}\n\n{table_text}".strip() if text else table_text
-        if not text:
-            empty_pages.append(page_number)
-            continue
-        sections.append(
-            DocumentSection(
-                filename=filename,
-                page=page_number,
-                section=infer_section(text),
-                text=text,
-            )
-        )
-
-    if len(empty_pages) > max_ocr_pages:
-        logger.warning(
-            "PDF %s: %d pages have no text layer; OCR'ing the first %d (MAX_OCR_PAGES) "
-            "and skipping pages %s.",
-            filename,
-            len(empty_pages),
-            max_ocr_pages,
-            empty_pages[max_ocr_pages:],
-        )
-        empty_pages = empty_pages[:max_ocr_pages]
-    if empty_pages:
-        # Every empty page, not only all-empty PDFs: a scanned page bound into an
-        # otherwise digital PDF used to be dropped without a word.
-        try:
-            ocr_sections = _ocr_pdf_pages(filename, content, empty_pages)
-        except EmptyDocumentError:
-            if not sections:
-                raise
-            logger.warning(
-                "PDF %s: pages %s have no text layer and OCR is not installed "
-                "(uv sync --extra ocr); indexing the remaining pages only.",
-                filename,
-                empty_pages,
-            )
-            ocr_sections = []
-        except Exception:
-            # OCR itself broke (engine load, unreadable PDF for the rasterizer). A fully
-            # scanned PDF has nothing else to offer, so that still fails; a mixed one
-            # keeps its text pages, as it did before its empty pages were OCR'd.
-            if not sections:
-                raise
-            logger.warning(
-                "PDF %s: OCR failed for pages %s; indexing the remaining pages only.",
-                filename,
-                empty_pages,
-                exc_info=True,
-            )
-            ocr_sections = []
-        sections = sorted([*sections, *ocr_sections], key=lambda section: section.page)
-
-    if not sections:
-        raise EmptyDocumentError(f"PDF '{filename}' has no extractable text.")
-    return sections
-
-
-# Content-stream operators that draw a rectangle or a line, plus XObject paints (a
-# form can draw either). A table's ruling edges need one of them; text doesn't.
-_RULING_OPERATOR_RE = re.compile(rb"(?<![A-Za-z])(?:re|l|Do)(?![A-Za-z])")
-
-
-def _pages_that_draw_lines(reader: PdfReader) -> set[int] | None:
-    """1-based pages whose content stream draws rectangles, lines or XObjects.
-
-    A cheap byte scan of the stream pypdf already decoded — laying a page out with
-    pdfplumber just to learn it has no ruling edges parsed most prose PDFs twice.
-    Over-inclusive by design (an "l" inside a text string counts): a false positive
-    only costs the old full check. None when a stream can't be read: check every page.
-    """
-
-    pages: set[int] = set()
-    try:
-        for page_number, page in enumerate(reader.pages, start=1):
-            contents = page.get_contents()
-            if contents is None:
-                continue
-            if _RULING_OPERATOR_RE.search(contents.get_data()):
-                pages.add(page_number)
-    except Exception:
-        return None
-    return pages
-
-
-def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[int, list[str]]:
-    """Return page-number -> rendered Markdown tables. Best-effort: failure -> {}.
-
-    Table extraction is enrichment, never a parse gate — any pdfplumber error (or a
-    page with no tables) simply yields no table text for that document/page. ``pages``
-    limits the work to those 1-based pages (None: all of them).
-    """
-
-    if pages is not None and not pages:
-        return {}
-    try:
-        import pdfplumber
-
-        result: dict[int, list[str]] = {}
-        with pdfplumber.open(BytesIO(content)) as pdf:
-            for page_number, page in enumerate(pdf.pages, start=1):
-                if pages is not None and page_number not in pages:
-                    continue
-                try:
-                    # The default "lines" strategy builds tables only from ruling edges
-                    # (rects, lines, curves); a page with none can't yield one, so skip
-                    # the table finder — most pages of a prose PDF.
-                    if not (page.rects or page.lines or page.curves):
-                        continue
-                    blocks = [_table_to_markdown(table) for table in page.extract_tables() if table]
-                    blocks = [block for block in blocks if block]
-                    if blocks:
-                        result[page_number] = blocks
-                finally:
-                    # Parsed layout objects are cached per page until closed; on a long
-                    # PDF they otherwise accumulate for the whole document.
-                    page.close()
-        return result
-    except Exception:
-        logger.warning("PDF table extraction failed; continuing with text only.", exc_info=True)
-        return {}
-
-
-def _table_to_markdown(rows: Sequence[Sequence[object]]) -> str:
-    """Render an extracted table (list of rows of cells) as a Markdown table."""
-
-    cleaned = [
-        [str(cell).strip().replace("\n", " ") if cell is not None else "" for cell in row]
-        for row in rows
-        if any(cell is not None and str(cell).strip() for cell in row)
-    ]
-    if not cleaned:
-        return ""
-    width = max(len(row) for row in cleaned)
-    lines = ["| " + " | ".join(row + [""] * (width - len(row))) + " |" for row in cleaned]
-    header_sep = "| " + " | ".join(["---"] * width) + " |"
-    return "\n".join([lines[0], header_sep, *lines[1:]])
-
-
-def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> list[DocumentSection]:
-    """OCR the given PDF pages when the ``ocr`` extra is installed.
-
-    Raises ``EmptyDocumentError`` with an install hint when the extra is absent, so a
-    scanned PDF gives an actionable message rather than a generic "no text" error.
-    """
-
-    try:
-        import pdfplumber
-        from rapidocr_onnxruntime import RapidOCR
-    except ImportError as exc:
-        raise EmptyDocumentError(
-            f"PDF '{filename}' has no extractable text — it may be scanned images. "
-            "Install OCR support with: uv sync --extra ocr "
-            "(or pip install 'docrag[ocr]')."
-        ) from exc
-
-    engine = _get_ocr_engine(RapidOCR)
-    sections: list[DocumentSection] = []
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page_number in page_numbers:
-            if page_number > len(pdf.pages):
-                continue
-            try:
-                image = pdf.pages[page_number - 1].to_image(resolution=200)
-                import numpy as np
-
-                ocr_result, _ = engine(np.array(image.original))
-            except Exception:
-                # One unreadable image page must not fail the whole document — before
-                # mixed PDFs were OCR'd, such a page was simply skipped.
-                logger.warning(
-                    "PDF %s: OCR failed on page %d; skipping it.",
-                    filename,
-                    page_number,
-                    exc_info=True,
-                )
-                continue
-            text = normalize_text("\n".join(line[1] for line in (ocr_result or [])))
-            if text:
-                sections.append(
-                    DocumentSection(
-                        filename=filename,
-                        page=page_number,
-                        section=infer_section(text),
-                        text=text,
-                    )
-                )
-    return sections
-
-
-_OCR_ENGINE: object | None = None
-# The ingest executor runs two workers, so two scanned PDFs arriving together could both
-# see _OCR_ENGINE as None and each construct one — doubling a heavyweight model load.
-_OCR_ENGINE_LOCK = Lock()
-
-
-def _get_ocr_engine(engine_cls: type) -> Any:
-    """Lazily construct and cache the OCR engine (model load is expensive)."""
-
-    global _OCR_ENGINE
-    if _OCR_ENGINE is None:
-        with _OCR_ENGINE_LOCK:
-            # Re-check inside the lock: another worker may have built it while we waited.
-            if _OCR_ENGINE is None:
-                _OCR_ENGINE = engine_cls()
-    return _OCR_ENGINE
-
-
-_HTML_STRIP_TAGS = ("script", "style", "noscript", "template")
-_HTML_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
-_DEFAULT_CSV_ROWS_PER_SECTION = 50
-
-
-# A DOCX is a zip that python-docx inflates entirely into memory. MAX_UPLOAD_BYTES caps
-# the compressed size only, so a few-MB upload declaring gigabytes of XML would OOM the
-# ingest worker. Real documents (images included) sit far below this.
-DOCX_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
-
-
-def _check_docx_expanded_size(filename: str, content: bytes) -> None:
-    """Refuse a DOCX whose members would inflate past ``DOCX_MAX_EXPANDED_BYTES``."""
-
-    try:
-        with ZipFile(BytesIO(content)) as archive:
-            expanded = sum(member.file_size for member in archive.infolist())
-    except BadZipFile as exc:
-        raise DocumentParseError(f"Could not parse DOCX '{filename}'.") from exc
-    if expanded > DOCX_MAX_EXPANDED_BYTES:
-        raise DocumentParseError(
-            f"DOCX '{filename}' expands to {expanded // (1024 * 1024)} MiB, over the "
-            f"{DOCX_MAX_EXPANDED_BYTES // (1024 * 1024)} MiB limit."
-        )
-
-
-def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
-    """Extract DOCX text, using heading styles as semantic section boundaries.
-
-    DOCX has no fixed pagination, so ``page`` is always 1 and the section label
-    carries the location meaning. Tables are rendered as one text block of
-    ``" | "``-joined cell rows in document order.
-    """
-
-    from docx import Document
-    from docx.table import Table
-    from docx.text.paragraph import Paragraph
-
-    _check_docx_expanded_size(filename, content)
-    try:
-        document = Document(BytesIO(content))
-    except Exception as exc:
-        raise DocumentParseError(f"Could not parse DOCX '{filename}'.") from exc
-
-    sections: list[DocumentSection] = []
-    current_section = DEFAULT_SECTION
-    buffer: list[str] = []
-
-    def flush() -> None:
-        text = normalize_text("\n".join(buffer))
-        if text:
-            sections.append(
-                DocumentSection(
-                    filename=filename,
-                    page=1,
-                    section=current_section,
-                    text=text,
-                    boundary="semantic",
-                )
-            )
-
-    for block in _iter_docx_blocks(document, Paragraph, Table):
-        if isinstance(block, Paragraph):
-            style_name = block.style.name if block.style is not None else ""
-            text = block.text.strip()
-            if not text:
-                continue
-            if style_name.startswith("Heading"):
-                flush()
-                current_section = text[:120] or DEFAULT_SECTION
-                buffer = [text]
-            else:
-                buffer.append(text)
-        elif isinstance(block, Table):
-            rows = [" | ".join(cell.text.strip() for cell in row.cells) for row in block.rows]
-            table_text = "\n".join(row for row in rows if row.strip())
-            if table_text:
-                buffer.append(table_text)
-
-    flush()
-    if not sections:
-        raise EmptyDocumentError(f"DOCX '{filename}' has no extractable text.")
-    return sections
-
-
-def _iter_docx_blocks(document: object, paragraph_cls: type, table_cls: type) -> Iterator[object]:
-    """Yield a DOCX body's paragraphs and tables in document order.
-
-    Prefers python-docx >= 1.1's ``iter_inner_content`` and falls back to manual XML
-    body iteration on older versions.
-    """
-
-    iter_inner = getattr(document, "iter_inner_content", None)
-    if callable(iter_inner):
-        yield from iter_inner()
-        return
-    body = document.element.body  # type: ignore[attr-defined]
-    for child in body.iterchildren():
-        if child.tag.endswith("}p"):
-            yield paragraph_cls(child, document)
-        elif child.tag.endswith("}tbl"):
-            yield table_cls(child, document)
-
-
-def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
-    """Extract readable HTML text, splitting on h1-h6 into semantic sections."""
-
-    from bs4 import BeautifulSoup
-    from bs4.element import CData, PreformattedString
-
-    soup = BeautifulSoup(text, "html.parser")
-    for element in soup(list(_HTML_STRIP_TAGS)):
-        element.decompose()
-
-    body = soup.body or soup
-    title_tag = soup.title.get_text(strip=True) if soup.title else ""
-
-    sections: list[DocumentSection] = []
-    current_section = title_tag[:120] or DEFAULT_SECTION
-    buffer: list[str] = []
-
-    def flush() -> None:
-        section_text = normalize_text(" ".join(buffer))
-        if section_text:
-            sections.append(
-                DocumentSection(
-                    filename=filename,
-                    page=1,
-                    section=current_section,
-                    text=section_text,
-                    boundary="semantic",
-                )
-            )
-
-    for element in cast(Iterator[Any], body.descendants):
-        name = getattr(element, "name", None)
-        if name in _HTML_HEADING_TAGS:
-            flush()
-            current_section = element.get_text(" ", strip=True)[:120] or DEFAULT_SECTION
-            buffer = []
-        elif name is None:  # NavigableString
-            # Comments, doctypes and processing instructions aren't rendered text: an
-            # invisible <!-- ... --> would otherwise reach the prompt as a source.
-            if isinstance(element, PreformattedString) and not isinstance(element, CData):
-                continue
-            chunk = str(element).strip()
-            if chunk:
-                buffer.append(chunk)
-
-    flush()
-    if not sections:
-        # No headings and/or text only outside body: fall back to whole-document text.
-        whole = normalize_text(soup.get_text(" ", strip=True))
-        if not whole:
-            raise EmptyDocumentError(f"HTML '{filename}' has no extractable text.")
-        return [DocumentSection(filename=filename, page=1, section=current_section, text=whole)]
-    return sections
-
-
-def parse_csv_document(
-    filename: str, text: str, settings: AppSettings | None = None
-) -> list[DocumentSection]:
-    """Render CSV rows as self-describing text, grouped into row-range sections."""
-
-    import csv
-
-    rows_per_section = (
-        int(settings.csv_rows_per_section)
-        if settings is not None
-        else _DEFAULT_CSV_ROWS_PER_SECTION
-    )
-    try:
-        dialect = csv.Sniffer().sniff(text[:2048])
-        delimiter = dialect.delimiter
-    except csv.Error:
-        delimiter = ","
-    # A stream with newline="", as the csv module requires: str.splitlines() cut quoted
-    # multi-line cells apart and also split on \u2028/\x0c inside a cell.
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
-    try:
-        records = [row for row in reader if any(cell.strip() for cell in row)]
-    except csv.Error as exc:  # e.g. a field past csv.field_size_limit()
-        raise DocumentParseError(f"Could not parse CSV '{filename}': {exc}") from exc
-    if not records:
-        raise EmptyDocumentError(f"CSV '{filename}' has no rows.")
-
-    header = [cell.strip() for cell in records[0]]
-    data_rows = records[1:]
-    if not data_rows:
-        # Header-only file: treat the header row itself as the single section.
-        return [
-            DocumentSection(
-                filename=filename,
-                page=1,
-                section="Header",
-                text="; ".join(header),
-            )
-        ]
-
-    sections: list[DocumentSection] = []
-    for start in range(0, len(data_rows), rows_per_section):
-        group = data_rows[start : start + rows_per_section]
-        rendered_rows = [_render_csv_row(header, row) for row in group]
-        text_block = "\n".join(line for line in rendered_rows if line)
-        if not text_block:
-            continue
-        first_row = start + 2  # 1-based, and row 1 is the header
-        last_row = start + len(group) + 1
-        label = f"Rows {first_row}-{last_row}"
-        sections.append(DocumentSection(filename=filename, page=1, section=label, text=text_block))
-    if not sections:
-        raise EmptyDocumentError(f"CSV '{filename}' has no data rows.")
-    return sections
-
-
-def _render_csv_row(header: list[str], row: list[str]) -> str:
-    """Render one CSV data row as "col1: v1; col2: v2" so any chunk slice self-describes."""
-
-    parts: list[str] = []
-    for index, value in enumerate(row):
-        cell = value.strip()
-        if not cell:
-            continue
-        column = header[index] if index < len(header) and header[index] else f"col{index + 1}"
-        parts.append(f"{column}: {cell}")
-    return "; ".join(parts)
-
-
-_TEXT_DECODE_FALLBACKS: tuple[str, ...] = ("utf-8-sig", "cp1252", "latin-1")
-
-
-_TEXT_BOMS: tuple[tuple[bytes, str], ...] = (
-    (codecs.BOM_UTF32_LE, "utf-32"),
-    (codecs.BOM_UTF32_BE, "utf-32"),
-    (codecs.BOM_UTF16_LE, "utf-16"),
-    (codecs.BOM_UTF16_BE, "utf-16"),
-)
-
-
-def decode_text_document(filename: str, content: bytes) -> str:
-    """Decode a text-like document, falling back across common encodings.
-
-    ``utf-8-sig`` only tolerates a BOM, not a different encoding — a `.txt`/`.md`
-    file saved as cp1252 or latin-1 (common from Windows tools) would otherwise be
-    rejected outright even though it decodes cleanly under one of these fallbacks.
-    latin-1 never raises (every byte maps to a codepoint), so it's the final,
-    always-succeeding fallback rather than a real "unsupported encoding" signal.
-    """
-
-    text: str | None = None
-    # A byte-order mark names the encoding outright. UTF-16 ("Unicode" in Notepad's
-    # save dialog) otherwise fell through to cp1252/latin-1 and indexed as mojibake
-    # interleaved with NULs. UTF-32 first: its little-endian BOM starts with UTF-16's.
-    for bom, encoding in _TEXT_BOMS:
-        if content.startswith(bom):
-            try:
-                text = content.decode(encoding)
-            except UnicodeDecodeError as exc:
-                raise DocumentParseError(
-                    f"Could not decode text document '{filename}' as {encoding}."
-                ) from exc
-            break
-    for encoding in _TEXT_DECODE_FALLBACKS if text is None else ():
-        try:
-            text = content.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        else:
-            break
-
-    if text is None:
-        raise DocumentParseError(f"Could not decode text document '{filename}'.")
-
-    text = normalize_text(text)
-    if not text:
-        raise EmptyDocumentError(f"Document '{filename}' has no extractable text.")
-    return text
-
-
-def parse_markdown_document(filename: str, text: str) -> list[DocumentSection]:
-    """Split Markdown into sections using heading text as citation metadata.
-
-    Recognizes ATX headings (``# Heading``) and setext H1 headings (``Title`` on its
-    own line followed by a line of ``=``). Setext H2 (``---`` underline) is not
-    treated as a heading — it's ambiguous with a CommonMark thematic break (``<hr>``).
-    """
-
-    sections: list[DocumentSection] = []
-    current_section = DEFAULT_SECTION
-    buffer: list[str] = []
-
-    def flush() -> None:
-        section_text = normalize_text("\n".join(buffer))
-        if section_text:
-            sections.append(
-                DocumentSection(
-                    filename=filename,
-                    page=1,
-                    section=current_section,
-                    text=section_text,
-                    boundary="semantic",
-                )
-            )
-
-    lines = text.splitlines()
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        atx_match = _MARKDOWN_HEADING_RE.match(line)
-        if atx_match:
-            flush()
-            current_section = atx_match.group(1).strip() or DEFAULT_SECTION
-            buffer = [line]
-            index += 1
-            continue
-
-        next_line = lines[index + 1] if index + 1 < len(lines) else ""
-        if line.strip() and _SETEXT_H1_UNDERLINE_RE.match(next_line):
-            flush()
-            current_section = line.strip() or DEFAULT_SECTION
-            buffer = [line, next_line]
-            index += 2
-            continue
-
-        buffer.append(line)
-        index += 1
-
-    flush()
-    if not sections:
-        raise EmptyDocumentError(f"Markdown document '{filename}' has no extractable text.")
-    return sections
-
-
-def looks_like_markdown(text: str) -> bool:
-    """Heuristic used only for ``.txt`` uploads: content with two or more heading
-    lines (ATX ``#`` or setext ``===``) is treated as Markdown saved with the wrong
-    extension, so it gets heading-based section splitting instead of one giant chunk.
-    """
-
-    lines = text.splitlines()
-    heading_count = 0
-    for index, line in enumerate(lines):
-        next_line = lines[index + 1] if index + 1 < len(lines) else ""
-        is_heading = bool(_MARKDOWN_HEADING_RE.match(line)) or (
-            bool(line.strip()) and bool(_SETEXT_H1_UNDERLINE_RE.match(next_line))
-        )
-        if is_heading:
-            heading_count += 1
-        if heading_count >= _MIN_MARKDOWN_HEADINGS_FOR_TXT_SNIFF:
-            return True
-    return False
-
-
-def parse_plain_text_document(filename: str, text: str) -> list[DocumentSection]:
-    """Split plain text into blank-line-delimited paragraph sections.
-
-    Each paragraph becomes its own ``DocumentSection`` labeled via ``infer_section``,
-    so a multi-paragraph .txt upload no longer collapses into a single section (and
-    therefore, for short files, a single chunk) covering the whole document.
-    """
-
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    if not paragraphs:
-        paragraphs = [text]
-    return [
-        DocumentSection(filename=filename, page=1, section=infer_section(paragraph), text=paragraph)
-        for paragraph in paragraphs
-    ]
-
-
 MAX_TAGS_PER_DOCUMENT = 20
+
+
 MAX_TAG_LENGTH = 40
 
 
@@ -1197,51 +373,6 @@ def validate_upload_filename(filename: str) -> str:
             f"Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}."
         )
     return safe_filename
-
-
-def normalize_text(text: str) -> str:
-    """Normalize line endings and trim surrounding whitespace."""
-
-    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
-def infer_section(text: str) -> str:
-    """Infer a stable section label when richer structure is unavailable.
-
-    Skips candidate first-lines that look like page furniture — a bare page number,
-    a "Page N" label, or a lone roman numeral — since PDF page text often has exactly
-    one of these as its literal first line, which would otherwise become a
-    meaningless citation section label. Falls back to the first non-blank line if
-    every candidate line looks like furniture.
-    """
-
-    first_candidate: str | None = None
-    for line in text.splitlines():
-        candidate = line.strip().strip("#").strip()
-        if not candidate:
-            continue
-        if first_candidate is None:
-            first_candidate = candidate
-        if _looks_like_page_furniture(candidate):
-            continue
-        return candidate[:120]
-    if first_candidate is not None:
-        return first_candidate[:120]
-    return DEFAULT_SECTION
-
-
-def _looks_like_page_furniture(candidate: str) -> bool:
-    """True for page numbers/footers unlikely to be a meaningful heading."""
-
-    if len(candidate) < 3:
-        return True
-    if _DIGITS_ONLY_RE.match(candidate):
-        return True
-    if _PAGE_LABEL_RE.match(candidate):
-        return True
-    if _ROMAN_NUMERAL_RE.match(candidate):
-        return True
-    return False
 
 
 def build_chunk_id(filename: str, page: int, section: str, ordinal: int, text: str) -> str:

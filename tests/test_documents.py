@@ -4,7 +4,8 @@ from typing import Any
 
 import pytest
 
-import api.documents as documents
+import api.chunking as chunking
+import api.parsers.pdf as pdf_parser
 from api.documents import (
     ChunkConfigError,
     DocumentChunk,
@@ -286,7 +287,7 @@ def test_pdf_parser_preserves_page_numbers(monkeypatch: pytest.MonkeyPatch) -> N
                 FakePage("Appendix\ngamma delta"),
             ]
 
-    monkeypatch.setattr(documents, "PdfReader", FakeReader)
+    monkeypatch.setattr(pdf_parser, "PdfReader", FakeReader)
 
     sections = parse_document_bytes("paper.pdf", b"not real pdf")
 
@@ -479,7 +480,7 @@ def test_split_oversized_pieces_stay_within_budget() -> None:
     counter = WordTokenCounter()
     sentence = " ".join(f"word{i}" for i in range(200))
 
-    pieces = documents._split_oversized(sentence, 10, counter)
+    pieces = chunking._split_oversized(sentence, 10, counter)
 
     assert len(pieces) > 1
     for piece, tokens in pieces:
