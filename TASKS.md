@@ -94,6 +94,8 @@ This task plan follows the requested build order and the architecture implied by
 - Use FastAPI TestClient for endpoint tests.
 - Document setup, one-command run, provider configuration, re-ingestion requirements, and troubleshooting.
 
+Status: done — the pytest suite (`tests/`, including `tests/routes_http/` over TestClient), the vitest and Playwright suites, and the README. Later work is tracked in `CHANGELOG.md` and summarized in `CLAUDE.md`'s Current State.
+
 ## Specification Risks And Inconsistencies
 
 - The prompt references a "Build Order section," but no explicit section with that heading is present; this plan infers build order from the requested artifact order and dependency flow.
