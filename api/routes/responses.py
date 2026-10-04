@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from api.generation import ChatMessage, StageTimings
+from api.retrieval import payload_optional_int
 from api.schemas import (
     DocumentChunkResponse,
     HistoryMessageRequest,
@@ -46,20 +47,16 @@ def history_messages(history: list[HistoryMessageRequest] | None) -> list[ChatMe
     return [{"role": message.role, "content": message.content} for message in history]
 
 
-def payload_optional_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def content_chunk(payload: dict[str, object]) -> DocumentChunkResponse:
     """Build one source-viewer chunk from a stored Qdrant payload, tolerating gaps."""
 
-    page = payload_optional_int(payload.get("page"))
+    page = payload_optional_int(payload, "page")
     return DocumentChunkResponse(
         chunk_id=str(payload.get("chunk_id", "")),
         page=page if page is not None else 0,
         section=str(payload.get("section", "")),
         text=str(payload.get("text", "")),
-        chunk_ordinal=payload_optional_int(payload.get("chunk_ordinal")),
+        chunk_ordinal=payload_optional_int(payload, "chunk_ordinal"),
     )
 
 

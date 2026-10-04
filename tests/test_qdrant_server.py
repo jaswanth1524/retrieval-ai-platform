@@ -129,7 +129,7 @@ def test_filename_scope_and_metadata_use_the_servers_payload_index(
         "guide.md": 2,
         "notes.md": 1,
     }
-    assert repository.list_filenames(settings) == ["notes.md"]
+    assert sorted(repository.filename_chunk_counts(settings)) == ["notes.md"]
 
 
 def test_bm25_ranks_a_rare_term_above_a_common_one_after_migration(

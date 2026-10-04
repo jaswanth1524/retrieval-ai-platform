@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
-from api.answer_cache import bump_corpus_generation
+from api.corpus import bump_corpus_generation
 from api.dependencies import (
     require_api_key,
     require_full_key,

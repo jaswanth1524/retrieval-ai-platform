@@ -18,9 +18,9 @@ from api.answer_cache import (
     CachedAnswer,
     CacheKey,
     answer_cache_key,
-    bump_corpus_generation,
 )
 from api.chunking import HeuristicTokenCounter, TokenCounter
+from api.corpus import bump_corpus_generation
 from api.diversity import select_diverse
 from api.documents import CHUNKER_VERSION, chunk_sections, parse_document_bytes
 from api.errors import public_error_message

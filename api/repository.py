@@ -447,11 +447,6 @@ class VectorRepository:
             wait=True,
         )
 
-    def list_filenames(self, settings: AppSettings) -> list[str]:
-        """Return the distinct filenames currently indexed, for per-document filtering."""
-
-        return sorted(self.filename_chunk_counts(settings))
-
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
         """Remove specific points by id — a single call regardless of how many
         filenames those ids originally belonged to (no per-filename round-trips)."""

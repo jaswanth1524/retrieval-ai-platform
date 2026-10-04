@@ -157,7 +157,7 @@ def test_vector_repository_list_filenames_returns_distinct_sorted_names() -> Non
         [make_point("p1", "b.md"), make_point("p2", "a.md"), make_point("p3", "b.md")],
     )
 
-    assert repository.list_filenames(settings) == ["a.md", "b.md"]
+    assert sorted(repository.filename_chunk_counts(settings)) == ["a.md", "b.md"]
 
 
 def test_vector_repository_list_filenames_empty_for_empty_collection() -> None:
@@ -166,7 +166,7 @@ def test_vector_repository_list_filenames_empty_for_empty_collection() -> None:
     repository = VectorRepository(client)
     repository.ensure_ready(settings)
 
-    assert repository.list_filenames(settings) == []
+    assert sorted(repository.filename_chunk_counts(settings)) == []
 
 
 def test_vector_repository_filename_chunk_counts_counts_points_per_file() -> None:
