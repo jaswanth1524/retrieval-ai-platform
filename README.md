@@ -248,8 +248,10 @@ uv run python -m eval.harness retrieval eval/datasets/handbook_eval.jsonl \
   --baseline eval/baselines/handbook_reranked.json
 ```
 
-Measured with the default models, chunk hit@1 is 0.95 after rerank against 0.74 for the
-fused list, 0.68 dense-only and 0.79 sparse-only. The small sample set still scores 1.0,
+Measured with the default models on macOS arm64, chunk hit@1 is 0.95 after rerank
+against 0.74 for the fused list, 0.68 dense-only and 0.79 sparse-only. The committed
+baseline is from linux/amd64 (CI), where the int8 reranker orders one borderline question
+differently (0.89); CI allows a drop of 0.06, i.e. one question. The small sample set still scores 1.0,
 so it only catches breakage. `LITELLM_MODE=PRODUCTION` stops LiteLLM loading the repo's
 `.env` on import; run from a directory without a `.env` (or unset what it sets) so the
 run uses exactly the settings you exported.

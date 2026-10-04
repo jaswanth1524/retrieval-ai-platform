@@ -134,7 +134,10 @@ jobs:
       # The retrieval eval (eval/harness.py) against real models and a real Qdrant: the
       # handbook corpus, split small so each section is its own chunk, scored at file
       # and chunk level and compared with the committed baseline. Same settings the
-      # baseline was made with (see its fingerprint); a drop past 0.05 fails the job.
+      # baseline was made with (see its fingerprint). The baseline is from linux/amd64:
+      # int8 ONNX scores differ slightly by CPU, enough to reorder one borderline
+      # question (macOS arm64 scores it 0.947 hit@1, Linux 0.895). 0.06 allows that one
+      # question (1/19 = 0.053) and fails on two.
       - name: Retrieval eval vs baseline
         env:
           LITELLM_MODE: PRODUCTION
@@ -148,7 +151,8 @@ jobs:
           export FASTEMBED_CACHE_PATH="$HOME/.cache/fastembed"
           uv run python -m eval.harness ingest eval/corpus_handbook
           uv run python -m eval.harness retrieval eval/datasets/handbook_eval.jsonl \
-            --baseline eval/baselines/handbook_reranked.json --output eval-results.json
+            --baseline eval/baselines/handbook_reranked.json --max-regression 0.06 \
+            --output eval-results.json
 
   frontend:
     runs-on: ubuntu-latest
