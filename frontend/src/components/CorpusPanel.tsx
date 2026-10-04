@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
 import type { DragEvent, RefObject } from 'react';
 import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
@@ -262,6 +262,11 @@ function CorpusPanel({
   const inFlightNames = new Set(
     uploads.filter((item) => item.status === 'uploading').map((item) => item.filename),
   );
+  // Sets, not Array.includes per card: with a large corpus that was a quadratic scan on
+  // every render.
+  const reindexable = useMemo(() => new Set(reindexableFilenames), [reindexableFilenames]);
+  const stale = useMemo(() => new Set(staleFilenames), [staleFilenames]);
+  const indexed = useMemo(() => new Set(filenames), [filenames]);
   const indexedCards: DocCard[] = filenames.filter((filename) => !inFlightNames.has(filename)).map((filename) => {
     const count = chunkCounts[filename] ?? 0;
     const parts = [`${count} ${count === 1 ? 'chunk' : 'chunks'}`];
@@ -271,16 +276,16 @@ function CorpusPanel({
     if (bytes !== undefined) parts.push(formatBytes(bytes));
     const uploadedAt = uploadedAts[filename];
     if (uploadedAt !== undefined) parts.push(formatRelativeTime(uploadedAt * 1000));
-    const canReindex = onReindex !== undefined && reindexableFilenames.includes(filename);
+    const canReindex = onReindex !== undefined && reindexable.has(filename);
     // Only flagged when it can be acted on. Without a stored original there is nothing
     // to re-index from, and a document indexed before versions were recorded counts as
     // stale even if the current chunker produced it — a label the user can't clear.
-    const stale = canReindex && staleFilenames.includes(filename);
-    if (stale) parts.push('older chunking');
+    const isStale = canReindex && stale.has(filename);
+    if (isStale) parts.push('older chunking');
     return {
       key: `doc:${filename}`,
       filename,
-      stale,
+      stale: isStale,
       canReindex,
       status: 'indexed' as const,
       detail: parts.join(' · '),
@@ -294,7 +299,7 @@ function CorpusPanel({
   const uploadCards: DocCard[] = uploads
     .filter((item) => item.status !== 'success')
     .map((item) => {
-      const reindexing = filenames.includes(item.filename);
+      const reindexing = indexed.has(item.filename);
       return item.status === 'error'
         ? {
             key: `upload:${item.id}`,
@@ -546,4 +551,5 @@ function CorpusPanel({
   );
 }
 
-export default CorpusPanel;
+// Memoized: App re-renders on every streamed token, and nothing here changes then.
+export default memo(CorpusPanel);

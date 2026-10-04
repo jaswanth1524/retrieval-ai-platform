@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { ConversationSummary } from '../hooks/useChat';
 import { formatRelativeTimeAgo } from '../utils/relativeTime';
@@ -190,4 +190,5 @@ function ConversationList({
   );
 }
 
-export default ConversationList;
+// Memoized: App re-renders on every streamed token, and the list doesn't change then.
+export default memo(ConversationList);

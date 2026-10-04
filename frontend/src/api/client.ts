@@ -20,6 +20,7 @@ import type {
   TraceDetailResponse,
   TraceListResponse,
 } from './types';
+import { readStored, writeStored } from '../utils/safeStorage';
 
 export class ApiClientError extends Error {
   statusCode?: number;
@@ -46,21 +47,11 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 const API_KEY_STORAGE_KEY = 'docrag-api-key';
 
 export function getApiKey(): string {
-  try {
-    return localStorage.getItem(API_KEY_STORAGE_KEY) ?? '';
-  } catch {
-    return '';
-  }
+  return readStored(API_KEY_STORAGE_KEY) ?? '';
 }
 
 export function setApiKey(key: string): void {
-  try {
-    if (key) localStorage.setItem(API_KEY_STORAGE_KEY, key);
-    else localStorage.removeItem(API_KEY_STORAGE_KEY);
-  } catch {
-    // Best-effort; the key still applies for the rest of this session via the
-    // in-memory value read on the next request even if persistence failed.
-  }
+  writeStored(API_KEY_STORAGE_KEY, key || null);
 }
 
 function authHeaders(): Record<string, string> {

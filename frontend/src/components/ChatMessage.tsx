@@ -3,6 +3,7 @@ import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
 import { withCitationFootnotes } from '../utils/exportChat';
+import { splitStreamingMarkdown } from '../utils/markdownBlocks';
 import CitationCard from './CitationCard';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
@@ -278,9 +279,11 @@ function ChatMessage({
               <StreamingSkeleton stage={streamStage} />
             ) : (
               <div className="chat-message__markdown">
-                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
-                  {turn.content}
-                </ReactMarkdown>
+                {streamStage !== undefined ? (
+                  <StreamingMarkdown text={turn.content} />
+                ) : (
+                  <MarkdownBlock text={turn.content} />
+                )}
               </div>
             )}
             <div className="chat-message__meta-row">
@@ -419,6 +422,28 @@ function ChatMessage({
         </div>
       )}
     </div>
+  );
+}
+
+const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+      {text}
+    </ReactMarkdown>
+  );
+});
+
+/** An answer still streaming: finished blocks are memoized, so each token re-parses only
+ *  the block it extends rather than the whole answer so far. */
+function StreamingMarkdown({ text }: { text: string }) {
+  const { done, tail } = splitStreamingMarkdown(text);
+  return (
+    <>
+      {done.map((block, index) => (
+        <MarkdownBlock key={index} text={block} />
+      ))}
+      <MarkdownBlock text={tail} />
+    </>
   );
 }
 

@@ -380,6 +380,25 @@ describe('ChatMessage', () => {
     expect(screen.queryByTestId('chat-message-regenerate')).not.toBeInTheDocument();
   });
 
+  it('renders a streaming answer block by block with the same markdown as a finished one', () => {
+    const content = 'First **bold** point.\n\n- one\n- two\n\nStill going';
+    const { rerender } = render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content })}
+        engineerMode={false}
+        streamStage="generating answer…"
+      />,
+    );
+
+    expect(screen.getByText('bold').tagName).toBe('STRONG');
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    expect(screen.getByText('Still going')).toBeInTheDocument();
+
+    rerender(<ChatMessage turn={makeTurn({ role: 'assistant', content })} engineerMode={false} />);
+    expect(screen.getByText('bold').tagName).toBe('STRONG');
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+
   it('renders no Regenerate button on a user or error turn', () => {
     render(
       <ChatMessage
