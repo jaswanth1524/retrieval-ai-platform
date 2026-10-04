@@ -87,7 +87,8 @@ jobs:
     # server's own hybrid query, its IDF modifier, or payload indexes. This runs the
     # server-only tests against the same Qdrant version compose pins, over REST and gRPC.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # First run downloads the models (~0.5 GB); later runs restore them from cache.
+    timeout-minutes: 30
     services:
       qdrant:
         image: qdrant/qdrant:v1.19.1
@@ -105,7 +106,8 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        # Tests only: the eval extra (ragas, langchain) is for RAGAS, not this job.
+        run: uv sync --locked --extra test
 
       - name: Wait for Qdrant
         run: |
@@ -120,6 +122,33 @@ jobs:
           DOCRAG_TEST_QDRANT_URL: http://127.0.0.1:6333
           DOCRAG_TEST_QDRANT_GRPC_PORT: "6334"
         run: uv run pytest tests/test_qdrant_server.py -v
+
+      - name: Cache embedding and reranker models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/fastembed
+            ~/.cache/huggingface
+          key: models-${{ runner.os }}-${{ hashFiles('api/settings.py') }}
+
+      # The retrieval eval (eval/harness.py) against real models and a real Qdrant: the
+      # handbook corpus, split small so each section is its own chunk, scored at file
+      # and chunk level and compared with the committed baseline. Same settings the
+      # baseline was made with (see its fingerprint); a drop past 0.05 fails the job.
+      - name: Retrieval eval vs baseline
+        env:
+          LITELLM_MODE: PRODUCTION
+          QDRANT_URL: http://127.0.0.1:6333
+          QDRANT_COLLECTION: eval_handbook
+          CHUNK_SIZE_TOKENS: "48"
+          CHUNK_OVERLAP_TOKENS: "8"
+          MIN_SECTION_WORDS: "0"
+        run: |
+          # The cached directory (env values aren't shell-expanded, so set here).
+          export FASTEMBED_CACHE_PATH="$HOME/.cache/fastembed"
+          uv run python -m eval.harness ingest eval/corpus_handbook
+          uv run python -m eval.harness retrieval eval/datasets/handbook_eval.jsonl \
+            --baseline eval/baselines/handbook_reranked.json --output eval-results.json
 
   frontend:
     runs-on: ubuntu-latest

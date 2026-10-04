@@ -221,6 +221,32 @@
    "text_sha1": "1fde54ddecbdf591"
   }
  ],
+ "corpus_handbook__contractor_handbook.md": [
+  {
+   "chunk_id": "78ae9b046722691e871f",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "f2ac56bce8b87c38"
+  },
+  {
+   "chunk_id": "75bc5bda55b719a9bf0a",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "7dc91d8a1346174c"
+  },
+  {
+   "chunk_id": "ccf6a2d90aff3d94cc45",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "1e745eea5686cacc"
+  },
+  {
+   "chunk_id": "1ed42c6ccd5ae59e74cc",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "b609d1dcd4a60a5f"
+  }
+ ],
  "corpus_handbook__data_retention_policy.md": [
   {
    "chunk_id": "e6db1d3bc660b562c6dd",
@@ -447,6 +473,26 @@
    "text_sha1": "ee9ceaa2fdd93875"
   }
  ],
+ "corpus_handbook__security_newsletter.md": [
+  {
+   "chunk_id": "dffe8679bebe7dfebe79",
+   "page": 1,
+   "section": "Password tips",
+   "text_sha1": "38e18994081bfa76"
+  },
+  {
+   "chunk_id": "a13675f89203820c43cb",
+   "page": 1,
+   "section": "Password tips",
+   "text_sha1": "7f50c840a0dc5b6b"
+  },
+  {
+   "chunk_id": "c089efac823a3da43fb7",
+   "page": 1,
+   "section": "Password tips",
+   "text_sha1": "51d952c9069f39fd"
+  }
+ ],
  "corpus_handbook__security_policy.md": [
   {
    "chunk_id": "a58a58aaff5c08f39827",
@@ -497,6 +543,26 @@
    "page": 1,
    "section": "About this policy",
    "text_sha1": "3e2eaafc592802e8"
+  }
+ ],
+ "corpus_handbook__travel_policy_2019_archived.md": [
+  {
+   "chunk_id": "66e73fc41bab0a966e95",
+   "page": 1,
+   "section": "Per diem",
+   "text_sha1": "4486a6cefaf3f5ee"
+  },
+  {
+   "chunk_id": "233af9e6e22ca78d5eb6",
+   "page": 1,
+   "section": "Per diem",
+   "text_sha1": "2f99167d70640974"
+  },
+  {
+   "chunk_id": "f87a33ebe7022a8d8ce6",
+   "page": 1,
+   "section": "Per diem",
+   "text_sha1": "c0ba8329d0f805c5"
   }
  ],
  "sample.txt": [
