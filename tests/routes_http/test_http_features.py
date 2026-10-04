@@ -171,7 +171,7 @@ def _start_gated_upload(api_context: ApiTestContext, gate_on: int) -> tuple[str,
 
 
 def test_a_running_job_is_cancelled_at_its_last_point_before_writing(
-    api_context: ApiTestContext,
+    api_context: ApiTestContext, caplog: pytest.LogCaptureFixture
 ) -> None:
     job_id, embeddings = _start_gated_upload(api_context, gate_on=1)
 
@@ -182,6 +182,8 @@ def test_a_running_job_is_cancelled_at_its_last_point_before_writing(
     assert response.status_code == 202
     assert job["state"] == "failed" and job["cancelled"] is True
     assert "big.txt" not in api_context.client.get("/documents").json()["filenames"]
+    # A cancel the user asked for is not logged as a failure with a traceback.
+    assert not [r for r in caplog.records if r.levelno >= 30 and r.name == "api.ingest_jobs"]
 
 
 def test_a_job_that_already_wrote_cannot_be_cancelled(api_context: ApiTestContext) -> None:

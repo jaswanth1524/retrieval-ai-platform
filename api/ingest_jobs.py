@@ -221,6 +221,13 @@ def run_ingest_job(
             before_first_write=handle.begin_write if handle is not None else None,
             tags=tags,
         )
+    except IngestCancelledError as exc:
+        # Asked for, not a fault: one line, no traceback.
+        logger.info("Ingest job %s for %r cancelled.", job_id, filename)
+        ingest_job_seconds.labels(outcome="failed").observe(time.monotonic() - started)
+        ingest_jobs_total.labels(outcome="failed", error_type="cancelled").inc()
+        job_store.update(job_id, state="failed", error=job_error_message(exc))
+        return
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
         ingest_job_seconds.labels(outcome="failed").observe(time.monotonic() - started)
