@@ -9,7 +9,33 @@ import type {
 } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
-import { chatStoreAvailable, loadChatStore, saveChatStore } from './chatStore';
+import { chatStoreAvailable, clearChatStore, loadChatStore, saveChatStore } from './chatStore';
+import {
+  CHAT_STORAGE_KEY,
+  EMPTY_SCOPE,
+  MAX_CONVERSATIONS,
+  TITLE_MAX_CHARS,
+  byRecentUse,
+  deriveTitle,
+  emptyConversation,
+  emptyStorage,
+  isChatTurn,
+  isOnlyEmpty,
+  loadStorage,
+  mergeConversations,
+  parseConversations,
+  persistStorage,
+} from './chatPersistence';
+import type {
+  ChatStorageV2,
+  Conversation,
+  ConversationScope,
+  ConversationSummary,
+} from './chatPersistence';
+
+// Re-exported for the components and tests that import them from here.
+export { EMPTY_SCOPE, mergeConversations } from './chatPersistence';
+export type { Conversation, ConversationScope, ConversationSummary } from './chatPersistence';
 
 // Mirrors the server's own REQUEST_HISTORY_MAX_MESSAGES cap (api/schemas.py) — kept
 // in sync so a client-side trim never silently disagrees with what the server would
@@ -56,8 +82,9 @@ export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
       (turn.role === 'user' || turn.role === 'assistant') &&
       turn.content.trim().length > 0 &&
       // A stopped answer is a fragment; sent back as history it reads to the model as
-      // what it actually concluded.
-      !turn.stopped,
+      // what it actually concluded. Same for one cut short by a failed connection.
+      !turn.stopped &&
+      !turn.incomplete,
     )
     .slice(-HISTORY_MAX_MESSAGES);
 
@@ -70,32 +97,6 @@ export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
     withinBudget.unshift({ role: candidates[i].role, content });
   }
   return withinBudget;
-}
-
-/** Which documents a conversation's questions search. Empty lists mean "everything". */
-export interface ConversationScope {
-  filenames: string[];
-  tags: string[];
-}
-
-export const EMPTY_SCOPE: ConversationScope = { filenames: [], tags: [] };
-
-export interface Conversation {
-  id: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  turns: ChatTurn[];
-  // Per conversation, so a follow-up in another conversation can't silently search
-  // the documents this one was scoped to. Absent on conversations saved before it.
-  scope?: ConversationScope;
-}
-
-export interface ConversationSummary {
-  id: string;
-  title: string;
-  updatedAt: number;
-  turnCount: number;
 }
 
 // Server stage labels mapped to what the reader sees. Anything the server sends that
@@ -130,6 +131,9 @@ export interface UseChatResult {
   setScope: (scope: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => void;
   /** Drop names that are no longer indexed from every conversation's scope. */
   pruneScopes: (indexedFilenames: string[]) => void;
+  /** Drop just these filenames from every conversation's scope. Unlike pruneScopes it
+   *  needs no snapshot of the whole corpus, which can be stale by the time it runs. */
+  removeFromScopes: (filenames: string[]) => void;
   ask: (
     question: string,
     provider?: LlmProvider,
@@ -170,266 +174,8 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
   };
 }
 
-const CHAT_STORAGE_KEY = 'docrag-chat-history';
-const CHAT_STORAGE_VERSION = 2;
-// Cap persisted turns per conversation so a very long session doesn't grow
-// localStorage unboundedly; older turns drop from persistence only, never from the
-// in-memory session. Conversations beyond the cap are pruned oldest-updated first.
-const CHAT_STORAGE_MAX_TURNS = 100;
-const MAX_CONVERSATIONS = 20;
-const TITLE_MAX_CHARS = 60;
-// Each source carries its full chunk text (~2 KB), up to 8 per answer, and it was the
-// bulk of what filled the ~5 MB quota. Only the most recent turns keep it on disk; older
-// ones keep the citation (file, page, section, chunk id), which is what opens the viewer.
-const PERSISTED_SOURCE_TEXT_TURNS = 6;
-
-export interface ChatStorageV2 {
-  version: 2;
-  activeConversationId: string | null;
-  conversations: Conversation[];
-}
-
-function isChatTurn(value: unknown): value is ChatTurn {
-  if (!value || typeof value !== 'object') return false;
-  const turn = value as Partial<ChatTurn>;
-  return (
-    typeof turn.id === 'string' &&
-    (turn.role === 'user' || turn.role === 'assistant' || turn.role === 'error') &&
-    typeof turn.content === 'string' &&
-    Array.isArray(turn.sources) &&
-    typeof turn.timestamp === 'number'
-  );
-}
-
-function deriveTitle(turns: ChatTurn[]): string {
-  const firstUser = turns.find((turn) => turn.role === 'user' && turn.content.trim());
-  if (!firstUser) return 'New chat';
-  const collapsed = firstUser.content.replace(/\s+/g, ' ').trim();
-  return collapsed.slice(0, TITLE_MAX_CHARS) || 'New chat';
-}
-
-function emptyConversation(): Conversation {
-  const now = Date.now();
-  return { id: newId(), title: 'New chat', createdAt: now, updatedAt: now, turns: [] };
-}
-
-function byRecentUse(a: Conversation, b: Conversation): number {
-  return b.updatedAt - a.updatedAt;
-}
-
-/** A conversation as written to disk: the last `maxTurns` turns, with source text kept
- * only on the most recent few (see PERSISTED_SOURCE_TEXT_TURNS). */
-function compactForStorage(conversation: Conversation, maxTurns: number): Conversation {
-  const turns = conversation.turns.slice(-maxTurns);
-  const keepTextFrom = turns.length - PERSISTED_SOURCE_TEXT_TURNS;
-  return {
-    ...conversation,
-    turns: turns.map((turn, index) =>
-      index >= keepTextFrom || turn.sources.every((source) => !source.text)
-        ? turn
-        : { ...turn, sources: turn.sources.map((source) => ({ ...source, text: '' })) },
-    ),
-  };
-}
-
-type PersistOutcome = 'saved' | 'partial' | 'failed';
-
-/** Write the store to localStorage, falling back to the active conversation alone. */
-function persistStorage(storage: ChatStorageV2): PersistOutcome {
-  const { conversations, activeConversationId } = storage;
-  const onlyEmpty = conversations.length === 1 && conversations[0].turns.length === 0;
-  if (onlyEmpty) {
-    try {
-      localStorage.removeItem(CHAT_STORAGE_KEY);
-    } catch {
-      // Nothing more to do if even a removeItem fails.
-    }
-    return 'saved';
-  }
-  const payloadFor = (convos: Conversation[], maxTurns: number) =>
-    JSON.stringify({
-      version: CHAT_STORAGE_VERSION,
-      activeConversationId,
-      conversations: convos.map((conversation) => compactForStorage(conversation, maxTurns)),
-    });
-  try {
-    localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(conversations, CHAT_STORAGE_MAX_TURNS));
-    return 'saved';
-  } catch {
-    // Quota most likely exceeded. Retry once with only the active conversation and a
-    // shorter tail rather than freezing at the last successful write with no signal —
-    // this still drops older conversations from disk but keeps the current one saved.
-    const reduced = conversations.filter((c) => c.id === activeConversationId);
-    if (reduced.length === 0) {
-      // No active match to fall back to. Writing the reduced payload here would
-      // persist an empty conversations array, which loadStorage reads back as
-      // "nothing saved" — a silent wipe reported as success. Fail loudly instead.
-      return 'failed';
-    }
-    try {
-      localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(reduced, 20));
-      // The write succeeded but every other conversation, and all but the last 20
-      // turns of this one, are now absent from disk — its own signal, not a clean save.
-      return 'partial';
-    } catch {
-      return 'failed';
-    }
-  }
-}
-
-/** ``incoming`` with passage text put back from ``mine`` where it was stripped.
- *
- * Another tab's localStorage copy drops old passage text; merged over this tab's full
- * copy as-is, the next IndexedDB save would have stored the stripped version. */
-function keepPassageText(incoming: Conversation, mine: Conversation): Conversation {
-  const mineById = new Map(mine.turns.map((turn) => [turn.id, turn]));
-  let restored = false;
-  const turns = incoming.turns.map((turn) => {
-    const own = mineById.get(turn.id);
-    if (!own || turn.sources.length !== own.sources.length) return turn;
-    if (!turn.sources.some((source, index) => !source.text && own.sources[index].text)) return turn;
-    restored = true;
-    return {
-      ...turn,
-      sources: turn.sources.map((source, index) =>
-        source.text ? source : { ...source, text: own.sources[index].text },
-      ),
-    };
-  });
-  return restored ? { ...incoming, turns } : incoming;
-}
-
-/** Fold another tab's saved conversations into this tab's, newest copy of each winning.
- *
- * Every tab used to rewrite the whole blob from its own memory, so asking in tab B
- * erased what tab A had just saved. A conversation deleted in the other tab survives
- * here if this tab still has it — losing a delete beats losing a conversation. */
-export function mergeConversations(
-  local: ChatStorageV2,
-  incoming: Conversation[],
-  // IndexedDB's copy of a conversation is the complete one (localStorage's drops old
-  // passage text), so on equal timestamps it wins.
-  preferIncomingOnTie = false,
-): ChatStorageV2 {
-  const byId = new Map(local.conversations.map((conversation) => [conversation.id, conversation]));
-  let changed = false;
-  for (const conversation of incoming) {
-    const mine = byId.get(conversation.id);
-    if (
-      !mine ||
-      conversation.updatedAt > mine.updatedAt ||
-      (preferIncomingOnTie && conversation.updatedAt === mine.updatedAt)
-    ) {
-      byId.set(conversation.id, mine ? keepPassageText(conversation, mine) : conversation);
-      changed = true;
-    }
-  }
-  if (!changed) return local;
-  const conversations = [...byId.values()].sort(byRecentUse).slice(0, MAX_CONVERSATIONS);
-  const activeConversationId = conversations.some((c) => c.id === local.activeConversationId)
-    ? local.activeConversationId
-    : conversations[0].id;
-  return { ...local, activeConversationId, conversations };
-}
-
-/** The conversations in a saved v2 payload (either store), or null when unreadable. */
-function parseConversations(value: unknown): Conversation[] | null {
-  if (!value || typeof value !== 'object') return null;
-  const parsed = value as { version?: number; conversations?: unknown };
-  if (parsed.version !== 2 || !Array.isArray(parsed.conversations)) return null;
-  return parsed.conversations
-    .map(sanitizeConversation)
-    .filter((conversation): conversation is Conversation => conversation !== null);
-}
-
-function emptyStorage(): ChatStorageV2 {
-  const conversation = emptyConversation();
-  return { version: 2, activeConversationId: conversation.id, conversations: [conversation] };
-}
-
-function sanitizeConversation(value: unknown): Conversation | null {
-  if (!value || typeof value !== 'object') return null;
-  const raw = value as Partial<Conversation>;
-  if (typeof raw.id !== 'string' || !Array.isArray(raw.turns)) return null;
-  const turns = raw.turns.filter(isChatTurn);
-  return {
-    id: raw.id,
-    title: typeof raw.title === 'string' && raw.title ? raw.title : deriveTitle(turns),
-    createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
-    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
-    turns,
-    scope: sanitizeScope(raw.scope),
-  };
-}
-
-function sanitizeScope(value: unknown): ConversationScope | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const raw = value as Partial<ConversationScope>;
-  const strings = (list: unknown) =>
-    Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : [];
-  return { filenames: strings(raw.filenames), tags: strings(raw.tags) };
-}
-
-// Logs an unreadable or unrecognized-shape persisted value before it's replaced with an
-// empty conversation, so the corruption is diagnosable from the console instead of
-// vanishing silently. Deliberately does *not* copy the blob to a sibling storage key:
-// nothing in the app ever reads such a copy back, so it would double the footprint of a
-// value that may well have been what exceeded the quota, and pay that cost forever.
-// Recovery would need a real UI to surface and discard it — a feature, not a side effect.
-function reportUnreadableStorage(raw: string): void {
-  console.warn(
-    `Discarding unreadable chat history in localStorage["${CHAT_STORAGE_KEY}"] ` +
-      `(${raw.length} chars); starting a fresh conversation.`,
-  );
-}
-
-function loadStorage(): ChatStorageV2 {
-  let raw: string | null = null;
-  try {
-    raw = localStorage.getItem(CHAT_STORAGE_KEY);
-    if (!raw) return emptyStorage();
-    const parsed = JSON.parse(raw) as {
-      version?: number;
-      turns?: unknown;
-      conversations?: unknown;
-      activeConversationId?: unknown;
-    };
-
-    if (parsed.version === 2 && Array.isArray(parsed.conversations)) {
-      const conversations = parsed.conversations
-        .map(sanitizeConversation)
-        .filter((conversation): conversation is Conversation => conversation !== null);
-      if (conversations.length === 0) return emptyStorage();
-      const activeId =
-        typeof parsed.activeConversationId === 'string' &&
-        conversations.some((conversation) => conversation.id === parsed.activeConversationId)
-          ? parsed.activeConversationId
-          : conversations[0].id;
-      return { version: 2, activeConversationId: activeId, conversations };
-    }
-
-    // v1 migration: a single flat thread becomes the first conversation. Read-only
-    // until the first successful v2 write, so a crash mid-migration never loses v1.
-    if (parsed.version === 1 && Array.isArray(parsed.turns)) {
-      const turns = parsed.turns.filter(isChatTurn);
-      if (turns.length === 0) return emptyStorage();
-      const conversation: Conversation = {
-        id: newId(),
-        title: deriveTitle(turns),
-        createdAt: turns[0].timestamp,
-        updatedAt: turns[turns.length - 1].timestamp,
-        turns,
-      };
-      return { version: 2, activeConversationId: conversation.id, conversations: [conversation] };
-    }
-
-    reportUnreadableStorage(raw);
-    return emptyStorage();
-  } catch {
-    if (raw) reportUnreadableStorage(raw);
-    return emptyStorage();
-  }
-}
+// How long IndexedDB writes are held back so a burst of changes is written once.
+const CHAT_STORE_SAVE_DELAY_MS = 300;
 
 export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
@@ -459,6 +205,33 @@ export function useChat(): UseChatResult {
 
   const storageRef = useRef(storage);
   storageRef.current = storage;
+  // The next IndexedDB write, held back by CHAT_STORE_SAVE_DELAY_MS (see the save effect).
+  const pendingChatStoreRef = useRef<ChatStorageV2 | null>(null);
+  const chatStoreTimerRef = useRef<number | undefined>(undefined);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const flushChatStore = () => {
+    window.clearTimeout(chatStoreTimerRef.current);
+    const pendingStorage = pendingChatStoreRef.current;
+    pendingChatStoreRef.current = null;
+    if (pendingStorage === null) return;
+    // Mirrors persistStorage: a lone empty conversation clears the store rather than
+    // being saved, so it can't come back next to a new one after a reload.
+    void (isOnlyEmpty(pendingStorage) ? clearChatStore() : saveChatStore(pendingStorage)).then(
+      (saved) => {
+        // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
+        if (saved && mountedRef.current) {
+          setPersistError(false);
+          setPersistPartial(false);
+        }
+      },
+    );
+  };
   // IndexedDB holds the full history (see chatStore.ts). Nothing is written there until
   // it has been read: saving first would replace it with localStorage's compact copy.
   const [chatStoreReady, setChatStoreReady] = useState(() => !chatStoreAvailable());
@@ -468,7 +241,9 @@ export function useChat(): UseChatResult {
     let cancelled = false;
     void loadChatStore().then((raw) => {
       if (cancelled) return;
-      const incoming = parseConversations(raw);
+      // An empty conversation holds nothing to restore, and merging one in next to the
+      // fresh one this load already made showed two "New chat" rows.
+      const incoming = parseConversations(raw)?.filter((c) => c.turns.length > 0);
       if (incoming && incoming.length > 0) {
         setStorage((prev) => mergeConversations(prev, incoming, true));
       }
@@ -492,18 +267,24 @@ export function useChat(): UseChatResult {
     setPersistError(outcome === 'failed');
     setPersistPartial(outcome === 'partial');
     if (!chatStoreReady || !chatStoreAvailable()) return;
-    let current = true;
-    void saveChatStore(storage).then((saved) => {
-      // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
-      if (saved && current) {
-        setPersistError(false);
-        setPersistPartial(false);
-      }
-    });
-    return () => {
-      current = false;
-    };
+    // Coalesced: every scope click, rename or rating used to rewrite the whole history
+    // in IndexedDB at once; a burst of changes now costs one write. The timer is not
+    // cancelled on unmount (the write must still land), and a hidden tab or pagehide
+    // flushes it early.
+    pendingChatStoreRef.current = storage;
+    window.clearTimeout(chatStoreTimerRef.current);
+    chatStoreTimerRef.current = window.setTimeout(flushChatStore, CHAT_STORE_SAVE_DELAY_MS);
   }, [storage, pending, chatStoreReady]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flushChatStore();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+    // flushChatStore only reads refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     // A reload, a link followed in this tab, or a closed tab during a 1-2 minute answer
@@ -527,6 +308,9 @@ export function useChat(): UseChatResult {
             };
       persistStorage(snapshot);
       // Best effort: the page may be gone before this commits; localStorage has it.
+      // This snapshot supersedes any write still waiting on its timer.
+      window.clearTimeout(chatStoreTimerRef.current);
+      pendingChatStoreRef.current = null;
       if (chatStoreAvailable()) void saveChatStore(snapshot);
     };
     window.addEventListener('pagehide', flush);
@@ -613,7 +397,9 @@ export function useChat(): UseChatResult {
       setActiveTurns((prev) => {
         const existing = prev.find((turn) => turn.id === assistantTurnId);
         if (!existing) {
-          return [...prev, update({ ...makeTurn('assistant', ''), id: assistantTurnId })];
+          const created: ChatTurn = { ...makeTurn('assistant', ''), id: assistantTurnId };
+          if (options?.modelLabel) created.model = options.modelLabel;
+          return [...prev, update(created)];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
       }, touch);
@@ -688,7 +474,17 @@ export function useChat(): UseChatResult {
         );
       } else {
         const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
-        setActiveTurns((prev) => [...prev, { ...makeTurn('error', message), question }]);
+        // Whatever streamed before the failure is a fragment. Left unmarked it read as a
+        // finished answer: it offered Regenerate and feedback, and went back to the
+        // model as history on the next question.
+        // (An assistant turn with no text yet is kept as it was: it carries the trace
+        // link to the partial server-side trace.)
+        setActiveTurns((prev) => [
+          ...prev.map((turn) =>
+            turn.id === assistantTurnId && turn.content !== '' ? { ...turn, incomplete: true } : turn,
+          ),
+          { ...makeTurn('error', message), question },
+        ]);
       }
     } finally {
       flushDelta();
@@ -803,13 +599,12 @@ export function useChat(): UseChatResult {
     [],
   );
 
-  const pruneScopes = useCallback((indexedFilenames: string[]) => {
-    const indexed = new Set(indexedFilenames);
+  const keepInScopes = useCallback((keep: (filename: string) => boolean) => {
     setStorage((prev) => {
       let changed = false;
       const conversations = prev.conversations.map((conversation) => {
         const filenames = conversation.scope?.filenames ?? [];
-        const kept = filenames.filter((name) => indexed.has(name));
+        const kept = filenames.filter(keep);
         if (kept.length === filenames.length) return conversation;
         changed = true;
         return { ...conversation, scope: { tags: conversation.scope?.tags ?? [], filenames: kept } };
@@ -817,6 +612,22 @@ export function useChat(): UseChatResult {
       return changed ? { ...prev, conversations } : prev;
     });
   }, []);
+
+  const pruneScopes = useCallback(
+    (indexedFilenames: string[]) => {
+      const indexed = new Set(indexedFilenames);
+      keepInScopes((name) => indexed.has(name));
+    },
+    [keepInScopes],
+  );
+
+  const removeFromScopes = useCallback(
+    (filenames: string[]) => {
+      const removed = new Set(filenames);
+      keepInScopes((name) => !removed.has(name));
+    },
+    [keepInScopes],
+  );
 
   // Stable identities (pending is read through a ref) so components receiving these
   // don't re-render on every streamed delta.
@@ -935,6 +746,7 @@ export function useChat(): UseChatResult {
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
     setScope,
     pruneScopes,
+    removeFromScopes,
     editAndResend,
     importConversation,
     pending,

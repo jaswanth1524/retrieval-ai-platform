@@ -7,7 +7,8 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, NotRequired, TypedDict
@@ -17,11 +18,12 @@ from api.answer_cache import (
     CachedAnswer,
     CacheKey,
     answer_cache_key,
-    bump_corpus_generation,
 )
 from api.chunking import HeuristicTokenCounter, TokenCounter
+from api.corpus import bump_corpus_generation
 from api.diversity import select_diverse
 from api.documents import CHUNKER_VERSION, chunk_sections, parse_document_bytes
+from api.errors import public_error_message
 from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
     ChatGenerator,
@@ -43,6 +45,7 @@ from api.generation import (
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
 from api.repository import VectorRepository, reciprocal_rank_fusion
+from api.request_id import current_request_id
 from api.reranking import RerankedChunk, Reranker, rerank_candidates_detailed
 from api.retrieval import (
     QueryEmbeddingProvider,
@@ -53,7 +56,14 @@ from api.retrieval import (
     points_to_chunks,
 )
 from api.settings import AppSettings
-from api.tracing import QueryTrace, TraceConfig, TraceSink, build_trace_candidates
+from api.tracing import (
+    QueryTrace,
+    TraceConfig,
+    TraceMode,
+    TraceSink,
+    TraceStatus,
+    build_trace_candidates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +337,10 @@ def expand_with_neighbors(
     return expanded
 
 
+class QuestionAbandoned(Exception):
+    """The client left mid-question; stop before the next expensive stage."""
+
+
 class RagPipeline:
     """Composes retrieval, reranking, and generation behind a single call."""
 
@@ -377,7 +391,10 @@ class RagPipeline:
         return settings.model_copy(update=update) if update else settings
 
     def _trace_config(
-        self, effective_settings: AppSettings, filenames: Sequence[str] | None
+        self,
+        effective_settings: AppSettings,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None = None,
     ) -> TraceConfig:
         return TraceConfig(
             llm_provider=effective_settings.llm_provider,
@@ -387,6 +404,117 @@ class RagPipeline:
             rerank_min_score=float(effective_settings.rerank_min_score),
             fused_top_n=int(effective_settings.fused_top_n),
             filenames=list(filenames) if filenames else None,
+            tags=list(tags) if tags else None,
+        )
+
+    def _phase_timings(
+        self,
+        phase: RetrievalPhase,
+        *,
+        total_start: float,
+        condense_ms: float,
+        generate_ms: float = 0.0,
+        citation_retry_ms: float = 0.0,
+    ) -> StageTimings:
+        """Stage timings for a finished question; ``total_ms`` measured now."""
+
+        return StageTimings(
+            embed_ms=phase.embed_ms,
+            search_ms=phase.search_ms,
+            rerank_ms=phase.rerank_ms,
+            generate_ms=generate_ms,
+            total_ms=(time.monotonic() - total_start) * 1000,
+            condense_ms=condense_ms,
+            query_expansion_ms=phase.query_expansion_ms,
+            context_expansion_ms=phase.context_expansion_ms,
+            citation_retry_ms=citation_retry_ms,
+        )
+
+    def _error_trace(
+        self,
+        *,
+        trace_id: str,
+        question: str,
+        mode: TraceMode,
+        effective_settings: AppSettings | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        error: str,
+        answer: str | None,
+        condensed_question: str | None,
+        history_message_count: int,
+    ) -> QueryTrace:
+        """The trace of a question that failed (or was abandoned) before finishing."""
+
+        return QueryTrace(
+            trace_id=trace_id,
+            created_at=time.time(),
+            question=question,
+            mode=mode,
+            status="error",
+            config=self._trace_config(effective_settings, filenames, tags)
+            if effective_settings is not None
+            else None,
+            candidates=[],
+            prompt_messages=None,
+            answer=answer,
+            cited_source_numbers=[],
+            timings=None,
+            error=error,
+            condensed_question=condensed_question,
+            history_message_count=history_message_count,
+            request_id=current_request_id(),
+        )
+
+    def _finished_trace(
+        self,
+        *,
+        trace_id: str,
+        question: str,
+        mode: TraceMode,
+        status: TraceStatus,
+        effective_settings: AppSettings,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        phase: RetrievalPhase,
+        selected: Sequence[RerankedChunk],
+        context_budget_dropped_ids: AbstractSet[str] = frozenset(),
+        prompt_messages: list[ChatMessage] | None,
+        answer: str,
+        cited_source_numbers: list[int],
+        timings: StageTimings,
+        condensed_question: str | None,
+        history_message_count: int,
+        citation_retry_used: bool = False,
+    ) -> QueryTrace:
+        """The trace of a question that ran to an answer (or to "insufficient context")."""
+
+        return QueryTrace(
+            trace_id=trace_id,
+            created_at=time.time(),
+            question=question,
+            mode=mode,
+            status=status,
+            config=self._trace_config(effective_settings, filenames, tags),
+            candidates=build_trace_candidates(
+                phase.fused_candidates,
+                phase.scored_chunks,
+                phase.context_chunks,
+                selected,
+                min_score=float(effective_settings.rerank_min_score),
+                diversity_dropped_ids=phase.diversity_dropped_ids,
+                context_budget_dropped_ids=context_budget_dropped_ids,
+            ),
+            prompt_messages=prompt_messages,
+            answer=answer,
+            cited_source_numbers=cited_source_numbers,
+            timings=timings_dict(timings),
+            error=None,
+            condensed_question=condensed_question,
+            history_message_count=history_message_count,
+            query_variants=phase.query_variants,
+            citation_retry_used=citation_retry_used,
+            request_id=current_request_id(),
         )
 
     def _truncate_history(
@@ -456,11 +584,19 @@ class RagPipeline:
         effective_settings: AppSettings,
         filenames: Sequence[str] | None,
         tags: Sequence[str] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        *,
+        for_generation: bool = True,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
 
-        Inlines ``retrieve_candidates``' steps (rather than calling it as one call)
-        so embedding and search can be timed separately for observability.
+        ``for_generation=False`` (search without an answer) skips the two stages that
+        only serve the prompt: LLM query expansion and neighbour expansion.
+
+        Embedding and search are separate steps so each can be timed for
+        observability.
+        ``should_stop`` is checked before the rerank, the costliest stage, and raises
+        ``QuestionAbandoned`` when the client has gone.
         """
 
         normalized_query = question.strip()
@@ -473,7 +609,7 @@ class RagPipeline:
         # Left un-timed (query_expansion_ms stays 0.0) when disabled, like condense_ms.
         variants: list[str] = []
         query_expansion_ms = 0.0
-        if effective_settings.query_expansion_enabled:
+        if effective_settings.query_expansion_enabled and for_generation:
             query_expansion_start = time.monotonic()
             variants = generate_query_variants(
                 normalized_query,
@@ -508,6 +644,8 @@ class RagPipeline:
         )
         candidates = points_to_chunks(points)
         search_ms = (time.monotonic() - search_start) * 1000
+        if should_stop is not None and should_stop():
+            raise QuestionAbandoned
 
         rerank_start = time.monotonic()
         outcome = rerank_candidates_detailed(
@@ -525,12 +663,16 @@ class RagPipeline:
         # the tail stays in the list unexpanded because traces report it as kept.
         context_expansion_start = time.monotonic()
         context_limit = int(effective_settings.max_context_chunks)
-        expanded = [
-            *expand_with_neighbors(
-                diverse_outcome.kept[:context_limit], self._repository, effective_settings
-            ),
-            *diverse_outcome.kept[context_limit:],
-        ]
+        expanded = (
+            [
+                *expand_with_neighbors(
+                    diverse_outcome.kept[:context_limit], self._repository, effective_settings
+                ),
+                *diverse_outcome.kept[context_limit:],
+            ]
+            if for_generation
+            else list(diverse_outcome.kept)
+        )
         context_expansion_ms = (time.monotonic() - context_expansion_start) * 1000
 
         return RetrievalPhase(
@@ -552,13 +694,20 @@ class RagPipeline:
         overrides: AnswerOverrides | None = None,
         filenames: Sequence[str] | None = None,
         tags: Sequence[str] | None = None,
+        *,
+        for_generation: bool = True,
     ) -> RetrievalPhase:
         """Retrieval exactly as ``answer`` runs it — query expansion, hybrid search,
         rerank, diversity filter, neighbour expansion — without generating. The eval
-        harness scores this, so it measures the pipeline users actually get."""
+        harness scores this, so it measures the pipeline users actually get.
+        ``for_generation=False`` is ``POST /search``: the same hybrid search, RRF and
+        rerank, minus the LLM query expansion and the neighbour expansion that only
+        feed a prompt."""
 
         effective_settings = self._effective_settings(overrides or AnswerOverrides())
-        return self._retrieve_and_rerank(question, effective_settings, filenames, tags)
+        return self._retrieve_and_rerank(
+            question, effective_settings, filenames, tags, for_generation=for_generation
+        )
 
     def _cache_key(
         self,
@@ -622,8 +771,14 @@ class RagPipeline:
         *,
         tags: Sequence[str] | None = None,
         use_cache: bool = True,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Iterator[StreamEvent]:
-        """``_answer_stream_uncached``, replayed from the answer cache on a hit."""
+        """``_answer_stream_uncached``, replayed from the answer cache on a hit.
+
+        ``should_stop`` (the client has gone) is polled between stages, so an
+        abandoned question stops before the rerank or the LLM call instead of
+        finishing work nobody will read.
+        """
 
         started = time.monotonic()
         key = self._cache_key(question, overrides, filenames, tags, history)
@@ -643,10 +798,20 @@ class RagPipeline:
                 }
                 return
         done: DoneEvent | None = None
-        for event in self._answer_stream_uncached(question, overrides, filenames, history, tags):
-            if event["type"] == "done":
-                done = event
-            yield event
+        events = self._answer_stream_uncached(
+            question, overrides, filenames, history, tags, should_stop
+        )
+        try:
+            for event in events:
+                if event["type"] == "done":
+                    done = event
+                yield event
+        finally:
+            # Closing this generator (the client left) must close the inner one now: its
+            # `finally` records the "closed early" trace. Left to garbage collection, it
+            # ran whenever the inner generator was freed — never, while anything (a
+            # tracer, a traceback) still held it.
+            events.close()
         if key is not None and done is not None and self._answer_cache is not None:
             self._answer_cache.put(
                 key,
@@ -712,37 +877,27 @@ class RagPipeline:
             # block just timed covers two LLM calls when it fired. Split it back out so
             # generate_ms means the same thing here as it does on the streaming path.
             generate_ms = (time.monotonic() - generate_start) * 1000 - grounded.citation_retry_ms
-            total_ms = (time.monotonic() - total_start) * 1000
-
-            timings = StageTimings(
-                embed_ms=phase.embed_ms,
-                search_ms=phase.search_ms,
-                rerank_ms=phase.rerank_ms,
-                generate_ms=generate_ms,
-                total_ms=total_ms,
+            timings = self._phase_timings(
+                phase,
+                total_start=total_start,
                 condense_ms=condense_ms,
-                query_expansion_ms=phase.query_expansion_ms,
-                context_expansion_ms=phase.context_expansion_ms,
+                generate_ms=generate_ms,
                 citation_retry_ms=grounded.citation_retry_ms,
             )
         except Exception as exc:
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
-                    QueryTrace(
+                    self._error_trace(
                         trace_id=trace_id,
-                        created_at=time.time(),
                         question=question,
                         mode="sync",
-                        status="error",
-                        config=self._trace_config(effective_settings, filenames)
-                        if effective_settings is not None
-                        else None,
-                        candidates=[],
-                        prompt_messages=None,
+                        effective_settings=effective_settings,
+                        filenames=filenames,
+                        tags=tags,
+                        # Traces are readable with the read-only key: the same rule
+                        # as a response body, so no internal detail.
+                        error=public_error_message(exc),
                         answer=None,
-                        cited_source_numbers=[],
-                        timings=None,
-                        error=str(exc),
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
                     )
@@ -754,32 +909,24 @@ class RagPipeline:
             # build_grounded_messages call would agree today but is a re-derivation that
             # can drift, and it could never reproduce the citation-retry continuation
             # that actually produced the answer when grounded.citation_retry_used is set.
-            prompt_messages = grounded.prompt_messages or None
             trace_store.add(
-                QueryTrace(
+                self._finished_trace(
                     trace_id=trace_id,
-                    created_at=time.time(),
                     question=question,
                     mode="sync",
                     status="ok" if selected else "insufficient_context",
-                    config=self._trace_config(effective_settings, filenames),
-                    candidates=build_trace_candidates(
-                        phase.fused_candidates,
-                        phase.scored_chunks,
-                        phase.context_chunks,
-                        selected,
-                        min_score=float(effective_settings.rerank_min_score),
-                        diversity_dropped_ids=phase.diversity_dropped_ids,
-                        context_budget_dropped_ids=fitted.dropped_point_ids,
-                    ),
-                    prompt_messages=prompt_messages,
+                    effective_settings=effective_settings,
+                    filenames=filenames,
+                    tags=tags,
+                    phase=phase,
+                    selected=selected,
+                    context_budget_dropped_ids=fitted.dropped_point_ids,
+                    prompt_messages=grounded.prompt_messages or None,
                     answer=grounded.answer,
                     cited_source_numbers=[source.source_number for source in grounded.sources],
-                    timings=timings_dict(timings),
-                    error=None,
+                    timings=timings,
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
-                    query_variants=phase.query_variants,
                     citation_retry_used=grounded.citation_retry_used,
                 )
             )
@@ -792,7 +939,8 @@ class RagPipeline:
         filenames: Sequence[str] | None = None,
         history: Sequence[ChatMessage] | None = None,
         tags: Sequence[str] | None = None,
-    ) -> Iterator[StreamEvent]:
+        should_stop: Callable[[], bool] | None = None,
+    ) -> Generator[StreamEvent]:
         """Stream a grounded answer as SSE-ready events: sources, deltas, then done.
 
         Sources are emitted immediately after rerank (before the LLM call starts) so
@@ -814,25 +962,19 @@ class RagPipeline:
         # that `except Exception` never sees) before any of them ran.
         finalized = False
 
-        def _store_error_trace(error: BaseException) -> None:
+        def _store_error_trace(error: str) -> None:
             if trace_store is None or trace_id is None:
                 return
             trace_store.add(
-                QueryTrace(
+                self._error_trace(
                     trace_id=trace_id,
-                    created_at=time.time(),
                     question=question,
                     mode="stream",
-                    status="error",
-                    config=self._trace_config(effective_settings, filenames)
-                    if effective_settings is not None
-                    else None,
-                    candidates=[],
-                    prompt_messages=None,
+                    effective_settings=effective_settings,
+                    filenames=filenames,
+                    tags=tags,
+                    error=error,
                     answer="".join(parts).strip() or None,
-                    cited_source_numbers=[],
-                    timings=None,
-                    error=str(error),
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
                 )
@@ -850,7 +992,9 @@ class RagPipeline:
                 question, truncated_history, effective_settings
             )
             yield {"type": "stage", "stage": "searching"}
-            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames, tags)
+            phase = self._retrieve_and_rerank(
+                retrieval_query, effective_settings, filenames, tags, should_stop
+            )
             fitted = fit_prompt_to_context_window(
                 question.strip(),
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
@@ -861,42 +1005,27 @@ class RagPipeline:
 
             if not selected:
                 yield {"type": "sources", "sources": [], "trace_id": trace_id}
-                total_ms = (time.monotonic() - total_start) * 1000
-                timings = StageTimings(
-                    embed_ms=phase.embed_ms,
-                    search_ms=phase.search_ms,
-                    rerank_ms=phase.rerank_ms,
-                    generate_ms=0.0,
-                    total_ms=total_ms,
-                    condense_ms=condense_ms,
-                    query_expansion_ms=phase.query_expansion_ms,
-                    context_expansion_ms=phase.context_expansion_ms,
+                timings = self._phase_timings(
+                    phase, total_start=total_start, condense_ms=condense_ms
                 )
                 if trace_store is not None and trace_id is not None:
                     trace_store.add(
-                        QueryTrace(
+                        self._finished_trace(
                             trace_id=trace_id,
-                            created_at=time.time(),
                             question=question,
                             mode="stream",
                             status="insufficient_context",
-                            config=self._trace_config(effective_settings, filenames),
-                            candidates=build_trace_candidates(
-                                phase.fused_candidates,
-                                phase.scored_chunks,
-                                phase.context_chunks,
-                                [],
-                                min_score=float(effective_settings.rerank_min_score),
-                                diversity_dropped_ids=phase.diversity_dropped_ids,
-                            ),
+                            effective_settings=effective_settings,
+                            filenames=filenames,
+                            tags=tags,
+                            phase=phase,
+                            selected=[],
                             prompt_messages=None,
                             answer=INSUFFICIENT_CONTEXT_ANSWER,
                             cited_source_numbers=[],
-                            timings=timings_dict(timings),
-                            error=None,
+                            timings=timings,
                             condensed_question=condensed_question,
                             history_message_count=len(truncated_history),
-                            query_variants=phase.query_variants,
                         )
                     )
                 finalized = True
@@ -917,6 +1046,8 @@ class RagPipeline:
             }
 
             messages = build_grounded_messages(question.strip(), selected, fitted.history or None)
+            if should_stop is not None and should_stop():
+                return  # the finally below records the trace as closed early
             generate_start = time.monotonic()
             for delta in self._generator.stream(messages, effective_settings):
                 parts.append(delta)
@@ -945,36 +1076,26 @@ class RagPipeline:
             cited = outcome.cited
             citation_retry_used = outcome.retry_used
 
-            total_ms = (time.monotonic() - total_start) * 1000
-            timings = StageTimings(
-                embed_ms=phase.embed_ms,
-                search_ms=phase.search_ms,
-                rerank_ms=phase.rerank_ms,
-                generate_ms=generate_ms,
-                total_ms=total_ms,
+            timings = self._phase_timings(
+                phase,
+                total_start=total_start,
                 condense_ms=condense_ms,
-                query_expansion_ms=phase.query_expansion_ms,
-                context_expansion_ms=phase.context_expansion_ms,
+                generate_ms=generate_ms,
                 citation_retry_ms=outcome.retry_ms,
             )
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
-                    QueryTrace(
+                    self._finished_trace(
                         trace_id=trace_id,
-                        created_at=time.time(),
                         question=question,
                         mode="stream",
                         status="ok",
-                        config=self._trace_config(effective_settings, filenames),
-                        candidates=build_trace_candidates(
-                            phase.fused_candidates,
-                            phase.scored_chunks,
-                            phase.context_chunks,
-                            selected,
-                            min_score=float(effective_settings.rerank_min_score),
-                            diversity_dropped_ids=phase.diversity_dropped_ids,
-                            context_budget_dropped_ids=fitted.dropped_point_ids,
-                        ),
+                        effective_settings=effective_settings,
+                        filenames=filenames,
+                        tags=tags,
+                        phase=phase,
+                        selected=selected,
+                        context_budget_dropped_ids=fitted.dropped_point_ids,
                         # outcome.prompt_messages, not the `messages` that were streamed:
                         # when the citation retry fired, the streamed answer was replaced
                         # by the retry's, and the retry's continuation is what produced
@@ -982,11 +1103,9 @@ class RagPipeline:
                         prompt_messages=list(outcome.prompt_messages),
                         answer=answer,
                         cited_source_numbers=[source.source_number for source in cited],
-                        timings=timings_dict(timings),
-                        error=None,
+                        timings=timings,
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
-                        query_variants=phase.query_variants,
                         citation_retry_used=citation_retry_used,
                     )
                 )
@@ -998,18 +1117,21 @@ class RagPipeline:
                 "timings": timings_dict(timings),
                 "trace_id": trace_id,
             }
+        except QuestionAbandoned:
+            return  # the finally below records the trace as closed early
         except Exception as exc:
             if not finalized:
-                _store_error_trace(exc)
+                _store_error_trace(public_error_message(exc))
                 finalized = True
             raise
         finally:
             if not finalized:
-                # Reached only via GeneratorExit (the client disconnected, or the
-                # generator was otherwise closed mid-stream without completing or
-                # raising an `Exception`) — `finally` re-raises it automatically once
-                # this block returns, so no explicit `raise` is needed here.
-                _store_error_trace(RuntimeError("Stream closed before completion."))
+                # Reached via GeneratorExit (the client disconnected, or the generator
+                # was otherwise closed mid-stream without completing or raising an
+                # `Exception`) — `finally` re-raises it automatically once this block
+                # returns, so no explicit `raise` is needed here — or via an early
+                # return once `should_stop` reported the client gone.
+                _store_error_trace("Stream closed before completion.")
                 finalized = True
 
 
@@ -1048,13 +1170,18 @@ class IngestService:
         on_indexed: Callable[[], None] | None = None,
         uploaded_at: float | None = None,
         precondition: Callable[[], None] | None = None,
+        *,
+        before_first_write: Callable[[], None] | None = None,
+        tags: tuple[str, ...] | None = None,
     ) -> DocumentIngestOutcome:
         """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
 
         ``on_indexed`` runs under the filename write lock once indexing succeeded (see
         ``ingest_chunks``). ``uploaded_at`` overrides the upload stamp — a re-index of a
         stored original keeps the document's original upload time rather than "now".
-        ``precondition`` is checked under that lock before anything is written.
+        ``precondition`` is checked under that lock before anything is written, and
+        ``before_first_write`` right before the first batch lands (see ``ingest_chunks``).
+        ``tags`` sets the document's tags (a restore) instead of carrying its current ones.
         """
 
         sections = parse_document_bytes(filename, content, self._settings)
@@ -1091,6 +1218,8 @@ class IngestService:
                 # A re-upload or re-index replaces the document's points; its tags are
                 # a property of the document, not of one upload, so they carry over.
                 carry_tags=True,
+                before_first_write=before_first_write,
+                tags=tags,
             )
         finally:
             # Even a failed ingest may have written points; cached answers could

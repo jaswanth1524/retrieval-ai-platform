@@ -1,7 +1,15 @@
-import { useRef, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
 import type { DragEvent, RefObject } from 'react';
 import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
+import {
+  ACCEPTED_EXTENSIONS,
+  DEFAULT_MAX_UPLOAD_BYTES,
+  formatBytes,
+  validateUploads,
+} from '../utils/uploadValidation';
+import type { RejectedFile } from '../utils/uploadValidation';
+import ConfirmInline from './ConfirmInline';
 import './CorpusPanel.css';
 
 // Both are structural details of UploadItem below and have no consumers outside this
@@ -26,27 +34,32 @@ export interface UploadItem {
   file?: File;
   /** A re-index of the stored original rather than an upload — retried the same way. */
   reindex?: boolean;
+  /** Cancel was pressed and hasn't settled yet. */
+  cancelling?: boolean;
 }
 
-interface RejectedFile {
-  filename: string;
-  message: string;
+/** One indexed document's metadata, from GET /documents. */
+export interface DocumentMeta {
+  chunks: number;
+  // Absent for a document indexed before this metadata was stamped at ingest time —
+  // the detail line simply omits it.
+  pages?: number;
+  bytes?: number;
+  /** Seconds since the epoch. */
+  uploadedAt?: number;
+  /** Indexed by an older chunker. */
+  stale: boolean;
+  /** Has a stored original the server can re-index from (and serve back). */
+  reindexable: boolean;
+  tags: string[];
 }
-
-// Matches the backend's AppSettings.max_upload_bytes default — used only until
-// /config has loaded and supplies the server's actual configured limit.
-const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
-// Mirrors api/documents.py SUPPORTED_EXTENSIONS.
-const ACCEPTED_EXTENSIONS = ['.pdf', '.txt', '.md', '.markdown', '.docx', '.html', '.htm', '.csv'];
 
 interface CorpusPanelProps {
+  /** Indexed documents, in display order. */
   filenames: string[];
-  chunkCounts: Record<string, number>;
-  // Absent (not present with a null value) for a filename ingested before this
-  // metadata was stamped at ingest time — the detail line simply omits it.
-  pageCounts?: Record<string, number>;
-  byteSizes?: Record<string, number>;
-  uploadedAts?: Record<string, number>;
+  /** Their metadata. A document indexed moments ago may have none yet (it arrives with
+   *  the next refresh); its card shows what it can. */
+  documents: Record<string, DocumentMeta>;
   uploads: UploadItem[];
   onUpload: (files: File[]) => Promise<void>;
   onDelete: (filename: string) => Promise<void>;
@@ -56,17 +69,17 @@ interface CorpusPanelProps {
   browseInputRef?: RefObject<HTMLInputElement | null>;
   onRetryUpload?: (uploadId: string) => void;
   onDismissUpload?: (uploadId: string) => void;
-  /** Indexed by an older chunker. */
-  staleFilenames?: string[];
-  /** Have a stored original the server can re-index from. */
-  reindexableFilenames?: string[];
+  /** Stop an upload or re-index that is waiting or hasn't started writing yet. */
+  onCancelUpload?: (uploadId: string) => void;
   onReindex?: (filename: string) => void;
   /** Re-index every stale document that has a stored original, in one request. */
   onReindexAllStale?: () => void;
-  /** Each tagged document's tags. */
-  tags?: Record<string, string[]>;
   /** Replace a document's tags; rejects with a message to show on failure. */
   onSetTags?: (filename: string, tags: string[]) => Promise<void>;
+  /** The read-only API key: no upload or delete (the server would answer 403). */
+  readOnly?: boolean;
+  /** Download a document's stored original (RAW_DOCUMENT_DIR); absent when none are kept. */
+  onOpenOriginal?: (filename: string) => void;
 }
 
 interface TagEditorProps {
@@ -157,10 +170,6 @@ function TagEditor({ filename, tags, disabled, onSave }: TagEditorProps) {
   );
 }
 
-function formatBytes(bytes: number): string {
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf('.');
   return dot === -1 ? '' : filename.slice(dot + 1).toUpperCase();
@@ -178,9 +187,11 @@ interface DocCard {
   /** Set for cards backed by an upload (in flight or failed) rather than the index. */
   uploadId?: string;
   canRetry?: boolean;
+  cancelling?: boolean;
   status: 'indexed' | 'indexing' | 'failed';
   stale?: boolean;
   canReindex?: boolean;
+  hasOriginal?: boolean;
   detail: string;
   pct: number;
   error?: string;
@@ -188,10 +199,7 @@ interface DocCard {
 
 function CorpusPanel({
   filenames,
-  chunkCounts,
-  pageCounts = {},
-  byteSizes = {},
-  uploadedAts = {},
+  documents,
   uploads,
   onUpload,
   onDelete,
@@ -200,12 +208,12 @@ function CorpusPanel({
   browseInputRef,
   onRetryUpload,
   onDismissUpload,
-  staleFilenames = [],
-  reindexableFilenames = [],
+  onCancelUpload,
   onReindex,
   onReindexAllStale,
-  tags = {},
   onSetTags,
+  readOnly = false,
+  onOpenOriginal,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFile[]>([]);
@@ -220,26 +228,7 @@ function CorpusPanel({
 
   const handleFilesChange = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
-    const accepted: File[] = [];
-    const rejected: RejectedFile[] = [];
-    Array.from(fileList).forEach((file) => {
-      // The input's `accept` filters the picker only; a drop bypasses it, and an
-      // unsupported file used to cost a round trip to learn the server rejects it.
-      const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-      if (!file.name.includes('.') || !ACCEPTED_EXTENSIONS.includes(extension)) {
-        rejected.push({
-          filename: file.name,
-          message: `${file.name} isn't a supported type (${ACCEPTED_EXTENSIONS.join(' ')}).`,
-        });
-      } else if (file.size > maxUploadBytes) {
-        rejected.push({
-          filename: file.name,
-          message: `${file.name} is too large (${formatBytes(file.size)}). Maximum is ${formatBytes(maxUploadBytes)}.`,
-        });
-      } else {
-        accepted.push(file);
-      }
-    });
+    const { accepted, rejected } = validateUploads(Array.from(fileList), maxUploadBytes);
     setRejectedFiles(rejected);
     setStagedFiles((prev) => [...prev, ...accepted]);
   };
@@ -289,26 +278,29 @@ function CorpusPanel({
   const inFlightNames = new Set(
     uploads.filter((item) => item.status === 'uploading').map((item) => item.filename),
   );
+  // A Set, not Array.includes per upload card: with a large corpus that was a quadratic
+  // scan on every render.
+  const indexed = useMemo(() => new Set(filenames), [filenames]);
   const indexedCards: DocCard[] = filenames.filter((filename) => !inFlightNames.has(filename)).map((filename) => {
-    const count = chunkCounts[filename] ?? 0;
+    const meta = documents[filename];
+    const count = meta?.chunks ?? 0;
     const parts = [`${count} ${count === 1 ? 'chunk' : 'chunks'}`];
-    const pages = pageCounts[filename];
-    if (pages) parts.push(`${pages} page${pages === 1 ? '' : 's'}`);
-    const bytes = byteSizes[filename];
-    if (bytes !== undefined) parts.push(formatBytes(bytes));
-    const uploadedAt = uploadedAts[filename];
-    if (uploadedAt !== undefined) parts.push(formatRelativeTime(uploadedAt * 1000));
-    const canReindex = onReindex !== undefined && reindexableFilenames.includes(filename);
+    if (meta?.pages) parts.push(`${meta.pages} page${meta.pages === 1 ? '' : 's'}`);
+    if (meta?.bytes !== undefined) parts.push(formatBytes(meta.bytes));
+    if (meta?.uploadedAt !== undefined) parts.push(formatRelativeTime(meta.uploadedAt * 1000));
+    const hasOriginal = meta?.reindexable ?? false;
+    const canReindex = onReindex !== undefined && hasOriginal;
     // Only flagged when it can be acted on. Without a stored original there is nothing
     // to re-index from, and a document indexed before versions were recorded counts as
     // stale even if the current chunker produced it — a label the user can't clear.
-    const stale = canReindex && staleFilenames.includes(filename);
-    if (stale) parts.push('older chunking');
+    const isStale = canReindex && (meta?.stale ?? false);
+    if (isStale) parts.push('older chunking');
     return {
       key: `doc:${filename}`,
       filename,
-      stale,
+      stale: isStale,
       canReindex,
+      hasOriginal,
       status: 'indexed' as const,
       detail: parts.join(' · '),
       pct: 100,
@@ -321,7 +313,7 @@ function CorpusPanel({
   const uploadCards: DocCard[] = uploads
     .filter((item) => item.status !== 'success')
     .map((item) => {
-      const reindexing = filenames.includes(item.filename);
+      const reindexing = indexed.has(item.filename);
       return item.status === 'error'
         ? {
             key: `upload:${item.id}`,
@@ -338,8 +330,10 @@ function CorpusPanel({
             uploadId: item.id,
             filename: item.filename,
             status: 'indexing',
-            detail:
-              item.progress?.state === 'waiting'
+            cancelling: item.cancelling,
+            detail: item.cancelling
+              ? 'cancelling…'
+              : item.progress?.state === 'waiting'
                 ? 'waiting for room in the indexing queue…'
                 : `${reindexing ? 're-indexing' : 'indexing'} ${progressPercent(item.progress)}%`,
             pct: progressPercent(item.progress),
@@ -355,6 +349,12 @@ function CorpusPanel({
 
   return (
     <>
+      {readOnly && (
+        <p className="corpus-panel__readonly" data-testid="corpus-readonly">
+          Read-only key: you can search and ask, but not change documents.
+        </p>
+      )}
+      {!readOnly && (
       <label
         className={`corpus-panel__dropzone${dragOver ? ' corpus-panel__dropzone--active' : ''}`}
         onDragOver={handleDragOver}
@@ -374,6 +374,7 @@ function CorpusPanel({
           data-testid="upload-input"
         />
       </label>
+      )}
 
       {stagedFiles.length > 0 && (
         <div className="corpus-panel__staged" data-testid="upload-staged-list">
@@ -453,37 +454,27 @@ function CorpusPanel({
             <span className="corpus-panel__ext">{extensionOf(card.filename)}</span>
             <span className="corpus-panel__name">{card.filename}</span>
             {confirming === card.key ? (
-              <div
+              <ConfirmInline
                 className="corpus-panel__confirm"
-                onKeyDown={(event) => {
-                  if (event.key !== 'Escape') return;
-                  // Cancels the confirm only — not the drawer this panel may sit in.
-                  event.stopPropagation();
-                  setConfirming(null);
-                }}
-              >
-                <span>Delete?</span>
-                <button
-                  type="button"
-                  className="corpus-panel__confirm-yes"
-                  onClick={() => void handleDelete(card.filename)}
-                  disabled={deleting === card.filename}
-                >
-                  {deleting === card.filename ? '…' : 'Confirm'}
-                </button>
-                {/* Focus the safe choice, as ConversationList does: the ✕ that opened
-                    this confirm just unmounted, which dropped focus to <body>. */}
-                <button
-                  type="button"
-                  className="corpus-panel__confirm-no"
-                  autoFocus
-                  onClick={() => setConfirming(null)}
-                >
-                  Cancel
-                </button>
-              </div>
+                prompt="Delete?"
+                confirmLabel="Confirm"
+                onCancel={() => setConfirming(null)}
+                onConfirm={() => void handleDelete(card.filename)}
+                busy={deleting === card.filename}
+              />
             ) : card.status === 'indexed' ? (
               <div className="corpus-panel__card-actions">
+                {card.hasOriginal && onOpenOriginal && (
+                  <button
+                    type="button"
+                    className="corpus-panel__open-original"
+                    onClick={() => onOpenOriginal(card.filename)}
+                    aria-label={`Download the original of ${card.filename}`}
+                    title="Download the uploaded file"
+                  >
+                    ⇱
+                  </button>
+                )}
                 {card.canReindex && (
                   <button
                     type="button"
@@ -500,16 +491,34 @@ function CorpusPanel({
                     ↻
                   </button>
                 )}
+                {!readOnly && (
+                  <button
+                    type="button"
+                    className="corpus-panel__remove"
+                    onClick={() => setConfirming(card.key)}
+                    disabled={disabled}
+                    aria-label={`Delete ${card.filename}`}
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            ) : card.status === 'indexing' ? (
+              !readOnly &&
+              onCancelUpload &&
+              card.uploadId !== undefined && (
                 <button
                   type="button"
-                  className="corpus-panel__remove"
-                  onClick={() => setConfirming(card.key)}
-                  disabled={disabled}
-                  aria-label={`Delete ${card.filename}`}
+                  className="corpus-panel__cancel"
+                  onClick={() => onCancelUpload(card.uploadId!)}
+                  disabled={card.cancelling}
+                  aria-label={`Cancel indexing ${card.filename}`}
+                  title="Stop before anything is written to the index"
+                  data-testid="corpus-cancel-upload"
                 >
-                  ✕
+                  Cancel
                 </button>
-              </div>
+              )
             ) : (
               card.status === 'failed' &&
               card.uploadId !== undefined && (
@@ -562,7 +571,7 @@ function CorpusPanel({
           {card.status === 'indexed' && onSetTags && (
             <TagEditor
               filename={card.filename}
-              tags={tags[card.filename] ?? []}
+              tags={documents[card.filename]?.tags ?? []}
               disabled={disabled}
               onSave={onSetTags}
             />
@@ -573,4 +582,5 @@ function CorpusPanel({
   );
 }
 
-export default CorpusPanel;
+// Memoized: App re-renders on every streamed token, and nothing here changes then.
+export default memo(CorpusPanel);

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useDialog } from '../hooks/useDialog';
+import { shortcutLabel } from '../utils/platform';
 import './CommandPalette.css';
 
 export interface Command {
@@ -39,6 +40,13 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Arrow keys move the highlight past the list's visible height; keep it in view.
+  const highlightedId = matches[highlighted]?.id;
+  useEffect(() => {
+    if (highlightedId === undefined) return;
+    document.getElementById(`palette-cmd-${highlightedId}`)?.scrollIntoView?.({ block: 'nearest' });
+  }, [highlightedId]);
 
   const run = (command: Command | undefined) => {
     if (!command || command.disabled) return;
@@ -125,7 +133,7 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
                 </span>
                 <span className="palette__label">{command.label}</span>
                 {command.shortcut && (
-                  <span className="palette__shortcut mono">{command.shortcut}</span>
+                  <span className="palette__shortcut mono">{shortcutLabel(command.shortcut)}</span>
                 )}
               </button>
             </li>
@@ -135,7 +143,7 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
         <div className="palette__footer mono">
           <span>↑↓ navigate</span>
           <span>⏎ run</span>
-          <span>⌘K toggle</span>
+          <span>{shortcutLabel('⌘K')} toggle</span>
         </div>
       </div>
     </div>

@@ -48,6 +48,25 @@
   line-height: 1;
 }
 
+.document-viewer__original {
+  margin-left: auto;
+  margin-right: 0.75rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.document-viewer__original:hover,
+.document-viewer__original:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .document-viewer__body {
   overflow-y: auto;
   padding: 1rem;

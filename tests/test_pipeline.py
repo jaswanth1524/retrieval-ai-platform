@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -17,9 +18,10 @@ from api.pipeline import (
     expand_with_neighbors,
 )
 from api.repository import VectorRepository
-from api.reranking import rerank_candidates
-from api.retrieval import RetrievalConfigError, retrieve_candidates
+from api.reranking import RerankedChunk, rerank_candidates_detailed
+from api.retrieval import RetrievalConfigError, RetrievalError, points_to_chunks
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 class StaticEmbeddingProvider:
@@ -165,12 +167,7 @@ class ListTraceStore:
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "pipeline_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("pipeline_documents"),
         "chunk_size_tokens": 20,
         "chunk_overlap_tokens": 0,
         "fused_top_n": 5,
@@ -178,7 +175,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "max_context_chunks": 2,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_embedding(value: float) -> EmbeddedText:
@@ -186,6 +183,15 @@ def make_embedding(value: float) -> EmbeddedText:
         dense=[value, 0.0, 0.0],
         sparse=models.SparseVector(indices=[1], values=[1.0]),
     )
+
+
+def search_and_rerank(
+    repository: VectorRepository, settings: AppSettings, query: str
+) -> list[RerankedChunk]:
+    """Hybrid search, then rerank: the primitives ``RagPipeline.retrieve`` composes."""
+
+    candidates = points_to_chunks(repository.hybrid_search(settings, make_embedding(1.0)))
+    return rerank_candidates_detailed(query, candidates, FakeReranker(), settings).kept
 
 
 class WordTokenCounter:
@@ -520,10 +526,7 @@ def test_expand_with_neighbors_merges_adjacent_chunk_text() -> None:
         token_counter=WordTokenCounter(),
     ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
 
-    candidates = retrieve_candidates(
-        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "one")
     middle = next(chunk for chunk in reranked if chunk.chunk_ordinal == 2)
 
     [expanded_middle] = expand_with_neighbors([middle], repository, settings)
@@ -559,10 +562,7 @@ def test_expand_with_neighbors_fetches_once_per_filename_not_once_per_chunk() ->
         b"Thirteen fourteen fifteen.",
     )
 
-    candidates = retrieve_candidates(
-        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "one")
     by_ordinal = {chunk.chunk_ordinal: chunk for chunk in reranked}
     selected = [by_ordinal[2], by_ordinal[4]]
 
@@ -596,10 +596,7 @@ def test_expand_with_neighbors_never_pulls_in_a_chunk_that_has_its_own_block() -
         settings,
         token_counter=WordTokenCounter(),
     ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
-    candidates = retrieve_candidates(
-        repository, settings, "one", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("one", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "one")
     by_ordinal = {chunk.chunk_ordinal: chunk for chunk in reranked}
 
     first, second = expand_with_neighbors([by_ordinal[1], by_ordinal[2]], repository, settings)
@@ -662,10 +659,7 @@ def test_expand_with_neighbors_disabled_by_zero_radius() -> None:
     IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
         "guide.txt", b"Intro alpha beta"
     )
-    candidates = retrieve_candidates(
-        repository, settings, "alpha", StaticEmbeddingProvider([make_embedding(1.0)])
-    )
-    reranked = rerank_candidates("alpha", candidates, FakeReranker(), settings)
+    reranked = search_and_rerank(repository, settings, "alpha")
 
     expanded = expand_with_neighbors(reranked, repository, settings)
 
@@ -755,7 +749,8 @@ def test_rag_pipeline_answer_records_partial_trace_on_generation_error() -> None
     assert len(trace_store.traces) == 1
     trace = trace_store.traces[0]
     assert trace.status == "error"
-    assert trace.error == "generation boom"
+    # Not the exception text: traces are readable with the read-only key.
+    assert trace.error == "The question could not be answered due to an unexpected server error."
     assert trace.answer is None
     # The retrieval phase completed before generation failed, so the effective
     # config is still captured even though the trace as a whole is an error.
@@ -817,15 +812,30 @@ def test_rag_pipeline_answer_stream_records_partial_trace_on_mid_stream_error() 
     trace = trace_store.traces[0]
     assert trace.mode == "stream"
     assert trace.status == "error"
-    assert trace.error == "generation boom mid-stream"
+    assert trace.error == "The question could not be answered due to an unexpected server error."
     assert trace.answer == "partial"
 
 
-def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_close() -> None:
+def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A client disconnecting mid-stream closes the generator (GeneratorExit) before
     any `except Exception`/success path runs — the `finally` clause must still record
-    a trace rather than silently dropping it."""
+    a trace rather than silently dropping it.
 
+    The inner (uncached) stream is kept referenced here, as a tracer or a traceback can:
+    closing must reach it directly, not when garbage collection frees it (CI under
+    coverage lost the trace that way)."""
+
+    held: list[Any] = []
+    uncached = RagPipeline._answer_stream_uncached
+
+    def still_referenced(self: RagPipeline, *args: Any, **kwargs: Any) -> Any:
+        events = uncached(self, *args, **kwargs)
+        held.append(events)
+        return events
+
+    monkeypatch.setattr(RagPipeline, "_answer_stream_uncached", still_referenced)
     settings = make_settings()
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
@@ -850,6 +860,46 @@ def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_clos
     trace = trace_store.traces[0]
     assert trace.status == "error"
     assert trace.error == "Stream closed before completion."
+
+
+@pytest.mark.parametrize("stop_after", ["searching", "sources"])
+def test_answer_stream_stops_before_the_next_costly_stage_once_the_client_is_gone(
+    stop_after: str,
+) -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    reranker = FakeReranker()
+    generator = FakeGenerator("Alpha is documented [1].")
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=reranker,
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+    gone = threading.Event()
+
+    events = []
+    for event in pipeline.answer_stream("alpha", use_cache=False, should_stop=gone.is_set):
+        events.append(event)
+        if event["type"] == "stage" and event.get("stage") == stop_after:
+            gone.set()
+        if event["type"] == "sources" and stop_after == "sources":
+            gone.set()
+
+    if stop_after == "searching":
+        assert reranker.seen_documents == []  # stopped before the rerank
+        assert [event["type"] for event in events] == ["stage"]
+    else:
+        assert reranker.seen_documents != []
+        assert [event["type"] for event in events] == ["stage", "sources"]
+    assert generator.messages == []  # never called the LLM
+    assert [trace.error for trace in trace_store.traces] == ["Stream closed before completion."]
 
 
 _HISTORY: list[ChatMessage] = [
@@ -1525,24 +1575,67 @@ def test_expansion_variants_are_searched_side_by_side() -> None:
         "guide.txt", b"Intro\nalpha beta"
     )
 
-    class SlowRepository(CountingRepository):
+    # All four searches (the question plus three variants) must be in flight at once:
+    # run one after another, the first would wait at the barrier alone and break it.
+    # Deterministic, unlike the wall-clock bound this replaced.
+    all_in_flight = threading.Barrier(4, timeout=5)
+
+    class BarrierRepository(CountingRepository):
         def hybrid_search(self, *args: Any, **kwargs: Any) -> Any:
-            time.sleep(0.3)
+            all_in_flight.wait()
             return super().hybrid_search(*args, **kwargs)
 
-    slow = SlowRepository(inner)
+    repository = BarrierRepository(inner)
     pipeline = RagPipeline(
-        repository=slow,  # type: ignore[arg-type]
+        repository=repository,  # type: ignore[arg-type]
         embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
         reranker=FakeReranker(),
         generator=SequencedGenerator(["one\ntwo\nthree", "Alpha is documented [1]."]),
         settings=settings,
     )
 
-    started = time.monotonic()
     pipeline.answer("alpha", use_cache=False)
-    elapsed = time.monotonic() - started
 
-    assert slow.search_calls == 4
-    # Four 0.3 s searches one after another would take 1.2 s.
-    assert elapsed < 0.9
+    assert repository.search_calls == 4
+    assert not all_in_flight.broken
+
+
+def test_rag_pipeline_retrieve_rejects_an_empty_query() -> None:
+    settings = make_settings()
+    pipeline = RagPipeline(
+        repository=VectorRepository(QdrantClient(":memory:")),
+        embedding_provider=StaticEmbeddingProvider([]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("unused"),
+        settings=settings,
+    )
+
+    with pytest.raises(RetrievalError, match="Query text"):
+        pipeline.retrieve("   ")
+
+
+def test_rag_pipeline_retrieve_checks_the_collection_before_embedding() -> None:
+    """An embedding-tag mismatch refuses the query without paying for embedding."""
+
+    class RefusingRepository(VectorRepository):
+        def ensure_ready(self, settings: AppSettings) -> None:
+            raise RetrievalError("refused")
+
+        def hybrid_search(self, *args: Any, **kwargs: Any) -> list[models.ScoredPoint]:
+            raise AssertionError("hybrid_search must not run when ensure_ready refuses")
+
+    class FailingEmbeddingProvider:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            raise AssertionError("embedding must not run when ensure_ready refuses")
+
+    settings = make_settings()
+    pipeline = RagPipeline(
+        repository=RefusingRepository(QdrantClient(":memory:")),
+        embedding_provider=FailingEmbeddingProvider(),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("unused"),
+        settings=settings,
+    )
+
+    with pytest.raises(RetrievalError, match="refused"):
+        pipeline.retrieve("alpha")

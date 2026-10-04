@@ -235,3 +235,11 @@
   text-transform: uppercase;
   cursor: pointer;
 }
+
+.settings__checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from api.chunking import HeuristicTokenCounter, HFTokenCounter, make_token_counter
+from tests.factories import make_test_settings
 
 
 def test_heuristic_counter_scales_with_word_count() -> None:
@@ -43,7 +44,7 @@ class CharTokenCounter:
 
 
 def test_cjk_sentences_end_at_full_width_punctuation() -> None:
-    from api.documents import _SENTENCE_SPLIT_RE
+    from api.chunking import _SENTENCE_SPLIT_RE
 
     parts = [
         part for part in _SENTENCE_SPLIT_RE.split("第一句。第二句！第三句？ Next one. Done") if part
@@ -53,7 +54,7 @@ def test_cjk_sentences_end_at_full_width_punctuation() -> None:
 
 
 def test_an_over_budget_word_is_cut_into_budget_sized_pieces() -> None:
-    from api.documents import _split_oversized
+    from api.chunking import _split_oversized
 
     blob = "QUJD" * 100  # 400 characters, no whitespace: a base64 blob
 
@@ -65,9 +66,8 @@ def test_an_over_budget_word_is_cut_into_budget_sized_pieces() -> None:
 
 def test_every_chunk_of_unspaced_cjk_fits_the_budget() -> None:
     from api.documents import DocumentSection, chunk_sections
-    from api.settings import AppSettings
 
-    settings = AppSettings(_env_file=None, chunk_size_tokens=60, chunk_overlap_tokens=0)  # type: ignore[call-arg]
+    settings = make_test_settings(chunk_size_tokens=60, chunk_overlap_tokens=0)
     text = "这是一个没有空格的很长的中文段落" * 30  # 480 characters, no sentence end
     section = DocumentSection(filename="zh.txt", page=1, section="正文", text=text)
 

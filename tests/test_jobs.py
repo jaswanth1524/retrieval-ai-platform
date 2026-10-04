@@ -298,3 +298,14 @@ def test_ingest_backlog_admits_within_budget_and_always_when_empty() -> None:
     assert backlog.try_reserve(40)
     assert not backlog.try_reserve(1)
     assert backlog.pending_bytes == 100
+
+
+def test_backlog_has_room_peeks_without_reserving() -> None:
+    backlog = IngestBacklog(max_bytes=10, max_jobs=2)
+
+    assert backlog.has_room(10)
+    assert backlog.try_reserve(6)
+    assert backlog.has_room(4) and not backlog.has_room(5)
+    assert backlog.pending_bytes == 6  # peeking reserved nothing
+    assert backlog.try_reserve(4)
+    assert not backlog.has_room(0)  # the job cap is reached too

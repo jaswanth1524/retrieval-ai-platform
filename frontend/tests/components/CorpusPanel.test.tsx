@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import CorpusPanel, { type UploadItem } from '../../src/components/CorpusPanel';
+import CorpusPanel, { type DocumentMeta, type UploadItem } from '../../src/components/CorpusPanel';
 
 function makeFile(name: string, sizeBytes: number): File {
   const file = new File(['x'], name, { type: 'text/plain' });
@@ -13,10 +13,14 @@ function dataTransferWith(files: File[]): DataTransfer {
   return { files } as unknown as DataTransfer;
 }
 
+function meta(overrides: Partial<DocumentMeta> = {}): DocumentMeta {
+  return { chunks: 1, stale: false, reindexable: false, tags: [], ...overrides };
+}
+
 function setup(overrides: Partial<Parameters<typeof CorpusPanel>[0]> = {}) {
   const props = {
     filenames: [] as string[],
-    chunkCounts: {} as Record<string, number>,
+    documents: {} as Record<string, DocumentMeta>,
     uploads: [] as UploadItem[],
     onUpload: vi.fn().mockResolvedValue(undefined),
     onDelete: vi.fn().mockResolvedValue(undefined),
@@ -32,7 +36,7 @@ describe('CorpusPanel', () => {
     // out by name — so replacing a document showed no progress at all.
     setup({
       filenames: ['a.txt'],
-      chunkCounts: { 'a.txt': 3 },
+      documents: { 'a.txt': meta({ chunks: 3 }) },
       uploads: [
         {
           id: 'u1',
@@ -49,13 +53,52 @@ describe('CorpusPanel', () => {
   });
 
   it('focuses Cancel on a delete confirm, and Escape backs out of it', async () => {
-    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 3 } });
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta({ chunks: 3 }) } });
 
     await userEvent.click(screen.getByLabelText('Delete a.txt'));
     expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
     await userEvent.keyboard('{Escape}');
     expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
     expect(screen.getByLabelText('Delete a.txt')).toBeInTheDocument();
+  });
+
+  it('offers Cancel on a card that is indexing, and only there', async () => {
+    const onCancelUpload = vi.fn();
+    setup({
+      filenames: ['a.txt'],
+      documents: { 'a.txt': meta() },
+      uploads: [
+        { id: 'u1', filename: 'b.txt', status: 'uploading' },
+        { id: 'u2', filename: 'c.txt', status: 'error', error: 'Ingestion failed.' },
+      ],
+      onCancelUpload,
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel indexing b.txt' }));
+
+    expect(onCancelUpload).toHaveBeenCalledWith('u1');
+    // Indexed and failed cards have nothing to stop.
+    expect(screen.getAllByTestId('corpus-cancel-upload')).toHaveLength(1);
+  });
+
+  it('shows a cancel in progress and does not offer it twice', () => {
+    setup({
+      uploads: [{ id: 'u1', filename: 'b.txt', status: 'uploading', cancelling: true }],
+      onCancelUpload: vi.fn(),
+    });
+
+    expect(screen.getByRole('button', { name: 'Cancel indexing b.txt' })).toBeDisabled();
+    expect(screen.getByTestId('corpus-panel-item')).toHaveTextContent('cancelling…');
+  });
+
+  it('offers no Cancel to a read-only key', () => {
+    setup({
+      uploads: [{ id: 'u1', filename: 'b.txt', status: 'uploading' }],
+      onCancelUpload: vi.fn(),
+      readOnly: true,
+    });
+
+    expect(screen.queryByTestId('corpus-cancel-upload')).not.toBeInTheDocument();
   });
 
   it('exposes indexing progress as a progressbar', () => {
@@ -79,9 +122,11 @@ describe('CorpusPanel', () => {
     const onReindex = vi.fn();
     setup({
       filenames: ['old.md', 'new.md', 'no-original.md'],
-      chunkCounts: { 'old.md': 2, 'new.md': 2, 'no-original.md': 2 },
-      staleFilenames: ['old.md', 'no-original.md'],
-      reindexableFilenames: ['old.md', 'new.md'],
+      documents: {
+        'old.md': meta({ chunks: 2, stale: true, reindexable: true }),
+        'new.md': meta({ chunks: 2, reindexable: true }),
+        'no-original.md': meta({ chunks: 2, stale: true }),
+      },
       onReindex,
     });
 
@@ -102,17 +147,34 @@ describe('CorpusPanel', () => {
     const onReindexAllStale = vi.fn();
     const props = {
       filenames: ['a.md', 'b.md'],
-      chunkCounts: { 'a.md': 1, 'b.md': 1 },
-      reindexableFilenames: ['a.md', 'b.md'],
       onReindex: vi.fn(),
       onReindexAllStale,
     };
-    const { unmount } = render(<CorpusPanel {...props} uploads={[]} onUpload={vi.fn()} onDelete={vi.fn()} staleFilenames={['a.md']} />);
+    const { unmount } = render(
+      <CorpusPanel
+        {...props}
+        documents={{ 'a.md': meta({ stale: true, reindexable: true }), 'b.md': meta({ reindexable: true }) }}
+        uploads={[]}
+        onUpload={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
     // One stale document: its own ↻ is enough.
     expect(screen.queryByTestId('reindex-all-stale')).not.toBeInTheDocument();
     unmount();
 
-    render(<CorpusPanel {...props} uploads={[]} onUpload={vi.fn()} onDelete={vi.fn()} staleFilenames={['a.md', 'b.md']} />);
+    render(
+      <CorpusPanel
+        {...props}
+        documents={{
+          'a.md': meta({ stale: true, reindexable: true }),
+          'b.md': meta({ stale: true, reindexable: true }),
+        }}
+        uploads={[]}
+        onUpload={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
     await userEvent.click(screen.getByTestId('reindex-all-stale'));
     expect(onReindexAllStale).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId('reindex-all-stale')).toHaveTextContent('Re-index 2 documents');
@@ -121,9 +183,7 @@ describe('CorpusPanel', () => {
   it('hides re-index and the stale label entirely when the server keeps no originals', () => {
     setup({
       filenames: ['a.md'],
-      chunkCounts: { 'a.md': 1 },
-      staleFilenames: ['a.md'],
-      reindexableFilenames: ['a.md'],
+      documents: { 'a.md': meta({ stale: true, reindexable: true }) },
     });
     expect(screen.queryByRole('button', { name: 'Re-index a.md' })).not.toBeInTheDocument();
     expect(screen.getByTestId('corpus-panel-item')).not.toHaveTextContent('older chunking');
@@ -134,7 +194,7 @@ describe('CorpusPanel', () => {
     const onDismissUpload = vi.fn();
     setup({
       filenames: ['a.txt'],
-      chunkCounts: { 'a.txt': 3 },
+      documents: { 'a.txt': meta({ chunks: 3 }) },
       uploads: [
         {
           id: 'u1',
@@ -168,7 +228,7 @@ describe('CorpusPanel', () => {
   });
 
   it('lists indexed filenames with their chunk counts', () => {
-    setup({ filenames: ['a.txt', 'b.pdf'], chunkCounts: { 'a.txt': 3, 'b.pdf': 61 } });
+    setup({ filenames: ['a.txt', 'b.pdf'], documents: { 'a.txt': meta({ chunks: 3 }), 'b.pdf': meta({ chunks: 61 }) } });
 
     const items = screen.getAllByTestId('corpus-panel-item');
     expect(items[0]).toHaveTextContent('a.txt');
@@ -180,10 +240,9 @@ describe('CorpusPanel', () => {
   it('appends page count, size, and upload time to the detail line when present', () => {
     setup({
       filenames: ['a.txt'],
-      chunkCounts: { 'a.txt': 3 },
-      pageCounts: { 'a.txt': 2 },
-      byteSizes: { 'a.txt': 1024 * 1024 },
-      uploadedAts: { 'a.txt': Date.now() / 1000 },
+      documents: {
+        'a.txt': meta({ chunks: 3, pages: 2, bytes: 1024 * 1024, uploadedAt: Date.now() / 1000 }),
+      },
     });
 
     const item = screen.getByTestId('corpus-panel-item');
@@ -196,7 +255,7 @@ describe('CorpusPanel', () => {
   it('omits page/size/upload-time from the detail line for a filename missing that metadata', () => {
     // The pre-existing case: a filename ingested before this metadata was stamped
     // has none of these fields in the response at all.
-    setup({ filenames: ['legacy.txt'], chunkCounts: { 'legacy.txt': 1 } });
+    setup({ filenames: ['legacy.txt'], documents: { 'legacy.txt': meta() } });
 
     const item = screen.getByTestId('corpus-panel-item');
     expect(item).toHaveTextContent('1 chunk');
@@ -212,7 +271,7 @@ describe('CorpusPanel', () => {
   it('filters the document list by a substring match, case-insensitively', async () => {
     setup({
       filenames: ['contract.pdf', 'invoice.txt', 'README.md'],
-      chunkCounts: { 'contract.pdf': 3, 'invoice.txt': 1, 'README.md': 2 },
+      documents: { 'contract.pdf': meta({ chunks: 3 }), 'invoice.txt': meta(), 'README.md': meta({ chunks: 2 }) },
     });
 
     await userEvent.type(screen.getByTestId('corpus-panel-search'), 'read');
@@ -223,7 +282,7 @@ describe('CorpusPanel', () => {
   });
 
   it('shows a no-match message and no cards when the filter matches nothing', async () => {
-    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 } });
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta() } });
 
     await userEvent.type(screen.getByTestId('corpus-panel-search'), 'zzz');
 
@@ -232,7 +291,7 @@ describe('CorpusPanel', () => {
   });
 
   it('clicking delete shows an inline confirm, and confirming calls onDelete once', async () => {
-    const props = setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 } });
+    const props = setup({ filenames: ['a.txt'], documents: { 'a.txt': meta() } });
 
     await userEvent.click(screen.getByLabelText('Delete a.txt'));
     expect(screen.getByText('Delete?')).toBeInTheDocument();
@@ -244,7 +303,7 @@ describe('CorpusPanel', () => {
   });
 
   it('clicking cancel dismisses the confirm without calling onDelete', async () => {
-    const props = setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 } });
+    const props = setup({ filenames: ['a.txt'], documents: { 'a.txt': meta() } });
 
     await userEvent.click(screen.getByLabelText('Delete a.txt'));
     await userEvent.click(screen.getByText('Cancel'));
@@ -256,7 +315,7 @@ describe('CorpusPanel', () => {
   it('shows an error message when onDelete rejects', async () => {
     setup({
       filenames: ['a.txt'],
-      chunkCounts: { 'a.txt': 1 },
+      documents: { 'a.txt': meta() },
       onDelete: vi.fn().mockRejectedValue(new Error('No indexed document named a.txt.')),
     });
 
@@ -267,7 +326,7 @@ describe('CorpusPanel', () => {
   });
 
   it('disables delete buttons when disabled is true', () => {
-    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 }, disabled: true });
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta() }, disabled: true });
     expect(screen.getByLabelText('Delete a.txt')).toBeDisabled();
   });
 
@@ -344,7 +403,7 @@ describe('CorpusPanel', () => {
   it('opens the delete confirm on one card only when a failed upload shares its name', async () => {
     setup({
       filenames: ['a.txt'],
-      chunkCounts: { 'a.txt': 3 },
+      documents: { 'a.txt': meta({ chunks: 3 }) },
       uploads: [{ id: 'u1', filename: 'a.txt', status: 'error', error: 'Indexing failed.' }],
     });
 
@@ -355,7 +414,7 @@ describe('CorpusPanel', () => {
 
   it('edits a document\'s tags inline and saves them as a list', async () => {
     const onSetTags = vi.fn().mockResolvedValue(undefined);
-    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 }, tags: { 'a.txt': ['hr'] }, onSetTags });
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta({ tags: ['hr'] }) }, onSetTags });
 
     expect(screen.getByText('#hr')).toBeInTheDocument();
     await userEvent.click(screen.getByLabelText('Edit tags for a.txt'));
@@ -368,7 +427,7 @@ describe('CorpusPanel', () => {
 
   it('keeps the tag editor open with the error when saving fails', async () => {
     const onSetTags = vi.fn().mockRejectedValue(new Error('Tags must be 1-40 printable characters.'));
-    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 1 }, onSetTags });
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta() }, onSetTags });
 
     await userEvent.click(screen.getByLabelText('Edit tags for a.txt'));
     await userEvent.type(screen.getByTestId('corpus-tags-input'), 'x{Enter}');
@@ -431,7 +490,7 @@ describe('CorpusPanel', () => {
       { id: '1', filename: 'a.txt', status: 'success' },
       { id: '2', filename: 'b.txt', status: 'error', error: 'Ingestion failed.' },
     ];
-    setup({ filenames: ['a.txt'], chunkCounts: { 'a.txt': 3 }, uploads });
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta({ chunks: 3 }) }, uploads });
 
     const items = screen.getAllByTestId('corpus-panel-item');
     // a.txt is both an indexed filename and a 'success' upload entry — only one card.

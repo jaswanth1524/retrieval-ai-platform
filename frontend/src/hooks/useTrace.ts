@@ -53,16 +53,13 @@ function remember(traceId: string, trace: TraceDetailResponse): void {
  * can never reproduce this race.
  */
 export function useTrace(traceId: string | null, ready = true): TraceState {
-  const cached = traceId ? cache.get(traceId) : undefined;
-  const [state, setState] = useState<TraceState>(() =>
-    traceId === null
-      ? { status: 'unavailable', reason: NO_TRACE_ID }
-      : cached
-        ? { status: 'ready', trace: cached }
-        : !ready
-          ? { status: 'pending', reason: STILL_GENERATING }
-          : { status: 'loading' },
-  );
+  // Keyed by the trace it describes: when the inspected turn changes, the state from
+  // the previous one would otherwise paint for a frame before the effect below reset it.
+  const [keyed, setKeyed] = useState<{ id: string | null; state: TraceState }>(() => ({
+    id: traceId,
+    state: initialState(traceId, ready),
+  }));
+  const setState = (state: TraceState) => setKeyed({ id: traceId, state });
 
   useEffect(() => {
     if (traceId === null) {
@@ -105,9 +102,18 @@ export function useTrace(traceId: string | null, ready = true): TraceState {
       });
 
     return () => controller.abort();
+    // setState only closes over traceId, which is already a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [traceId, ready]);
 
-  return state;
+  return keyed.id === traceId ? keyed.state : initialState(traceId, ready);
+}
+
+function initialState(traceId: string | null, ready: boolean): TraceState {
+  if (traceId === null) return { status: 'unavailable', reason: NO_TRACE_ID };
+  const cached = cache.get(traceId);
+  if (cached) return { status: 'ready', trace: cached };
+  return ready ? { status: 'loading' } : { status: 'pending', reason: STILL_GENERATING };
 }
 
 /** Test seam: drop the module-level cache so cases don't leak into one another. */

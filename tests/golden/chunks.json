@@ -1,0 +1,616 @@
+{
+ "corpus__docrag_citations.md": [
+  {
+   "chunk_id": "60e9669f2b90515b7846",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "60729daa88d95b5f"
+  },
+  {
+   "chunk_id": "12f166b11ff992f6eb83",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "6a8329de6bd1a11e"
+  },
+  {
+   "chunk_id": "c66af481a2e477cc947c",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "b5e97094ff6f91d0"
+  },
+  {
+   "chunk_id": "e19e18eb1c43d630c8cb",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "85de367b102d0cbc"
+  },
+  {
+   "chunk_id": "d6a0a4dd0074a281d364",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "d44e0088c3c4970b"
+  },
+  {
+   "chunk_id": "2d9f6998359c687001de",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "6bd2a58a5c318ef8"
+  },
+  {
+   "chunk_id": "3a415ae8be6b7a88e927",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "6e5853812f3e5f65"
+  },
+  {
+   "chunk_id": "2c7790441df14b708b37",
+   "page": 1,
+   "section": "Citation retry",
+   "text_sha1": "0b709f817f713388"
+  }
+ ],
+ "corpus__docrag_conversation.md": [
+  {
+   "chunk_id": "7006f9a779aa020c276b",
+   "page": 1,
+   "section": "Follow-up questions",
+   "text_sha1": "1fa92acd79058d49"
+  },
+  {
+   "chunk_id": "7a51febd494f5bddf2a3",
+   "page": 1,
+   "section": "Follow-up questions",
+   "text_sha1": "c8e103c6ac3c89ef"
+  },
+  {
+   "chunk_id": "3f42c0e16dfbb379b52b",
+   "page": 1,
+   "section": "Follow-up questions",
+   "text_sha1": "5aa163c39cea86de"
+  },
+  {
+   "chunk_id": "3c2d6a1eb86fac4df9ef",
+   "page": 1,
+   "section": "Follow-up questions",
+   "text_sha1": "f5fee26b9f8fdc81"
+  }
+ ],
+ "corpus__docrag_overview.md": [
+  {
+   "chunk_id": "6946f94bb5d5b06d064d",
+   "page": 1,
+   "section": "Retrieval strategy",
+   "text_sha1": "8c68672c24cf3248"
+  },
+  {
+   "chunk_id": "84b07013718c9a551f54",
+   "page": 1,
+   "section": "Retrieval strategy",
+   "text_sha1": "253445e1dec337db"
+  },
+  {
+   "chunk_id": "0b9d3bc755cbd4ae0892",
+   "page": 1,
+   "section": "Retrieval strategy",
+   "text_sha1": "410cb9314d8afe8c"
+  },
+  {
+   "chunk_id": "03ea9b0b60d0a118c5f7",
+   "page": 1,
+   "section": "Retrieval strategy",
+   "text_sha1": "f126de13b1e163f3"
+  },
+  {
+   "chunk_id": "c3d9a445f7a9e79dd8c6",
+   "page": 1,
+   "section": "Embedding model tag",
+   "text_sha1": "c0bb6370e4fbb3e6"
+  },
+  {
+   "chunk_id": "975c5e62195836227844",
+   "page": 1,
+   "section": "Embedding model tag",
+   "text_sha1": "bb5ceddac75406c5"
+  },
+  {
+   "chunk_id": "46268410089fa949bfbc",
+   "page": 1,
+   "section": "Embedding model tag",
+   "text_sha1": "579f2fab72505c0f"
+  },
+  {
+   "chunk_id": "af78ed8482a66eec1650",
+   "page": 1,
+   "section": "Embedding model tag",
+   "text_sha1": "04cef5f767824056"
+  },
+  {
+   "chunk_id": "9247b5292581622acab4",
+   "page": 1,
+   "section": "Embedding model tag",
+   "text_sha1": "d7ab9fcc6127f2b5"
+  }
+ ],
+ "corpus__docrag_providers.md": [
+  {
+   "chunk_id": "8a2a813677a2468f15a7",
+   "page": 1,
+   "section": "Self-hosted OpenAI-compatible servers",
+   "text_sha1": "b79541808596e939"
+  },
+  {
+   "chunk_id": "754850d2a58a7eda6a5f",
+   "page": 1,
+   "section": "Self-hosted OpenAI-compatible servers",
+   "text_sha1": "a60ccbbb9dbd53d0"
+  },
+  {
+   "chunk_id": "c48fd7a86341c1339f04",
+   "page": 1,
+   "section": "Self-hosted OpenAI-compatible servers",
+   "text_sha1": "c23c41ab7f2ca572"
+  },
+  {
+   "chunk_id": "55ebf7e135d4d8f19dd0",
+   "page": 1,
+   "section": "Self-hosted OpenAI-compatible servers",
+   "text_sha1": "965d2eefc52e1e4a"
+  },
+  {
+   "chunk_id": "1fed88c6cebf8181fd6d",
+   "page": 1,
+   "section": "Self-hosted OpenAI-compatible servers",
+   "text_sha1": "b95f007895a1a88c"
+  }
+ ],
+ "corpus_handbook__code_of_conduct.md": [
+  {
+   "chunk_id": "f093b89191ad85827d84",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "4260cc095ac1e99a"
+  },
+  {
+   "chunk_id": "06d7b807f85bcbf40798",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "3251d0291e142aa5"
+  },
+  {
+   "chunk_id": "e3a9316b8fb90de82792",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "ec080bed7dd9d8fb"
+  },
+  {
+   "chunk_id": "056f8737507ba87514be",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "dea3a6efaa916efb"
+  }
+ ],
+ "corpus_handbook__company_calendar.md": [
+  {
+   "chunk_id": "bd8704633ca6f1601839",
+   "page": 1,
+   "section": "Working days",
+   "text_sha1": "1a8dfb0b809cd0a3"
+  },
+  {
+   "chunk_id": "311a890761f3036eb627",
+   "page": 1,
+   "section": "Working days",
+   "text_sha1": "387b16444ba22013"
+  },
+  {
+   "chunk_id": "51243510ac98a3fac887",
+   "page": 1,
+   "section": "Working days",
+   "text_sha1": "f3ac19781c901e61"
+  },
+  {
+   "chunk_id": "d90ad14b44d2ccba38c4",
+   "page": 1,
+   "section": "Working days",
+   "text_sha1": "20a7751994a03833"
+  },
+  {
+   "chunk_id": "9633e594e375399ebf09",
+   "page": 1,
+   "section": "Working days",
+   "text_sha1": "1fde54ddecbdf591"
+  }
+ ],
+ "corpus_handbook__contractor_handbook.md": [
+  {
+   "chunk_id": "78ae9b046722691e871f",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "f2ac56bce8b87c38"
+  },
+  {
+   "chunk_id": "75bc5bda55b719a9bf0a",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "7dc91d8a1346174c"
+  },
+  {
+   "chunk_id": "ccf6a2d90aff3d94cc45",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "1e745eea5686cacc"
+  },
+  {
+   "chunk_id": "1ed42c6ccd5ae59e74cc",
+   "page": 1,
+   "section": "Equipment",
+   "text_sha1": "b609d1dcd4a60a5f"
+  }
+ ],
+ "corpus_handbook__data_retention_policy.md": [
+  {
+   "chunk_id": "e6db1d3bc660b562c6dd",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "a9adb636c468747e"
+  },
+  {
+   "chunk_id": "18b89bff288fbda1b2ea",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "232a45b8ac22bf3b"
+  },
+  {
+   "chunk_id": "b8c49c1317184a5725e6",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "7c035dd4adefb1f0"
+  },
+  {
+   "chunk_id": "f72068770f85c9212aea",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "602c91cb0edf801b"
+  },
+  {
+   "chunk_id": "7623c57be92c948573f5",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "a4e16545be7b3ab3"
+  }
+ ],
+ "corpus_handbook__expense_policy.md": [
+  {
+   "chunk_id": "f66debe5cae4a3d792ac",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "c02f216c66ded4c8"
+  },
+  {
+   "chunk_id": "7378e840e5b08263b4f3",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "16edcaac58e6f23a"
+  },
+  {
+   "chunk_id": "886552d7572a598eba67",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "ba6663dca50719c4"
+  },
+  {
+   "chunk_id": "629f8329b06e01b63b4f",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "247966576a7c1aa9"
+  }
+ ],
+ "corpus_handbook__general_faq.md": [
+  {
+   "chunk_id": "e8356a170fb650fa5c5a",
+   "page": 1,
+   "section": "About the FAQ",
+   "text_sha1": "15ad3bc7fa7d8fe9"
+  },
+  {
+   "chunk_id": "f4f3a2a22a3b8a2c307f",
+   "page": 1,
+   "section": "About the FAQ",
+   "text_sha1": "441d2fa97fc4da20"
+  },
+  {
+   "chunk_id": "fb1088c45256245606af",
+   "page": 1,
+   "section": "About the FAQ",
+   "text_sha1": "43969544a068decb"
+  },
+  {
+   "chunk_id": "864659cf6c7ccf605de0",
+   "page": 1,
+   "section": "About the FAQ",
+   "text_sha1": "84f582cd530eb798"
+  }
+ ],
+ "corpus_handbook__it_equipment_policy.md": [
+  {
+   "chunk_id": "024682d0c8c056869e2e",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "51ddbea4e4471f13"
+  },
+  {
+   "chunk_id": "7e07fe8373ed42f884eb",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "232a45b8ac22bf3b"
+  },
+  {
+   "chunk_id": "32028322712908e7c488",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "42791f925bfa3058"
+  },
+  {
+   "chunk_id": "2904571d1afbe58732e6",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "09b37d0e30dc0361"
+  },
+  {
+   "chunk_id": "a3b7985007e670b7dea1",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "cf9b3f3f958a6ba5"
+  }
+ ],
+ "corpus_handbook__leave_policy.md": [
+  {
+   "chunk_id": "31ba2b90cc2ebb296c6f",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "66c8d465e34efa86"
+  },
+  {
+   "chunk_id": "2ac7d0f10c5fff356c1f",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "f8b35060198f4d9b"
+  },
+  {
+   "chunk_id": "4013c6586a1b2c9c46ed",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "39b76a93a67388c5"
+  },
+  {
+   "chunk_id": "99e26b75513d05fde96d",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "93f523dac675a6c7"
+  }
+ ],
+ "corpus_handbook__onboarding_policy.md": [
+  {
+   "chunk_id": "a0e18eee1329aca94d60",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "31338e1ca8c53eb8"
+  },
+  {
+   "chunk_id": "14d04f7227442c325357",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "eacaba9e401a7239"
+  },
+  {
+   "chunk_id": "d545f22e295101e57990",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "9462b97661b93f0e"
+  },
+  {
+   "chunk_id": "88f78552dbef5bfed555",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "ec2d0643feb56901"
+  }
+ ],
+ "corpus_handbook__procurement_policy.md": [
+  {
+   "chunk_id": "96261ccdb17e77ed7b96",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "b31f79b81d0d1d5d"
+  },
+  {
+   "chunk_id": "7c21e962d24a7d61ad59",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "74d9c7a5a4c6746b"
+  },
+  {
+   "chunk_id": "ca494606805588fa200a",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "99b109e1c3d23204"
+  },
+  {
+   "chunk_id": "b91abfa24324b5f5bd0d",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "8cdfd49cb96f372b"
+  }
+ ],
+ "corpus_handbook__remote_work_policy.md": [
+  {
+   "chunk_id": "c6cd636e2ad857d067a3",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "2bf8cd5aaf7eaf80"
+  },
+  {
+   "chunk_id": "e72f3043fb9c00ee47a8",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "232a45b8ac22bf3b"
+  },
+  {
+   "chunk_id": "ce6d2cecbc0572a0a0f4",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "da5ee831cd71ce7f"
+  },
+  {
+   "chunk_id": "b4257ad86d9825e3f656",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "ee31aab7d3c10640"
+  },
+  {
+   "chunk_id": "4175b4c9969c5e9d7884",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "ee9ceaa2fdd93875"
+  }
+ ],
+ "corpus_handbook__security_newsletter.md": [
+  {
+   "chunk_id": "dffe8679bebe7dfebe79",
+   "page": 1,
+   "section": "Password tips",
+   "text_sha1": "38e18994081bfa76"
+  },
+  {
+   "chunk_id": "a13675f89203820c43cb",
+   "page": 1,
+   "section": "Password tips",
+   "text_sha1": "7f50c840a0dc5b6b"
+  },
+  {
+   "chunk_id": "c089efac823a3da43fb7",
+   "page": 1,
+   "section": "Password tips",
+   "text_sha1": "51d952c9069f39fd"
+  }
+ ],
+ "corpus_handbook__security_policy.md": [
+  {
+   "chunk_id": "a58a58aaff5c08f39827",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "69b3f82cd212c713"
+  },
+  {
+   "chunk_id": "15697f8c7ab73cb80e0f",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "93ea064d16882a53"
+  },
+  {
+   "chunk_id": "1941150c4575c83a0891",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "4c2aaea071631ecf"
+  },
+  {
+   "chunk_id": "4e73e2f32237654d96ca",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "b87cb88ee6517387"
+  }
+ ],
+ "corpus_handbook__travel_policy.md": [
+  {
+   "chunk_id": "dc530026e8f3dbc543b6",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "3f24f4229e395a24"
+  },
+  {
+   "chunk_id": "7a798d0db993cedcec18",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "a03c3a2fa46755d2"
+  },
+  {
+   "chunk_id": "8494faaf26f8b9c4f28e",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "2955ee69e4d63b76"
+  },
+  {
+   "chunk_id": "b3dc4d504ae6c453359d",
+   "page": 1,
+   "section": "About this policy",
+   "text_sha1": "3e2eaafc592802e8"
+  }
+ ],
+ "corpus_handbook__travel_policy_2019_archived.md": [
+  {
+   "chunk_id": "66e73fc41bab0a966e95",
+   "page": 1,
+   "section": "Per diem",
+   "text_sha1": "4486a6cefaf3f5ee"
+  },
+  {
+   "chunk_id": "233af9e6e22ca78d5eb6",
+   "page": 1,
+   "section": "Per diem",
+   "text_sha1": "2f99167d70640974"
+  },
+  {
+   "chunk_id": "f87a33ebe7022a8d8ce6",
+   "page": 1,
+   "section": "Per diem",
+   "text_sha1": "c0ba8329d0f805c5"
+  }
+ ],
+ "sample.txt": [
+  {
+   "chunk_id": "928f7229c22f3e37b7cd",
+   "page": 1,
+   "section": "Plain notes about the release.",
+   "text_sha1": "69078420b40cac57"
+  }
+ ],
+ "cjk.txt": [
+  {
+   "chunk_id": "275cf38abdc9dd47c9b0",
+   "page": 1,
+   "section": "第一句话。第二句话！第三句话？最后一句。",
+   "text_sha1": "44eed5a1e40a3e65"
+  }
+ ],
+ "page.html": [
+  {
+   "chunk_id": "acac94059c861ba4e3e5",
+   "page": 1,
+   "section": "Upgrade",
+   "text_sha1": "3292a5d9007ca104"
+  }
+ ],
+ "rows.csv": [
+  {
+   "chunk_id": "70f98150dc055e491678",
+   "page": 1,
+   "section": "Rows 2-4",
+   "text_sha1": "c0e791cb00a10906"
+  }
+ ],
+ "policy.docx": [
+  {
+   "chunk_id": "ee31189f418825c8aae7",
+   "page": 1,
+   "section": "Approvals",
+   "text_sha1": "4baf184a7a2c96ad"
+  }
+ ],
+ "report.pdf": [
+  {
+   "chunk_id": "751543ed1de7bac87dc0",
+   "page": 1,
+   "section": "Quarterly report page one about retrieval quality.",
+   "text_sha1": "31ed903848d684bc"
+  }
+ ]
+}

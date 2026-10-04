@@ -78,6 +78,11 @@ class PublicConfigResponse(BaseModel):
     # OPENAI_COMPATIBLE_BASE_URL and _MODEL are set (the server itself isn't probed).
     openai_compatible_available: bool = False
     openai_compatible_model: str = ""
+    # Providers a question may choose per request (ALLOWED_REQUEST_PROVIDERS, plus
+    # LLM_PROVIDER). Whether each is reachable is the *_available fields above.
+    allowed_request_providers: list[str] = Field(
+        default_factory=lambda: ["ollama", "openai", "openai_compatible"]
+    )
 
 
 class DocumentIngestResponse(BaseModel):
@@ -107,6 +112,8 @@ class DocumentJobStatusResponse(BaseModel):
     chunks_done: int
     error: str | None = None
     result: DocumentIngestResponse | None = None
+    # True for a job stopped by DELETE /documents/jobs/{job_id} (state "failed").
+    cancelled: bool = False
 
 
 class DocumentListResponse(BaseModel):
@@ -260,6 +267,8 @@ class TraceConfigResponse(BaseModel):
     rerank_min_score: float
     fused_top_n: int
     filenames: list[str] | None
+    # The tag scope the question was asked under; None when it wasn't tag-scoped.
+    tags: list[str] | None = None
 
 
 class TraceCandidateResponse(BaseModel):
@@ -325,6 +334,8 @@ class TraceDetailResponse(BaseModel):
     query_variants: list[str] = Field(default_factory=list)
     # True when a zero-citation answer was retried and the retry supplied citations.
     citation_retry_used: bool = False
+    # The X-Request-ID of the request that asked it, to find its log lines.
+    request_id: str | None = None
 
 
 class HistoryMessageRequest(BaseModel):
@@ -399,3 +410,65 @@ class QuestionResponse(BaseModel):
     trace_id: str | None = None
     # Served from the answer cache: no retrieval or generation ran for this request.
     cached: bool = False
+
+
+class AccessResponse(BaseModel):
+    """What the caller's key unlocks: everything ("full"), reading and asking only
+    ("read", API_READ_KEY), or everything because no key is configured ("open")."""
+
+    access: Literal["full", "read", "open"]
+
+
+class SearchRequest(BaseModel):
+    """Retrieval without an answer: the passages a question would be answered from."""
+
+    query: str = Field(min_length=1, max_length=4000)
+    filenames: list[str] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
+    )
+    tags: list[str] | None = Field(default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT)
+    # How many reranked passages to return; capped by the server's fused_top_n (400).
+    rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
+
+
+class SearchResultResponse(BaseModel):
+    """One passage, best first, with the scores that ranked it."""
+
+    rank: int
+    filename: str
+    page: int
+    section: str
+    chunk_id: str
+    chunk_ordinal: int | None
+    text: str
+    # RRF-fused hybrid score, then the cross-encoder's score normalized to [0, 1].
+    retrieval_score: float
+    rerank_score: float
+
+
+class SearchTimingsResponse(BaseModel):
+    embed_ms: float
+    search_ms: float
+    rerank_ms: float
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResultResponse]
+    timings: SearchTimingsResponse
+
+
+class ImportResponse(BaseModel):
+    """What POST /import did with each document in the backup."""
+
+    # Indexing jobs started, one per restored document (poll like an upload's).
+    jobs: list[DocumentJobAcceptedResponse]
+    # Not started because the indexing queue was full; import the same file again later.
+    deferred: list[str]
+    # Already indexed here, so left as they are.
+    skipped: list[str]
+    # Listed in the manifest without a stored original (RAW_DOCUMENT_DIR was off).
+    missing_originals: list[str]
+    # Unusable entries: an invalid name, or an original over MAX_UPLOAD_BYTES.
+    rejected: list[str]
+    feedback_imported: int
+    feedback_skipped: int

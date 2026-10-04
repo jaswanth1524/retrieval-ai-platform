@@ -128,7 +128,7 @@ def key_access(settings: AppSettings, supplied: bytes | None) -> KeyAccess:
     return "full" if full else "read" if read else "none"
 
 
-def _supplied(x_api_key: str | None) -> bytes | None:
+def supplied_key_bytes(x_api_key: str | None) -> bytes | None:
     return x_api_key.encode("latin-1", "replace") if x_api_key else None
 
 
@@ -154,7 +154,7 @@ def require_api_key(
 
     if not settings.api_key:
         return
-    if key_access(settings, _supplied(x_api_key)) == "none":
+    if key_access(settings, supplied_key_bytes(x_api_key)) == "none":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid API key.",
@@ -170,7 +170,7 @@ def require_full_key(
 
     if not settings.api_key:
         return
-    access = key_access(settings, _supplied(x_api_key))
+    access = key_access(settings, supplied_key_bytes(x_api_key))
     if access == "none":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid API key."

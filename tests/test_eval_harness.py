@@ -17,6 +17,7 @@ from eval.harness import (
     rank_for_question,
     run_retrieval_eval,
 )
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -28,7 +29,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "rerank_min_score": 0.0,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 class FakeEmbeddingProvider:
@@ -249,3 +250,60 @@ def test_validate_checks_a_dataset_without_a_database(tmp_path: Path) -> None:
     assert main(["validate", str(labeled)]) == 0
     assert main(["validate", str(unlabeled)]) == 2
     assert main(["validate", "eval/datasets/retrieval_eval.sample.jsonl"]) == 0
+
+
+class PassageRepository(FakeRepository):
+    """Adds the payload reads passage resolution uses."""
+
+    def chunks_for_filename(self, settings: AppSettings, filename: str) -> list[dict[str, Any]]:
+        return [
+            dict(point.payload or {})
+            for point in self._points
+            if (point.payload or {}).get("filename") == filename
+        ]
+
+    def filename_metadata(self, settings: AppSettings) -> dict[str, Any]:
+        return {(p.payload or {})["filename"]: None for p in self._points}
+
+
+def test_passages_resolve_to_the_chunks_containing_them_and_are_scored() -> None:
+    from eval.harness import Collaborators, RetrievalExample
+
+    points = [_point("c1", "a.md"), _point("c2", "b.md")]
+
+    class FakeCollaborators(Collaborators):
+        def __init__(self) -> None:
+            self.settings = make_settings()
+            self.repository = PassageRepository(points)
+            self.embedding_provider = FakeEmbeddingProvider()
+            self.reranker = FakeReranker(["c2", "c1"])
+            self.generator = None  # type: ignore[assignment]
+
+    examples = [
+        RetrievalExample(
+            question="q",
+            reference=None,
+            relevant_filenames=frozenset({"a.md"}),
+            relevant_chunk_ids=frozenset(),
+            relevant_passages=frozenset({"  C1 "}),
+        )
+    ]
+    results = run_retrieval_eval(examples, FakeCollaborators(), ks=(1, 2))
+
+    # c1 is the labeled chunk, ranked second behind c2.
+    assert results["aggregate"]["chunk"]["hit@1"] == 0.0
+    assert results["aggregate"]["chunk"]["hit@2"] == 1.0
+
+
+def test_a_passage_in_no_chunk_fails_the_run() -> None:
+    from eval.harness import resolve_passages
+
+    example = load_retrieval_dataset_from([{"question": "q", "relevant_passages": ["nowhere"]}])
+    with pytest.raises(HarnessDataError, match="in no indexed chunk"):
+        resolve_passages(example, PassageRepository([_point("c1", "a.md")]), make_settings())
+
+
+def load_retrieval_dataset_from(rows: list[dict[str, Any]]) -> list[Any]:
+    from eval.harness import _example_from_mapping
+
+    return [_example_from_mapping(row, index) for index, row in enumerate(rows, 1)]

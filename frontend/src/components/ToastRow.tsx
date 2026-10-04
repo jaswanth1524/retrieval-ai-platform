@@ -13,16 +13,21 @@ interface ToastRowProps {
  * the control the user is reaching for. In flow it displaces instead.
  */
 function ToastRow({ toasts, onDismiss }: ToastRowProps) {
-  if (toasts.length === 0) return null;
-
+  // Always mounted, even empty: screen readers often skip a live region that appears
+  // together with its first message, so a toast rendered into a fresh region could go
+  // unannounced. Confirmations are announced politely through this region; failures
+  // interrupt (role="alert").
   return (
-    <div className="toast-row" data-testid="toast-row">
+    <div
+      className={`toast-row${toasts.length === 0 ? ' toast-row--empty' : ''}`}
+      aria-live="polite"
+      data-testid={toasts.length === 0 ? undefined : 'toast-row'}
+    >
       {toasts.map((toast) => (
         <div
           key={toast.id}
           className={`toast toast--${toast.tone}`}
-          // Failures must interrupt a screen reader; confirmations must not.
-          role={toast.tone === 'bad' ? 'alert' : 'status'}
+          role={toast.tone === 'bad' ? 'alert' : undefined}
           data-testid="toast"
         >
           <span className="toast__dot" aria-hidden="true" />

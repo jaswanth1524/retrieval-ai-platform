@@ -4,7 +4,8 @@ from typing import Any
 
 import pytest
 
-import api.documents as documents
+import api.chunking as chunking
+import api.parsers.pdf as pdf_parser
 from api.documents import (
     ChunkConfigError,
     DocumentChunk,
@@ -19,6 +20,7 @@ from api.documents import (
     parse_markdown_document,
 )
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -28,7 +30,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "min_section_words": 0,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def test_parse_text_document_normalizes_filename_and_metadata() -> None:
@@ -286,7 +288,7 @@ def test_pdf_parser_preserves_page_numbers(monkeypatch: pytest.MonkeyPatch) -> N
                 FakePage("Appendix\ngamma delta"),
             ]
 
-    monkeypatch.setattr(documents, "PdfReader", FakeReader)
+    monkeypatch.setattr(pdf_parser, "PdfReader", FakeReader)
 
     sections = parse_document_bytes("paper.pdf", b"not real pdf")
 
@@ -479,7 +481,7 @@ def test_split_oversized_pieces_stay_within_budget() -> None:
     counter = WordTokenCounter()
     sentence = " ".join(f"word{i}" for i in range(200))
 
-    pieces = documents._split_oversized(sentence, 10, counter)
+    pieces = chunking._split_oversized(sentence, 10, counter)
 
     assert len(pieces) > 1
     for piece, tokens in pieces:
@@ -525,3 +527,25 @@ def test_normalize_filename_rejects_names_the_filesystem_cannot_store(filename: 
 
     with pytest.raises(UnsupportedDocumentError):
         normalize_filename(filename)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-be", "utf-32", "utf-32-be"])
+def test_text_with_a_unicode_byte_order_mark_decodes_by_it(encoding: str) -> None:
+    import codecs
+
+    text = "Café notes\n\nThe second paragraph — with a dash."
+    boms = {
+        "utf-16": codecs.BOM_UTF16_LE,
+        "utf-16-be": codecs.BOM_UTF16_BE,
+        "utf-32": codecs.BOM_UTF32_LE,
+        "utf-32-be": codecs.BOM_UTF32_BE,
+    }
+    body = text.encode("utf-16-le" if encoding == "utf-16" else encoding)
+    if encoding == "utf-32":
+        body = text.encode("utf-32-le")
+    content = boms[encoding] + body
+
+    sections = parse_document_bytes("notes.txt", content)
+
+    assert "\x00" not in sections[0].text
+    assert sections[0].text.startswith("Café notes")

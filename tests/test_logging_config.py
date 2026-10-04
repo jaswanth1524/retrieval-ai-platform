@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from api.logging_config import configure_logging
 
 
@@ -29,3 +31,22 @@ def test_configure_logging_leaves_api_logger_propagating() -> None:
     # propagate must stay True so pytest's caplog (root-attached) still sees api.* records.
     configure_logging("INFO")
     assert logging.getLogger("api").propagate is True
+
+
+def test_json_log_lines_carry_the_request_id(capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    from api.request_id import request_id_var
+
+    configure_logging("INFO", "json")
+    token = request_id_var.set("req-42")
+    try:
+        logging.getLogger("api.test").info("hello %s", "world")
+    finally:
+        request_id_var.reset(token)
+        configure_logging("INFO")
+
+    line = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+    assert line["message"] == "hello world"
+    assert line["request_id"] == "req-42"
+    assert line["level"] == "INFO"

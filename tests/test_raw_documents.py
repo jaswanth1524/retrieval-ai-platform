@@ -53,3 +53,14 @@ def test_creates_the_directory_if_it_does_not_exist(tmp_path: Path) -> None:
     directory = tmp_path / "nested" / "raw"
     RawDocumentStore(str(directory))
     assert directory.is_dir()
+
+
+def test_a_name_too_long_for_the_filesystem_reads_as_absent(tmp_path: Path) -> None:
+    # Python 3.12's is_file() raises ENAMETOOLONG here (3.13 returns False); either way
+    # the store must answer "no original", not raise into the route.
+    store = RawDocumentStore(str(tmp_path))
+    long_name = "a" * 300 + ".txt"
+
+    assert store.path(long_name) is None
+    assert store.read(long_name) is None
+    assert store.delete(long_name) is False

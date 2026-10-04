@@ -215,35 +215,9 @@
   background: var(--accent);
 }
 
+/* ConfirmInline supplies the buttons; the card's top row only needs it not to shrink. */
 .corpus-panel__confirm {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--rail-dim);
   flex-shrink: 0;
-}
-
-.corpus-panel__confirm-yes,
-.corpus-panel__confirm-no {
-  border: 1px solid var(--rail-rule);
-  background: transparent;
-  color: var(--rail-text);
-  border-radius: var(--radius-sm);
-  font-size: 10.5px;
-  padding: 2px 6px;
-  cursor: pointer;
-}
-
-.corpus-panel__confirm-yes {
-  border-color: var(--bad);
-  color: var(--bad);
-}
-
-.corpus-panel__confirm-yes:disabled,
-.corpus-panel__confirm-no:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
 }
 
 .corpus-panel__failed-actions {
@@ -253,7 +227,8 @@
   flex-shrink: 0;
 }
 
-.corpus-panel__retry {
+.corpus-panel__retry,
+.corpus-panel__cancel {
   border: 1px solid var(--rule-hi);
   border-radius: var(--radius-sm);
   background: transparent;
@@ -263,7 +238,17 @@
   padding: 1px 6px;
 }
 
-.corpus-panel__retry:hover:not(:disabled) {
+.corpus-panel__cancel {
+  flex-shrink: 0;
+}
+
+.corpus-panel__cancel:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.corpus-panel__retry:hover:not(:disabled),
+.corpus-panel__cancel:hover:not(:disabled) {
   color: var(--accent);
   border-color: var(--accent);
 }
@@ -365,4 +350,25 @@
 .corpus-panel__tags-error {
   font-size: 11px;
   color: var(--bad);
+}
+
+.corpus-panel__readonly {
+  margin: 0 0 10px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+/* Same look as the ↻ re-index control beside it. */
+.corpus-panel__open-original {
+  border: none;
+  background: transparent;
+  color: var(--rail-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.corpus-panel__open-original:hover,
+.corpus-panel__open-original:focus-visible {
+  color: var(--accent);
 }

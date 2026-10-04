@@ -72,6 +72,23 @@ export async function saveChatStore(value: unknown): Promise<boolean> {
   }
 }
 
+/** Remove the saved history (nothing worth keeping: one empty conversation). */
+export async function clearChatStore(): Promise<boolean> {
+  if (!chatStoreAvailable()) return false;
+  try {
+    const db = await open();
+    return await new Promise<boolean>((resolve) => {
+      const transaction = db.transaction(STORE, 'readwrite');
+      transaction.objectStore(STORE).delete(KEY);
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+    });
+  } catch {
+    return false;
+  }
+}
+
 /** Test seam: drop the cached connection (e.g. after swapping in a fresh fake). */
 export function resetChatStoreConnection(): void {
   connection = null;

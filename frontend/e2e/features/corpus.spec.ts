@@ -96,3 +96,63 @@ test('an upload turned away by a full indexing queue waits and goes through', as
     page.getByTestId('corpus-panel-item').filter({ hasText: 'queued.md' }).getByLabel('Delete queued.md'),
   ).toBeVisible();
 });
+
+test('a file dropped on the chat uploads instead of the browser opening it', async ({ page }) => {
+  await page.getByTestId('rail-chat').click();
+  const transfer = await page.evaluateHandle(() => {
+    const data = new DataTransfer();
+    data.items.add(new File(['# Dropped'], 'dropped.md', { type: 'text/markdown' }));
+    return data;
+  });
+  const thread = page.locator('.app-main');
+
+  await thread.dispatchEvent('dragenter', { dataTransfer: transfer });
+  await expect(page.getByTestId('app-drop-overlay')).toBeVisible();
+  await thread.dispatchEvent('dragover', { dataTransfer: transfer });
+  await thread.dispatchEvent('drop', { dataTransfer: transfer });
+
+  await expect(page.getByTestId('app-drop-overlay')).toHaveCount(0);
+  await expect(
+    page.getByTestId('corpus-panel-item').filter({ hasText: 'dropped.md' }).getByLabel('Delete dropped.md'),
+  ).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+});
+
+test('an upload still indexing can be cancelled, and nothing is added', async ({ page, api }) => {
+  // Stays "embedding" until cancelled.
+  api.jobSteps = [{ status: 200, body: api.jobBody('embedding') }];
+  await page.getByTestId('upload-input').setInputFiles({
+    name: 'draft.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('Draft notes.'),
+  });
+  await page.getByTestId('upload-button').click();
+  const card = page.getByTestId('corpus-panel-item').filter({ hasText: 'draft.txt' });
+  await expect(card).toContainText('indexing');
+
+  await card.getByRole('button', { name: 'Cancel indexing draft.txt' }).click();
+
+  await expect(card).toHaveCount(0, { timeout: 10_000 });
+  expect(api.documents).not.toContain('draft.txt');
+});
+
+test('a job already writing to the index refuses Cancel and keeps going', async ({ page, api }) => {
+  api.cancelTooLate = true;
+  api.jobSteps = [
+    ...Array.from({ length: 3 }, () => ({ status: 200, body: api.jobBody('embedding') })),
+    { status: 200, body: api.jobBody('done') },
+  ];
+  await page.getByTestId('upload-input').setInputFiles({
+    name: 'big.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('Big document.'),
+  });
+  await page.getByTestId('upload-button').click();
+  const card = page.getByTestId('corpus-panel-item').filter({ hasText: 'big.txt' });
+
+  await card.getByRole('button', { name: 'Cancel indexing big.txt' }).click();
+
+  await expect(page.getByText("Couldn't cancel big.txt")).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Delete big.txt' })).toBeVisible({ timeout: 10_000 });
+});
+

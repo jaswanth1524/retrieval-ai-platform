@@ -19,6 +19,7 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,6 +124,38 @@ class FeedbackStore:
                     (self._max_rows,),
                 )
         return feedback
+
+    def import_rows(self, rows: Sequence[Feedback]) -> int:
+        """Insert rows from a backup, keeping their ids and timestamps; rows whose id is
+        already here are skipped, so restoring the same backup twice adds nothing.
+        Returns how many were added."""
+
+        added = 0
+        with self._lock, self._connect() as conn:
+            for row in sorted(rows, key=lambda item: item.created_at):
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO feedback (id, trace_id, question, answer_excerpt, "
+                    "cited_filenames_json, rating, citation_source_number, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row.id,
+                        row.trace_id,
+                        row.question,
+                        row.answer_excerpt,
+                        json.dumps(row.cited_filenames),
+                        row.rating,
+                        row.citation_source_number,
+                        row.created_at,
+                    ),
+                )
+                added += cursor.rowcount
+            if self._max_rows is not None:
+                conn.execute(
+                    "DELETE FROM feedback WHERE rowid <= "
+                    "(SELECT rowid FROM feedback ORDER BY rowid DESC LIMIT 1 OFFSET ?)",
+                    (self._max_rows,),
+                )
+        return added
 
     def list_recent(self, limit: int = 100) -> list[Feedback]:
         """Return the most recently recorded feedback, newest first."""

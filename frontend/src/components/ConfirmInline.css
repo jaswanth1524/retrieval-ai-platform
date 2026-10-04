@@ -1,0 +1,51 @@
+.confirm-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.confirm-inline--rail {
+  --confirm-ink: var(--rail-text);
+  --confirm-dim: var(--rail-dim);
+  --confirm-rule: var(--rail-rule);
+}
+
+.confirm-inline--main {
+  --confirm-ink: var(--ink);
+  --confirm-dim: var(--muted);
+  --confirm-rule: var(--rule);
+}
+
+.confirm-inline__prompt {
+  color: var(--confirm-dim);
+}
+
+.confirm-inline__actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.confirm-inline__yes,
+.confirm-inline__no {
+  border: 1px solid var(--confirm-rule);
+  background: transparent;
+  color: var(--confirm-ink);
+  border-radius: var(--radius-sm);
+  font-size: 10.5px;
+  /* Compact: in a corpus card it shares one row with the document's name. */
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.confirm-inline__yes {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.confirm-inline__yes:disabled,
+.confirm-inline__no:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

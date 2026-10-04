@@ -29,6 +29,7 @@ from api.generation import (
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 class FakeGenerator:
@@ -97,7 +98,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "llm_max_tokens": 512,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_chunk(chunk_id: str, text: str, page: int = 1) -> RerankedChunk:
@@ -1098,3 +1099,42 @@ def test_a_refused_connection_reported_as_a_server_error_still_names_the_server(
         list(generator.stream([{"role": "user", "content": "Hi"}], settings))
 
     assert "pw" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Alpha [1].", {1}),
+        ("Alpha [1, 2].", {1, 2}),
+        ("Alpha [1,3] and [2].", {1, 2, 3}),
+        ("Alpha [1-3].", {1, 2, 3}),
+        ("Alpha [1–3].", {1, 2, 3}),  # en dash
+        ("Alpha [1, 3-4].", {1, 3, 4}),
+        ("Alpha [1-100000].", {1, 2, 3, 4, 5}),  # clamped to the sources on offer
+        ("Alpha [3-1].", set()),  # backwards: ignored
+        ("Alpha [a] and [1, x].", set()),
+        ("No markers.", set()),
+    ],
+)
+def test_cited_numbers_reads_list_and_range_markers(text: str, expected: set[int]) -> None:
+    from api.generation import cited_numbers
+
+    assert cited_numbers(text, 5) == expected
+
+
+def test_a_list_marker_counts_as_cited_and_does_not_trigger_a_retry() -> None:
+    sources = source_citations([make_chunk("c1", "alpha"), make_chunk("c2", "beta")])
+    generator = FakeGenerator("unused")
+
+    outcome = finalize_citations(
+        [{"role": "user", "content": "q"}],
+        "Alpha and beta [1, 2].",
+        sources,
+        generator,
+        make_settings(),
+    )
+
+    assert [source.source_number for source in outcome.cited] == [1, 2]
+    assert outcome.retry_used is False
+    assert generator.messages == []
+    assert needs_citation_retry("Alpha [1-2].", 2) is False

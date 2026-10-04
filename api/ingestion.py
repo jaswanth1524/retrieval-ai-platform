@@ -131,7 +131,8 @@ class IngestSequencer:
         self._lock = Lock()
         self._next = 0
         self._in_flight: dict[str, int] = {}
-        self._applied: dict[str, int] = {}
+        # Newest applied (sequence, was_a_delete) per filename.
+        self._applied: dict[str, tuple[int, bool]] = {}
 
     def admit(self, filename: str) -> int:
         with self._lock:
@@ -140,18 +141,29 @@ class IngestSequencer:
             return self._next
 
     def check(self, filename: str, sequence: int) -> None:
-        """Raise if a newer ingest of ``filename`` was applied. Call under its lock."""
+        """Raise if a newer ingest (or delete) of ``filename`` was applied. Call under
+        its lock."""
 
         with self._lock:
-            if self._applied.get(filename, 0) > sequence:
+            applied, was_delete = self._applied.get(filename, (0, False))
+            if applied <= sequence:
+                return
+            if was_delete:
                 raise IngestionError(
-                    f"A newer version of '{filename}' was indexed while this one was "
-                    "waiting; kept the newer version."
+                    f"'{filename}' was deleted after this upload was queued; it was not indexed."
                 )
+            raise IngestionError(
+                f"A newer version of '{filename}' was indexed while this one was "
+                "waiting; kept the newer version."
+            )
 
-    def mark_applied(self, filename: str, sequence: int) -> None:
+    def mark_applied(self, filename: str, sequence: int, *, deleted: bool = False) -> None:
+        """Record an applied ingest — or, with ``deleted``, a delete: an upload queued
+        before a delete would otherwise index the document straight back."""
+
         with self._lock:
-            self._applied[filename] = max(self._applied.get(filename, 0), sequence)
+            if sequence > self._applied.get(filename, (0, False))[0]:
+                self._applied[filename] = (sequence, deleted)
 
     def release(self, filename: str) -> None:
         with self._lock:
@@ -175,6 +187,8 @@ def ingest_chunks(
     on_indexed: Callable[[], None] | None = None,
     precondition: Callable[[], None] | None = None,
     carry_tags: bool = False,
+    before_first_write: Callable[[], None] | None = None,
+    tags: tuple[str, ...] | None = None,
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
@@ -197,7 +211,12 @@ def ingest_chunks(
     ``carry_tags`` stamps each chunk with its document's current tags, read under the
     same lock ``PATCH /documents/{filename}/tags`` takes — read any earlier and a tag
     change landing while this ingest parsed or queued was overwritten by the old tags.
-    Tags aren't part of the embedded text, so this never changes a vector.
+    Tags aren't part of the embedded text, so this never changes a vector. ``tags``,
+    when given, sets the tags outright instead (a restore from a backup).
+
+    ``before_first_write`` runs once, right before the first batch is upserted, and
+    aborts the ingest by raising — the last point where nothing has changed yet (job
+    cancellation).
     """
 
     if not chunks:
@@ -218,7 +237,9 @@ def ingest_chunks(
         if precondition is not None:
             precondition()
 
-        if carry_tags:
+        if tags is not None:
+            chunks = [replace(chunk, tags=tags) for chunk in chunks]
+        elif carry_tags:
             current_tags = {
                 filename: repository.tags_for_filename(settings, filename) for filename in filenames
             }
@@ -249,6 +270,8 @@ def ingest_chunks(
                 build_point(chunk, embedding, settings)
                 for chunk, embedding in zip(batch, embeddings, strict=True)
             ]
+            if batches_written == 0 and before_first_write is not None:
+                before_first_write()
             try:
                 repository.upsert(settings, points)
             except Exception as exc:

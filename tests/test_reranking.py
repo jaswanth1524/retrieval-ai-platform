@@ -9,11 +9,11 @@ import pytest
 from api.reranking import (
     LocalCrossEncoderReranker,
     RerankingError,
-    rerank_candidates,
     rerank_candidates_detailed,
 )
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def _sigmoid(x: float) -> float:
@@ -59,7 +59,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "reranker_batch_size": 7,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_candidate(chunk_id: str, text: str, score: float) -> RetrievedChunk:
@@ -83,7 +83,7 @@ def test_rerank_candidates_sorts_by_cross_encoder_score_and_truncates() -> None:
     ]
     reranker = FakeReranker([0.2, 0.95, 0.5])
 
-    results = rerank_candidates("  setup docs  ", candidates, reranker, settings)
+    results = rerank_candidates_detailed("  setup docs  ", candidates, reranker, settings).kept
 
     assert reranker.seen_query == "setup docs"
     # Scored as they were embedded: prefixed with filename and section.
@@ -110,7 +110,7 @@ def test_rerank_candidates_scores_only_rerank_candidates_setting() -> None:
     ]
     reranker = FakeReranker([0.1, 0.2])
 
-    results = rerank_candidates("query", candidates, reranker, settings)
+    results = rerank_candidates_detailed("query", candidates, reranker, settings).kept
 
     assert reranker.seen_documents == ["guide.md › Setup\nfirst", "guide.md › Setup\nsecond"]
     assert [result.chunk_id for result in results] == ["c2", "c1"]
@@ -125,7 +125,7 @@ def test_rerank_candidates_rerank_candidates_setting_never_exceeds_fused_top_n()
     ]
     reranker = FakeReranker([0.1, 0.2])
 
-    results = rerank_candidates("query", candidates, reranker, settings)
+    results = rerank_candidates_detailed("query", candidates, reranker, settings).kept
 
     assert reranker.seen_documents == ["guide.md › Setup\nfirst", "guide.md › Setup\nsecond"]
     assert [result.chunk_id for result in results] == ["c2", "c1"]
@@ -140,7 +140,7 @@ def test_rerank_candidates_scores_only_fused_top_n() -> None:
     ]
     reranker = FakeReranker([0.1, 0.2])
 
-    results = rerank_candidates("query", candidates, reranker, settings)
+    results = rerank_candidates_detailed("query", candidates, reranker, settings).kept
 
     assert reranker.seen_documents == ["guide.md › Setup\nfirst", "guide.md › Setup\nsecond"]
     assert [result.chunk_id for result in results] == ["c2", "c1"]
@@ -154,20 +154,20 @@ def test_rerank_candidates_uses_retrieval_score_as_tiebreaker() -> None:
     ]
     reranker = FakeReranker([0.5, 0.5])
 
-    results = rerank_candidates("query", candidates, reranker, settings)
+    results = rerank_candidates_detailed("query", candidates, reranker, settings).kept
 
     assert [result.chunk_id for result in results] == ["high", "low"]
 
 
 def test_rerank_candidates_rejects_empty_query() -> None:
     with pytest.raises(RetrievalError, match="Query text"):
-        rerank_candidates(" ", [], FakeReranker([]), make_settings())
+        rerank_candidates_detailed(" ", [], FakeReranker([]), make_settings())
 
 
 def test_rerank_candidates_returns_empty_without_calling_reranker() -> None:
     reranker = FakeReranker([1.0])
 
-    results = rerank_candidates("query", [], reranker, make_settings())
+    results = rerank_candidates_detailed("query", [], reranker, make_settings()).kept
 
     assert results == []
     assert reranker.seen_query is None
@@ -177,7 +177,7 @@ def test_rerank_candidates_rejects_score_count_mismatch() -> None:
     candidates = [make_candidate("c1", "first", 0.9), make_candidate("c2", "second", 0.8)]
 
     with pytest.raises(RerankingError, match="score count mismatch"):
-        rerank_candidates("query", candidates, FakeReranker([0.1]), make_settings())
+        rerank_candidates_detailed("query", candidates, FakeReranker([0.1]), make_settings())
 
 
 def test_rerank_candidates_filters_below_min_score() -> None:
@@ -189,7 +189,7 @@ def test_rerank_candidates_filters_below_min_score() -> None:
     # sigmoid(2.0) ~= 0.88 (passes 0.30); sigmoid(-5.0) ~= 0.0067 (fails 0.30).
     reranker = FakeReranker([2.0, -5.0])
 
-    results = rerank_candidates("query", candidates, reranker, settings)
+    results = rerank_candidates_detailed("query", candidates, reranker, settings).kept
 
     assert [result.chunk_id for result in results] == ["relevant"]
     assert len(results) < settings.rerank_top_k
@@ -203,14 +203,14 @@ def test_rerank_candidates_returns_empty_when_all_below_min_score() -> None:
     ]
     reranker = FakeReranker([-6.0, -7.0])
 
-    results = rerank_candidates("query", candidates, reranker, settings)
+    results = rerank_candidates_detailed("query", candidates, reranker, settings).kept
 
     assert results == []
 
 
 def test_rerank_candidates_detailed_scored_includes_dropped_below_min_score() -> None:
-    """`.kept` matches `rerank_candidates`'s return; `.scored` also carries the
-    candidate that was filtered out, for trace/debug visibility into why."""
+    """`.scored` also carries the candidate `.kept` filtered out, for trace/debug
+    visibility into why."""
 
     settings = make_settings(rerank_top_k=5, rerank_min_score=0.30)
     candidates = [
@@ -223,7 +223,6 @@ def test_rerank_candidates_detailed_scored_includes_dropped_below_min_score() ->
 
     assert [c.chunk_id for c in outcome.kept] == ["relevant"]
     assert {c.chunk_id for c in outcome.scored} == {"relevant", "irrelevant"}
-    assert outcome.kept == rerank_candidates("query", candidates, reranker, settings)
 
 
 def test_rerank_candidates_detailed_scored_excludes_beyond_rerank_candidates_cap() -> None:
@@ -277,8 +276,11 @@ def test_local_cross_encoder_reranker_wraps_model_failure_as_reranking_error() -
 
     reranker = LocalCrossEncoderReranker(make_settings(), model=RaisingCrossEncoder())
 
-    with pytest.raises(RerankingError, match="model download failed"):
+    with pytest.raises(RerankingError) as raised:
         reranker.score("query", ["doc"])
+    # A fixed message for the client; the cause stays chained for the log.
+    assert str(raised.value) == "Reranker model failed."
+    assert "model download failed" in str(raised.value.__cause__)
 
 
 class CountingCrossEncoder:
@@ -358,4 +360,4 @@ def test_auto_onnx_file_picks_int8_for_jina_only() -> None:
 
 
 def test_reranker_onnx_file_defaults_to_auto() -> None:
-    assert AppSettings(_env_file=None).reranker_onnx_file == "auto"  # type: ignore[call-arg]
+    assert make_test_settings().reranker_onnx_file == "auto"

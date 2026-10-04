@@ -9,10 +9,11 @@ from api.answer_cache import (
     bump_corpus_generation,
 )
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def _settings(**overrides: Any) -> AppSettings:
-    return AppSettings(_env_file=None, **overrides)  # type: ignore[call-arg]
+    return make_test_settings(**overrides)
 
 
 def _answer(text: str) -> CachedAnswer:

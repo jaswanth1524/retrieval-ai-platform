@@ -15,13 +15,13 @@ from api.ingestion import ingest_chunks
 from api.qdrant_schema import VectorStoreUnavailableError
 from api.repository import VectorRepository
 from api.retrieval import (
-    RetrievalError,
     RetrievalPayloadError,
+    RetrievedChunk,
     points_to_chunks,
-    retrieve_candidates,
     scored_point_to_chunk,
 )
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 def _unexpected_response(status_code: int) -> UnexpectedResponse:
@@ -42,19 +42,14 @@ class StaticEmbeddingProvider:
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "retrieval_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("retrieval_documents"),
         "dense_retrieval_limit": 3,
         "sparse_retrieval_limit": 3,
         "fused_top_n": 3,
         "rrf_k": 60,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_chunk(chunk_id: str, text: str, page: int = 1) -> DocumentChunk:
@@ -95,15 +90,25 @@ def seed_collection(settings: AppSettings) -> QdrantClient:
     return client
 
 
-def test_retrieve_candidates_uses_qdrant_server_side_rrf() -> None:
+# The query "alpha": dense-closest to c1, and sharing c1's (and c3's) sparse term.
+ALPHA_QUERY = make_embedding([1.0, 0.0, 0.0], [10], [1.0])
+
+
+def search(
+    repository: VectorRepository,
+    settings: AppSettings,
+    filenames: Sequence[str] | None = None,
+) -> list[RetrievedChunk]:
+    return points_to_chunks(repository.hybrid_search(settings, ALPHA_QUERY, filenames))
+
+
+def test_hybrid_search_uses_qdrant_server_side_rrf() -> None:
     settings = make_settings()
     client = seed_collection(settings)
     repository = VectorRepository(client)
-    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
 
-    results = retrieve_candidates(repository, settings, "alpha", query_provider)
+    results = search(repository, settings)
 
-    assert query_provider.seen_texts == ["alpha"]
     assert [result.chunk_id for result in results] == ["c1", "c3", "c2"]
     assert results[0].filename == "guide.md"
     assert results[0].page == 1
@@ -111,7 +116,7 @@ def test_retrieve_candidates_uses_qdrant_server_side_rrf() -> None:
     assert results[0].text == "alpha exact"
 
 
-def test_retrieve_candidates_falls_back_to_manual_rrf(
+def test_hybrid_search_falls_back_to_manual_rrf(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = make_settings()
@@ -130,9 +135,7 @@ def test_retrieve_candidates_falls_back_to_manual_rrf(
         return original_query_points(*args, **kwargs)
 
     monkeypatch.setattr(client, "query_points", query_points)
-    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
-
-    results = retrieve_candidates(repository, settings, "alpha", query_provider)
+    results = search(repository, settings)
 
     assert hybrid_attempted is True
     assert [result.chunk_id for result in results] == ["c1", "c3", "c2"]
@@ -159,16 +162,14 @@ def test_manual_fusion_fallback_is_remembered_per_client(
         return original_query_points(*args, **kwargs)
 
     monkeypatch.setattr(client, "query_points", query_points)
-    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
-
-    first = retrieve_candidates(repository, settings, "alpha", query_provider)
-    second = retrieve_candidates(VectorRepository(client), settings, "alpha", query_provider)
+    first = search(repository, settings)
+    second = search(VectorRepository(client), settings)
 
     assert hybrid_attempts == 1
     assert [r.chunk_id for r in first] == [r.chunk_id for r in second] == ["c1", "c3", "c2"]
 
 
-def test_retrieve_candidates_does_not_fall_back_on_real_query_error(
+def test_hybrid_search_does_not_fall_back_on_real_query_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A genuine server error (not an RRF-unsupported signal) must not be masked by a
@@ -188,15 +189,13 @@ def test_retrieve_candidates_does_not_fall_back_on_real_query_error(
         raise AssertionError("must not fall back to manual fusion for a real 500")
 
     monkeypatch.setattr(client, "query_points", query_points)
-    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
-
     with pytest.raises(UnexpectedResponse):
-        retrieve_candidates(repository, settings, "alpha", query_provider)
+        search(repository, settings)
 
     assert manual_fusion_attempted is False
 
 
-def test_retrieve_candidates_wraps_connection_failure_as_service_unavailable(
+def test_hybrid_search_wraps_connection_failure_as_service_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = make_settings()
@@ -207,13 +206,11 @@ def test_retrieve_candidates_wraps_connection_failure_as_service_unavailable(
         raise ResponseHandlingException(ConnectionError("connection refused"))
 
     monkeypatch.setattr(client, "query_points", query_points)
-    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
-
     with pytest.raises(VectorStoreUnavailableError, match="unreachable"):
-        retrieve_candidates(repository, settings, "alpha", query_provider)
+        search(repository, settings)
 
 
-def test_retrieve_candidates_filters_by_filenames() -> None:
+def test_hybrid_search_filters_by_filenames() -> None:
     settings = make_settings()
     client = QdrantClient(":memory:")
     repository = VectorRepository(client)
@@ -226,40 +223,9 @@ def test_retrieve_candidates_filters_by_filenames() -> None:
         make_embedding([1.0, 0.0, 0.0], [10], [1.0]),
     ]
     ingest_chunks(repository, settings, chunks, StaticEmbeddingProvider(embeddings))
-    query_provider = StaticEmbeddingProvider([make_embedding([1.0, 0.0, 0.0], [10], [1.0])])
-
-    results = retrieve_candidates(repository, settings, "alpha", query_provider, filenames=["b.md"])
+    results = search(repository, settings, filenames=["b.md"])
 
     assert [result.filename for result in results] == ["b.md"]
-
-
-def test_retrieve_candidates_rejects_empty_query() -> None:
-    settings = make_settings()
-    client = seed_collection(settings)
-    repository = VectorRepository(client)
-
-    with pytest.raises(RetrievalError, match="Query text"):
-        retrieve_candidates(repository, settings, "   ", StaticEmbeddingProvider([]))
-
-
-def test_retrieve_candidates_validates_before_embedding() -> None:
-    class RefusingRepository:
-        def ensure_ready(self, settings: AppSettings) -> None:
-            raise RetrievalError("refused")
-
-        def hybrid_search(
-            self, settings: AppSettings, query_embedding: EmbeddedText
-        ) -> list[models.ScoredPoint]:
-            raise AssertionError("hybrid_search must not run when ensure_ready refuses")
-
-    class FailingEmbeddingProvider:
-        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
-            raise AssertionError("embedding must not run when ensure_ready refuses")
-
-    settings = make_settings()
-
-    with pytest.raises(RetrievalError, match="refused"):
-        retrieve_candidates(RefusingRepository(), settings, "alpha", FailingEmbeddingProvider())
 
 
 def test_scored_point_to_chunk_requires_citation_payload() -> None:

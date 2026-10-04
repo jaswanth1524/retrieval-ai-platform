@@ -1,6 +1,6 @@
 import './IconRail.css';
 
-export type RailPanel = 'chat' | 'corpus' | 'traces';
+export type RailPanel = 'chat' | 'corpus' | 'traces' | 'feedback';
 
 interface RailItem {
   key: RailPanel;
@@ -12,6 +12,7 @@ const RAIL_ITEMS: RailItem[] = [
   { key: 'chat', glyph: '☰', label: 'Conversations' },
   { key: 'corpus', glyph: '▤', label: 'Corpus' },
   { key: 'traces', glyph: '◔', label: 'Traces' },
+  { key: 'feedback', glyph: '★', label: 'Feedback' },
 ];
 
 interface IconRailProps {
@@ -20,9 +21,18 @@ interface IconRailProps {
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
   onOpenSettings: () => void;
+  /** Rail entries to leave out (the feedback panel when feedback is off or read-only). */
+  hidden?: RailPanel[];
 }
 
-function IconRail({ active, onSelect, theme, onToggleTheme, onOpenSettings }: IconRailProps) {
+function IconRail({
+  active,
+  onSelect,
+  theme,
+  onToggleTheme,
+  onOpenSettings,
+  hidden = [],
+}: IconRailProps) {
   return (
     <nav className="icon-rail" aria-label="Primary">
       <div className="icon-rail__logo-slot">
@@ -30,7 +40,7 @@ function IconRail({ active, onSelect, theme, onToggleTheme, onOpenSettings }: Ic
           DR
         </span>
       </div>
-      {RAIL_ITEMS.map((item) => (
+      {RAIL_ITEMS.filter((item) => !hidden.includes(item.key)).map((item) => (
         <button
           key={item.key}
           type="button"

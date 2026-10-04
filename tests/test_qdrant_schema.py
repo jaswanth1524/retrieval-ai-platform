@@ -21,6 +21,7 @@ from api.qdrant_schema import (
     sparse_vectors_config,
 )
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -35,7 +36,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "embedding_model_tag": "local-dense:v1",
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def test_vector_configs_use_named_dense_and_sparse_vectors() -> None:
@@ -257,10 +258,8 @@ def test_make_qdrant_client_sends_the_configured_api_key(monkeypatch: pytest.Mon
     captured: list[dict[str, object]] = []
     monkeypatch.setattr(qdrant_schema, "QdrantClient", lambda **kwargs: captured.append(kwargs))
 
-    qdrant_schema.make_qdrant_client(
-        AppSettings(_env_file=None, qdrant_api_key="qdrant-secret")  # type: ignore[call-arg]
-    )
-    qdrant_schema.make_qdrant_client(AppSettings(_env_file=None))  # type: ignore[call-arg]
+    qdrant_schema.make_qdrant_client(make_test_settings(qdrant_api_key="qdrant-secret"))
+    qdrant_schema.make_qdrant_client(make_test_settings())
 
     assert captured[0]["api_key"] == "qdrant-secret"
     assert captured[1]["api_key"] is None

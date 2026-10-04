@@ -36,6 +36,40 @@ export interface PublicConfigResponse {
   /** An OpenAI-compatible server (vLLM, llama.cpp, LM Studio) is configured. */
   openai_compatible_available?: boolean;
   openai_compatible_model?: string;
+  /** Providers a question may pick per request (ALLOWED_REQUEST_PROVIDERS). */
+  allowed_request_providers?: string[];
+}
+
+/** What the caller's API key unlocks (GET /access). */
+export type AccessLevel = 'full' | 'read' | 'open';
+
+export interface AccessResponse {
+  access: AccessLevel;
+}
+
+export interface ImportResponse {
+  jobs: DocumentJobAcceptedResponse[];
+  deferred: string[];
+  skipped: string[];
+  missing_originals: string[];
+  rejected: string[];
+  feedback_imported: number;
+  feedback_skipped: number;
+}
+
+export interface FeedbackItemResponse {
+  id: string;
+  trace_id: string | null;
+  question: string;
+  answer_excerpt: string;
+  cited_filenames: string[];
+  rating: FeedbackRating;
+  citation_source_number: number | null;
+  created_at: number;
+}
+
+export interface FeedbackListResponse {
+  feedback: FeedbackItemResponse[];
 }
 
 export interface QuestionOverrides {
@@ -73,6 +107,8 @@ export interface DocumentJobStatusResponse {
   chunks_done: number;
   error: string | null;
   result: DocumentIngestResponse | null;
+  /** Stopped by DELETE /documents/jobs/{id} (state "failed"). */
+  cancelled?: boolean;
 }
 
 export interface DocumentListResponse {
@@ -179,6 +215,8 @@ export interface QuestionOptions {
   tags?: string[];
   /** Skip the server's answer cache (Regenerate). */
   bypassCache?: boolean;
+  /** Client-only, never sent: the model asked, recorded on the answer it produces. */
+  modelLabel?: string;
 }
 
 export type TraceStatus = 'ok' | 'insufficient_context' | 'error';

@@ -8,12 +8,13 @@ from qdrant_client import QdrantClient
 
 from api.provider_health import check_ollama_reachable, check_qdrant_reachable
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {"ollama_base_url": "http://localhost:11434"}
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def test_check_ollama_reachable_true_on_2xx(monkeypatch: pytest.MonkeyPatch) -> None:

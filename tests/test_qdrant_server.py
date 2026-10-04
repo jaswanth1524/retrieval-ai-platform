@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from qdrant_client import QdrantClient, models
 
+from api.corpus import bump_corpus_generation
 from api.documents import DocumentChunk
 from api.embeddings import EmbeddedText
 from api.ingestion import ingest_chunks
@@ -26,6 +27,7 @@ from api.repository import (
     clear_hybrid_fallback_cache,
 )
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 QDRANT_URL = os.environ.get("DOCRAG_TEST_QDRANT_URL", "")
 # Compose runs the API with QDRANT_PREFER_GRPC=true, so every test runs over both
@@ -71,7 +73,7 @@ def server(request: pytest.FixtureRequest) -> Generator[tuple[QdrantClient, AppS
         "sparse_retrieval_limit": 3,
         "fused_top_n": 3,
     }
-    settings = AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    settings = make_test_settings(**defaults)
     try:
         yield client, settings
     finally:
@@ -129,7 +131,9 @@ def test_filename_scope_and_metadata_use_the_servers_payload_index(
         "guide.md": 2,
         "notes.md": 1,
     }
-    assert repository.list_filenames(settings) == ["notes.md"]
+    # As DELETE /documents does: the listing is cached until the corpus changes.
+    bump_corpus_generation()
+    assert sorted(repository.filename_metadata(settings)) == ["notes.md"]
 
 
 def test_bm25_ranks_a_rare_term_above_a_common_one_after_migration(

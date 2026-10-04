@@ -22,6 +22,7 @@ from api.ingestion import (
 from api.qdrant_schema import CollectionSchemaError
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from tests.factories import in_memory_qdrant, make_test_settings
 
 
 class FakeEmbeddingProvider:
@@ -36,15 +37,10 @@ class FakeEmbeddingProvider:
 
 def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
-        "qdrant_url": ":memory:",
-        "qdrant_collection": "ingest_documents",
-        "qdrant_dense_vector_name": "dense",
-        "qdrant_sparse_vector_name": "sparse",
-        "qdrant_dense_vector_size": 3,
-        "embedding_model_tag": "test-embedding:v1",
+        **in_memory_qdrant("ingest_documents"),
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def make_chunk(
@@ -349,12 +345,14 @@ def test_ingest_chunks_serializes_concurrent_ingests_of_the_same_filename() -> N
             self._inner.upsert(settings, points)
             if self._is_a:
                 record("a_upserted")
+                a_holds_the_lock.set()
                 time.sleep(0.2)
 
         def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
             record("a_deleted" if self._is_a else "b_deleted")
             self._inner.delete_by_ids(settings, point_ids)
 
+    a_holds_the_lock = threading.Event()
     repo_a = DelayingRepository(inner, is_a=True)
     repo_b = DelayingRepository(inner, is_a=False)
 
@@ -365,11 +363,10 @@ def test_ingest_chunks_serializes_concurrent_ingests_of_the_same_filename() -> N
         future_a = pool.submit(
             ingest_chunks, repo_a, settings, [chunk_a], FakeEmbeddingProvider([make_embedding(0.1)])
         )
-        # Give A a head start so it reaches its post-upsert sleep (still holding the
-        # lock) before B attempts to start — without this, B could win the race for
-        # the lock instead of A, which would still pass but wouldn't exercise the
-        # intended window.
-        time.sleep(0.05)
+        # Start B only once A is inside its post-upsert window (still holding the lock),
+        # so B really contends for it — otherwise B could win the race for the lock
+        # instead of A, which would still pass but wouldn't exercise the window.
+        assert a_holds_the_lock.wait(timeout=5.0)
         future_b = pool.submit(
             ingest_chunks, repo_b, settings, [chunk_b], FakeEmbeddingProvider([make_embedding(0.2)])
         )

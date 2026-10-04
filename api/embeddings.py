@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from fastembed import SparseTextEmbedding, TextEmbedding
 from qdrant_client import models
 
 from api.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingError(RuntimeError):
@@ -110,7 +113,9 @@ class LocalEmbeddingProvider:
         except EmbeddingError:
             raise
         except Exception as exc:
-            raise EmbeddingError(f"Embedding model failed: {exc}") from exc
+            # The cause (often a path or an ONNX runtime message) stays in the log.
+            logger.warning("Embedding model failed.", exc_info=True)
+            raise EmbeddingError("Embedding model failed.") from exc
 
         if len(dense_vectors) != len(texts):
             raise EmbeddingError(
@@ -153,7 +158,8 @@ class LocalEmbeddingProvider:
         except EmbeddingError:
             raise
         except Exception as exc:
-            raise EmbeddingError(f"Embedding model failed: {exc}") from exc
+            logger.warning("Query embedding failed.", exc_info=True)
+            raise EmbeddingError("Embedding model failed.") from exc
 
         if len(dense_vectors) != 1 or len(sparse_vectors) != 1:
             raise EmbeddingError(

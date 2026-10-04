@@ -99,6 +99,11 @@ class AppSettings(BaseSettings):
     rerank_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
 
     llm_provider: str = "ollama"
+    # Providers a question may pick per request (`llm_provider` on /questions*), as a
+    # JSON list, e.g. ["ollama"]. Unset: any configured provider. LLM_PROVIDER itself
+    # is always allowed. Restricting it stops a caller — anyone with the read key, or
+    # anyone at all without API_KEY — from switching to a paid provider at will.
+    allowed_request_providers: list[Literal["ollama", "openai", "openai_compatible"]] | None = None
     llm_model: str = "llama3.1:8b"
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_max_tokens: PositiveInt = 512
@@ -149,6 +154,9 @@ class AppSettings(BaseSettings):
     reasoning_token_headroom: PositiveInt = 3072
 
     max_upload_bytes: PositiveInt = 50 * 1024 * 1024
+    # POST /import: the largest backup zip (GET /export) accepted. Each original inside
+    # is still held to max_upload_bytes.
+    max_import_bytes: PositiveInt = 256 * 1024 * 1024
     # Real dense-model subword tokens (api/chunking.py counts with the model's own
     # tokenizer). bge-small hard-truncates at 512 tokens; the chunker reserves headroom
     # for the contextual-embedding prefix and never exceeds this budget, so the embedded
@@ -165,6 +173,13 @@ class AppSettings(BaseSettings):
     # rows (each row rendered as "col: value; ..."), so citations point at a labeled
     # row range instead of one giant section.
     csv_rows_per_section: int = Field(default=50, ge=1)
+
+    # PDF work limits. A PDF over max_pdf_pages is refused (400) before any page is
+    # read; only the first max_ocr_pages text-less pages are OCR'd (200 dpi each, the
+    # slowest step by far), the rest skipped with a warning. Without them a small file
+    # of thousands of blank pages held both ingest workers for hours.
+    max_pdf_pages: int = Field(default=2000, ge=1)
+    max_ocr_pages: int = Field(default=100, ge=0)
 
     # Chunks are embedded and upserted in batches of this size rather than all at
     # once, so a single huge document reports incremental job progress and never
@@ -299,6 +314,8 @@ class AppSettings(BaseSettings):
     # it the root logger's WARNING default silences every logger.info in the codebase
     # (request logs, ingest progress, warmup notices).
     log_level: str = "INFO"
+    # "json": one JSON object per log line (for a log shipper); "text" otherwise.
+    log_format: Literal["text", "json"] = "text"
 
     @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":

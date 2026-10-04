@@ -3,7 +3,8 @@
 Guards test isolation against a real developer ``.env``. Two separate leak paths exist:
 
 1. ``AppSettings`` itself reads ``.env`` (see ``api/settings.py``'s ``env_file=".env"``) —
-   every ``make_settings()`` helper already passes ``_env_file=None`` to disable this.
+   ``tests/factories.py:make_test_settings`` (behind every ``make_settings()`` helper)
+   passes ``_env_file=None`` to disable this.
 2. ``litellm`` calls ``dotenv.load_dotenv()`` at import time (``litellm/__init__.py``),
    which copies real ``.env`` values into the actual process ``os.environ`` as a side
    effect. ``_env_file=None`` does NOT protect against this — pydantic-settings always
@@ -18,6 +19,7 @@ else) has already copied ``.env`` into the process environment.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 
 import pytest
@@ -34,3 +36,23 @@ def _isolate_app_settings_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None
     for env_var in _SETTINGS_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _drop_log_handlers_added_by_the_test() -> Generator[None]:
+    """Remove the ``api``/``eval`` log handlers a test attached, when it ends.
+
+    ``create_app`` configures logging, which binds a StreamHandler to the ``sys.stderr``
+    of that moment — pytest's capture stream for the running test. Left in place, every
+    later test that logged wrote to that closed stream ("Logging error ... I/O operation
+    on closed file" in the output).
+    """
+
+    loggers = [logging.getLogger(name) for name in ("api", "eval")]
+    before = {logger.name: list(logger.handlers) for logger in loggers}
+    yield
+    for logger in loggers:
+        for handler in logger.handlers[:]:
+            if handler not in before[logger.name]:
+                logger.removeHandler(handler)
+                handler.close()

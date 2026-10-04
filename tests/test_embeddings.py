@@ -12,7 +12,7 @@ from api.embeddings import (
     coerce_sequence,
     coerce_sparse_vector,
 )
-from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 class ArrayLike:
@@ -113,7 +113,7 @@ class RecordingSparseModel:
 
 
 def test_embed_query_applies_instruction_and_query_side_sparse() -> None:
-    settings = AppSettings(_env_file=None, dense_query_instruction="PREFIX: ")  # type: ignore[call-arg]
+    settings = make_test_settings(dense_query_instruction="PREFIX: ")
     dense = RecordingDenseModel()
     sparse = RecordingSparseModel()
     provider = LocalEmbeddingProvider(settings, dense_model=dense, sparse_model=sparse)
@@ -128,7 +128,7 @@ def test_embed_query_applies_instruction_and_query_side_sparse() -> None:
 
 
 def test_embed_query_without_instruction_uses_raw_query() -> None:
-    settings = AppSettings(_env_file=None, dense_query_instruction="")  # type: ignore[call-arg]
+    settings = make_test_settings(dense_query_instruction="")
     dense = RecordingDenseModel()
     sparse = RecordingSparseModel()
     provider = LocalEmbeddingProvider(settings, dense_model=dense, sparse_model=sparse)
@@ -144,10 +144,14 @@ def test_local_embedding_provider_wraps_model_failure_as_embedding_error() -> No
     into EmbeddingError rather than an unwrapped exception."""
 
     provider = LocalEmbeddingProvider(
-        AppSettings(_env_file=None),  # type: ignore[call-arg]
+        make_test_settings(),
         dense_model=RaisingDenseModel(),
         sparse_model=EmptySparseModel(),
     )
 
-    with pytest.raises(EmbeddingError, match="model download failed"):
+    with pytest.raises(EmbeddingError) as raised:
         provider.embed_texts(["hello"])
+    # A fixed message for the client; the cause (which can name paths) stays chained
+    # for the log.
+    assert str(raised.value) == "Embedding model failed."
+    assert "model download failed" in str(raised.value.__cause__)

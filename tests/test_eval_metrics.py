@@ -39,7 +39,15 @@ def test_recall_at_k_zero_when_relevant_empty() -> None:
 
 def test_score_ranking_emits_all_requested_keys() -> None:
     scores = score_ranking(["a", "b"], {"a"}, ks=(1, 2))
-    assert set(scores) == {"mrr", "hit@1", "recall@1", "hit@2", "recall@2"}
+    assert set(scores) == {
+        "mrr",
+        "hit@1",
+        "recall@1",
+        "ndcg@1",
+        "hit@2",
+        "recall@2",
+        "ndcg@2",
+    }
     assert scores["hit@1"] == 1.0
     assert scores["mrr"] == 1.0
 
@@ -65,3 +73,15 @@ def test_compare_to_baseline_allows_within_tolerance() -> None:
 
 def test_compare_to_baseline_skips_missing_current_keys() -> None:
     assert compare_to_baseline({}, {"mrr": 0.90}, max_regression=0.05) == []
+
+
+def test_ndcg_rewards_rank_not_just_presence() -> None:
+    from eval.metrics import ndcg_at_k
+
+    assert ndcg_at_k(["a", "b"], {"a"}, 2) == 1.0
+    assert 0.6 < ndcg_at_k(["b", "a"], {"a"}, 2) < 0.64  # 1/log2(3)
+    assert ndcg_at_k(["b", "c"], {"a"}, 2) == 0.0
+    assert ndcg_at_k(["a"], set(), 1) == 0.0
+    # Two relevant, both found: perfect only in the first two places.
+    assert ndcg_at_k(["a", "b", "x"], {"a", "b"}, 3) == 1.0
+    assert ndcg_at_k(["x", "a", "b"], {"a", "b"}, 3) < 1.0

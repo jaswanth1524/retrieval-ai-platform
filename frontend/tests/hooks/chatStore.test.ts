@@ -62,7 +62,10 @@ describe('useChat with IndexedDB', () => {
 
   it('keeps everything when localStorage is full, without warning the user', async () => {
     const { result } = renderHook(() => useChat());
-    await waitFor(async () => expect(await loadChatStore()).not.toBeNull());
+    // Let the mount's IndexedDB read finish (it gates every save).
+    await act(async () => {
+      await loadChatStore();
+    });
     vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
       throw new DOMException('quota', 'QuotaExceededError');
     });
@@ -77,5 +80,37 @@ describe('useChat with IndexedDB', () => {
       expect(result.current.persistError).toBe(false);
       expect(result.current.persistPartial).toBe(false);
     });
+  });
+
+  it('does not bring back an empty conversation next to the new one after a reload', async () => {
+    const first = renderHook(() => useChat());
+    await act(async () => {
+      await loadChatStore();
+    });
+    first.unmount();
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await loadChatStore();
+    });
+
+    expect(result.current.conversations).toHaveLength(1);
+    expect(await loadChatStore()).toBeNull();
+  });
+
+  it('drops an empty conversation saved by an older version when it hydrates', async () => {
+    await saveChatStore({
+      version: 2,
+      activeConversationId: 'empty',
+      conversations: [
+        { id: 'empty', title: 'New chat', createdAt: 1, updatedAt: 60, turns: [] },
+        { id: 'c1', title: 'Saved', createdAt: 1, updatedAt: 50, turns: [turn('q', 'user', 'Q')] },
+      ],
+    });
+
+    const { result } = renderHook(() => useChat());
+
+    await waitFor(() => expect(result.current.conversations.map((c) => c.title)).toContain('Saved'));
+    expect(result.current.conversations.filter((c) => c.title === 'New chat')).toHaveLength(1);
   });
 });

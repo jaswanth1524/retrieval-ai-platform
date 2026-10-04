@@ -5,6 +5,7 @@ from typing import Any
 from api.diversity import jaccard, select_diverse, word_shingles
 from api.reranking import RerankedChunk, RerankOutcome
 from api.settings import AppSettings
+from tests.factories import make_test_settings
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -15,7 +16,7 @@ def make_settings(**overrides: Any) -> AppSettings:
         "context_diversity_max_similarity": 0.6,
     }
     defaults.update(overrides)
-    return AppSettings(_env_file=None, **defaults)  # type: ignore[call-arg]
+    return make_test_settings(**defaults)
 
 
 def chunk(

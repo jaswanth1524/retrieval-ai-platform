@@ -11,6 +11,7 @@ question. Metrics are computed independently at each requested cutoff ``k``.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any
@@ -40,6 +41,25 @@ def recall_at_k(ranked: Sequence[str], relevant: AbstractSet[str], k: int) -> fl
     return found / len(relevant)
 
 
+def ndcg_at_k(ranked: Sequence[str], relevant: AbstractSet[str], k: int) -> float:
+    """Binary-relevance nDCG@k: rewards relevant items ranked higher, not just present.
+
+    hit@k and recall@k can't tell rank 1 from rank k; once both saturate, this still
+    moves when a relevant item drops a place. 0.0 when nothing is relevant.
+    """
+
+    if not relevant:
+        return 0.0
+    seen: set[str] = set()
+    dcg = 0.0
+    for index, item in enumerate(ranked[:k], start=1):
+        if item in relevant and item not in seen:
+            seen.add(item)
+            dcg += 1.0 / math.log2(index + 1)
+    ideal = sum(1.0 / math.log2(index + 1) for index in range(1, min(len(relevant), k) + 1))
+    return dcg / ideal
+
+
 def score_ranking(
     ranked: Sequence[str], relevant: AbstractSet[str], ks: Sequence[int]
 ) -> dict[str, float]:
@@ -49,6 +69,7 @@ def score_ranking(
     for k in ks:
         scores[f"hit@{k}"] = hit_at_k(ranked, relevant, k)
         scores[f"recall@{k}"] = recall_at_k(ranked, relevant, k)
+        scores[f"ndcg@{k}"] = ndcg_at_k(ranked, relevant, k)
     return scores
 
 

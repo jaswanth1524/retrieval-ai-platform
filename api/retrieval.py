@@ -10,7 +10,6 @@ from typing import Protocol
 from qdrant_client import models
 
 from api.embeddings import EmbeddedText, EmbeddingError
-from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -33,19 +32,6 @@ class QueryEmbeddingProvider(Protocol):
     def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]: ...
 
 
-class SearchRepository(Protocol):
-    """Vector-store surface retrieval needs: fused dense+sparse candidates."""
-
-    def ensure_ready(self, settings: AppSettings) -> None: ...
-
-    def hybrid_search(
-        self,
-        settings: AppSettings,
-        query_embedding: EmbeddedText,
-        filenames: Sequence[str] | None = None,
-    ) -> list[models.ScoredPoint]: ...
-
-
 @dataclass(frozen=True)
 class RetrievedChunk:
     """A fused retrieval candidate ready for reranking."""
@@ -60,31 +46,6 @@ class RetrievedChunk:
     # None for points indexed before chunk_ordinal existed — neighbor expansion
     # skips those gracefully rather than treating a missing ordinal as an error.
     chunk_ordinal: int | None = None
-
-
-def retrieve_candidates(
-    repository: SearchRepository,
-    settings: AppSettings,
-    query: str,
-    embedding_provider: QueryEmbeddingProvider,
-    filenames: Sequence[str] | None = None,
-) -> list[RetrievedChunk]:
-    """Retrieve fused dense+sparse candidates for a user query.
-
-    ``filenames``, when given, restricts retrieval to those documents only (both the
-    dense and sparse prefetch legs are filtered before fusion, not after).
-    """
-
-    normalized_query = query.strip()
-    if not normalized_query:
-        raise RetrievalError("Query text is required.")
-
-    # Validate before embedding: an embedding-tag mismatch should refuse the query
-    # without paying for embedding work first.
-    repository.ensure_ready(settings)
-    query_embedding = embed_query(normalized_query, embedding_provider)
-    points = repository.hybrid_search(settings, query_embedding, filenames)
-    return points_to_chunks(points)
 
 
 def points_to_chunks(points: Sequence[models.ScoredPoint]) -> list[RetrievedChunk]:

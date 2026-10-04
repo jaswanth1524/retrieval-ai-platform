@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -19,6 +20,8 @@ from fastembed.rerank.cross_encoder import TextCrossEncoder
 from api.documents import contextual_text
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 
 def _sigmoid(x: float) -> float:
@@ -178,7 +181,9 @@ class LocalCrossEncoderReranker:
                     )
                 )
         except Exception as exc:
-            raise RerankingError(f"Reranker model failed: {exc}") from exc
+            # The cause (often a path or an ONNX runtime message) stays in the log.
+            logger.warning("Reranker model failed.", exc_info=True)
+            raise RerankingError("Reranker model failed.") from exc
         return [float(score) for score in scores]
 
 
@@ -194,27 +199,12 @@ class RerankOutcome:
 
     ``scored`` is every candidate actually sent to the cross-encoder, sorted
     descending — including ones later dropped by ``rerank_min_score`` or the
-    ``rerank_top_k`` cut. ``kept`` is the same list ``rerank_candidates`` has always
-    returned: filtered and sliced to the top-K.
+    ``rerank_top_k`` cut. ``kept`` is the survivors: filtered and sliced to
+    the top-K.
     """
 
     scored: list[RerankedChunk]
     kept: list[RerankedChunk]
-
-
-def rerank_candidates(
-    query: str,
-    candidates: Sequence[RetrievedChunk],
-    reranker: Reranker,
-    settings: AppSettings,
-) -> list[RerankedChunk]:
-    """Rerank the fused top-N candidates, drop low-relevance ones, keep the top-K.
-
-    Thin wrapper over ``rerank_candidates_detailed`` for callers that only need the
-    survivors — see that function's docstring for the full scoring/filtering rules.
-    """
-
-    return rerank_candidates_detailed(query, candidates, reranker, settings).kept
 
 
 def rerank_candidates_detailed(

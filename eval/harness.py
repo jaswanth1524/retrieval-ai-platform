@@ -72,6 +72,10 @@ class RetrievalExample:
     reference: str | None
     relevant_filenames: frozenset[str]
     relevant_chunk_ids: frozenset[str]
+    # Text the right chunk contains (whitespace/case-insensitive). Resolved to chunk ids
+    # against the indexed corpus at run time, so labels survive chunking changes that
+    # would change every chunk id.
+    relevant_passages: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -256,6 +260,7 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
         reference=reference.strip() if isinstance(reference, str) and reference.strip() else None,
         relevant_filenames=_string_set(data.get("relevant_filenames"), index, "relevant_filenames"),
         relevant_chunk_ids=_string_set(data.get("relevant_chunk_ids"), index, "relevant_chunk_ids"),
+        relevant_passages=_string_set(data.get("relevant_passages"), index, "relevant_passages"),
     )
 
 
@@ -278,6 +283,10 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "chunker_version": CHUNKER_VERSION,
         "rerank_top_k": int(settings.rerank_top_k),
         "query_expansion_enabled": bool(settings.query_expansion_enabled),
+        # Chunk ids (and so chunk-level scores) depend on these.
+        "chunk_size_tokens": int(settings.chunk_size_tokens),
+        "chunk_overlap_tokens": int(settings.chunk_overlap_tokens),
+        "min_section_words": int(settings.min_section_words),
     }
 
 
@@ -292,6 +301,7 @@ def run_retrieval_eval(
     per_question: list[dict[str, Any]] = []
     filename_rows: list[dict[str, float]] = []
     chunk_rows: list[dict[str, float]] = []
+    passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
     for example in examples:
         ranked = rank_for_question(
             example.question,
@@ -307,8 +317,11 @@ def run_retrieval_eval(
             file_scores = score_ranking(ranked.filenames, example.relevant_filenames, ks)
             entry["filename"] = file_scores
             filename_rows.append(file_scores)
-        if example.relevant_chunk_ids:
-            chunk_scores = score_ranking(ranked.chunk_ids, example.relevant_chunk_ids, ks)
+        relevant_chunks = example.relevant_chunk_ids | passage_ids.get(
+            example.question, frozenset()
+        )
+        if relevant_chunks:
+            chunk_scores = score_ranking(ranked.chunk_ids, relevant_chunks, ks)
             entry["chunk"] = chunk_scores
             chunk_rows.append(chunk_scores)
         per_question.append(entry)
@@ -323,6 +336,56 @@ def run_retrieval_eval(
         },
         "per_question": per_question,
     }
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def resolve_passages(
+    examples: Sequence[RetrievalExample], repository: Any, settings: AppSettings
+) -> dict[str, frozenset[str]]:
+    """Each question's ``relevant_passages``, as the ids of the chunks containing them.
+
+    Looks only in the question's relevant files when it names any. A passage found in
+    no chunk is a broken label (the text changed, or a typo) and fails the run rather
+    than silently scoring that question as unlabeled.
+    """
+
+    wanted = [example for example in examples if example.relevant_passages]
+    if not wanted:
+        return {}
+    filenames = sorted(
+        {name for example in wanted for name in example.relevant_filenames}
+        or set(repository.filename_metadata(settings))
+    )
+    chunks: dict[str, list[tuple[str, str]]] = {
+        name: [
+            (str(payload.get("chunk_id", "")), _normalized(str(payload.get("text", ""))))
+            for payload in repository.chunks_for_filename(settings, name)
+        ]
+        for name in filenames
+    }
+    resolved: dict[str, frozenset[str]] = {}
+    for example in wanted:
+        search = example.relevant_filenames or frozenset(filenames)
+        ids: set[str] = set()
+        for passage in example.relevant_passages:
+            needle = _normalized(passage)
+            found = {
+                chunk_id
+                for name in search
+                for chunk_id, text in chunks.get(name, [])
+                if needle in text
+            }
+            if not found:
+                raise HarnessDataError(
+                    f"Passage {passage!r} (question {example.question!r}) is in no indexed "
+                    "chunk; ingest the corpus first, or fix the label."
+                )
+            ids |= found
+        resolved[example.question] = frozenset(ids)
+    return resolved
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -387,7 +450,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     if args.command == "validate":
-        labeled = sum(1 for e in examples if e.relevant_filenames or e.relevant_chunk_ids)
+        labeled = sum(
+            1
+            for e in examples
+            if e.relevant_filenames or e.relevant_chunk_ids or e.relevant_passages
+        )
         print(f"{len(examples)} examples, {labeled} labeled: OK")
         return 0 if labeled else 2
 
@@ -395,7 +462,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "retrieval":
         ks = tuple(args.ks) if args.ks else DEFAULT_KS
-        results = run_retrieval_eval(examples, Collaborators(settings), ks, args.arm)
+        try:
+            results = run_retrieval_eval(examples, Collaborators(settings), ks, args.arm)
+        except HarnessDataError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         _emit(results, args.output)
         if args.baseline is not None:
             return _check_baseline(results, args.baseline, args.max_regression)

@@ -1,7 +1,14 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import ChatMessage, { type ChatTurn } from '../../src/components/ChatMessage';
+import { loadMarkdown } from '../../src/components/markdownLoader';
+
+// The renderer is a lazy chunk the app fetches after boot; loaded first, answers render
+// as markdown on their first render, as they do in the app once it has arrived.
+beforeAll(async () => {
+  await loadMarkdown();
+});
 
 function makeTurn(overrides: Partial<ChatTurn>): ChatTurn {
   return {
@@ -380,6 +387,54 @@ describe('ChatMessage', () => {
     expect(screen.queryByTestId('chat-message-regenerate')).not.toBeInTheDocument();
   });
 
+  it('renders a streaming answer block by block with the same markdown as a finished one', () => {
+    const content = 'First **bold** point.\n\n- one\n- two\n\nStill going';
+    const { rerender } = render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content })}
+        engineerMode={false}
+        streamStage="generating answer…"
+      />,
+    );
+
+    expect(screen.getByText('bold').tagName).toBe('STRONG');
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    expect(screen.getByText('Still going')).toBeInTheDocument();
+
+    rerender(<ChatMessage turn={makeTurn({ role: 'assistant', content })} engineerMode={false} />);
+    expect(screen.getByText('bold').tagName).toBe('STRONG');
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+
+  it('turns [n] markers into buttons that open and preview the cited source', async () => {
+    const onOpenSource = vi.fn();
+    const onCitationHover = vi.fn();
+    const source = {
+      source_number: 2,
+      filename: 'guide.pdf',
+      page: 4,
+      section: 'Setup',
+      chunk_id: 'c-2',
+      text: 'passage',
+    };
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Use docker [2]. Not `arr[2]`. Unknown [7].', sources: [source] })}
+        engineerMode={false}
+        onOpenSource={onOpenSource}
+        onCitationHover={onCitationHover}
+      />,
+    );
+
+    const chip = screen.getByRole('button', { name: 'Source 2: guide.pdf, page 4' });
+    await userEvent.hover(chip);
+    expect(onCitationHover).toHaveBeenCalledWith(source);
+    await userEvent.click(chip);
+    expect(onOpenSource).toHaveBeenCalledWith('guide.pdf', 'c-2');
+    expect(screen.getAllByTestId('inline-citation')).toHaveLength(1);
+    expect(screen.getByText('arr[2]')).toBeInTheDocument();
+  });
+
   it('renders no Regenerate button on a user or error turn', () => {
     render(
       <ChatMessage
@@ -533,58 +588,20 @@ describe('ChatMessage', () => {
 });
 
 describe('ChatMessage answer-progress announcement', () => {
-  // The answer text itself is deliberately NOT a live region: it mutates on every SSE
-  // delta, and a polite region over that re-reads the whole answer per token. These
-  // pin the discrete states a screen reader is actually told about instead.
-  it('announces the stage while waiting, then that the answer is ready', () => {
-    const { rerender } = render(
-      <ChatMessage
-        turn={makeTurn({ role: 'assistant', content: '' })}
-        engineerMode={false}
-        streamStage="retrieving…"
-      />,
-    );
-
-    expect(screen.getByRole('status')).toHaveTextContent('retrieving…');
-
-    // Tokens have started landing: still streaming, but the stage skeleton is gone.
-    rerender(
+  // Progress is announced once, by ChatThread's status line (see ChatThread.test); a
+  // region per message left dozens of them in a long conversation. The answer text is
+  // never a live region: it changes on every streamed token.
+  it('puts no live region on the answer or the message', () => {
+    render(
       <ChatMessage
         turn={makeTurn({ role: 'assistant', content: 'Partial ans' })}
         engineerMode={false}
         streamStage="generating…"
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent('Answer streaming.');
-
-    // Stream finished: streamStage goes undefined.
-    rerender(
-      <ChatMessage
-        turn={makeTurn({ role: 'assistant', content: 'Complete answer [1].' })}
-        engineerMode={false}
-      />,
-    );
-    expect(screen.getByRole('status')).toHaveTextContent('Answer ready.');
-  });
-
-  it('does not put the answer text itself in a live region', () => {
-    render(
-      <ChatMessage
-        turn={makeTurn({ role: 'assistant', content: 'Complete answer [1].' })}
-        engineerMode={false}
-      />,
-    );
-
-    // The status node carries the announcement; the markdown node must not, or every
-    // delta re-reads the entire answer.
-    expect(screen.getByRole('status')).not.toHaveTextContent('Complete answer');
-    expect(document.querySelector('.chat-message__markdown')).not.toHaveAttribute('aria-live');
-  });
-
-  it('gives a user turn no status region at all', () => {
-    render(<ChatMessage turn={makeTurn({ role: 'user', content: 'Hi' })} engineerMode={false} />);
 
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(document.querySelector('[aria-live]')).toBeNull();
   });
 
   it('edits a question and sends it through onEditQuestion', async () => {

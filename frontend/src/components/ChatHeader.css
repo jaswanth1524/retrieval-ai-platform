@@ -66,26 +66,9 @@
   cursor: not-allowed;
 }
 
-.chat-header__confirm {
-  display: flex;
-  gap: 4px;
-}
-
-.chat-header__confirm-yes,
-.chat-header__confirm-no {
-  border: 1px solid var(--rule);
-  background: transparent;
-  color: var(--ink);
-  border-radius: var(--radius-sm);
+.chat-header__confirm button {
   font-family: var(--fm);
   font-size: 10px;
-  padding: 3px 8px;
-  cursor: pointer;
-}
-
-.chat-header__confirm-yes {
-  border-color: var(--bad);
-  color: var(--bad);
 }
 
 .chat-header__spacer {
@@ -173,6 +156,25 @@
   /* ⌘K is unreachable without a keyboard anyway, and the palette has a rail entry. */
   .chat-header__palette {
     display: none;
+  }
+
+  /* Clear's confirm is two buttons where Clear was one; next to Export it pushed the
+     mode switch off the edge. Export steps aside only while the confirm is open. */
+  .chat-header__actions:has(.chat-header__confirm) .chat-header__action {
+    display: none;
+  }
+
+  .chat-header {
+    gap: 4px;
+    padding: 0 8px;
+  }
+
+  .chat-header__actions {
+    gap: 4px;
+  }
+
+  .chat-header__mode-btn {
+    padding: 5px 7px;
   }
 }
 
