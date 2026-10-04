@@ -36,6 +36,7 @@ from tests.routes_http.support import (
     FakeReranker,
     count_generations,
     ingested_client,
+    keyed_client,
     make_settings,
     parse_sse_events,
     raw_storage_client,
@@ -411,6 +412,74 @@ def test_keepalive_closes_the_source_when_the_client_goes_away() -> None:
     assert closed.wait(2)
 
 
+def test_a_disconnect_keeps_the_question_slot_until_the_pipeline_really_stops() -> None:
+    """The slot used to be freed the moment the client left, while the pipeline thread
+    went on retrieving and reranking; a client reconnecting in a loop could run any
+    number of them past MAX_CONCURRENT_QUESTIONS."""
+
+    from api.main import _StreamLease, _with_keepalive
+
+    slots = QuestionSlots(1)
+    release = slots.try_acquire()
+    assert release is not None
+    lease = _StreamLease(release)
+    in_rerank = threading.Event()
+    rerank_done = threading.Event()
+
+    def pipeline() -> Generator[str]:
+        yield "searching"
+        in_rerank.set()
+        rerank_done.wait(5)  # a long rerank, not interruptible mid-call
+        yield "sources"
+
+    stream = _with_keepalive(pipeline(), 1.0, on_start=lease.hand_off, on_finish=lease.release)
+    assert next(stream) == "searching"
+    assert in_rerank.wait(2)
+    stream.close()  # the client disconnects mid-rerank
+    lease.release_if_not_handed_off()  # what the response's finally/background task do
+
+    assert slots.try_acquire() is None  # the rerank is still running: still counted
+    rerank_done.set()
+    for _ in range(200):
+        again = slots.try_acquire()
+        if again is not None:
+            again()
+            break
+        threading.Event().wait(0.01)
+    else:
+        raise AssertionError("the slot was never released after the pipeline stopped")
+
+
+def test_a_lease_never_handed_off_is_released_by_the_response() -> None:
+    from api.main import _StreamLease
+
+    slots = QuestionSlots(1)
+    release = slots.try_acquire()
+    assert release is not None
+    lease = _StreamLease(release)
+
+    # The client left before the first frame: the generator never ran.
+    lease.release_if_not_handed_off()
+
+    again = slots.try_acquire()
+    assert again is not None
+    again()
+
+
+def test_keepalive_runs_the_source_in_the_callers_context() -> None:
+    import contextvars
+
+    from api.main import _with_keepalive
+
+    marker: contextvars.ContextVar[str] = contextvars.ContextVar("marker", default="unset")
+    marker.set("request-123")
+
+    def source() -> Generator[str]:
+        yield marker.get()
+
+    assert [item for item in _with_keepalive(source(), 1.0) if item is not None] == ["request-123"]
+
+
 def test_a_repeated_question_is_answered_from_the_cache(api_context: ApiTestContext) -> None:
     uploaded = upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
     assert uploaded["state"] == "done"
@@ -551,3 +620,27 @@ def test_questions_past_the_concurrency_cap_are_429_with_retry_after(
             == 200
         )
         assert client.post("/questions/stream", json={"question": "alpha"}).status_code == 200
+
+
+def test_a_provider_outside_the_allowlist_is_refused_before_a_slot_is_taken() -> None:
+    with keyed_client("", allowed_request_providers=["ollama"]) as client:
+        assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+
+        for route in ("/questions", "/questions/stream"):
+            refused = client.post(route, json={"question": "alpha", "llm_provider": "openai"})
+            assert refused.status_code == 400
+            assert "ALLOWED_REQUEST_PROVIDERS" in refused.json()["detail"]
+
+        # The default provider, named or not, is always allowed.
+        assert client.post("/questions", json={"question": "alpha"}).status_code == 200
+        allowed = client.post("/questions", json={"question": "alpha", "llm_provider": "ollama"})
+        assert allowed.status_code == 200
+        assert client.get("/config").json()["allowed_request_providers"] == ["ollama"]
+
+
+def test_every_provider_is_allowed_per_request_by_default(api_context: ApiTestContext) -> None:
+    assert api_context.client.get("/config").json()["allowed_request_providers"] == [
+        "ollama",
+        "openai",
+        "openai_compatible",
+    ]

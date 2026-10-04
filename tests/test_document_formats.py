@@ -501,3 +501,43 @@ def test_a_pdf_with_no_ruling_never_opens_pdfplumber(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(pdfplumber, "open", refuse)
 
     assert documents._extract_pdf_tables(b"%PDF", set()) == {}
+
+
+def test_a_pdf_over_the_page_limit_is_refused_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.samples import pdf_bytes
+
+    def no_table_scan(*args: object, **kwargs: object) -> dict[int, list[str]]:
+        raise AssertionError("pages were read for a PDF over the limit")
+
+    monkeypatch.setattr(documents, "_extract_pdf_tables", no_table_scan)
+
+    with pytest.raises(documents.DocumentParseError, match="limit is 2"):
+        documents.parse_document_bytes(
+            "big.pdf", pdf_bytes(["one", "two", "three"]), make_settings(max_pdf_pages=2)
+        )
+
+
+def test_only_the_first_max_ocr_pages_scanned_pages_are_ocred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.samples import pdf_bytes
+
+    ocr_requests: list[list[int]] = []
+
+    def fake_ocr(filename: str, content: bytes, pages: list[int]) -> list[DocumentSection]:
+        ocr_requests.append(list(pages))
+        return [
+            DocumentSection(filename=filename, page=page, section="Scan", text=f"page {page}")
+            for page in pages
+        ]
+
+    monkeypatch.setattr(documents, "_ocr_pdf_pages", fake_ocr)
+
+    sections = documents.parse_document_bytes(
+        "scan.pdf", pdf_bytes(["Digital text.", "", "", ""]), make_settings(max_ocr_pages=2)
+    )
+
+    assert ocr_requests == [[2, 3]]
+    assert [section.page for section in sections] == [1, 2, 3]

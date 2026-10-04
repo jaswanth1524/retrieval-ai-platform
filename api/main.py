@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import mimetypes
@@ -60,6 +61,14 @@ from api.documents import (
     validate_upload_filename,
 )
 from api.embeddings import EmbeddedText, EmbeddingError
+from api.errors import (
+    QUESTION_ERROR_TYPES,
+    QUESTION_USER_FACING_ERRORS,
+    VECTOR_STORE_UNAVAILABLE,
+    is_vector_store_unavailable,
+    public_error_message,
+    question_error_type,
+)
 from api.export import build_export, iter_file
 from api.feedback import FeedbackStore
 from api.generation import ChatMessage, GenerationConfigError, GenerationError, StageTimings
@@ -81,7 +90,7 @@ from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.request_guard import RequestGuardMiddleware
 from api.reranking import RerankingError
-from api.retrieval import RetrievalConfigError, RetrievalError, RetrievalPayloadError
+from api.retrieval import RetrievalError, RetrievalPayloadError
 from api.schemas import (
     FEEDBACK_LIST_MAX_LIMIT,
     REQUEST_MAX_CONTEXT_CHUNKS_MAX,
@@ -340,73 +349,12 @@ def _ingest_error_type(exc: Exception) -> str:
     return "unexpected"
 
 
-# Ordered most-specific-first: several of these are subclasses of one another
-# (RetrievalPayloadError/RetrievalConfigError < RetrievalError,
-# GenerationConfigError < GenerationError), so a parent check must not run first.
-_QUESTION_ERROR_TYPES: tuple[tuple[type[Exception], str], ...] = (
-    (RetrievalPayloadError, "retrieval_payload"),
-    (RetrievalConfigError, "retrieval_config"),
-    (RetrievalError, "retrieval"),
-    (GenerationConfigError, "generation_config"),
-    (GenerationError, "generation"),
-    (RerankingError, "reranking"),
-    (EmbeddingError, "embedding"),
-    (VectorStoreUnavailableError, "vector_store_unavailable"),
-    (CollectionSchemaError, "collection_schema"),
-)
-
-
-def _question_error_type(exc: Exception) -> str:
-    """Coarse error_type label for docrag_questions_total{outcome="error"}."""
-
-    for exc_type, label in _QUESTION_ERROR_TYPES:
-        if isinstance(exc, exc_type):
-            return label
-    return "unexpected"
-
-
-# Derived from _QUESTION_ERROR_TYPES above, which now has two jobs: it orders the
-# metric labels AND decides which messages are safe to return. Adding a type there for
-# labeling silently widens what the streaming route is allowed to send verbatim, so
-# only add types whose str() is an authored, client-safe message.
-#
-# The same domain errors register_exception_handlers maps to authored status codes, so
-# their str() is already what a client sees on the synchronous /questions route. The
-# streaming route needs this set spelled out separately: /questions lets an unanticipated
-# exception fall through to Starlette's default 500 ("Internal Server Error", nothing
-# leaked), but /questions/stream has already committed a 200 by the time it can fail, so
-# it must catch everything — and without an allowlist that means putting an arbitrary
-# str(exc) (a path, a config value) on the wire.
-_QUESTION_USER_FACING_ERRORS: tuple[type[Exception], ...] = tuple(
-    exc_type for exc_type, _ in _QUESTION_ERROR_TYPES
-)
-
-
-# The gRPC status codes that mean "couldn't reach it / gave up waiting" rather than
-# "it answered and said no" — the gRPC-transport equivalent of the REST client's
-# ResponseHandlingException.
-_GRPC_UNAVAILABLE_CODES = frozenset(
-    {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
-)
-
-
-def _is_vector_store_unavailable(exc: Exception) -> bool:
-    if isinstance(exc, ResponseHandlingException):
-        return True
-    # grpc.RpcError itself declares no code(); the concrete _InactiveRpcError raised in
-    # practice does, so probe rather than assume.
-    code = getattr(exc, "code", None)
-    return callable(code) and code() in _GRPC_UNAVAILABLE_CODES
-
-
-def _question_error_message(exc: Exception) -> str:
-    if isinstance(exc, _QUESTION_USER_FACING_ERRORS):
-        return str(exc)
-    # A raw transport failure carries no authored message, but "unexpected server
-    # error" would hide an actionable cause the synchronous route names properly.
-    if _is_vector_store_unavailable(exc):
-        return "The vector store is unavailable. Try again shortly."
-    return "The question could not be answered due to an unexpected server error."
+# Kept under their old names: tests and the error handlers below use them.
+_QUESTION_ERROR_TYPES = QUESTION_ERROR_TYPES
+_QUESTION_USER_FACING_ERRORS = QUESTION_USER_FACING_ERRORS
+_question_error_type = question_error_type
+_is_vector_store_unavailable = is_vector_store_unavailable
+_question_error_message = public_error_message
 
 
 def _run_ingest_job(
@@ -434,10 +382,12 @@ def _run_ingest_job(
         job_store.update(job_id, state="embedding", chunks_done=done, chunks_total=total)
 
     def check_sequence() -> None:
-        if sequence is not None:
-            ingest_sequencer.check(filename, sequence)
+        # The re-index precondition first: its "deleted before its re-index ran" names
+        # the cause more exactly than the sequencer's generic refusal.
         if precondition is not None:
             precondition()
+        if sequence is not None:
+            ingest_sequencer.check(filename, sequence)
 
     def save_original() -> None:
         if sequence is not None:
@@ -501,6 +451,8 @@ def _run_ingest_job(
 _ORIGINAL_CHUNK_BYTES = 64 * 1024
 # A page of /content is at most 2 * this + 1 chunks.
 CONTENT_MAX_RADIUS = 100
+# /content with no paging parameters returns at most this many chunks.
+CONTENT_UNPAGED_MAX_CHUNKS = 2000
 
 _BACKLOG_FULL_ERROR = (
     "Too many documents are already waiting to be indexed. Retry once some of them finish."
@@ -657,17 +609,28 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _END_OF_STREAM = object()
 
 
-def _with_keepalive[T](source: Iterator[T], interval: float) -> Iterator[T | None]:
+def _with_keepalive[T](
+    source: Iterator[T],
+    interval: float,
+    *,
+    stop: threading.Event | None = None,
+    on_start: Callable[[], None] | None = None,
+    on_finish: Callable[[], None] | None = None,
+) -> Iterator[T | None]:
     """Yield ``source``'s items, and ``None`` whenever ``interval`` passes without one.
 
     ``source`` runs on its own thread so a blocking step inside it (retrieval, the
     first token) can't stop the heartbeat. When the consumer stops early (the client
-    disconnected), the producer stops at its next item and closes ``source``, so an
-    abandoned answer doesn't keep generating.
+    disconnected), ``stop`` is set and the producer stops at its next item and closes
+    ``source``, so an abandoned answer doesn't keep generating. ``on_start`` runs just
+    before the thread starts and ``on_finish`` once it has closed ``source`` — the
+    point where its work has really ended, which can be well after the consumer left.
+    The thread runs in a copy of the caller's context, so context variables (a
+    request id) carry over.
     """
 
     items: queue.Queue[object] = queue.Queue()
-    stop = threading.Event()
+    stop = stop if stop is not None else threading.Event()
 
     def produce() -> None:
         try:
@@ -678,12 +641,25 @@ def _with_keepalive[T](source: Iterator[T], interval: float) -> Iterator[T | Non
         except BaseException as exc:
             items.put(exc)
         finally:
-            close = getattr(source, "close", None)
-            if close is not None:
-                close()
+            try:
+                close = getattr(source, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                if on_finish is not None:
+                    on_finish()
             items.put(_END_OF_STREAM)
 
-    threading.Thread(target=produce, name="docrag-sse", daemon=True).start()
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=context.run, args=(produce,), name="docrag-sse", daemon=True)
+    if on_start is not None:
+        on_start()
+    try:
+        thread.start()
+    except BaseException:
+        if on_finish is not None:
+            on_finish()
+        raise
     try:
         while True:
             try:
@@ -698,6 +674,35 @@ def _with_keepalive[T](source: Iterator[T], interval: float) -> Iterator[T | Non
             yield item  # type: ignore[misc]
     finally:
         stop.set()
+
+
+class _StreamLease:
+    """Hands a question slot's release to whoever ends up owning the work.
+
+    Before the pipeline thread starts, the response owns the slot (released by its
+    background task, which also covers a client that leaves before the first frame).
+    Once the thread starts, only the thread releases it, when its work has actually
+    stopped: releasing on disconnect let a client that reconnects in a loop keep
+    unlimited retrievals and reranks running past MAX_CONCURRENT_QUESTIONS.
+    """
+
+    def __init__(self, release: Release) -> None:
+        self._release = release
+        self._lock = threading.Lock()
+        self._handed_off = False
+
+    def hand_off(self) -> None:
+        with self._lock:
+            self._handed_off = True
+
+    def release(self) -> None:
+        self._release()
+
+    def release_if_not_handed_off(self) -> None:
+        with self._lock:
+            if self._handed_off:
+                return
+        self._release()
 
 
 _QUESTIONS_BUSY_ERROR = (
@@ -798,6 +803,7 @@ def _trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
                 rerank_min_score=trace.config.rerank_min_score,
                 fused_top_n=trace.config.fused_top_n,
                 filenames=trace.config.filenames,
+                tags=trace.config.tags,
             )
             if trace.config is not None
             else None
@@ -1002,6 +1008,14 @@ def register_routes(app: FastAPI) -> None:
         for name, meta in sorted(metadata.items()):
             if meta.chunker_version is not None and meta.chunker_version >= CHUNKER_VERSION:
                 continue
+            size = store.size(name)
+            if size is None:
+                continue
+            # Checked before reading: once the backlog is full, reading every remaining
+            # original into memory only to defer it cost the whole corpus in RAM.
+            if not backlog.has_room(size):
+                deferred.append(name)
+                continue
             content = store.read(name)
             if content is None:
                 continue
@@ -1082,17 +1096,27 @@ def register_routes(app: FastAPI) -> None:
         # would still report success. The raw copy (when stored) is removed under the
         # same lock, or a deleted document's original bytes would accumulate forever.
         filename = _stored_filename(filename)
-        with filename_write_lock(filename):
-            point_ids = repository.point_ids_for_filename(settings, filename)
-            if point_ids:
-                repository.delete_by_ids(settings, point_ids)
-            # Also when no points remain: an original orphaned by an earlier failed
-            # ingest was otherwise undeletable, since the 404 came first.
-            removed_original = raw_store.delete(filename) if raw_store is not None else False
-            if not point_ids and not removed_original:
-                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-        if point_ids:
-            bump_corpus_generation()
+        # Sequenced like an ingest, and admitted before waiting for the lock, so an
+        # upload already queued for this name is refused when it reaches the lock
+        # instead of indexing the document straight back after the delete.
+        sequence = ingest_sequencer.admit(filename)
+        try:
+            with filename_write_lock(filename):
+                point_ids = repository.point_ids_for_filename(settings, filename)
+                if point_ids:
+                    repository.delete_by_ids(settings, point_ids)
+                    # Right away, not after the original below: if removing that
+                    # raises, cached answers must still stop citing the deleted points.
+                    bump_corpus_generation()
+                    ingest_sequencer.mark_applied(filename, sequence, deleted=True)
+                # Also when no points remain: an original orphaned by an earlier failed
+                # ingest was otherwise undeletable, since the 404 came first.
+                removed_original = raw_store.delete(filename) if raw_store is not None else False
+                if not point_ids and not removed_original:
+                    raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+                ingest_sequencer.mark_applied(filename, sequence, deleted=True)
+        finally:
+            ingest_sequencer.release(filename)
         return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
 
     # Payload-only: no re-embedding, so it is instant even for a large document.
@@ -1113,7 +1137,8 @@ def register_routes(app: FastAPI) -> None:
         # carry_tags), so a re-upload in flight either sees this change or runs after
         # it and carries it over — it never writes the tags from before it.
         with filename_write_lock(filename):
-            if not repository.point_ids_for_filename(settings, filename):
+            # A count, not a scroll of every point id just to see whether there is one.
+            if repository.chunk_count_for_filename(settings, filename) == 0:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
             repository.set_tags(settings, filename, tags)
         bump_corpus_generation()
@@ -1166,18 +1191,29 @@ def register_routes(app: FastAPI) -> None:
         # `radius` chunks either side of it; `start`/`end` a range of ordinals. A 50 MB
         # CSV used to ship every chunk so the viewer could show the few around a citation.
         filename = _stored_filename(filename)
-        if around is None and start is None and end is None:
-            payloads = repository.chunks_for_filename(settings, filename)
-            if not payloads:
-                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-            return DocumentContentResponse(
-                filename=filename,
-                chunks=[_content_chunk(payload) for payload in payloads],
-                total_chunks=len(payloads),
-            )
         total = repository.chunk_count_for_filename(settings, filename)
         if total == 0:
             raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+        if around is None and start is None and end is None:
+            # The whole document, up to CONTENT_UNPAGED_MAX_CHUNKS: unbounded, one
+            # request could pull a 100k-chunk document into memory. total_chunks still
+            # reports the real size, so a client can tell the list was cut short.
+            if total <= CONTENT_UNPAGED_MAX_CHUNKS:
+                payloads = repository.chunks_for_filename(settings, filename)
+            else:
+                payloads = (
+                    repository.chunks_in_ordinal_range(
+                        settings, filename, 1, CONTENT_UNPAGED_MAX_CHUNKS
+                    )
+                    or repository.chunks_for_filename(settings, filename)[
+                        :CONTENT_UNPAGED_MAX_CHUNKS
+                    ]
+                )  # a legacy document with no ordinals to range over
+            return DocumentContentResponse(
+                filename=filename,
+                chunks=[_content_chunk(payload) for payload in payloads],
+                total_chunks=total,
+            )
         target_found: bool | None = None
         if around is not None:
             ordinal = repository.chunk_ordinal_of(settings, filename, around)
@@ -1341,7 +1377,9 @@ def register_routes(app: FastAPI) -> None:
         request: QuestionRequest,
         pipeline: RagPipelineDep,
         slots: QuestionSlotsDep,
+        settings: SettingsDep,
     ) -> QuestionResponse:
+        _check_request_provider(request.llm_provider, settings)
         release = _question_slot(slots)
         try:
             grounded = pipeline.answer(
@@ -1396,9 +1434,12 @@ def register_routes(app: FastAPI) -> None:
         request: QuestionRequest,
         pipeline: RagPipelineDep,
         slots: QuestionSlotsDep,
+        settings: SettingsDep,
     ) -> StreamingResponse:
+        _check_request_provider(request.llm_provider, settings)
         # Taken here, before the 200 is committed, so a full server can still say 429.
-        release = _question_slot(slots)
+        lease = _StreamLease(_question_slot(slots))
+        stop = threading.Event()
         overrides = AnswerOverrides(
             llm_provider=request.llm_provider,
             rerank_top_k=request.rerank_top_k,
@@ -1420,8 +1461,12 @@ def register_routes(app: FastAPI) -> None:
                         history=_history_messages(request.history),
                         tags=request.tags,
                         use_cache=request.use_cache,
+                        should_stop=stop.is_set,
                     ),
                     _SSE_KEEPALIVE_SECONDS,
+                    stop=stop,
+                    on_start=lease.hand_off,
+                    on_finish=lease.release,
                 ):
                     if event is None:
                         yield _SSE_KEEPALIVE_FRAME
@@ -1443,15 +1488,15 @@ def register_routes(app: FastAPI) -> None:
                 logger.warning("Streamed question failed: %s", exc, exc_info=True)
                 yield _sse_event({"type": "error", "detail": _question_error_message(exc)})
             finally:
-                release()
+                lease.release_if_not_handed_off()
 
         return StreamingResponse(
             event_source(),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
             # Also after a disconnect before the first frame, which never runs the
-            # generator (and so never its finally). release() is idempotent.
-            background=BackgroundTask(release),
+            # generator (and so never its finally). The release is idempotent.
+            background=BackgroundTask(lease.release_if_not_handed_off),
         )
 
 
@@ -1487,6 +1532,31 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
             settings.openai_compatible_base_url and settings.openai_compatible_model
         ),
         openai_compatible_model=settings.openai_compatible_model,
+        allowed_request_providers=allowed_request_providers(settings),
+    )
+
+
+REQUEST_PROVIDERS = ("ollama", "openai", "openai_compatible")
+
+
+def allowed_request_providers(settings: AppSettings) -> list[str]:
+    """Providers a question may pick per request: the allowlist plus the default."""
+
+    allowed = settings.allowed_request_providers
+    if allowed is None:
+        return list(REQUEST_PROVIDERS)
+    default = settings.llm_provider.lower().strip()
+    return [name for name in REQUEST_PROVIDERS if name in allowed or name == default]
+
+
+def _check_request_provider(provider: str | None, settings: AppSettings) -> None:
+    """400 for a per-request provider the operator hasn't allowed — before a question
+    slot is taken, so a refused request costs nothing."""
+
+    if provider is None or provider in allowed_request_providers(settings):
+        return
+    raise GenerationConfigError(
+        f"LLM provider '{provider}' is not allowed on this server (ALLOWED_REQUEST_PROVIDERS)."
     )
 
 
@@ -1563,7 +1633,7 @@ async def vector_store_transport_handler(request: Request, exc: Exception) -> JS
     if _is_vector_store_unavailable(exc):
         return JSONResponse(
             status_code=503,
-            content={"detail": "The vector store is unavailable. Try again shortly."},
+            content={"detail": VECTOR_STORE_UNAVAILABLE},
         )
     # A gRPC error that isn't a transport failure (a malformed query, say) is a bug,
     # not an outage — still redacted and logged, but not mislabeled as unavailability.

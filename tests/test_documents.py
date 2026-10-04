@@ -525,3 +525,25 @@ def test_normalize_filename_rejects_names_the_filesystem_cannot_store(filename: 
 
     with pytest.raises(UnsupportedDocumentError):
         normalize_filename(filename)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-be", "utf-32", "utf-32-be"])
+def test_text_with_a_unicode_byte_order_mark_decodes_by_it(encoding: str) -> None:
+    import codecs
+
+    text = "Café notes\n\nThe second paragraph — with a dash."
+    boms = {
+        "utf-16": codecs.BOM_UTF16_LE,
+        "utf-16-be": codecs.BOM_UTF16_BE,
+        "utf-32": codecs.BOM_UTF32_LE,
+        "utf-32-be": codecs.BOM_UTF32_BE,
+    }
+    body = text.encode("utf-16-le" if encoding == "utf-16" else encoding)
+    if encoding == "utf-32":
+        body = text.encode("utf-32-le")
+    content = boms[encoding] + body
+
+    sections = parse_document_bytes("notes.txt", content)
+
+    assert "\x00" not in sections[0].text
+    assert sections[0].text.startswith("Café notes")

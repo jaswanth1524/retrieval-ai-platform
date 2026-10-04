@@ -22,6 +22,7 @@ from api.answer_cache import (
 from api.chunking import HeuristicTokenCounter, TokenCounter
 from api.diversity import select_diverse
 from api.documents import CHUNKER_VERSION, chunk_sections, parse_document_bytes
+from api.errors import public_error_message
 from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
     ChatGenerator,
@@ -327,6 +328,10 @@ def expand_with_neighbors(
     return expanded
 
 
+class QuestionAbandoned(Exception):
+    """The client left mid-question; stop before the next expensive stage."""
+
+
 class RagPipeline:
     """Composes retrieval, reranking, and generation behind a single call."""
 
@@ -377,7 +382,10 @@ class RagPipeline:
         return settings.model_copy(update=update) if update else settings
 
     def _trace_config(
-        self, effective_settings: AppSettings, filenames: Sequence[str] | None
+        self,
+        effective_settings: AppSettings,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None = None,
     ) -> TraceConfig:
         return TraceConfig(
             llm_provider=effective_settings.llm_provider,
@@ -387,6 +395,7 @@ class RagPipeline:
             rerank_min_score=float(effective_settings.rerank_min_score),
             fused_top_n=int(effective_settings.fused_top_n),
             filenames=list(filenames) if filenames else None,
+            tags=list(tags) if tags else None,
         )
 
     def _truncate_history(
@@ -456,11 +465,14 @@ class RagPipeline:
         effective_settings: AppSettings,
         filenames: Sequence[str] | None,
         tags: Sequence[str] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
 
         Inlines ``retrieve_candidates``' steps (rather than calling it as one call)
         so embedding and search can be timed separately for observability.
+        ``should_stop`` is checked before the rerank, the costliest stage, and raises
+        ``QuestionAbandoned`` when the client has gone.
         """
 
         normalized_query = question.strip()
@@ -508,6 +520,8 @@ class RagPipeline:
         )
         candidates = points_to_chunks(points)
         search_ms = (time.monotonic() - search_start) * 1000
+        if should_stop is not None and should_stop():
+            raise QuestionAbandoned
 
         rerank_start = time.monotonic()
         outcome = rerank_candidates_detailed(
@@ -622,8 +636,14 @@ class RagPipeline:
         *,
         tags: Sequence[str] | None = None,
         use_cache: bool = True,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Iterator[StreamEvent]:
-        """``_answer_stream_uncached``, replayed from the answer cache on a hit."""
+        """``_answer_stream_uncached``, replayed from the answer cache on a hit.
+
+        ``should_stop`` (the client has gone) is polled between stages, so an
+        abandoned question stops before the rerank or the LLM call instead of
+        finishing work nobody will read.
+        """
 
         started = time.monotonic()
         key = self._cache_key(question, overrides, filenames, tags, history)
@@ -643,7 +663,9 @@ class RagPipeline:
                 }
                 return
         done: DoneEvent | None = None
-        for event in self._answer_stream_uncached(question, overrides, filenames, history, tags):
+        for event in self._answer_stream_uncached(
+            question, overrides, filenames, history, tags, should_stop
+        ):
             if event["type"] == "done":
                 done = event
             yield event
@@ -734,7 +756,7 @@ class RagPipeline:
                         question=question,
                         mode="sync",
                         status="error",
-                        config=self._trace_config(effective_settings, filenames)
+                        config=self._trace_config(effective_settings, filenames, tags)
                         if effective_settings is not None
                         else None,
                         candidates=[],
@@ -742,7 +764,9 @@ class RagPipeline:
                         answer=None,
                         cited_source_numbers=[],
                         timings=None,
-                        error=str(exc),
+                        # Traces are readable with the read-only key: the same rule
+                        # as a response body, so no internal detail.
+                        error=public_error_message(exc),
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
                     )
@@ -762,7 +786,7 @@ class RagPipeline:
                     question=question,
                     mode="sync",
                     status="ok" if selected else "insufficient_context",
-                    config=self._trace_config(effective_settings, filenames),
+                    config=self._trace_config(effective_settings, filenames, tags),
                     candidates=build_trace_candidates(
                         phase.fused_candidates,
                         phase.scored_chunks,
@@ -792,6 +816,7 @@ class RagPipeline:
         filenames: Sequence[str] | None = None,
         history: Sequence[ChatMessage] | None = None,
         tags: Sequence[str] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Iterator[StreamEvent]:
         """Stream a grounded answer as SSE-ready events: sources, deltas, then done.
 
@@ -814,7 +839,7 @@ class RagPipeline:
         # that `except Exception` never sees) before any of them ran.
         finalized = False
 
-        def _store_error_trace(error: BaseException) -> None:
+        def _store_error_trace(error: str) -> None:
             if trace_store is None or trace_id is None:
                 return
             trace_store.add(
@@ -824,7 +849,7 @@ class RagPipeline:
                     question=question,
                     mode="stream",
                     status="error",
-                    config=self._trace_config(effective_settings, filenames)
+                    config=self._trace_config(effective_settings, filenames, tags)
                     if effective_settings is not None
                     else None,
                     candidates=[],
@@ -832,7 +857,7 @@ class RagPipeline:
                     answer="".join(parts).strip() or None,
                     cited_source_numbers=[],
                     timings=None,
-                    error=str(error),
+                    error=error,
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
                 )
@@ -850,7 +875,9 @@ class RagPipeline:
                 question, truncated_history, effective_settings
             )
             yield {"type": "stage", "stage": "searching"}
-            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames, tags)
+            phase = self._retrieve_and_rerank(
+                retrieval_query, effective_settings, filenames, tags, should_stop
+            )
             fitted = fit_prompt_to_context_window(
                 question.strip(),
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
@@ -880,7 +907,7 @@ class RagPipeline:
                             question=question,
                             mode="stream",
                             status="insufficient_context",
-                            config=self._trace_config(effective_settings, filenames),
+                            config=self._trace_config(effective_settings, filenames, tags),
                             candidates=build_trace_candidates(
                                 phase.fused_candidates,
                                 phase.scored_chunks,
@@ -917,6 +944,8 @@ class RagPipeline:
             }
 
             messages = build_grounded_messages(question.strip(), selected, fitted.history or None)
+            if should_stop is not None and should_stop():
+                return  # the finally below records the trace as closed early
             generate_start = time.monotonic()
             for delta in self._generator.stream(messages, effective_settings):
                 parts.append(delta)
@@ -965,7 +994,7 @@ class RagPipeline:
                         question=question,
                         mode="stream",
                         status="ok",
-                        config=self._trace_config(effective_settings, filenames),
+                        config=self._trace_config(effective_settings, filenames, tags),
                         candidates=build_trace_candidates(
                             phase.fused_candidates,
                             phase.scored_chunks,
@@ -998,18 +1027,21 @@ class RagPipeline:
                 "timings": timings_dict(timings),
                 "trace_id": trace_id,
             }
+        except QuestionAbandoned:
+            return  # the finally below records the trace as closed early
         except Exception as exc:
             if not finalized:
-                _store_error_trace(exc)
+                _store_error_trace(public_error_message(exc))
                 finalized = True
             raise
         finally:
             if not finalized:
-                # Reached only via GeneratorExit (the client disconnected, or the
-                # generator was otherwise closed mid-stream without completing or
-                # raising an `Exception`) — `finally` re-raises it automatically once
-                # this block returns, so no explicit `raise` is needed here.
-                _store_error_trace(RuntimeError("Stream closed before completion."))
+                # Reached via GeneratorExit (the client disconnected, or the generator
+                # was otherwise closed mid-stream without completing or raising an
+                # `Exception`) — `finally` re-raises it automatically once this block
+                # returns, so no explicit `raise` is needed here — or via an early
+                # return once `should_stop` reported the client gone.
+                _store_error_trace("Stream closed before completion.")
                 finalized = True
 
 

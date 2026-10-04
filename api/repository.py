@@ -156,7 +156,8 @@ class VectorRepository:
                 _server_side_hybrid_unsupported.add(self._client)
                 return self._manual_hybrid_query(settings, query_embedding, query_filter)
         except ResponseHandlingException as exc:
-            raise VectorStoreUnavailableError(f"Qdrant is unreachable: {exc}") from exc
+            logger.warning("Qdrant is unreachable.", exc_info=True)
+            raise VectorStoreUnavailableError("Qdrant is unreachable.") from exc
 
     def upsert(self, settings: AppSettings, points: Sequence[models.PointStruct]) -> None:
         """Index points into the collection."""

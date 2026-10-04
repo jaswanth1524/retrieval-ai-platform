@@ -149,5 +149,9 @@ def test_local_embedding_provider_wraps_model_failure_as_embedding_error() -> No
         sparse_model=EmptySparseModel(),
     )
 
-    with pytest.raises(EmbeddingError, match="model download failed"):
+    with pytest.raises(EmbeddingError) as raised:
         provider.embed_texts(["hello"])
+    # A fixed message for the client; the cause (which can name paths) stays chained
+    # for the log.
+    assert str(raised.value) == "Embedding model failed."
+    assert "model download failed" in str(raised.value.__cause__)

@@ -25,7 +25,11 @@ INSUFFICIENT_CONTEXT_ANSWER = (
     "I do not have enough information in the provided documents to answer that question."
 )
 
-_CITATION_RE = re.compile(r"\[(\d+)\]")
+# One bracketed citation marker: [3], and the list/range forms models also write —
+# [1, 2], [1-3], [1–3], [1, 3-4]. Matching only [3] counted "[1, 2]" as uncited, which
+# cost a retry LLM call and could end with no sources at all.
+_CITATION_RE = re.compile(r"\[(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\]")
+_CITATION_RANGE_SEP = re.compile(r"\s*[-–]\s*")
 
 _OLLAMA_MODEL_PREFIXES = ("ollama/", "ollama_chat/")
 
@@ -665,10 +669,28 @@ def cited_sources(
     relevance.
     """
 
-    referenced = {int(match) for match in _CITATION_RE.findall(answer)}
     available = {source.source_number for source in sources}
+    referenced = cited_numbers(answer, max(available, default=0))
     used = referenced & available
     return [source for source in sources if source.source_number in used]
+
+
+def cited_numbers(text: str, max_number: int) -> set[int]:
+    """Every source number ``text`` cites, with ranges expanded.
+
+    A range is clamped to ``max_number`` (the highest source number on offer), so a
+    stray ``[1-100000]`` costs nothing; a backwards range like ``[3-1]`` is ignored.
+    """
+
+    numbers: set[int] = set()
+    for marker in _CITATION_RE.findall(text):
+        for part in marker.split(","):
+            bounds = _CITATION_RANGE_SEP.split(part.strip())
+            start = int(bounds[0])
+            end = int(bounds[-1])
+            if start <= end:
+                numbers.update(range(start, min(end, max_number) + 1))
+    return numbers
 
 
 def needs_citation_retry(answer: str, source_count: int) -> bool:

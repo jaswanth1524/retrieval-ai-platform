@@ -250,3 +250,14 @@ def test_feedback_list_returns_recorded_ratings_newest_first(
     assert listed[0]["trace_id"] == "trace-down"
     assert listed[0]["citation_source_number"] is None
     assert len(limited) == 1
+
+
+def test_a_trace_records_the_tag_scope_of_its_question(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    assert client.patch("/documents/guide.txt/tags", json={"tags": ["hr"]}).status_code == 200
+
+    answer = client.post("/questions", json={"question": "alpha", "tags": ["hr"]}).json()
+    config = client.get(f"/traces/{answer['trace_id']}").json()["config"]
+
+    assert config["tags"] == ["hr"]

@@ -21,6 +21,7 @@ from api.dependencies import (
 from api.embeddings import EmbeddedText
 from api.ingestion import filename_write_lock
 from api.jobs import IngestBacklog, SqliteIngestJobStore
+from api.raw_documents import RawDocumentStore
 from tests.routes_http.support import (
     ApiTestContext,
     hermetic_app,
@@ -94,6 +95,35 @@ def test_document_upload_rejects_unusable_filenames(
     )
 
     assert response.status_code == 400
+
+
+def test_document_upload_rejects_a_filename_longer_than_the_filesystem_allows(
+    api_context: ApiTestContext,
+) -> None:
+    long_name = "é" * 130 + ".txt"  # 264 UTF-8 bytes, 134 characters
+
+    response = api_context.client.post(
+        "/documents", files={"file": (long_name, b"alpha", "text/plain")}
+    )
+
+    assert response.status_code == 400
+    assert "255 bytes" in response.json()["detail"]
+
+
+def test_a_document_indexed_under_an_overlong_name_does_not_break_the_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    long_name = "a" * 300 + ".txt"
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        # An upload from before the cap: indexed, but its original could never be saved.
+        monkeypatch.setattr("api.documents.MAX_FILENAME_BYTES", 10_000)
+        assert upload_and_wait(client, long_name, b"alpha beta")["state"] == "done"
+        monkeypatch.setattr("api.documents.MAX_FILENAME_BYTES", 255)
+
+        listing = client.get("/documents")
+        assert listing.status_code == 200
+        assert long_name in listing.json()["filenames"]
+        assert client.delete(f"/documents/{quote(long_name)}").status_code == 200
 
 
 def test_document_upload_releases_its_backlog_bytes_when_the_job_finishes(
@@ -584,11 +614,20 @@ def test_reindex_all_defers_what_the_backlog_cannot_take(
         full = IngestBacklog(max_bytes=4)
         assert full.try_reserve(4)
         client.app.dependency_overrides[get_ingest_backlog] = lambda: full  # type: ignore[attr-defined]
+        reads: list[str] = []
+        real_read = RawDocumentStore.read
+
+        def counting_read(self: RawDocumentStore, filename: str) -> bytes | None:
+            reads.append(filename)
+            return real_read(self, filename)
+
+        monkeypatch.setattr(RawDocumentStore, "read", counting_read)
 
         response = client.post("/documents/reindex")
 
         assert response.status_code == 202
         assert response.json() == {"jobs": [], "deferred": ["old.txt"]}
+        assert reads == []  # deferred without reading the original into memory
 
 
 def test_reindex_is_a_409_without_raw_storage(api_context: ApiTestContext) -> None:
@@ -637,6 +676,68 @@ def test_a_delete_while_a_reindex_is_queued_stays_deleted(
         assert job["state"] == "failed"
         assert "deleted before its re-index ran" in job["error"]
         assert "guide.txt" not in client.get("/documents").json()["filenames"]
+
+
+def test_a_delete_while_an_upload_is_queued_stays_deleted(api_context: ApiTestContext) -> None:
+    """An upload admitted before a DELETE used to index the document straight back once
+    it reached the front of the queue."""
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from api.dependencies import get_ingest_executor
+
+    client = api_context.client
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    single = ThreadPoolExecutor(max_workers=1)
+    busy = threading.Event()
+    single.submit(busy.wait, 5)  # the one worker is busy: the re-upload queues
+    api_context.app.dependency_overrides[get_ingest_executor] = lambda: single
+    try:
+        response = client.post(
+            "/documents", files={"file": ("guide.txt", b"Intro\nalpha gamma", "text/plain")}
+        )
+        job_id = response.json()["job_id"]
+        assert client.delete("/documents/guide.txt").status_code == 200
+        busy.set()
+
+        job = wait_for_job(client, job_id)
+    finally:
+        busy.set()
+        single.shutdown(wait=True)
+
+    assert job["state"] == "failed"
+    assert "was deleted after this upload was queued" in job["error"]
+    assert "guide.txt" not in client.get("/documents").json()["filenames"]
+
+
+def test_an_upload_after_a_delete_is_indexed(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    assert client.delete("/documents/guide.txt").status_code == 200
+
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    assert "guide.txt" in client.get("/documents").json()["filenames"]
+
+
+def test_a_delete_invalidates_cached_answers_even_when_removing_the_original_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from api.corpus import corpus_generation
+    from api.raw_documents import RawDocumentStore
+
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+        before = corpus_generation()
+
+        def broken_delete(self: RawDocumentStore, filename: str) -> bool:
+            raise PermissionError("read-only volume")
+
+        monkeypatch.setattr(RawDocumentStore, "delete", broken_delete)
+        with TestClient(client.app, raise_server_exceptions=False) as failing:
+            assert failing.delete("/documents/guide.txt").status_code == 500
+
+        assert corpus_generation() > before
 
 
 def test_a_queued_reindex_does_not_overwrite_a_newer_upload(
@@ -780,3 +881,19 @@ def test_document_content_pages_around_a_chunk_or_by_ordinal_range(
     assert bad.status_code == 422
     assert client.get("/documents/long.txt/content", params={"radius": 1000}).status_code == 422
     assert client.get("/documents/none.txt/content", params={"start": 1}).status_code == 404
+
+
+def test_unpaged_document_content_is_capped_but_reports_the_real_total(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("api.main.CONTENT_UNPAGED_MAX_CHUNKS", 3)
+    client = api_context.client
+    body = "\n\n".join(
+        f"Section {i}\n" + " ".join(f"word{i}x{j}" for j in range(30)) for i in range(8)
+    )
+    assert upload_and_wait(client, "long.txt", body.encode())["state"] == "done"
+
+    content = client.get("/documents/long.txt/content").json()
+
+    assert [c["chunk_ordinal"] for c in content["chunks"]] == [1, 2, 3]
+    assert content["total_chunks"] > 3

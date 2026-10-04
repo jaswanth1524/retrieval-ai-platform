@@ -3,18 +3,20 @@
 Off by default (``AppSettings.raw_document_dir`` unset) — every prior release
 discards the uploaded bytes once ingestion is queued. Enabling this adds a side
 channel: ``GET /documents/{filename}/original`` downloads the exact bytes that were
-uploaded. Re-indexing from these originals (so a future chunking/embedding change
-could apply without asking users to re-upload) is not implemented — this module only
-stores and serves the bytes.
+uploaded, and ``POST /documents/{filename}/reindex`` re-chunks a document from them.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import BinaryIO
 
 from api.documents import normalize_filename
+
+logger = logging.getLogger(__name__)
 
 
 class RawDocumentStore:
@@ -51,16 +53,58 @@ class RawDocumentStore:
         """Path of the stored original, or None when none is stored."""
 
         path = self._path_for(filename)
-        return path if path.is_file() else None
+        return path if _is_file(path) else None
+
+    def size(self, filename: str) -> int | None:
+        """Size in bytes of the stored original, or None when none is stored."""
+
+        path = self.path(filename)
+        if path is None:
+            return None
+        try:
+            return path.stat().st_size
+        except OSError:
+            return None
+
+    def open(self, filename: str) -> BinaryIO | None:
+        """An open handle on the stored original, or None when none is stored.
+
+        Opening (rather than returning a path to open later) closes the window in
+        which a concurrent DELETE turns "it exists" into FileNotFoundError: an open
+        handle keeps reading the bytes it opened even after the file is unlinked.
+        """
+
+        path = self.path(filename)
+        if path is None:
+            return None
+        try:
+            return path.open("rb")
+        except OSError:
+            return None
 
     def delete(self, filename: str) -> bool:
         """Remove the stored original; True when there was one to remove."""
 
         path = self._path_for(filename)
-        if not path.is_file():
+        if not _is_file(path):
             return False
         path.unlink(missing_ok=True)
         return True
 
     def _path_for(self, filename: str) -> Path:
         return self._directory / normalize_filename(filename)
+
+
+def _is_file(path: Path) -> bool:
+    """``path.is_file()``, but a name the OS can't even look up is simply absent.
+
+    On Python 3.12 ``is_file`` raises for ENAMETOOLONG (3.13 returns False), so a
+    document indexed under a name longer than the filesystem allows made every listing
+    that checks for its original fail.
+    """
+
+    try:
+        return path.is_file()
+    except OSError as exc:
+        logger.warning("Cannot look up stored original %s: %s", path.name[:80], exc)
+        return False

@@ -233,7 +233,9 @@ def _ensure_collection_uncached(client: QdrantClient, settings: AppSettings) -> 
     try:
         return _ensure_collection_against_qdrant(client, settings)
     except ResponseHandlingException as exc:
-        raise VectorStoreUnavailableError(f"Qdrant is unreachable: {exc}") from exc
+        # The cause (the URL it tried, a socket error) stays in the log.
+        logger.warning("Qdrant is unreachable.", exc_info=True)
+        raise VectorStoreUnavailableError("Qdrant is unreachable.") from exc
 
 
 def _ensure_collection_against_qdrant(

@@ -15,12 +15,14 @@ this complements it rather than duplicating vectors a new model would replace an
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import time
 import zipfile
 from collections.abc import Iterator
 from dataclasses import asdict
 from tempfile import SpooledTemporaryFile
-from typing import IO
+from typing import IO, BinaryIO
 
 from api.documents import CHUNKER_VERSION
 from api.feedback import FeedbackStore
@@ -33,6 +35,17 @@ from api.version import app_version
 _SPOOL_BYTES = 32 * 1024 * 1024
 _CHUNK_BYTES = 64 * 1024
 _FEEDBACK_PAGE = 1_000_000
+MANIFEST_VERSION = 1
+
+
+def _write_member(archive: zipfile.ZipFile, name: str, source: BinaryIO) -> None:
+    """Copy ``source`` into ``archive`` in blocks, never whole into memory."""
+
+    info = zipfile.ZipInfo(name, date_time=time.localtime(os.fstat(source.fileno()).st_mtime)[:6])
+    # ZIP_STORED: uploads are mostly already compressed (PDF, DOCX).
+    info.compress_type = zipfile.ZIP_STORED
+    with archive.open(info, "w", force_zip64=True) as member:
+        shutil.copyfileobj(source, member, _CHUNK_BYTES)
 
 
 def build_export(
@@ -48,10 +61,13 @@ def build_export(
     with zipfile.ZipFile(spool, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         documents = []
         for filename, meta in sorted(metadata.items()):
-            original = raw_store.path(filename) if raw_store is not None else None
-            if original is not None:
-                # ZIP_STORED: uploads are mostly already compressed (PDF, DOCX).
-                archive.write(original, f"originals/{filename}", zipfile.ZIP_STORED)
+            # A document deleted while the export runs simply has no original here,
+            # instead of failing the whole export with FileNotFoundError.
+            handle = raw_store.open(filename) if raw_store is not None else None
+            original = handle is not None
+            if handle is not None:
+                with handle:
+                    _write_member(archive, f"originals/{filename}", handle)
             documents.append(
                 {
                     "filename": filename,
@@ -61,10 +77,12 @@ def build_export(
                     "uploaded_at": meta.uploaded_at,
                     "chunker_version": meta.chunker_version,
                     "tags": list(meta.tags),
-                    "original": f"originals/{filename}" if original is not None else None,
+                    "original": f"originals/{filename}" if original else None,
                 }
             )
         manifest = {
+            # Bumped on any change a restore (POST /import) must handle differently.
+            "manifest_version": MANIFEST_VERSION,
             "docrag_version": app_version(),
             "exported_at": time.time(),
             "qdrant_collection": settings.qdrant_collection,

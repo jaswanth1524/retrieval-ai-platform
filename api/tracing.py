@@ -64,6 +64,7 @@ class TraceConfig:
     rerank_min_score: float
     fused_top_n: int
     filenames: list[str] | None
+    tags: list[str] | None = None
 
 
 @dataclass

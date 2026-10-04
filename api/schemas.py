@@ -78,6 +78,11 @@ class PublicConfigResponse(BaseModel):
     # OPENAI_COMPATIBLE_BASE_URL and _MODEL are set (the server itself isn't probed).
     openai_compatible_available: bool = False
     openai_compatible_model: str = ""
+    # Providers a question may choose per request (ALLOWED_REQUEST_PROVIDERS, plus
+    # LLM_PROVIDER). Whether each is reachable is the *_available fields above.
+    allowed_request_providers: list[str] = Field(
+        default_factory=lambda: ["ollama", "openai", "openai_compatible"]
+    )
 
 
 class DocumentIngestResponse(BaseModel):
@@ -260,6 +265,8 @@ class TraceConfigResponse(BaseModel):
     rerank_min_score: float
     fused_top_n: int
     filenames: list[str] | None
+    # The tag scope the question was asked under; None when it wasn't tag-scoped.
+    tags: list[str] | None = None
 
 
 class TraceCandidateResponse(BaseModel):

@@ -92,6 +92,18 @@ class IngestBacklog:
             self._jobs += 1
             return True
 
+    def has_room(self, size: int) -> bool:
+        """Whether ``try_reserve(size)`` would succeed right now, without reserving.
+
+        Lets a bulk re-index skip reading an original it couldn't queue anyway; the
+        real reservation still happens when the job is enqueued.
+        """
+
+        with self._lock:
+            if self._pending and self._pending + size > self._max_bytes:
+                return False
+            return self._max_jobs is None or self._jobs < self._max_jobs
+
     def release(self, size: int) -> None:
         with self._lock:
             self._pending = max(0, self._pending - size)

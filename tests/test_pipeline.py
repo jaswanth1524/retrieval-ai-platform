@@ -756,7 +756,8 @@ def test_rag_pipeline_answer_records_partial_trace_on_generation_error() -> None
     assert len(trace_store.traces) == 1
     trace = trace_store.traces[0]
     assert trace.status == "error"
-    assert trace.error == "generation boom"
+    # Not the exception text: traces are readable with the read-only key.
+    assert trace.error == "The question could not be answered due to an unexpected server error."
     assert trace.answer is None
     # The retrieval phase completed before generation failed, so the effective
     # config is still captured even though the trace as a whole is an error.
@@ -818,7 +819,7 @@ def test_rag_pipeline_answer_stream_records_partial_trace_on_mid_stream_error() 
     trace = trace_store.traces[0]
     assert trace.mode == "stream"
     assert trace.status == "error"
-    assert trace.error == "generation boom mid-stream"
+    assert trace.error == "The question could not be answered due to an unexpected server error."
     assert trace.answer == "partial"
 
 
@@ -851,6 +852,46 @@ def test_rag_pipeline_answer_stream_records_closed_trace_on_early_generator_clos
     trace = trace_store.traces[0]
     assert trace.status == "error"
     assert trace.error == "Stream closed before completion."
+
+
+@pytest.mark.parametrize("stop_after", ["searching", "sources"])
+def test_answer_stream_stops_before_the_next_costly_stage_once_the_client_is_gone(
+    stop_after: str,
+) -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    reranker = FakeReranker()
+    generator = FakeGenerator("Alpha is documented [1].")
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=reranker,
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+    gone = threading.Event()
+
+    events = []
+    for event in pipeline.answer_stream("alpha", use_cache=False, should_stop=gone.is_set):
+        events.append(event)
+        if event["type"] == "stage" and event.get("stage") == stop_after:
+            gone.set()
+        if event["type"] == "sources" and stop_after == "sources":
+            gone.set()
+
+    if stop_after == "searching":
+        assert reranker.seen_documents == []  # stopped before the rerank
+        assert [event["type"] for event in events] == ["stage"]
+    else:
+        assert reranker.seen_documents != []
+        assert [event["type"] for event in events] == ["stage", "sources"]
+    assert generator.messages == []  # never called the LLM
+    assert [trace.error for trace in trace_store.traces] == ["Stream closed before completion."]
 
 
 _HISTORY: list[ChatMessage] = [

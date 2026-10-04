@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import io
 import logging
 import re
@@ -172,15 +173,15 @@ def parse_document_bytes(
 ) -> list[DocumentSection]:
     """Parse uploaded document bytes into text sections with source metadata.
 
-    ``settings`` is only consulted for CSV row grouping (``csv_rows_per_section``);
-    None uses the default, keeping the two-argument call working for other formats.
+    ``settings`` is only consulted for CSV row grouping and the PDF page limits; None
+    uses the defaults, keeping the two-argument call working.
     """
 
     safe_filename = validate_upload_filename(filename)
     suffix = PurePosixPath(safe_filename).suffix.lower()
 
     if suffix == ".pdf":
-        return parse_pdf_document(safe_filename, content)
+        return parse_pdf_document(safe_filename, content, settings)
     if suffix == ".docx":
         return parse_docx_document(safe_filename, content)
 
@@ -478,13 +479,20 @@ def _merge_semantic_run(
     return merged
 
 
-def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
+def parse_pdf_document(
+    filename: str, content: bytes, settings: AppSettings | None = None
+) -> list[DocumentSection]:
     """Extract text from a PDF, preserving one-based page numbers.
 
     pypdf provides the text stream; pdfplumber (best-effort) appends any extracted
     tables as Markdown blocks so table Q&A is answerable. Pages with no extractable
-    text fall back to OCR when the optional ``ocr`` extra is installed.
+    text fall back to OCR when the optional ``ocr`` extra is installed, up to
+    ``max_ocr_pages`` of them; a PDF over ``max_pdf_pages`` is refused up front.
     """
+
+    limits = settings if settings is not None else AppSettings.model_construct()
+    max_pdf_pages = int(limits.max_pdf_pages)
+    max_ocr_pages = int(limits.max_ocr_pages)
 
     try:
         reader = PdfReader(BytesIO(content))
@@ -499,6 +507,15 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
             raise DocumentParseError(f"PDF '{filename}' is password-protected.") from exc
         if not decrypted:
             raise DocumentParseError(f"PDF '{filename}' is password-protected.")
+    try:
+        page_count = len(reader.pages)
+    except Exception as exc:
+        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
+    if page_count > max_pdf_pages:
+        raise DocumentParseError(
+            f"PDF '{filename}' has {page_count} pages; the limit is {max_pdf_pages} "
+            "(MAX_PDF_PAGES). Split it into smaller files."
+        )
 
     tables_by_page = _extract_pdf_tables(content, _pages_that_draw_lines(reader))
 
@@ -533,6 +550,16 @@ def parse_pdf_document(filename: str, content: bytes) -> list[DocumentSection]:
             )
         )
 
+    if len(empty_pages) > max_ocr_pages:
+        logger.warning(
+            "PDF %s: %d pages have no text layer; OCR'ing the first %d (MAX_OCR_PAGES) "
+            "and skipping pages %s.",
+            filename,
+            len(empty_pages),
+            max_ocr_pages,
+            empty_pages[max_ocr_pages:],
+        )
+        empty_pages = empty_pages[:max_ocr_pages]
     if empty_pages:
         # Every empty page, not only all-empty PDFs: a scanned page bound into an
         # otherwise digital PDF used to be dropped without a word.
@@ -949,6 +976,14 @@ def _render_csv_row(header: list[str], row: list[str]) -> str:
 _TEXT_DECODE_FALLBACKS: tuple[str, ...] = ("utf-8-sig", "cp1252", "latin-1")
 
 
+_TEXT_BOMS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
 def decode_text_document(filename: str, content: bytes) -> str:
     """Decode a text-like document, falling back across common encodings.
 
@@ -960,7 +995,19 @@ def decode_text_document(filename: str, content: bytes) -> str:
     """
 
     text: str | None = None
-    for encoding in _TEXT_DECODE_FALLBACKS:
+    # A byte-order mark names the encoding outright. UTF-16 ("Unicode" in Notepad's
+    # save dialog) otherwise fell through to cp1252/latin-1 and indexed as mojibake
+    # interleaved with NULs. UTF-32 first: its little-endian BOM starts with UTF-16's.
+    for bom, encoding in _TEXT_BOMS:
+        if content.startswith(bom):
+            try:
+                text = content.decode(encoding)
+            except UnicodeDecodeError as exc:
+                raise DocumentParseError(
+                    f"Could not decode text document '{filename}' as {encoding}."
+                ) from exc
+            break
+    for encoding in _TEXT_DECODE_FALLBACKS if text is None else ():
         try:
             text = content.decode(encoding)
         except UnicodeDecodeError:
@@ -1105,6 +1152,9 @@ def contextual_text(filename: str, section: str, text: str) -> str:
     return f"{filename} › {section}\n{text}"
 
 
+MAX_FILENAME_BYTES = 255
+
+
 def normalize_filename(filename: str) -> str:
     """Return a basename-only upload filename.
 
@@ -1131,6 +1181,15 @@ def validate_upload_filename(filename: str) -> str:
     """
 
     safe_filename = normalize_filename(filename)
+    # Most filesystems cap a name at 255 bytes. Past that, storing the original fails
+    # with ENAMETOOLONG, and on Python 3.12 so does every later existence check on it,
+    # which turned one long name into a 500 for the whole document list. Checked here,
+    # at upload, not in normalize_filename, so a document already indexed under a
+    # longer name can still be found and deleted.
+    if len(safe_filename.encode("utf-8")) > MAX_FILENAME_BYTES:
+        raise UnsupportedDocumentError(
+            f"Document filename is longer than {MAX_FILENAME_BYTES} bytes; rename it."
+        )
     suffix = PurePosixPath(safe_filename).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise UnsupportedDocumentError(

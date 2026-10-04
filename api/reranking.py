@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -19,6 +20,8 @@ from fastembed.rerank.cross_encoder import TextCrossEncoder
 from api.documents import contextual_text
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 
 def _sigmoid(x: float) -> float:
@@ -178,7 +181,9 @@ class LocalCrossEncoderReranker:
                     )
                 )
         except Exception as exc:
-            raise RerankingError(f"Reranker model failed: {exc}") from exc
+            # The cause (often a path or an ONNX runtime message) stays in the log.
+            logger.warning("Reranker model failed.", exc_info=True)
+            raise RerankingError("Reranker model failed.") from exc
         return [float(score) for score in scores]
 
 

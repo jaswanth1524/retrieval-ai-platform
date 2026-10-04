@@ -277,8 +277,11 @@ def test_local_cross_encoder_reranker_wraps_model_failure_as_reranking_error() -
 
     reranker = LocalCrossEncoderReranker(make_settings(), model=RaisingCrossEncoder())
 
-    with pytest.raises(RerankingError, match="model download failed"):
+    with pytest.raises(RerankingError) as raised:
         reranker.score("query", ["doc"])
+    # A fixed message for the client; the cause stays chained for the log.
+    assert str(raised.value) == "Reranker model failed."
+    assert "model download failed" in str(raised.value.__cause__)
 
 
 class CountingCrossEncoder:
