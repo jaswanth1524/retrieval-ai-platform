@@ -9,6 +9,8 @@ interface DocumentViewerProps {
   filename: string;
   chunkId: string | null;
   onClose: () => void;
+  /** Download the uploaded file itself; absent when the server keeps no originals. */
+  onDownloadOriginal?: () => void;
 }
 
 // Chunks either side of the cited target fetched on open, and fetched per Load
@@ -28,7 +30,7 @@ function ordinalOf(chunk: DocumentChunkResponse | undefined): number | null {
   return chunk?.chunk_ordinal ?? null;
 }
 
-function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
+function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: DocumentViewerProps) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -138,6 +140,16 @@ function DocumentViewer({ filename, chunkId, onClose }: DocumentViewerProps) {
       <div className="document-viewer__panel">
         <div className="document-viewer__header">
           <span className="document-viewer__filename">{filename}</span>
+          {onDownloadOriginal && (
+            <button
+              type="button"
+              className="document-viewer__original"
+              onClick={onDownloadOriginal}
+              data-testid="viewer-download-original"
+            >
+              Download original
+            </button>
+          )}
           <button
             type="button"
             className="document-viewer__close"

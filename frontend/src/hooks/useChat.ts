@@ -397,7 +397,9 @@ export function useChat(): UseChatResult {
       setActiveTurns((prev) => {
         const existing = prev.find((turn) => turn.id === assistantTurnId);
         if (!existing) {
-          return [...prev, update({ ...makeTurn('assistant', ''), id: assistantTurnId })];
+          const created: ChatTurn = { ...makeTurn('assistant', ''), id: assistantTurnId };
+          if (options?.modelLabel) created.model = options.modelLabel;
+          return [...prev, update(created)];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
       }, touch);

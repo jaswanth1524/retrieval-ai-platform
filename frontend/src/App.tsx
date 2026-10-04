@@ -1,8 +1,10 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api } from './api/client';
 import type {
+  AccessLevel,
   ApiStatus,
   CitationResponse,
+  FeedbackItemResponse,
   LlmProvider,
   PublicConfigResponse,
   QuestionOverrides,
@@ -24,11 +26,13 @@ import type { InspectorTab } from './components/Inspector';
 import SourcePreview from './components/SourcePreview';
 import ToastRow from './components/ToastRow';
 import TracesPanel from './components/TracesPanel';
+import FeedbackPanel from './components/FeedbackPanel';
 import { useChat } from './hooks/useChat';
 import { useCorpus } from './hooks/useCorpus';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
 import { useWindowFileDrop } from './hooks/useWindowFileDrop';
+import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
 import { readStored, readStoredJson, writeStored } from './utils/safeStorage';
 import { DEFAULT_MAX_UPLOAD_BYTES, validateUploads } from './utils/uploadValidation';
@@ -42,6 +46,20 @@ const SettingsModal = lazy(() => import('./components/SettingsModal'));
 
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
 const MODE_STORAGE_KEY = 'docrag-mode';
+const PROVIDER_STORAGE_KEY = 'docrag-provider';
+
+/** Whether `provider` can be asked on this server: configured, and allowed per request. */
+function isProviderUsable(
+  provider: string | null,
+  config: PublicConfigResponse,
+): provider is LlmProvider {
+  const allowed = config.allowed_request_providers;
+  if (allowed && provider !== null && !allowed.includes(provider)) return false;
+  if (provider === 'ollama') return true;
+  if (provider === 'openai') return config.openai_available;
+  if (provider === 'openai_compatible') return Boolean(config.openai_compatible_available);
+  return false;
+}
 const EMPTY_OVERRIDES: QuestionOverrides = {
   rerankTopK: null,
   maxContextChunks: null,
@@ -85,6 +103,7 @@ const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
   chat: { title: 'Conversations', actionLabel: 'New' },
   corpus: { title: 'Corpus', actionLabel: 'Upload' },
   traces: { title: 'Traces', actionLabel: 'Refresh' },
+  feedback: { title: 'Feedback', actionLabel: 'Refresh' },
 };
 
 function scopeLabel(
@@ -124,6 +143,14 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
   const [exportingBackup, setExportingBackup] = useState(false);
+  // Optimistic until /access answers: a full-key (or keyless) server is the common case.
+  const [access, setAccess] = useState<AccessLevel>('full');
+  const readOnly = access === 'read';
+  const [restoring, setRestoring] = useState(false);
+  const [notifyOnAnswer, setNotifyOnAnswer] = useState(
+    () => readStored(NOTIFY_STORAGE_KEY) === 'true',
+  );
+  const restoreInputRef = useRef<HTMLInputElement>(null);
   const exportingRef = useRef(false);
   const { tooNarrowForInspector, roomyEnoughForInspector, panelCollapsed } = useResponsiveLayout();
   // Narrow screens only: whether the context panel's drawer is showing. On wider screens
@@ -180,6 +207,7 @@ function App() {
     handleReindexAllStale,
     handleDeleteDocument,
     handleSetTags,
+    trackJobs,
   } = useCorpus({
     onAuthFailure: (err) => noteAuthFailure(err),
     onAuthRestored: () => setApiStatus((prev) => (prev === 'unauthorized' ? 'ok' : prev)),
@@ -261,7 +289,21 @@ function App() {
       setApiStatus('unauthorized');
       return true;
     }
+    // A 403 means a read-only key (API_READ_KEY): hide what it can't do from now on.
+    // The error itself is still shown by the caller.
+    if (err instanceof ApiClientError && err.statusCode === 403) setAccess('read');
     return false;
+  };
+
+  /** Ask the server which key this browser holds. An older server without /access
+   *  (404) is treated as full access; a 403 on any write corrects that later. */
+  const refreshAccess = async (signal?: AbortSignal) => {
+    try {
+      setAccess((await api.access(signal)).access);
+    } catch (err) {
+      if (err instanceof ApiClientError && err.statusCode === 404) setAccess('full');
+      else noteAuthFailure(err);
+    }
   };
 
   useEffect(() => {
@@ -284,26 +326,29 @@ function App() {
           writeStored(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(clamped));
           return clamped;
         });
-        // Sync the dropdown to the server's default provider once config loads.
-        if (configResult.llm_provider === 'openai' && configResult.openai_available) {
+        // A provider picked earlier in this browser wins, if the server still offers
+        // it; otherwise sync the dropdown to the server's default.
+        const remembered = readStored(PROVIDER_STORAGE_KEY);
+        if (isProviderUsable(remembered, configResult)) {
+          setSelectedProvider(remembered);
+        } else if (configResult.llm_provider === 'openai' && configResult.openai_available) {
           setSelectedProvider('openai');
-        }
-        if (
+        } else if (
           configResult.llm_provider === 'openai_compatible' &&
           configResult.openai_compatible_available
         ) {
           setSelectedProvider('openai_compatible');
-        }
-        // Ollama is the hardcoded default above, but if it's unreachable and OpenAI
-        // is configured, don't leave the user stuck on a provider that will 502.
-        if (
+        } else if (
+          // Ollama is the hardcoded default above, but if it's unreachable and OpenAI
+          // is configured (and allowed), don't leave the user stuck on one that will 502.
           configResult.llm_provider === 'ollama' &&
           !configResult.ollama_available &&
-          configResult.openai_available
+          isProviderUsable('openai', configResult)
         ) {
           setSelectedProvider('openai');
         }
         setApiStatus('ok');
+        void refreshAccess(controller.signal);
         try {
           await refreshDocuments(controller.signal);
         } catch (err) {
@@ -327,6 +372,36 @@ function App() {
     // Boot once. refreshDocuments reads only setters and useChat's stable pruneScopes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const [feedbackItems, setFeedbackItems] = useState<FeedbackItemResponse[] | null>(null);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const loadFeedback = (signal?: AbortSignal) => {
+    setFeedbackItems(null);
+    setFeedbackError(null);
+    api
+      .listFeedback(200, signal)
+      .then((response) => setFeedbackItems(response.feedback))
+      .catch((err) => {
+        if (signal?.aborted) return;
+        noteAuthFailure(err);
+        setFeedbackError(err instanceof ApiClientError ? err.message : 'Could not load feedback.');
+      });
+  };
+
+  useEffect(() => {
+    if (rail !== 'feedback') return;
+    const controller = new AbortController();
+    loadFeedback(controller.signal);
+    return () => controller.abort();
+    // loadFeedback only calls setters and the API.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rail]);
+
+  // The feedback panel needs feedback on and the full key (GET /feedback is operator data).
+  const feedbackPanelAvailable = Boolean(config?.feedback_enabled) && !readOnly;
+  useEffect(() => {
+    if (rail === 'feedback' && !feedbackPanelAvailable) setRail('chat');
+  }, [rail, feedbackPanelAvailable]);
 
   const loadTraces = (signal?: AbortSignal) => {
     setTraces(null);
@@ -387,7 +462,7 @@ function App() {
 
   // Files dropped anywhere outside the corpus panel's own dropzone upload directly
   // (that dropzone stages them for review instead).
-  const fileDragActive = useWindowFileDrop(apiReachable, (files) => {
+  const fileDragActive = useWindowFileDrop(apiReachable && !readOnly, (files) => {
     const { accepted, rejected } = validateUploads(
       files,
       config?.max_upload_bytes ?? DEFAULT_MAX_UPLOAD_BYTES,
@@ -414,9 +489,10 @@ function App() {
         ? 'Upload a document to start.'
         : undefined;
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
-  // The engineer meta line's model label is the CURRENTLY selected provider's model,
-  // not necessarily the one that answered an older turn — the app doesn't record a
-  // per-turn model, and adding that is a backend change out of scope for the redesign.
+  const lastQuestion = [...turns].reverse().find((turn) => turn.role === 'user')?.content;
+  useBackgroundNotice(pending, notifyOnAnswer, lastQuestion);
+  // The selected provider's model. Each answer records the one it was asked of
+  // (ChatTurn.model); this labels answers saved before that, and the composer.
   const currentModelLabel = config
     ? selectedProvider === 'ollama'
       ? config.llm_model
@@ -459,8 +535,11 @@ function App() {
   const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
   const askQuestion = useCallback(
     (question: string) =>
-      ask(question, selectedProvider, advancedOptions, scopeFilenames, { tags: selectedTags }),
-    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags],
+      ask(question, selectedProvider, advancedOptions, scopeFilenames, {
+        tags: selectedTags,
+        modelLabel: currentModelLabel,
+      }),
+    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
   // Regenerate must produce a new answer, not the cached copy of the one on screen.
   const regenerateQuestion = useCallback(
@@ -468,17 +547,19 @@ function App() {
       ask(question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
         bypassCache: true,
+        modelLabel: currentModelLabel,
       }),
-    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags],
+    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
   const editQuestion = useCallback(
     (turnId: string, question: string) => {
       setPinnedTraceId(null);
       return editAndResend(turnId, question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
+        modelLabel: currentModelLabel,
       });
     },
-    [editAndResend, selectedProvider, advancedOptions, scopeFilenames, selectedTags],
+    [editAndResend, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
 
   // Same reasoning as askQuestion above — passed to both ChatThread and Inspector.
@@ -661,35 +742,46 @@ function App() {
           if (panelCollapsed) setPanelDrawerOpen(true);
         },
       },
-      {
-        id: 'export-corpus',
-        glyph: '⇩',
-        label: 'Download a backup of all documents (zip)',
-        // Building the zip can take a while for a large corpus; without a guard every
-        // impatient re-run started another full export on the server.
-        disabled: exportingBackup,
-        run: () => {
-          if (exportingRef.current) return;
-          exportingRef.current = true;
-          setExportingBackup(true);
-          pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
-          api
-            .exportCorpus()
-            .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
-            .catch((err) => {
-              if (noteAuthFailure(err)) return;
-              pushToast({
-                tone: 'bad',
-                title: 'Backup failed',
-                body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
-              });
-            })
-            .finally(() => {
-              exportingRef.current = false;
-              setExportingBackup(false);
-            });
-        },
-      },
+      ...(readOnly
+        ? []
+        : [
+            {
+              id: 'restore-backup',
+              glyph: '⇧',
+              label: 'Restore documents from a backup (zip)',
+              run: () => restoreInputRef.current?.click(),
+              disabled: restoring,
+            },
+            {
+              id: 'export-corpus',
+              glyph: '⇩',
+              label: 'Download a backup of all documents (zip)',
+              // Building the zip can take a while for a large corpus; without a guard every
+              // impatient re-run started another full export on the server.
+              disabled: exportingBackup,
+              run: () => {
+                if (exportingRef.current) return;
+                exportingRef.current = true;
+                setExportingBackup(true);
+                pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
+                api
+                  .exportCorpus()
+                  .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
+                  .catch((err) => {
+                    if (noteAuthFailure(err)) return;
+                    pushToast({
+                      tone: 'bad',
+                      title: 'Backup failed',
+                      body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
+                    });
+                  })
+                  .finally(() => {
+                    exportingRef.current = false;
+                    setExportingBackup(false);
+                  });
+              },
+            },
+          ]),
       {
         id: 'import-json',
         glyph: '⇧',
@@ -730,11 +822,70 @@ function App() {
       conversations,
       activeConversationId,
       exportingBackup,
+      readOnly,
+      restoring,
     ],
   );
   commandsRef.current = commands;
 
   const importInputRef = useRef<HTMLInputElement>(null);
+
+  const handleRestoreFile = async (file: File) => {
+    setRestoring(true);
+    pushToast({ tone: 'info', title: 'Restoring backup…', body: file.name });
+    let result;
+    try {
+      result = await api.importBackup(file);
+    } catch (err) {
+      if (!noteAuthFailure(err)) {
+        pushToast({
+          tone: 'bad',
+          title: 'Restore failed',
+          body: err instanceof ApiClientError ? err.message : 'Could not read the backup.',
+        });
+      }
+      return;
+    } finally {
+      setRestoring(false);
+    }
+    const notes = [
+      result.skipped.length > 0 && `${result.skipped.length} already indexed (kept as is)`,
+      result.deferred.length > 0 &&
+        `${result.deferred.length} waiting for room in the queue — restore the same file again later`,
+      result.missing_originals.length > 0 &&
+        `${result.missing_originals.length} had no stored original in the backup`,
+      result.rejected.length > 0 && `${result.rejected.length} couldn't be used`,
+      result.feedback_imported > 0 && `${result.feedback_imported} ratings restored`,
+    ].filter(Boolean);
+    pushToast({
+      tone: result.deferred.length + result.rejected.length > 0 ? 'warn' : 'good',
+      title: `Restoring ${result.jobs.length} document${result.jobs.length === 1 ? '' : 's'}`,
+      body: notes.length > 0 ? `${notes.join('; ')}.` : undefined,
+    });
+    if (result.jobs.length > 0) {
+      setRail('corpus');
+      await trackJobs(result.jobs);
+    }
+  };
+
+  const downloadOriginal = useCallback(
+    (filename: string) => {
+      api
+        .getDocumentOriginal(filename)
+        .then((blob) => downloadFile(filename, blob.type || 'application/octet-stream', blob))
+        .catch((err) => {
+          if (noteAuthFailure(err)) return;
+          pushToast({
+            tone: 'bad',
+            title: 'Download failed',
+            body: err instanceof ApiClientError ? err.message : 'Could not fetch the original.',
+          });
+        });
+    },
+    // noteAuthFailure only calls state setters; pushToast is stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pushToast],
+  );
   const handleImportFile = async (file: File) => {
     let parsed: unknown;
     try {
@@ -762,7 +913,11 @@ function App() {
     if (rail === 'chat') {
       newConversation();
       setPanelDrawerOpen(false);
-    } else if (rail === 'corpus') corpusBrowseInputRef.current?.click();
+    } else if (rail === 'corpus') {
+      if (readOnly) void refreshDocuments().catch(noteAuthFailure);
+      else corpusBrowseInputRef.current?.click();
+    }
+    else if (rail === 'feedback') loadFeedback();
     else loadTraces();
   };
 
@@ -785,16 +940,29 @@ function App() {
         }}
         data-testid="import-conversation-input"
       />
+      <input
+        ref={restoreInputRef}
+        type="file"
+        accept=".zip,application/zip"
+        hidden
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = '';
+          if (file) void handleRestoreFile(file);
+        }}
+        data-testid="restore-backup-input"
+      />
       <IconRail
         active={rail}
         onSelect={handleRailSelect}
         theme={theme}
         onToggleTheme={toggleTheme}
         onOpenSettings={() => setSettingsOpen(true)}
+        hidden={feedbackPanelAvailable ? [] : ['feedback']}
       />
       <ContextPanel
         title={PANEL_META[rail].title}
-        actionLabel={PANEL_META[rail].actionLabel}
+        actionLabel={rail === 'corpus' && readOnly ? 'Refresh' : PANEL_META[rail].actionLabel}
         onAction={handlePanelAction}
         apiStatus={apiStatus}
         chunkTotal={chunkTotal}
@@ -829,16 +997,25 @@ function App() {
             onDismissUpload={handleDismissUpload}
             staleFilenames={staleFilenames}
             reindexableFilenames={reindexableFilenames}
-            onReindex={config?.raw_documents_enabled ? handleReindex : undefined}
+            onReindex={config?.raw_documents_enabled && !readOnly ? handleReindex : undefined}
             onReindexAllStale={
-              config?.raw_documents_enabled ? handleReindexAllStale : undefined
+              config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
             }
             tags={documentTags}
-            onSetTags={handleSetTags}
+            onSetTags={readOnly ? undefined : handleSetTags}
+            readOnly={readOnly}
+            onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
           />
         )}
         {rail === 'traces' && (
           <TracesPanel traces={traces} error={tracesError} onSelect={handleSelectTrace} />
+        )}
+        {rail === 'feedback' && (
+          <FeedbackPanel
+            feedback={feedbackItems}
+            error={feedbackError}
+            onSelectTrace={handleSelectTrace}
+          />
         )}
       </ContextPanel>
       <main className="app-main">
@@ -901,7 +1078,10 @@ function App() {
               onSelectedTagsChange={setSelectedTags}
               config={config}
               provider={selectedProvider}
-              onProviderChange={setSelectedProvider}
+              onProviderChange={(provider) => {
+                setSelectedProvider(provider);
+                writeStored(PROVIDER_STORAGE_KEY, provider);
+              }}
               providerLabel={currentModelLabel ?? selectedProvider}
             />
           </>
@@ -946,8 +1126,15 @@ function App() {
                 refreshDocuments().catch((err) => {
                   noteAuthFailure(err);
                 });
+                // A different key may unlock more (or less).
+                void refreshAccess();
               }}
               disabled={pending}
+              notifyOnAnswer={notifyOnAnswer}
+              onNotifyOnAnswerChange={(value) => {
+                setNotifyOnAnswer(value);
+                writeStored(NOTIFY_STORAGE_KEY, value ? 'true' : null);
+              }}
             />
           )}
           {sourceView && (
@@ -955,6 +1142,11 @@ function App() {
               filename={sourceView.filename}
               chunkId={sourceView.chunkId}
               onClose={() => setSourceView(null)}
+              onDownloadOriginal={
+                config?.raw_documents_enabled && reindexableFilenames.includes(sourceView.filename)
+                  ? () => downloadOriginal(sourceView.filename)
+                  : undefined
+              }
             />
           )}
         </Suspense>

@@ -399,6 +399,35 @@ describe('ChatMessage', () => {
     expect(screen.getAllByRole('listitem')).toHaveLength(2);
   });
 
+  it('turns [n] markers into buttons that open and preview the cited source', async () => {
+    const onOpenSource = vi.fn();
+    const onCitationHover = vi.fn();
+    const source = {
+      source_number: 2,
+      filename: 'guide.pdf',
+      page: 4,
+      section: 'Setup',
+      chunk_id: 'c-2',
+      text: 'passage',
+    };
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Use docker [2]. Not `arr[2]`. Unknown [7].', sources: [source] })}
+        engineerMode={false}
+        onOpenSource={onOpenSource}
+        onCitationHover={onCitationHover}
+      />,
+    );
+
+    const chip = screen.getByRole('button', { name: 'Source 2: guide.pdf, page 4' });
+    await userEvent.hover(chip);
+    expect(onCitationHover).toHaveBeenCalledWith(source);
+    await userEvent.click(chip);
+    expect(onOpenSource).toHaveBeenCalledWith('guide.pdf', 'c-2');
+    expect(screen.getAllByTestId('inline-citation')).toHaveLength(1);
+    expect(screen.getByText('arr[2]')).toBeInTheDocument();
+  });
+
   it('renders no Regenerate button on a user or error turn', () => {
     render(
       <ChatMessage

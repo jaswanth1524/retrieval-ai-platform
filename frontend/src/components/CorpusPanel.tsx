@@ -63,6 +63,10 @@ interface CorpusPanelProps {
   tags?: Record<string, string[]>;
   /** Replace a document's tags; rejects with a message to show on failure. */
   onSetTags?: (filename: string, tags: string[]) => Promise<void>;
+  /** The read-only API key: no upload or delete (the server would answer 403). */
+  readOnly?: boolean;
+  /** Download a document's stored original (RAW_DOCUMENT_DIR); absent when none are kept. */
+  onOpenOriginal?: (filename: string) => void;
 }
 
 interface TagEditorProps {
@@ -173,6 +177,7 @@ interface DocCard {
   status: 'indexed' | 'indexing' | 'failed';
   stale?: boolean;
   canReindex?: boolean;
+  hasOriginal?: boolean;
   detail: string;
   pct: number;
   error?: string;
@@ -198,6 +203,8 @@ function CorpusPanel({
   onReindexAllStale,
   tags = {},
   onSetTags,
+  readOnly = false,
+  onOpenOriginal,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFile[]>([]);
@@ -277,6 +284,7 @@ function CorpusPanel({
     const uploadedAt = uploadedAts[filename];
     if (uploadedAt !== undefined) parts.push(formatRelativeTime(uploadedAt * 1000));
     const canReindex = onReindex !== undefined && reindexable.has(filename);
+    const hasOriginal = reindexable.has(filename);
     // Only flagged when it can be acted on. Without a stored original there is nothing
     // to re-index from, and a document indexed before versions were recorded counts as
     // stale even if the current chunker produced it — a label the user can't clear.
@@ -287,6 +295,7 @@ function CorpusPanel({
       filename,
       stale: isStale,
       canReindex,
+      hasOriginal,
       status: 'indexed' as const,
       detail: parts.join(' · '),
       pct: 100,
@@ -333,6 +342,12 @@ function CorpusPanel({
 
   return (
     <>
+      {readOnly && (
+        <p className="corpus-panel__readonly" data-testid="corpus-readonly">
+          Read-only key: you can search and ask, but not change documents.
+        </p>
+      )}
+      {!readOnly && (
       <label
         className={`corpus-panel__dropzone${dragOver ? ' corpus-panel__dropzone--active' : ''}`}
         onDragOver={handleDragOver}
@@ -352,6 +367,7 @@ function CorpusPanel({
           data-testid="upload-input"
         />
       </label>
+      )}
 
       {stagedFiles.length > 0 && (
         <div className="corpus-panel__staged" data-testid="upload-staged-list">
@@ -462,6 +478,17 @@ function CorpusPanel({
               </div>
             ) : card.status === 'indexed' ? (
               <div className="corpus-panel__card-actions">
+                {card.hasOriginal && onOpenOriginal && (
+                  <button
+                    type="button"
+                    className="corpus-panel__open-original"
+                    onClick={() => onOpenOriginal(card.filename)}
+                    aria-label={`Download the original of ${card.filename}`}
+                    title="Download the uploaded file"
+                  >
+                    ⇱
+                  </button>
+                )}
                 {card.canReindex && (
                   <button
                     type="button"
@@ -478,15 +505,17 @@ function CorpusPanel({
                     ↻
                   </button>
                 )}
-                <button
-                  type="button"
-                  className="corpus-panel__remove"
-                  onClick={() => setConfirming(card.key)}
-                  disabled={disabled}
-                  aria-label={`Delete ${card.filename}`}
-                >
-                  ✕
-                </button>
+                {!readOnly && (
+                  <button
+                    type="button"
+                    className="corpus-panel__remove"
+                    onClick={() => setConfirming(card.key)}
+                    disabled={disabled}
+                    aria-label={`Delete ${card.filename}`}
+                  >
+                    ✕
+                  </button>
+                )}
               </div>
             ) : (
               card.status === 'failed' &&

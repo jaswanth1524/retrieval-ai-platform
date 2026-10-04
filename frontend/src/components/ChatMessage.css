@@ -297,3 +297,25 @@
   border-radius: var(--radius-sm);
   padding: 0 5px;
 }
+
+/* An inline [n] citation in the answer text: opens the source it cites. */
+.chat-message__cite {
+  display: inline-block;
+  min-width: 1.35em;
+  margin: 0 1px;
+  padding: 0 4px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.75em;
+  line-height: 1.45;
+  vertical-align: 0.15em;
+  cursor: pointer;
+}
+
+.chat-message__cite:hover,
+.chat-message__cite:focus-visible {
+  border-color: var(--accent);
+}

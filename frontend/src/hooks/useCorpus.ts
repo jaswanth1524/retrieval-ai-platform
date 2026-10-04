@@ -204,6 +204,20 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest();
     };
 
+    // Follows jobs the server already started (a backup restore), like uploads.
+    const trackJobs = async (jobs: DocumentJobAcceptedResponse[]) => {
+      const items: UploadItem[] = jobs.map((job) => ({
+        id: newId(),
+        filename: job.filename,
+        status: 'uploading',
+      }));
+      setUploads((prev) => [...prev, ...items]);
+      await Promise.allSettled(
+        jobs.map((job, index) => runIngestJob(items[index].id, () => Promise.resolve(job))),
+      );
+      await refreshAfterIngest();
+    };
+
     const handleUpload = async (files: File[]) => {
       const newItems: UploadItem[] = files.map((file) => ({
         id: newId(),
@@ -284,6 +298,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleReindexAllStale,
       handleDeleteDocument,
       handleSetTags,
+      trackJobs,
     };
     // Built once: everything above reads state through setters and refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -30,6 +30,9 @@ export default defineConfig({
       // saved the app's HTML as the zip.
       '/export': 'http://localhost:8000',
       '/metrics': 'http://localhost:8000',
+      '/access': 'http://localhost:8000',
+      '/import': 'http://localhost:8000',
+      '/search': 'http://localhost:8000',
     },
   },
   test: {

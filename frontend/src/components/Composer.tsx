@@ -147,8 +147,13 @@ function Composer({
     );
   };
 
-  const openaiEnabled = config?.openai_available ?? false;
-  const ollamaEnabled = config?.ollama_available ?? false;
+  // ALLOWED_REQUEST_PROVIDERS: a provider the server refuses per request is shown
+  // disabled rather than offered and turned away with a 400.
+  const allowed = (name: string) =>
+    !config?.allowed_request_providers || config.allowed_request_providers.includes(name);
+  const openaiEnabled = (config?.openai_available ?? false) && allowed('openai');
+  const ollamaEnabled = (config?.ollama_available ?? false) && allowed('ollama');
+  const compatibleAllowed = allowed('openai_compatible');
 
   // A search hiding an already-selected filename would make it permanently
   // unselectable (the checkbox list is the only way to remove it from scope), so a
@@ -293,7 +298,11 @@ function Composer({
                   />
                   <span>Ollama &middot; {config.llm_model}</span>
                 </label>
-                {!ollamaEnabled && <p className="composer__popover-note">Ollama isn&apos;t reachable.</p>}
+                {!ollamaEnabled && (
+                  <p className="composer__popover-note">
+                    {allowed('ollama') ? "Ollama isn't reachable." : 'Not allowed on this server.'}
+                  </p>
+                )}
                 <label className="composer__popover-item">
                   <input
                     type="radio"
@@ -305,13 +314,18 @@ function Composer({
                   />
                   <span>OpenAI &middot; {config.openai_model}</span>
                 </label>
-                {!openaiEnabled && <p className="composer__popover-note">Set OPENAI_API_KEY to enable.</p>}
+                {!openaiEnabled && (
+                  <p className="composer__popover-note">
+                    {allowed('openai') ? 'Set OPENAI_API_KEY to enable.' : 'Not allowed on this server.'}
+                  </p>
+                )}
                 {config.openai_compatible_available && (
                   <label className="composer__popover-item">
                     <input
                       type="radio"
                       name="composer-provider"
                       checked={provider === 'openai_compatible'}
+                      disabled={!compatibleAllowed}
                       onChange={() => onProviderChange('openai_compatible')}
                       data-testid="provider-openai-compatible"
                     />

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { getApiKey, setApiKey } from '../api/client';
 import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
+import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
 
 interface SettingsModalProps {
@@ -11,6 +12,9 @@ interface SettingsModalProps {
   onClose: () => void;
   onSaved: () => void;
   disabled?: boolean;
+  /** Show a system notification when an answer finishes in a background tab. */
+  notifyOnAnswer?: boolean;
+  onNotifyOnAnswerChange?: (value: boolean) => void;
 }
 
 const EMPTY_OVERRIDES: QuestionOverrides = {
@@ -81,6 +85,8 @@ function SettingsModal({
   onClose,
   onSaved,
   disabled,
+  notifyOnAnswer = false,
+  onNotifyOnAnswerChange,
 }: SettingsModalProps) {
   const dialogRef = useDialog(true, onClose);
   const [apiKeyDraft, setApiKeyDraft] = useState(getApiKey);
@@ -88,6 +94,8 @@ function SettingsModal({
   // directly, so a drag doesn't localStorage-write on every tick and Cancel (unmount,
   // since the modal is only ever conditionally rendered) discards it for free.
   const [draftOverrides, setDraftOverrides] = useState(overrides);
+  const [notifyDraft, setNotifyDraft] = useState(notifyOnAnswer);
+  const [notifyBlocked, setNotifyBlocked] = useState(false);
 
   const rerankTopK = draftOverrides.rerankTopK ?? config.rerank_top_k;
   const maxContextChunks = draftOverrides.maxContextChunks ?? config.max_context_chunks;
@@ -96,6 +104,7 @@ function SettingsModal({
   const save = () => {
     onOverridesChange(draftOverrides);
     setApiKey(apiKeyDraft);
+    onNotifyOnAnswerChange?.(notifyDraft);
     onSaved();
     onClose();
   };
@@ -241,6 +250,39 @@ function SettingsModal({
               Only needed when the server has <code>API_KEY</code> set. Stored in this browser.
             </p>
           </section>
+
+          {onNotifyOnAnswerChange && notificationsSupported() && (
+            <section className="settings__section">
+              <h3 className="settings__section-title mono">Notifications</h3>
+              <label className="settings__checkbox">
+                <input
+                  type="checkbox"
+                  checked={notifyDraft}
+                  onChange={(event) => {
+                    const checked = event.target.checked;
+                    setNotifyBlocked(false);
+                    if (!checked) {
+                      setNotifyDraft(false);
+                      return;
+                    }
+                    // Asked from this click, never unprompted: browsers block (and
+                    // remember) a permission request with no user gesture behind it.
+                    void Notification.requestPermission().then((permission) => {
+                      setNotifyDraft(permission === 'granted');
+                      setNotifyBlocked(permission === 'denied');
+                    });
+                  }}
+                  data-testid="settings-notify"
+                />
+                Notify me when an answer finishes in a background tab
+              </label>
+              {notifyBlocked && (
+                <p className="settings__hint">
+                  The browser blocked notifications for this site; allow them in its site settings.
+                </p>
+              )}
+            </section>
+          )}
 
           <details className="settings__system">
             <summary className="mono">System info</summary>

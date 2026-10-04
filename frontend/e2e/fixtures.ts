@@ -110,6 +110,14 @@ export class MockApi {
   uploadsQueueFull = 0;
   /** Successive GET /documents/jobs/{id} responses; the last one repeats. */
   jobSteps: JobStep[] = [];
+  /** What GET /access reports the browser's key unlocks. */
+  access: 'full' | 'read' | 'open' = 'open';
+  /** GET /feedback rows (newest first). */
+  feedbackItems: object[] = [];
+  /** Filenames a POST /import restores (each becomes a job). */
+  importFilenames: string[] = [];
+  /** Bodies of every POST /import, for a spec to inspect. */
+  readonly imports: string[] = [];
   /** In-flight ingest jobs by id: the file each one indexes and how often it was polled.
    *  Every job walks `jobSteps` on its own, so a bulk re-index runs several at once. */
   private readonly jobs = new Map<string, { filename: string; polls: number }>();
@@ -120,7 +128,10 @@ export class MockApi {
 
   async install(page: Page): Promise<void> {
     await page.route(
-      (url) => /^\/(health|config|documents|questions|traces|feedback)(\/|$)/.test(url.pathname),
+      (url) =>
+        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search)(\/|$)/.test(
+          url.pathname,
+        ),
       (route) => this.handle(route),
     );
   }
@@ -145,6 +156,7 @@ export class MockApi {
     if (this.apiKey !== null && request.headers()['x-api-key'] !== this.apiKey) {
       return this.configured(route, 401, { detail: 'Missing or invalid API key.' });
     }
+    if (path === '/access') return this.json(route, 200, { access: this.access });
     if (path === '/traces') return this.json(route, 200, { traces: this.traces });
     if (path.startsWith('/traces/')) {
       return this.json(route, 200, {
@@ -225,7 +237,7 @@ export class MockApi {
       return this.json(route, 202, { jobs: due.map((name) => this.startJob(name)), deferred: [] });
     }
 
-    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags))?$/.exec(path);
+    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags|original))?$/.exec(path);
     if (documentRoute) {
       const filename = decodeURIComponent(documentRoute[1]);
       const action = documentRoute[2];
@@ -276,10 +288,28 @@ export class MockApi {
       if (action === 'reindex' && method === 'POST') {
         return this.json(route, 202, this.startJob(filename));
       }
+      if (action === 'original' && method === 'GET') {
+        return route.fulfill({ status: 200, contentType: 'text/markdown', body: `# ${filename}` });
+      }
     }
 
     if (path === '/feedback' && method === 'POST') {
       return this.json(route, 201, { id: 1 });
+    }
+    if (path === '/feedback' && method === 'GET') {
+      return this.json(route, 200, { feedback: this.feedbackItems });
+    }
+    if (path === '/import' && method === 'POST') {
+      this.imports.push(request.postData() ?? '');
+      return this.json(route, 202, {
+        jobs: this.importFilenames.map((name) => this.startJob(name)),
+        deferred: [],
+        skipped: [],
+        missing_originals: [],
+        rejected: [],
+        feedback_imported: 2,
+        feedback_skipped: 0,
+      });
     }
 
     this.unmocked.push(`${method} ${path}`);

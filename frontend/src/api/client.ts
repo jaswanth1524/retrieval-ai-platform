@@ -1,4 +1,5 @@
 import type {
+  AccessResponse,
   CitationResponse,
   DocumentContentResponse,
   DocumentDeleteResponse,
@@ -7,10 +8,12 @@ import type {
   DocumentListResponse,
   DocumentReindexAllResponse,
   DocumentTagsResponse,
+  FeedbackListResponse,
   FeedbackRequest,
   FeedbackResponse,
   HealthResponse,
   HistoryMessage,
+  ImportResponse,
   LlmProvider,
   PublicConfigResponse,
   QuestionOptions,
@@ -272,6 +275,42 @@ export const api = {
 
   config: (signal?: AbortSignal) => request<PublicConfigResponse>('/config', { signal }),
 
+  // Which key this browser holds: "read" hides what the server would refuse (403).
+  access: (signal?: AbortSignal) => request<AccessResponse>('/access', { signal }),
+
+  // Recorded answer ratings, newest first (full key; 404 when feedback is off).
+  listFeedback: (limit = 200, signal?: AbortSignal) =>
+    request<FeedbackListResponse>(`/feedback?limit=${limit}`, { signal }),
+
+  // Restores a backup zip from exportCorpus: each document is re-indexed as a job.
+  importBackup: (file: File, signal?: AbortSignal) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<ImportResponse>('/import', {
+      method: 'POST',
+      body: form,
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+    });
+  },
+
+  // The exact uploaded bytes (RAW_DOCUMENT_DIR on). Fetched, not linked: a plain link
+  // can't carry the X-API-Key header.
+  getDocumentOriginal: async (filename: string): Promise<Blob> => {
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}/documents/${encodeURIComponent(filename)}/original`, {
+        headers: authHeaders(),
+      });
+    } catch (err) {
+      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+    }
+    if (!response.ok) {
+      throw new ApiClientError(await extractErrorDetail(response), response.status);
+    }
+    return response.blob();
+  },
+
   listDocuments: (signal?: AbortSignal) =>
     request<DocumentListResponse>('/documents', { signal }),
 
@@ -332,9 +371,7 @@ export const api = {
     }),
 
   // Reconstructs a document from its stored chunks (ordinal order) for the source
-  // viewer. A separate, opt-in GET /documents/{filename}/original route serves the
-  // literal uploaded bytes when the server has raw storage enabled (no client
-  // wrapper here yet — nothing in the UI surfaces it).
+  // viewer (getDocumentOriginal serves the uploaded bytes themselves).
   // With no page, the whole document; `around` + `radius` for the chunks either side
   // of a cited one, or `start`/`end` (1-based ordinals, inclusive) for a range.
   getDocumentContent: (filename: string, signal?: AbortSignal, page: ContentPage = {}) => {

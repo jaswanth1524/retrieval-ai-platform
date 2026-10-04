@@ -1,8 +1,10 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
 import { withCitationFootnotes } from '../utils/exportChat';
+import { citationNumberFromHref, linkCitations } from '../utils/citations';
 import { splitStreamingMarkdown } from '../utils/markdownBlocks';
 import CitationCard from './CitationCard';
 import StreamingSkeleton from './StreamingSkeleton';
@@ -14,14 +16,18 @@ const REMARK_PLUGINS = [remarkGfm];
 // it rendered, no click needed. Show the alt text instead of loading anything.
 const MARKDOWN_COMPONENTS: Components = {
   img: ({ alt }) => (alt ? <span className="chat-message__image-alt">[{alt}]</span> : null),
-  // A link followed in this tab used to unload the app mid-answer. `noreferrer` also
-  // keeps the DocRAG URL out of wherever a document's link points.
-  a: ({ href, children }) => (
+  a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+};
+
+// A link followed in this tab used to unload the app mid-answer. `noreferrer` also
+// keeps the DocRAG URL out of wherever a document's link points.
+function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
+  return (
     <a href={href} target="_blank" rel="noopener noreferrer">
       {children}
     </a>
-  ),
-};
+  );
+}
 // Error turns created before this page load are history, not news: announcing each one
 // as an alert on every conversation switch or reload read out stale failures.
 const SESSION_STARTED_AT = Date.now();
@@ -56,6 +62,8 @@ export interface ChatTurn {
   incomplete?: boolean;
   // Served from the server's answer cache rather than generated for this question.
   cached?: boolean;
+  // The model that was asked (absent on answers saved before this was recorded).
+  model?: string;
 }
 
 interface ChatMessageProps {
@@ -189,6 +197,39 @@ function ChatMessage({
   };
 
   const showSkeleton = streamStage !== undefined && turn.content === '';
+  // [n] markers become buttons that open (and on hover preview) the source they cite.
+  const markdownComponents = useMemo<Components>(() => {
+    const byNumber = new Map(turn.sources.map((source) => [source.source_number, source]));
+    return {
+      ...MARKDOWN_COMPONENTS,
+      a: ({ href, children }) => {
+        const number = citationNumberFromHref(href);
+        if (number === null) return <ExternalLink href={href}>{children}</ExternalLink>;
+        const source = byNumber.get(number);
+        if (!source) return <>[{number}]</>;
+        return (
+          <button
+            type="button"
+            className="chat-message__cite"
+            onClick={() => {
+              onCitationLeave?.();
+              onOpenSource?.(source.filename, source.chunk_id);
+            }}
+            onMouseEnter={() => onCitationHover?.(source)}
+            onMouseLeave={onCitationLeave}
+            aria-label={`Source ${number}: ${source.filename}, page ${source.page}`}
+            data-testid="inline-citation"
+          >
+            {number}
+          </button>
+        );
+      },
+    };
+  }, [turn.sources, onOpenSource, onCitationHover, onCitationLeave]);
+  const linkedContent = useMemo(() => {
+    const highest = turn.sources.reduce((max, source) => Math.max(max, source.source_number), 0);
+    return linkCitations(turn.content, highest);
+  }, [turn.content, turn.sources]);
   const timings = turn.timings;
   const showMeta = engineerMode && turn.role === 'assistant' && !showSkeleton && timings !== null;
 
@@ -280,9 +321,9 @@ function ChatMessage({
             ) : (
               <div className="chat-message__markdown">
                 {streamStage !== undefined ? (
-                  <StreamingMarkdown text={turn.content} />
+                  <StreamingMarkdown text={linkedContent} components={markdownComponents} />
                 ) : (
-                  <MarkdownBlock text={turn.content} />
+                  <MarkdownBlock text={linkedContent} components={markdownComponents} />
                 )}
               </div>
             )}
@@ -390,7 +431,7 @@ function ChatMessage({
             {showMeta && timings && (
               <div className="chat-message__engineer-meta mono">
                 <span>{formatDuration(timings.total_ms)}</span>
-                {currentModelLabel && <span>{currentModelLabel}</span>}
+                {(turn.model ?? currentModelLabel) && <span>{turn.model ?? currentModelLabel}</span>}
               </div>
             )}
           </div>
@@ -425,9 +466,14 @@ function ChatMessage({
   );
 }
 
-const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
+interface MarkdownProps {
+  text: string;
+  components: Components;
+}
+
+const MarkdownBlock = memo(function MarkdownBlock({ text, components }: MarkdownProps) {
   return (
-    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components}>
       {text}
     </ReactMarkdown>
   );
@@ -435,14 +481,14 @@ const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
 
 /** An answer still streaming: finished blocks are memoized, so each token re-parses only
  *  the block it extends rather than the whole answer so far. */
-function StreamingMarkdown({ text }: { text: string }) {
+function StreamingMarkdown({ text, components }: MarkdownProps) {
   const { done, tail } = splitStreamingMarkdown(text);
   return (
     <>
       {done.map((block, index) => (
-        <MarkdownBlock key={index} text={block} />
+        <MarkdownBlock key={index} text={block} components={components} />
       ))}
-      <MarkdownBlock text={tail} />
+      <MarkdownBlock text={tail} components={components} />
     </>
   );
 }
