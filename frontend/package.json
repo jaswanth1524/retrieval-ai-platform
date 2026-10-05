@@ -29,7 +29,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4",
     "fake-indexeddb": "^6.2.5",
-    "jsdom": "^25",
+    "jsdom": "^30",
     "oxlint": "^1.71.0",
     "typescript": "~6.0.2",
     "vite": "^7",
