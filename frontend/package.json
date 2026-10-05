@@ -27,7 +27,7 @@
     "@types/node": "^24.13.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^4",
+    "@vitejs/plugin-react": "^6",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^25",
     "oxlint": "^1.71.0",
