@@ -54,4 +54,27 @@ describe('useDialog', () => {
     await userEvent.keyboard('{Escape}');
     expect(closeOuter).toHaveBeenCalledTimes(1);
   });
+
+  it('never wraps to a button taken out of the tab order', async () => {
+    // An inactive tab (tabindex=-1) counted as the dialog's last item, so Shift+Tab
+    // from the first item sent focus to it. (summary is in the list too; jsdom can't
+    // focus one, so that half is checked in the browser.)
+    function WithTabs() {
+      const ref = useDialog(true, () => {});
+      return (
+        <div ref={ref}>
+          <button type="button">close</button>
+          <a href="#prompt">prompt sent</a>
+          <button type="button" tabIndex={-1}>
+            inactive tab
+          </button>
+        </div>
+      );
+    }
+    render(<WithTabs />);
+
+    expect(screen.getByText('close')).toHaveFocus();
+    await userEvent.tab({ shift: true });
+    expect(screen.getByText('prompt sent')).toHaveFocus();
+  });
 });

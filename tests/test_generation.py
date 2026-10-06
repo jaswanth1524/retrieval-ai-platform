@@ -1138,3 +1138,42 @@ def test_a_list_marker_counts_as_cited_and_does_not_trigger_a_retry() -> None:
     assert outcome.retry_used is False
     assert generator.messages == []
     assert needs_citation_retry("Alpha [1-2].", 2) is False
+
+
+def test_a_stream_closed_early_closes_the_provider_response() -> None:
+    """LiteLLM's sync stream has no close(): when the client left, the HTTP response
+    stayed open until garbage collection and Ollama kept generating for nobody."""
+
+    closed: list[str] = []
+
+    class Lines:
+        def __iter__(self) -> Lines:
+            return self
+
+        def __next__(self) -> str:
+            return "line"
+
+        def close(self) -> None:
+            closed.append("lines")
+
+    class Wrapper:
+        def __init__(self) -> None:
+            self.completion_stream = type("Iterator", (), {"streaming_response": Lines()})()
+
+        def __iter__(self) -> Wrapper:
+            return self
+
+        def __next__(self) -> dict[str, Any]:
+            return {"choices": [{"delta": {"content": "token "}}]}
+
+    def completion_client(**kwargs: Any) -> Wrapper:
+        return Wrapper()
+
+    stream = LiteLLMGenerator(make_test_settings(), completion_client=completion_client).stream(
+        [ChatMessage(role="user", content="hi")], make_test_settings()
+    )
+    assert next(iter(stream)) == "token "
+    assert closed == []
+    stream.close()  # type: ignore[attr-defined]
+
+    assert closed == ["lines"]

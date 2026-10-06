@@ -446,6 +446,18 @@ describe('CorpusPanel', () => {
     expect(screen.getByTestId('upload-button')).toBeInTheDocument();
   });
 
+  it('stages files dropped while an upload runs instead of swallowing them', () => {
+    setup({ maxUploadBytes: 1000, uploads: [{ id: 'u1', filename: 'b.txt', status: 'uploading' }] });
+
+    fireEvent.drop(screen.getByTestId('upload-dropzone'), {
+      dataTransfer: dataTransferWith([makeFile('next.txt', 10)]),
+    });
+
+    expect(screen.getByText('next.txt')).toBeInTheDocument();
+    // Sent once the running upload finishes.
+    expect(screen.getByTestId('upload-button')).toBeDisabled();
+  });
+
   it('rejects an oversized file dropped onto the drop-zone', () => {
     setup({ maxUploadBytes: 10 });
 

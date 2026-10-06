@@ -68,6 +68,14 @@ def _documents() -> dict[str, bytes]:
         b"<p>Pull the new image and restart.</p></body></html>"
     )
     documents["rows.csv"] = b"name,team\nada,platform\ngrace,search\nlin,ops\n"
+    documents["rows_blank.csv"] = b"name,team\n\nada,platform\n\n\ngrace,search\n"
+    documents["long_heading.md"] = (
+        f"# {'Heading ' * 40}\n\nThe body under a very long heading.".encode()
+    )
+    documents["fenced.md"] = (
+        b"# Install\n\nRun the installer first.\n\n```bash\n# a comment, not a heading\n"
+        b"uv sync\n```\n\n# Usage\n\nStart the server."
+    )
     documents["policy.docx"] = _docx_bytes()
     documents["report.pdf"] = pdf_bytes(
         ["Quarterly report page one about retrieval quality.", "Page two covers latency."]

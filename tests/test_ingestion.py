@@ -428,3 +428,42 @@ def test_filename_write_lock_registry_evicts_idle_entries() -> None:
     assert held_entry.users == 0
 
     assert set(_filename_locks) == before
+
+
+def test_a_dense_vector_size_other_than_the_setting_names_the_setting() -> None:
+    """Qdrant rejected the upsert instead, reported as "retry the upload" — advice no
+    retry could ever follow."""
+
+    settings = make_settings(qdrant_dense_vector_size=4)
+    repository = VectorRepository(QdrantClient(":memory:"))
+
+    with pytest.raises(CollectionSchemaError, match="QDRANT_DENSE_VECTOR_SIZE=3"):
+        ingest_chunks(
+            repository, settings, [make_chunk()], FakeEmbeddingProvider([make_embedding()])
+        )
+
+    assert repository.point_ids_for_filename(settings, "guide.md") == []
+
+
+def test_vectors_held_for_the_write_round_trip_exactly() -> None:
+    """Held as float32 until the locked write; the model's float32 values survive."""
+
+    import numpy as np
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    dense = [float(np.float32(v)) for v in (0.1234567, -0.9876543, 0.5)]
+    embedding = EmbeddedText(dense=dense, sparse=models.SparseVector(indices=[1], values=[0.5]))
+
+    ingest_chunks(
+        VectorRepository(client), settings, [make_chunk()], FakeEmbeddingProvider([embedding])
+    )
+
+    (point,) = client.retrieve(
+        settings.qdrant_collection, [point_id_for_chunk(make_chunk())], with_vectors=True
+    )
+    assert isinstance(point.vector, dict)
+    stored = point.vector[settings.qdrant_dense_vector_name]
+    # Qdrant's in-memory cosine store normalizes; compare directions.
+    expected = np.asarray(dense) / np.linalg.norm(dense)
+    assert np.allclose(stored, expected, atol=1e-6)

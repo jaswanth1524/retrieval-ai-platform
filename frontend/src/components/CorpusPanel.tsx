@@ -11,6 +11,7 @@ import {
 import type { RejectedFile } from '../utils/uploadValidation';
 import ConfirmInline from './ConfirmInline';
 import './CorpusPanel.css';
+import { isImeComposing } from '../utils/keyboard';
 
 // Both are structural details of UploadItem below and have no consumers outside this
 // file — kept unexported so the module's public surface is just UploadItem + default.
@@ -122,6 +123,7 @@ function TagEditor({ filename, tags, disabled, onSave }: TagEditorProps) {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
+            if (isImeComposing(event)) return;
             if (event.key === 'Enter') {
               event.preventDefault();
               void save();
@@ -248,15 +250,16 @@ function CorpusPanel({
 
   const handleDragOver = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
-    if (!submitting) setDragOver(true);
+    setDragOver(true);
   };
 
   const handleDragLeave = () => setDragOver(false);
 
+  // Staged even while an upload runs (Upload waits for it): the drop used to be
+  // swallowed silently — marked handled, so the page-wide drop zone skipped it too.
   const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
     setDragOver(false);
-    if (submitting) return;
     handleFilesChange(event.dataTransfer.files);
   };
 

@@ -114,6 +114,22 @@ export class MockApi {
   access: 'full' | 'read' | 'open' = 'open';
   /** GET /feedback rows (newest first). */
   feedbackItems: object[] = [];
+  /** Passages POST /search returns, best first; null makes it answer 429 (all slots busy). */
+  searchResults: object[] | null = [
+    {
+      rank: 1,
+      filename: 'guide.md',
+      page: 1,
+      section: 'Retrieval',
+      chunk_id: 'c1',
+      chunk_ordinal: 1,
+      text: 'DocRAG fuses dense and BM25 results with Reciprocal Rank Fusion.',
+      retrieval_score: 0.03,
+      rerank_score: 0.93,
+    },
+  ];
+  /** Bodies of every POST /search, for a spec to inspect. */
+  readonly searches: object[] = [];
   /** Filenames a POST /import restores (each becomes a job). */
   importFilenames: string[] = [];
   /** Bodies of every POST /import, for a spec to inspect. */
@@ -313,6 +329,16 @@ export class MockApi {
       }
     }
 
+    if (path === '/search' && method === 'POST') {
+      this.searches.push(JSON.parse(request.postData() ?? '{}'));
+      if (this.searchResults === null) {
+        return this.configured(route, 429, { detail: 'Too many questions at once.' });
+      }
+      return this.json(route, 200, {
+        results: this.searchResults,
+        timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1 },
+      });
+    }
     if (path === '/feedback' && method === 'POST') {
       return this.json(route, 201, { id: 1 });
     }

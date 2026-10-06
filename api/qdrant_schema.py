@@ -30,12 +30,39 @@ class CollectionSchemaError(RuntimeError):
     """Raised when an existing Qdrant collection does not match DocRAG's schema."""
 
 
+def check_dense_dimension(size: int, settings: AppSettings) -> None:
+    """Refuse a dense vector whose size isn't the collection's configured one.
+
+    A wrong ``QDRANT_DENSE_VECTOR_SIZE`` otherwise surfaced as Qdrant rejecting the
+    upsert, reported as "Indexing failed ... retry the upload" — advice no retry follows.
+    """
+
+    expected = int(settings.qdrant_dense_vector_size)
+    if size != expected:
+        raise CollectionSchemaError(
+            f"The dense embedding model '{settings.dense_embedding_model}' produces "
+            f"{size}-dimensional vectors, but QDRANT_DENSE_VECTOR_SIZE is {expected}. "
+            f"Set QDRANT_DENSE_VECTOR_SIZE={size} (with a new QDRANT_COLLECTION, since "
+            "an existing collection's vector size can't change)."
+        )
+
+
 class VectorStoreUnavailableError(RuntimeError):
     """Raised when Qdrant cannot be reached (connection refused, timeout, DNS, ...).
 
     Distinct from ``CollectionSchemaError``: this is an infra/connectivity failure,
     not a schema mismatch, so it maps to a 503 rather than a 409.
     """
+
+
+# What an operator does about an index built for another embedding setup. Listing,
+# deleting, tagging and exporting still work on it; questions and uploads don't.
+RECOVERY_HINT = (
+    "Questions and uploads are refused until the index matches the configuration. "
+    "Either restore the previous embedding settings, or rebuild the index: download a "
+    "backup (GET /export), delete every document, then restore the backup (POST /import) "
+    "— or delete every document and upload them again."
+)
 
 
 class EmbeddingModelMismatchError(CollectionSchemaError):
@@ -48,7 +75,7 @@ class EmbeddingModelMismatchError(CollectionSchemaError):
         actual_label = actual if actual is not None else "<missing>"
         super().__init__(
             f"Collection '{collection_name}' uses embedding model tag '{actual_label}', "
-            f"but the configured tag is '{expected}'. Re-ingest documents before querying."
+            f"but the configured tag is '{expected}'. {RECOVERY_HINT}"
         )
 
 
@@ -185,14 +212,91 @@ _readiness_cache = WeakKeyDictionary()
 _ensure_collection_lock = Lock()
 
 
-def ensure_collection(client: QdrantClient, settings: AppSettings) -> CollectionReady:
-    """Create or validate the configured Qdrant collection, caching success per client."""
+def ensure_collection(
+    client: QdrantClient, settings: AppSettings, *, strict: bool = True
+) -> CollectionReady:
+    """Create or validate the configured Qdrant collection, caching success per client.
 
-    cache_key: _ReadinessKey = (
+    ``strict=False`` is for reads and deletes, which don't depend on the vector space:
+    a collection built for another embedding setup is accepted (never cached), so an
+    operator who changed the model can still list, export, re-tag and delete documents
+    — the way out — instead of being refused everything. Searching and writing vectors
+    stay strict.
+    """
+
+    try:
+        return _ensure_collection_strict(client, settings)
+    except CollectionSchemaError:
+        if strict:
+            raise
+        return CollectionReady(
+            collection_name=settings.qdrant_collection,
+            created=False,
+            embedding_model_tag=settings.embedding_model_tag,
+        )
+
+
+def recreate_if_empty_and_mismatched(client: QdrantClient, settings: AppSettings) -> bool:
+    """Replace an *empty* collection that doesn't match the configuration; True if it did.
+
+    The last step of the documented recovery: once every document is deleted, the next
+    upload or import recreates the collection for the current embedding setup instead
+    of being refused forever. A collection with any point left is never touched — the
+    mismatch error still refuses the write.
+    """
+
+    try:
+        _ensure_collection_strict(client, settings)
+        return False
+    except CollectionSchemaError:
+        pass
+    collection_name = settings.qdrant_collection
+    with _ensure_collection_lock:
+        if client.count(collection_name=collection_name, exact=True).count > 0:
+            raise_mismatch(client, settings)
+        logger.warning(
+            "Recreating the empty collection %r for the configured embedding setup (%s).",
+            collection_name,
+            settings.embedding_model_tag,
+        )
+        client.delete_collection(collection_name)
+        _readiness_cache.get(client, {}).pop(_readiness_key(settings), None)
+    _ensure_collection_strict(client, settings)
+    return True
+
+
+def raise_mismatch(client: QdrantClient, settings: AppSettings) -> None:
+    """Raise the collection's schema mismatch, if it has one."""
+
+    validate_collection_schema(client.get_collection(settings.qdrant_collection), settings)
+
+
+def index_compatibility(client: QdrantClient, settings: AppSettings) -> str | None:
+    """Why the collection can't serve questions, or None. Never creates or changes it."""
+
+    if _readiness_cache.get(client, {}).get(_readiness_key(settings)) is not None:
+        return None
+    try:
+        if not client.collection_exists(settings.qdrant_collection):
+            return None
+        raise_mismatch(client, settings)
+    except CollectionSchemaError as exc:
+        return str(exc)
+    except Exception:  # noqa: BLE001 - reachability is reported separately
+        logger.debug("Could not read the collection for readiness.", exc_info=True)
+    return None
+
+
+def _readiness_key(settings: AppSettings) -> _ReadinessKey:
+    return (
         settings.qdrant_collection,
         settings.embedding_model_tag,
         settings.sparse_embedding_model,
     )
+
+
+def _ensure_collection_strict(client: QdrantClient, settings: AppSettings) -> CollectionReady:
+    cache_key = _readiness_key(settings)
     cached = _readiness_cache.get(client, {}).get(cache_key)
     if cached is not None:
         return cached
@@ -211,14 +315,7 @@ def forget_collection(client: QdrantClient, settings: AppSettings) -> None:
     """Drop the cached readiness of one collection, so the next call re-checks Qdrant."""
 
     with _ensure_collection_lock:
-        _readiness_cache.get(client, {}).pop(
-            (
-                settings.qdrant_collection,
-                settings.embedding_model_tag,
-                settings.sparse_embedding_model,
-            ),
-            None,
-        )
+        _readiness_cache.get(client, {}).pop(_readiness_key(settings), None)
 
 
 def clear_readiness_cache() -> None:
@@ -299,8 +396,7 @@ def validate_collection_schema(
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' uses sparse embedding model "
             f"'{actual_sparse if actual_sparse is not None else '<missing>'}', but the "
-            f"configured model is '{settings.sparse_embedding_model}'. "
-            "Re-ingest documents before querying."
+            f"configured model is '{settings.sparse_embedding_model}'. {RECOVERY_HINT}"
         )
 
     params = collection_info.config.params
@@ -308,7 +404,7 @@ def validate_collection_schema(
     if not isinstance(vectors, dict) or settings.qdrant_dense_vector_name not in vectors:
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' is missing dense vector "
-            f"'{settings.qdrant_dense_vector_name}'. Re-ingest documents."
+            f"'{settings.qdrant_dense_vector_name}'. {RECOVERY_HINT}"
         )
 
     dense_config = vectors[settings.qdrant_dense_vector_name]
@@ -316,19 +412,19 @@ def validate_collection_schema(
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' dense vector size is "
             f"{dense_config.size}, expected {settings.qdrant_dense_vector_size}. "
-            "Re-ingest documents."
+            f"{RECOVERY_HINT}"
         )
     if dense_config.distance != models.Distance.COSINE:
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' dense vector distance is "
-            f"{dense_config.distance}, expected {models.Distance.COSINE}. Re-ingest documents."
+            f"{dense_config.distance}, expected {models.Distance.COSINE}. {RECOVERY_HINT}"
         )
 
     sparse_vectors = params.sparse_vectors or {}
     if settings.qdrant_sparse_vector_name not in sparse_vectors:
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' is missing sparse vector "
-            f"'{settings.qdrant_sparse_vector_name}'. Re-ingest documents."
+            f"'{settings.qdrant_sparse_vector_name}'. {RECOVERY_HINT}"
         )
 
 

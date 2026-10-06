@@ -280,6 +280,8 @@ def test_ocr_pdf_pages_skips_a_page_whose_ocr_fails(monkeypatch: pytest.MonkeyPa
         def __init__(self, page_number: int) -> None:
             self.original = np.full((2, 2), page_number, dtype=np.uint8)
 
+    closed: list[int] = []
+
     class FakePage:
         def __init__(self, page_number: int) -> None:
             self.page_number = page_number
@@ -288,6 +290,9 @@ def test_ocr_pdf_pages_skips_a_page_whose_ocr_fails(monkeypatch: pytest.MonkeyPa
             if self.page_number == 2:
                 raise ValueError("unsupported image colorspace")
             return FakeImage(self.page_number)
+
+        def close(self) -> None:
+            closed.append(self.page_number)
 
     class FakePdf:
         pages = [FakePage(1), FakePage(2), FakePage(3)]
@@ -314,6 +319,8 @@ def test_ocr_pdf_pages_skips_a_page_whose_ocr_fails(monkeypatch: pytest.MonkeyPa
     assert [(section.page, section.text) for section in sections] == [
         (3, "Scanned text of page 3."),
     ]
+    # Every OCR'd page is released, including the one that failed.
+    assert closed == [2, 3]
 
 
 def test_extract_pdf_tables_skips_pages_without_ruling_edges(

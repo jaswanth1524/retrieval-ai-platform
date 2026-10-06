@@ -27,7 +27,7 @@ def register(app: FastAPI) -> None:
     def search(
         request: SearchRequest, pipeline: RagPipelineDep, slots: QuestionSlotsDep
     ) -> SearchResponse:
-        release = question_slot(slots)
+        release = question_slot(slots, count_metric=False)
         try:
             phase = pipeline.retrieve(
                 request.query,

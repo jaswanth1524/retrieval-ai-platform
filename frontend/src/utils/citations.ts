@@ -9,12 +9,14 @@ const CODE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g;
 export const CITATION_HREF_PREFIX = '#docrag-cite-';
 
 /** The source numbers one marker's contents cite, ranges expanded and clamped to the
- *  sources on offer (a stray [1-100000] costs nothing; [3-1] is ignored). */
+ *  sources on offer (a stray [1-100000] costs nothing; [3-1] and [0] are ignored). */
 export function citedNumbers(marker: string, maxNumber: number): number[] {
   const numbers: number[] = [];
   for (const part of marker.split(',')) {
     const bounds = part.trim().split(RANGE_SEP).map(Number);
-    const start = bounds[0];
+    // Sources are numbered from 1: an "[0]" became a link to no source, which the
+    // renderer then treated as an ordinary link to the app itself.
+    const start = Math.max(bounds[0], 1);
     const end = bounds[bounds.length - 1];
     for (let n = start; n <= Math.min(end, maxNumber); n += 1) {
       if (!numbers.includes(n)) numbers.push(n);

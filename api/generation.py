@@ -154,7 +154,7 @@ class GroundedAnswer:
     # The exact message list of the call that produced `answer` — the retry's
     # continuation when citation_retry_used is True. Carried out so tracing records what
     # was really sent instead of re-deriving a prompt that may not be the one used.
-    # Never surfaced through the HTTP response (see main.py's QuestionResponse), only
+    # Never surfaced through the HTTP response (see api/schemas.py's QuestionResponse), only
     # through the debug trace.
     prompt_messages: list[ChatMessage] = field(default_factory=list)
 

@@ -11,7 +11,7 @@ from api.tracing import TRACE_DROP_REASONS
 
 # Bounds for per-question retrieval/generation overrides accepted by QuestionRequest.
 # rrf_k and fused_top_n stay server-only (hybrid retrieval / RRF fusion is spec-pinned
-# by CLAUDE.md) — only these three fields are ever user-adjustable per request.
+# by CLAUDE.md) — only these fields are ever user-adjustable per request.
 REQUEST_RERANK_TOP_K_MAX = 50
 REQUEST_MAX_CONTEXT_CHUNKS_MAX = 20
 REQUEST_TEMPERATURE_MIN = 0.0
@@ -42,6 +42,11 @@ class ReadinessResponse(BaseModel):
     qdrant: bool
     generation_provider: bool
     llm_provider: str
+    # False when the collection was built for another embedding setup: questions and
+    # uploads are refused (409) while listing, export and delete still work. Not part
+    # of `status` — the app is up, and the UI is how the operator recovers.
+    index_compatible: bool = True
+    index_detail: str | None = None
 
 
 class PublicConfigResponse(BaseModel):

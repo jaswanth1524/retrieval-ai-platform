@@ -8,7 +8,7 @@ from qdrant_client import QdrantClient, models
 
 from api.repository import DocumentMetadata, VectorRepository, reciprocal_rank_fusion
 from api.settings import AppSettings
-from tests.factories import in_memory_qdrant, make_test_settings
+from tests.factories import in_memory_qdrant, make_test_settings, wait_until
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -398,3 +398,93 @@ def test_the_document_listing_is_cached_until_the_corpus_changes(
     repository.filename_metadata(settings)
     assert len(scans) == 2
     clear_metadata_cache()
+
+
+def test_concurrent_listings_share_one_scan_of_the_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After each finished job every open UI asked at once, and each scrolled the
+    whole collection."""
+
+    import threading
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(settings, [make_point("p1", "a.md")])
+    scan = repository._scan_filename_metadata
+    scans: list[int] = []
+    release = threading.Event()
+
+    def slow_scan(settings: AppSettings) -> dict[str, DocumentMetadata]:
+        scans.append(1)
+        release.wait(5)
+        return scan(settings)
+
+    monkeypatch.setattr(repository, "_scan_filename_metadata", slow_scan)
+    results: list[dict[str, DocumentMetadata]] = []
+    workers = [
+        threading.Thread(target=lambda: results.append(repository.filename_metadata(settings)))
+        for _ in range(5)
+    ]
+    for worker in workers:
+        worker.start()
+    wait_until(lambda: scans, message="no scan started")
+    release.set()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert len(scans) == 1
+    assert len(results) == 5 and all(set(result) == {"a.md"} for result in results)
+
+
+def test_a_scan_slower_than_the_ttl_still_stores_a_fresh_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import api.repository as repository_module
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(settings, [make_point("p1", "a.md")])
+    clock = [1000.0]
+    monkeypatch.setattr(repository_module.time, "monotonic", lambda: clock[0])
+    scan = repository._scan_filename_metadata
+    scans: list[int] = []
+
+    def slow_scan(settings: AppSettings) -> dict[str, DocumentMetadata]:
+        scans.append(1)
+        clock[0] += 60  # longer than the 30 s TTL
+        return scan(settings)
+
+    monkeypatch.setattr(repository, "_scan_filename_metadata", slow_scan)
+    repository.filename_metadata(settings)
+    repository.filename_metadata(settings)
+
+    assert len(scans) == 1  # the entry was stored as of the scan's end, not its start
+
+
+def test_staleness_follows_the_chunking_fingerprint_and_the_token_counter() -> None:
+    from api.documents import CHUNKER_VERSION
+
+    def meta(**values: Any) -> DocumentMetadata:
+        base: dict[str, Any] = {
+            "chunk_count": 1,
+            "page_count": 1,
+            "byte_size": None,
+            "uploaded_at": None,
+            "chunker_version": CHUNKER_VERSION,
+        }
+        return DocumentMetadata(**{**base, **values})
+
+    current = "fp-now"
+    # Indexed before fingerprints existed but by today's chunker: not flagged on upgrade.
+    assert not meta().is_stale(current, "hf")
+    assert not meta(chunking_fingerprints=frozenset({current})).is_stale(current, "hf")
+    # Another CHUNK_SIZE_TOKENS/overlap/model: one old point is enough.
+    assert meta(chunking_fingerprints=frozenset({current, "fp-old"})).is_stale(current, "hf")
+    assert meta(chunker_version=CHUNKER_VERSION - 1).is_stale(current, "hf")
+    assert meta(chunker_version=None).is_stale(current, "hf")
+    # Sized by the heuristic: stale once the real tokenizer is there, not before.
+    heuristic = meta(chunking_fingerprints=frozenset({current}), heuristic_chunked=True)
+    assert heuristic.is_stale(current, "hf")
+    assert not heuristic.is_stale(current, "heuristic")
+    assert not heuristic.is_stale(current, "unknown")

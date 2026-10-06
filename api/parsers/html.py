@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any, cast
 
-from api.parsers.common import DEFAULT_SECTION, DocumentSection, EmptyDocumentError, normalize_text
+from api.parsers.common import DocumentSection, EmptyDocumentError, cap_section, normalize_text
 
 _HTML_STRIP_TAGS = ("script", "style", "noscript", "template")
 
@@ -27,7 +27,7 @@ def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
     title_tag = soup.title.get_text(strip=True) if soup.title else ""
 
     sections: list[DocumentSection] = []
-    current_section = title_tag[:120] or DEFAULT_SECTION
+    current_section = cap_section(title_tag)
     buffer: list[str] = []
 
     def flush() -> None:
@@ -47,7 +47,7 @@ def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
         name = getattr(element, "name", None)
         if name in _HTML_HEADING_TAGS:
             flush()
-            current_section = element.get_text(" ", strip=True)[:120] or DEFAULT_SECTION
+            current_section = cap_section(element.get_text(" ", strip=True))
             buffer = []
         elif name is None:  # NavigableString
             # Comments, doctypes and processing instructions aren't rendered text: an

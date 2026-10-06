@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import type { ChatMode } from '../components/ChatHeader';
 import type { Command } from '../components/CommandPalette';
+import { isShortcutModifier } from '../utils/platform';
 import type { ConversationSummary } from './chatPersistence';
 
 /** What the command list shows: labels that flip, commands that can't run right now. */
@@ -31,6 +32,7 @@ export interface CommandActions {
   exportMarkdown: () => void;
   exportJson: () => void;
   browseTraces: () => void;
+  searchPassages: () => void;
   restoreBackup: () => void;
   downloadBackup: () => void;
   importConversation: () => void;
@@ -84,13 +86,18 @@ export function useCommands(
         run: () => run.current.newConversation(),
         disabled: pending,
       },
-      {
-        id: 'upload',
-        glyph: '↑',
-        label: 'Upload a document',
-        shortcut: '⌘U',
-        run: () => run.current.upload(),
-      },
+      // Not offered to the read-only key: the server refuses its uploads (403).
+      ...(readOnly
+        ? []
+        : [
+            {
+              id: 'upload',
+              glyph: '↑',
+              label: 'Upload a document',
+              shortcut: '⌘U',
+              run: () => run.current.upload(),
+            },
+          ]),
       {
         id: 'settings',
         glyph: '⚙',
@@ -131,6 +138,12 @@ export function useCommands(
         label: 'Export conversation as JSON',
         run: () => run.current.exportJson(),
         disabled: !hasTurns,
+      },
+      {
+        id: 'search-passages',
+        glyph: '⌕',
+        label: 'Search passages',
+        run: () => run.current.searchPassages(),
       },
       {
         id: 'traces',
@@ -203,7 +216,7 @@ export function useCommands(
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      if (!isShortcutModifier(event) || event.altKey) return;
       // Never stack a second dialog over Settings or the document viewer.
       if (paletteRef.current.otherDialogOpen) return;
       const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;

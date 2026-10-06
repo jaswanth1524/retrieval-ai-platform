@@ -2,38 +2,44 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
+from api.chunking import TokenCounter
 from api.corpus import bump_corpus_generation
 from api.dependencies import (
     require_api_key,
     require_full_key,
 )
 from api.documents import (
-    CHUNKER_VERSION,
     DocumentNotFoundError,
+    chunking_fingerprint,
     normalize_tags,
     validate_upload_filename,
 )
 from api.export import build_export, iter_file
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
+    FilenameConflictError,
     cancel_ingest_job,
     enqueue_ingest,
     original_still_stored,
+    refuse_near_duplicate_name,
     require_raw_store,
     stored_filename,
 )
 from api.ingestion import filename_write_lock, ingest_sequencer
 from api.jobs import JobNotFoundError, JobStore
+from api.raw_documents import RawDocumentStore
+from api.repository import DocumentMetadata, VectorRepository
 from api.restore import BackupImportError, restore_backup
 from api.routes.deps import (
     FeedbackStoreDep,
@@ -43,6 +49,7 @@ from api.routes.deps import (
     IngestServiceDep,
     RawDocumentStoreDep,
     SettingsDep,
+    TokenCounterDep,
     VectorRepositoryDep,
 )
 from api.routes.responses import content_chunk
@@ -58,7 +65,10 @@ from api.schemas import (
     DocumentTagsResponse,
     ImportResponse,
 )
+from api.settings import AppSettings
 from api.upload import read_upload_within_limit
+
+logger = logging.getLogger(__name__)
 
 _ORIGINAL_CHUNK_BYTES = 64 * 1024
 # A page of /content is at most 2 * this + 1 chunks.
@@ -93,9 +103,13 @@ def register(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def list_documents(
-        repository: VectorRepositoryDep, settings: SettingsDep, raw_store: RawDocumentStoreDep
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        raw_store: RawDocumentStoreDep,
+        token_counter: TokenCounterDep,
     ) -> DocumentListResponse:
         metadata = repository.filename_metadata(settings)
+        is_stale = _staleness(settings, token_counter)
         return DocumentListResponse(
             filenames=sorted(metadata),
             chunk_counts={name: meta.chunk_count for name, meta in metadata.items()},
@@ -110,11 +124,7 @@ def register(app: FastAPI) -> None:
                 for name, meta in metadata.items()
                 if meta.uploaded_at is not None
             },
-            stale_filenames=sorted(
-                name
-                for name, meta in metadata.items()
-                if meta.chunker_version is None or meta.chunker_version < CHUNKER_VERSION
-            ),
+            stale_filenames=sorted(name for name, meta in metadata.items() if is_stale(meta)),
             reindexable_filenames=sorted(
                 name
                 for name in metadata
@@ -128,9 +138,16 @@ def register(app: FastAPI) -> None:
         response_model=DocumentJobAcceptedResponse,
         status_code=202,
         dependencies=[Depends(require_full_key)],
+        responses={
+            409: {
+                "description": "With stored originals, the name differs from an existing "
+                "document's only by letter case or accents."
+            }
+        },
     )
     async def upload_document(
         ingest_service: IngestServiceDep,
+        repository: VectorRepositoryDep,
         settings: SettingsDep,
         job_store: IngestJobStoreDep,
         executor: IngestExecutorDep,
@@ -141,6 +158,12 @@ def register(app: FastAPI) -> None:
         # Rejected here, not in the background job: an unusable name or type used to
         # be accepted with a 202 and only fail once the client polled the job.
         filename = validate_upload_filename(file.filename or "")
+        if raw_store is not None:
+            known = await run_in_threadpool(_known_filenames, repository, settings)
+            try:
+                refuse_near_duplicate_name(filename, known)
+            except FilenameConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
         # job_store.create is a sqlite INSERT under JOB_STORE_BACKEND=sqlite; off the
         # event loop so it can't stall other in-flight requests.
@@ -172,13 +195,17 @@ def register(app: FastAPI) -> None:
         executor: IngestExecutorDep,
         backlog: IngestBacklogDep,
         raw_store: RawDocumentStoreDep,
+        token_counter: TokenCounterDep,
     ) -> DocumentReindexAllResponse:
         store = require_raw_store(raw_store)
+        is_stale = _staleness(settings, token_counter)
+        # 409 now, not one failed job per document, when the index can't take them.
+        repository.ensure_writable(settings)
         metadata = repository.filename_metadata(settings)
         jobs: list[DocumentJobAcceptedResponse] = []
         deferred: list[str] = []
         for name, meta in sorted(metadata.items()):
-            if meta.chunker_version is not None and meta.chunker_version >= CHUNKER_VERSION:
+            if not is_stale(meta):
                 continue
             size = store.size(name)
             if size is None:
@@ -229,6 +256,7 @@ def register(app: FastAPI) -> None:
     ) -> DocumentJobAcceptedResponse:
         store = require_raw_store(raw_store)
         name = stored_filename(filename)
+        repository.ensure_writable(settings)
         content = store.read(name)
         if content is None:
             raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
@@ -250,6 +278,12 @@ def register(app: FastAPI) -> None:
         "/documents/{filename}",
         response_model=DocumentDeleteResponse,
         dependencies=[Depends(require_full_key)],
+        responses={
+            409: {
+                "description": "A newer upload of the document was indexed after this "
+                "delete was requested; it was kept."
+            }
+        },
     )
     def delete_document(
         filename: str,
@@ -274,6 +308,18 @@ def register(app: FastAPI) -> None:
         sequence = ingest_sequencer.admit(filename)
         try:
             with filename_write_lock(filename):
+                # The lock isn't fair: an upload admitted after this delete can reach
+                # it first and be indexed. Deleting then would remove the newer
+                # document the user just uploaded, so the delete stands down.
+                superseded = ingest_sequencer.superseded_by(filename, sequence)
+                if superseded == "upload":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"A newer upload of '{filename}' was indexed after this "
+                        "delete was requested; it was kept.",
+                    )
+                if superseded == "delete":
+                    raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
                 point_ids = repository.point_ids_for_filename(settings, filename)
                 if point_ids:
                     repository.delete_by_ids(settings, point_ids)
@@ -283,7 +329,9 @@ def register(app: FastAPI) -> None:
                     ingest_sequencer.mark_applied(filename, sequence, deleted=True)
                 # Also when no points remain: an original orphaned by an earlier failed
                 # ingest was otherwise undeletable, since the 404 came first.
-                removed_original = raw_store.delete(filename) if raw_store is not None else False
+                removed_original = _delete_original(
+                    raw_store, filename, points_gone=bool(point_ids)
+                )
                 if not point_ids and not removed_original:
                     raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
                 ingest_sequencer.mark_applied(filename, sequence, deleted=True)
@@ -509,6 +557,9 @@ def register(app: FastAPI) -> None:
         def enqueue(
             filename: str, content: bytes, uploaded_at: float | None, tags: tuple[str, ...]
         ) -> DocumentJobAcceptedResponse:
+            if raw_store is not None:
+                # A DocumentError: listed under `rejected`, the rest still restored.
+                refuse_near_duplicate_name(filename, _known_filenames(repository, settings))
             return enqueue_ingest(
                 job_store=job_store,
                 executor=executor,
@@ -521,6 +572,9 @@ def register(app: FastAPI) -> None:
                 tags=tags,
             )
 
+        # The last step of recovering from an embedding change (export, delete all,
+        # import): an emptied collection is rebuilt here; a non-empty one is a 409.
+        repository.ensure_writable(settings)
         try:
             outcome = restore_backup(
                 file.file,
@@ -541,3 +595,40 @@ def register(app: FastAPI) -> None:
             feedback_imported=outcome.feedback_imported,
             feedback_skipped=outcome.feedback_skipped,
         )
+
+
+def _staleness(
+    settings: AppSettings, token_counter: TokenCounter
+) -> Callable[[DocumentMetadata], bool]:
+    """The one staleness rule the listing and bulk re-index share."""
+
+    fingerprint = chunking_fingerprint(settings)
+    counter_mode = str(getattr(token_counter, "mode", "unknown"))
+    return lambda meta: meta.is_stale(fingerprint, counter_mode)
+
+
+def _known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
+    """Every indexed filename plus those with an upload or delete in flight."""
+
+    return [*repository.filename_metadata(settings), *ingest_sequencer.in_flight()]
+
+
+def _delete_original(
+    raw_store: RawDocumentStore | None, filename: str, *, points_gone: bool
+) -> bool:
+    """Remove the stored original; True when one was removed.
+
+    Once the points are gone the delete has happened: a failure removing the original
+    (a read-only or permission-locked RAW_DOCUMENT_DIR) is logged rather than turned
+    into a 500, and a second DELETE removes the orphan through the no-points path.
+    """
+
+    if raw_store is None:
+        return False
+    try:
+        return raw_store.delete(filename)
+    except OSError:
+        if not points_gone:
+            raise
+        logger.exception("Could not remove the stored original of '%s'", filename)
+        return True

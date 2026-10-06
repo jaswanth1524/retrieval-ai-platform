@@ -208,7 +208,7 @@ class LiteLLMGenerator:
         except Exception as exc:
             # LiteLLM/provider SDKs raise many distinct exception types (auth,
             # connection, rate limit, ...); this boundary's job is translating all
-            # of them into our domain error so main.py maps them to a clean 502
+            # of them into our domain error so api/error_handlers.py maps them to a clean 502
             # instead of an opaque 500.
             if _never_connected(exc):
                 raise _connection_error(exc, settings) from exc
@@ -241,16 +241,43 @@ class LiteLLMGenerator:
             # completion_client's return type is `object` (it must also cover the
             # non-streaming response `complete` uses) — with stream=True it is
             # actually an iterable of chunks; cast narrows that for the loop below.
-            for chunk in cast(Iterable[object], response):
-                delta = extract_delta_text(chunk)
-                if delta:
-                    yield delta
+            try:
+                for chunk in cast(Iterable[object], response):
+                    delta = extract_delta_text(chunk)
+                    if delta:
+                        yield delta
+            finally:
+                _close_stream(response)
         except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
             raise _connection_error(exc, settings) from exc
         except Exception as exc:
             if _never_connected(exc):
                 raise _connection_error(exc, settings) from exc
             raise _provider_failure(exc) from exc
+
+
+def _close_stream(response: object) -> None:
+    """Release the provider's HTTP response when a stream ends early (client left).
+
+    LiteLLM's sync stream wrapper has ``aclose`` but no ``close``, and its line iterator
+    is only released when garbage-collected — meanwhile the connection stays open and
+    Ollama keeps generating an answer nobody reads, holding the GPU. Closing the
+    iterators down the chain reaches httpx's response, which closes the socket.
+    """
+
+    stream = getattr(response, "completion_stream", None)
+    for candidate in (
+        getattr(stream, "streaming_response", None),
+        getattr(stream, "response_iterator", None),
+        stream,
+        response,
+    ):
+        close = getattr(candidate, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - cleanup must never mask the real outcome
+                logger.debug("Closing the provider stream failed.", exc_info=True)
 
 
 class ChatGenerator(Protocol):

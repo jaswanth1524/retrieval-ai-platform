@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useDialog } from '../hooks/useDialog';
 import { shortcutLabel } from '../utils/platform';
 import './CommandPalette.css';
+import { isImeComposing } from '../utils/keyboard';
 
 export interface Command {
   id: string;
@@ -65,7 +66,7 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
       setHighlighted((prev) =>
         matches.length === 0 ? 0 : (prev - 1 + matches.length) % matches.length,
       );
-    } else if (event.key === 'Enter') {
+    } else if (event.key === 'Enter' && !isImeComposing(event)) {
       event.preventDefault();
       run(matches[highlighted]);
     }

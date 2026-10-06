@@ -1,6 +1,7 @@
 import { renderHook } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { type CommandActions, type CommandState, useCommands } from '../../src/hooks/useCommands';
+import { isShortcutModifier } from '../../src/utils/platform';
 
 function state(overrides: Partial<CommandState> = {}): CommandState {
   return {
@@ -30,6 +31,7 @@ function actions(): CommandActions {
     exportMarkdown: vi.fn(),
     exportJson: vi.fn(),
     browseTraces: vi.fn(),
+    searchPassages: vi.fn(),
     restoreBackup: vi.fn(),
     downloadBackup: vi.fn(),
     importConversation: vi.fn(),
@@ -39,7 +41,8 @@ function actions(): CommandActions {
 }
 
 function press(key: string, init: KeyboardEventInit = {}) {
-  document.dispatchEvent(new KeyboardEvent('keydown', { key, metaKey: true, ...init }));
+  // jsdom reports a non-Apple platform, where the shortcut modifier is Ctrl.
+  document.dispatchEvent(new KeyboardEvent('keydown', { key, ctrlKey: true, ...init }));
 }
 
 describe('useCommands', () => {
@@ -108,5 +111,33 @@ describe('useCommands', () => {
     const ids = result.current.map((command) => command.id);
     expect(ids).not.toContain('restore-backup');
     expect(ids).not.toContain('export-corpus');
+  });
+
+  it('leaves upload out for a read-only key, shortcut included', () => {
+    const run = actions();
+    const { result } = renderHook(() =>
+      useCommands(state({ readOnly: true }), run, {
+        otherDialogOpen: false,
+        togglePalette: vi.fn(),
+        closePalette: vi.fn(),
+      }),
+    );
+
+    press('u');
+
+    expect(result.current.map((command) => command.id)).not.toContain('upload');
+    expect(run.upload).not.toHaveBeenCalled();
+  });
+});
+
+describe('isShortcutModifier', () => {
+  it('takes ⌘ on a Mac, leaving Ctrl+K to text fields, and Ctrl elsewhere', () => {
+    const ctrl = new KeyboardEvent('keydown', { key: 'k', ctrlKey: true });
+    const meta = new KeyboardEvent('keydown', { key: 'k', metaKey: true });
+
+    expect(isShortcutModifier(meta, true)).toBe(true);
+    expect(isShortcutModifier(ctrl, true)).toBe(false);
+    expect(isShortcutModifier(ctrl, false)).toBe(true);
+    expect(isShortcutModifier(meta, false)).toBe(false);
   });
 });

@@ -135,3 +135,41 @@ def test_feedback_store_prunes_the_oldest_rows_past_its_cap(tmp_path: Path) -> N
         )
 
     assert [row.question for row in store.list_recent()] == ["q4", "q3", "q2"]
+
+
+def test_rows_restored_from_a_backup_are_ordered_and_pruned_by_their_age(
+    tmp_path: Path,
+) -> None:
+    """Restored rows are inserted last; ordered by insert they listed as the newest and
+    were the last to be pruned, however old they were."""
+
+    from api.feedback import Feedback
+
+    store = FeedbackStore(str(tmp_path / "feedback.db"), max_rows=3)
+    for index in range(2):
+        store.add(
+            trace_id=None,
+            question=f"live{index}",
+            answer_excerpt="a",
+            cited_filenames=[],
+            rating="up",
+            citation_source_number=None,
+        )
+    old = [
+        Feedback(
+            id=f"old{index}",
+            trace_id=None,
+            question=f"old{index}",
+            answer_excerpt="a",
+            cited_filenames=[],
+            rating="down",
+            citation_source_number=None,
+            created_at=1_000.0 + index,
+        )
+        for index in range(2)
+    ]
+
+    assert store.import_rows(old) == 2
+
+    # Four rows against a cap of three: the oldest restored one goes.
+    assert [row.question for row in store.list_recent()] == ["live1", "live0", "old1"]

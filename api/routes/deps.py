@@ -10,6 +10,7 @@ from fastapi import Depends
 from qdrant_client import QdrantClient
 
 from api.admission import QuestionSlots
+from api.chunking import TokenCounter
 from api.dependencies import (
     get_app_settings,
     get_feedback_store,
@@ -23,6 +24,7 @@ from api.dependencies import (
     get_question_slots,
     get_rag_pipeline,
     get_raw_document_store,
+    get_token_counter,
     get_trace_store,
     get_vector_repository,
 )
@@ -74,3 +76,6 @@ QuestionSlotsDep = Annotated[QuestionSlots, Depends(get_question_slots)]
 
 
 TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
+
+
+TokenCounterDep = Annotated[TokenCounter, Depends(get_token_counter)]

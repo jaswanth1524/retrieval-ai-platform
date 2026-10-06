@@ -1,7 +1,7 @@
 import type { CitationResponse } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 
-const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+export const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
   minute: '2-digit',
 });
@@ -50,5 +50,7 @@ export function downloadFile(filename: string, mimeType: string, content: string
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+  // Not revoked at once: Safari can still be reading a large file (a corpus backup)
+  // when the click returns. FileSaver.js waits 40 s for the same reason.
+  setTimeout(() => URL.revokeObjectURL(url), 40_000);
 }

@@ -64,3 +64,22 @@ def test_a_name_too_long_for_the_filesystem_reads_as_absent(tmp_path: Path) -> N
     assert store.path(long_name) is None
     assert store.read(long_name) is None
     assert store.delete(long_name) is False
+
+
+def test_temp_files_left_by_an_interrupted_save_are_swept_once_stale(tmp_path: Path) -> None:
+    import os
+    import time
+
+    stale = tmp_path / ".upload-abc123"
+    fresh = tmp_path / ".upload-def456"
+    for temp in (stale, fresh):
+        temp.write_bytes(b"partial")
+    an_hour_and_more_ago = time.time() - 3700
+    os.utime(stale, (an_hour_and_more_ago, an_hour_and_more_ago))
+    (tmp_path / "guide.txt").write_bytes(b"original")
+
+    RawDocumentStore(str(tmp_path))
+
+    assert not stale.exists()
+    assert fresh.exists()  # may still be a save in progress
+    assert (tmp_path / "guide.txt").read_bytes() == b"original"

@@ -85,6 +85,32 @@ describe('useCorpus', () => {
     expect(result.current.availableTags).toEqual([]);
   });
 
+  it('ignores a listing that was overtaken by a delete', async () => {
+    api.listDocuments.mockResolvedValueOnce({ filenames: ['a.md', 'b.md'], chunk_counts: {} });
+    const { result } = setup();
+    await act(() => result.current.refreshDocuments());
+
+    // A slow listing, requested before the delete, answers after it.
+    let answerSlowListing!: (value: unknown) => void;
+    api.listDocuments.mockReturnValueOnce(new Promise((resolve) => (answerSlowListing = resolve)));
+    let slow!: Promise<void>;
+    act(() => {
+      slow = result.current.refreshDocuments();
+    });
+    api.deleteDocument.mockResolvedValue({ filename: 'b.md', points_deleted: 1 });
+    await act(() => result.current.handleDeleteDocument('b.md'));
+    answerSlowListing({ filenames: ['a.md', 'b.md'], chunk_counts: {}, tags: { 'b.md': ['x'] } });
+    await act(() => slow);
+
+    expect(result.current.indexedFilenames).toEqual(['a.md']);
+
+    // Nor does a tag change that lands after the delete bring a record back.
+    api.setDocumentTags.mockResolvedValue({ filename: 'b.md', tags: ['late'] });
+    await act(() => result.current.handleSetTags('b.md', ['late']));
+    expect(result.current.documents).not.toHaveProperty('b.md');
+    expect(result.current.availableTags).toEqual([]);
+  });
+
   it('cancels an upload still waiting for room in the queue without asking the server', async () => {
     api.uploadDocument.mockRejectedValue(
       new ApiClientError('Too many documents are already waiting.', 503, 15),
@@ -122,6 +148,34 @@ describe('useCorpus', () => {
 
     expect(result.current.uploads).toEqual([]);
     expect(api.uploadDocument).toHaveBeenCalledTimes(1);
+    expect(api.cancelDocumentJob).not.toHaveBeenCalled();
+  });
+
+  it('aborts the request still sending the file when Cancel is pressed', async () => {
+    // Cancel only took effect after the whole body was sent: minutes for a big file on a
+    // slow link, with the card saying "cancelling" all along.
+    let sentSignal: AbortSignal | undefined;
+    api.uploadDocument.mockImplementation(
+      (_file: File, signal?: AbortSignal) =>
+        new Promise((_, reject) => {
+          sentSignal = signal;
+          signal?.addEventListener('abort', () =>
+            reject(new ApiClientError('Request timed out or was cancelled.')),
+          );
+        }),
+    );
+    const { result } = setup();
+
+    let upload!: Promise<void>;
+    act(() => {
+      upload = result.current.handleUpload([file]);
+    });
+    await waitFor(() => expect(sentSignal).toBeDefined());
+    act(() => result.current.handleCancelUpload(result.current.uploads[0].id));
+    await act(() => upload);
+
+    expect(sentSignal?.aborted).toBe(true);
+    expect(result.current.uploads).toEqual([]); // removed, not shown as a failure
     expect(api.cancelDocumentJob).not.toHaveBeenCalled();
   });
 

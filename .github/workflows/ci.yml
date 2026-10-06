@@ -12,10 +12,14 @@ on:
 permissions:
   contents: read
 
-# A new push to the same branch or PR supersedes the run in progress.
+# A new push to the same PR supersedes the run in progress. Not on main: two merges in
+# a row cancelled the first one's run, and the build caches it would have saved.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned by commit (the tag is kept as a comment): the docker job writes the
+# build cache the release build reads, so a moved tag here could reach a release.
 
 jobs:
   backend:
@@ -28,10 +32,10 @@ jobs:
         python-version: ["3.12", "3.13"]
     name: backend (python ${{ matrix.python-version }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -80,7 +84,7 @@ jobs:
         # ragas carries advisories with no fixed release to move to.
         run: |
           uv export --frozen --extra ocr --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
-          uvx pip-audit --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
+          uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
 
   qdrant:
     # The unit suite runs Qdrant in-process (":memory:"), which never exercises the
@@ -96,10 +100,10 @@ jobs:
           - 6333:6333
           - 6334:6334
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           python-version: "3.12"
           enable-cache: true
@@ -123,13 +127,29 @@ jobs:
           DOCRAG_TEST_QDRANT_GRPC_PORT: "6334"
         run: uv run pytest tests/test_qdrant_server.py -v
 
+      - name: Name the models to cache
+        # Keyed on what is downloaded — the model names, the reranker's ONNX export and the
+        # fastembed that fetches them — not on a file whose every edit threw away
+        # ~0.5 GB, while a fastembed upgrade kept stale ones.
+        id: models
+        run: |
+          key=$(uv run python -c "
+          import importlib.metadata as m
+          from api.settings import AppSettings as S
+          s = S(_env_file=None)
+          parts = [s.dense_embedding_model, s.sparse_embedding_model, s.reranker_model,
+                   s.reranker_onnx_file, m.version('fastembed')]
+          print('-'.join(parts).replace('/', '_'))
+          ")
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
       - name: Cache embedding and reranker models
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/fastembed
             ~/.cache/huggingface
-          key: models-${{ runner.os }}-${{ hashFiles('api/settings.py') }}
+          key: models-${{ runner.os }}-${{ steps.models.outputs.key }}
 
       # The retrieval eval (eval/harness.py) against real models and a real Qdrant: the
       # handbook corpus, split small so each section is its own chunk, scored at file
@@ -154,6 +174,16 @@ jobs:
             --baseline eval/baselines/handbook_reranked.json --max-regression 0.06 \
             --output eval-results.json
 
+      - name: Upload eval results
+        # Also on a regression: the numbers are what a baseline refresh is made from.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eval-results
+          path: eval-results.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -161,10 +191,10 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -196,10 +226,10 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -214,7 +244,7 @@ jobs:
 
       - name: Cache Playwright browsers
         id: browser-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-chromium
@@ -236,7 +266,7 @@ jobs:
 
       - name: Upload Playwright report and traces
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: playwright-evidence
           path: |
@@ -248,32 +278,67 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           load: true
           tags: docrag:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Its own scope: the release build reads `release`, so what CI writes can't
+          # reach a published image.
+          cache-from: type=gha,scope=ci
+          cache-to: type=gha,scope=ci,mode=max
 
-      # Booted, not just built: a missing runtime dependency or an import error used to
-      # ship unnoticed. WARMUP_MODELS=false keeps model downloads out of CI, and /health
-      # touches neither the models nor Qdrant.
-      - name: Boot image and probe /health
+      # Booted the way users run it — compose, with the read-only filesystem, dropped
+      # capabilities and a real Qdrant — not just `docker run`: a missing runtime
+      # dependency, an import error or a write the hardening forbids used to ship
+      # unnoticed. WARMUP_MODELS=false (compose.ci.yml) keeps model downloads out of CI.
+      - name: Boot the compose stack
+        env:
+          COMPOSE_FILES: -f docker-compose.yml -f .github/ci/compose.ci.yml
         run: |
-          docker run -d --name docrag-ci -p 8000:8000 -e WARMUP_MODELS=false docrag:ci
-          for _ in $(seq 60); do
-            if curl -fsS http://127.0.0.1:8000/health; then
-              curl -fsS http://127.0.0.1:8000/ | grep -q '<div id="root">'
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs docrag-ci
-          exit 1
+          docker compose $COMPOSE_FILES up -d --no-build --wait --wait-timeout 180
+
+      - name: Probe the running stack
+        run: |
+          curl -fsS http://127.0.0.1:8000/health
+          curl -fsS http://127.0.0.1:8000/ | grep -q '<div id="root">'
+          # /health/ready answers 503 with no Ollama here; the body still says whether
+          # Qdrant is reachable and the index matches.
+          ready=$(curl -sS http://127.0.0.1:8000/health/ready)
+          echo "$ready"
+          echo "$ready" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["qdrant"] is True and d["index_compatible"] is True, d'
+          # The image reports the version it was built from (api/version.py reads
+          # pyproject.toml, which must be copied into the image).
+          expected=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)
+          reported=$(curl -fsS http://127.0.0.1:8000/openapi.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])')
+          test "$reported" = "$expected" || { echo "image reports $reported, pyproject says $expected"; exit 1; }
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yml -f .github/ci/compose.ci.yml logs --no-color
+
+  docker-ocr:
+    # The OCR variant adds apt packages the default image doesn't have; build it (not
+    # boot it) on main so a broken UV_EXTRAS=ocr path doesn't wait for a user to hit it.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image with OCR
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          build-args: UV_EXTRAS=ocr
+          tags: docrag:ci-ocr
+          cache-from: type=gha,scope=ci-ocr
+          cache-to: type=gha,scope=ci-ocr,mode=max

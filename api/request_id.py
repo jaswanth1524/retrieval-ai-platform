@@ -8,9 +8,12 @@ or an upload can be followed from the access log through retrieval to its trace.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 import uuid
+from collections.abc import Callable
+from concurrent.futures import Executor, Future
 from contextvars import ContextVar
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -23,6 +26,16 @@ request_id_var: ContextVar[str | None] = ContextVar("docrag_request_id", default
 
 def current_request_id() -> str | None:
     return request_id_var.get()
+
+
+def submit_in_context[R](executor: Executor, function: Callable[[], R]) -> Future[R]:
+    """``executor.submit(function)``, run in a copy of the caller's context.
+
+    A pool thread starts with an empty context, so its log lines lost the request id.
+    One copy per task: a single Context can't be entered by two threads at once.
+    """
+
+    return executor.submit(contextvars.copy_context().run, function)
 
 
 class RequestIdMiddleware:

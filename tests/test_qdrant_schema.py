@@ -144,7 +144,7 @@ def test_existing_collection_with_embedding_tag_mismatch_is_rejected() -> None:
         metadata={EMBEDDING_MODEL_TAG_KEY: "other-tag"},
     )
 
-    with pytest.raises(EmbeddingModelMismatchError, match="Re-ingest documents"):
+    with pytest.raises(EmbeddingModelMismatchError, match="delete every document"):
         ensure_collection(client, settings)
 
 

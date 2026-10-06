@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import ConversationList from '../../src/components/ConversationList';
@@ -153,6 +153,19 @@ describe('ConversationList', () => {
     await userEvent.clear(input);
     await userEvent.type(input, 'Renamed{Enter}');
     expect(props.onRename).toHaveBeenCalledWith('c1', 'Renamed');
+  });
+
+  it('ignores the Enter that confirms an input-method candidate', async () => {
+    const props = setup();
+    await userEvent.click(screen.getByLabelText('Rename First chat'));
+    const input = screen.getByLabelText('Rename First chat');
+    await userEvent.clear(input);
+    await userEvent.type(input, 'nihon');
+
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(props.onRename).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.onRename).toHaveBeenCalledWith('c1', 'nihon');
   });
 
   it('filters a long list by title, always keeping the active conversation', async () => {

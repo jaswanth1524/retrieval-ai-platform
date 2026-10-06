@@ -57,6 +57,33 @@ export interface ImportResponse {
   feedback_skipped: number;
 }
 
+/** POST /search: the passages a question would be answered from, with no LLM involved. */
+export interface SearchRequest {
+  query: string;
+  filenames?: string[];
+  tags?: string[];
+  rerank_top_k?: number;
+}
+
+export interface SearchResultResponse {
+  rank: number;
+  filename: string;
+  page: number;
+  section: string;
+  chunk_id: string;
+  chunk_ordinal: number | null;
+  text: string;
+  /** RRF-fused hybrid score. */
+  retrieval_score: number;
+  /** Cross-encoder score, normalized to [0, 1]. */
+  rerank_score: number;
+}
+
+export interface SearchResponse {
+  results: SearchResultResponse[];
+  timings: { embed_ms: number; search_ms: number; rerank_ms: number };
+}
+
 export interface FeedbackItemResponse {
   id: string;
   trace_id: string | null;

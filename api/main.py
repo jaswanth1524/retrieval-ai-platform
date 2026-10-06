@@ -25,6 +25,7 @@ from api.dependencies import (
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.logging_config import configure_logging
+from api.qdrant_schema import check_dense_dimension
 from api.request_guard import RequestGuardMiddleware
 from api.request_id import RequestIdMiddleware
 from api.routes import documents as documents_routes
@@ -107,6 +108,7 @@ def run_model_warmup(
     embedding_provider: WarmupEmbeddingProvider,
     reranker: WarmupReranker,
     token_counter: WarmupTokenCounter | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
     """Force the lazy-loaded models to load once, logging duration or failure.
 
@@ -121,8 +123,14 @@ def run_model_warmup(
     misconfiguration is now visible in the startup log instead of silently deferred.
     """
 
+    def warm_embedding() -> None:
+        embedded = embedding_provider.embed_texts(["warmup"])
+        # A wrong QDRANT_DENSE_VECTOR_SIZE named at boot, not at the first upload.
+        if settings is not None:
+            check_dense_dimension(len(embedded[0].dense), settings)
+
     tasks: dict[str, Callable[[], object]] = {
-        "embedding": lambda: embedding_provider.embed_texts(["warmup"]),
+        "embedding": warm_embedding,
         "reranker": lambda: reranker.score("warmup", ["warmup"]),
     }
     if token_counter is not None:
@@ -154,7 +162,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_app_settings()
     if settings.warmup_models:
         await run_in_threadpool(
-            run_model_warmup, get_embedding_provider(), get_reranker(), get_token_counter()
+            run_model_warmup,
+            get_embedding_provider(),
+            get_reranker(),
+            get_token_counter(),
+            settings,
         )
     yield
     shutdown_executors()

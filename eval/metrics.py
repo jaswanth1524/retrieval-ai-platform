@@ -133,6 +133,18 @@ def baseline_shape_problems(current: Mapping[str, Any], baseline: Mapping[str, A
     baseline_arm = baseline.get("fingerprint", {}).get("arm", "reranked")
     if current_arm != baseline_arm:
         problems.append(f"arm differs: {current_arm} vs baseline {baseline_arm}")
+    # A setting both runs recorded and that differs measured something else: the
+    # comparison only noted it, so a baseline kept passing after a change that moved the
+    # ranking, and its allowed drop quietly absorbed the change. Settings only one side
+    # recorded (a baseline from before the key existed) stay a note.
+    current_print = current.get("fingerprint", {})
+    baseline_print = baseline.get("fingerprint", {})
+    for key in sorted(set(current_print) & set(baseline_print) - {"arm"}):
+        if current_print[key] != baseline_print[key]:
+            problems.append(
+                f"{key} differs: {current_print[key]!r} vs baseline {baseline_print[key]!r} "
+                "(re-measure the baseline with --output if the change is intended)"
+            )
     current_agg = current.get("aggregate", {})
     baseline_agg = baseline.get("aggregate", {})
     shared = [

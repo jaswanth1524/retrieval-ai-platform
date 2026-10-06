@@ -549,3 +549,77 @@ def test_text_with_a_unicode_byte_order_mark_decodes_by_it(encoding: str) -> Non
 
     assert "\x00" not in sections[0].text
     assert sections[0].text.startswith("Café notes")
+
+
+def test_a_long_markdown_heading_is_capped_and_cannot_explode_the_chunk_count() -> None:
+    from api.chunking import HeuristicTokenCounter
+
+    body = " ".join(f"Sentence {i} of the body text." for i in range(90))
+    settings = make_settings(chunk_size_tokens=448, chunk_overlap_tokens=100)
+    long_heading = parse_markdown_document("notes.md", f"# {'Heading ' * 250}\n\n{body}")
+    short_heading = parse_markdown_document("notes.md", f"# Heading\n\n{body}")
+
+    assert len(long_heading[0].section) == 120
+    long_chunks = chunk_sections(long_heading, settings, HeuristicTokenCounter())
+    short_chunks = chunk_sections(short_heading, settings, HeuristicTokenCounter())
+    # Was 4351 one-word chunks for a 2000-character heading over a body that makes 3.
+    assert len(long_chunks) <= 2 * len(short_chunks)
+
+
+def _sentences(count: int) -> str:
+    return " ".join(f"Sentence {i} is here." for i in range(count))  # 7 heuristic tokens each
+
+
+def test_an_overlap_at_or_over_the_window_budget_still_advances_half_a_window() -> None:
+    from api.chunking import HeuristicTokenCounter
+
+    sections = [DocumentSection(filename="notes.txt", page=1, section="Body", text=_sentences(300))]
+    # Budget ~44 tokens (6 sentences); an overlap of 46 used to step back all but one.
+    settings = make_settings(chunk_size_tokens=48, chunk_overlap_tokens=46)
+
+    chunks = chunk_sections(sections, settings, HeuristicTokenCounter())
+
+    assert len(chunks) <= 100  # was 300: one new sentence per window
+
+
+def test_a_prefix_bigger_than_the_chunk_size_keeps_a_floor_of_budget_for_text() -> None:
+    from api.chunking import HeuristicTokenCounter
+
+    filename = "a " * 100 + "notes.txt"  # ~160 heuristic tokens of prefix
+    sections = [DocumentSection(filename=filename, page=1, section="Body", text=_sentences(300))]
+    settings = make_settings(chunk_size_tokens=48, chunk_overlap_tokens=8)
+
+    chunks = chunk_sections(sections, settings, HeuristicTokenCounter())
+
+    # A budget of 1 token cut every sentence into single words: 1200 chunks.
+    assert len(chunks) == 300
+    assert all(chunk.text.startswith("Sentence ") for chunk in chunks)
+
+
+def test_markdown_code_fences_hide_comment_lines_from_heading_detection() -> None:
+    text = (
+        "# Install\n\nRun the script below to install everything you need today.\n\n"
+        "```bash\n# install the dependencies\nuv sync\n```\n\n"
+        "~~~\n# not a heading either\n```\nstill code\n~~~\n\n"
+        "# Usage\n\nStart the server and open the browser at the given port.\n"
+    )
+
+    sections = parse_markdown_document("readme.md", text)
+
+    assert [section.section for section in sections] == ["Install", "Usage"]
+    assert "# install the dependencies" in sections[0].text
+    assert "still code" in sections[0].text
+    # A .txt whose only "headings" are code comments isn't sniffed as Markdown.
+    assert not looks_like_markdown("notes\n```\n# one\n# two\n```\n")
+    assert looks_like_markdown("# one\ntext\n# two\ntext\n")
+
+
+def test_csv_section_labels_use_spreadsheet_row_numbers_despite_blank_rows() -> None:
+    csv_text = "name,port\n\napi,8000\nqdrant,6333\n\n\nui,5173\n"
+    settings = make_settings(csv_rows_per_section=2)
+
+    sections = parse_document_bytes("services.csv", csv_text.encode("utf-8"), settings)
+
+    # Row 1 is the header, rows 2, 5 and 6 are blank.
+    assert [section.section for section in sections] == ["Rows 3-4", "Rows 7-7"]
+    assert sections[1].text == "name: ui; port: 5173"

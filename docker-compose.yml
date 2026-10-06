@@ -41,6 +41,11 @@ services:
       retries: 12
 
   api:
+    # The released image (ghcr.io, see .github/workflows/release.yml) when pulled, the one
+    # built here otherwise: DOCRAG_PULL_POLICY=always with DOCRAG_VERSION=0.1.0 runs a
+    # release without building. The default builds from source, as before.
+    image: ghcr.io/jaswanth1524/retrieval-ai-platform:${DOCRAG_VERSION:-local}
+    pull_policy: ${DOCRAG_PULL_POLICY:-build}
     build:
       context: .
       dockerfile: Dockerfile
@@ -48,6 +53,9 @@ services:
         # Optional uv extras baked into the image, e.g. UV_EXTRAS=ocr for scanned PDFs.
         UV_EXTRAS: ${UV_EXTRAS:-}
     restart: unless-stopped
+    # Running ingests finish when the container is stopped (queued ones are failed), and
+    # a large PDF can take minutes: Docker's default 10 s killed them midway.
+    stop_grace_period: 60s
     logging: *default-logging
     # Hardened: the image is immutable at runtime. Writable places are only the model
     # cache volume, /app/data when its volume is mounted, and a tmpfs /tmp (upload
@@ -61,8 +69,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # The reranker's peak is ~2.7 GB (see README "Latency"). A cap keeps a runaway
-    # request from taking the whole Docker VM down with it; restart brings it back.
+    # The reranker peaks around 1.4 GB with the default int8 model and 2.3-2.7 GB with fp32
+    # (RERANKER_ONNX_FILE=; README "Latency"). A cap keeps a runaway request from taking
+    # the whole Docker VM down with it; restart brings it back.
     mem_limit: ${API_MEM_LIMIT:-4g}
     env_file:
       - .env.example

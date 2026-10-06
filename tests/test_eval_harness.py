@@ -24,6 +24,7 @@ def make_settings(**overrides: Any) -> AppSettings:
     defaults: dict[str, Any] = {
         "qdrant_url": ":memory:",
         "embedding_model_tag": "test-embedding:v1",
+        "qdrant_dense_vector_size": 3,  # the fake embedder's size
         "rerank_top_k": 3,
         "rerank_candidates": 10,
         "rerank_min_score": 0.0,
@@ -235,6 +236,14 @@ def test_baseline_checks_refuse_a_run_they_cannot_compare() -> None:
     assert baseline_shape_problems({**same, "k_values": [5]}, baseline)
     assert baseline_shape_problems({**same, "question_count": 4}, baseline)
     assert baseline_shape_problems({**same, "fingerprint": {"arm": "dense"}}, baseline)
+    # A setting that ranks results, changed since the baseline: refused, not just noted.
+    measured = {**baseline, "fingerprint": {"arm": "reranked", "reranker_onnx_file": "auto"}}
+    int8 = {**same, "fingerprint": {"arm": "reranked", "reranker_onnx_file": "auto"}}
+    fp32 = {**same, "fingerprint": {"arm": "reranked", "reranker_onnx_file": ""}}
+    assert baseline_shape_problems(int8, measured) == []
+    assert "reranker_onnx_file differs" in baseline_shape_problems(fp32, measured)[0]
+    # A key the older baseline never recorded is only a note.
+    assert baseline_shape_problems(int8, baseline) == []
     unlabeled = {**same, "aggregate": {"filename": {}, "chunk": {}}}
     assert "no metric" in baseline_shape_problems(unlabeled, baseline)[0]
 

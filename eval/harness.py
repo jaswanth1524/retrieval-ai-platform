@@ -287,6 +287,17 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "chunk_size_tokens": int(settings.chunk_size_tokens),
         "chunk_overlap_tokens": int(settings.chunk_overlap_tokens),
         "min_section_words": int(settings.min_section_words),
+        # What ranks the results. int8 vs fp32 reranking reorders borderline questions
+        # (the CI comment on the baseline's CPU says as much), and the rest decide which
+        # candidates are scored, kept and shown.
+        "reranker_onnx_file": settings.reranker_onnx_file,
+        "rerank_candidates": int(settings.rerank_candidates),
+        "rerank_min_score": float(settings.rerank_min_score),
+        "fused_top_n": int(settings.fused_top_n),
+        "context_neighbor_radius": int(settings.context_neighbor_radius),
+        "context_diversity_enabled": bool(settings.context_diversity_enabled),
+        "context_diversity_max_similarity": float(settings.context_diversity_max_similarity),
+        "dense_query_instruction": settings.dense_query_instruction,
     }
 
 

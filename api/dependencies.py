@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,8 @@ from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
 from api.tracing import TraceStore
 
+logger = logging.getLogger(__name__)
+
 
 @lru_cache
 def get_app_settings() -> AppSettings:
@@ -66,10 +69,15 @@ def get_embedding_provider() -> LocalEmbeddingProvider:
 def get_reranker() -> LocalCrossEncoderReranker:
     """Return a cached local cross-encoder reranker."""
 
+    settings = get_app_settings()
     try:
-        return LocalCrossEncoderReranker(get_app_settings())
+        return LocalCrossEncoderReranker(settings)
     except ValueError as exc:
-        raise RerankingError(str(exc)) from exc
+        # fastembed's message (supported-model lists, paths) stays in the log.
+        logger.warning("Could not load the reranker.", exc_info=True)
+        raise RerankingError(
+            f"Reranker model '{settings.reranker_model}' could not be loaded; check RERANKER_MODEL."
+        ) from exc
 
 
 @lru_cache
@@ -95,8 +103,8 @@ def get_ollama_reachability_checker() -> Callable[[AppSettings], bool]:
 def get_qdrant_reachability_checker() -> Callable[[QdrantClient], bool]:
     """Return the Qdrant-reachability probe.
 
-    Not cached, mirroring ``get_ollama_reachability_checker`` — exposed as a
-    dependency so tests can override it without needing a real Qdrant instance.
+    Not cached (unlike the Ollama probe): a readiness check must see Qdrant as it is
+    now. Exposed as a dependency so tests can override it without a real Qdrant.
     """
 
     return check_qdrant_reachable

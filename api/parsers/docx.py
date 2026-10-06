@@ -11,6 +11,7 @@ from api.parsers.common import (
     DocumentParseError,
     DocumentSection,
     EmptyDocumentError,
+    cap_section,
     normalize_text,
 )
 
@@ -78,7 +79,7 @@ def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
                 continue
             if style_name.startswith("Heading"):
                 flush()
-                current_section = text[:120] or DEFAULT_SECTION
+                current_section = cap_section(text)
                 buffer = [text]
             else:
                 buffer.append(text)

@@ -4,6 +4,7 @@ chunk -> embed -> index), each behind a single call so handlers stay thin.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 import uuid
@@ -22,7 +23,12 @@ from api.answer_cache import (
 from api.chunking import HeuristicTokenCounter, TokenCounter
 from api.corpus import bump_corpus_generation
 from api.diversity import select_diverse
-from api.documents import CHUNKER_VERSION, chunk_sections, parse_document_bytes
+from api.documents import (
+    CHUNKER_VERSION,
+    chunk_sections,
+    chunking_fingerprint,
+    parse_document_bytes,
+)
 from api.errors import public_error_message
 from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
@@ -44,8 +50,9 @@ from api.generation import (
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
+from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository, reciprocal_rank_fusion
-from api.request_id import current_request_id
+from api.request_id import current_request_id, submit_in_context
 from api.reranking import RerankedChunk, Reranker, rerank_candidates_detailed
 from api.retrieval import (
     QueryEmbeddingProvider,
@@ -167,7 +174,10 @@ def _map_concurrently[T, R](function: Callable[[T], R], items: Sequence[T]) -> l
 
     if len(items) <= 1:
         return [function(item) for item in items]
-    return list(_VARIANT_EXECUTOR.map(function, items))
+    futures = [
+        submit_in_context(_VARIANT_EXECUTOR, functools.partial(function, item)) for item in items
+    ]
+    return [future.result() for future in futures]
 
 
 def _cached_timings(started: float) -> StageTimings:
@@ -578,6 +588,23 @@ class RagPipeline:
             return question, condense_ms, None
         return condensed, condense_ms, condensed
 
+    def _stored_tag_variants(self, tags: Sequence[str], settings: AppSettings) -> list[str]:
+        """The stored spellings of ``tags``, matched the way tags are de-duplicated.
+
+        Tags are stored as first typed ("Finance") and de-duplicated case-insensitively,
+        but the payload filter matches exactly, so asking for "finance" found nothing.
+        Tags no document carries are kept as given: they still match nothing, where an
+        empty list would have dropped the filter and searched every document.
+        """
+
+        wanted = {" ".join(tag.split()).casefold() for tag in tags}
+        stored = {
+            tag
+            for metadata in self._repository.filename_metadata(settings).values()
+            for tag in metadata.tags
+        }
+        return sorted(tag for tag in stored if tag.casefold() in wanted) or list(tags)
+
     def _retrieve_and_rerank(
         self,
         question: str,
@@ -603,6 +630,8 @@ class RagPipeline:
         if not normalized_query:
             raise RetrievalError("Query text is required.")
         self._repository.ensure_ready(effective_settings)
+        if tags:
+            tags = self._stored_tag_variants(tags, effective_settings)
 
         # Multi-query expansion (opt-in): rewrite into variant phrasings, retrieve each,
         # and RRF-fuse the result lists with the same pinned rrf_k before one rerank.
@@ -625,6 +654,7 @@ class RagPipeline:
             lambda query: embed_query(query, self._embedding_provider), queries
         )
         embed_ms = (time.monotonic() - embed_start) * 1000
+        check_dense_dimension(len(query_embeddings[0].dense), effective_settings)
 
         search_start = time.monotonic()
         result_lists = _map_concurrently(
@@ -1184,6 +1214,9 @@ class IngestService:
         ``tags`` sets the document's tags (a restore) instead of carrying its current ones.
         """
 
+        # Before parsing: an index built for another embedding setup refuses the
+        # upload here unless it is empty, in which case it is rebuilt for this one.
+        self._repository.ensure_writable(self._settings)
         sections = parse_document_bytes(filename, content, self._settings)
         chunks = chunk_sections(sections, self._settings, self._token_counter)
         # Stamped here (not in chunk_sections) because this is the first point in the
@@ -1191,12 +1224,17 @@ class IngestService:
         # chunking itself works purely from parsed text.
         upload_stamp = uploaded_at if uploaded_at is not None else time.time()
         upload_size = len(content)
+        fingerprint = chunking_fingerprint(self._settings)
+        # Read after chunking: the tokenizer loads (or fails to) on first use.
+        counter_mode = getattr(self._token_counter, "mode", None)
         chunks = [
             replace(
                 chunk,
                 byte_size=upload_size,
                 uploaded_at=upload_stamp,
                 chunker_version=CHUNKER_VERSION,
+                chunking_fingerprint=fingerprint,
+                token_counter=counter_mode if counter_mode in ("hf", "heuristic") else None,
             )
             for chunk in chunks
         ]

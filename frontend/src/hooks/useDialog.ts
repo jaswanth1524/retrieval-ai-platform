@@ -2,7 +2,18 @@ import { useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 
 const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]';
+
+/** What Tab can actually reach inside ``container``, in order.
+ *
+ * ``summary`` (a <details> disclosure) is reachable but wasn't listed, so the trap
+ * wrapped before it; and a button taken out of the tab order (an inactive tab,
+ * tabindex=-1) was listed, so it could be the "last" item the trap waited for. */
+function tabbable(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+    (element) => element.getAttribute('tabindex') !== '-1',
+  );
+}
 
 // Open dialogs, innermost last. Several can be open at once (the document viewer opened
 // from the inspector drawer), and only the innermost may react to Escape or trap Tab —
@@ -40,8 +51,7 @@ export function useDialog<T extends HTMLElement = HTMLDivElement>(
     openerRef.current = document.activeElement as HTMLElement | null;
 
     const container = containerRef.current;
-    const focusables = container?.querySelectorAll<HTMLElement>(FOCUSABLE);
-    focusables?.[0]?.focus();
+    if (container) tabbable(container)[0]?.focus();
 
     const handleKey = (event: KeyboardEvent) => {
       if (openDialogs[openDialogs.length - 1] !== id) return;
@@ -54,7 +64,7 @@ export function useDialog<T extends HTMLElement = HTMLDivElement>(
 
       // Re-query on each Tab: the palette's result list changes as the user filters,
       // so a list captured at open time goes stale immediately.
-      const items = Array.from(containerRef.current.querySelectorAll<HTMLElement>(FOCUSABLE));
+      const items = tabbable(containerRef.current);
       if (items.length === 0) return;
       const first = items[0];
       const last = items[items.length - 1];

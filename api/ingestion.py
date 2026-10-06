@@ -6,13 +6,16 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from threading import Lock
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
+import numpy as np
+import numpy.typing as npt
 from qdrant_client import models
 
 from api.documents import DocumentChunk, EmptyDocumentError, contextual_text
 from api.embeddings import EmbeddedText, EmbeddingError
+from api.qdrant_schema import check_dense_dimension
 from api.settings import AppSettings
 
 
@@ -140,22 +143,31 @@ class IngestSequencer:
             self._in_flight[filename] = self._in_flight.get(filename, 0) + 1
             return self._next
 
+    def superseded_by(self, filename: str, sequence: int) -> Literal["upload", "delete"] | None:
+        """What newer operation on ``filename`` was applied after ``sequence`` was
+        admitted, if any. Call under its lock."""
+
+        with self._lock:
+            applied, was_delete = self._applied.get(filename, (0, False))
+        if applied <= sequence:
+            return None
+        return "delete" if was_delete else "upload"
+
     def check(self, filename: str, sequence: int) -> None:
         """Raise if a newer ingest (or delete) of ``filename`` was applied. Call under
         its lock."""
 
-        with self._lock:
-            applied, was_delete = self._applied.get(filename, (0, False))
-            if applied <= sequence:
-                return
-            if was_delete:
-                raise IngestionError(
-                    f"'{filename}' was deleted after this upload was queued; it was not indexed."
-                )
+        superseded = self.superseded_by(filename, sequence)
+        if superseded is None:
+            return
+        if superseded == "delete":
             raise IngestionError(
-                f"A newer version of '{filename}' was indexed while this one was "
-                "waiting; kept the newer version."
+                f"'{filename}' was deleted after this upload was queued; it was not indexed."
             )
+        raise IngestionError(
+            f"A newer version of '{filename}' was indexed while this one was "
+            "waiting; kept the newer version."
+        )
 
     def mark_applied(self, filename: str, sequence: int, *, deleted: bool = False) -> None:
         """Record an applied ingest — or, with ``deleted``, a delete: an upload queued
@@ -164,6 +176,12 @@ class IngestSequencer:
         with self._lock:
             if sequence > self._applied.get(filename, (0, False))[0]:
                 self._applied[filename] = (sequence, deleted)
+
+    def in_flight(self) -> list[str]:
+        """Filenames with an admitted upload, re-index or delete not yet finished."""
+
+        with self._lock:
+            return list(self._in_flight)
 
     def release(self, filename: str) -> None:
         with self._lock:
@@ -192,27 +210,32 @@ def ingest_chunks(
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
-    Chunks are embedded and upserted in batches of ``settings.ingest_batch_size`` so a
-    single huge document reports incremental progress (via ``on_progress(done, total)``)
-    and never holds one giant embedding call in memory. Stale-cleanup ordering is
-    unchanged: every filename's currently-indexed IDs are snapshotted *before* the
-    first batch is written, and only IDs absent from every new batch are deleted
-    afterward — a failure partway through a multi-batch ingest still leaves whatever
-    batches already succeeded correctly indexed, never wiped.
+    Two phases. Embedding — the slow part, minutes for a large PDF — runs first and
+    takes no lock, in batches of ``settings.ingest_batch_size`` that report progress via
+    ``on_progress(done, total)``. Only the write takes ``filename_write_lock``: holding
+    it through embedding kept a DELETE or a tag change of the same document waiting on
+    a request thread for the whole ingest. Tags aren't part of the embedded text, so
+    the vectors don't depend on anything the lock protects.
+
+    The write is unchanged: every filename's currently indexed IDs are snapshotted
+    *before* the first batch is written, and only IDs absent from the new version are
+    deleted afterward — a failure partway through a multi-batch write still leaves the
+    batches already written correctly indexed, never wiped.
+
+    ``precondition`` aborts the ingest by raising. It runs before embedding and between
+    embedding batches, so work that is already doomed (a cancelled job, a newer upload
+    already indexed) stops early, and again first thing under the lock, where it
+    decides — a re-index checks there that its document wasn't deleted while the job
+    waited, since a DELETE in that window would otherwise be undone.
 
     ``on_indexed`` runs once the new version is fully written (before stale cleanup),
     still inside the filename lock — for side effects that must be atomic with the
     index (the stored original), so a concurrent DELETE can't interleave with them.
 
-    ``precondition`` runs first thing under the same lock and aborts the ingest by
-    raising — a re-index checks there that its document wasn't deleted while the job
-    waited in the queue, since a DELETE in that window would otherwise be undone.
-
     ``carry_tags`` stamps each chunk with its document's current tags, read under the
     same lock ``PATCH /documents/{filename}/tags`` takes — read any earlier and a tag
-    change landing while this ingest parsed or queued was overwritten by the old tags.
-    Tags aren't part of the embedded text, so this never changes a vector. ``tags``,
-    when given, sets the tags outright instead (a restore from a backup).
+    change landing while this ingest embedded or queued was overwritten by the old
+    tags. ``tags``, when given, sets the tags outright instead (a restore from a backup).
 
     ``before_first_write`` runs once, right before the first batch is upserted, and
     aborts the ingest by raising — the last point where nothing has changed yet (job
@@ -226,8 +249,26 @@ def ingest_chunks(
     # without paying for embedding work on chunks that can't be written anyway.
     repository.ensure_ready(settings)
 
-    # Filenames are locked in sorted order (already sorted below) so two multi-file
-    # ingests that share more than one filename can never deadlock on each other.
+    batch_size = int(settings.ingest_batch_size)
+    total = len(chunks)
+    embeddings: list[_StoredEmbedding] = []
+    for start in range(0, total, batch_size):
+        if precondition is not None:
+            precondition()
+        batch = chunks[start : start + batch_size]
+        embedded = embedding_provider.embed_texts([_contextual_embedding_text(c) for c in batch])
+        if len(embedded) != len(batch):
+            raise EmbeddingError(
+                f"Embedding count mismatch: got {len(embedded)}, expected {len(batch)}."
+            )
+        if start == 0:
+            check_dense_dimension(len(embedded[0].dense), settings)
+        embeddings.extend(_StoredEmbedding.of(embedding) for embedding in embedded)
+        if on_progress is not None:
+            on_progress(min(start + batch_size, total), total)
+
+    # Filenames are locked in sorted order so two multi-file ingests that share more
+    # than one filename can never deadlock on each other.
     filenames = sorted({chunk.filename for chunk in chunks})
 
     with ExitStack() as locks:
@@ -253,29 +294,22 @@ def ingest_chunks(
         for filename in filenames:
             stale_candidate_ids.update(repository.point_ids_for_filename(settings, filename))
 
-        batch_size = int(settings.ingest_batch_size)
-        total = len(chunks)
         new_ids: set[str] = set()
-        batches_written = 0
         for start in range(0, total, batch_size):
-            batch = list(chunks[start : start + batch_size])
-            embeddings = embedding_provider.embed_texts(
-                [_contextual_embedding_text(c) for c in batch]
-            )
-            if len(embeddings) != len(batch):
-                raise EmbeddingError(
-                    f"Embedding count mismatch: got {len(embeddings)}, expected {len(batch)}."
-                )
             points = [
-                build_point(chunk, embedding, settings)
-                for chunk, embedding in zip(batch, embeddings, strict=True)
+                build_point(chunk, embedding.restore(), settings)
+                for chunk, embedding in zip(
+                    chunks[start : start + batch_size],
+                    embeddings[start : start + batch_size],
+                    strict=True,
+                )
             ]
-            if batches_written == 0 and before_first_write is not None:
+            if start == 0 and before_first_write is not None:
                 before_first_write()
             try:
                 repository.upsert(settings, points)
             except Exception as exc:
-                if batches_written == 0:
+                if start == 0:
                     raise IngestionError(
                         f"Indexing failed while updating {', '.join(filenames)}; the previous "
                         "version remains indexed. Please retry the upload."
@@ -286,9 +320,6 @@ def ingest_chunks(
                     "version). Please retry the upload."
                 ) from exc
             new_ids.update(str(point.id) for point in points)
-            batches_written += 1
-            if on_progress is not None:
-                on_progress(min(start + batch_size, total), total)
 
         # Every batch of the new version is live from here on, so its original bytes
         # belong to it now — before stale cleanup, whose failure still leaves the new
@@ -311,6 +342,26 @@ def ingest_chunks(
             collection_name=settings.qdrant_collection,
             points_count=total,
         )
+
+
+@dataclass(frozen=True)
+class _StoredEmbedding:
+    """One chunk's vectors, held between embedding and the locked write.
+
+    The dense vector as float32 rather than a list of Python floats (~8x the memory):
+    a whole document's vectors now wait for the write instead of one batch's. The model
+    produces float32, so the round trip is exact.
+    """
+
+    dense: npt.NDArray[np.float32]
+    sparse: models.SparseVector
+
+    @classmethod
+    def of(cls, embedding: EmbeddedText) -> _StoredEmbedding:
+        return cls(dense=np.asarray(embedding.dense, dtype=np.float32), sparse=embedding.sparse)
+
+    def restore(self) -> EmbeddedText:
+        return EmbeddedText(dense=self.dense.tolist(), sparse=self.sparse)
 
 
 def _contextual_embedding_text(chunk: DocumentChunk) -> str:

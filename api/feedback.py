@@ -78,9 +78,22 @@ class FeedbackStore:
                 )
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS feedback_created_at ON feedback (created_at)")
 
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_transaction(self._path)
+
+    def _trim(self, conn: sqlite3.Connection) -> None:
+        """Keep the newest ``max_rows`` by when they were given, not by insert order:
+        rows restored from a backup are inserted last but can be the oldest."""
+
+        if self._max_rows is None:
+            return
+        conn.execute(
+            "DELETE FROM feedback WHERE rowid NOT IN (SELECT rowid FROM feedback "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+            (self._max_rows,),
+        )
 
     def add(
         self,
@@ -117,12 +130,7 @@ class FeedbackStore:
                     feedback.created_at,
                 ),
             )
-            if self._max_rows is not None:
-                conn.execute(
-                    "DELETE FROM feedback WHERE rowid <= "
-                    "(SELECT rowid FROM feedback ORDER BY rowid DESC LIMIT 1 OFFSET ?)",
-                    (self._max_rows,),
-                )
+            self._trim(conn)
         return feedback
 
     def import_rows(self, rows: Sequence[Feedback]) -> int:
@@ -149,22 +157,18 @@ class FeedbackStore:
                     ),
                 )
                 added += cursor.rowcount
-            if self._max_rows is not None:
-                conn.execute(
-                    "DELETE FROM feedback WHERE rowid <= "
-                    "(SELECT rowid FROM feedback ORDER BY rowid DESC LIMIT 1 OFFSET ?)",
-                    (self._max_rows,),
-                )
+            self._trim(conn)
         return added
 
     def list_recent(self, limit: int = 100) -> list[Feedback]:
-        """Return the most recently recorded feedback, newest first."""
+        """Return the most recent feedback, newest first by when it was given (a row
+        restored from a backup keeps its original time)."""
 
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, trace_id, question, answer_excerpt, cited_filenames_json, "
                 "rating, citation_source_number, created_at FROM feedback "
-                "ORDER BY rowid DESC LIMIT ?",
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [

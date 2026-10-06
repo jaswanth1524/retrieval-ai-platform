@@ -58,4 +58,24 @@ describe('useBackgroundNotice', () => {
     on.rerender({ pending: false });
     expect(shown).toEqual(['Answer ready']);
   });
+
+  it('says when the question failed or was stopped instead of "Answer ready"', () => {
+    const shown: string[] = [];
+    class FakeNotification {
+      static permission = 'granted';
+      constructor(title: string) {
+        shown.push(title);
+      }
+    }
+    vi.stubGlobal('Notification', FakeNotification);
+    setHidden(true);
+    for (const outcome of ['failed', 'stopped'] as const) {
+      const hook = renderHook(
+        ({ pending }) => useBackgroundNotice(pending, true, 'q', outcome),
+        { initialProps: { pending: true } },
+      );
+      hook.rerender({ pending: false });
+    }
+    expect(shown).toEqual(['Question failed', 'Answer stopped']);
+  });
 });
