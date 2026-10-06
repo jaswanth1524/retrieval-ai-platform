@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -57,6 +59,7 @@ __all__ = [
     "UnsupportedDocumentError",
     "build_chunk_id",
     "chunk_sections",
+    "chunking_fingerprint",
     "contextual_text",
     "infer_section",
     "looks_like_markdown",
@@ -68,6 +71,9 @@ __all__ = [
     "parse_markdown_document",
     "validate_upload_filename",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 Parser = Callable[[str, bytes, AppSettings | None], list[DocumentSection]]
@@ -121,14 +127,44 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 
 
 # Chunker output format version — bumped when the chunking algorithm changes in a way
-# that alters chunk contents (v2: token-aware, sentence-boundary windowing). Logged per
-# ingest for trace/debug clarity. Not stored on the collection: the vector space is
-# unchanged (same embedding model), so old and new chunks stay mutually queryable — a
-# hard refusal would punish existing corpora for a quality improvement. Re-uploading a
-# document replaces its chunks (deterministic point IDs + stale-chunk cleanup).
+# that alters chunk contents (v2: token-aware, sentence-boundary windowing). Not a
+# collection-level check: the vector space is unchanged (same embedding model), so old
+# and new chunks stay mutually queryable — a hard refusal would punish existing corpora
+# for a quality improvement. Instead it is stamped per point and part of
+# ``chunking_fingerprint``, so documents chunked by an older version are listed as stale.
 # v3: token counts exclude [CLS]/[SEP] per unit (reserved once per chunk instead), so
 # windows fill their budget rather than stopping ~2 tokens short per sentence.
-CHUNKER_VERSION = 3
+# v4: section labels capped at 120 characters in every parser (Markdown headings weren't),
+# no headings detected inside fenced code blocks, CSV labels use spreadsheet row numbers,
+# and a long filename/section prefix can no longer shrink the window budget to a token.
+# Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
+# carry an older version is listed as stale, and re-indexing it applies this one.
+CHUNKER_VERSION = 4
+
+# The smallest share of CHUNK_SIZE_TOKENS a window keeps for text, whatever the
+# filename › section prefix costs. Without a floor a long name left one token per
+# window: each chunk was a single word, embedded under a prefix many times its size.
+_MIN_BUDGET_SHARE = 4
+
+
+def chunking_fingerprint(settings: AppSettings) -> str:
+    """A short hash of everything that decides a document's chunks.
+
+    Stamped on every point at ingest, so a document chunked under other settings —
+    ``CHUNK_SIZE_TOKENS``, overlap, the dense model's tokenizer, a ``CHUNKER_VERSION``
+    bump — is listed as stale and can be re-indexed, instead of only a version bump
+    being noticed.
+    """
+
+    decided_by = {
+        "chunker_version": CHUNKER_VERSION,
+        "chunk_size_tokens": int(settings.chunk_size_tokens),
+        "chunk_overlap_tokens": int(settings.chunk_overlap_tokens),
+        "min_section_words": int(settings.min_section_words),
+        "csv_rows_per_section": int(settings.csv_rows_per_section),
+        "dense_embedding_model": settings.dense_embedding_model,
+    }
+    return sha256(json.dumps(decided_by, sort_keys=True).encode()).hexdigest()[:12]
 
 
 class ChunkConfigError(DocumentError):
@@ -174,6 +210,10 @@ class DocumentChunk:
     # Document-level labels (PATCH /documents/{filename}/tags), stamped on every chunk
     # so a question can be scoped by tag with the same payload filter as by filename.
     tags: tuple[str, ...] = ()
+    # ``chunking_fingerprint(settings)`` at ingest, and which token counter sized the
+    # chunks ("hf" or "heuristic", see api/chunking.py). Absent on older points.
+    chunking_fingerprint: str | None = None
+    token_counter: str | None = None
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
@@ -181,6 +221,8 @@ class DocumentChunk:
     PAYLOAD_UPLOADED_AT_KEY: ClassVar[str] = "uploaded_at"
     PAYLOAD_CHUNKER_VERSION_KEY: ClassVar[str] = "chunker_version"
     PAYLOAD_TAGS_KEY: ClassVar[str] = "tags"
+    PAYLOAD_FINGERPRINT_KEY: ClassVar[str] = "chunking_fingerprint"
+    PAYLOAD_TOKEN_COUNTER_KEY: ClassVar[str] = "token_counter"
 
     def to_payload(self) -> dict[str, str | int | float | list[str]]:
         """Return the Qdrant payload shape needed for grounded citations."""
@@ -201,6 +243,10 @@ class DocumentChunk:
             payload[self.PAYLOAD_CHUNKER_VERSION_KEY] = self.chunker_version
         if self.tags:
             payload[self.PAYLOAD_TAGS_KEY] = list(self.tags)
+        if self.chunking_fingerprint is not None:
+            payload[self.PAYLOAD_FINGERPRINT_KEY] = self.chunking_fingerprint
+        if self.token_counter is not None:
+            payload[self.PAYLOAD_TOKEN_COUNTER_KEY] = self.token_counter
         return payload
 
 
@@ -263,10 +309,27 @@ def chunk_sections(
         # Counts exclude special tokens; the ones the model wraps around each embedded
         # string ([CLS]/[SEP]) are reserved once per chunk here.
         special = int(getattr(token_counter, "special_tokens_per_sequence", 0))
-        budget = max(1, chunk_size - prefix_tokens - special)
+        budget = chunk_size - prefix_tokens - special
+        floor = max(1, chunk_size // _MIN_BUDGET_SHARE)
+        if budget < floor:
+            # prefix + chunk now exceeds CHUNK_SIZE_TOKENS. At the default 448 it still
+            # fits the model's 512: filenames are capped at 255 bytes and section
+            # labels at 120 characters, so the prefix can't grow without bound.
+            logger.warning(
+                "The filename/section prefix of '%s' costs %d of CHUNK_SIZE_TOKENS=%d; "
+                "keeping %d tokens per chunk for text.",
+                filename,
+                prefix_tokens,
+                chunk_size,
+                floor,
+            )
+            budget = floor
+        # Overlap counts against the window: at or above the budget each window would
+        # advance by a single sentence and repeat the rest of the previous one.
+        window_overlap = min(overlap, budget // 2)
 
         units = _sentence_units(group, budget, token_counter)
-        for window in _window_units(units, budget, overlap):
+        for window in _window_units(units, budget, window_overlap):
             chunk_text = " ".join(unit.text for unit in window).strip()
             if not chunk_text:
                 continue

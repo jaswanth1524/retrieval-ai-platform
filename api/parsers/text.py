@@ -10,6 +10,7 @@ from api.parsers.common import (
     DocumentParseError,
     DocumentSection,
     EmptyDocumentError,
+    cap_section,
     infer_section,
     normalize_text,
 )
@@ -20,6 +21,36 @@ _SETEXT_H1_UNDERLINE_RE = re.compile(r"^\s{0,3}=+\s*$")
 
 
 _MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+
+
+# A fenced code block's opening/closing line: three or more backticks or tildes. Lines
+# inside one are code — a "# comment" in a bash block is not a heading.
+_CODE_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+class _FenceTracker:
+    """Tracks whether a line sits inside a fenced code block (CommonMark rules).
+
+    A fence closes on a line of the same character at least as long as the opener; an
+    unclosed fence runs to the end of the document.
+    """
+
+    def __init__(self) -> None:
+        self._open: str | None = None
+
+    def is_code(self, line: str) -> bool:
+        """Feed one line; True when it is a fence line or inside a fenced block."""
+
+        match = _CODE_FENCE_RE.match(line)
+        if self._open is None:
+            if match:
+                self._open = match.group(1)
+                return True
+            return False
+        if match and match.group(1)[0] == self._open[0] and len(match.group(1)) >= len(self._open):
+            if not line.strip().strip(match.group(1)[0]):
+                self._open = None
+        return True
 
 
 # .txt content sniffing: >=2 heading lines is treated as evidence the file is
@@ -105,13 +136,18 @@ def parse_markdown_document(filename: str, text: str) -> list[DocumentSection]:
             )
 
     lines = text.splitlines()
+    fences = _FenceTracker()
     index = 0
     while index < len(lines):
         line = lines[index]
+        if fences.is_code(line):
+            buffer.append(line)
+            index += 1
+            continue
         atx_match = _MARKDOWN_HEADING_RE.match(line)
         if atx_match:
             flush()
-            current_section = atx_match.group(1).strip() or DEFAULT_SECTION
+            current_section = cap_section(atx_match.group(1).strip())
             buffer = [line]
             index += 1
             continue
@@ -119,7 +155,7 @@ def parse_markdown_document(filename: str, text: str) -> list[DocumentSection]:
         next_line = lines[index + 1] if index + 1 < len(lines) else ""
         if line.strip() and _SETEXT_H1_UNDERLINE_RE.match(next_line):
             flush()
-            current_section = line.strip() or DEFAULT_SECTION
+            current_section = cap_section(line.strip())
             buffer = [line, next_line]
             index += 2
             continue
@@ -140,8 +176,11 @@ def looks_like_markdown(text: str) -> bool:
     """
 
     lines = text.splitlines()
+    fences = _FenceTracker()
     heading_count = 0
     for index, line in enumerate(lines):
+        if fences.is_code(line):
+            continue
         next_line = lines[index + 1] if index + 1 < len(lines) else ""
         is_heading = bool(_MARKDOWN_HEADING_RE.match(line)) or (
             bool(line.strip()) and bool(_SETEXT_H1_UNDERLINE_RE.match(next_line))

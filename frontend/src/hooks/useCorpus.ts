@@ -57,6 +57,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
   const [documents, setDocuments] = useState<Record<string, DocumentMeta>>({});
   const uploadsRef = useRef(uploads);
   uploadsRef.current = uploads;
+  const indexedRef = useRef(indexedFilenames);
+  indexedRef.current = indexedFilenames;
 
   const actions = useMemo(() => {
     // Per upload (by UploadItem id), outside React state so a click can't race a render:
@@ -65,13 +67,22 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     const jobIds = new Map<string, string>();
     const cancelRequested = new Set<string>();
     const wakeWaiting = new Map<string, () => void>();
+    // The request still sending the file: Cancel aborts it instead of waiting for the
+    // whole body to go up first.
+    const sending = new Map<string, AbortController>();
 
     const removeUpload = (id: string) => {
       setUploads((prev) => prev.filter((item) => item.id !== id));
     };
 
+    // Listings can come back out of order (a slow one started before a delete landing
+    // after it put the deleted document back); only the latest one requested applies.
+    let listingSequence = 0;
+
     const refreshDocuments = async (signal?: AbortSignal) => {
+      const sequence = ++listingSequence;
       const response = await api.listDocuments(signal);
+      if (sequence !== listingSequence) return;
       setIndexedFilenames(response.filenames);
       // A document deleted elsewhere (another tab, the API) stayed in scope: the header
       // still named it and the popover — which lists only indexed files — couldn't
@@ -89,13 +100,16 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     // and will drain: wait and try again rather than fail every file past the cap.
     const startWhenQueueHasRoom = async (
       id: string,
-      start: () => Promise<DocumentJobAcceptedResponse>,
+      start: (signal: AbortSignal) => Promise<DocumentJobAcceptedResponse>,
     ): Promise<DocumentJobAcceptedResponse> => {
       for (let attempt = 1; ; attempt += 1) {
         if (cancelRequested.has(id)) throw new UploadCancelled();
+        const controller = new AbortController();
+        sending.set(id, controller);
         try {
-          return await start();
+          return await start(controller.signal);
         } catch (err) {
+          if (controller.signal.aborted && cancelRequested.has(id)) throw new UploadCancelled();
           const waitSeconds = err instanceof ApiClientError ? err.retryAfterSeconds : undefined;
           if (
             !(err instanceof ApiClientError) ||
@@ -124,6 +138,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
             const timer = setTimeout(wake, Math.min(Math.max(waitSeconds, 1), 30) * 1000);
             wakeWaiting.set(id, wake);
           });
+        } finally {
+          sending.delete(id);
         }
       }
     };
@@ -150,7 +166,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     const runIngestJob = async (
       id: string,
       filename: string,
-      start: () => Promise<DocumentJobAcceptedResponse>,
+      start: (signal: AbortSignal) => Promise<DocumentJobAcceptedResponse>,
     ) => {
       try {
         const accepted = await startWhenQueueHasRoom(id, start);
@@ -222,7 +238,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     };
 
     const uploadOne = (file: File, id: string) =>
-      runIngestJob(id, file.name, () => api.uploadDocument(file));
+      runIngestJob(id, file.name, (signal) => api.uploadDocument(file, signal));
 
     // Stops an upload or re-index: before the server has it, locally; after, by asking
     // the server, which refuses (409) once the job has started writing to the index.
@@ -238,6 +254,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         return;
       }
       cancelRequested.add(id);
+      sending.get(id)?.abort();
       wakeWaiting.get(id)?.();
     };
 
@@ -253,7 +270,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     const handleReindex = async (filename: string) => {
       const id = newId();
       setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true }]);
-      await runIngestJob(id, filename, () => api.reindexDocument(filename));
+      await runIngestJob(id, filename, (signal) => api.reindexDocument(filename, signal));
       await refreshAfterIngest();
     };
 
@@ -335,8 +352,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         ),
       );
       const { file, filename } = item;
-      await runIngestJob(id, filename, () =>
-        file ? api.uploadDocument(file) : api.reindexDocument(filename),
+      await runIngestJob(id, filename, (signal) =>
+        file ? api.uploadDocument(file, signal) : api.reindexDocument(filename, signal),
       );
       await refreshAfterIngest();
     };
@@ -347,6 +364,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     const handleDeleteDocument = async (filename: string) => {
       await api.deleteDocument(filename);
+      // Any listing already on its way predates the delete.
+      listingSequence += 1;
       // A deleted document can never remain in the corpus or the active search scope.
       setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
       deps.current.removeFromScopes([filename]);
@@ -360,6 +379,9 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     const handleSetTags = async (filename: string, tags: string[]) => {
       const result = await api.setDocumentTags(filename, tags);
+      // Deleted while the request was out: don't bring back a record for it, whose
+      // tags would linger in the scope popover.
+      if (!indexedRef.current.includes(filename)) return;
       setDocuments((prev) => ({
         ...prev,
         // Indexed moments ago and not refreshed yet: the rest arrives with the next

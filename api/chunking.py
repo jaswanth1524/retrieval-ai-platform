@@ -12,8 +12,10 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass, replace
-from typing import Protocol
+from threading import Lock
+from typing import Literal, Protocol
 
 from api.parsers.common import DocumentSection
 
@@ -38,10 +40,18 @@ class TokenCounter(Protocol):
 _BERT_SPECIAL_TOKENS = 2
 
 
+TokenCounterMode = Literal["hf", "heuristic", "unknown"]
+
+# How long a failed tokenizer fetch keeps chunking on the heuristic before it is tried
+# again. One failure (offline at boot) used to degrade the process for its lifetime.
+_TOKENIZER_RETRY_SECONDS = 300.0
+
+
 class HeuristicTokenCounter:
     """Word-count-based token estimate; no model, always available."""
 
     special_tokens_per_sequence = _BERT_SPECIAL_TOKENS
+    mode: TokenCounterMode = "heuristic"
 
     def count(self, text: str) -> int:
         words = len(text.split())
@@ -52,8 +62,10 @@ class HFTokenCounter:
     """Counts subword tokens with the dense model's own tokenizer, lazy-loaded once.
 
     The tokenizer is fetched on the first ``count`` call, not at construction, so
-    building the counter is free and a fetch failure degrades to the heuristic (logged
-    once) rather than raising — a document must still ingest without network access.
+    building the counter is free and a fetch failure degrades to the heuristic (logged)
+    rather than raising — a document must still ingest without network access. The
+    fetch is retried after ``_TOKENIZER_RETRY_SECONDS``, and ``mode`` says which counter
+    sized the chunks, so documents chunked by the heuristic can be found and re-indexed.
     """
 
     special_tokens_per_sequence = _BERT_SPECIAL_TOKENS
@@ -62,11 +74,18 @@ class HFTokenCounter:
         self._model_name = model_name
         self._tokenizer: object | None = None
         self._fallback = HeuristicTokenCounter()
-        self._degraded = False
+        self._degraded_at: float | None = None
+        self._load_lock = Lock()
+
+    @property
+    def mode(self) -> TokenCounterMode:
+        """Which counter ``count`` uses now; reading it never triggers a load."""
+
+        if self._tokenizer is not None:
+            return "hf"
+        return "heuristic" if self._degraded_at is not None else "unknown"
 
     def count(self, text: str) -> int:
-        if self._degraded:
-            return self._fallback.count(text)
         if self._tokenizer is None and not self._load():
             return self._fallback.count(text)
         # Without special tokens: [CLS]/[SEP] wrap the whole embedded string once, and
@@ -79,20 +98,31 @@ class HFTokenCounter:
         return len(encode.ids)
 
     def _load(self) -> bool:
-        try:
-            from tokenizers import Tokenizer
+        with self._load_lock:
+            if self._tokenizer is not None:
+                return True
+            if (
+                self._degraded_at is not None
+                and time.monotonic() - self._degraded_at < _TOKENIZER_RETRY_SECONDS
+            ):
+                return False
+            try:
+                from tokenizers import Tokenizer
 
-            self._tokenizer = Tokenizer.from_pretrained(self._model_name)
+                self._tokenizer = Tokenizer.from_pretrained(self._model_name)
+            except Exception as exc:  # noqa: BLE001 - any failure must degrade, not crash ingest
+                self._degraded_at = time.monotonic()
+                logger.warning(
+                    "Could not load tokenizer for %s (%s); counting tokens for chunk sizing "
+                    "with a heuristic, retrying in %.0f s.",
+                    self._model_name,
+                    exc,
+                    _TOKENIZER_RETRY_SECONDS,
+                )
+                return False
+            if self._degraded_at is not None:
+                logger.info("Loaded tokenizer for %s after an earlier failure.", self._model_name)
             return True
-        except Exception as exc:  # noqa: BLE001 - any failure must degrade, not crash ingest
-            self._degraded = True
-            logger.warning(
-                "Could not load tokenizer for %s (%s); falling back to heuristic token "
-                "counting for chunk sizing.",
-                self._model_name,
-                exc,
-            )
-            return False
 
 
 def make_token_counter(model_name: str) -> TokenCounter:

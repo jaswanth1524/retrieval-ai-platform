@@ -28,6 +28,7 @@ from api.qdrant_schema import (
     dense_vectors_config,
     sparse_vectors_config,
 )
+from tests.factories import wait_until
 from tests.routes_http.support import (
     ApiTestContext,
     CapturingCompletionClient,
@@ -237,7 +238,7 @@ def test_question_endpoint_returns_conflict_for_embedding_mismatch(
     response = api_context.client.post("/questions", json={"question": "alpha"})
 
     assert response.status_code == 409
-    assert "Re-ingest documents" in response.json()["detail"]
+    assert "delete every document" in response.json()["detail"]
 
 
 def test_document_original_streams_with_its_length_and_type(
@@ -440,14 +441,9 @@ def test_a_disconnect_keeps_the_question_slot_until_the_pipeline_really_stops() 
 
     assert slots.try_acquire() is None  # the rerank is still running: still counted
     rerank_done.set()
-    for _ in range(200):
-        again = slots.try_acquire()
-        if again is not None:
-            again()
-            break
-        threading.Event().wait(0.01)
-    else:
-        raise AssertionError("the slot was never released after the pipeline stopped")
+    wait_until(
+        slots.try_acquire, message="the slot was never released after the pipeline stopped"
+    )()
 
 
 def test_a_lease_never_handed_off_is_released_by_the_response() -> None:
@@ -592,6 +588,27 @@ def test_tags_are_set_listed_preserved_on_re_upload_and_scope_questions(
     cleared = client.patch("/documents/contract.txt/tags", json={"tags": []})
     assert cleared.json()["tags"] == []
     assert client.get("/documents").json()["tags"] == {}
+
+
+def test_question_and_search_tags_match_stored_tags_case_insensitively(
+    api_context: ApiTestContext,
+) -> None:
+    """Tags are de-duplicated case-insensitively but were filtered exactly, so asking
+    for "finance" found nothing tagged "Finance"."""
+
+    client = api_context.client
+    assert upload_and_wait(client, "budget.txt", b"Intro\nalpha budget")["state"] == "done"
+    assert upload_and_wait(client, "notes.txt", b"Intro\nalpha notes")["state"] == "done"
+    client.patch("/documents/budget.txt/tags", json={"tags": ["Finance"]})
+
+    scoped = client.post("/questions", json={"question": "alpha", "tags": [" finance "]}).json()
+    found = client.post("/search", json={"query": "alpha", "tags": ["FINANCE"]}).json()
+    unknown = client.post("/questions", json={"question": "alpha", "tags": ["nope"]}).json()
+
+    assert {source["filename"] for source in scoped["sources"]} == {"budget.txt"}
+    assert {result["filename"] for result in found["results"]} == {"budget.txt"}
+    # A tag nobody carries still matches nothing — it never widens to every document.
+    assert unknown["sources"] == []
 
 
 def test_questions_past_the_concurrency_cap_are_429_with_retry_after(

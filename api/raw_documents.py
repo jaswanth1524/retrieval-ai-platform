@@ -11,12 +11,15 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import BinaryIO
 
 from api.documents import normalize_filename
 
 logger = logging.getLogger(__name__)
+
+_STALE_TEMP_FILE_SECONDS = 3600.0
 
 
 class RawDocumentStore:
@@ -31,6 +34,23 @@ class RawDocumentStore:
     def __init__(self, directory: str) -> None:
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
+        self._sweep_stale_temp_files()
+
+    def _sweep_stale_temp_files(self) -> None:
+        """Remove ``.upload-*`` temp files a crash or kill left mid-save.
+
+        ``save`` removes its temp file on any error it sees, but not when the process
+        dies in between; those accumulated forever. An hour old is never a save still
+        running in another process sharing the directory.
+        """
+
+        cutoff = time.time() - _STALE_TEMP_FILE_SECONDS
+        for temp in self._directory.glob(".upload-*"):
+            try:
+                if temp.is_file() and temp.stat().st_mtime < cutoff:
+                    temp.unlink()
+            except OSError:
+                logger.warning("Could not remove stale temp file %s", temp, exc_info=True)
 
     def save(self, filename: str, content: bytes) -> None:
         """Write atomically: a crash mid-write leaves the previous original intact."""

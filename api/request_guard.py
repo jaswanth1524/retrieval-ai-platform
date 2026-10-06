@@ -92,8 +92,14 @@ class RequestGuardMiddleware:
             return
 
         settings = self._settings(scope)
-        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        raw_headers = scope.get("headers", [])
+        headers = {key.lower(): value for key, value in raw_headers}
         if settings.api_key:
+            # The dict above keeps the last copy and FastAPI's dependency reads the
+            # first; one header, so both checks judge the same key.
+            if sum(1 for key, _ in raw_headers if key.lower() == b"x-api-key") > 1:
+                await _reject(send, 400, "Send a single X-API-Key header.")
+                return
             access = key_access(settings, headers.get(b"x-api-key"))
             if access == "none":
                 await _reject(send, 401, "Missing or invalid API key.")

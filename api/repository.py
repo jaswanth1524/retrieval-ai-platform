@@ -22,11 +22,13 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from qdrant_client.http.models.models import QueryResponse
 
 from api.corpus import corpus_generation
+from api.documents import CHUNKER_VERSION
 from api.embeddings import EmbeddedText
 from api.qdrant_schema import (
     VectorStoreUnavailableError,
     ensure_collection,
     forget_collection,
+    recreate_if_empty_and_mismatched,
 )
 from api.settings import AppSettings
 
@@ -50,6 +52,9 @@ _metadata_cache: WeakKeyDictionary[
     QdrantClient, dict[str, tuple[int, float, dict[str, DocumentMetadata]]]
 ]
 _metadata_cache = WeakKeyDictionary()
+# One scan at a time per (client, collection): after every invalidation (each finished
+# job) the UI's concurrent GET /documents calls each scrolled the whole collection.
+_metadata_scan_locks: WeakKeyDictionary[QdrantClient, dict[str, Lock]] = WeakKeyDictionary()
 
 
 def clear_metadata_cache() -> None:
@@ -82,6 +87,25 @@ class DocumentMetadata:
     chunker_version: int | None = None
     # Union of tags across the filename's points (they are normally all the same).
     tags: tuple[str, ...] = ()
+    # Every chunking fingerprint among the points (empty when none carries one), and
+    # whether any point was sized by the heuristic token counter.
+    chunking_fingerprints: frozenset[str] = frozenset()
+    heuristic_chunked: bool = False
+
+    def is_stale(self, fingerprint: str, counter_mode: str) -> bool:
+        """Chunked differently from how it would be today, so re-indexing changes it.
+
+        Stale when any point predates ``CHUNKER_VERSION`` (or the field), when any point
+        was chunked under other settings, or when the heuristic sized it while the real
+        tokenizer is available now. A point with no fingerprint but a current version
+        counts as current, so upgrading doesn't flag the whole corpus at once.
+        """
+
+        if self.chunker_version is None or self.chunker_version < CHUNKER_VERSION:
+            return True
+        if self.chunking_fingerprints - {fingerprint}:
+            return True
+        return self.heuristic_chunked and counter_mode == "hf"
 
 
 _SCROLL_PAGE_SIZE = 256
@@ -120,9 +144,20 @@ class VectorRepository:
             self.ensure_ready(settings)
             return getattr(self._client, method)(*args, **kwargs)
 
-    def ensure_ready(self, settings: AppSettings) -> None:
-        """Create or validate the collection. Cheap after the first call (cached)."""
+    def ensure_ready(self, settings: AppSettings, *, strict: bool = True) -> None:
+        """Create or validate the collection. Cheap after the first call (cached).
 
+        ``strict=False`` (reads, tags, deletes) accepts a collection built for another
+        embedding setup — see ``qdrant_schema.ensure_collection``.
+        """
+
+        ensure_collection(self._client, settings, strict=strict)
+
+    def ensure_writable(self, settings: AppSettings) -> None:
+        """``ensure_ready`` for a write of new vectors: an empty collection built for
+        another embedding setup is recreated for this one; a non-empty one refuses."""
+
+        recreate_if_empty_and_mismatched(self._client, settings)
         ensure_collection(self._client, settings)
 
     def hybrid_search(
@@ -153,8 +188,12 @@ class VectorRepository:
                     # more confusing failure and hide the actual cause.
                     raise
                 # Older Qdrant servers may not support server-side prefetch + RRF.
+                # Remembered only once manual fusion works: a 400 for any other reason
+                # (a vector of the wrong size) fails that too, and remembering it
+                # switched this client off server-side hybrid until a restart.
+                points = self._manual_hybrid_query(settings, query_embedding, query_filter)
                 _server_side_hybrid_unsupported.add(self._client)
-                return self._manual_hybrid_query(settings, query_embedding, query_filter)
+                return points
         except ResponseHandlingException as exc:
             logger.warning("Qdrant is unreachable.", exc_info=True)
             raise VectorStoreUnavailableError("Qdrant is unreachable.") from exc
@@ -204,7 +243,7 @@ class VectorRepository:
         matters.
         """
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         return [
             str(point.id)
             for point in self._scroll_all(
@@ -219,7 +258,7 @@ class VectorRepository:
         the source viewer). Points with no ``chunk_ordinal`` sort last, stably.
         """
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         payloads: list[dict[str, object]] = [
             point.payload
             for point in self._scroll_all(
@@ -233,7 +272,7 @@ class VectorRepository:
     def chunk_count_for_filename(self, settings: AppSettings, filename: str) -> int:
         """How many points one document has (an exact count, no payloads read)."""
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         result = self._call(
             settings,
             "count",
@@ -246,7 +285,7 @@ class VectorRepository:
     def chunk_ordinal_of(self, settings: AppSettings, filename: str, chunk_id: str) -> int | None:
         """The ordinal of one chunk of a document, or None when it doesn't exist."""
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         points, _ = self._call(
             settings,
             "scroll",
@@ -273,7 +312,7 @@ class VectorRepository:
         ``chunk_ordinal`` rather than the whole document scrolled and sliced.
         """
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         payloads = [
             point.payload
             for point in self._scroll_all(
@@ -305,22 +344,42 @@ class VectorRepository:
         process's writes).
         """
 
-        generation = corpus_generation()
-        now = time.monotonic()
-        with _metadata_lock:
-            cached = _metadata_cache.get(self._client, {}).get(settings.qdrant_collection)
+        collection = settings.qdrant_collection
+        cached = self._cached_metadata(collection, corpus_generation())
         if cached is not None:
-            cached_generation, stored_at, metadata = cached
-            if cached_generation == generation and now - stored_at < _METADATA_TTL_SECONDS:
-                return dict(metadata)
-        metadata = self._scan_filename_metadata(settings)
+            return dict(cached)
         with _metadata_lock:
-            _metadata_cache.setdefault(self._client, {})[settings.qdrant_collection] = (
-                generation,
-                now,
-                metadata,
+            scan_lock = _metadata_scan_locks.setdefault(self._client, {}).setdefault(
+                collection, Lock()
             )
+        with scan_lock:
+            # Whoever held the lock may have just stored a fresh listing.
+            generation = corpus_generation()
+            cached = self._cached_metadata(collection, generation)
+            if cached is not None:
+                return dict(cached)
+            # The generation is read before the scan, so a change landing during it
+            # leaves the entry stale; the time is taken after, so a scan slower than
+            # the TTL doesn't store an entry that has already expired.
+            metadata = self._scan_filename_metadata(settings)
+            with _metadata_lock:
+                _metadata_cache.setdefault(self._client, {})[collection] = (
+                    generation,
+                    time.monotonic(),
+                    metadata,
+                )
         return dict(metadata)
+
+    def _cached_metadata(
+        self, collection: str, generation: int
+    ) -> dict[str, DocumentMetadata] | None:
+        with _metadata_lock:
+            cached = _metadata_cache.get(self._client, {}).get(collection)
+        if cached is None:
+            return None
+        cached_generation, stored_at, metadata = cached
+        fresh = time.monotonic() - stored_at < _METADATA_TTL_SECONDS
+        return metadata if cached_generation == generation and fresh else None
 
     def _scan_filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
         """Return each indexed filename's chunk count, page count, byte size, and
@@ -335,7 +394,7 @@ class VectorRepository:
         payload, so both stay ``None``.
         """
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         chunk_counts: Counter[str] = Counter()
         max_page: dict[str, int] = {}
         byte_size: dict[str, int] = {}
@@ -343,6 +402,8 @@ class VectorRepository:
         min_version: dict[str, int] = {}
         unversioned: set[str] = set()
         tags: dict[str, dict[str, None]] = {}
+        fingerprints: dict[str, set[str]] = {}
+        heuristic: set[str] = set()
         for point in self._scroll_all(
             settings,
             with_payload=[
@@ -352,6 +413,8 @@ class VectorRepository:
                 "uploaded_at",
                 "chunker_version",
                 "tags",
+                "chunking_fingerprint",
+                "token_counter",
             ],
         ):
             if not point.payload:
@@ -378,6 +441,11 @@ class VectorRepository:
             if isinstance(point_tags, list):
                 ordered = tags.setdefault(filename, {})
                 ordered.update((tag, None) for tag in point_tags if isinstance(tag, str))
+            fingerprint = point.payload.get("chunking_fingerprint")
+            if isinstance(fingerprint, str):
+                fingerprints.setdefault(filename, set()).add(fingerprint)
+            if point.payload.get("token_counter") == "heuristic":
+                heuristic.add(filename)
         return {
             filename: DocumentMetadata(
                 chunk_count=count,
@@ -386,6 +454,8 @@ class VectorRepository:
                 uploaded_at=uploaded_at.get(filename),
                 chunker_version=None if filename in unversioned else min_version.get(filename),
                 tags=tuple(tags.get(filename, {})),
+                chunking_fingerprints=frozenset(fingerprints.get(filename, ())),
+                heuristic_chunked=filename in heuristic,
             )
             for filename, count in chunk_counts.items()
         }
@@ -393,7 +463,7 @@ class VectorRepository:
     def uploaded_at_for_filename(self, settings: AppSettings, filename: str) -> float | None:
         """The stored upload time of an indexed document (one point read), or None."""
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         points, _ = self._call(
             settings,
             "scroll",
@@ -409,7 +479,7 @@ class VectorRepository:
     def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]:
         """The tags stored on an indexed document (one point read), or ``()``."""
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         points, _ = self._call(
             settings,
             "scroll",
@@ -427,7 +497,7 @@ class VectorRepository:
     def set_tags(self, settings: AppSettings, filename: str, tags: Sequence[str]) -> None:
         """Replace a document's tags on every one of its points. Payload-only: no re-embed."""
 
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         self._call(
             settings,
             "set_payload",
@@ -443,7 +513,7 @@ class VectorRepository:
 
         if not point_ids:
             return
-        self.ensure_ready(settings)
+        self.ensure_ready(settings, strict=False)
         self._call(
             settings,
             "delete",

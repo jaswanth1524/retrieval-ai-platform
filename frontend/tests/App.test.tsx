@@ -164,12 +164,12 @@ describe('App', () => {
     render(<App />);
     await screen.findByText('api ok');
 
-    await userEvent.keyboard('{Meta>}k{/Meta}');
+    await userEvent.keyboard('{Control>}k{/Control}');
     // Lazy-loaded: the first open resolves its chunk before rendering.
     expect(await screen.findByTestId('command-palette')).toBeInTheDocument();
 
     // Same chord closes it again.
-    await userEvent.keyboard('{Meta>}k{/Meta}');
+    await userEvent.keyboard('{Control>}k{/Control}');
     expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
   });
 
@@ -383,6 +383,74 @@ describe('App', () => {
     expect(screen.queryByTestId('trace-tab')).not.toBeInTheDocument();
   });
 
+  it('shows a clicked trace even when this conversation already has answers', async () => {
+    // The inspector fell back to the latest answer whenever the pinned trace wasn't one
+    // of this conversation's turns, so clicking an older trace showed the current
+    // answer's trace instead.
+    const traceDetail = (id: string, question: string) => ({
+      trace_id: id, created_at: 0, question, mode: 'stream', status: 'ok', config: null,
+      candidates: [], prompt_messages: null, answer: 'a', cited_source_numbers: [],
+      timings: null, error: null,
+    });
+    const fetchedTraces: string[] = [];
+    const encoder = new TextEncoder();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: ['g.md'], chunk_counts: { 'g.md': 1 } });
+        if (url.endsWith('/questions/stream')) {
+          const frames = [
+            { type: 'sources', sources: [], trace_id: 'trace-current' },
+            { type: 'done', answer: 'Answer.', sources: [], trace_id: 'trace-current',
+              timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 } },
+          ];
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const frame of frames) controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+              controller.close();
+            },
+          });
+          return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+        }
+        if (url.endsWith('/traces')) {
+          return jsonResponse({
+            traces: [{ trace_id: 'trace-old', created_at: Date.now() / 1000, question: 'An older question',
+              mode: 'stream', status: 'ok', llm_provider: 'ollama', total_ms: 10, candidate_count: 1, kept_count: 1 }],
+          });
+        }
+        const match = url.match(/\/traces\/(trace-[a-z]+)/);
+        if (match) {
+          fetchedTraces.push(match[1]);
+          return jsonResponse(traceDetail(match[1], match[1] === 'trace-old' ? 'An older question' : 'A question'));
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+    await userEvent.type(screen.getByTestId('question-textarea'), 'A question');
+    await userEvent.click(screen.getByTestId('question-submit'));
+    await screen.findByText('Answer.');
+
+    await userEvent.click(screen.getByTestId('rail-traces'));
+    await userEvent.click(await screen.findByTestId('traces-panel-row'));
+
+    await waitFor(() => expect(fetchedTraces.at(-1)).toBe('trace-old'));
+    expect(fetchedTraces).not.toContain('trace-current');
+
+    // Closing and reopening from the palette follows the conversation again, as the
+    // header toggle does; the palette's own copy of the toggle kept the old pin.
+    for (const label of ['Hide inspector', 'Show inspector']) {
+      await userEvent.keyboard('{Control>}k{/Control}');
+      await userEvent.click(await screen.findByRole('option', { name: new RegExp(label) }));
+    }
+    await waitFor(() => expect(fetchedTraces.at(-1)).toBe('trace-current'));
+  });
+
   it('does not fetch the trace — and does not show it as evicted — while the answer is still streaming', async () => {
     // Regression test for a real bug found via live end-to-end testing against real
     // Ollama generation (a real gap of several seconds between events, which a
@@ -444,7 +512,9 @@ describe('App', () => {
     // even exists, matching a user who has it open while asking a question.
     await userEvent.click(screen.getByTestId('toggle-inspector'));
     await userEvent.click(screen.getByRole('radio', { name: /engineer/i }));
-    await userEvent.click(screen.getByTestId('inspector-tab-retrieval'));
+    // findBy: the inspector is a lazy chunk, loaded already only if an earlier test
+    // happened to open it.
+    await userEvent.click(await screen.findByTestId('inspector-tab-retrieval'));
 
     await userEvent.type(screen.getByTestId('question-textarea'), 'A question');
     await userEvent.click(screen.getByTestId('question-submit'));

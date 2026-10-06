@@ -35,11 +35,16 @@
 .chat-message__question {
   margin: 0;
   flex: 1;
+  /* min-width lets a long URL wrap instead of widening the thread on a phone. */
+  min-width: 0;
   font-size: 18px;
   font-weight: 500;
   line-height: 1.42;
   letter-spacing: -0.015em;
   text-wrap: pretty;
+  /* Keep the line breaks typed with Shift+Enter. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .chat-message__answer {

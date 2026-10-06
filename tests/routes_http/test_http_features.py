@@ -24,6 +24,7 @@ from api.dependencies import (
 from api.embeddings import EmbeddedText
 from api.feedback import FeedbackStore
 from api.raw_documents import RawDocumentStore
+from api.repository import VectorRepository
 from tests.routes_http.support import (
     ApiTestContext,
     FakeEmbeddingProvider,
@@ -102,8 +103,14 @@ def test_search_validates_and_respects_the_question_cap(api_context: ApiTestCont
     held = full.try_acquire()
     assert held is not None
     api_context.app.dependency_overrides[get_question_slots] = lambda: full
+    from api.metrics import questions_total
+
+    busy_questions = questions_total.labels(outcome="error", error_type="busy")
+    before = busy_questions._value.get()
     busy = client.post("/search", json={"query": "alpha"})
     assert busy.status_code == 429
+    # A search isn't a question: it stays out of docrag_questions_total.
+    assert busy_questions._value.get() == before
     held()
 
 
@@ -157,14 +164,16 @@ class GatedEmbeddings(FakeEmbeddingProvider):
         return super().embed_texts(texts)
 
 
+def _four_sections() -> bytes:
+    sections = (f"Section {i}\n" + " ".join(f"w{i}x{j}" for j in range(30)) for i in range(4))
+    return "\n\n".join(sections).encode()
+
+
 def _start_gated_upload(api_context: ApiTestContext, gate_on: int) -> tuple[str, GatedEmbeddings]:
     embeddings = GatedEmbeddings(gate_on)
     api_context.app.dependency_overrides[get_embedding_provider] = lambda: embeddings
-    body = "\n\n".join(
-        f"Section {i}\n" + " ".join(f"w{i}x{j}" for j in range(30)) for i in range(4)
-    )
     job_id = api_context.client.post(
-        "/documents", files={"file": ("big.txt", body.encode(), "text/plain")}
+        "/documents", files={"file": ("big.txt", _four_sections(), "text/plain")}
     ).json()["job_id"]
     assert embeddings.reached.wait(5)
     return job_id, embeddings
@@ -186,7 +195,12 @@ def test_a_running_job_is_cancelled_at_its_last_point_before_writing(
     assert not [r for r in caplog.records if r.levelno >= 30 and r.name == "api.ingest_jobs"]
 
 
-def test_a_job_that_already_wrote_cannot_be_cancelled(api_context: ApiTestContext) -> None:
+def test_a_job_still_embedding_after_its_first_batch_can_be_cancelled(
+    api_context: ApiTestContext,
+) -> None:
+    """Nothing is written until every batch is embedded, so the cancel window covers
+    the whole embedding run, not just its first batch."""
+
     api_context.settings.__dict__["ingest_batch_size"] = 1
     job_id, embeddings = _start_gated_upload(api_context, gate_on=2)
 
@@ -194,8 +208,69 @@ def test_a_job_that_already_wrote_cannot_be_cancelled(api_context: ApiTestContex
     embeddings.release.set()
     job = wait_for_job(api_context.client, job_id)
 
+    assert response.status_code == 202
+    assert job["state"] == "failed" and job["cancelled"] is True
+    assert embeddings.calls == 2  # stopped at the next checkpoint, not run to the end
+    assert "big.txt" not in api_context.client.get("/documents").json()["filenames"]
+
+
+def test_a_job_that_already_wrote_cannot_be_cancelled(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api_context.settings.__dict__["ingest_batch_size"] = 1
+    writing, release = threading.Event(), threading.Event()
+    upsert = VectorRepository.upsert
+    calls: list[int] = []
+
+    def gated_upsert(self: VectorRepository, settings: Any, points: Any) -> None:
+        calls.append(len(points))
+        if len(calls) == 2:
+            writing.set()
+            release.wait(5)
+        upsert(self, settings, points)
+
+    monkeypatch.setattr(VectorRepository, "upsert", gated_upsert)
+    job_id = api_context.client.post(
+        "/documents", files={"file": ("big.txt", _four_sections(), "text/plain")}
+    ).json()["job_id"]
+    assert writing.wait(5)
+
+    response = api_context.client.delete(f"/documents/jobs/{job_id}")
+    release.set()
+    job = wait_for_job(api_context.client, job_id)
+
     assert response.status_code == 409
     assert job["state"] == "done" and job["cancelled"] is False
+
+
+def test_tags_and_delete_are_not_held_up_by_an_embedding_ingest(
+    api_context: ApiTestContext,
+) -> None:
+    """Embedding used to run under the filename lock, so a tag change or a DELETE of
+    the document waited on a request thread for the whole re-index."""
+
+    client = api_context.client
+    assert upload_and_wait(client, "big.txt", b"Intro\nalpha beta")["state"] == "done"
+    job_id, embeddings = _start_gated_upload(api_context, gate_on=1)
+
+    statuses: list[int] = []
+    worker = threading.Thread(
+        target=lambda: statuses.append(
+            client.patch("/documents/big.txt/tags", json={"tags": ["finance"]}).status_code
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=3)
+    finished_while_embedding = not worker.is_alive()
+    embeddings.release.set()
+    worker.join(timeout=10)
+
+    assert finished_while_embedding, "PATCH tags waited for the ingest's embedding"
+    assert statuses == [200]
+    assert wait_for_job(client, job_id)["state"] == "done"
+    # Read under the lock at write time, the new tag reaches the re-indexed chunks.
+    assert client.get("/documents").json()["tags"] == {"big.txt": ["finance"]}
 
 
 def test_cancelling_an_unknown_or_finished_job(api_context: ApiTestContext) -> None:
@@ -283,14 +358,7 @@ def test_an_export_restores_into_a_fresh_instance(tmp_path: Path) -> None:
 
 
 def wait_for_job_with(client: Any, job_id: str) -> dict[str, Any]:
-    import time
-
-    for _ in range(500):
-        job: dict[str, Any] = client.get(f"/documents/jobs/{job_id}", headers=FULL).json()
-        if job["state"] in ("done", "failed"):
-            return job
-        time.sleep(0.01)
-    raise AssertionError("job did not finish")
+    return wait_for_job(client, job_id, headers=FULL)
 
 
 @pytest.mark.parametrize(

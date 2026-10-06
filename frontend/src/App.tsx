@@ -25,6 +25,7 @@ import type { RailPanel } from './components/IconRail';
 import type { InspectorTab } from './components/Inspector';
 import SourcePreview from './components/SourcePreview';
 import ToastRow from './components/ToastRow';
+import SearchPanel from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import FeedbackPanel from './components/FeedbackPanel';
 import { useChat } from './hooks/useChat';
@@ -35,6 +36,7 @@ import { useToasts } from './hooks/useToasts';
 import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
+import { EMPTY_OVERRIDES } from './utils/overrides';
 import { readStored, readStoredJson, writeStored } from './utils/safeStorage';
 import { DEFAULT_MAX_UPLOAD_BYTES, validateUploads } from './utils/uploadValidation';
 
@@ -61,12 +63,6 @@ function isProviderUsable(
   if (provider === 'openai_compatible') return Boolean(config.openai_compatible_available);
   return false;
 }
-const EMPTY_OVERRIDES: QuestionOverrides = {
-  rerankTopK: null,
-  maxContextChunks: null,
-  llmTemperature: null,
-};
-
 function loadPersistedOverrides(): QuestionOverrides {
   // Storage denied/corrupt — fall back to defaults for this session.
   const parsed = readStoredJson<Partial<QuestionOverrides>>(ADVANCED_OPTIONS_STORAGE_KEY);
@@ -103,6 +99,7 @@ function loadPersistedMode(): ChatMode {
 const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
   chat: { title: 'Conversations', actionLabel: 'New' },
   corpus: { title: 'Corpus', actionLabel: 'Upload' },
+  search: { title: 'Search passages', actionLabel: 'Clear' },
   traces: { title: 'Traces', actionLabel: 'Refresh' },
   feedback: { title: 'Feedback', actionLabel: 'Refresh' },
 };
@@ -132,6 +129,7 @@ function App() {
   );
   const [mode, setModeState] = useState<ChatMode>(loadPersistedMode);
   const [rail, setRail] = useState<RailPanel>('chat');
+  const [searchResetKey, setSearchResetKey] = useState(0);
   const [traces, setTraces] = useState<TraceSummaryResponse[] | null>(null);
   const [tracesError, setTracesError] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -498,7 +496,10 @@ function App() {
         : undefined;
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
   const lastQuestion = [...turns].reverse().find((turn) => turn.role === 'user')?.content;
-  useBackgroundNotice(pending, notifyOnAnswer, lastQuestion);
+  const lastTurn = turns[turns.length - 1];
+  const lastOutcome =
+    lastTurn?.role === 'error' ? 'failed' : lastTurn?.stopped ? 'stopped' : 'answered';
+  useBackgroundNotice(pending, notifyOnAnswer, lastQuestion, lastOutcome);
   // The selected provider's model. Each answer records the one it was asked of
   // (ChatTurn.model); this labels answers saved before that, and the composer.
   const currentModelLabel = config
@@ -511,9 +512,11 @@ function App() {
 
   // The turn the inspector describes: the one pinned by a trace-row click, else the
   // most recent assistant turn so the panel tracks the conversation without a click.
-  const inspectedTurn =
-    (pinnedTraceId ? turns.find((turn) => turn.traceId === pinnedTraceId) : undefined) ??
-    [...turns].reverse().find((turn) => turn.role === 'assistant');
+  // A pin this conversation doesn't hold describes no turn here: falling back to the
+  // latest answer showed that answer's trace instead of the row that was clicked.
+  const inspectedTurn = pinnedTraceId
+    ? turns.find((turn) => turn.traceId === pinnedTraceId)
+    : [...turns].reverse().find((turn) => turn.role === 'assistant');
   // A pinned trace from the trace browser may belong to a turn this conversation never
   // held (another session, or one since cleared) — fall back to the id itself so the
   // Retrieval and Trace tabs can still fetch and render it.
@@ -541,6 +544,7 @@ function App() {
   // onRetry prop through ChatThread — an unstable reference here would defeat
   // React.memo(ChatMessage) and reintroduce a full-list re-render on every SSE delta.
   const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
+  const currentScopeLabel = scopeLabel(indexedFilenames, selectedFilenames, selectedTags);
   const askQuestion = useCallback(
     (question: string) =>
       ask(question, selectedProvider, advancedOptions, scopeFilenames, {
@@ -577,9 +581,8 @@ function App() {
   );
   const handleCitationLeave = useCallback(() => setHoveredCitation(null), []);
 
-  // Fire-and-forget: a rating is low-stakes feedback, not an action the user needs
-  // confirmed or retried on failure — ChatMessage already shows the pick optimistically
-  // (see its feedbackGiven state) before this even resolves.
+  // Shown at once (ChatMessage's feedbackGiven); taken back if it couldn't be sent, so
+  // the buttons don't claim a rating the server never recorded and it can be retried.
   const handleFeedback = useCallback((payload: FeedbackPayload) => {
     setTurnFeedback(payload.turnId, payload.rating);
     void api
@@ -591,10 +594,18 @@ function App() {
         rating: payload.rating,
         citation_source_number: null,
       })
-      .catch(() => {
-        // Best-effort — nothing in the UI depends on this succeeding.
+      .catch((err) => {
+        setTurnFeedback(payload.turnId, undefined);
+        if (noteAuthFailure(err)) return;
+        pushToast({
+          tone: 'warn',
+          title: "Couldn't send your rating",
+          body: err instanceof ApiClientError ? err.message : 'Try again in a moment.',
+        });
       });
-  }, [setTurnFeedback]);
+    // noteAuthFailure only calls state setters; pushToast is stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setTurnFeedback, pushToast]);
 
   // Persistence problems arrive as state flags, not events, so they are surfaced with
   // stable ids — a re-render must refresh the same notice rather than stack duplicates.
@@ -709,14 +720,15 @@ function App() {
         requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
       },
       openSettings: () => setSettingsOpen(true),
-      toggleInspector: () => {
-        setInspectorForced(true);
-        setInspectorOpen((prev) => !prev);
-      },
+      toggleInspector,
       setMode,
       toggleTheme,
       exportMarkdown,
       exportJson,
+      searchPassages: () => {
+        setRail('search');
+        if (panelCollapsed) setPanelDrawerOpen(true);
+      },
       browseTraces: () => {
         setRail('traces');
         if (panelCollapsed) setPanelDrawerOpen(true);
@@ -791,6 +803,10 @@ function App() {
     [pushToast],
   );
   const handleImportFile = async (file: File) => {
+    if (pending) {
+      pushToast({ tone: 'warn', title: 'Wait for the answer to finish', body: 'Then import the conversation.' });
+      return;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(await file.text());
@@ -821,6 +837,7 @@ function App() {
       if (readOnly) void refreshDocuments().catch(noteAuthFailure);
       else corpusBrowseInputRef.current?.click();
     }
+    else if (rail === 'search') setSearchResetKey((key) => key + 1);
     else if (rail === 'feedback') loadFeedback();
     else loadTraces();
   };
@@ -906,6 +923,15 @@ function App() {
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
           />
         )}
+        {rail === 'search' && (
+          <SearchPanel
+            filenames={selectedFilenames}
+            tags={selectedTags}
+            onOpenSource={handleOpenSource}
+            resetKey={searchResetKey}
+            onAuthFailure={noteAuthFailure}
+          />
+        )}
         {rail === 'traces' && (
           <TracesPanel traces={traces} error={tracesError} onSelect={handleSelectTrace} />
         )}
@@ -927,7 +953,7 @@ function App() {
             <ChatHeader
               key={activeConversationId ?? 'none'}
               title={activeConversation?.title ?? 'New chat'}
-              scopeLabel={scopeLabel(indexedFilenames, selectedFilenames, selectedTags)}
+              scopeLabel={currentScopeLabel}
               mode={mode}
               onSetMode={setMode}
               hasTurns={turns.length > 0}
@@ -962,7 +988,7 @@ function App() {
               hint={composerHint}
               pending={pending}
               onCancel={cancel}
-              scopeLabel={scopeLabel(indexedFilenames, selectedFilenames, selectedTags)}
+              scopeLabel={currentScopeLabel}
               indexedFilenames={indexedFilenames}
               selectedFilenames={selectedFilenames}
               onSelectedFilenamesChange={setSelectedFilenames}

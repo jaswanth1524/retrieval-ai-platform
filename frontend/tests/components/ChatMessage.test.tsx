@@ -516,6 +516,24 @@ describe('ChatMessage', () => {
       expect(onFeedback).toHaveBeenCalledWith(expect.objectContaining({ rating: 'down' }));
     });
 
+    it('offers the buttons again when a rating that failed to send is taken back', () => {
+      const props = {
+        engineerMode: false,
+        regenerateQuestion: 'Q?',
+        feedbackEnabled: true,
+        onFeedback: vi.fn(),
+      };
+      const { rerender } = render(
+        <ChatMessage {...props} turn={makeTurn({ role: 'assistant', content: 'A.', feedback: 'up' })} />,
+      );
+      expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
+
+      rerender(<ChatMessage {...props} turn={makeTurn({ role: 'assistant', content: 'A.' })} />);
+
+      expect(screen.getByTestId('chat-message-feedback-up')).toBeEnabled();
+      expect(screen.getByTestId('chat-message-feedback-up')).toHaveAttribute('aria-pressed', 'false');
+    });
+
     it('keeps a rating saved on the turn, so a remount cannot rate the answer again', () => {
       render(
         <ChatMessage

@@ -53,6 +53,8 @@ def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
         "qdrant": True,
         "generation_provider": True,
         "llm_provider": "ollama",
+        "index_compatible": True,
+        "index_detail": None,
     }
 
 
@@ -214,6 +216,25 @@ def test_run_model_warmup_swallows_failures_instead_of_raising() -> None:
     # model failing must not leave the others cold.
     run_model_warmup(RaisingEmbeddingProvider(), reranker)
     assert reranker.seen_documents == ["warmup"]
+
+
+def test_run_model_warmup_names_a_wrong_dense_vector_size_at_boot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fake embeds 3 dimensions; a collection configured for 4 would only fail at
+    the first upload, as "retry the upload"."""
+
+    run_model_warmup(
+        FakeEmbeddingProvider(),
+        FakeReranker(),
+        settings=make_settings(qdrant_dense_vector_size=4),
+    )
+
+    assert any(
+        "QDRANT_DENSE_VECTOR_SIZE=3" in r.getMessage()
+        or (r.exc_info and "QDRANT_DENSE_VECTOR_SIZE=3" in str(r.exc_info[1]))
+        for r in caplog.records
+    )
 
 
 def test_lifespan_runs_warmup_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -479,6 +500,8 @@ def test_export_zips_the_manifest_originals_and_feedback(
     assert document["filename"] == "guide.txt"
     assert document["tags"] == ["kb"]
     assert document["original"] == "originals/guide.txt"
+    # Which chunking produced each document, next to the current one.
+    assert document["chunking_fingerprints"] == [manifest["chunking_fingerprint"]]
     assert archive.read("originals/guide.txt") == b"Intro\nalpha beta"
     assert "feedback.jsonl" not in archive.namelist()  # feedback is off here
 
@@ -540,3 +563,24 @@ def test_a_trace_records_the_request_id_of_its_question(api_context: ApiTestCont
     ).json()
 
     assert client.get(f"/traces/{answer['trace_id']}").json()["request_id"] == "ask-1"
+
+
+def test_a_reranker_that_fails_to_load_names_the_setting_not_the_library_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import api.dependencies as dependencies
+    from api.reranking import RerankingError
+
+    def broken(settings: object) -> object:
+        raise ValueError("Model x is not supported in TextCrossEncoder; /home/app/.cache/...")
+
+    clear_dependency_caches()
+    monkeypatch.setattr(dependencies, "LocalCrossEncoderReranker", broken)
+    try:
+        with pytest.raises(RerankingError) as raised:
+            dependencies.get_reranker()
+    finally:
+        clear_dependency_caches()
+
+    assert "RERANKER_MODEL" in str(raised.value)
+    assert "/home/app" not in str(raised.value)

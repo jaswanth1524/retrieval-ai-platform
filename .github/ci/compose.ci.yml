@@ -1,0 +1,10 @@
+# Layered over docker-compose.yml by the CI docker job: the image CI just built (no
+# rebuild), no model downloads at boot, and no .env.example host values the job doesn't
+# have. Everything else — the read-only filesystem, dropped capabilities, tmpfs, the
+# Qdrant service and its healthcheck — is the file users run.
+services:
+  api:
+    image: docrag:ci
+    pull_policy: never
+    environment:
+      WARMUP_MODELS: "false"

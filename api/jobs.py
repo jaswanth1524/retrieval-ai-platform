@@ -10,7 +10,7 @@ Two backends, selected by ``AppSettings.job_store_backend`` (see
   otherwise it gets a 404 (``JobNotFoundError``) even though the ingest already
   succeeded in Qdrant.
 
-Both implement the ``JobStore`` protocol below; every other module (``api.main``,
+Both implement the ``JobStore`` protocol below; every other module (``api.ingest_jobs``,
 ``api.dependencies``) types against that, not either concrete class.
 """
 
@@ -55,12 +55,8 @@ class IngestJob:
     chunks_done: int = 0
     error: str | None = None
     result: dict[str, object] | None = None
-    # Process-relative (time.monotonic): safe for in-process duration math, but
-    # meaningless across a restart, so it can't order jobs persisted to disk.
-    created_at: float = field(default_factory=time.monotonic)
-    # Wall-clock equivalent used only for oldest-first ordering when a job store
-    # backend needs that to survive a restart (SqliteIngestJobStore). Additive field
-    # with a default, so existing IngestJobStore construction/tests are unaffected.
+    # Wall clock, for oldest-first ordering that survives a restart
+    # (SqliteIngestJobStore).
     created_at_wall: float = field(default_factory=time.time)
 
 
@@ -116,7 +112,7 @@ class IngestBacklog:
 
 
 class JobStore(Protocol):
-    """Minimal surface ``api.main`` needs to track background ingest jobs."""
+    """Minimal surface ``api.ingest_jobs`` needs to track background ingest jobs."""
 
     def create(self, filename: str) -> IngestJob: ...
 
@@ -207,10 +203,6 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         chunks_done=int(chunks_done),
         error=None if error is None else str(error),
         result=None if result_json is None else json.loads(result_json),
-        # Loaded from disk, not measured in this process — meaningless for duration
-        # math (nothing reads IngestJob.created_at; see the module docstring), only
-        # needs to exist to satisfy the dataclass.
-        created_at=time.monotonic(),
         created_at_wall=float(created_at_wall),
     )
 

@@ -11,6 +11,8 @@ import type {
   FeedbackListResponse,
   FeedbackRequest,
   FeedbackResponse,
+  SearchRequest,
+  SearchResponse,
   HealthResponse,
   HistoryMessage,
   ImportResponse,
@@ -18,7 +20,6 @@ import type {
   PublicConfigResponse,
   QuestionOptions,
   QuestionOverrides,
-  QuestionResponse,
   TimingsResponse,
   TraceDetailResponse,
   TraceListResponse,
@@ -149,6 +150,49 @@ export async function extractErrorDetail(response: Response): Promise<string> {
 // Question-answering and upload both run a full ingest/generation pipeline that
 // routinely takes 70+ seconds; health/config use the short DEFAULT_TIMEOUT_MS.
 const LONG_RUNNING_TIMEOUT_MS = 120_000;
+
+// An upload's budget grows with its size: a fixed 120 s cut off a 50 MB file on any link
+// slower than ~3.5 Mbit/s, and Retry failed the same way. 256 KiB/s (~2 Mbit/s) on top
+// of the base, capped at 30 minutes.
+const UPLOAD_MIN_BYTES_PER_SECOND = 256 * 1024;
+const UPLOAD_MAX_TIMEOUT_MS = 30 * 60_000;
+
+// A file downloaded whole (an original, a corpus backup). Without a limit a stalled
+// export left "Download a backup" disabled until the page was reloaded.
+const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+
+/** GET ``path`` as a Blob within DOWNLOAD_TIMEOUT_MS, the body read included. */
+async function downloadBlob(path: string): Promise<{ response: Response; blob: Blob }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  try {
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}${path}`, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) throw new ApiClientError('Request timed out or was cancelled.');
+      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+    }
+    if (!response.ok) {
+      throw new ApiClientError(await extractErrorDetail(response), response.status);
+    }
+    try {
+      return { response, blob: await response.blob() };
+    } catch {
+      throw new ApiClientError('The download was interrupted or timed out.');
+    }
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export function uploadTimeoutMs(sizeBytes: number): number {
+  const transferMs = (sizeBytes / UPLOAD_MIN_BYTES_PER_SECOND) * 1000;
+  return Math.min(LONG_RUNNING_TIMEOUT_MS + Math.ceil(transferMs), UPLOAD_MAX_TIMEOUT_MS);
+}
 
 // A streamed answer can stay silent for a long stretch legitimately — rerank before
 // the first frame (measured 46-74s on CPU), prefill before the first token, the
@@ -296,20 +340,8 @@ export const api = {
 
   // The exact uploaded bytes (RAW_DOCUMENT_DIR on). Fetched, not linked: a plain link
   // can't carry the X-API-Key header.
-  getDocumentOriginal: async (filename: string): Promise<Blob> => {
-    let response: Response;
-    try {
-      response = await fetch(`${BASE_URL}/documents/${encodeURIComponent(filename)}/original`, {
-        headers: authHeaders(),
-      });
-    } catch (err) {
-      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
-    }
-    if (!response.ok) {
-      throw new ApiClientError(await extractErrorDetail(response), response.status);
-    }
-    return response.blob();
-  },
+  getDocumentOriginal: async (filename: string): Promise<Blob> =>
+    (await downloadBlob(`/documents/${encodeURIComponent(filename)}/original`)).blob,
 
   listDocuments: (signal?: AbortSignal) =>
     request<DocumentListResponse>('/documents', { signal }),
@@ -321,7 +353,7 @@ export const api = {
     return request<DocumentJobAcceptedResponse>('/documents', {
       method: 'POST',
       body: form,
-      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      timeoutMs: uploadTimeoutMs(file.size),
       signal,
     });
   },
@@ -359,18 +391,10 @@ export const api = {
   // The whole-corpus backup zip (manifest, stored originals, feedback). Needs the full
   // API key when one is set. Returns the file and the name the server suggested.
   exportCorpus: async (): Promise<{ blob: Blob; filename: string }> => {
-    let response: Response;
-    try {
-      response = await fetch(`${BASE_URL}/export`, { headers: authHeaders() });
-    } catch (err) {
-      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
-    }
-    if (!response.ok) {
-      throw new ApiClientError(await extractErrorDetail(response), response.status);
-    }
+    const { response, blob } = await downloadBlob('/export');
     const disposition = response.headers.get('Content-Disposition') ?? '';
     const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'docrag-export.zip';
-    return { blob: await response.blob(), filename };
+    return { blob, filename };
   },
 
   deleteDocument: (filename: string, signal?: AbortSignal) =>
@@ -395,6 +419,17 @@ export const api = {
       { signal },
     );
   },
+
+  // Ranked passages without an answer: works with no LLM reachable. 429 when the server
+  // is answering its maximum number of questions (it shares their slots).
+  searchPassages: (body: SearchRequest, signal?: AbortSignal) =>
+    request<SearchResponse>('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+    }),
 
   submitFeedback: (body: FeedbackRequest, signal?: AbortSignal) =>
     request<FeedbackResponse>('/feedback', {
@@ -427,7 +462,7 @@ export const api = {
     while (true) {
       let status: DocumentJobStatusResponse | null = null;
       try {
-        status = await request<DocumentJobStatusResponse>(`/documents/jobs/${jobId}`, {
+        status = await request<DocumentJobStatusResponse>(`/documents/jobs/${encodeURIComponent(jobId)}`, {
           signal,
         });
         transientFailures = 0;
@@ -461,30 +496,10 @@ export const api = {
     }
   },
 
-  askQuestion: (
-    question: string,
-    llmProvider?: LlmProvider,
-    overrides?: QuestionOverrides,
-    signal?: AbortSignal,
-    filenames?: string[],
-    history?: HistoryMessage[],
-    options?: QuestionOptions,
-  ) =>
-    request<QuestionResponse>('/questions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(
-        questionRequestBody(question, llmProvider, overrides, filenames, history, options),
-      ),
-      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
-      signal,
-    }),
-
   // Streams sources -> answer deltas -> a final done event over SSE, so the UI can
   // render citations and incremental text instead of waiting the full ~70s+ for a
-  // complete answer. Falls back to nothing special on failure — errors (including a
-  // mid-stream `error` event from the backend) reject the returned promise the same
-  // way askQuestion's non-streaming failures do.
+  // complete answer. Errors (including a mid-stream `error` event from the backend)
+  // reject the returned promise.
   askQuestionStream: async (
     question: string,
     llmProvider: LlmProvider | undefined,
@@ -503,6 +518,8 @@ export const api = {
     };
     const abortFromCaller = () => timeoutController.abort();
     signal?.addEventListener('abort', abortFromCaller);
+    // An already-aborted signal never fires 'abort', so the question was sent anyway.
+    if (signal?.aborted) timeoutController.abort();
     let sawDone = false;
 
     try {
@@ -576,19 +593,4 @@ export const api = {
       signal?.removeEventListener('abort', abortFromCaller);
     }
   },
-};
-
-export type {
-  CitationResponse,
-  DocumentContentResponse,
-  DocumentDeleteResponse,
-  DocumentJobAcceptedResponse,
-  DocumentJobStatusResponse,
-  DocumentListResponse,
-  HealthResponse,
-  PublicConfigResponse,
-  QuestionResponse,
-  TimingsResponse,
-  TraceDetailResponse,
-  TraceListResponse,
 };

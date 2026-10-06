@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,7 +31,7 @@ from api.generation import ChatMessage, GenerationError, LiteLLMGenerator
 from api.main import create_app
 from api.reranking import RerankingError
 from api.settings import AppSettings
-from tests.factories import in_memory_qdrant, make_test_settings
+from tests.factories import in_memory_qdrant, make_test_settings, wait_until
 
 
 class FakeEmbeddingProvider:
@@ -153,14 +152,9 @@ def upload_and_wait(
     assert response.status_code == 202
     job_id = response.json()["job_id"]
 
-    for _ in range(500):
-        # Same headers as the upload: the job-status route is key-guarded too, so
-        # polling it bare would 401 here exactly as it would in a real client.
-        status = client.get(f"/documents/jobs/{job_id}", headers=headers).json()
-        if status["state"] in ("done", "failed"):
-            return status
-        time.sleep(0.01)
-    raise AssertionError(f"ingest job {job_id} did not finish in time")
+    # Same headers as the upload: the job-status route is key-guarded too, so
+    # polling it bare would 401 here exactly as it would in a real client.
+    return wait_for_job(client, job_id, headers=headers)
 
 
 @contextmanager
@@ -328,13 +322,14 @@ def stream_error_detail(api_context: ApiTestContext, exc: Exception) -> str:
     return detail
 
 
-def wait_for_job(client: TestClient, job_id: str) -> dict[str, Any]:
-    for _ in range(300):
-        status: dict[str, Any] = client.get(f"/documents/jobs/{job_id}").json()
-        if status["state"] in ("done", "failed"):
-            return status
-        time.sleep(0.01)
-    raise AssertionError(f"job {job_id} never finished")
+def wait_for_job(
+    client: TestClient, job_id: str, *, headers: dict[str, str] | None = None
+) -> dict[str, Any]:
+    def finished() -> dict[str, Any] | None:
+        status: dict[str, Any] = client.get(f"/documents/jobs/{job_id}", headers=headers).json()
+        return status if status["state"] in ("done", "failed") else None
+
+    return wait_until(finished, message=f"job {job_id} never finished")
 
 
 def count_generations(generator: FakeGenerator) -> list[int]:

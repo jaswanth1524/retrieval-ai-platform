@@ -6,7 +6,8 @@ import contextvars
 import logging
 import threading
 import time
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Literal
 
@@ -378,6 +379,34 @@ def stored_filename(filename: str) -> str:
     if name != filename:
         raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
     return name
+
+
+class FilenameConflictError(DocumentError):
+    """Another document's name differs from this one only by case or Unicode form."""
+
+
+def _folded(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def refuse_near_duplicate_name(filename: str, existing: Iterable[str]) -> None:
+    """Refuse a name that only case or Unicode normalization tells apart from another.
+
+    Only matters when originals are stored: on a case-insensitive or normalizing disk
+    (a macOS host, a Windows bind mount) ``Report.pdf`` and ``report.pdf`` are one file,
+    so the second upload replaced the first document's original — and deleting either
+    removed both. The index itself tells them apart, so this is checked only with a raw
+    store, and re-uploading the exact same name is always allowed.
+    """
+
+    folded = _folded(filename)
+    for other in existing:
+        if other != filename and _folded(other) == folded:
+            raise FilenameConflictError(
+                f"'{filename}' differs from the existing document '{other}' only by "
+                "letter case or accents, and their stored originals would overwrite each "
+                f"other. Rename the file, or delete '{other}' first."
+            )
 
 
 def require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:

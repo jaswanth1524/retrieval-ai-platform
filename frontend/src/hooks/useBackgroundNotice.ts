@@ -12,12 +12,25 @@ export { NOTIFY_STORAGE_KEY };
  *  two on local models, long enough to switch away. The tab title counts unseen answers
  *  ("(2) DocRAG") until the tab is shown again, and — only when the user turned it on
  *  in Settings and the browser granted it — a system notification is shown too. */
-export function useBackgroundNotice(pending: boolean, notify: boolean, question?: string): void {
+export type AnswerOutcome = 'answered' | 'failed' | 'stopped';
+
+const NOTICE_TITLES: Record<AnswerOutcome, string> = {
+  answered: 'Answer ready',
+  failed: 'Question failed',
+  stopped: 'Answer stopped',
+};
+
+export function useBackgroundNotice(
+  pending: boolean,
+  notify: boolean,
+  question?: string,
+  outcome: AnswerOutcome = 'answered',
+): void {
   const baseTitle = useRef(document.title);
   const unseen = useRef(0);
   const wasPending = useRef(pending);
-  const latest = useRef({ notify, question });
-  latest.current = { notify, question };
+  const latest = useRef({ notify, question, outcome });
+  latest.current = { notify, question, outcome };
 
   useEffect(() => {
     const finished = wasPending.current && !pending;
@@ -27,7 +40,8 @@ export function useBackgroundNotice(pending: boolean, notify: boolean, question?
     document.title = `(${unseen.current}) ${baseTitle.current}`;
     if (latest.current.notify && notificationsSupported() && Notification.permission === 'granted') {
       try {
-        new Notification('Answer ready', {
+        // A failure announced as "Answer ready" sent the user back for nothing.
+        new Notification(NOTICE_TITLES[latest.current.outcome], {
           body: latest.current.question?.slice(0, 120),
           tag: 'docrag-answer',
         });

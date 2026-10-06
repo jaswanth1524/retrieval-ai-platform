@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import quote
@@ -12,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
 
+import api.ingestion as ingestion
 from api.dependencies import (
     clear_dependency_caches,
     get_embedding_provider,
@@ -22,6 +22,7 @@ from api.embeddings import EmbeddedText
 from api.ingestion import filename_write_lock
 from api.jobs import IngestBacklog, SqliteIngestJobStore
 from api.raw_documents import RawDocumentStore
+from tests.factories import wait_until
 from tests.routes_http.support import (
     ApiTestContext,
     hermetic_app,
@@ -134,11 +135,7 @@ def test_document_upload_releases_its_backlog_bytes_when_the_job_finishes(
 
     assert upload_and_wait(api_context.client, "guide.txt", b"alpha beta")["state"] == "done"
 
-    for _ in range(200):
-        if backlog.pending_bytes == 0:
-            break
-        time.sleep(0.01)
-    assert backlog.pending_bytes == 0
+    wait_until(lambda: backlog.pending_bytes == 0, message="backlog bytes never released")
 
 
 def test_document_upload_during_shutdown_fails_the_job_and_frees_its_bytes(
@@ -200,12 +197,7 @@ def test_shutdown_lets_a_running_ingest_finish(api_context: ApiTestContext) -> N
     shutdown_executors()
     release.set()
 
-    for _ in range(200):
-        state = api_context.client.get(f"/documents/jobs/{job_id}").json()["state"]
-        if state in ("done", "failed"):
-            break
-        time.sleep(0.01)
-    assert state == "done"
+    assert wait_for_job(api_context.client, job_id)["state"] == "done"
 
 
 def test_a_queued_job_cancelled_by_shutdown_is_failed_and_frees_its_bytes() -> None:
@@ -549,6 +541,43 @@ def test_delete_document_waits_for_the_filename_write_lock(api_context: ApiTestC
     assert statuses == [200]
 
 
+def test_a_delete_overtaken_by_a_newer_upload_at_the_lock_keeps_that_upload(
+    api_context: ApiTestContext,
+) -> None:
+    """The filename lock isn't fair: an upload admitted after a DELETE can reach it
+    first. The delete used to run anyway and remove the document just re-uploaded."""
+
+    from api.ingestion import ingest_sequencer
+
+    client = api_context.client
+    upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")
+    statuses: list[tuple[int, str]] = []
+
+    def delete_in_background() -> None:
+        response = client.delete("/documents/guide.txt")
+        statuses.append((response.status_code, response.json()["detail"]))
+
+    worker = threading.Thread(target=delete_in_background, daemon=True)
+    with filename_write_lock("guide.txt"):
+        worker.start()
+        wait_until(
+            lambda: (
+                (entry := ingestion._filename_locks.get("guide.txt")) is not None
+                and entry.users >= 2
+            ),
+            message="the DELETE never reached the filename lock",
+        )
+        # What a newer upload does when it wins the lock: indexed and marked applied.
+        newer = ingest_sequencer.admit("guide.txt")
+        ingest_sequencer.mark_applied("guide.txt", newer)
+        ingest_sequencer.release("guide.txt")
+
+    worker.join(timeout=15)
+    assert statuses and statuses[0][0] == 409
+    assert "newer upload" in statuses[0][1]
+    assert client.get("/documents").json()["filenames"] == ["guide.txt"]
+
+
 def test_reindex_rechunks_a_stale_document_from_its_original_and_keeps_its_upload_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -720,11 +749,12 @@ def test_an_upload_after_a_delete_is_indexed(api_context: ApiTestContext) -> Non
     assert "guide.txt" in client.get("/documents").json()["filenames"]
 
 
-def test_a_delete_invalidates_cached_answers_even_when_removing_the_original_fails(
+def test_a_delete_succeeds_and_invalidates_cached_answers_when_removing_the_original_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The points are gone by then: a 500 told the user a delete that happened failed."""
+
     from api.corpus import corpus_generation
-    from api.raw_documents import RawDocumentStore
 
     with raw_storage_client(tmp_path, monkeypatch) as client:
         assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
@@ -733,11 +763,17 @@ def test_a_delete_invalidates_cached_answers_even_when_removing_the_original_fai
         def broken_delete(self: RawDocumentStore, filename: str) -> bool:
             raise PermissionError("read-only volume")
 
-        monkeypatch.setattr(RawDocumentStore, "delete", broken_delete)
-        with TestClient(client.app, raise_server_exceptions=False) as failing:
-            assert failing.delete("/documents/guide.txt").status_code == 500
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(RawDocumentStore, "delete", broken_delete)
+            response = client.delete("/documents/guide.txt")
 
+        assert response.status_code == 200
+        assert response.json()["points_deleted"] > 0
         assert corpus_generation() > before
+        assert client.get("/documents").json()["filenames"] == []
+        # The orphaned original goes with a second DELETE, through the no-points path.
+        assert client.delete("/documents/guide.txt").status_code == 200
+    assert not (tmp_path / "guide.txt").exists()
 
 
 def test_a_queued_reindex_does_not_overwrite_a_newer_upload(
@@ -834,13 +870,13 @@ def test_a_tag_change_made_while_a_re_upload_waits_for_the_lock_survives_it(
             "/documents", files={"file": ("guide.txt", b"Intro\nalpha v2", "text/plain")}
         ).json()["job_id"]
         # The ingest has parsed and is now queued on the lock this test holds.
-        for _ in range(500):
-            entry = ingestion._filename_locks.get("guide.txt")
-            if entry is not None and entry.users >= 2:
-                break
-            time.sleep(0.01)
-        else:
-            raise AssertionError("the re-upload never reached the filename lock")
+        wait_until(
+            lambda: (
+                (entry := ingestion._filename_locks.get("guide.txt")) is not None
+                and entry.users >= 2
+            ),
+            message="the re-upload never reached the filename lock",
+        )
         # What PATCH does, as the holder of the lock.
         VectorRepository(api_context.qdrant).set_tags(api_context.settings, "guide.txt", ["new"])
 
@@ -897,3 +933,54 @@ def test_unpaged_document_content_is_capped_but_reports_the_real_total(
 
     assert [c["chunk_ordinal"] for c in content["chunks"]] == [1, 2, 3]
     assert content["total_chunks"] > 3
+
+
+def test_with_stored_originals_a_name_differing_only_by_case_or_accents_is_a_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a case-insensitive disk both names are one original file: the second upload
+    replaced the first document's bytes, and deleting either removed both."""
+
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        assert upload_and_wait(client, "Report.pdf.txt", b"Intro\nalpha")["state"] == "done"
+        assert upload_and_wait(client, "R\u00e9sum\u00e9.txt", b"Intro\nbeta")["state"] == "done"
+
+        for clash in ("report.PDF.txt", "Re\u0301sume\u0301.txt"):
+            response = client.post(
+                "/documents", files={"file": (clash, b"Intro\ngamma", "text/plain")}
+            )
+            assert response.status_code == 409, clash
+            assert "only by letter case" in response.json()["detail"]
+        # The exact same name is a re-upload, always allowed.
+        assert upload_and_wait(client, "Report.pdf.txt", b"Intro\nv2")["state"] == "done"
+
+
+def test_without_stored_originals_names_differing_by_case_are_separate_documents(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "Report.txt", b"Intro\nalpha")["state"] == "done"
+    assert upload_and_wait(client, "report.txt", b"Intro\nbeta")["state"] == "done"
+    assert client.get("/documents").json()["filenames"] == ["Report.txt", "report.txt"]
+
+
+def test_changing_the_chunk_settings_lists_documents_as_stale_and_reindex_all_fixes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a CHUNKER_VERSION bump used to count; a new CHUNK_SIZE_TOKENS left every
+    document chunked the old way with nothing to say so."""
+
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        import api.dependencies
+
+        settings = api.dependencies.get_app_settings()  # patched to the client's settings
+        assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+        assert client.get("/documents").json()["stale_filenames"] == []
+
+        settings.__dict__["chunk_size_tokens"] = settings.chunk_size_tokens - 1
+        assert client.get("/documents").json()["stale_filenames"] == ["guide.txt"]
+
+        accepted = client.post("/documents/reindex").json()
+        assert [job["filename"] for job in accepted["jobs"]] == ["guide.txt"]
+        assert wait_for_job(client, accepted["jobs"][0]["job_id"])["state"] == "done"
+        assert client.get("/documents").json()["stale_filenames"] == []

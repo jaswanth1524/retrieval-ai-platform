@@ -50,3 +50,25 @@ def test_json_log_lines_carry_the_request_id(capsys: pytest.CaptureFixture[str])
     assert line["message"] == "hello world"
     assert line["request_id"] == "req-42"
     assert line["level"] == "INFO"
+
+
+def test_concurrent_query_variants_keep_the_request_id_in_their_threads() -> None:
+    """Pool threads start with an empty context: with query expansion on, repository
+    log lines from the variant searches had no request id."""
+
+    import threading
+
+    from api.pipeline import _map_concurrently
+    from api.request_id import current_request_id, request_id_var
+
+    gate = threading.Barrier(3)
+
+    def seen(_: int) -> str | None:
+        gate.wait(5)  # all three run at once, on pool threads
+        return current_request_id()
+
+    token = request_id_var.set("req-123")
+    try:
+        assert _map_concurrently(seen, [1, 2, 3]) == ["req-123"] * 3
+    finally:
+        request_id_var.reset(token)

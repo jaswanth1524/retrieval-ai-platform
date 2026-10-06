@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiClientError, api, extractErrorDetail } from '../../src/api/client';
+import { ApiClientError, api, extractErrorDetail, uploadTimeoutMs } from '../../src/api/client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -10,6 +10,22 @@ function jsonResponse(status: number, body: unknown): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+// A complete (done-only) answer stream: the request body is the same for every question,
+// so these tests read it from whichever fetch call carried it.
+function doneStream(): Response {
+  const frame = `data: ${JSON.stringify({ type: 'done', answer: 'x', sources: [], timings: null })}\n\n`;
+  return new Response(frame, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+function ask(
+  question: string,
+  provider?: Parameters<typeof api.askQuestionStream>[1],
+  overrides?: Parameters<typeof api.askQuestionStream>[2],
+  options?: Parameters<typeof api.askQuestionStream>[7],
+) {
+  return api.askQuestionStream(question, provider, overrides, undefined, undefined, {}, undefined, options);
 }
 
 describe('extractErrorDetail', () => {
@@ -37,19 +53,6 @@ describe('extractErrorDetail', () => {
 });
 
 describe('api client', () => {
-  it('throws ApiClientError with the extracted detail on a non-2xx response', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(jsonResponse(409, { detail: 'Re-ingest documents before querying.' })),
-    );
-
-    await expect(api.askQuestion('hi')).rejects.toMatchObject({
-      name: 'ApiClientError',
-      message: 'Re-ingest documents before querying.',
-      statusCode: 409,
-    });
-  });
-
   it('throws ApiClientError on a network failure', async () => {
     vi.stubGlobal(
       'fetch',
@@ -60,10 +63,10 @@ describe('api client', () => {
   });
 
   it('includes llm_provider in the body when a provider is passed', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    const fetchMock = vi.fn(async () => doneStream());
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.askQuestion('hi', 'openai');
+    await ask('hi', 'openai');
 
     const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
     expect(body).toEqual({ question: 'hi', llm_provider: 'openai' });
@@ -71,14 +74,11 @@ describe('api client', () => {
 
   it('sends tags and use_cache=false only when asked to', async () => {
     // A fresh Response per call: a body can only be read once.
-    const fetchMock = vi.fn(async () => jsonResponse(200, { answer: 'x', sources: [] }));
+    const fetchMock = vi.fn(async () => doneStream());
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.askQuestion('hi', undefined, undefined, undefined, undefined, undefined, {
-      tags: ['legal'],
-      bypassCache: true,
-    });
-    await api.askQuestion('hi', undefined, undefined, undefined, undefined, undefined, { tags: [] });
+    await ask('hi', undefined, undefined, { tags: ['legal'], bypassCache: true });
+    await ask('hi', undefined, undefined, { tags: [] });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toEqual({
       question: 'hi',
@@ -102,10 +102,10 @@ describe('api client', () => {
   });
 
   it('omits llm_provider from the body when no provider is passed', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    const fetchMock = vi.fn(async () => doneStream());
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.askQuestion('hi');
+    await ask('hi');
 
     const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
     expect(body).toEqual({ question: 'hi' });
@@ -113,10 +113,10 @@ describe('api client', () => {
   });
 
   it('includes only the set override fields in the body', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    const fetchMock = vi.fn(async () => doneStream());
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.askQuestion('hi', undefined, {
+    await ask('hi', undefined, {
       rerankTopK: 3,
       maxContextChunks: null,
       llmTemperature: 1.5,
@@ -128,10 +128,10 @@ describe('api client', () => {
   });
 
   it('omits all override fields when overrides is undefined or all null', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { answer: 'x', sources: [] }));
+    const fetchMock = vi.fn(async () => doneStream());
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.askQuestion('hi', undefined, {
+    await ask('hi', undefined, {
       rerankTopK: null,
       maxContextChunks: null,
       llmTemperature: null,
@@ -462,6 +462,20 @@ describe('askQuestionStream', () => {
     });
   });
 
+  it('sends nothing live for a question whose signal was already aborted', async () => {
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      init.signal?.aborted ? Promise.reject(new DOMException('aborted', 'AbortError')) : Promise.resolve(sseResponse([])),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      api.askQuestionStream('hi', undefined, undefined, undefined, undefined, {}, controller.signal),
+    ).rejects.toBeInstanceOf(ApiClientError);
+    expect(fetchMock.mock.calls[0][1].signal?.aborted).toBe(true);
+  });
+
   it('throws ApiClientError on a non-2xx response before reading the stream', async () => {
     vi.stubGlobal(
       'fetch',
@@ -707,5 +721,14 @@ describe('exportCorpus', () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(403, { detail: 'This API key is read-only.' })));
 
     await expect(api.exportCorpus()).rejects.toMatchObject({ statusCode: 403 });
+  });
+});
+
+describe('uploadTimeoutMs', () => {
+  it('gives a large file time to reach a slow server, within a cap', () => {
+    // The fixed 120 s cut off a 50 MB upload on any link slower than ~3.5 Mbit/s.
+    expect(uploadTimeoutMs(0)).toBe(120_000);
+    expect(uploadTimeoutMs(50 * 1024 * 1024)).toBe(120_000 + 200_000);
+    expect(uploadTimeoutMs(10 * 1024 * 1024 * 1024)).toBe(30 * 60_000);
   });
 });

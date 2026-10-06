@@ -8,6 +8,11 @@ from typing import Literal
 
 DEFAULT_SECTION = "Document"
 
+# Longest section label any parser emits. The label is part of every chunk's embedded
+# prefix ("filename › section"), so an uncapped one — a 2000-character Markdown heading —
+# left a token or two of budget per chunk and turned one page into thousands of chunks.
+MAX_SECTION_CHARS = 120
+
 
 # infer_section: candidate first-lines that look like page furniture rather than an
 # actual heading, so a PDF page's literal first line (often a page number or footer)
@@ -60,6 +65,12 @@ def normalize_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
+def cap_section(label: str) -> str:
+    """A section label cut to ``MAX_SECTION_CHARS``; ``DEFAULT_SECTION`` when empty."""
+
+    return label[:MAX_SECTION_CHARS] or DEFAULT_SECTION
+
+
 def infer_section(text: str) -> str:
     """Infer a stable section label when richer structure is unavailable.
 
@@ -79,9 +90,9 @@ def infer_section(text: str) -> str:
             first_candidate = candidate
         if _looks_like_page_furniture(candidate):
             continue
-        return candidate[:120]
+        return cap_section(candidate)
     if first_candidate is not None:
-        return first_candidate[:120]
+        return cap_section(first_candidate)
     return DEFAULT_SECTION
 
 

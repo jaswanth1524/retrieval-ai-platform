@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from fastembed import SparseTextEmbedding, TextEmbedding
 from qdrant_client import models
 
+from api.request_id import submit_in_context
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -106,8 +107,12 @@ class LocalEmbeddingProvider:
         # download/load happens on this first call, not at __init__ — this is the
         # boundary that must translate a load failure into EmbeddingError.
         try:
-            dense_future = self._executor.submit(lambda: list(self.dense_model.embed(texts)))
-            sparse_future = self._executor.submit(lambda: list(self.sparse_model.embed(texts)))
+            dense_future = submit_in_context(
+                self._executor, lambda: list(self.dense_model.embed(texts))
+            )
+            sparse_future = submit_in_context(
+                self._executor, lambda: list(self.sparse_model.embed(texts))
+            )
             dense_vectors = [coerce_dense_vector(vector) for vector in dense_future.result()]
             sparse_vectors = [coerce_sparse_vector(vector) for vector in sparse_future.result()]
         except EmbeddingError:
@@ -147,11 +152,11 @@ class LocalEmbeddingProvider:
         instruction = self.settings.dense_query_instruction
         dense_text = f"{instruction}{text}" if instruction else text
         try:
-            dense_future = self._query_executor.submit(
-                lambda: list(self.dense_model.embed([dense_text]))
+            dense_future = submit_in_context(
+                self._query_executor, lambda: list(self.dense_model.embed([dense_text]))
             )
-            sparse_future = self._query_executor.submit(
-                lambda: list(self.sparse_model.query_embed([text]))
+            sparse_future = submit_in_context(
+                self._query_executor, lambda: list(self.sparse_model.query_embed([text]))
             )
             dense_vectors = [coerce_dense_vector(v) for v in dense_future.result()]
             sparse_vectors = [coerce_sparse_vector(v) for v in sparse_future.result()]

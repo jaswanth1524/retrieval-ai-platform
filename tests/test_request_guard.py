@@ -172,3 +172,16 @@ def test_full_key_routes() -> None:
         ("GET", "/traces"),
     ]:
         assert not needs_full_key(method, path), (method, path)
+
+
+def test_two_api_key_headers_are_a_400() -> None:
+    """The guard judged the last copy and the route's dependency the first, so the two
+    checks could see different keys."""
+
+    downstream, sent, _ = _run(
+        _settings(api_key="secret"),
+        headers=[(b"x-api-key", b"secret"), (b"X-API-Key", b"other")],
+    )
+
+    assert _status(sent) == 400
+    assert not downstream.called

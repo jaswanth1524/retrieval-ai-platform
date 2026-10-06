@@ -7,7 +7,7 @@ import logging
 import grpc
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from qdrant_client.http.exceptions import ResponseHandlingException
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from api.documents import (
     DocumentError,
@@ -41,6 +41,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(CollectionSchemaError, conflict_handler)
     app.add_exception_handler(VectorStoreUnavailableError, service_unavailable_handler)
     app.add_exception_handler(ResponseHandlingException, vector_store_transport_handler)
+    app.add_exception_handler(UnexpectedResponse, vector_store_response_handler)
     # grpcio is a hard dependency of qdrant-client and nothing else here speaks gRPC,
     # so this is effectively "any Qdrant gRPC failure" despite the broad type.
     app.add_exception_handler(grpc.RpcError, vector_store_transport_handler)
@@ -111,6 +112,28 @@ async def vector_store_transport_handler(request: Request, exc: Exception) -> JS
         status_code=500,
         content={"detail": "The request failed due to an unexpected vector store error."},
     )
+
+
+QDRANT_REJECTED_KEY = "Qdrant rejected the request's credentials; check QDRANT_API_KEY."
+QDRANT_SERVER_ERROR = "The vector store failed to handle the request. Try again shortly."
+QDRANT_UNEXPECTED_ERROR = "The request failed due to an unexpected vector store error."
+
+
+async def vector_store_response_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Map an error status from Qdrant's REST API to a fixed message instead of a bare 500.
+
+    Repository methods let ``UnexpectedResponse`` through (only a missing collection is
+    recovered from), so a wrong ``QDRANT_API_KEY`` or a Qdrant 5xx surfaced as an
+    unhandled exception. The real response is logged; the client gets a fixed message.
+    """
+
+    status = exc.status_code if isinstance(exc, UnexpectedResponse) else None
+    logger.warning("Qdrant answered with an error (HTTP %s).", status, exc_info=exc)
+    if status in (401, 403):
+        return JSONResponse(status_code=503, content={"detail": QDRANT_REJECTED_KEY})
+    if status is not None and status >= 500:
+        return JSONResponse(status_code=503, content={"detail": QDRANT_SERVER_ERROR})
+    return JSONResponse(status_code=500, content={"detail": QDRANT_UNEXPECTED_ERROR})
 
 
 async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:

@@ -48,10 +48,14 @@ QUESTIONS_BUSY_ERROR = (
 )
 
 
-def question_slot(slots: QuestionSlots) -> Release:
+def question_slot(slots: QuestionSlots, *, count_metric: bool = True) -> Release:
+    """A question slot, or 429. ``count_metric=False`` for a search, which isn't a
+    question and stays out of ``questions_total``."""
+
     release = slots.try_acquire()
     if release is None:
-        questions_total.labels(outcome="error", error_type="busy").inc()
+        if count_metric:
+            questions_total.labels(outcome="error", error_type="busy").inc()
         raise HTTPException(
             status_code=429, detail=QUESTIONS_BUSY_ERROR, headers={"Retry-After": "5"}
         )

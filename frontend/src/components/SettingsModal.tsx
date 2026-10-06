@@ -4,6 +4,7 @@ import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
+import { EMPTY_OVERRIDES } from '../utils/overrides';
 
 interface SettingsModalProps {
   config: PublicConfigResponse;
@@ -16,12 +17,6 @@ interface SettingsModalProps {
   notifyOnAnswer?: boolean;
   onNotifyOnAnswerChange?: (value: boolean) => void;
 }
-
-const EMPTY_OVERRIDES: QuestionOverrides = {
-  rerankTopK: null,
-  maxContextChunks: null,
-  llmTemperature: null,
-};
 
 const SYSTEM_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
   ['Qdrant collection', 'qdrant_collection'],

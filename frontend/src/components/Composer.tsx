@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
 import './Composer.css';
+import { isImeComposing } from '../utils/keyboard';
 
 // Matches the backend's QuestionRequest.question max_length in api/schemas.py.
 const MAX_QUESTION_LENGTH = 4000;
@@ -118,7 +119,7 @@ function Composer({
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter while an IME is composing (Japanese, Chinese, Korean) confirms the candidate;
     // treating it as "send" submitted half-typed questions. 229 is Safari's composing code.
-    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (isImeComposing(event)) return;
     // Esc in the question box stops the answer being written, like the Stop button.
     if (event.key === 'Escape' && pending && !openPopover) {
       event.preventDefault();
@@ -199,7 +200,6 @@ function Composer({
                 setScopeQuery('');
               }}
               disabled={indexedFilenames.length === 0}
-              aria-haspopup="dialog"
               aria-expanded={openPopover === 'scope'}
               aria-controls="composer-scope-popover"
               ref={scopeButtonRef}
@@ -271,7 +271,6 @@ function Composer({
               className="composer__chip"
               onClick={() => setOpenPopover((prev) => (prev === 'provider' ? null : 'provider'))}
               disabled={!config}
-              aria-haspopup="dialog"
               aria-expanded={openPopover === 'provider'}
               aria-controls="composer-provider-popover"
               ref={providerButtonRef}

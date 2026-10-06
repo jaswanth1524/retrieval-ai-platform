@@ -28,10 +28,47 @@ def test_hf_counter_degrades_to_heuristic_when_tokenizer_unavailable(
     # Force the lazy tokenizer load to fail; the counter must fall back, not raise.
     monkeypatch.setattr("tokenizers.Tokenizer.from_pretrained", _boom)
 
+    assert counter.mode == "unknown"
     result = counter.count("one two three")
     assert result == HeuristicTokenCounter().count("one two three")
+    assert counter.mode == "heuristic"
     # Subsequent calls stay on the heuristic without retrying the failed load.
     assert counter.count("four five") == HeuristicTokenCounter().count("four five")
+
+
+def test_hf_counter_retries_the_tokenizer_after_a_while(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One failed fetch (offline at boot) degraded chunk sizing for the process's life."""
+
+    import api.chunking as chunking
+
+    class FakeEncoding:
+        ids = [1, 2]
+
+    class FakeTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = True) -> FakeEncoding:
+            return FakeEncoding()
+
+    attempts: list[int] = []
+
+    def flaky(*args: object, **kwargs: object) -> object:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("no network")
+        return FakeTokenizer()
+
+    clock = [100.0]
+    monkeypatch.setattr("tokenizers.Tokenizer.from_pretrained", flaky)
+    monkeypatch.setattr(chunking.time, "monotonic", lambda: clock[0])
+    counter = HFTokenCounter("model")
+
+    counter.count("one two three")
+    clock[0] += 299
+    counter.count("one two three")
+    assert (len(attempts), counter.mode) == (1, "heuristic")
+
+    clock[0] += 2
+    assert counter.count("one two three") == 2
+    assert (len(attempts), counter.mode) == (2, "hf")
 
 
 class CharTokenCounter:

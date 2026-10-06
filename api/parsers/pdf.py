@@ -243,8 +243,9 @@ def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> li
         for page_number in page_numbers:
             if page_number > len(pdf.pages):
                 continue
+            page = pdf.pages[page_number - 1]
             try:
-                image = pdf.pages[page_number - 1].to_image(resolution=200)
+                image = page.to_image(resolution=200)
                 import numpy as np
 
                 ocr_result, _ = engine(np.array(image.original))
@@ -258,6 +259,10 @@ def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> li
                     exc_info=True,
                 )
                 continue
+            finally:
+                # A page keeps its parsed objects cached until closed; a long scan
+                # otherwise held every OCR'd page in memory until the PDF closed.
+                page.close()
             text = normalize_text("\n".join(line[1] for line in (ocr_result or [])))
             if text:
                 sections.append(

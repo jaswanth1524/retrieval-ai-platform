@@ -82,6 +82,17 @@ body {
   }
 }
 
+/* iOS zooms the page in on focusing a field set below 16px, and leaves it zoomed.
+   !important: every component styles its own fields by class, which a type selector
+   can't outrank, and this must hold for all of them on touch screens. */
+@media (pointer: coarse) {
+  textarea,
+  select,
+  input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']) {
+    font-size: max(16px, 1em) !important;
+  }
+}
+
 @keyframes dr-in {
   from {
     opacity: 0;

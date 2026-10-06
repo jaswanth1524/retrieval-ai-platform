@@ -31,13 +31,19 @@ def parse_csv_document(
     # multi-line cells apart and also split on \u2028/\x0c inside a cell.
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     try:
-        records = [row for row in reader if any(cell.strip() for cell in row)]
+        # Numbered before blank rows are dropped, so a section label names the rows a
+        # spreadsheet shows ("Rows 4-9"), not positions among the non-blank ones.
+        records = [
+            (number, row)
+            for number, row in enumerate(reader, 1)
+            if any(cell.strip() for cell in row)
+        ]
     except csv.Error as exc:  # e.g. a field past csv.field_size_limit()
         raise DocumentParseError(f"Could not parse CSV '{filename}': {exc}") from exc
     if not records:
         raise EmptyDocumentError(f"CSV '{filename}' has no rows.")
 
-    header = [cell.strip() for cell in records[0]]
+    header = [cell.strip() for cell in records[0][1]]
     data_rows = records[1:]
     if not data_rows:
         # Header-only file: treat the header row itself as the single section.
@@ -53,13 +59,11 @@ def parse_csv_document(
     sections: list[DocumentSection] = []
     for start in range(0, len(data_rows), rows_per_section):
         group = data_rows[start : start + rows_per_section]
-        rendered_rows = [_render_csv_row(header, row) for row in group]
+        rendered_rows = [_render_csv_row(header, row) for _, row in group]
         text_block = "\n".join(line for line in rendered_rows if line)
         if not text_block:
             continue
-        first_row = start + 2  # 1-based, and row 1 is the header
-        last_row = start + len(group) + 1
-        label = f"Rows {first_row}-{last_row}"
+        label = f"Rows {group[0][0]}-{group[-1][0]}"
         sections.append(DocumentSection(filename=filename, page=1, section=label, text=text_block))
     if not sections:
         raise EmptyDocumentError(f"CSV '{filename}' has no data rows.")

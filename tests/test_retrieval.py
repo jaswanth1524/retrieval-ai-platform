@@ -169,6 +169,33 @@ def test_manual_fusion_fallback_is_remembered_per_client(
     assert [r.chunk_id for r in first] == [r.chunk_id for r in second] == ["c1", "c3", "c2"]
 
 
+def test_a_400_that_manual_fusion_also_fails_is_not_remembered_as_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 400 for another reason (a query vector of the wrong size) fails the manual
+    query too; remembering it turned server-side hybrid off for the process."""
+
+    from api.repository import _server_side_hybrid_unsupported
+
+    settings = make_settings()
+    client = seed_collection(settings)
+    original_query_points = client.query_points
+    broken = True
+
+    def query_points(*args: Any, **kwargs: Any) -> object:
+        if broken:
+            raise _unexpected_response(400)
+        return original_query_points(*args, **kwargs)
+
+    monkeypatch.setattr(client, "query_points", query_points)
+    with pytest.raises(UnexpectedResponse):
+        search(VectorRepository(client), settings)
+
+    assert client not in _server_side_hybrid_unsupported
+    broken = False
+    assert [r.chunk_id for r in search(VectorRepository(client), settings)] == ["c1", "c3", "c2"]
+
+
 def test_hybrid_search_does_not_fall_back_on_real_query_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

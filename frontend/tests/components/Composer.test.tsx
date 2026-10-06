@@ -336,7 +336,8 @@ describe('Composer', () => {
       render(<Composer {...baseProps({ config: makeConfig({ openai_available: true }) })} />);
 
       const scopeButton = screen.getByTestId('composer-scope-button');
-      expect(scopeButton).toHaveAttribute('aria-haspopup', 'dialog');
+      // A disclosure (aria-expanded), not a dialog: the popover is a plain group.
+      expect(scopeButton).not.toHaveAttribute('aria-haspopup');
       expect(scopeButton).toHaveAttribute('aria-expanded', 'false');
 
       await userEvent.click(scopeButton);

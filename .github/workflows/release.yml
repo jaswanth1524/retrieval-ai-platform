@@ -1,8 +1,10 @@
 name: Release
 
-# Pushing a version tag (v0.2.0) publishes the image to GHCR, signs it, scans it, and
-# opens a GitHub release whose notes are that version's CHANGELOG.md section. Tag the
-# commit whose pyproject.toml `version` matches the tag; the build refuses otherwise.
+# Pushing a version tag (v0.2.0) publishes the image (linux/amd64 and linux/arm64) to
+# GHCR, signs it, scans it, and opens a GitHub release whose notes are that version's
+# CHANGELOG.md section. Tag the commit whose pyproject.toml `version` matches the tag;
+# the build refuses otherwise. A fixable CRITICAL vulnerability in the amd64 image stops
+# the release before anything is pushed.
 on:
   push:
     tags: ["v*"]
@@ -26,7 +28,7 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
-      # Actions pinned by commit; Dependabot (github-actions ecosystem) bumps them.
+      # Actions pinned by commit; bump them by hand.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Tag matches pyproject version
@@ -36,6 +38,21 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml version $version"
             exit 1
           fi
+
+      - name: CHANGELOG has this version
+        # The release notes are that section; without it the release went out with none.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes=$(awk -v v="$version" '
+            $0 ~ "^## " { if (found) exit; if (index($0, "## " v) == 1) { found = 1; next } }
+            found && NF { print }
+          ' CHANGELOG.md)
+          if [ -z "$notes" ]; then
+            echo "::error::CHANGELOG.md has no non-empty '## $version' section"
+            exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -53,18 +70,43 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      # Built and scanned locally first, so a known-fixable CRITICAL issue is found before
+      # anything is published. The push below reuses these layers from the cache.
+      - name: Build the amd64 image for scanning
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: docrag:scan
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+
+      - name: Scan before pushing (fixable CRITICAL fails the release)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          # The program, pinned with the action (v0.35.0's own default, made explicit).
+          version: v0.69.3
+          image-ref: docrag:scan
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Build provenance and an SBOM, attached to the image as attestations.
           provenance: mode=max
           sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Its own scope, apart from CI's.
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
 
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
@@ -75,9 +117,13 @@ jobs:
         #   --certificate-oidc-issuer https://token.actions.githubusercontent.com
         run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
 
-      - name: Scan the image
+      - name: Scan the published image (report)
+        # The amd64 image was gated above; this records HIGH findings for both
+        # architectures' shared layers in the Security tab without blocking.
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
+          # The program, pinned with the action (v0.35.0's own default, made explicit).
+          version: v0.69.3
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: sarif
           output: trivy.sarif

@@ -8,7 +8,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Token-aware chunking**: chunks are sized by the dense model's real subword tokens (not word counts) and split on sentence boundaries, so an embedded chunk never silently overflows the model's 512-token limit.
 - **Broad format support**: PDF (with table extraction and optional OCR for scanned pages), DOCX, HTML, CSV, TXT, and Markdown. OCR is an optional extra (`uv sync --extra ocr`).
 - **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder. Citation markers (`[2]`, `[1, 2]`, `[1-3]`) in the answer text are buttons that open the cited passage.
-- **Search without an answer**: `POST /search` returns the ranked passages for a query — the same hybrid search, RRF and rerank a question uses, with no LLM call — so finding things in your documents works even when the LLM is down.
+- **Search without an answer**: `POST /search` returns the ranked passages for a query — the same hybrid search, RRF and rerank a question uses, with no LLM call — so finding things in your documents works even when the LLM is down. The UI has it as the Search panel in the left rail (and in the ⌘K palette), scoped like a question.
 - **Multi-query expansion** (opt-in): rewrite the query into several phrasings, retrieve each, and RRF-fuse before reranking — off by default (`QUERY_EXPANSION_ENABLED`).
 - **Conversation memory**: the client sends recent chat turns with each question; when history is present, one extra LLM call rewrites a follow-up ("what about the second one?") into a standalone retrieval query before hybrid search runs. The server itself stores no session state.
 - **Multi-conversation chat**: named conversations with new/switch/rename/delete, persisted locally across reloads (older single-thread history migrates automatically).
@@ -86,6 +86,8 @@ Qdrant server-side hybrid query is used where available (with `QDRANT_PREFER_GRP
 docker compose up
 ```
 
+Needs Docker Compose v2.24+ (Docker Engine 25+): the file uses an optional `env_file` entry and `start_interval` healthchecks. To run a published release instead of building, `DOCRAG_VERSION=0.1.0 DOCRAG_PULL_POLICY=always docker compose up` pulls `ghcr.io/jaswanth1524/retrieval-ai-platform:0.1.0` (linux/amd64 and linux/arm64).
+
 The Compose file runs two services: Qdrant, and the API. The API's Docker image builds the `frontend/` React app and serves the built static files itself, so the browser UI and the JSON API share a single origin/port — there is no separate UI container. It loads non-secret defaults from `.env.example`; copy it to `.env` (`cp .env.example .env`) to set real secrets such as `OPENAI_API_KEY` — values in `.env` override `.env.example` and the file is git-ignored. The hosts in `.env.example` are the compose-network ones (`QDRANT_URL=http://qdrant:6333`, Ollama at `host.docker.internal`); when running the API on the host with `uv run uvicorn`, set them to `localhost` in your `.env`.
 
 The default `OLLAMA_BASE_URL` targets `host.docker.internal`, which Docker Desktop (macOS/Windows) resolves automatically. On native Linux, Compose maps this via `extra_hosts: host-gateway`, so no extra setup is required there either. Ollama itself must be running on the host (`ollama serve`) with the configured model pulled (default `llama3.1:8b`).
@@ -153,7 +155,7 @@ CI (`.github/workflows/ci.yml`) runs five jobs on every push/PR, with a read-onl
 - **e2e**: Playwright against the production build with a mocked API.
 - **docker**: builds the image (layer cache in GitHub Actions) and boots it, probing `/health` and the served UI.
 
-Releases (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` that matches `version` in `pyproject.toml` publishes `ghcr.io/<owner>/<repo>:X.Y.Z` with build provenance and an SBOM, signs it with cosign (keyless), scans it with Trivy (results in the Security tab) and creates the GitHub release from that version's `CHANGELOG.md` section.
+Releases (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` that matches `version` in `pyproject.toml` publishes `ghcr.io/<owner>/<repo>:X.Y.Z` (linux/amd64 and linux/arm64) with build provenance and an SBOM, signs it with cosign (keyless), scans it with Trivy (a fixable CRITICAL vulnerability stops the release before the push; HIGH findings go to the Security tab) and creates the GitHub release from that version's `CHANGELOG.md` section, which must exist and be non-empty (`tests/test_release_metadata.py` checks it, and that `frontend/package.json` and the Qdrant pins agree). The first push of a package to GHCR may start private: set it to public in the package settings if you want anonymous pulls.
 
 ## Configuration
 
@@ -277,7 +279,7 @@ baseline checks) are unit-tested with fakes; the handbook eval runs for real in 
 The simplest backup is the app's own: `GET /export` (or "Download a backup" in the ⌘K
 palette) and, to restore, `POST /import` with that zip ("Restore documents from a
 backup"). It re-indexes from the stored originals, so it needs `RAW_DOCUMENT_DIR` on
-when the backup was made, and survives an embedding-model change. A restore skips
+when the backup was made. A restore skips
 documents already indexed, and one deferred because the indexing queue was full is
 finished by importing the same file again. For a byte-level backup, everything DocRAG
 knows lives in two places:
@@ -291,6 +293,14 @@ knows lives in two places:
   the feedback database, and stored originals (`RAW_DOCUMENT_DIR`). Back it up with the
   volume, e.g. `docker run --rm -v <project>_docrag_job_store:/data -v "$PWD":/backup
   busybox tar czf /backup/docrag-data.tgz -C /data .`.
+
+**After changing the embedding model** (`DENSE_EMBEDDING_MODEL`/`EMBEDDING_MODEL_TAG`, or the
+sparse model) the existing index no longer matches: questions, search and uploads answer
+409 with the way out, while listing, exporting, tagging and deleting documents keep
+working and `/health/ready` reports `index_compatible: false`. Export a backup, delete
+every document, then restore it — the emptied collection is rebuilt for the new model on
+the first restore or upload. Without stored originals, delete everything and upload the
+files again.
 
 To upgrade: back up both, pull, then `docker compose up -d --build`. Bump `QDRANT_IMAGE`
 on its own, after a snapshot — Qdrant reads older storage but not newer. Check
@@ -328,6 +338,7 @@ existing collection automatically, with no re-ingest.
 - `eval/harness.py`, `eval/metrics.py`: live retrieval/answer harness and its metric math.
 - `eval/ragas_runner.py`, `eval/datasets/`, `eval/corpus/`, `eval/baselines/`: optional RAGAS runner, sample datasets, the fixture corpus they are labeled against, and a committed baseline.
 - `CHANGELOG.md`: what changed per release, and whether it needs a re-index.
+- `docs/`: design notes; `docs/history/` keeps the earlier audit and task plan for reference.
 
 ## License
 

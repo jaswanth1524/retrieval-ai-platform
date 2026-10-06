@@ -1,8 +1,9 @@
-# Base images are pinned by digest (the tag is kept for reading); Dependabot's docker
-# ecosystem (.github/dependabot.yml) proposes the updates.
+# Base images are pinned by digest (the tag is kept for reading); bump them by hand.
 
 # ---- frontend build stage ----
-FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS frontend-build
+# Always the builder's own platform: the output is static files, so a multi-arch image
+# build doesn't run npm under QEMU.
+FROM --platform=$BUILDPLATFORM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
@@ -47,6 +48,9 @@ RUN if printf '%s\n' $UV_EXTRAS | grep -qx ocr; then \
     fi
 COPY --from=python-build /app/.venv ./.venv
 COPY --from=python-build /app/api ./api
+# api/version.py reads the version from here; without it the image reports 0.0.0 (in
+# /openapi.json and every /export manifest).
+COPY pyproject.toml ./
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 # Non-root: created after the COPYs so the venv/app dir is owned by root at build

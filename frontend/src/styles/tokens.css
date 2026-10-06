@@ -1,5 +1,7 @@
 :root,
 :root[data-theme='dark'] {
+  /* Native controls (scrollbars, checkboxes, search inputs) follow the theme. */
+  color-scheme: dark;
   --paper: #141211;
   --card: #1b1918;
   --sunk: #100f0e;
@@ -10,7 +12,8 @@
   --rail-rule: rgba(234, 229, 219, 0.12);
   --ink: #eae5db;
   --muted: #a49c8e;
-  --dim: #7d766b;
+  /* Small text on --card needs 4.5:1 (WCAG AA); #7d766b was 3.9:1. */
+  --dim: #8f877b;
   --rule: rgba(234, 229, 219, 0.14);
   --rule-hi: rgba(234, 229, 219, 0.32);
   --accent: oklch(71% 0.15 45);
@@ -23,6 +26,7 @@
 }
 
 :root[data-theme='light'] {
+  color-scheme: light;
   --paper: #f3f0ea;
   --card: #fbfaf7;
   --sunk: #eae6de;
@@ -33,7 +37,8 @@
   --rail-rule: rgba(234, 229, 219, 0.14);
   --ink: #16130f;
   --muted: #5f594e;
-  --dim: #8b8377;
+  /* At least 4.5:1 on --paper, --card and --sunk; #8b8377 was 3.0-3.6:1. */
+  --dim: #6b645a;
   --rule: rgba(20, 18, 15, 0.15);
   --rule-hi: rgba(20, 18, 15, 0.34);
   --accent: oklch(55% 0.16 45);
@@ -41,7 +46,8 @@
   --accent-soft: oklch(55% 0.16 45 / 0.1);
   --data: oklch(46% 0.09 232);
   --good: oklch(48% 0.11 150);
-  --warn: oklch(60% 0.12 75);
+  /* Also used as text (stale labels, trace warnings): 60% lightness was 3.2-3.9:1. */
+  --warn: oklch(52% 0.12 75);
   --bad: oklch(52% 0.17 27);
 }
 

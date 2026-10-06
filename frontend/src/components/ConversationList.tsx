@@ -3,6 +3,7 @@ import type { ConversationSummary } from '../hooks/useChat';
 import { formatRelativeTimeAgo } from '../utils/relativeTime';
 import ConfirmInline from './ConfirmInline';
 import './ConversationList.css';
+import { isImeComposing } from '../utils/keyboard';
 
 // Below this many conversations a search box is clutter; above it, scrolling is slower.
 const SEARCH_THRESHOLD = 5;
@@ -110,6 +111,7 @@ function ConversationList({
                 onChange={(event) => setDraftTitle(event.target.value)}
                 onBlur={commitEditing}
                 onKeyDown={(event) => {
+                  if (isImeComposing(event)) return;
                   if (event.key === 'Enter') commitEditing();
                   if (event.key === 'Escape') {
                     event.stopPropagation();

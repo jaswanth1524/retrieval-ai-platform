@@ -125,12 +125,12 @@ class AppSettings(BaseSettings):
     # history until it fits with LLM_MAX_TOKENS to spare — an over-long prompt had its
     # *front* (the grounding rules) silently cut by the model server.
     llm_context_window: int = Field(default=0, ge=0)
-    # Finished answers kept for repeat questions (api/answer_cache.py); 0 turns the
-    # cache off. Invalidated by every ingest, delete and tag change, and expired after
-    # the TTL. Questions with conversation history are never cached.
     # Questions answered at once; past it a question gets 429 + Retry-After at once
     # instead of holding a request thread for a minute (api/admission.py). 0 = no cap.
     max_concurrent_questions: int = Field(default=4, ge=0)
+    # Finished answers kept for repeat questions (api/answer_cache.py); 0 turns the
+    # cache off. Invalidated by every ingest, delete and tag change, and expired after
+    # the TTL. Questions with conversation history are never cached.
     answer_cache_size: int = Field(default=256, ge=0)
     answer_cache_ttl_seconds: float = Field(default=3600.0, gt=0.0)
     openai_api_key: str | None = Field(default=None)
@@ -299,8 +299,8 @@ class AppSettings(BaseSettings):
     # Optional single shared API key. Empty (the default) keeps every route fully open,
     # preserving the zero-config self-host story. When set, every route except
     # /health, /health/ready and /config — reads included — requires a matching
-    # X-API-Key header (api/dependencies.py's require_api_key, and api/main.py's
-    # middleware, which checks it before a request body is read). Not multi-user auth —
+    # X-API-Key header (api/dependencies.py's require_api_key, and
+    # api/request_guard.py, which checks it before a request body is read). Not multi-user auth —
     # one key for the whole API.
     api_key: str = ""
     # Optional second, read-only key (needs API_KEY set too): it can ask questions and

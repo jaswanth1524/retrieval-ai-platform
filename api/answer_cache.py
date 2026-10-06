@@ -4,8 +4,8 @@ A question costs retrieval, reranking and an LLM call — tens of seconds on the
 default. The same question against the same corpus and settings gets the same grounded
 answer (temperature 0 by default), so it is served from here instead.
 
-Keys include a *corpus generation* that every successful ingest, delete or tag change
-bumps, so an answer is never served from before the documents it was drawn from
+Keys include a *corpus generation* that every ingest (even a failed one), delete and
+tag change bumps, so an answer is never served from before the documents it was drawn from
 changed. Entries also expire after a TTL, which bounds staleness across processes
 (the generation is per process; a second API worker's writes don't bump this one's).
 Questions with conversation history are never cached: their retrieval query depends

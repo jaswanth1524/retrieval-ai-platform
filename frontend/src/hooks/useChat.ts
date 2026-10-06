@@ -19,12 +19,13 @@ import {
   deriveTitle,
   emptyConversation,
   emptyStorage,
-  isChatTurn,
   isOnlyEmpty,
   loadStorage,
   mergeConversations,
   parseConversations,
+  parseDeleted,
   persistStorage,
+  sanitizeTurn,
 } from './chatPersistence';
 import type {
   ChatStorageV2,
@@ -34,7 +35,7 @@ import type {
 } from './chatPersistence';
 
 // Re-exported for the components and tests that import them from here.
-export { EMPTY_SCOPE, mergeConversations } from './chatPersistence';
+export { mergeConversations } from './chatPersistence';
 export type { Conversation, ConversationScope, ConversationSummary } from './chatPersistence';
 
 // Mirrors the server's own REQUEST_HISTORY_MAX_MESSAGES cap (api/schemas.py) — kept
@@ -159,7 +160,8 @@ export interface UseChatResult {
   switchConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
   deleteConversation: (id: string) => void;
-  setTurnFeedback: (turnId: string, rating: FeedbackRating) => void;
+  /** `undefined` takes a rating back (it could not be sent). */
+  setTurnFeedback: (turnId: string, rating: FeedbackRating | undefined) => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
@@ -244,8 +246,9 @@ export function useChat(): UseChatResult {
       // An empty conversation holds nothing to restore, and merging one in next to the
       // fresh one this load already made showed two "New chat" rows.
       const incoming = parseConversations(raw)?.filter((c) => c.turns.length > 0);
-      if (incoming && incoming.length > 0) {
-        setStorage((prev) => mergeConversations(prev, incoming, true));
+      const deleted = parseDeleted(raw);
+      if ((incoming && incoming.length > 0) || deleted?.length) {
+        setStorage((prev) => mergeConversations(prev, incoming ?? [], true, deleted));
       }
       setChatStoreReady(true);
     });
@@ -321,9 +324,10 @@ export function useChat(): UseChatResult {
     const onStorage = (event: StorageEvent) => {
       if (event.key !== CHAT_STORAGE_KEY || !event.newValue) return;
       try {
-        const incoming = parseConversations(JSON.parse(event.newValue));
+        const payload: unknown = JSON.parse(event.newValue);
+        const incoming = parseConversations(payload);
         if (!incoming) return;
-        setStorage((prev) => mergeConversations(prev, incoming));
+        setStorage((prev) => mergeConversations(prev, incoming, false, parseDeleted(payload)));
       } catch {
         // Another tab wrote something unreadable; keep what this tab has.
       }
@@ -556,12 +560,18 @@ export function useChat(): UseChatResult {
   );
 
   const importConversation = useCallback((raw: unknown, title?: string) => {
+    // It becomes the active conversation: mid-answer, the rest of the stream would have
+    // landed in it.
+    if (pendingRef.current) return false;
     const candidate = Array.isArray(raw) ? { turns: raw } : raw;
     if (!candidate || typeof candidate !== 'object') return false;
     const record = candidate as Partial<Conversation>;
     if (!Array.isArray(record.turns)) return false;
     // Fresh turn ids: importing the same file twice must not produce clashing keys.
-    const turns = record.turns.filter(isChatTurn).map((turn) => ({ ...turn, id: newId() }));
+    const turns = record.turns
+      .map(sanitizeTurn)
+      .filter((turn): turn is ChatTurn => turn !== null)
+      .map((turn) => ({ ...turn, id: newId() }));
     if (turns.length === 0) return false;
     const now = Date.now();
     const conversation: Conversation = {
@@ -591,6 +601,7 @@ export function useChat(): UseChatResult {
             ? {
                 ...conversation,
                 scope: typeof next === 'function' ? next(conversation.scope ?? EMPTY_SCOPE) : next,
+                editedAt: Date.now(),
               }
             : conversation,
         ),
@@ -607,7 +618,11 @@ export function useChat(): UseChatResult {
         const kept = filenames.filter(keep);
         if (kept.length === filenames.length) return conversation;
         changed = true;
-        return { ...conversation, scope: { tags: conversation.scope?.tags ?? [], filenames: kept } };
+        return {
+          ...conversation,
+          scope: { tags: conversation.scope?.tags ?? [], filenames: kept },
+          editedAt: Date.now(),
+        };
       });
       return changed ? { ...prev, conversations } : prev;
     });
@@ -680,7 +695,7 @@ export function useChat(): UseChatResult {
     setStorage((prev) => ({
       ...prev,
       conversations: prev.conversations.map((conversation) =>
-        conversation.id === id ? { ...conversation, title: trimmed } : conversation,
+        conversation.id === id ? { ...conversation, title: trimmed, editedAt: Date.now() } : conversation,
       ),
     }));
   }, []);
@@ -688,17 +703,22 @@ export function useChat(): UseChatResult {
   const deleteConversation = useCallback((id: string) => {
     if (pendingRef.current) return;
     setStorage((prev) => {
+      // Recorded, so another tab's copy of it doesn't bring it back on its next save.
+      const deleted = [
+        ...(prev.deleted ?? []).filter((entry) => entry.id !== id),
+        { id, at: Date.now() },
+      ];
       const remaining = prev.conversations.filter((conversation) => conversation.id !== id);
-      if (remaining.length === 0) return emptyStorage();
+      if (remaining.length === 0) return { ...emptyStorage(), deleted };
       const activeId =
         prev.activeConversationId === id
           ? [...remaining].sort(byRecentUse)[0].id
           : prev.activeConversationId;
-      return { ...prev, activeConversationId: activeId, conversations: remaining };
+      return { ...prev, activeConversationId: activeId, conversations: remaining, deleted };
     });
   }, []);
 
-  const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating) => {
+  const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
     // Stored on the turn, so a rating survives a reload or a conversation switch and
     // the buttons can't send a duplicate row for the same answer.
     setStorage((prev) => ({
@@ -710,6 +730,7 @@ export function useChat(): UseChatResult {
               turns: conversation.turns.map((turn) =>
                 turn.id === turnId ? { ...turn, feedback: rating } : turn,
               ),
+              editedAt: Date.now(),
             }
           : conversation,
       ),

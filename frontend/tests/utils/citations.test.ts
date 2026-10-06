@@ -24,6 +24,9 @@ describe('citedNumbers', () => {
     expect(citedNumbers('1, 3-4', 5)).toEqual([1, 3, 4]);
     expect(citedNumbers('1-100000', 3)).toEqual([1, 2, 3]);
     expect(citedNumbers('3-1', 5)).toEqual([]);
+    // Sources start at 1: [0] links nothing (it became a link to the app itself).
+    expect(citedNumbers('0', 5)).toEqual([]);
+    expect(citedNumbers('0-2', 5)).toEqual([1, 2]);
   });
 });
 

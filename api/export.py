@@ -24,7 +24,7 @@ from dataclasses import asdict
 from tempfile import SpooledTemporaryFile
 from typing import IO, BinaryIO
 
-from api.documents import CHUNKER_VERSION
+from api.documents import CHUNKER_VERSION, chunking_fingerprint
 from api.feedback import FeedbackStore
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
@@ -76,6 +76,7 @@ def build_export(
                     "byte_size": meta.byte_size,
                     "uploaded_at": meta.uploaded_at,
                     "chunker_version": meta.chunker_version,
+                    "chunking_fingerprints": sorted(meta.chunking_fingerprints),
                     "tags": list(meta.tags),
                     "original": f"originals/{filename}" if original else None,
                 }
@@ -89,6 +90,7 @@ def build_export(
             "embedding_model_tag": settings.embedding_model_tag,
             "sparse_embedding_model": settings.sparse_embedding_model,
             "chunker_version": CHUNKER_VERSION,
+            "chunking_fingerprint": chunking_fingerprint(settings),
             "documents": documents,
         }
         archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))

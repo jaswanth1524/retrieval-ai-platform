@@ -331,6 +331,44 @@ def test_a_non_transport_grpc_error_is_a_redacted_500_not_a_false_503(
     assert "unavailable" not in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    ("status", "expected_status", "expected_detail"),
+    [
+        (401, 503, "QDRANT_API_KEY"),
+        (403, 503, "QDRANT_API_KEY"),
+        (502, 503, "Try again shortly"),
+        (400, 500, "unexpected vector store error"),
+    ],
+)
+def test_an_error_status_from_qdrant_is_a_fixed_message_not_a_bare_500(
+    api_context: ApiTestContext,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    import httpx
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
+
+    def reject(*args: object, **kwargs: object) -> Any:
+        raise UnexpectedResponse(
+            status_code=status,
+            reason_phrase="nope",
+            content=b'{"status": {"error": "secret internal detail"}}',
+            headers=httpx.Headers(),
+        )
+
+    monkeypatch.setattr(api_context.qdrant, "scroll", reject)
+
+    response = api_context.client.get("/documents")
+
+    assert response.status_code == expected_status
+    assert expected_detail in response.json()["detail"]
+    assert "secret" not in response.json()["detail"]
+
+
 def test_more_uploads_than_the_job_store_retains_are_503_not_evicted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
