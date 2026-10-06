@@ -214,7 +214,7 @@ jobs:
 
       - name: Audit runtime dependencies
         # Runtime packages only (what the browser loads); build/test tooling advisories
-        # never reach a user and are left to Dependabot.
+        # never reach a user.
         run: npm audit --omit=dev --audit-level=high
 
   e2e:

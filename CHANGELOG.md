@@ -84,6 +84,7 @@ them. If you are upgrading from a development build:
   what is downloaded; the eval baseline refuses a run made with different ranking
   settings and its results are uploaded.
 - Compose waits 60 s for running ingests when stopping.
+- Dependabot version-update config removed; dependencies are bumped by hand.
 
 ## History before 0.1.0
 

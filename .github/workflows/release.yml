@@ -28,7 +28,7 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
-      # Actions pinned by commit; Dependabot (github-actions ecosystem) bumps them.
+      # Actions pinned by commit; bump them by hand.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Tag matches pyproject version
@@ -85,6 +85,8 @@ jobs:
       - name: Scan before pushing (fixable CRITICAL fails the release)
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
+          # The program, pinned with the action (v0.35.0's own default, made explicit).
+          version: v0.69.3
           image-ref: docrag:scan
           format: table
           severity: CRITICAL
@@ -120,6 +122,8 @@ jobs:
         # architectures' shared layers in the Security tab without blocking.
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
+          # The program, pinned with the action (v0.35.0's own default, made explicit).
+          version: v0.69.3
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: sarif
           output: trivy.sarif

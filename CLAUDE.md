@@ -27,7 +27,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Treat the project sp
   - Security: answers never load markdown images (`ChatMessage.tsx` renders their alt text), and the system prompt says source text is data, not instructions.
   - Metrics: `docrag_ingest_job_seconds{outcome}` histogram.
   - Caching: the `/config` Ollama probe is cached ~10s per base URL (`provider_health.check_ollama_reachable_cached`).
-  - Infra: Qdrant pinned to `v1.19.1` in compose. CI audits runtime deps (`pip-audit` on core+`ocr`, `npm audit --omit=dev`); `.github/dependabot.yml` covers uv/npm/actions/docker.
+  - Infra: Qdrant pinned to `v1.19.1` in compose. CI audits runtime deps (`pip-audit` on core+`ocr`, `npm audit --omit=dev`). Dependencies, action SHAs and base-image digests are bumped by hand (no Dependabot config).
   - Frontend:
     - Dialogs and the inspector are `React.lazy` chunks (react split out in `vite.config.ts`) behind `LazyChunkBoundary`, which turns a missing chunk from a stale tab into a "reload" prompt instead of a blank app.
     - Below 860px the context panel is a drawer toggled from the rail, and below 1120px the inspector opens as a drawer. Both use `useDialog`, which keeps a stack so only the innermost dialog handles Escape and Tab.

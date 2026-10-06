@@ -1,5 +1,4 @@
-# Base images are pinned by digest (the tag is kept for reading); Dependabot's docker
-# ecosystem (.github/dependabot.yml) proposes the updates.
+# Base images are pinned by digest (the tag is kept for reading); bump them by hand.
 
 # ---- frontend build stage ----
 # Always the builder's own platform: the output is static files, so a multi-arch image
