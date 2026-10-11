@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { TOAST_TIMEOUT_MS, useToasts } from '../../src/hooks/useToasts';
+import { FAILURE_TOAST_TIMEOUT_MS, TOAST_TIMEOUT_MS, useToasts } from '../../src/hooks/useToasts';
 
 describe('useToasts', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -21,6 +21,31 @@ describe('useToasts', () => {
 
     act(() => {
       vi.advanceTimersByTime(1);
+    });
+    expect(result.current.toasts).toHaveLength(0);
+  });
+
+  it('keeps a failure up longer, and not at all while it is held', () => {
+    const { result } = renderHook(() => useToasts());
+
+    let id = '';
+    act(() => {
+      id = result.current.push({ tone: 'bad', title: 'Restore failed', body: 'the reason' });
+    });
+    act(() => {
+      vi.advanceTimersByTime(TOAST_TIMEOUT_MS);
+    });
+    expect(result.current.toasts).toHaveLength(1);
+
+    act(() => result.current.hold(id));
+    act(() => {
+      vi.advanceTimersByTime(FAILURE_TOAST_TIMEOUT_MS * 2);
+    });
+    expect(result.current.toasts).toHaveLength(1);
+
+    act(() => result.current.release(id));
+    act(() => {
+      vi.advanceTimersByTime(FAILURE_TOAST_TIMEOUT_MS);
     });
     expect(result.current.toasts).toHaveLength(0);
   });

@@ -197,10 +197,11 @@ def ensure_payload_indexes(
 
 
 # Per-client cache of already-validated collections, keyed by (collection, embedding
-# tag, sparse model) so a config change is never masked by a stale cache entry. Only
-# successful readiness is cached; validation failures always re-check against Qdrant so
-# a mismatch keeps refusing until it is actually fixed (re-ingest), not until restart.
-_ReadinessKey = tuple[str, str, str]
+# tag, dense and sparse models) so a config change is never masked by a stale cache
+# entry. Only successful readiness is cached; validation failures always re-check
+# against Qdrant so a mismatch keeps refusing until it is actually fixed (re-ingest),
+# not until restart.
+_ReadinessKey = tuple[str, str, str, str]
 _readiness_cache: WeakKeyDictionary[QdrantClient, dict[_ReadinessKey, CollectionReady]]
 _readiness_cache = WeakKeyDictionary()
 
@@ -251,18 +252,27 @@ def recreate_if_empty_and_mismatched(client: QdrantClient, settings: AppSettings
     except CollectionSchemaError:
         pass
     collection_name = settings.qdrant_collection
+    recreated = False
     with _ensure_collection_lock:
-        if client.count(collection_name=collection_name, exact=True).count > 0:
-            raise_mismatch(client, settings)
-        logger.warning(
-            "Recreating the empty collection %r for the configured embedding setup (%s).",
-            collection_name,
-            settings.embedding_model_tag,
-        )
-        client.delete_collection(collection_name)
-        _readiness_cache.get(client, {}).pop(_readiness_key(settings), None)
+        # Re-validate under the lock: another thread may have rebuilt the collection
+        # (or a document may have landed) while this one waited. The delete below is
+        # reached only with a mismatch confirmed now and zero points counted after it.
+        try:
+            if client.collection_exists(collection_name):
+                raise_mismatch(client, settings)
+        except CollectionSchemaError:
+            if client.count(collection_name=collection_name, exact=True).count > 0:
+                raise
+            logger.warning(
+                "Recreating the empty collection %r for the configured embedding setup (%s).",
+                collection_name,
+                settings.embedding_model_tag,
+            )
+            client.delete_collection(collection_name)
+            _readiness_cache.get(client, {}).pop(_readiness_key(settings), None)
+            recreated = True
     _ensure_collection_strict(client, settings)
-    return True
+    return recreated
 
 
 def raise_mismatch(client: QdrantClient, settings: AppSettings) -> None:
@@ -291,6 +301,7 @@ def _readiness_key(settings: AppSettings) -> _ReadinessKey:
     return (
         settings.qdrant_collection,
         settings.embedding_model_tag,
+        settings.dense_embedding_model,
         settings.sparse_embedding_model,
     )
 
@@ -387,6 +398,17 @@ def validate_collection_schema(
             collection_name=settings.qdrant_collection,
             expected=settings.embedding_model_tag,
             actual=actual_tag,
+        )
+
+    # The tag is set by hand, so a changed dense model with the tag left alone would
+    # embed questions in another vector space than the stored points. A collection
+    # created before the model name was recorded is accepted.
+    actual_dense = metadata.get("dense_embedding_model")
+    if actual_dense is not None and actual_dense != settings.dense_embedding_model:
+        raise CollectionSchemaError(
+            f"Collection '{settings.qdrant_collection}' uses dense embedding model "
+            f"'{actual_dense}', but the configured model is "
+            f"'{settings.dense_embedding_model}'. {RECOVERY_HINT}"
         )
 
     # The dense-only tag does not capture the sparse model, but changing it also

@@ -25,7 +25,12 @@ TraceMode = Literal["sync", "stream"]
 # context_budget: kept by the reranker but left out of the prompt so it would fit the
 # model's context window (api.generation.fit_prompt_to_context_window).
 DropReason = Literal[
-    "below_min_score", "near_duplicate", "top_k_cut", "not_scored", "context_budget"
+    "below_min_score",
+    "near_duplicate",
+    "top_k_cut",
+    "not_scored",
+    "context_budget",
+    "context_limit",
 ]
 TRACE_DROP_REASONS: tuple[str, ...] = get_args(DropReason)
 
@@ -179,6 +184,9 @@ def build_trace_candidates(
                 drop_reason = "top_k_cut"
         elif candidate.point_id in context_budget_dropped_ids:
             drop_reason = "context_budget"
+        elif candidate.point_id not in selected_ids:
+            # Kept by rerank, but past the max_context_chunks prefix the prompt takes.
+            drop_reason = "context_limit"
         result.append(
             TraceCandidate(
                 point_id=candidate.point_id,

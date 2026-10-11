@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import {
   CHAT_STORAGE_MAX_TURNS,
+  MAX_CONVERSATIONS,
   type ChatStorageV2,
   type Conversation,
   TOMBSTONE_MAX_AGE_MS,
@@ -132,5 +133,52 @@ describe('sanitizeConversation', () => {
 
     expect(parsed?.[0].turns[0]).toEqual(valid);
     expect(parsed?.[0].editedAt).toBe(7);
+  });
+
+  it('replaces a time a Date cannot hold, which crashed every render', () => {
+    const parsed = parseConversations({
+      version: 2,
+      conversations: [
+        conversation({
+          createdAt: Number.MAX_VALUE,
+          updatedAt: -1e300,
+          editedAt: 9e15,
+          turns: [{ ...turn('a'), timestamp: 1e300 }],
+        }),
+      ],
+    });
+
+    const [saved] = parsed!;
+    expect(() => new Date(saved.turns[0].timestamp).toISOString()).not.toThrow();
+    expect(() => new Date(saved.createdAt).toISOString()).not.toThrow();
+    expect(() => new Date(saved.updatedAt).toISOString()).not.toThrow();
+    expect(saved.editedAt).toBeUndefined();
+  });
+});
+
+describe('mergeConversations with an answer streaming', () => {
+  it('neither drops nor replaces the streaming conversation', () => {
+    const local = storage([conversation({ id: 's', turns: [turn('q'), turn('a', 'assistant')], updatedAt: 5 })]);
+    const theirs = conversation({ id: 's', title: 'Renamed', turns: [], updatedAt: 5, editedAt: 9 });
+
+    const renamed = mergeConversations(local, [theirs], false, undefined, 10, 's');
+    expect(renamed.conversations[0].title).toBe('Renamed');
+    expect(renamed.conversations[0].turns.map((t) => t.id)).toEqual(['q', 'a']);
+
+    const deleted = mergeConversations(local, [], false, [{ id: 's', at: 9 }], 10, 's');
+    expect(deleted.conversations.map((c) => c.id)).toEqual(['s']);
+    expect(deleted.activeConversationId).toBe('s');
+  });
+
+  it('keeps the streaming conversation past the conversation cap', () => {
+    const local = storage([conversation({ id: 's', updatedAt: 1 })]);
+    const incoming = Array.from({ length: MAX_CONVERSATIONS }, (_, index) =>
+      conversation({ id: `n${index}`, updatedAt: 10 + index }),
+    );
+
+    const merged = mergeConversations(local, incoming, false, undefined, 100, 's');
+    expect(merged.conversations).toHaveLength(MAX_CONVERSATIONS);
+    expect(merged.conversations.some((c) => c.id === 's')).toBe(true);
+    expect(merged.activeConversationId).toBe('s');
   });
 });

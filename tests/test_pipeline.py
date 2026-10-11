@@ -726,6 +726,35 @@ def test_rag_pipeline_answer_without_trace_store_leaves_trace_id_none() -> None:
     assert grounded.trace_id is None
 
 
+def test_a_provider_config_error_reaches_the_pipeline_not_the_cache_key() -> None:
+    """Building the answer-cache key resolves the provider; an OpenAI provider with no
+    key raised there, before the pipeline's own handling and its error trace."""
+
+    from api.answer_cache import AnswerCache
+
+    settings = make_settings(llm_provider="openai", openai_api_key=None)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+        trace_store=trace_store,
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=60),
+    )
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.answer == "Alpha is documented [1]."
+    assert len(trace_store.traces) == 1
+
+
 def test_rag_pipeline_answer_records_partial_trace_on_generation_error() -> None:
     settings = make_settings()
     client = QdrantClient(":memory:")

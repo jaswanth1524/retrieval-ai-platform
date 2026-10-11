@@ -312,6 +312,26 @@ def test_a_passage_in_no_chunk_fails_the_run() -> None:
         resolve_passages(example, PassageRepository([_point("c1", "a.md")]), make_settings())
 
 
+def test_a_passage_only_row_searches_every_file_even_when_other_rows_name_files() -> None:
+    from eval.harness import resolve_passages
+
+    examples = load_retrieval_dataset_from(
+        [
+            {"question": "q", "relevant_filenames": ["a.md"]},
+            {"question": "q", "relevant_passages": ["c2"]},
+            {"question": "named", "relevant_filenames": ["a.md"], "relevant_passages": ["c1"]},
+        ]
+    )
+    repository = PassageRepository([_point("c1", "a.md"), _point("c2", "b.md")])
+
+    # Row 2 names no file, so b.md is searched although only a.md is named elsewhere;
+    # results are keyed by position, so the duplicate question text doesn't collide.
+    assert resolve_passages(examples, repository, make_settings()) == {
+        1: frozenset({"c2"}),
+        2: frozenset({"c1"}),
+    }
+
+
 def load_retrieval_dataset_from(rows: list[dict[str, Any]]) -> list[Any]:
     from eval.harness import _example_from_mapping
 

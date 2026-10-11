@@ -14,6 +14,19 @@ describe('linkCitations', () => {
     expect(linkCitations(text, 3)).toBe(text);
   });
 
+  it('links adjacent markers, which the server counts as citations', () => {
+    expect(linkCitations('As shown [1][2].', 2)).toBe(
+      'As shown [1](#docrag-cite-1)[2](#docrag-cite-2).',
+    );
+    expect(linkCitations('[1][2][3]', 3)).toBe(
+      '[1](#docrag-cite-1)[2](#docrag-cite-2)[3](#docrag-cite-3)',
+    );
+  });
+
+  it('still leaves reference-style link halves alone', () => {
+    expect(linkCitations('See [1][ref] and [ref][2].', 3)).toBe('See [1][ref] and [ref][2].');
+  });
+
   it('does nothing when there are no sources', () => {
     expect(linkCitations('A [1].', 0)).toBe('A [1].');
   });

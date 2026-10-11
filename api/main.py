@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# The UI's bundled fonts. python:3.12-slim has no /etc/mime.types, and Python's own table
+# lacks .woff2, so StaticFiles served them as application/octet-stream.
+mimetypes.add_type("font/woff2", ".woff2")
 
 
 # The largest reranker_batch_size with a measured peak (2.66 GB over 50 candidates of
@@ -105,8 +109,8 @@ class WarmupTokenCounter(Protocol):
 
 
 def run_model_warmup(
-    embedding_provider: WarmupEmbeddingProvider,
-    reranker: WarmupReranker,
+    embedding_provider: WarmupEmbeddingProvider | None,
+    reranker: WarmupReranker | None,
     token_counter: WarmupTokenCounter | None = None,
     settings: AppSettings | None = None,
 ) -> None:
@@ -124,17 +128,21 @@ def run_model_warmup(
     """
 
     def warm_embedding() -> None:
+        assert embedding_provider is not None
         embedded = embedding_provider.embed_texts(["warmup"])
         # A wrong QDRANT_DENSE_VECTOR_SIZE named at boot, not at the first upload.
         if settings is not None:
             check_dense_dimension(len(embedded[0].dense), settings)
 
-    tasks: dict[str, Callable[[], object]] = {
-        "embedding": warm_embedding,
-        "reranker": lambda: reranker.score("warmup", ["warmup"]),
-    }
+    tasks: dict[str, Callable[[], object]] = {}
+    if embedding_provider is not None:
+        tasks["embedding"] = warm_embedding
+    if reranker is not None:
+        tasks["reranker"] = lambda: reranker.score("warmup", ["warmup"])
     if token_counter is not None:
         tasks["tokenizer"] = lambda: token_counter.count("warmup")
+    if not tasks:
+        return
 
     start = time.monotonic()
     failed = False
@@ -155,6 +163,22 @@ def run_model_warmup(
         logger.info("Model warmup completed in %.1fs", time.monotonic() - start)
 
 
+def _build_for_warmup[T](name: str, factory: Callable[[], T]) -> T | None:
+    """Construct one warmup model, logging instead of raising (a misspelled model name
+    must not stop the app from booting — the same error reaches the first request)."""
+
+    try:
+        return factory()
+    except Exception:  # noqa: BLE001 - warmup never raises, see run_model_warmup
+        logger.error(
+            "Could not construct the %s for warmup; check DENSE_EMBEDDING_MODEL/"
+            "SPARSE_EMBEDDING_MODEL/RERANKER_MODEL.",
+            name,
+            exc_info=True,
+        )
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
@@ -163,8 +187,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.warmup_models:
         await run_in_threadpool(
             run_model_warmup,
-            get_embedding_provider(),
-            get_reranker(),
+            _build_for_warmup("embedding models", get_embedding_provider),
+            _build_for_warmup("reranker", get_reranker),
             get_token_counter(),
             settings,
         )

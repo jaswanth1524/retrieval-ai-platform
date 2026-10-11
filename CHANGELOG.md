@@ -10,9 +10,9 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 ## Unreleased
 
-## 0.1.0 — 2026-10-05
+## 0.1.0 — 2026-10-10
 
-The first release. It collects everything below: three review passes and the work before
+The first release. It collects everything below: four review passes and the work before
 them. If you are upgrading from a development build:
 
 - **Re-index: Recommended.** `CHUNKER_VERSION` is now 4 (section labels are capped,
@@ -26,6 +26,48 @@ them. If you are upgrading from a development build:
   false`. Questions and uploads are refused until the index matches again: download a
   backup (`GET /export`), delete every document, then `POST /import` it (an emptied
   collection is rebuilt for the new model), or delete everything and upload again.
+- **Docker Compose now publishes the API on `127.0.0.1` only.** Set `API_BIND=0.0.0.0` in
+  `.env` to reach it from other devices, and set `API_KEY` when you do.
+
+### Changed in the fourth review pass
+- Docker Compose publishes the API on `127.0.0.1` only. Set `API_BIND=0.0.0.0` in `.env`
+  to open it to other devices, and set `API_KEY` when you do.
+- An upload into an index built for another embedding setup is refused up front (409)
+  instead of being accepted and failing in the background.
+- A collection whose recorded dense model differs from `DENSE_EMBEDDING_MODEL` is treated
+  as mismatched even when `EMBEDDING_MODEL_TAG` was left unchanged.
+- With `API_KEY` set, `/docs`, `/redoc` and `/openapi.json` need the key too.
+- `LLM_PROVIDER` must be `ollama`, `openai` or `openai_compatible`, and
+  `CHUNK_OVERLAP_TOKENS` must be below `CHUNK_SIZE_TOKENS`; both are checked at startup.
+- The UI fonts are bundled, so the app makes no third-party requests.
+
+### Fixes from the fourth review pass
+- Rebuilding an empty mismatched collection re-checks under the lock, so a collection
+  that gained points meanwhile is never deleted.
+- A misspelled embedding or reranker model gives a named error; at warmup it is logged
+  and the app still boots.
+- An ingest job that crashed outside its own error handling is marked failed instead
+  of staying in progress.
+- `POST /import` rejects one document with a bad tag instead of stopping partway.
+- The raw-store startup sweep only removes its own temporary files.
+- Traces label a chunk cut by `max_context_chunks` as `context_limit`.
+- LiteLLM no longer fetches its model price list from GitHub at import (Docker, tests).
+- UI:
+  - An answer keeps streaming into the conversation it was asked in, even when another
+    tab renames or deletes it; a delete from another tab applies once the answer ends.
+  - Adjacent citations (`[1][2]`) are clickable.
+  - A corrupt timestamp in imported history can't crash the page.
+  - The Settings sliders can't build a request the server rejects.
+  - History sent with a question leaves out unanswered and repeated questions.
+  - Deleted tags drop out of conversation scopes, and the scope picker stops at the
+    server's limits.
+  - An answer streaming in a hidden tab is saved, and a closed IndexedDB connection
+    is reopened.
+  - Enter in the command palette always runs the highlighted row.
+  - Failure toasts stay for 10 s, and focus, labels and contrast are fixed in a few
+    places.
+- Eval: a passage-only dataset row searches every file. The RAGAS runner fails when any
+  metric scored nothing, and writes NaN as `null`.
 
 ### Fixes
 - Deleting a document no longer removes a newer upload of it that won the race for the

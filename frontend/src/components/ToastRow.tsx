@@ -4,6 +4,9 @@ import './ToastRow.css';
 interface ToastRowProps {
   toasts: Toast[];
   onDismiss: (id: string) => void;
+  /** Pause and resume a toast's auto-dismiss while the pointer or focus is on it. */
+  onHold?: (id: string) => void;
+  onRelease?: (id: string) => void;
 }
 
 /** Notices rendered in normal flow, between the thread and the composer.
@@ -12,7 +15,7 @@ interface ToastRowProps {
  * (chat history failed to save), and a floating toast over the composer would cover
  * the control the user is reaching for. In flow it displaces instead.
  */
-function ToastRow({ toasts, onDismiss }: ToastRowProps) {
+function ToastRow({ toasts, onDismiss, onHold, onRelease }: ToastRowProps) {
   // Always mounted, even empty: screen readers often skip a live region that appears
   // together with its first message, so a toast rendered into a fresh region could go
   // unannounced. Confirmations are announced politely through this region; failures
@@ -28,6 +31,10 @@ function ToastRow({ toasts, onDismiss }: ToastRowProps) {
           key={toast.id}
           className={`toast toast--${toast.tone}`}
           role={toast.tone === 'bad' ? 'alert' : undefined}
+          onMouseEnter={() => onHold?.(toast.id)}
+          onMouseLeave={() => onRelease?.(toast.id)}
+          onFocus={() => onHold?.(toast.id)}
+          onBlur={() => onRelease?.(toast.id)}
           data-testid="toast"
         >
           <span className="toast__dot" aria-hidden="true" />

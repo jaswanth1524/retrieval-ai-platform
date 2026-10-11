@@ -56,7 +56,8 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
         const body = (
           <>
             <span className="feedback-panel__question">
-              <span aria-label={item.rating === 'up' ? 'Rated up' : 'Rated down'}>
+              {/* role="img": an aria-label on a bare span is not announced. */}
+              <span role="img" aria-label={item.rating === 'up' ? 'Rated up' : 'Rated down'}>
                 {item.rating === 'up' ? '👍' : '👎'}
               </span>{' '}
               {item.question}

@@ -64,6 +64,10 @@ ENV HOME=/home/app
 # on every container recreate.
 # Created here, owned by `app`, so a fresh named volume is seeded writable.
 ENV FASTEMBED_CACHE_PATH=/home/app/.cache/fastembed HF_HOME=/home/app/.cache/huggingface
+# LiteLLM otherwise fetches its model price map from GitHub every time it is imported:
+# a phone-home on each boot, and a 5 s stall with a warning on an offline host. The
+# copy bundled with the installed LiteLLM is used instead.
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True
 RUN mkdir -p /home/app/.cache/fastembed /home/app/.cache/huggingface \
     && chown -R app:app /home/app/.cache
 # /app/data is where JOB_STORE_PATH, RAW_DOCUMENT_DIR and FEEDBACK_STORE_PATH all

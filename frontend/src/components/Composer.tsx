@@ -6,6 +6,11 @@ import { isImeComposing } from '../utils/keyboard';
 
 // Matches the backend's QuestionRequest.question max_length in api/schemas.py.
 const MAX_QUESTION_LENGTH = 4000;
+// The most tags and files one question may be scoped to (api/schemas.py's
+// MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
+// question and every passage search, with nothing saying why.
+const MAX_SCOPE_TAGS = 20;
+const MAX_SCOPE_FILENAMES = 500;
 
 interface ComposerProps {
   onSubmit: (question: string) => void;
@@ -169,6 +174,9 @@ function Composer({
             selectedFilenames.includes(filename),
         );
 
+  const tagsFull = selectedTags.length >= MAX_SCOPE_TAGS;
+  const filenamesFull = selectedFilenames.length >= MAX_SCOPE_FILENAMES;
+
   return (
     <div className="composer" ref={wrapRef}>
       {hint && (
@@ -238,6 +246,16 @@ function Composer({
                     data-testid="composer-scope-search"
                   />
                 )}
+                {tagsFull && (
+                  <p className="composer__popover-note" data-testid="scope-tags-full">
+                    Up to {MAX_SCOPE_TAGS} tags per question.
+                  </p>
+                )}
+                {filenamesFull && (
+                  <p className="composer__popover-note" data-testid="scope-files-full">
+                    Up to {MAX_SCOPE_FILENAMES} documents per question.
+                  </p>
+                )}
                 {availableTags.length > 0 && onSelectedTagsChange && (
                   <div className="composer__popover-tags" role="group" aria-label="Tags">
                     {availableTags.map((tag) => (
@@ -245,6 +263,7 @@ function Composer({
                         <input
                           type="checkbox"
                           checked={selectedTags.includes(tag)}
+                          disabled={tagsFull && !selectedTags.includes(tag)}
                           onChange={() => toggleTag(tag)}
                         />
                         <span>#{tag}</span>
@@ -257,6 +276,7 @@ function Composer({
                     <input
                       type="checkbox"
                       checked={selectedFilenames.includes(filename)}
+                      disabled={filenamesFull && !selectedFilenames.includes(filename)}
                       onChange={() => toggleFilename(filename)}
                     />
                     <span className="composer__popover-filename mono">{filename}</span>

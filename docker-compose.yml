@@ -86,6 +86,11 @@ services:
       WARMUP_MODELS: "true"
       # Same Docker network as Qdrant, so gRPC is reachable without extra config.
       QDRANT_PREFER_GRPC: "true"
+      # Pinned to the model_cache volume: a host path set in .env for running the API
+      # outside Docker would otherwise land on the read-only root filesystem, and every
+      # model download would fail.
+      FASTEMBED_CACHE_PATH: /home/app/.cache/fastembed
+      HF_HOME: /home/app/.cache/huggingface
     # Off by default: JOB_STORE_BACKEND=memory, RAW_DOCUMENT_DIR="" and
     # FEEDBACK_ENABLED=false (the .env.example defaults) mean ingest-job status is lost
     # on container recreate, uploaded originals aren't kept, and no feedback is
@@ -106,8 +111,11 @@ services:
       # Lets OLLAMA_BASE_URL=http://host.docker.internal:... resolve on native Linux
       # Docker (Docker Desktop on macOS/Windows already resolves this automatically).
       - "host.docker.internal:host-gateway"
+    # Loopback by default, like Qdrant above: with API_KEY empty (the default) anyone who
+    # can reach this port can upload, delete and download the whole corpus. Set
+    # API_BIND=0.0.0.0 in .env to serve other devices on the network, and set API_KEY.
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     healthcheck:
       # Liveness only (probes /health, not /health/ready) — deliberately doesn't
       # depend on Ollama/Qdrant reachability, so a slow/unreachable Ollama can't

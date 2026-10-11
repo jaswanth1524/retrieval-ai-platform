@@ -185,3 +185,15 @@ def test_two_api_key_headers_are_a_400() -> None:
 
     assert _status(sent) == 400
     assert not downstream.called
+
+
+def test_api_docs_need_the_key_when_one_is_set() -> None:
+    """Open, /docs and /openapi.json listed every route and schema of an instance
+    whose API itself needs a key."""
+
+    for path in ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"):
+        assert is_guarded_path(path)
+        _, sent, _ = _run(_settings(api_key="secret"), path=path, method="GET")
+        assert _status(sent) == 401
+    downstream, sent, _ = _run(_settings(), path="/openapi.json", method="GET")
+    assert downstream.called

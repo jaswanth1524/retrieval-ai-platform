@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -155,3 +158,46 @@ def test_local_embedding_provider_wraps_model_failure_as_embedding_error() -> No
     # for the log.
     assert str(raised.value) == "Embedding model failed."
     assert "model download failed" in str(raised.value.__cause__)
+
+
+class SlowFirstLoadDenseModel:
+    """Counts how many threads are inside ``embed`` at once, like fastembed's
+    unlocked lazy load would let two of them load the model together."""
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.peak = 0
+        self.lock = threading.Lock()
+
+    def embed(
+        self,
+        documents: str | Iterable[str],
+        batch_size: int = 256,
+        parallel: int | None = None,
+        **kwargs: Any,
+    ) -> Iterable[object]:
+        docs = [documents] if isinstance(documents, str) else list(documents)
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        time.sleep(0.05)
+        with self.lock:
+            self.active -= 1
+        return [[0.1, 0.2, 0.3] for _ in docs]
+
+
+def test_the_first_call_per_model_is_not_run_twice_at_once() -> None:
+    """An ingest batch and a question arriving together at cold start both loaded the
+    same lazy ONNX model; the first call per model is serialized."""
+
+    dense = SlowFirstLoadDenseModel()
+    provider = LocalEmbeddingProvider(
+        make_test_settings(), dense_model=dense, sparse_model=RecordingSparseModel()
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(provider.embed_texts, ["a"]), pool.submit(provider.embed_query, "q")]
+        for future in futures:
+            future.result()
+
+    assert dense.peak == 1

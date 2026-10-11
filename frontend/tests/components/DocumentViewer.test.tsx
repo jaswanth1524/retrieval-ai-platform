@@ -163,6 +163,32 @@ describe('DocumentViewer', () => {
       expect(screen.queryByTestId('viewer-load-later')).not.toBeInTheDocument();
     });
 
+    it('drops "Show the first 2000" once those chunks are on screen', async () => {
+      // Past the server's unpaged cap the button fetched the same 2000 again and stayed.
+      const huge = Array.from({ length: 2100 }, (_, i) => makeChunk(i));
+      const paged = servePaged(huge);
+      getContentMock.mockImplementation(async (filename: string, signal?: AbortSignal, page: ContentPage = {}) => {
+        const response = await paged(filename, signal, page);
+        return page.around === undefined && page.start === undefined
+          ? { ...response, chunks: huge.slice(0, 2000) }
+          : response;
+      });
+
+      render(<DocumentViewer filename="huge.md" chunkId="c400" onClose={vi.fn()} />);
+      await waitFor(
+        () => expect(screen.getByTestId('viewer-show-all')).toHaveTextContent('Show the first 2000'),
+        SLOW_RENDER,
+      );
+      await userEvent.click(screen.getByTestId('viewer-show-all'));
+
+      await waitFor(
+        () => expect(screen.getAllByTestId('viewer-chunk')).toHaveLength(2000),
+        SLOW_RENDER,
+      );
+      expect(screen.queryByTestId('viewer-show-all')).not.toBeInTheDocument();
+      expect(screen.getByTestId('viewer-load-later')).toBeInTheDocument();
+    });
+
     it('asks the server for a page around the cited chunk, not the whole document', async () => {
       getContentMock.mockImplementation(servePaged(BIG_CONTENT.chunks));
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -20,6 +21,9 @@ from api.documents import normalize_filename
 logger = logging.getLogger(__name__)
 
 _STALE_TEMP_FILE_SECONDS = 3600.0
+# What tempfile.mkstemp(prefix=".upload-") produces: 8 characters from
+# [a-z0-9_] and no suffix — which no accepted upload name can have.
+_TEMP_FILE_NAME = re.compile(r"\.upload-[a-z0-9_]{8}")
 
 
 class RawDocumentStore:
@@ -46,6 +50,10 @@ class RawDocumentStore:
 
         cutoff = time.time() - _STALE_TEMP_FILE_SECONDS
         for temp in self._directory.glob(".upload-*"):
+            # Only mkstemp's own names: a stored original may be called ".upload-x.txt"
+            # (a leading dot is a valid name), and it has a suffix a temp file never has.
+            if not _TEMP_FILE_NAME.fullmatch(temp.name):
+                continue
             try:
                 if temp.is_file() and temp.stat().st_mtime < cutoff:
                     temp.unlink()

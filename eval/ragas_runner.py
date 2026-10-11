@@ -153,7 +153,7 @@ def load_judges(llm_model: str | None, embeddings: str | None) -> tuple[Any, Any
 
     ``llm_model`` is any LiteLLM model string (``ollama_chat/qwen2.5``,
     ``gpt-4o-mini``), so scoring can stay on the machine. ``embeddings="fastembed"``
-    uses the same local dense model DocRAG embeds with.
+    uses the same local dense model DocRAG embeds with (``DENSE_EMBEDDING_MODEL``).
     """
 
     llm = None
@@ -168,8 +168,10 @@ def load_judges(llm_model: str | None, embeddings: str | None) -> tuple[Any, Any
             from langchain_community.embeddings import FastEmbedEmbeddings
             from ragas.embeddings import LangchainEmbeddingsWrapper
 
+            from api.settings import AppSettings
+
             embedder = LangchainEmbeddingsWrapper(
-                FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+                FastEmbedEmbeddings(model_name=AppSettings().dense_embedding_model)
             )
     except ImportError as exc:
         raise RagasUnavailableError(
@@ -198,6 +200,38 @@ def all_scores_missing(payload: Mapping[str, Any]) -> bool:
     else:
         values = [value for value in payload.values() if isinstance(value, int | float)]
     return not values or all(value != value for value in values)  # NaN != NaN
+
+
+def metrics_without_scores(payload: Mapping[str, Any]) -> list[str]:
+    """Metrics for which every score is NaN: that judge failed on every row.
+
+    One metric can fail alone (``answer_relevancy`` without ``--embeddings`` needs OpenAI
+    embeddings), and the run otherwise passed with a column of nothing.
+    """
+
+    rows = payload.get("rows")
+    columns: dict[str, list[float]] = {}
+    for row in rows if isinstance(rows, list) else [payload]:
+        if not isinstance(row, Mapping):
+            continue
+        for key, value in row.items():
+            if isinstance(value, int | float) and not isinstance(value, bool) and key != "index":
+                columns.setdefault(key, []).append(value)
+    return sorted(
+        name for name, values in columns.items() if all(value != value for value in values)
+    )
+
+
+def nan_to_none(value: Any) -> Any:
+    """``value`` with every NaN replaced by None, so the output is valid JSON (null)."""
+
+    if isinstance(value, float) and value != value:
+        return None
+    if isinstance(value, Mapping):
+        return {key: nan_to_none(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [nan_to_none(item) for item in value]
+    return value
 
 
 def load_ragas_runtime(
@@ -370,8 +404,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    unscored = metrics_without_scores(payload)
+    if unscored:
+        print(
+            f"error: RAGAS returned no score for {', '.join(unscored)} (every judge call for "
+            "it failed). Metrics that need embeddings use OpenAI's unless --embeddings "
+            "fastembed is given; see the log above.",
+            file=sys.stderr,
+        )
+        return 1
 
-    output = json.dumps(payload, indent=2, sort_keys=True)
+    output = json.dumps(nan_to_none(payload), indent=2, sort_keys=True, allow_nan=False)
     if args.output:
         args.output.write_text(f"{output}\n", encoding="utf-8")
     else:

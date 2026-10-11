@@ -98,7 +98,9 @@ class AppSettings(BaseSettings):
     # the same real-world trace) while letting paraphrase-level matches through.
     rerank_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
 
-    llm_provider: str = "ollama"
+    # Checked at startup (case-insensitive): a typo used to boot fine and then fail
+    # every question with a 400 that blamed the client.
+    llm_provider: Literal["ollama", "openai", "openai_compatible"] = "ollama"
     # Providers a question may pick per request (`llm_provider` on /questions*), as a
     # JSON list, e.g. ["ollama"]. Unset: any configured provider. LLM_PROVIDER itself
     # is always allowed. Restricting it stops a caller — anyone with the read key, or
@@ -193,7 +195,9 @@ class AppSettings(BaseSettings):
 
     # Finished background ingest jobs beyond this count are pruned oldest-first, so
     # a long-running process doesn't accumulate unbounded job history in memory —
-    # same tradeoff/pattern as trace_max_retained below.
+    # same tradeoff/pattern as trace_max_retained below. It also caps the jobs queued
+    # or running at once (IngestBacklog): past it an upload gets 503 + Retry-After
+    # even with byte budget left, so the store never evicts a job still in flight.
     ingest_jobs_max_retained: PositiveInt = 50
 
     # "memory" (default) matches every prior release: jobs are lost on restart, and a
@@ -318,6 +322,14 @@ class AppSettings(BaseSettings):
     log_format: Literal["text", "json"] = "text"
 
     @model_validator(mode="after")
+    def _overlap_below_chunk_size(self) -> "AppSettings":
+        # Refused at startup: otherwise every upload was accepted (202) and every job
+        # then failed in the background with the same message.
+        if self.chunk_overlap_tokens >= self.chunk_size_tokens:
+            raise ValueError("CHUNK_OVERLAP_TOKENS must be smaller than CHUNK_SIZE_TOKENS.")
+        return self
+
+    @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":
         # With only a read key, the "admin" routes would have no key at all: anyone
         # could change the corpus that readers need a key to look at.
@@ -326,6 +338,11 @@ class AppSettings(BaseSettings):
         if self.api_read_key and self.api_read_key == self.api_key:
             raise ValueError("API_READ_KEY must differ from API_KEY.")
         return self
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalize_llm_provider(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
 
     @field_validator("log_level", mode="before")
     @classmethod

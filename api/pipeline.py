@@ -34,6 +34,7 @@ from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
     ChatGenerator,
     ChatMessage,
+    GenerationConfigError,
     GenerationError,
     GroundedAnswer,
     SourceCitation,
@@ -165,7 +166,8 @@ StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent
 
 
 # Query-expansion variants are embedded and searched side by side: four sequential
-# embed+search round trips were the whole cost of turning expansion on.
+# embed+search round trips were the whole cost of turning expansion on. Neighbour
+# expansion fetches its per-file scrolls here too.
 _VARIANT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="docrag-variants")
 
 
@@ -305,11 +307,16 @@ def expand_with_neighbors(
         )
 
     # (filename, ordinal) -> text, so each chunk can pick its own neighbours back out.
+    # The per-file scrolls are independent round trips, so they run concurrently.
+    wanted = [
+        (filename, sorted(ordinals)) for filename, ordinals in ordinals_by_file.items() if ordinals
+    ]
+    fetched = _map_concurrently(
+        lambda item: repository.fetch_neighbors(settings, item[0], item[1]), wanted
+    )
     neighbor_text: dict[tuple[str, int], str] = {}
-    for filename, ordinals in ordinals_by_file.items():
-        if not ordinals:
-            continue
-        for point in repository.fetch_neighbors(settings, filename, sorted(ordinals)):
+    for (filename, _), points in zip(wanted, fetched, strict=True):
+        for point in points:
             payload = point.payload or {}
             ordinal = payload.get("chunk_ordinal")
             text = payload.get("text")
@@ -753,9 +760,11 @@ class RagPipeline:
             return None
         try:
             settings = self._effective_settings(overrides or AnswerOverrides())
-        except RetrievalConfigError:
-            return None  # the uncached path raises it with its proper handling
-        return answer_cache_key(question, settings, filenames, tags)
+            return answer_cache_key(question, settings, filenames, tags)
+        except (RetrievalConfigError, GenerationConfigError):
+            # The uncached path raises it with its proper handling, error trace
+            # included (a provider without its key failed here, before the trace).
+            return None
 
     def answer(
         self,

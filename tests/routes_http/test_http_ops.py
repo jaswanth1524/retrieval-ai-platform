@@ -15,7 +15,7 @@ from api.dependencies import (
     get_ollama_reachability_checker,
     get_qdrant_reachability_checker,
 )
-from api.embeddings import EmbeddedText
+from api.embeddings import EmbeddedText, EmbeddingError
 from api.main import (
     create_app,
     run_model_warmup,
@@ -266,6 +266,47 @@ def test_lifespan_runs_warmup_when_enabled(monkeypatch: pytest.MonkeyPatch) -> N
     assert reranker.seen_documents == ["warmup"]
     # The chunking tokenizer is warmed too, so the first upload doesn't fetch it.
     assert counted == ["warmup"]
+    clear_dependency_caches()
+
+
+def test_a_misspelled_model_name_logs_at_warmup_instead_of_stopping_the_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The providers were built as the warmup's arguments, outside its guard, so a bad
+    DENSE_EMBEDDING_MODEL crashed startup; the reranker is still warmed."""
+
+    clear_dependency_caches()
+    settings = make_settings(warmup_models=True)
+    reranker = FakeReranker()
+
+    def bad_embedding_model() -> object:
+        raise EmbeddingError("Embedding models 'nope' could not be loaded.")
+
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.main.get_embedding_provider", bad_embedding_model)
+    monkeypatch.setattr("api.main.get_reranker", lambda: reranker)
+    monkeypatch.setattr("api.main.get_token_counter", lambda: None)
+
+    with TestClient(create_app()) as client:
+        assert client.get("/health").status_code == 200
+
+    assert reranker.seen_documents == ["warmup"]
+    clear_dependency_caches()
+
+
+def test_an_unknown_dense_model_is_a_named_embedding_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fastembed raises a bare ValueError in the constructor, which every route
+    turned into an opaque 500; the reranker already had a named error."""
+
+    from api.dependencies import get_embedding_provider
+
+    monkeypatch.setenv("DENSE_EMBEDDING_MODEL", "nope/not-a-model")
+    clear_dependency_caches()
+
+    with pytest.raises(EmbeddingError, match="DENSE_EMBEDDING_MODEL"):
+        get_embedding_provider()
     clear_dependency_caches()
 
 
@@ -584,3 +625,20 @@ def test_a_reranker_that_fails_to_load_names_the_setting_not_the_library_error(
 
     assert "RERANKER_MODEL" in str(raised.value)
     assert "/home/app" not in str(raised.value)
+
+
+def test_bundled_fonts_are_served_as_fonts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import api.main
+
+    # The Docker image (python:3.12-slim) has no /etc/mime.types, so this guards the
+    # explicit registration rather than whatever the host's table happens to say.
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "font.woff2").write_bytes(b"wOF2")
+    (tmp_path / "index.html").write_text("<div id='root'></div>")
+    monkeypatch.setattr(api.main, "FRONTEND_DIST_DIR", tmp_path)
+
+    with TestClient(api.main.create_app()) as client:
+        response = client.get("/assets/font.woff2")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "font/woff2"

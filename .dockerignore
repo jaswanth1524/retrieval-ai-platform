@@ -11,6 +11,11 @@
 
 frontend/node_modules
 frontend/dist
+frontend/tests
+frontend/e2e
+frontend/playwright-report
+frontend/test-results
+**/.DS_Store
 
 tests
 eval

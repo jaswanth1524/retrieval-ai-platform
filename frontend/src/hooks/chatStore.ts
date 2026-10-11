@@ -29,7 +29,20 @@ function open(): Promise<IDBDatabase> {
     connection = new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, 1);
       request.onupgradeneeded = () => request.result.createObjectStore(STORE);
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        const db = request.result;
+        // The browser can close the connection under us (WebKit does, and so does
+        // clearing site data), and another tab upgrading the database asks us to.
+        // Cached as-is, every later transaction threw and every save failed silently.
+        db.onclose = () => {
+          connection = null;
+        };
+        db.onversionchange = () => {
+          db.close();
+          connection = null;
+        };
+        resolve(db);
+      };
       request.onerror = () => reject(request.error);
       request.onblocked = () => reject(new Error('IndexedDB open blocked'));
     });
@@ -41,32 +54,51 @@ function open(): Promise<IDBDatabase> {
   return connection;
 }
 
+/** Run ``work`` against the database, once more on a fresh connection if the cached
+ *  one turns out to be closed (``transaction()`` throws InvalidStateError on it). */
+async function withDb<T>(work: (db: IDBDatabase) => Promise<T>): Promise<T> {
+  try {
+    return await work(await open());
+  } catch {
+    connection = null;
+    return work(await open());
+  }
+}
+
 export async function loadChatStore(): Promise<unknown> {
   if (!chatStoreAvailable()) return null;
   try {
-    const db = await open();
-    return await new Promise<unknown>((resolve, reject) => {
-      const request = db.transaction(STORE, 'readonly').objectStore(STORE).get(KEY);
-      request.onsuccess = () => resolve(request.result ?? null);
-      request.onerror = () => reject(request.error);
-    });
+    return await withDb(
+      (db) =>
+        new Promise<unknown>((resolve, reject) => {
+          const request = db.transaction(STORE, 'readonly').objectStore(STORE).get(KEY);
+          request.onsuccess = () => resolve(request.result ?? null);
+          request.onerror = () => reject(request.error);
+        }),
+    );
   } catch {
     return null;
   }
+}
+
+function write(apply: (store: IDBObjectStore) => void): Promise<boolean> {
+  return withDb(
+    (db) =>
+      new Promise<boolean>((resolve) => {
+        const transaction = db.transaction(STORE, 'readwrite');
+        apply(transaction.objectStore(STORE));
+        transaction.oncomplete = () => resolve(true);
+        transaction.onerror = () => resolve(false);
+        transaction.onabort = () => resolve(false);
+      }),
+  );
 }
 
 /** Resolves true once the value is durably written, false when it couldn't be. */
 export async function saveChatStore(value: unknown): Promise<boolean> {
   if (!chatStoreAvailable()) return false;
   try {
-    const db = await open();
-    return await new Promise<boolean>((resolve) => {
-      const transaction = db.transaction(STORE, 'readwrite');
-      transaction.objectStore(STORE).put(value, KEY);
-      transaction.oncomplete = () => resolve(true);
-      transaction.onerror = () => resolve(false);
-      transaction.onabort = () => resolve(false);
-    });
+    return await write((store) => store.put(value, KEY));
   } catch {
     return false;
   }
@@ -76,14 +108,7 @@ export async function saveChatStore(value: unknown): Promise<boolean> {
 export async function clearChatStore(): Promise<boolean> {
   if (!chatStoreAvailable()) return false;
   try {
-    const db = await open();
-    return await new Promise<boolean>((resolve) => {
-      const transaction = db.transaction(STORE, 'readwrite');
-      transaction.objectStore(STORE).delete(KEY);
-      transaction.oncomplete = () => resolve(true);
-      transaction.onerror = () => resolve(false);
-      transaction.onabort = () => resolve(false);
-    });
+    return await write((store) => store.delete(KEY));
   } catch {
     return false;
   }

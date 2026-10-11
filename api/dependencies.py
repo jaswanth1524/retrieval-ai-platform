@@ -15,7 +15,7 @@ from qdrant_client import QdrantClient
 from api.admission import QuestionSlots
 from api.answer_cache import AnswerCache
 from api.chunking import TokenCounter, make_token_counter
-from api.embeddings import LocalEmbeddingProvider
+from api.embeddings import EmbeddingError, LocalEmbeddingProvider
 from api.feedback import FeedbackStore
 from api.generation import LiteLLMGenerator
 from api.jobs import IngestBacklog, IngestJobStore, JobStore, SqliteIngestJobStore
@@ -62,7 +62,18 @@ def get_embedding_provider() -> LocalEmbeddingProvider:
     settings-driven switch here.
     """
 
-    return LocalEmbeddingProvider(get_app_settings())
+    settings = get_app_settings()
+    try:
+        return LocalEmbeddingProvider(settings)
+    except ValueError as exc:
+        # fastembed rejects an unknown model name in the constructor; its message
+        # (supported-model lists) stays in the log, as for the reranker below.
+        logger.warning("Could not load the embedding models.", exc_info=True)
+        raise EmbeddingError(
+            f"Embedding models '{settings.dense_embedding_model}' / "
+            f"'{settings.sparse_embedding_model}' could not be loaded; check "
+            "DENSE_EMBEDDING_MODEL and SPARSE_EMBEDDING_MODEL."
+        ) from exc
 
 
 @lru_cache

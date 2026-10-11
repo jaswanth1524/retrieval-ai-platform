@@ -52,5 +52,10 @@ describe('theme tokens', () => {
         }
       });
     }
+    it(`--rail-dim is readable on the rail and its panels in ${theme}`, () => {
+      for (const surface of ['rail', 'rail-2']) {
+        expect(contrast(token(theme, 'rail-dim'), token(theme, surface))).toBeGreaterThanOrEqual(4.5);
+      }
+    });
   }
 });

@@ -218,20 +218,14 @@ export interface TimingsResponse {
   query_expansion_ms?: number;
   // Neighbour/context expansion after rerank (small-to-big retrieval).
   context_expansion_ms?: number;
+  // The zero-citation retry's LLM round trip, after generation; 0 when it didn't fire.
+  // generate_ms excludes it.
+  citation_retry_ms?: number;
 }
 
 export interface HistoryMessage {
   role: 'user' | 'assistant';
   content: string;
-}
-
-export interface QuestionResponse {
-  answer: string;
-  sources: CitationResponse[];
-  timings?: TimingsResponse | null;
-  trace_id?: string | null;
-  /** Served from the server's answer cache. */
-  cached?: boolean;
 }
 
 export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible';
@@ -253,7 +247,12 @@ export type TraceDropReason =
   | 'near_duplicate'
   | 'top_k_cut'
   | 'not_scored'
-  | 'context_budget';
+  | 'context_budget'
+  // Kept by the reranker, but past max_context_chunks.
+  | 'context_limit'
+  // The server declares drop_reason extensible (x-extensible-enum): a reason added there
+  // must still type-check here, and is shown with its underscores replaced.
+  | (string & {});
 
 export interface PromptMessage {
   role: 'system' | 'user' | 'assistant';
@@ -268,6 +267,7 @@ export interface TraceConfigResponse {
   rerank_min_score: number;
   fused_top_n: number;
   filenames: string[] | null;
+  tags?: string[] | null;
 }
 
 export interface TraceCandidateResponse {
@@ -317,4 +317,6 @@ export interface TraceDetailResponse {
   history_message_count?: number;
   query_variants?: string[];
   citation_retry_used?: boolean;
+  /** The X-Request-ID of the request that produced it, for finding its log lines. */
+  request_id?: string | null;
 }

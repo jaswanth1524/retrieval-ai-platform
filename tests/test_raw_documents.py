@@ -70,8 +70,8 @@ def test_temp_files_left_by_an_interrupted_save_are_swept_once_stale(tmp_path: P
     import os
     import time
 
-    stale = tmp_path / ".upload-abc123"
-    fresh = tmp_path / ".upload-def456"
+    stale = tmp_path / ".upload-abc12345"
+    fresh = tmp_path / ".upload-def45678"
     for temp in (stale, fresh):
         temp.write_bytes(b"partial")
     an_hour_and_more_ago = time.time() - 3700
@@ -83,3 +83,20 @@ def test_temp_files_left_by_an_interrupted_save_are_swept_once_stale(tmp_path: P
     assert not stale.exists()
     assert fresh.exists()  # may still be a save in progress
     assert (tmp_path / "guide.txt").read_bytes() == b"original"
+
+
+def test_the_temp_sweep_never_removes_a_stored_original_named_like_one(tmp_path: Path) -> None:
+    """A leading dot is a valid upload name, so ".upload-notes.txt" can be a real
+    original; only mkstemp's suffix-less names are swept."""
+
+    import os
+    import time
+
+    store = RawDocumentStore(str(tmp_path))
+    store.save(".upload-notes.txt", b"mine")
+    an_hour_and_more_ago = time.time() - 3700
+    os.utime(tmp_path / ".upload-notes.txt", (an_hour_and_more_ago, an_hour_and_more_ago))
+
+    RawDocumentStore(str(tmp_path))
+
+    assert store.read(".upload-notes.txt") == b"mine"

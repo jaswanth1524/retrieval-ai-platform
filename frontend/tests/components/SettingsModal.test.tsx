@@ -82,6 +82,22 @@ describe('SettingsModal', () => {
     expect(props.onOverridesChange).toHaveBeenCalledWith({ ...EMPTY, maxContextChunks: 11 });
   });
 
+  it('never stages more context chunks than reranked ones, which the server refuses', async () => {
+    const props = setup({ overrides: { ...EMPTY, maxContextChunks: 7 } });
+
+    fireEvent.change(screen.getByTestId('settings-rerank-top-k'), { target: { value: '4' } });
+
+    // The context slider follows rerank down and cannot go above it.
+    expect(screen.getByTestId('settings-max-context-chunks')).toHaveAttribute('max', '4');
+    expect(screen.getByTestId('settings-max-context-chunks')).toHaveValue('4');
+    await userEvent.click(screen.getByTestId('settings-save'));
+    expect(props.onOverridesChange).toHaveBeenCalledWith({
+      ...EMPTY,
+      rerankTopK: 4,
+      maxContextChunks: 4,
+    });
+  });
+
   it('rounds temperature to one decimal to survive repeated drags', async () => {
     // Binary float drift (0.1 + 0.2 !== 0.3) otherwise accumulates into a value the
     // server's own ge/le bounds would still accept but that renders as 0.7000000001.

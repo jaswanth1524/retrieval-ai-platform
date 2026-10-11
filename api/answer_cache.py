@@ -20,18 +20,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from threading import Lock
 
-from api.corpus import bump_corpus_generation, corpus_generation
+from api.corpus import corpus_generation
 from api.generation import SourceCitation, completion_model_and_kwargs
 from api.settings import AppSettings
-
-__all__ = [
-    "AnswerCache",
-    "CacheKey",
-    "CachedAnswer",
-    "answer_cache_key",
-    "bump_corpus_generation",
-    "corpus_generation",
-]
 
 
 @dataclass(frozen=True)
@@ -58,7 +49,9 @@ def answer_cache_key(
     return (
         " ".join(question.split()).casefold(),
         tuple(sorted(set(filenames or ()))),
-        tuple(sorted(set(tags or ()))),
+        # Question tags match stored tags case-insensitively, so "Finance" and
+        # "finance" are one answer.
+        tuple(sorted({tag.casefold() for tag in tags or ()})),
         settings.llm_provider.lower().strip(),
         model,
         int(settings.rerank_top_k),

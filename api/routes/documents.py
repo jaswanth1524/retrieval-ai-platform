@@ -29,6 +29,7 @@ from api.export import build_export, iter_file
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
     FilenameConflictError,
+    backlog_full_error,
     cancel_ingest_job,
     enqueue_ingest,
     original_still_stored,
@@ -141,7 +142,8 @@ def register(app: FastAPI) -> None:
         responses={
             409: {
                 "description": "With stored originals, the name differs from an existing "
-                "document's only by letter case or accents."
+                "document's only by letter case or accents; or the collection was built "
+                "for another embedding setup and still holds documents."
             }
         },
     )
@@ -158,12 +160,20 @@ def register(app: FastAPI) -> None:
         # Rejected here, not in the background job: an unusable name or type used to
         # be accepted with a 202 and only fail once the client polled the job.
         filename = validate_upload_filename(file.filename or "")
+        # 409 now, as /reindex and /import do, rather than a 202 for a job that can
+        # only fail on a collection built for another embedding setup.
+        await run_in_threadpool(repository.ensure_writable, settings)
         if raw_store is not None:
             known = await run_in_threadpool(_known_filenames, repository, settings)
             try:
                 refuse_near_duplicate_name(filename, known)
             except FilenameConflictError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # The multipart parser has already spooled the part and knows its size: a full
+        # backlog refuses it before it is read into memory, not after (enqueue_ingest
+        # still makes the real reservation).
+        if file.size is not None and not backlog.has_room(file.size):
+            raise backlog_full_error()
         content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
         # job_store.create is a sqlite INSERT under JOB_STORE_BACKEND=sqlite; off the
         # event loop so it can't stall other in-flight requests.
@@ -326,7 +336,6 @@ def register(app: FastAPI) -> None:
                     # Right away, not after the original below: if removing that
                     # raises, cached answers must still stop citing the deleted points.
                     bump_corpus_generation()
-                    ingest_sequencer.mark_applied(filename, sequence, deleted=True)
                 # Also when no points remain: an original orphaned by an earlier failed
                 # ingest was otherwise undeletable, since the 404 came first.
                 removed_original = _delete_original(

@@ -85,33 +85,41 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
   // A signal aborted before the call never fires 'abort' again, so the request ran.
   if (callerSignal?.aborted) timeoutController.abort();
 
-  let response: Response;
+  // The timeout and the caller's signal stay armed until the body is read: cleared once
+  // the headers arrived, a server that then stalled mid-body hung the promise for good,
+  // and aborting on unmount did nothing.
   try {
-    response = await fetch(`${BASE_URL}${path}`, {
-      ...init,
-      headers: { ...authHeaders(), ...headers },
-      signal: timeoutController.signal,
-    });
-  } catch (err) {
-    if (timeoutController.signal.aborted) {
-      throw new ApiClientError('Request timed out or was cancelled.');
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}${path}`, {
+        ...init,
+        headers: { ...authHeaders(), ...headers },
+        signal: timeoutController.signal,
+      });
+    } catch (err) {
+      if (timeoutController.signal.aborted) {
+        throw new ApiClientError('Request timed out or was cancelled.');
+      }
+      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
     }
-    throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+    if (!response.ok) {
+      throw new ApiClientError(
+        await extractErrorDetail(response),
+        response.status,
+        retryAfterSeconds(response),
+      );
+    }
+    try {
+      return (await response.json()) as T;
+    } catch {
+      if (timeoutController.signal.aborted) {
+        throw new ApiClientError('Request timed out or was cancelled.');
+      }
+      throw new ApiClientError('API response was not valid JSON.');
+    }
   } finally {
     clearTimeout(timeoutId);
     callerSignal?.removeEventListener('abort', abortFromCaller);
-  }
-  if (!response.ok) {
-    throw new ApiClientError(
-      await extractErrorDetail(response),
-      response.status,
-      retryAfterSeconds(response),
-    );
-  }
-  try {
-    return (await response.json()) as T;
-  } catch {
-    throw new ApiClientError('API response was not valid JSON.');
   }
 }
 

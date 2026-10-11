@@ -1,7 +1,10 @@
 // Same marker grammar the server reads citations with (api/citations.py): [3], [1, 2],
 // [1-3], [1–3], [1, 3-4]. Not when it is a link's text ([1](url)), a reference
-// definition ([1]: url) or an image (![1]).
-const MARKER = /(?<![!\]\\])\[(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\](?![(:[])/g;
+// definition ([1]: url), an image (![1]) or half of a reference link ([1][ref]).
+// Adjacent markers ([1][2]) are two citations, as the server counts them: a `]` before
+// or a `[` after is allowed when it belongs to another numeric marker.
+const MARKER =
+  /(?<![!\\])(?<!(?<!\[\d[\d\s,–-]*)\])\[(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\](?![(:])(?!\[(?!\d[\d\s,–-]*\]))/g;
 const RANGE_SEP = /\s*[-–]\s*/;
 // Fenced code blocks and inline code spans: markers there are code, not citations.
 const CODE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g;

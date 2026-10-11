@@ -29,6 +29,22 @@ def test_chunk_overlap_tokens_rejects_negative() -> None:
         AppSettings(_env_file=None, chunk_overlap_tokens=-1)  # type: ignore[call-arg]
 
 
+def test_chunk_overlap_must_be_below_chunk_size_at_startup() -> None:
+    """Refused at boot, not as a 202 whose job then fails for every upload."""
+
+    with pytest.raises(ValidationError, match="CHUNK_OVERLAP_TOKENS"):
+        AppSettings(_env_file=None, chunk_size_tokens=100, chunk_overlap_tokens=100)  # type: ignore[call-arg]
+    settings = AppSettings(_env_file=None, chunk_size_tokens=100, chunk_overlap_tokens=99)  # type: ignore[call-arg]
+    assert settings.chunk_overlap_tokens == 99
+
+
+def test_llm_provider_is_checked_at_startup_case_insensitively() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, llm_provider="anthropic")  # type: ignore[call-arg]
+    settings = AppSettings(_env_file=None, llm_provider=" OpenAI ")  # type: ignore[call-arg]
+    assert settings.llm_provider == "openai"
+
+
 def test_llm_num_retries_rejects_negative() -> None:
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None, llm_num_retries=-1)  # type: ignore[call-arg]
