@@ -32,6 +32,8 @@ class CachedAnswer:
     # The trace of the run that produced the answer, so the inspector can still show
     # how it was retrieved.
     trace_id: str | None
+    answer_status: str = "answered"
+    top_rerank_score: float | None = None
 
 
 CacheKey = tuple[object, ...]

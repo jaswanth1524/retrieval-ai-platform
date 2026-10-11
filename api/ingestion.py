@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -15,6 +16,7 @@ from qdrant_client import models
 
 from api.documents import DocumentChunk, EmptyDocumentError, contextual_text
 from api.embeddings import EmbeddedText, EmbeddingError
+from api.metrics import ingest_stage_seconds
 from api.qdrant_schema import check_dense_dimension
 from api.settings import AppSettings
 
@@ -250,7 +252,9 @@ def ingest_chunks(
     repository.ensure_ready(settings)
 
     batch_size = int(settings.ingest_batch_size)
+    upsert_batch_size = int(settings.ingest_upsert_batch_size)
     total = len(chunks)
+    embed_start = time.monotonic()
     embeddings: list[_StoredEmbedding] = []
     for start in range(0, total, batch_size):
         if precondition is not None:
@@ -267,6 +271,8 @@ def ingest_chunks(
         if on_progress is not None:
             on_progress(min(start + batch_size, total), total)
 
+    ingest_stage_seconds.labels(stage="embed").observe(time.monotonic() - embed_start)
+
     # Filenames are locked in sorted order so two multi-file ingests that share more
     # than one filename can never deadlock on each other.
     filenames = sorted({chunk.filename for chunk in chunks})
@@ -274,6 +280,13 @@ def ingest_chunks(
     with ExitStack() as locks:
         for filename in filenames:
             locks.enter_context(filename_write_lock(filename))
+        # Registered after the locks, so it runs first on exit: the time locks are held.
+        write_start = time.monotonic()
+        locks.callback(
+            lambda: ingest_stage_seconds.labels(stage="write").observe(
+                time.monotonic() - write_start
+            )
+        )
 
         if precondition is not None:
             precondition()
@@ -295,12 +308,12 @@ def ingest_chunks(
             stale_candidate_ids.update(repository.point_ids_for_filename(settings, filename))
 
         new_ids: set[str] = set()
-        for start in range(0, total, batch_size):
+        for start in range(0, total, upsert_batch_size):
             points = [
                 build_point(chunk, embedding.restore(), settings)
                 for chunk, embedding in zip(
-                    chunks[start : start + batch_size],
-                    embeddings[start : start + batch_size],
+                    chunks[start : start + upsert_batch_size],
+                    embeddings[start : start + upsert_batch_size],
                     strict=True,
                 )
             ]

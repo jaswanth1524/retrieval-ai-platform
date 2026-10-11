@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type { FeedbackItemResponse, FeedbackRating } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import './FeedbackPanel.css';
@@ -93,4 +93,5 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
   );
 }
 
-export default FeedbackPanel;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(FeedbackPanel);

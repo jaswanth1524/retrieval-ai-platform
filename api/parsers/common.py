@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Literal
+from zipfile import BadZipFile, ZipFile
 
 DEFAULT_SECTION = "Document"
 
@@ -24,6 +26,12 @@ _PAGE_LABEL_RE = re.compile(r"^page\s+\d+$", re.IGNORECASE)
 
 
 _ROMAN_NUMERAL_RE = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
+
+
+# Zip-based formats (DOCX, EPUB) are inflated in memory by their parsers, while
+# MAX_UPLOAD_BYTES caps only the compressed size: a few-MB upload declaring gigabytes of
+# XML would OOM the ingest worker. Real documents (images included) sit far below this.
+ZIP_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 
 
 class DocumentError(ValueError):
@@ -108,3 +116,18 @@ def _looks_like_page_furniture(candidate: str) -> bool:
     if _ROMAN_NUMERAL_RE.match(candidate):
         return True
     return False
+
+
+def check_zip_expanded_size(filename: str, content: bytes, kind: str, limit: int) -> None:
+    """Refuse a zip-based document whose members would inflate past ``limit`` bytes."""
+
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            expanded = sum(member.file_size for member in archive.infolist())
+    except BadZipFile as exc:
+        raise DocumentParseError(f"Could not parse {kind} '{filename}'.") from exc
+    if expanded > limit:
+        raise DocumentParseError(
+            f"{kind} '{filename}' expands to {expanded // (1024 * 1024)} MiB, over the "
+            f"{limit // (1024 * 1024)} MiB limit."
+        )

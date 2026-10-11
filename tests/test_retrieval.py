@@ -187,7 +187,15 @@ def test_a_400_that_manual_fusion_also_fails_is_not_remembered_as_unsupported(
             raise _unexpected_response(400)
         return original_query_points(*args, **kwargs)
 
+    original_query_batch_points = client.query_batch_points
+
+    def query_batch_points(*args: Any, **kwargs: Any) -> object:
+        if broken:
+            raise _unexpected_response(400)
+        return original_query_batch_points(*args, **kwargs)
+
     monkeypatch.setattr(client, "query_points", query_points)
+    monkeypatch.setattr(client, "query_batch_points", query_batch_points)
     with pytest.raises(UnexpectedResponse):
         search(VectorRepository(client), settings)
 

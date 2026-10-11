@@ -21,6 +21,7 @@ from api.answer_cache import (
     answer_cache_key,
 )
 from api.chunking import HeuristicTokenCounter, TokenCounter
+from api.citations import answer_status
 from api.corpus import bump_corpus_generation
 from api.diversity import select_diverse
 from api.documents import (
@@ -51,6 +52,7 @@ from api.generation import (
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
+from api.metrics import ingest_stage_seconds
 from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
@@ -110,6 +112,8 @@ class RetrievalPhase:
     # so a latency breakdown can't attribute one to the other.
     query_expansion_ms: float = 0.0
     context_expansion_ms: float = 0.0
+    # Part of rerank_ms spent waiting for the reranker (another question was scoring).
+    rerank_wait_ms: float = 0.0
     diversity_dropped_ids: frozenset[str] = frozenset()
     query_variants: list[str] = field(default_factory=list)
 
@@ -160,6 +164,9 @@ class DoneEvent(TypedDict):
     trace_id: str | None
     # Present (True) only when the answer came from the answer cache.
     cached: NotRequired[bool]
+    # citations.answer_status, and the best cross-encoder score among the candidates.
+    answer_status: NotRequired[str]
+    top_rerank_score: NotRequired[float | None]
 
 
 StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent
@@ -180,6 +187,12 @@ def _map_concurrently[T, R](function: Callable[[T], R], items: Sequence[T]) -> l
         submit_in_context(_VARIANT_EXECUTOR, functools.partial(function, item)) for item in items
     ]
     return [future.result() for future in futures]
+
+
+def _top_rerank_score(phase: RetrievalPhase) -> float | None:
+    """The best cross-encoder score among the scored candidates, kept or not."""
+
+    return phase.scored_chunks[0].rerank_score if phase.scored_chunks else None
 
 
 def _cached_timings(started: float) -> StageTimings:
@@ -216,6 +229,8 @@ def timings_dict(timings: StageTimings) -> dict[str, float]:
         "query_expansion_ms": timings.query_expansion_ms,
         "context_expansion_ms": timings.context_expansion_ms,
         "citation_retry_ms": timings.citation_retry_ms,
+        "rerank_wait_ms": timings.rerank_wait_ms,
+        "first_token_ms": timings.first_token_ms,
     }
 
 
@@ -256,6 +271,31 @@ def _strip_overlap(previous: str, following: str, overlap_tokens: int) -> str:
     return following
 
 
+def _clip_head(text: str, max_chars: int) -> str:
+    """The start of ``text``, at most ``max_chars`` long, cut at a word boundary.
+    ``max_chars`` 0 keeps everything."""
+
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    mid_word = not head[-1].isspace() and not text[max_chars].isspace()
+    if mid_word and any(character.isspace() for character in head):
+        head = head.rsplit(None, 1)[0]
+    return head.rstrip()
+
+
+def _clip_tail(text: str, max_chars: int) -> str:
+    """The end of ``text``, at most ``max_chars`` long, cut at a word boundary."""
+
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    tail = text[-max_chars:]
+    mid_word = not tail[0].isspace() and not text[-max_chars - 1].isspace()
+    if mid_word and any(character.isspace() for character in tail):
+        tail = tail.split(None, 1)[1]
+    return tail.lstrip()
+
+
 def expand_with_neighbors(
     chunks: Sequence[RerankedChunk],
     repository: VectorRepository,
@@ -276,12 +316,18 @@ def expand_with_neighbors(
     itself one of ``chunks`` (it gets its own block) or already appeared in a
     higher-ranked chunk's block is skipped, and the overlap chunking repeats at each
     boundary between consecutive ordinals is trimmed.
+
+    ``context_neighbor_max_chars`` (0 = no cap) keeps only the text nearest the chunk:
+    the last that many characters before it and the first that many after it. The
+    sentences right at the boundary are what resolve a chunk that starts or ends
+    mid-thought; the far side of a neighbour mostly adds prefill.
     """
 
     radius = int(settings.context_neighbor_radius)
     if radius <= 0:
         return list(chunks)
     overlap_tokens = int(settings.chunk_overlap_tokens)
+    max_chars = int(settings.context_neighbor_max_chars)
 
     def wanted_ordinals(chunk: RerankedChunk) -> list[int]:
         assert chunk.chunk_ordinal is not None
@@ -340,7 +386,9 @@ def expand_with_neighbors(
             continue
 
         parts = sorted([*neighbors, (chunk.chunk_ordinal, chunk.text)])
-        merged_parts: list[str] = []
+        before: list[str] = []
+        center: list[str] = []
+        after: list[str] = []
         previous: tuple[int, str] | None = None
         for ordinal, text in parts:
             if previous is not None and ordinal == previous[0] + 1:
@@ -348,9 +396,19 @@ def expand_with_neighbors(
             else:
                 trimmed = text
             if trimmed:
-                merged_parts.append(trimmed)
+                if ordinal < chunk.chunk_ordinal:
+                    before.append(trimmed)
+                elif ordinal == chunk.chunk_ordinal:
+                    center.append(trimmed)
+                else:
+                    after.append(trimmed)
             previous = (ordinal, text)
-        expanded.append(replace(chunk, expanded_text="\n\n".join(merged_parts)))
+        merged = [
+            _clip_tail("\n\n".join(before), max_chars),
+            *center,
+            _clip_head("\n\n".join(after), max_chars),
+        ]
+        expanded.append(replace(chunk, expanded_text="\n\n".join(part for part in merged if part)))
     return expanded
 
 
@@ -432,6 +490,7 @@ class RagPipeline:
         condense_ms: float,
         generate_ms: float = 0.0,
         citation_retry_ms: float = 0.0,
+        first_token_ms: float = 0.0,
     ) -> StageTimings:
         """Stage timings for a finished question; ``total_ms`` measured now."""
 
@@ -445,6 +504,8 @@ class RagPipeline:
             query_expansion_ms=phase.query_expansion_ms,
             context_expansion_ms=phase.context_expansion_ms,
             citation_retry_ms=citation_retry_ms,
+            rerank_wait_ms=phase.rerank_wait_ms,
+            first_token_ms=first_token_ms,
         )
 
     def _error_trace(
@@ -605,11 +666,7 @@ class RagPipeline:
         """
 
         wanted = {" ".join(tag.split()).casefold() for tag in tags}
-        stored = {
-            tag
-            for metadata in self._repository.filename_metadata(settings).values()
-            for tag in metadata.tags
-        }
+        stored = self._repository.stored_tags(settings)
         return sorted(tag for tag in stored if tag.casefold() in wanted) or list(tags)
 
     def _retrieve_and_rerank(
@@ -637,8 +694,16 @@ class RagPipeline:
         if not normalized_query:
             raise RetrievalError("Query text is required.")
         self._repository.ensure_ready(effective_settings)
-        if tags:
-            tags = self._stored_tag_variants(tags, effective_settings)
+        # Looked up alongside query expansion and embedding, which don't depend on it;
+        # only the search below needs the stored spellings.
+        tag_variants = (
+            submit_in_context(
+                _VARIANT_EXECUTOR,
+                functools.partial(self._stored_tag_variants, tags, effective_settings),
+            )
+            if tags
+            else None
+        )
 
         # Multi-query expansion (opt-in): rewrite into variant phrasings, retrieve each,
         # and RRF-fuse the result lists with the same pinned rrf_k before one rerank.
@@ -662,6 +727,8 @@ class RagPipeline:
         )
         embed_ms = (time.monotonic() - embed_start) * 1000
         check_dense_dimension(len(query_embeddings[0].dense), effective_settings)
+        if tag_variants is not None:
+            tags = tag_variants.result()
 
         search_start = time.monotonic()
         result_lists = _map_concurrently(
@@ -693,6 +760,8 @@ class RagPipeline:
         )
         diverse_outcome, diversity_dropped = select_diverse(outcome, effective_settings)
         rerank_ms = (time.monotonic() - rerank_start) * 1000
+        # Read on this thread right after the call: the reranker keeps it per thread.
+        rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
 
         # Timed apart from rerank: neighbour expansion is a Qdrant round trip, not model
         # scoring, and folding it into rerank_ms hid it from every latency breakdown.
@@ -719,6 +788,7 @@ class RagPipeline:
             embed_ms=embed_ms,
             search_ms=search_ms,
             rerank_ms=rerank_ms,
+            rerank_wait_ms=rerank_wait_ms,
             query_expansion_ms=query_expansion_ms,
             context_expansion_ms=context_expansion_ms,
             diversity_dropped_ids=frozenset(diversity_dropped),
@@ -793,11 +863,20 @@ class RagPipeline:
                     timings=_cached_timings(started),
                     trace_id=hit.trace_id,
                     cached=True,
+                    answer_status=hit.answer_status,
+                    top_rerank_score=hit.top_rerank_score,
                 )
         grounded = self._answer_uncached(question, overrides, filenames, history, tags)
         if key is not None and self._answer_cache is not None:
             self._answer_cache.put(
-                key, CachedAnswer(grounded.answer, tuple(grounded.sources), grounded.trace_id)
+                key,
+                CachedAnswer(
+                    grounded.answer,
+                    tuple(grounded.sources),
+                    grounded.trace_id,
+                    grounded.answer_status,
+                    grounded.top_rerank_score,
+                ),
             )
         return grounded
 
@@ -834,6 +913,8 @@ class RagPipeline:
                     "timings": timings_dict(_cached_timings(started)),
                     "trace_id": hit.trace_id,
                     "cached": True,
+                    "answer_status": hit.answer_status,
+                    "top_rerank_score": hit.top_rerank_score,
                 }
                 return
         done: DoneEvent | None = None
@@ -858,6 +939,8 @@ class RagPipeline:
                     done["answer"],
                     tuple(SourceCitation(**source) for source in done["sources"]),
                     done["trace_id"],
+                    done.get("answer_status", "answered"),
+                    done.get("top_rerank_score"),
                 ),
             )
 
@@ -969,7 +1052,13 @@ class RagPipeline:
                     citation_retry_used=grounded.citation_retry_used,
                 )
             )
-        return replace(grounded, timings=timings, trace_id=trace_id)
+        return replace(
+            grounded,
+            timings=timings,
+            trace_id=trace_id,
+            answer_status=answer_status(grounded.answer, len(grounded.sources), len(selected)),
+            top_rerank_score=_top_rerank_score(phase),
+        )
 
     def _answer_stream_uncached(
         self,
@@ -1074,6 +1163,8 @@ class RagPipeline:
                     "sources": [],
                     "timings": timings_dict(timings),
                     "trace_id": trace_id,
+                    "answer_status": "no_context",
+                    "top_rerank_score": _top_rerank_score(phase),
                 }
                 return
 
@@ -1088,7 +1179,10 @@ class RagPipeline:
             if should_stop is not None and should_stop():
                 return  # the finally below records the trace as closed early
             generate_start = time.monotonic()
+            first_token_ms = 0.0
             for delta in self._generator.stream(messages, effective_settings):
+                if not parts:
+                    first_token_ms = (time.monotonic() - total_start) * 1000
                 parts.append(delta)
                 yield {"type": "delta", "text": delta}
             generate_ms = (time.monotonic() - generate_start) * 1000
@@ -1121,6 +1215,7 @@ class RagPipeline:
                 condense_ms=condense_ms,
                 generate_ms=generate_ms,
                 citation_retry_ms=outcome.retry_ms,
+                first_token_ms=first_token_ms,
             )
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
@@ -1155,6 +1250,8 @@ class RagPipeline:
                 "sources": [_citation_dict(source) for source in cited],
                 "timings": timings_dict(timings),
                 "trace_id": trace_id,
+                "answer_status": answer_status(answer, len(cited), len(selected)),
+                "top_rerank_score": _top_rerank_score(phase),
             }
         except QuestionAbandoned:
             return  # the finally below records the trace as closed early
@@ -1226,8 +1323,12 @@ class IngestService:
         # Before parsing: an index built for another embedding setup refuses the
         # upload here unless it is empty, in which case it is rebuilt for this one.
         self._repository.ensure_writable(self._settings)
+        parse_start = time.monotonic()
         sections = parse_document_bytes(filename, content, self._settings)
+        chunk_start = time.monotonic()
+        ingest_stage_seconds.labels(stage="parse").observe(chunk_start - parse_start)
         chunks = chunk_sections(sections, self._settings, self._token_counter)
+        ingest_stage_seconds.labels(stage="chunk").observe(time.monotonic() - chunk_start)
         # Stamped here (not in chunk_sections) because this is the first point in the
         # pipeline that has both the raw upload's byte count and the upload instant —
         # chunking itself works purely from parsed text.

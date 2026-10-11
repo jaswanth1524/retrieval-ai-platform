@@ -197,6 +197,28 @@ describe('Inspector', () => {
     expect(spans.at(-1)).toMatch(/^citation retry800ms/);
   });
 
+  it('shows time to first token and time queued behind another rerank', async () => {
+    getTrace.mockResolvedValue(
+      makeTrace({
+        timings: {
+          embed_ms: 20,
+          search_ms: 30,
+          rerank_ms: 400,
+          rerank_wait_ms: 150,
+          generate_ms: 1000,
+          first_token_ms: 900,
+          total_ms: 1450,
+          condense_ms: 0,
+        },
+      }),
+    );
+    setup({ tab: 'trace' });
+
+    expect(await screen.findByTestId('trace-tab')).toHaveTextContent('first token 0.90s');
+    const rerank = screen.getAllByTestId('trace-span').find((span) => span.textContent?.startsWith('rerank'));
+    expect(rerank).toHaveTextContent('150ms queued');
+  });
+
   it('degrades to an empty state when the trace was evicted', async () => {
     getTrace.mockRejectedValue(new ApiClientError('gone', 404));
     setup({ tab: 'trace' });

@@ -187,15 +187,38 @@ def fit_prompt_to_context_window(
     return FittedPrompt(chunks, kept_history, frozenset(dropped), dropped_history)
 
 
+# Recent messages the condense prompt sees, and how much of each assistant answer.
+CONDENSE_HISTORY_MESSAGES = 4
+CONDENSE_ASSISTANT_CHARS = 600
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` cut to about ``limit`` characters, on a word boundary."""
+
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(None, 1)[0] if " " in text[:limit] else text[:limit]
+    return f"{cut}…"
+
+
 def build_condense_messages(
     question: str,
     history: Sequence[ChatMessage],
 ) -> list[ChatMessage]:
-    """Build the prompt that rewrites a follow-up into a standalone retrieval query."""
+    """Build the prompt that rewrites a follow-up into a standalone retrieval query.
+
+    Only the last ``CONDENSE_HISTORY_MESSAGES`` messages, with assistant answers clipped
+    to ``CONDENSE_ASSISTANT_CHARS``: resolving "it" or "that policy" needs the recent
+    exchange, not every full answer, and the whole transcript was prefill the model
+    read on every follow-up before retrieval could start. Generation still gets the
+    full history.
+    """
 
     transcript = "\n".join(
-        f"{'User' if message['role'] == 'user' else 'Assistant'}: {message['content']}"
-        for message in history
+        f"User: {message['content']}"
+        if message["role"] == "user"
+        else f"Assistant: {_clip(message['content'], CONDENSE_ASSISTANT_CHARS)}"
+        for message in history[-CONDENSE_HISTORY_MESSAGES:]
     )
     return [
         {"role": "system", "content": CONDENSE_SYSTEM_PROMPT},

@@ -681,6 +681,14 @@ describe('ChatMessage answer-progress announcement', () => {
     expect(onRetry).not.toHaveBeenCalled();
   });
 
+  it('says when an answer was not found in the documents', () => {
+    render(
+      <ChatMessage turn={makeTurn({ role: 'assistant', content: 'No info.', notFound: true })} engineerMode={false} />,
+    );
+
+    expect(screen.getByTestId('chat-message-not-found')).toHaveTextContent('not in your documents');
+  });
+
   it('labels stopped and cached answers', () => {
     render(
       <ChatMessage turn={makeTurn({ role: 'assistant', content: 'Part', stopped: true, cached: true })} engineerMode={false} />,

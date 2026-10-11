@@ -1181,3 +1181,26 @@ def test_a_stream_closed_early_closes_the_provider_response() -> None:
     stream.close()  # type: ignore[attr-defined]
 
     assert closed == ["lines"]
+
+
+def test_build_condense_messages_sends_only_the_recent_exchange_with_answers_clipped() -> None:
+    """Condensing resolves "it"/"that one" from the last exchange; the full transcript
+    was prefill the model read before retrieval could even start."""
+
+    long_answer = "word " * 400
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "oldest question"},
+        {"role": "assistant", "content": "oldest answer"},
+        {"role": "user", "content": "What is DocRAG?"},
+        {"role": "assistant", "content": long_answer},
+        {"role": "user", "content": "Which formats?"},
+        {"role": "assistant", "content": "PDF and DOCX."},
+    ]
+
+    content = build_condense_messages("And the second one?", history)[1]["content"]
+
+    assert "oldest" not in content
+    assert "User: What is DocRAG?" in content
+    assert "Assistant: PDF and DOCX." in content
+    clipped = next(line for line in content.splitlines() if line.startswith("Assistant: word"))
+    assert len(clipped) < 700 and clipped.endswith("…")

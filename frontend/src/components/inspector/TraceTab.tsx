@@ -40,7 +40,9 @@ function buildSpans(trace: TraceDetailResponse): Span[] {
       'rerank',
       t.rerank_ms,
       'model',
-      `${trace.candidates.filter((c) => c.kept).length} kept`,
+      `${trace.candidates.filter((c) => c.kept).length} kept` +
+        // Waiting for another question's rerank to finish: not this question's cost.
+        (t.rerank_wait_ms ? ` · ${t.rerank_wait_ms.toFixed(0)}ms queued` : ''),
     ],
     [
       'context expansion',
@@ -92,6 +94,9 @@ function TraceTab({ trace }: TraceTabProps) {
       <p className="trace-tab__header mono">
         trace {trace.trace_id.slice(0, 6)} &middot; {(total / 1000).toFixed(2)}s &middot;{' '}
         {spans.length} spans
+        {trace.timings.first_token_ms ? (
+          <> &middot; first token {(trace.timings.first_token_ms / 1000).toFixed(2)}s</>
+        ) : null}
       </p>
 
       <div className="trace-tab__span trace-tab__span--root">

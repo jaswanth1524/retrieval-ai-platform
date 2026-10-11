@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { Toast } from '../hooks/useToasts';
 import './ToastRow.css';
 
@@ -57,4 +58,5 @@ function ToastRow({ toasts, onDismiss, onHold, onRelease }: ToastRowProps) {
   );
 }
 
-export default ToastRow;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(ToastRow);

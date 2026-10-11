@@ -3,12 +3,15 @@ import type { ChatTurn } from '../../src/components/ChatMessage';
 import {
   CHAT_STORAGE_MAX_TURNS,
   MAX_CONVERSATIONS,
+  MAX_PINNED_CONVERSATIONS,
   type ChatStorageV2,
   type Conversation,
   TOMBSTONE_MAX_AGE_MS,
+  capConversations,
   mergeConversations,
   parseConversations,
   sanitizeConversation,
+  searchConversations,
 } from '../../src/hooks/chatPersistence';
 
 function turn(id: string, role: ChatTurn['role'] = 'user'): ChatTurn {
@@ -180,5 +183,81 @@ describe('mergeConversations with an answer streaming', () => {
     expect(merged.conversations).toHaveLength(MAX_CONVERSATIONS);
     expect(merged.conversations.some((c) => c.id === 's')).toBe(true);
     expect(merged.activeConversationId).toBe('s');
+  });
+});
+
+describe('pinned conversations', () => {
+  const many = (count: number, pinnedIds: string[] = []) =>
+    Array.from({ length: count }, (_, index) =>
+      conversation({
+        id: `c${index}`,
+        updatedAt: count - index, // c0 is the most recently used
+        ...(pinnedIds.includes(`c${index}`) ? { pinned: true } : {}),
+      }),
+    );
+
+  it('drops the least recently used unpinned conversations past the cap', () => {
+    const kept = capConversations(many(MAX_CONVERSATIONS + 3, ['c21', 'c22']));
+
+    expect(kept).toHaveLength(MAX_CONVERSATIONS);
+    const ids = kept.map((c) => c.id);
+    expect(ids).toContain('c21'); // pinned, though among the oldest
+    expect(ids).toContain('c22');
+    expect(ids).not.toContain('c20');
+    expect(ids).not.toContain('c19');
+    // Still most recently used first.
+    expect(ids[0]).toBe('c0');
+  });
+
+  it('never drops the conversation being created or streamed into', () => {
+    const list = many(MAX_CONVERSATIONS + 1);
+    const kept = capConversations(list, `c${MAX_CONVERSATIONS}`);
+    expect(kept.map((c) => c.id)).toContain(`c${MAX_CONVERSATIONS}`);
+    expect(kept).toHaveLength(MAX_CONVERSATIONS);
+  });
+
+  it('protects at most the allowed number of pins', () => {
+    const pinned = Array.from({ length: MAX_PINNED_CONVERSATIONS + 2 }, (_, i) => `c${i + 5}`);
+    const kept = capConversations(many(MAX_CONVERSATIONS + 5, pinned));
+    expect(kept).toHaveLength(MAX_CONVERSATIONS);
+  });
+
+  it('reads a pin back and keeps it out of unrelated values', () => {
+    expect(sanitizeConversation({ ...conversation(), pinned: true })?.pinned).toBe(true);
+    expect(sanitizeConversation({ ...conversation(), pinned: 'yes' })?.pinned).toBeUndefined();
+  });
+
+  it("takes another tab's pin like a rename, even on the conversation streaming here", () => {
+    const local = storage([conversation({ updatedAt: 5 })]);
+    const pinnedThere = conversation({ updatedAt: 5, editedAt: 9, pinned: true });
+
+    expect(mergeConversations(local, [pinnedThere]).conversations[0].pinned).toBe(true);
+    const streaming = mergeConversations(local, [{ ...pinnedThere, turns: [] }], false, [], 10, 'c1');
+    expect(streaming.conversations[0]).toMatchObject({ pinned: true, turns: [turn('t1')] });
+  });
+});
+
+describe('searchConversations', () => {
+  it('finds the first turn whose text matches, with a snippet around it', () => {
+    const answer: ChatTurn = {
+      ...turn('a1', 'assistant'),
+      content: `${'lead in words '.repeat(6)}The travel policy allows economy fares only.`,
+    };
+    const conversations = [
+      conversation({ id: 'c1', turns: [turn('q1'), answer] }),
+      conversation({ id: 'c2', turns: [turn('nothing here')] }),
+    ];
+
+    const matches = searchConversations(conversations, '  TRAVEL policy ');
+
+    expect([...matches.keys()]).toEqual(['c1']);
+    expect(matches.get('c1')?.turnId).toBe('a1');
+    expect(matches.get('c1')?.snippet).toMatch(/^….*travel policy allows economy fares only\.$/);
+    expect(searchConversations(conversations, '   ').size).toBe(0);
+  });
+
+  it('skips error turns', () => {
+    const error: ChatTurn = { ...turn('e1', 'error'), content: 'Request failed: timeout' };
+    expect(searchConversations([conversation({ turns: [error] })], 'timeout').size).toBe(0);
   });
 });

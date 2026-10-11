@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -132,6 +133,19 @@ class LocalCrossEncoderReranker:
         self._cache_size = int(settings.rerank_cache_size)
         self._cache: OrderedDict[tuple[str, bytes], float] = OrderedDict()
         self._cache_lock = threading.Lock()
+        # Per thread: each question runs score() on its own thread, and reads back how
+        # long *its* call queued behind another question's forward pass.
+        self._local = threading.local()
+
+    @property
+    def last_wait_ms(self) -> float:
+        """Time the calling thread's last ``score`` spent waiting for the model lock.
+
+        Kept apart from scoring so a trace can tell "the reranker is slow" from "this
+        question queued behind another one": ``rerank_ms`` measures both together.
+        """
+
+        return float(getattr(self._local, "wait_ms", 0.0))
 
     @staticmethod
     def _cache_key(query: str, document: str) -> tuple[str, bytes]:
@@ -140,6 +154,7 @@ class LocalCrossEncoderReranker:
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
         """Return cross-encoder scores for query-document pairs, reusing cached pairs."""
 
+        self._local.wait_ms = 0.0
         keys = [self._cache_key(query, document) for document in documents]
         scores: list[float | None] = [None] * len(documents)
         if self._cache_size:
@@ -168,15 +183,23 @@ class LocalCrossEncoderReranker:
         return [float(score) for score in scores if score is not None]
 
     def _score_uncached(self, query: str, documents: Sequence[str]) -> list[float]:
+        # Scored shortest first: fastembed pads each batch to its longest pair, so a
+        # batch mixing a short tail chunk with full ones paid for the full length on
+        # every row (about 22% of rerank time over 50 candidates). Sorting groups similar
+        # lengths; the scores go back in input order. The int8 export's scores shift
+        # slightly with batch composition either way, so low scorers can trade places.
+        order = sorted(range(len(documents)), key=lambda index: len(documents[index]))
+        wait_start = time.monotonic()
         try:
             # The model is constructed with lazy_load=True, so the actual model
             # download/load happens on this first call, not at __init__ — this is
             # the boundary that must translate a load failure into RerankingError.
             with self._model_lock:
-                scores = list(
+                self._local.wait_ms = (time.monotonic() - wait_start) * 1000
+                sorted_scores = list(
                     self.model.rerank(
                         query=query,
-                        documents=documents,
+                        documents=[documents[index] for index in order],
                         batch_size=int(self.settings.reranker_batch_size),
                     )
                 )
@@ -184,7 +207,15 @@ class LocalCrossEncoderReranker:
             # The cause (often a path or an ONNX runtime message) stays in the log.
             logger.warning("Reranker model failed.", exc_info=True)
             raise RerankingError("Reranker model failed.") from exc
-        return [float(score) for score in scores]
+        if len(sorted_scores) != len(documents):
+            raise RerankingError(
+                f"Reranker score count mismatch: got {len(sorted_scores)}, "
+                f"expected {len(documents)}."
+            )
+        scores = [0.0] * len(documents)
+        for position, index in enumerate(order):
+            scores[index] = float(sorted_scores[position])
+        return scores
 
 
 class Reranker(Protocol):

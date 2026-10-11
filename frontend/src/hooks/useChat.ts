@@ -14,10 +14,11 @@ import { chatStoreAvailable, clearChatStore, loadChatStore, saveChatStore } from
 import {
   CHAT_STORAGE_KEY,
   EMPTY_SCOPE,
-  MAX_CONVERSATIONS,
+  MAX_PINNED_CONVERSATIONS,
   TITLE_MAX_CHARS,
   applyDeleteHeldDuringStream,
   byRecentUse,
+  capConversations,
   deriveTitle,
   emptyConversation,
   isOnlyEmpty,
@@ -27,18 +28,25 @@ import {
   parseDeleted,
   persistStorage,
   sanitizeTurn,
+  searchConversations as searchStoredConversations,
   withoutConversation,
 } from './chatPersistence';
 import type {
   ChatStorageV2,
   Conversation,
+  ConversationMatch,
   ConversationScope,
   ConversationSummary,
 } from './chatPersistence';
 
 // Re-exported for the components and tests that import them from here.
 export { mergeConversations } from './chatPersistence';
-export type { Conversation, ConversationScope, ConversationSummary } from './chatPersistence';
+export type {
+  Conversation,
+  ConversationMatch,
+  ConversationScope,
+  ConversationSummary,
+} from './chatPersistence';
 
 // Mirrors the server's own REQUEST_HISTORY_MAX_MESSAGES cap (api/schemas.py) — kept
 // in sync so a client-side trim never silently disagrees with what the server would
@@ -186,6 +194,11 @@ export interface UseChatResult {
   switchConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
   deleteConversation: (id: string) => void;
+  /** Pin or unpin; false (nothing changes) past MAX_PINNED_CONVERSATIONS pins. */
+  setPinned: (id: string, pinned: boolean) => boolean;
+  /** Conversations whose question or answer text contains `query`, by id. Reads the
+   *  latest history, so call it from an effect or a memo keyed on `conversations`. */
+  searchConversations: (query: string) => Map<string, ConversationMatch>;
   /** `undefined` takes a rating back (it could not be sent). */
   setTurnFeedback: (turnId: string, rating: FeedbackRating | undefined) => void;
 }
@@ -524,8 +537,9 @@ export function useChat(): UseChatResult {
             bufferedDeltaRef.current += text;
             if (frameId === null) frameId = requestAnimationFrame(flushDelta);
           },
-          onDone: (answer, sources, timings, traceId, cached) => {
+          onDone: (answer, sources, timings, traceId, cached, grounding) => {
             flushDelta();
+            const status = grounding?.answerStatus;
             updateAssistantTurn((turn) => ({
               ...turn,
               content: answer,
@@ -533,6 +547,9 @@ export function useChat(): UseChatResult {
               timings,
               traceId,
               ...(cached ? { cached: true } : {}),
+              ...(status === 'insufficient_context' || status === 'no_context'
+                ? { notFound: true }
+                : {}),
             }));
           },
         },
@@ -630,10 +647,7 @@ export function useChat(): UseChatResult {
       setStorage((prev) => ({
         ...prev,
         activeConversationId: fork.id,
-        conversations: [fork, ...[...prev.conversations].sort(byRecentUse)].slice(
-          0,
-          MAX_CONVERSATIONS,
-        ),
+        conversations: capConversations([fork, ...prev.conversations], fork.id),
       }));
       await runAsk(fork.id, question, buildHistory(prior), provider, overrides, filenames, options);
     },
@@ -665,10 +679,7 @@ export function useChat(): UseChatResult {
     setStorage((prev) => ({
       ...prev,
       activeConversationId: conversation.id,
-      conversations: [conversation, ...[...prev.conversations].sort(byRecentUse)].slice(
-        0,
-        MAX_CONVERSATIONS,
-      ),
+      conversations: capConversations([conversation, ...prev.conversations], conversation.id),
     }));
     return true;
   }, []);
@@ -763,12 +774,9 @@ export function useChat(): UseChatResult {
       const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
       if (active && active.turns.length === 0) return prev;
       const conversation = emptyConversation();
-      // Past the cap, the least recently *used* conversation goes — not the oldest
-      // created, which dropped a conversation still in daily use.
-      const conversations = [conversation, ...[...prev.conversations].sort(byRecentUse)].slice(
-        0,
-        MAX_CONVERSATIONS,
-      );
+      // Past the cap, the least recently *used* unpinned conversation goes — not the
+      // oldest created, which dropped a conversation still in daily use.
+      const conversations = capConversations([conversation, ...prev.conversations], conversation.id);
       return { ...prev, activeConversationId: conversation.id, conversations };
     });
   }, []);
@@ -798,6 +806,27 @@ export function useChat(): UseChatResult {
     setStorage((prev) => withoutConversation(prev, id, Date.now()));
   }, []);
 
+  const setPinned = useCallback((id: string, pinned: boolean) => {
+    const current = storageRef.current.conversations;
+    const target = current.find((conversation) => conversation.id === id);
+    if (!target || Boolean(target.pinned) === pinned) return Boolean(target);
+    if (pinned && current.filter((c) => c.pinned).length >= MAX_PINNED_CONVERSATIONS) return false;
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) =>
+        conversation.id === id
+          ? { ...conversation, pinned: pinned || undefined, editedAt: Date.now() }
+          : conversation,
+      ),
+    }));
+    return true;
+  }, []);
+
+  const searchConversations = useCallback(
+    (query: string) => searchStoredConversations(storageRef.current.conversations, query),
+    [],
+  );
+
   const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
     // Stored on the turn, so a rating survives a reload or a conversation switch and
     // the buttons can't send a duplicate row for the same answer.
@@ -826,6 +855,7 @@ export function useChat(): UseChatResult {
       title: conversation.title,
       updatedAt: conversation.updatedAt,
       turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
+      ...(conversation.pinned ? { pinned: true } : {}),
     }));
     const prev = summariesRef.current;
     const same =
@@ -835,7 +865,8 @@ export function useChat(): UseChatResult {
           summary.id === next[index].id &&
           summary.title === next[index].title &&
           summary.updatedAt === next[index].updatedAt &&
-          summary.turnCount === next[index].turnCount,
+          summary.turnCount === next[index].turnCount &&
+          summary.pinned === next[index].pinned,
       );
     if (same) return prev;
     summariesRef.current = next;
@@ -863,6 +894,8 @@ export function useChat(): UseChatResult {
     switchConversation,
     renameConversation,
     deleteConversation,
+    setPinned,
+    searchConversations,
     setTurnFeedback,
   };
 }

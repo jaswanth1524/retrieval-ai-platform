@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from api.citations import ANSWER_STATUSES
 from api.documents import MAX_TAGS_PER_DOCUMENT
 from api.tracing import TRACE_DROP_REASONS
 
@@ -88,6 +89,9 @@ class PublicConfigResponse(BaseModel):
     allowed_request_providers: list[str] = Field(
         default_factory=lambda: ["ollama", "openai", "openai_compatible"]
     )
+    # File suffixes an upload may have (".pdf", ".epub", ...), so the UI's file picker
+    # and its pre-upload check follow the server instead of a hard-coded copy.
+    supported_extensions: list[str] = Field(default_factory=list)
 
 
 class DocumentIngestResponse(BaseModel):
@@ -253,6 +257,12 @@ class TimingsResponse(BaseModel):
     # The zero-citation retry's LLM round trip. 0.0 when it didn't fire, which is the
     # common case. generate_ms now excludes it in both response modes.
     citation_retry_ms: float = 0.0
+    # Part of rerank_ms spent queued behind another question's rerank (the model scores
+    # one question at a time). 0.0 when nothing was ahead of it.
+    rerank_wait_ms: float = 0.0
+    # Request start to the first streamed answer token. 0.0 on /questions (nothing
+    # streams) and on answers served from the cache.
+    first_token_ms: float = 0.0
 
 
 class PromptMessageResponse(BaseModel):
@@ -415,6 +425,14 @@ class QuestionResponse(BaseModel):
     trace_id: str | None = None
     # Served from the answer cache: no retrieval or generation ran for this request.
     cached: bool = False
+    # "no_context": nothing cleared the rerank bar; "insufficient_context": the model
+    # said the documents don't cover the question and cited nothing. Extensible: show
+    # an unknown value as "answered".
+    answer_status: str = Field(
+        default="answered", json_schema_extra={"x-extensible-enum": list(ANSWER_STATUSES)}
+    )
+    # Best cross-encoder score (0-1) among the candidates, whether or not it was kept.
+    top_rerank_score: float | None = None
 
 
 class AccessResponse(BaseModel):

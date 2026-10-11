@@ -29,6 +29,8 @@ from api.parsers.common import (
 )
 from api.parsers.csv import parse_csv_document
 from api.parsers.docx import parse_docx_document
+from api.parsers.eml import parse_eml_document
+from api.parsers.epub import parse_epub_document
 from api.parsers.html import parse_html_document
 from api.parsers.pdf import parse_pdf_document
 from api.parsers.text import (
@@ -112,10 +114,24 @@ def _parse_docx(
     return parse_docx_document(filename, content)
 
 
+def _parse_epub(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_epub_document(filename, content)
+
+
+def _parse_eml(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_eml_document(filename, content)
+
+
 # One parser per supported suffix (api/parsers/*); adding a format is one entry here.
 PARSERS: dict[str, Parser] = {
     ".pdf": parse_pdf_document,
     ".docx": _parse_docx,
+    ".epub": _parse_epub,
+    ".eml": _parse_eml,
     ".md": _parse_markdown,
     ".markdown": _parse_markdown,
     ".html": _parse_html,

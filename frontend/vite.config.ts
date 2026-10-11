@@ -1,9 +1,45 @@
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { brotliCompressSync, constants, gzipSync } from 'node:zlib';
 import react from '@vitejs/plugin-react';
+import type { Plugin } from 'vite';
 import { configDefaults, defineConfig } from 'vitest/config';
+
+// Text assets get .br and .gz copies next to them, which api/static_files.py serves to
+// browsers that accept them; the API compresses nothing at request time. Fonts and
+// images are already compressed; index.html is tiny and must keep its ETag revalidation.
+const PRECOMPRESS = /\.(js|css|svg|json)$/;
+const PRECOMPRESS_MIN_BYTES = 1024;
+
+function precompress(): Plugin {
+  let assetsDir = '';
+  return {
+    name: 'docrag-precompress',
+    apply: 'build',
+    configResolved(config) {
+      assetsDir = resolve(config.root, config.build.outDir, config.build.assetsDir);
+    },
+    closeBundle() {
+      for (const name of readdirSync(assetsDir)) {
+        if (!PRECOMPRESS.test(name)) continue;
+        const path = join(assetsDir, name);
+        const content = readFileSync(path);
+        if (content.length < PRECOMPRESS_MIN_BYTES) continue;
+        writeFileSync(
+          `${path}.br`,
+          brotliCompressSync(content, {
+            params: { [constants.BROTLI_PARAM_QUALITY]: constants.BROTLI_MAX_QUALITY },
+          }),
+        );
+        writeFileSync(`${path}.gz`, gzipSync(content, { level: 9 }));
+      }
+    },
+  };
+}
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), precompress()],
   build: {
     rollupOptions: {
       output: {

@@ -354,6 +354,29 @@ describe('pollDocumentJob', () => {
     }
   });
 
+  it('polls again after 1s whenever the job has moved on', async () => {
+    vi.useFakeTimers();
+    try {
+      const queued = { ...embedding, state: 'queued', chunks_done: 0 };
+      const sequence = [queued, queued, queued, embedding, done];
+      let call = 0;
+      const fetchMock = vi.fn(async () => jsonResponse(200, sequence[call++]));
+      vi.stubGlobal('fetch', fetchMock);
+      const promise = api.pollDocumentJob('j1');
+
+      await vi.advanceTimersByTimeAsync(0); // queued
+      await vi.advanceTimersByTimeAsync(1_000); // queued, unchanged: next wait 1.5s
+      await vi.advanceTimersByTimeAsync(1_500); // queued: next wait 2.25s
+      await vi.advanceTimersByTimeAsync(2_250); // embedding: moved, so back to 1s
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect((await promise).state).toBe('done');
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rides out a few transient poll failures but not a 4xx', async () => {
     vi.useFakeTimers();
     try {
@@ -425,6 +448,8 @@ describe('askQuestionStream', () => {
       { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
       'trace-1',
       false,
+      // An older server sends no grounding fields.
+      { answerStatus: undefined, topRerankScore: undefined },
     );
   });
 
@@ -613,7 +638,10 @@ describe('askQuestionStream termination', () => {
     await expect(
       api.askQuestionStream('hi', undefined, undefined, undefined, undefined, { onDone }),
     ).resolves.toBeUndefined();
-    expect(onDone).toHaveBeenCalledWith('Full answer.', [], null, 't1', false);
+    expect(onDone).toHaveBeenCalledWith('Full answer.', [], null, 't1', false, {
+      answerStatus: undefined,
+      topRerankScore: undefined,
+    });
   });
 
   it('still rejects a connection reset before the done event', async () => {

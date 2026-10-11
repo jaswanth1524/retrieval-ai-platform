@@ -4,36 +4,26 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from io import BytesIO
-from zipfile import BadZipFile, ZipFile
 
 from api.parsers.common import (
     DEFAULT_SECTION,
+    ZIP_MAX_EXPANDED_BYTES,
     DocumentParseError,
     DocumentSection,
     EmptyDocumentError,
     cap_section,
+    check_zip_expanded_size,
     normalize_text,
 )
 
-# A DOCX is a zip that python-docx inflates entirely into memory. MAX_UPLOAD_BYTES caps
-# the compressed size only, so a few-MB upload declaring gigabytes of XML would OOM the
-# ingest worker. Real documents (images included) sit far below this.
-DOCX_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
+# python-docx inflates the whole zip in memory; see ZIP_MAX_EXPANDED_BYTES.
+DOCX_MAX_EXPANDED_BYTES = ZIP_MAX_EXPANDED_BYTES
 
 
 def _check_docx_expanded_size(filename: str, content: bytes) -> None:
     """Refuse a DOCX whose members would inflate past ``DOCX_MAX_EXPANDED_BYTES``."""
 
-    try:
-        with ZipFile(BytesIO(content)) as archive:
-            expanded = sum(member.file_size for member in archive.infolist())
-    except BadZipFile as exc:
-        raise DocumentParseError(f"Could not parse DOCX '{filename}'.") from exc
-    if expanded > DOCX_MAX_EXPANDED_BYTES:
-        raise DocumentParseError(
-            f"DOCX '{filename}' expands to {expanded // (1024 * 1024)} MiB, over the "
-            f"{DOCX_MAX_EXPANDED_BYTES // (1024 * 1024)} MiB limit."
-        )
+    check_zip_expanded_size(filename, content, "DOCX", DOCX_MAX_EXPANDED_BYTES)
 
 
 def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:

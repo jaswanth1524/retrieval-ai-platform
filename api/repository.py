@@ -70,6 +70,16 @@ def clear_hybrid_fallback_cache() -> None:
     _server_side_hybrid_unsupported.clear()
 
 
+# Payload fields a search hit is read for (retrieval.scored_point_to_chunk). Fetching
+# the whole payload sent each of 50 candidates' tags, fingerprint, sizes and stamps
+# over the wire for nothing.
+SEARCH_PAYLOAD_FIELDS = ["filename", "page", "section", "chunk_id", "text", "chunk_ordinal"]
+# Neighbour expansion reads only these.
+NEIGHBOR_PAYLOAD_FIELDS = ["chunk_ordinal", "text"]
+# Distinct tags one facet call returns before stored_tags falls back to a full scan.
+TAG_FACET_LIMIT = 1000
+
+
 @dataclass(frozen=True)
 class DocumentMetadata:
     """Per-filename aggregate derived from its indexed points' payloads."""
@@ -476,6 +486,38 @@ class VectorRepository:
         stamp = points[0].payload.get("uploaded_at") if points and points[0].payload else None
         return float(stamp) if isinstance(stamp, int | float) else None
 
+    def stored_tags(self, settings: AppSettings) -> set[str]:
+        """Every distinct tag in the collection, as stored.
+
+        From the metadata cache when it is warm, else one facet call on the ``tags``
+        keyword index. The scan behind ``filename_metadata`` reads every point's payload,
+        and a tag-scoped question used to pay it, before embedding, whenever the cache
+        had gone cold. A facet that comes back full may be truncated — a stored spelling
+        missing from it would silently mis-scope the question — so it falls back to the
+        scan then, and when the server can't facet at all.
+        """
+
+        cached = self._cached_metadata(settings.qdrant_collection, corpus_generation())
+        if cached is not None:
+            return {tag for metadata in cached.values() for tag in metadata.tags}
+        try:
+            response = self._call(
+                settings,
+                "facet",
+                collection_name=settings.qdrant_collection,
+                key="tags",
+                limit=TAG_FACET_LIMIT,
+                exact=True,
+            )
+        except (UnexpectedResponse, ResponseHandlingException, grpc.RpcError, ValueError):
+            logger.debug("Tag facet unavailable; reading tags from metadata.", exc_info=True)
+        else:
+            if len(response.hits) < TAG_FACET_LIMIT:
+                return {hit.value for hit in response.hits if isinstance(hit.value, str)}
+        return {
+            tag for metadata in self.filename_metadata(settings).values() for tag in metadata.tags
+        }
+
     def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]:
         """The tags stored on an indexed document (one point read), or ``()``."""
 
@@ -548,7 +590,7 @@ class VectorRepository:
             ],
             query=models.RrfQuery(rrf=models.Rrf(k=int(settings.rrf_k))),
             limit=int(settings.fused_top_n),
-            with_payload=True,
+            with_payload=SEARCH_PAYLOAD_FIELDS,
             with_vectors=False,
         )
         return _response_points(response)
@@ -562,30 +604,18 @@ class VectorRepository:
     ) -> list[models.ScoredPoint]:
         """One side of the hybrid search on its own — for fusion, and for evaluation."""
 
-        if leg == "dense":
-            response = self._call(
-                settings,
-                "query_points",
-                collection_name=settings.qdrant_collection,
-                query=query_embedding.dense,
-                using=settings.qdrant_dense_vector_name,
-                limit=int(settings.dense_retrieval_limit),
-                query_filter=query_filter,
-                with_payload=True,
-                with_vectors=False,
-            )
-        else:
-            response = self._call(
-                settings,
-                "query_points",
-                collection_name=settings.qdrant_collection,
-                query=query_embedding.sparse,
-                using=settings.qdrant_sparse_vector_name,
-                limit=int(settings.sparse_retrieval_limit),
-                query_filter=query_filter,
-                with_payload=True,
-                with_vectors=False,
-            )
+        request = _leg_request(settings, query_embedding, leg, query_filter)
+        response = self._call(
+            settings,
+            "query_points",
+            collection_name=settings.qdrant_collection,
+            query=request.query,
+            using=request.using,
+            limit=request.limit,
+            query_filter=request.filter,
+            with_payload=request.with_payload,
+            with_vectors=False,
+        )
         return _response_points(response)
 
     def _manual_hybrid_query(
@@ -594,11 +624,18 @@ class VectorRepository:
         query_embedding: EmbeddedText,
         query_filter: models.Filter | None,
     ) -> list[models.ScoredPoint]:
-        return reciprocal_rank_fusion(
-            [
-                self.search_leg(settings, query_embedding, "dense", query_filter),
-                self.search_leg(settings, query_embedding, "sparse", query_filter),
+        # Both legs in one round trip; fused here with the same pinned rrf_k.
+        responses = self._call(
+            settings,
+            "query_batch_points",
+            collection_name=settings.qdrant_collection,
+            requests=[
+                _leg_request(settings, query_embedding, "dense", query_filter),
+                _leg_request(settings, query_embedding, "sparse", query_filter),
             ],
+        )
+        return reciprocal_rank_fusion(
+            [_response_points(response) for response in responses],
             k=int(settings.rrf_k),
             limit=int(settings.fused_top_n),
         )
@@ -626,7 +663,7 @@ class VectorRepository:
                     ),
                 ]
             ),
-            with_payload=True,
+            with_payload=NEIGHBOR_PAYLOAD_FIELDS,
             with_vectors=False,
             limit=len(ordinals),
         )
@@ -706,3 +743,30 @@ def reciprocal_rank_fusion(
 
 def _response_points(response: QueryResponse) -> list[models.ScoredPoint]:
     return list(response.points)
+
+
+def _leg_request(
+    settings: AppSettings,
+    query_embedding: EmbeddedText,
+    leg: Literal["dense", "sparse"],
+    query_filter: models.Filter | None,
+) -> models.QueryRequest:
+    """One retrieval leg (dense or BM25) as a query request."""
+
+    if leg == "dense":
+        return models.QueryRequest(
+            query=query_embedding.dense,
+            using=settings.qdrant_dense_vector_name,
+            limit=int(settings.dense_retrieval_limit),
+            filter=query_filter,
+            with_payload=SEARCH_PAYLOAD_FIELDS,
+            with_vector=False,
+        )
+    return models.QueryRequest(
+        query=query_embedding.sparse,
+        using=settings.qdrant_sparse_vector_name,
+        limit=int(settings.sparse_retrieval_limit),
+        filter=query_filter,
+        with_payload=SEARCH_PAYLOAD_FIELDS,
+        with_vector=False,
+    )

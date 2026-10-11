@@ -642,3 +642,50 @@ def test_bundled_fonts_are_served_as_fonts(monkeypatch: pytest.MonkeyPatch, tmp_
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "font/woff2"
+
+
+def test_built_assets_are_served_precompressed_and_cached_by_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Content-hashed assets get the build's .br/.gz copy when the browser accepts it
+    and a year of caching; index.html keeps revalidating so a deploy is picked up."""
+
+    import gzip
+
+    import api.main
+
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    script = b"console.log('docrag');" * 50
+    (assets / "app-1a2b.js").write_bytes(script)
+    (assets / "app-1a2b.js.gz").write_bytes(gzip.compress(script))
+    (assets / "app-1a2b.js.br").write_bytes(b"brotli bytes")
+    (assets / "font.woff2").write_bytes(b"wOF2")
+    (tmp_path / "index.html").write_text("<div id='root'></div>")
+    monkeypatch.setattr(api.main, "FRONTEND_DIST_DIR", tmp_path)
+
+    with TestClient(api.main.create_app()) as client:
+        with client.stream(
+            "GET", "/assets/app-1a2b.js", headers={"Accept-Encoding": "gzip, br"}
+        ) as brotli:
+            raw = b"".join(brotli.iter_raw())
+        gzipped = client.get("/assets/app-1a2b.js", headers={"Accept-Encoding": "gzip"})
+        plain = client.get("/assets/app-1a2b.js", headers={"Accept-Encoding": "identity"})
+        refused = client.get("/assets/app-1a2b.js", headers={"Accept-Encoding": "br;q=0"})
+        font = client.get("/assets/font.woff2", headers={"Accept-Encoding": "br, gzip"})
+        index = client.get("/", headers={"Accept-Encoding": "br, gzip"})
+
+    assert brotli.headers["content-encoding"] == "br" and raw == b"brotli bytes"
+    assert brotli.headers["content-type"].startswith("text/javascript")
+    assert brotli.headers["vary"] == "Accept-Encoding"
+    assert gzipped.headers["content-encoding"] == "gzip" and gzipped.content == script
+    for response in (plain, refused):
+        assert "content-encoding" not in response.headers and response.content == script
+        assert response.headers["vary"] == "Accept-Encoding"
+    for response in (brotli, gzipped, plain, font):
+        assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+    # Fonts are already compressed: served as they are, with their own type.
+    assert "content-encoding" not in font.headers
+    assert font.headers["content-type"] == "font/woff2"
+    assert index.status_code == 200 and index.headers["cache-control"] == "no-cache"
+    assert "content-encoding" not in index.headers

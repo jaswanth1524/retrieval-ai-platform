@@ -260,4 +260,35 @@ describe('useCorpus', () => {
     expect(api.cancelDocumentJob).toHaveBeenCalledWith('job-7');
     expect(result.current.uploads).toEqual([]);
   });
+
+  it('sends the next file while earlier ones are still being indexed', async () => {
+    // Two send slots. Each accepted job then polls forever until released, which used
+    // to keep its slot: the third file was not sent until the first was indexed.
+    const finish: Array<() => void> = [];
+    api.uploadDocument.mockImplementation(async (sent: File) => ({
+      job_id: `job-${sent.name}`,
+      filename: sent.name,
+      state: 'queued',
+    }));
+    api.pollDocumentJob.mockImplementation(
+      (jobId: string) =>
+        new Promise((resolve) =>
+          finish.push(() => resolve(jobStatus({ job_id: jobId, state: 'done' }))),
+        ),
+    );
+    const { result } = setup();
+    const files = ['a.txt', 'b.txt', 'c.txt'].map((name) => new File(['x'], name));
+
+    let upload: Promise<void> | undefined;
+    act(() => {
+      upload = result.current.handleUpload(files);
+    });
+
+    await waitFor(() => expect(api.uploadDocument).toHaveBeenCalledTimes(3));
+    expect(api.pollDocumentJob).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      for (const done of finish) done();
+      await upload;
+    });
+  });
 });

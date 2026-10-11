@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
 import './Composer.css';
@@ -15,6 +15,8 @@ const MAX_SCOPE_FILENAMES = 500;
 interface ComposerProps {
   onSubmit: (question: string) => void;
   disabled: boolean;
+  /** The question can be typed but not sent yet (the app is still connecting). */
+  sendHeld?: boolean;
   hint?: string;
   pending: boolean;
   onCancel: () => void;
@@ -39,6 +41,7 @@ function isCoarsePointer(): boolean {
 function Composer({
   onSubmit,
   disabled,
+  sendHeld = false,
   hint,
   pending,
   onCancel,
@@ -116,7 +119,7 @@ function Composer({
   // only sending is held until it finishes.
   const submit = () => {
     const trimmed = value.trim();
-    if (!trimmed || disabled || pending) return;
+    if (!trimmed || disabled || sendHeld || pending) return;
     onSubmit(trimmed);
     setValue('');
   };
@@ -360,7 +363,7 @@ function Composer({
             type="button"
             className="composer__send"
             onClick={pending ? onCancel : submit}
-            disabled={pending ? false : disabled || !value.trim()}
+            disabled={pending ? false : disabled || sendHeld || !value.trim()}
             data-testid="question-submit"
           >
             {pending ? 'Stop' : 'Ask'}
@@ -371,4 +374,5 @@ function Composer({
   );
 }
 
-export default Composer;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(Composer);

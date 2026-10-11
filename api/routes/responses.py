@@ -36,6 +36,8 @@ def timings_response(timings: StageTimings | None) -> TimingsResponse | None:
         query_expansion_ms=timings.query_expansion_ms,
         context_expansion_ms=timings.context_expansion_ms,
         citation_retry_ms=timings.citation_retry_ms,
+        rerank_wait_ms=timings.rerank_wait_ms,
+        first_token_ms=timings.first_token_ms,
     )
 
 
@@ -140,15 +142,17 @@ def log_question(*, provider: str | None, source_count: int, timings: dict[str, 
 
     logger.info(
         "question answered provider=%s sources=%d condense_ms=%.1f embed_ms=%.1f "
-        "search_ms=%.1f rerank_ms=%.1f context_expansion_ms=%.1f generate_ms=%.1f "
-        "citation_retry_ms=%.1f total_ms=%.1f",
+        "search_ms=%.1f rerank_ms=%.1f rerank_wait_ms=%.1f context_expansion_ms=%.1f "
+        "first_token_ms=%.1f generate_ms=%.1f citation_retry_ms=%.1f total_ms=%.1f",
         provider or "default",
         source_count,
         timings.get("condense_ms", 0.0),
         timings["embed_ms"],
         timings["search_ms"],
         timings["rerank_ms"],
+        timings.get("rerank_wait_ms", 0.0),
         timings.get("context_expansion_ms", 0.0),
+        timings.get("first_token_ms", 0.0),
         timings["generate_ms"],
         timings.get("citation_retry_ms", 0.0),
         timings["total_ms"],

@@ -246,3 +246,44 @@ def test_a_document_is_paged_by_ordinal_range(server: tuple[QdrantClient, AppSet
     assert repository.chunk_ordinal_of(settings, "long.md", "nope") is None
     page = repository.chunks_in_ordinal_range(settings, "long.md", 3, 5)
     assert [payload["chunk_id"] for payload in page] == ["k3", "k4", "k5"]
+
+
+def test_stored_tags_come_from_the_tags_facet_on_the_server(
+    server: tuple[QdrantClient, AppSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The facet needs the server's keyword index; without it (or with values coming
+    back as anything but strings) stored_tags would quietly fall back to the scan."""
+
+    from api.repository import clear_metadata_cache
+
+    client, settings = server
+    repository = seed(client, settings)
+    repository.set_tags(settings, "notes.md", ["Legal", "q3"])
+    repository.set_tags(settings, "guide.md", ["legal"])
+    clear_metadata_cache()
+
+    def no_scan(settings: AppSettings) -> object:
+        raise AssertionError("the facet answered; no scan expected")
+
+    monkeypatch.setattr(repository, "_scan_filename_metadata", no_scan)
+    assert repository.stored_tags(settings) == {"Legal", "legal", "q3"}
+    clear_metadata_cache()
+
+
+def test_the_manual_fusion_fallback_sends_both_legs_in_one_batch(
+    server: tuple[QdrantClient, AppSettings],
+) -> None:
+    client, settings = server
+    repository = seed(client, settings)
+
+    points = repository._manual_hybrid_query(
+        settings, embedding([1.0, 0.0, 0.0], [10], [1.0]), None
+    )
+
+    assert [point.payload["chunk_id"] for point in points if point.payload][:2] == ["c1", "c3"]
+    assert all(
+        set(point.payload or {})
+        <= {"filename", "page", "section", "chunk_id", "text", "chunk_ordinal"}
+        for point in points
+    )
+    assert {"filename", "page", "section", "chunk_id", "text"} <= set(points[0].payload or {})

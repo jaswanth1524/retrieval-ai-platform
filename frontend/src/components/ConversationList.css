@@ -141,3 +141,22 @@
   background: var(--card);
   color: var(--ink);
 }
+
+/* The pinned group ends with a rule, so the unpinned list reads as its own group. */
+.conversation-list__row-wrap--last-pinned {
+  padding-bottom: 6px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--rail-rule);
+}
+
+.conversation-list__pin-mark {
+  color: var(--rail-dim);
+}
+
+.conversation-list__snippet {
+  font-size: 11.5px;
+  color: var(--rail-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

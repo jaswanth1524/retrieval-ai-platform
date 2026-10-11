@@ -467,3 +467,56 @@ def test_vectors_held_for_the_write_round_trip_exactly() -> None:
     # Qdrant's in-memory cosine store normalizes; compare directions.
     expected = np.asarray(dense) / np.linalg.norm(dense)
     assert np.allclose(stored, expected, atol=1e-6)
+
+
+def test_ingest_chunks_upserts_in_batches_independent_of_the_embedding_batch() -> None:
+    """Embedding stays in small batches for progress; the write goes in bigger ones,
+    so the filename lock is held through fewer Qdrant round trips."""
+
+    settings = make_settings(ingest_batch_size=2, ingest_upsert_batch_size=5)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    upserts: list[int] = []
+    upsert = repository.upsert
+
+    def counting_upsert(settings: AppSettings, points: Sequence[models.PointStruct]) -> None:
+        upserts.append(len(points))
+        upsert(settings, list(points))
+
+    repository.upsert = counting_upsert  # type: ignore[method-assign]
+    chunks = [make_chunk(chunk_id=f"c{index}", text=f"text {index}") for index in range(7)]
+
+    class BatchEmbeddings:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            self.calls.append(len(texts))
+            return [make_embedding() for _ in texts]
+
+    embeddings = BatchEmbeddings()
+    ingest_chunks(repository, settings, chunks, embeddings)
+
+    assert embeddings.calls == [2, 2, 2, 1]
+    assert upserts == [5, 2]
+    assert len(repository.point_ids_for_filename(settings, "guide.md")) == 7
+
+
+def test_ingest_chunks_records_embed_and_write_stage_times() -> None:
+    from prometheus_client import REGISTRY
+
+    def observations(stage: str) -> float:
+        value = REGISTRY.get_sample_value("docrag_ingest_stage_seconds_count", {"stage": stage})
+        return value or 0.0
+
+    before = {stage: observations(stage) for stage in ("embed", "write")}
+    ingest_chunks(
+        VectorRepository(QdrantClient(":memory:")),
+        make_settings(),
+        [make_chunk()],
+        FakeEmbeddingProvider([make_embedding()]),
+    )
+
+    assert {stage: observations(stage) - before[stage] for stage in before} == {
+        "embed": 1,
+        "write": 1,
+    }

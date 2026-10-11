@@ -43,6 +43,15 @@ ingest_job_seconds = Histogram(
     buckets=INGEST_LATENCY_BUCKETS,
 )
 
+# Where an ingest's time goes. "write" is everything under the filename lock:
+# snapshot, upserts, storing the original and stale cleanup.
+ingest_stage_seconds = Histogram(
+    "docrag_ingest_stage_seconds",
+    "Wall-clock time of each ingestion stage (parse, chunk, embed, write).",
+    labelnames=("stage",),
+    buckets=INGEST_LATENCY_BUCKETS,
+)
+
 ingest_chunks_total = Counter(
     "docrag_ingest_chunks_total",
     "Total document chunks successfully indexed.",
@@ -86,4 +95,12 @@ def observe_question_timings(timings: dict[str, float]) -> None:
     question_stage_seconds.labels(stage="citation_retry").observe(
         timings.get("citation_retry_ms", 0.0) / 1000
     )
+    # Queueing behind another question's rerank, a slice of "rerank" above.
+    question_stage_seconds.labels(stage="rerank_wait").observe(
+        timings.get("rerank_wait_ms", 0.0) / 1000
+    )
+    # Streamed questions only: /questions has no first token, and a 0 there would
+    # drag the series toward an instant answer nobody saw.
+    if timings.get("first_token_ms", 0.0) > 0:
+        question_stage_seconds.labels(stage="first_token").observe(timings["first_token_ms"] / 1000)
     question_stage_seconds.labels(stage="total").observe(timings["total_ms"] / 1000)

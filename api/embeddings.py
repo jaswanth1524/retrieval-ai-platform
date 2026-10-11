@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,6 +17,10 @@ from api.request_id import submit_in_context
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
+
+# Recent query embeddings. Regenerate, Retry and a repeated question re-embed the same
+# text; a dense+BM25 pass is small but it is on every question's critical path.
+QUERY_EMBEDDING_CACHE_SIZE = 256
 
 
 class EmbeddingError(RuntimeError):
@@ -98,6 +103,8 @@ class LocalEmbeddingProvider:
         # model runs under its lock; later calls skip it.
         self._load_locks = {"dense": Lock(), "sparse": Lock()}
         self._loaded: set[str] = set()
+        self._query_cache: OrderedDict[tuple[str, str], EmbeddedText] = OrderedDict()
+        self._query_cache_lock = Lock()
 
     def _run_model[T](self, model: str, call: Callable[[], T]) -> T:
         """Run one embed call, serializing it with any other first call to ``model``."""
@@ -170,6 +177,12 @@ class LocalEmbeddingProvider:
 
         instruction = self.settings.dense_query_instruction
         dense_text = f"{instruction}{text}" if instruction else text
+        cache_key = (dense_text, text)
+        with self._query_cache_lock:
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                self._query_cache.move_to_end(cache_key)
+                return cached
         try:
             dense_future = submit_in_context(
                 self._query_executor,
@@ -195,7 +208,13 @@ class LocalEmbeddingProvider:
             raise EmbeddingError(
                 "Query embedding must produce exactly one dense and one sparse vector."
             )
-        return EmbeddedText(dense=dense_vectors[0], sparse=sparse_vectors[0])
+        embedded = EmbeddedText(dense=dense_vectors[0], sparse=sparse_vectors[0])
+        with self._query_cache_lock:
+            self._query_cache[cache_key] = embedded
+            self._query_cache.move_to_end(cache_key)
+            while len(self._query_cache) > QUERY_EMBEDDING_CACHE_SIZE:
+                self._query_cache.popitem(last=False)
+        return embedded
 
 
 def coerce_dense_vector(vector: object) -> list[float]:

@@ -38,3 +38,69 @@ def pdf_bytes(pages: list[str]) -> bytes:
         f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
     )
     return out.getvalue()
+
+
+def epub_bytes(chapters: list[tuple[str, str]], *, spine_order: list[int] | None = None) -> bytes:
+    """A minimal valid EPUB: one XHTML file per ``(title, body)`` chapter, read in
+    ``spine_order`` (chapter indexes; default: as given)."""
+
+    import zipfile
+
+    order = spine_order if spine_order is not None else list(range(len(chapters)))
+    manifest = "".join(
+        f'<item id="c{index}" href="text/chapter%20{index}.xhtml" '
+        'media-type="application/xhtml+xml"/>'
+        for index in range(len(chapters))
+    )
+    spine = "".join(f'<itemref idref="c{index}"/>' for index in order)
+    package = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        f"<manifest>{manifest}"
+        '<item id="css" href="style.css" media-type="text/css"/></manifest>'
+        f"<spine>{spine}</spine></package>"
+    )
+    container = (
+        '<?xml version="1.0"?>'
+        '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" '
+        'media-type="application/oebps-package+xml"/></rootfiles></container>'
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", package)
+        archive.writestr("OEBPS/style.css", "body { margin: 0 }")
+        for index, (title, body) in enumerate(chapters):
+            archive.writestr(
+                f"OEBPS/text/chapter {index}.xhtml",
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<html xmlns="http://www.w3.org/1999/xhtml">'
+                f"<head><title>{title}</title></head>"
+                f"<body><h1>{title}</h1><p>{body}</p></body></html>",
+            )
+    return buffer.getvalue()
+
+
+def eml_bytes(
+    *, subject: str, body: str, html: str | None = None, attachment: bool = False
+) -> bytes:
+    """A small RFC 5322 email with a plain-text body, optionally an HTML alternative
+    and a PDF attachment."""
+
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = "Ada Lovelace <ada@example.com>"
+    message["To"] = "team@example.com"
+    message["Date"] = "Mon, 05 Oct 2026 09:30:00 +0000"
+    message.set_content(body)
+    if html is not None:
+        message.add_alternative(html, subtype="html")
+    if attachment:
+        message.add_attachment(
+            b"%PDF-1.4 not indexed", maintype="application", subtype="pdf", filename="a.pdf"
+        )
+    return bytes(message)

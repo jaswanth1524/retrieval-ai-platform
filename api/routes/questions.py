@@ -146,6 +146,8 @@ def register(app: FastAPI) -> None:
             timings=timings_response(grounded.timings),
             trace_id=grounded.trace_id,
             cached=grounded.cached,
+            answer_status=grounded.answer_status,
+            top_rerank_score=grounded.top_rerank_score,
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])

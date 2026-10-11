@@ -140,8 +140,33 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 
     if source_count <= 0 or _CITATION_RE.search(answer):
         return False
+    return not _states_insufficiency(answer)
+
+
+# How well an answer is grounded, sent with every answer. A string, not an enum, so a
+# new value can be added without breaking a client: an unknown one reads as "answered".
+ANSWER_STATUSES = ("answered", "insufficient_context", "no_context")
+
+
+def answer_status(answer: str, cited_count: int, source_count: int) -> str:
+    """``no_context`` when nothing cleared the rerank bar, ``insufficient_context`` when
+    the model said the sources don't cover it and cited none of them, else
+    ``answered``.
+
+    Both conditions, as for the citation retry: "the documents don't cover X, but Y
+    [1]" is a partial answer, and a hint word alone would have flagged it.
+    """
+
+    if source_count <= 0:
+        return "no_context"
+    if cited_count == 0 and _states_insufficiency(answer):
+        return "insufficient_context"
+    return "answered"
+
+
+def _states_insufficiency(answer: str) -> bool:
     lowered = _normalize_negation(answer.lower())
-    return not any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
+    return any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
 
 
 def retry_uncited_answer(

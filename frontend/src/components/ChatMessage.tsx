@@ -62,6 +62,9 @@ export interface ChatTurn {
   cached?: boolean;
   // The model that was asked (absent on answers saved before this was recorded).
   model?: string;
+  // The server said the documents don't answer it (answer_status insufficient_context
+  // or no_context): still an answer, shown with a "not found" flag.
+  notFound?: boolean;
 }
 
 interface ChatMessageProps {
@@ -242,7 +245,12 @@ function ChatMessage({
   const showMeta = engineerMode && turn.role === 'assistant' && !showSkeleton && timings !== null;
 
   return (
-    <div className="chat-message" data-testid="chat-message" data-role={turn.role}>
+    <div
+      className="chat-message"
+      data-testid="chat-message"
+      data-role={turn.role}
+      data-turn-id={turn.id}
+    >
       {turn.role === 'user' && (
         <div className="chat-message__row">
           <span className="chat-message__gutter" aria-hidden="true">
@@ -354,6 +362,15 @@ function ChatMessage({
                   data-testid="chat-message-cached"
                 >
                   cached
+                </span>
+              )}
+              {turn.notFound && (
+                <span
+                  className="chat-message__flag"
+                  title="The server found nothing in your documents that answers this"
+                  data-testid="chat-message-not-found"
+                >
+                  not in your documents
                 </span>
               )}
               <time

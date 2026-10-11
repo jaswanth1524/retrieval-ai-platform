@@ -187,4 +187,60 @@ describe('ConversationList', () => {
     setup();
     expect(screen.queryByTestId('conversation-search')).not.toBeInTheDocument();
   });
+
+  it('lists pinned conversations first and pins from the row', async () => {
+    const onPin = vi.fn();
+    setup({
+      conversations: [
+        { id: 'c1', title: 'Recent', updatedAt: 3, turnCount: 1 },
+        { id: 'c2', title: 'Pinned one', updatedAt: 1, turnCount: 1, pinned: true },
+      ],
+      onPin,
+    });
+
+    const rows = screen.getAllByTestId('conversation-item');
+    expect(rows[0]).toHaveAttribute('data-pinned', 'true');
+    expect(rows[0]).toHaveTextContent('Pinned one');
+    await userEvent.click(screen.getByRole('button', { name: 'Pin Recent' }));
+    expect(onPin).toHaveBeenCalledWith('c1', true);
+    await userEvent.click(screen.getByRole('button', { name: 'Unpin Pinned one' }));
+    expect(onPin).toHaveBeenCalledWith('c2', false);
+  });
+
+  it('disables pinning once the pin limit is reached', () => {
+    const conversations: ConversationSummary[] = Array.from({ length: 11 }, (_, index) => ({
+      id: `c${index}`,
+      title: `Chat ${index}`,
+      updatedAt: index,
+      turnCount: 1,
+      pinned: index < 10,
+    }));
+    setup({ conversations, onPin: vi.fn() });
+    expect(screen.getByRole('button', { name: 'Pin Chat 10' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Unpin Chat 0' })).toBeEnabled();
+  });
+
+  it('matches question and answer text, shows where, and opens the matching turn', async () => {
+    const conversations: ConversationSummary[] = Array.from({ length: 6 }, (_, index) => ({
+      id: `c${index}`,
+      title: `Chat ${index}`,
+      updatedAt: 10 - index,
+      turnCount: 1,
+    }));
+    const onSearch = vi.fn((query: string) =>
+      query === 'economy'
+        ? new Map([['c4', { turnId: 't9', snippet: '…allows economy fares…' }]])
+        : new Map(),
+    );
+    const onSwitch = vi.fn();
+    setup({ conversations, activeId: 'c0', onSearch, onSwitch });
+
+    await userEvent.type(screen.getByTestId('conversation-search'), 'economy');
+
+    const titles = screen.getAllByTestId('conversation-select').map((row) => row.textContent);
+    expect(titles).toHaveLength(2); // the active one always stays, plus the match
+    expect(screen.getByTestId('conversation-snippet')).toHaveTextContent('…allows economy fares…');
+    await userEvent.click(screen.getAllByTestId('conversation-select')[1]);
+    expect(onSwitch).toHaveBeenCalledWith('c4', 't9');
+  });
 });

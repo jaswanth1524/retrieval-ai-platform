@@ -38,6 +38,7 @@ export interface CommandActions {
   importConversation: () => void;
   clear: () => void;
   switchConversation: (id: string) => void;
+  pinConversation: (id: string, pinned: boolean) => void;
 }
 
 interface PaletteControls {
@@ -76,6 +77,7 @@ export function useCommands(
 
   const commands = useMemo<Command[]>(() => {
     const run = actionsRef;
+    const activeConversation = conversations.find((c) => c.id === activeConversationId);
     return [
       {
         id: 'new-conversation',
@@ -178,6 +180,17 @@ export function useCommands(
         run: () => run.current.importConversation(),
         disabled: pending,
       },
+      ...(activeConversation && hasTurns
+        ? [
+            {
+              id: 'pin-conversation',
+              glyph: activeConversation.pinned ? '☆' : '★',
+              label: activeConversation.pinned ? 'Unpin this conversation' : 'Pin this conversation',
+              run: () =>
+                run.current.pinConversation(activeConversation.id, !activeConversation.pinned),
+            },
+          ]
+        : []),
       {
         id: 'clear',
         glyph: '✕',

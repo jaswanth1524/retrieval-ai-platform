@@ -6,6 +6,7 @@ import {
   mergeConversations,
   useChat,
 } from '../../src/hooks/useChat';
+import { sanitizeTurn } from '../../src/hooks/chatPersistence';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import { ApiClientError, api } from '../../src/api/client';
 import type { QuestionStreamHandlers } from '../../src/api/client';
@@ -958,6 +959,55 @@ describe('useChat feature pack', () => {
     expect(call[3]).toEqual(['a.pdf']);
     expect(call[7]).toEqual({ tags: ['legal'], bypassCache: true });
     expect(result.current.turns[1]).toMatchObject({ content: 'From cache.', cached: true });
+  });
+
+  it('flags an answer the server says the documents do not contain, and keeps the flag', async () => {
+    askQuestionStreamMock.mockImplementation(async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+      handlers.onSources?.([], null);
+      handlers.onDone?.('Not in the documents.', [], ZERO_TIMINGS, null, false, {
+        answerStatus: 'insufficient_context',
+        topRerankScore: 0.2,
+      });
+    });
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('Q', 'ollama');
+    });
+
+    expect(result.current.turns[1]).toMatchObject({ content: 'Not in the documents.', notFound: true });
+    expect(sanitizeTurn(JSON.parse(JSON.stringify(result.current.turns[1])))?.notFound).toBe(true);
+  });
+
+  it('does not flag an answered question', async () => {
+    askQuestionStreamMock.mockImplementation(async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+      handlers.onDone?.('Yes [1].', [], ZERO_TIMINGS, null, false, { answerStatus: 'answered' });
+    });
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('Q', 'ollama');
+    });
+    expect(result.current.turns[1].notFound).toBeUndefined();
+  });
+
+  it('pins up to the limit, and finds conversations by their answers', async () => {
+    answeringStream('The travel policy allows economy fares.');
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('Which fares?', 'ollama');
+    });
+    const id = result.current.activeConversationId as string;
+
+    let pinned = false;
+    act(() => {
+      pinned = result.current.setPinned(id, true);
+    });
+    expect(pinned).toBe(true);
+    expect(result.current.conversations.find((c) => c.id === id)?.pinned).toBe(true);
+
+    const match = result.current.searchConversations('economy').get(id);
+    expect(match?.snippet).toContain('allows economy fares');
+    expect(result.current.turns.find((turn) => turn.id === match?.turnId)?.role).toBe('assistant');
   });
 
   it('edits a question into a new conversation, leaving the original intact', async () => {

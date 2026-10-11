@@ -10,6 +10,64 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 ## Unreleased
 
+Latency and features pass. **Re-index: None** — nothing here changes chunking or the
+index. The new EPUB and EML support applies to new uploads.
+
+### Added
+- EPUB and email (`.eml`) uploads. EPUB chapters are read in reading order, through the
+  HTML parser; the chapter's position is its page. An email's headers (subject, sender,
+  recipients, date) are a section of their own, then the plain-text body (or the HTML one
+  when there is none). Attachments are not indexed. No new dependencies.
+- `GET /config` lists the accepted upload types (`supported_extensions`); the UI's file
+  picker, drop check and dropzone label follow it.
+- Answers say how well they are grounded: `answer_status` (`answered`,
+  `insufficient_context` — the model said the documents don't cover it and cited none —
+  or `no_context` — nothing cleared the rerank bar) and `top_rerank_score`, on
+  `/questions` and the stream's `done` frame, cached answers included. The UI marks such
+  an answer "not in your documents".
+- Pinned conversations: listed first and never dropped by the 20-conversation cap (at
+  most 10 pins). Pin from the conversation row or ⌘K.
+- Conversation search matches question and answer text, not just titles; a match shows
+  where it was, and opening it scrolls to that turn.
+- The source viewer can show a stored PDF original at the cited page (with
+  `RAW_DOCUMENT_DIR` set, up to 50 MB), using the browser's own PDF viewer.
+- Latency observability: `first_token_ms` (request to first streamed token) and
+  `rerank_wait_ms` (time queued behind another question's rerank) in timings, traces and
+  `docrag_question_stage_seconds`; `docrag_ingest_stage_seconds{stage=parse|chunk|embed|write}`.
+- `INGEST_UPSERT_BATCH_SIZE` (default 256).
+- `CONTEXT_NEIGHBOR_MAX_CHARS` (default 0, off): keep only that many characters of
+  neighbour text on each side of a retrieved chunk. At `CHUNK_SIZE_TOKENS=96`, 300 cut
+  about 1 s of prefill on qwen2.5 (M1) with the same answers and citations on 11
+  questions; not measured at the default chunk size.
+
+### Faster
+- The reranker scores candidates shortest first, so each batch pads to similar lengths:
+  about 22% faster over 50 candidates (jina int8, M1). The int8 model's scores depend
+  slightly on which passages share a batch, so low-scoring candidates can trade places
+  (measured: top result unchanged on 10 of 10 questions, handbook eval metrics identical);
+  that was already true of the order fusion happened to produce.
+- Search returns only the six payload fields a candidate is built from; neighbour
+  expansion only two.
+- A tag-scoped question gets its tags' stored spellings from one facet call, alongside
+  embedding, instead of a full scan of the collection whenever the listing cache was cold.
+- Repeated query text (Regenerate, Retry) reuses its embedding.
+- Condensing a follow-up sends the last four messages, with long answers clipped, instead
+  of the whole history.
+- The manual-fusion fallback sends both retrieval legs in one Qdrant call.
+- Ingest writes 256 points per upsert instead of 64, so the filename lock is held through
+  fewer round trips.
+- The UI boots with `/config`, `/access` and the document list in parallel (no `/health`
+  first) and says "Connecting…" instead of "Upload a document" until the list arrives;
+  the question box can be typed in meanwhile.
+- Built JS and CSS ship precompressed (`.br`, `.gz`) and are served with a year of
+  caching under `/assets/`; `index.html` is revalidated. About 70% fewer bytes on a cold
+  load.
+- Uploads: two files are sent at a time, but an accepted file no longer holds its slot
+  while it is indexed; job polling drops back to 1 s whenever a job moves.
+- Fewer re-renders while an answer streams (memoized panels, stable handlers), a
+  reloaded chat stays scrolled to the bottom as it renders, a hovered citation prefetches
+  the viewer, and switching conversations is a transition.
+
 ## 0.1.0 — 2026-10-10
 
 The first release. It collects everything below: four review passes and the work before
