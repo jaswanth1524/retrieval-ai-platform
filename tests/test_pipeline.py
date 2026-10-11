@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Sequence
@@ -14,6 +15,8 @@ from api.pipeline import (
     AnswerOverrides,
     IngestService,
     RagPipeline,
+    _clip_head,
+    _clip_tail,
     _strip_overlap,
     expand_with_neighbors,
 )
@@ -1668,3 +1671,148 @@ def test_rag_pipeline_retrieve_checks_the_collection_before_embedding() -> None:
 
     with pytest.raises(RetrievalError, match="refused"):
         pipeline.retrieve("alpha")
+
+
+def test_streaming_reports_time_to_first_token() -> None:
+    """first_token_ms is what a user waits for before anything appears; /questions has
+    no first token and reports 0.0."""
+
+    generator = SequencedGenerator(["Alpha is documented [1]."])
+    pipeline = _retrying_pipeline(ListTraceStore(), generator)
+
+    events = list(pipeline.answer_stream("alpha"))
+    timings = next(event for event in events if event["type"] == "done")["timings"]
+
+    assert 0 < timings["first_token_ms"] <= timings["total_ms"]
+    assert timings["first_token_ms"] >= timings["rerank_ms"]
+    assert timings["rerank_wait_ms"] == 0.0  # the fake reranker never queues
+
+    grounded = _retrying_pipeline(
+        ListTraceStore(), SequencedGenerator(["Alpha is documented [1]."])
+    ).answer("alpha")
+    assert grounded.timings is not None and grounded.timings.first_token_ms == 0.0
+
+
+def test_rerank_wait_is_read_from_the_reranker_into_the_timings() -> None:
+    class QueuedReranker(FakeReranker):
+        last_wait_ms = 125.0
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=QueuedReranker(),
+        generator=SequencedGenerator(["Alpha [1]."]),
+        settings=settings,
+        trace_store=ListTraceStore(),
+    )
+
+    grounded = pipeline.answer("alpha")
+
+    assert grounded.timings is not None and grounded.timings.rerank_wait_ms == 125.0
+
+
+def test_clip_head_and_tail_keep_the_text_nearest_the_chunk_at_word_boundaries() -> None:
+    text = "alpha beta gamma delta"
+    assert _clip_head(text, 0) == text
+    assert _clip_head(text, 100) == text
+    assert _clip_head(text, 13) == "alpha beta"  # "gamma" would be cut mid-word
+    assert _clip_head(text, 11) == "alpha beta"
+    assert _clip_tail(text, 10) == "delta"  # "gamma" would be cut mid-word
+    assert _clip_tail(text, 13) == "gamma delta"
+    assert _clip_tail(text, 0) == text
+
+
+def test_expand_with_neighbors_caps_neighbour_text_on_each_side() -> None:
+    """Only the neighbour text next to the chunk is kept; the chunk itself and its
+    citation are untouched."""
+
+    settings = make_settings(
+        context_neighbor_radius=1,
+        chunk_size_tokens=8,
+        chunk_overlap_tokens=0,
+        context_neighbor_max_chars=12,
+    )
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(
+        repository,
+        StaticEmbeddingProvider([make_embedding(1.0) for _ in range(3)]),
+        settings,
+        token_counter=WordTokenCounter(),
+    ).ingest("guide.md", b"# Notes\nOne two three. Four five six. Seven eight nine.")
+    by_ordinal = {
+        chunk.chunk_ordinal: chunk for chunk in search_and_rerank(repository, settings, "one")
+    }
+
+    (middle,) = expand_with_neighbors([by_ordinal[2]], repository, settings)
+
+    assert middle.text == by_ordinal[2].text
+    assert middle.expanded_text == "\n\n".join(
+        [_clip_tail(by_ordinal[1].text, 12), by_ordinal[2].text, _clip_head(by_ordinal[3].text, 12)]
+    )
+    assert middle.expanded_text is not None
+    assert len(middle.expanded_text) < len(
+        "\n\n".join(by_ordinal[ordinal].text for ordinal in (1, 2, 3))
+    )
+
+
+def _status_pipeline(generator: FakeGenerator, *, ingest: bool = True) -> RagPipeline:
+    from api.answer_cache import AnswerCache
+
+    settings = make_settings(citation_retry_enabled=False)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    if ingest:
+        IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+            "guide.txt", b"Intro\nalpha beta"
+        )
+    return RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=60),
+    )
+
+
+def _stream_done(pipeline: RagPipeline, question: str) -> dict[str, Any]:
+    events = list(pipeline.answer_stream(question))
+    return dict(next(event for event in events if event["type"] == "done"))
+
+
+def test_answers_report_their_grounding_status_in_both_modes_and_from_the_cache() -> None:
+    cited = _status_pipeline(FakeGenerator("Alpha is documented [1]."))
+    grounded = cited.answer("alpha")
+    assert grounded.answer_status == "answered"
+    assert grounded.top_rerank_score == pytest.approx(1 / (1 + math.exp(-1.0)))
+    replay = cited.answer("alpha")
+    assert replay.cached and replay.answer_status == "answered"
+    assert replay.top_rerank_score == grounded.top_rerank_score
+
+    refused = _status_pipeline(
+        FakeGenerator("The provided documents do not contain enough information.")
+    )
+    done = _stream_done(refused, "beta")
+    assert done["answer_status"] == "insufficient_context"
+    replayed = _stream_done(refused, "beta")
+    assert replayed["cached"] and replayed["answer_status"] == "insufficient_context"
+
+    empty = _status_pipeline(FakeGenerator("unused"), ingest=False)
+    assert _stream_done(empty, "alpha")["answer_status"] == "no_context"
+    assert _stream_done(empty, "alpha")["top_rerank_score"] is None
+    assert empty.answer("gamma").answer_status == "no_context"
+
+
+def test_a_partial_answer_that_cites_a_source_is_still_answered() -> None:
+    """ "The documents don't cover X, but Y [1]" answers part of the question; the hint
+    words alone must not label it as not found."""
+
+    pipeline = _status_pipeline(
+        FakeGenerator("The documents do not contain the date, but alpha is beta [1].")
+    )
+    assert pipeline.answer("alpha").answer_status == "answered"
+    assert _stream_done(pipeline, "alpha beta")["answer_status"] == "answered"

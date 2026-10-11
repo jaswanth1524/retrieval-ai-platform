@@ -488,3 +488,152 @@ def test_staleness_follows_the_chunking_fingerprint_and_the_token_counter() -> N
     assert heuristic.is_stale(current, "hf")
     assert not heuristic.is_stale(current, "heuristic")
     assert not heuristic.is_stale(current, "unknown")
+
+
+def _tagged_point(point_id: str, filename: str, tags: list[str]) -> models.PointStruct:
+    point = make_point(point_id, filename)
+    assert point.payload is not None
+    point.payload["tags"] = tags
+    return point
+
+
+def _counting_scans(repository: VectorRepository, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    scans: list[int] = []
+    scan = repository._scan_filename_metadata
+
+    def counting_scan(settings: AppSettings) -> dict[str, DocumentMetadata]:
+        scans.append(1)
+        return scan(settings)
+
+    monkeypatch.setattr(repository, "_scan_filename_metadata", counting_scan)
+    return scans
+
+
+def test_stored_tags_come_from_one_facet_call_not_a_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tag-scoped question used to scroll the whole collection whenever the listing
+    cache was cold; the tags keyword index answers it in one call."""
+
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(
+        settings,
+        [
+            _tagged_point("a", "a.md", ["Finance", "q3"]),
+            _tagged_point("b", "b.md", ["finance"]),
+        ],
+    )
+    scans = _counting_scans(repository, monkeypatch)
+
+    assert repository.stored_tags(settings) == {"Finance", "finance", "q3"}
+    assert scans == []
+    clear_metadata_cache()
+
+
+def test_stored_tags_fall_back_to_the_scan_when_the_facet_may_be_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A facet that returns as many values as it was asked for may have cut some off,
+    and a missing stored spelling would silently search the wrong documents."""
+
+    from api import repository as repository_module
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    monkeypatch.setattr(repository_module, "TAG_FACET_LIMIT", 2)
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(
+        settings,
+        [
+            _tagged_point("a", "a.md", ["alpha", "beta"]),
+            _tagged_point("b", "b.md", ["gamma"]),
+        ],
+    )
+    scans = _counting_scans(repository, monkeypatch)
+
+    assert repository.stored_tags(settings) == {"alpha", "beta", "gamma"}
+    assert scans == [1]
+    clear_metadata_cache()
+
+
+def test_stored_tags_fall_back_to_the_scan_when_the_server_cannot_facet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(settings, [_tagged_point("a", "a.md", ["alpha"])])
+
+    def no_facet(*args: Any, **kwargs: Any) -> object:
+        raise ValueError("facet is not supported")
+
+    monkeypatch.setattr(client, "facet", no_facet)
+    assert repository.stored_tags(settings) == {"alpha"}
+    clear_metadata_cache()
+
+
+def test_stored_tags_use_a_warm_listing_without_calling_qdrant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    repository.upsert(settings, [_tagged_point("a", "a.md", ["alpha"])])
+    repository.filename_metadata(settings)
+
+    def no_facet(*args: Any, **kwargs: Any) -> object:
+        raise AssertionError("the warm listing already has every tag")
+
+    monkeypatch.setattr(client, "facet", no_facet)
+    assert repository.stored_tags(settings) == {"alpha"}
+    clear_metadata_cache()
+
+
+def test_search_hits_carry_only_the_fields_a_candidate_is_built_from() -> None:
+    """Search reads six payload fields; tags, sizes, stamps and fingerprints stay on
+    the server. Every field the candidate needs must still be there."""
+
+    from api.embeddings import EmbeddedText
+    from api.retrieval import points_to_chunks
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    point = _tagged_point("a", "a.md", ["alpha"])
+    assert point.payload is not None
+    point.payload.update({"chunk_ordinal": 3, "byte_size": 10, "uploaded_at": 1.0})
+    repository.upsert(settings, [point])
+    query = EmbeddedText(dense=[0.1, 0.2, 0.3], sparse=models.SparseVector(indices=[1], values=[1]))
+
+    for points in (
+        repository.hybrid_search(settings, query),
+        repository.search_leg(settings, query, "dense"),
+        repository.search_leg(settings, query, "sparse"),
+        repository._manual_hybrid_query(settings, query, None),
+    ):
+        assert set(points[0].payload or {}) == {
+            "filename",
+            "page",
+            "section",
+            "chunk_id",
+            "text",
+            "chunk_ordinal",
+        }
+        chunk = points_to_chunks(points)[0]
+        assert (chunk.filename, chunk.page, chunk.section, chunk.chunk_id) == (
+            "a.md",
+            1,
+            "Intro",
+            "a",
+        )
+        assert chunk.text == "hello" and chunk.chunk_ordinal == 3

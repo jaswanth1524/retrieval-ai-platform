@@ -201,3 +201,28 @@ def test_the_first_call_per_model_is_not_run_twice_at_once() -> None:
             future.result()
 
     assert dense.peak == 1
+
+
+def test_embed_query_reuses_a_recent_query_embedding() -> None:
+    """Regenerate and Retry re-ask the same text: the second embed is served from
+    the cache, a different text is embedded fresh, and the cache is bounded."""
+
+    from api import embeddings as embeddings_module
+
+    settings = make_test_settings(dense_query_instruction="PREFIX: ")
+    dense = RecordingDenseModel()
+    sparse = RecordingSparseModel()
+    provider = LocalEmbeddingProvider(settings, dense_model=dense, sparse_model=sparse)
+
+    first = provider.embed_query("what is docrag")
+    second = provider.embed_query("what is docrag")
+    provider.embed_query("something else")
+
+    assert second is first
+    assert dense.seen == ["PREFIX: what is docrag", "PREFIX: something else"]
+    assert sparse.query_seen == ["what is docrag", "something else"]
+
+    for index in range(embeddings_module.QUERY_EMBEDDING_CACHE_SIZE):
+        provider.embed_query(f"filler {index}")
+    provider.embed_query("what is docrag")
+    assert dense.seen[-1] == "PREFIX: what is docrag"  # evicted, so embedded again

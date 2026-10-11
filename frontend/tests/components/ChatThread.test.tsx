@@ -311,4 +311,35 @@ describe('ChatThread progress announcement', () => {
 
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
   });
+
+  it('says the documents are loading rather than asking for an upload before the listing', () => {
+    render(<ChatThread turns={[]} pending={false} engineerMode={false} documentsLoading />);
+    expect(screen.getByText('Loading your documents…')).toBeInTheDocument();
+  });
+
+  it('scrolls a conversation search hit into view once its turn has rendered', () => {
+    const scrolled: string[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function scrollIntoView(this: Element) {
+      scrolled.push((this as HTMLElement).dataset.turnId ?? '');
+    };
+    try {
+      const turns = [
+        makeTurn({ id: 'q1', content: 'First' }),
+        makeTurn({ id: 'q2', content: 'Second' }),
+      ];
+      const focus = { turnId: 'q3' };
+      const { rerender } = render(
+        <ChatThread turns={turns} pending={false} engineerMode={false} focusTurn={focus} />,
+      );
+      expect(scrolled).toEqual([]); // not rendered yet: switching is a transition
+
+      const more = [...turns, makeTurn({ id: 'q3', content: 'Third' })];
+      rerender(<ChatThread turns={more} pending={false} engineerMode={false} focusTurn={focus} />);
+      rerender(<ChatThread turns={[...more]} pending={false} engineerMode={false} focusTurn={focus} />);
+      expect(scrolled).toEqual(['q3']); // once per hit
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { ApiClientError, api } from '../api/client';
 import type { SearchResultResponse } from '../api/types';
@@ -141,4 +141,5 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
   );
 }
 
-export default SearchPanel;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(SearchPanel);

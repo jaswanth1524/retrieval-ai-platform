@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, validateUploads } from '../../src/utils/uploadValidation';
+import {
+  ACCEPTED_EXTENSIONS,
+  acceptedExtensions,
+  extensionsLabel,
+  formatBytes,
+  validateUploads,
+} from '../../src/utils/uploadValidation';
 
 describe('validateUploads', () => {
   it('accepts supported types under the size limit and explains every rejection', () => {
@@ -23,5 +29,25 @@ describe('formatBytes', () => {
     expect(formatBytes(12 * 1024)).toBe('12 KB');
     expect(formatBytes(50 * 1024 * 1024)).toBe('50.0 MB');
     expect(formatBytes(3 * 1024 ** 3)).toBe('3.0 GB');
+  });
+});
+
+describe('server-supplied upload types', () => {
+  it('accepts what the server lists, falling back to the built-in list', () => {
+    expect(acceptedExtensions(['.pdf', '.epub'])).toEqual(['.pdf', '.epub']);
+    expect(acceptedExtensions([])).toEqual(ACCEPTED_EXTENSIONS);
+    expect(acceptedExtensions(undefined)).toContain('.eml');
+
+    const epub = new File(['x'], 'novel.EPUB');
+    const docx = new File(['x'], 'memo.docx');
+    const { accepted, rejected } = validateUploads([epub, docx], 1024, ['.pdf', '.epub']);
+    expect(accepted).toEqual([epub]);
+    expect(rejected[0].message).toContain("memo.docx isn't a supported type (.pdf .epub)");
+  });
+
+  it('labels the dropzone without the alternate spellings', () => {
+    expect(extensionsLabel(['.pdf', '.md', '.markdown', '.html', '.htm', '.eml'])).toBe(
+      'pdf md html eml',
+    );
   });
 });

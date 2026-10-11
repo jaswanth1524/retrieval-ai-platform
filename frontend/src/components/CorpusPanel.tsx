@@ -3,8 +3,9 @@ import type { DragEvent, RefObject } from 'react';
 import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import {
-  ACCEPTED_EXTENSIONS,
+  acceptedExtensions,
   DEFAULT_MAX_UPLOAD_BYTES,
+  extensionsLabel,
   formatBytes,
   validateUploads,
 } from '../utils/uploadValidation';
@@ -65,6 +66,8 @@ interface CorpusPanelProps {
   onUpload: (files: File[]) => Promise<void>;
   onDelete: (filename: string) => Promise<void>;
   maxUploadBytes?: number;
+  /** Upload suffixes the server accepts; the built-in list when absent. */
+  supportedExtensions?: readonly string[];
   disabled?: boolean;
   // Lets the context panel's header "Upload" action open this same file dialog.
   browseInputRef?: RefObject<HTMLInputElement | null>;
@@ -227,6 +230,7 @@ function CorpusPanel({
   onUpload,
   onDelete,
   maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES,
+  supportedExtensions,
   disabled,
   browseInputRef,
   onRetryUpload,
@@ -251,7 +255,11 @@ function CorpusPanel({
 
   const handleFilesChange = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
-    const { accepted, rejected } = validateUploads(Array.from(fileList), maxUploadBytes);
+    const { accepted, rejected } = validateUploads(
+      Array.from(fileList),
+      maxUploadBytes,
+      acceptedExtensions(supportedExtensions),
+    );
     setRejectedFiles(rejected);
     setStagedFiles((prev) => [...prev, ...accepted]);
   };
@@ -386,12 +394,12 @@ function CorpusPanel({
         onDrop={handleDrop}
         data-testid="upload-dropzone"
       >
-        Drop files &middot; pdf docx md txt html csv
+        Drop files &middot; {extensionsLabel(acceptedExtensions(supportedExtensions))}
         <input
           ref={inputRef}
           type="file"
           className="corpus-panel__input"
-          accept={ACCEPTED_EXTENSIONS.join(',')}
+          accept={acceptedExtensions(supportedExtensions).join(',')}
           multiple
           onChange={(event) => {
             handleFilesChange(event.target.files);

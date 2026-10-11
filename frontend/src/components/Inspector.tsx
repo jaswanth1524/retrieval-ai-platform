@@ -1,4 +1,4 @@
-import { useEffect, useId } from 'react';
+import { memo, useEffect, useId } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { CitationResponse } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
@@ -169,4 +169,5 @@ function Inspector({
   );
 }
 
-export default Inspector;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(Inspector);

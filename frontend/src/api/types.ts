@@ -38,6 +38,8 @@ export interface PublicConfigResponse {
   openai_compatible_model?: string;
   /** Providers a question may pick per request (ALLOWED_REQUEST_PROVIDERS). */
   allowed_request_providers?: string[];
+  // Upload suffixes the server accepts (".pdf", ".epub", ...); absent on older servers.
+  supported_extensions?: string[];
 }
 
 /** What the caller's API key unlocks (GET /access). */
@@ -221,7 +223,14 @@ export interface TimingsResponse {
   // The zero-citation retry's LLM round trip, after generation; 0 when it didn't fire.
   // generate_ms excludes it.
   citation_retry_ms?: number;
+  // Part of rerank_ms spent queued behind another question's rerank.
+  rerank_wait_ms?: number;
+  // Request start to the first streamed token; 0 on /questions and cached answers.
+  first_token_ms?: number;
 }
+
+/** How well an answer is grounded. Extensible: treat an unknown value as 'answered'. */
+export type AnswerStatus = 'answered' | 'insufficient_context' | 'no_context' | (string & {});
 
 export interface HistoryMessage {
   role: 'user' | 'assistant';

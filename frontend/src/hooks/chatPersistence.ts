@@ -30,6 +30,8 @@ export interface Conversation {
   // deliberately ignores so the list order doesn't jump. Merging two tabs' copies
   // compares this, or a rename in one tab was overwritten by the other's next save.
   editedAt?: number;
+  // Kept past MAX_CONVERSATIONS and listed first. A pin is an edit (editedAt).
+  pinned?: boolean;
 }
 
 /** A conversation deleted in some tab, so another tab's copy doesn't bring it back. */
@@ -46,6 +48,13 @@ export interface ConversationSummary {
   title: string;
   updatedAt: number;
   turnCount: number;
+  pinned?: boolean;
+}
+
+/** Where a search matched inside a conversation's turns. */
+export interface ConversationMatch {
+  turnId: string;
+  snippet: string;
 }
 
 export const CHAT_STORAGE_KEY = 'docrag-chat-history';
@@ -57,6 +66,9 @@ export const CHAT_STORAGE_MAX_TURNS = 100;
 // The tail kept when even that doesn't fit the localStorage quota.
 export const CHAT_STORAGE_FALLBACK_TURNS = 20;
 export const MAX_CONVERSATIONS = 20;
+// Pinned conversations are never the ones dropped past MAX_CONVERSATIONS; at most this
+// many, so there is always room left for the conversations in use.
+export const MAX_PINNED_CONVERSATIONS = 10;
 export const TITLE_MAX_CHARS = 60;
 // Each source carries its full chunk text (~2 KB), up to 8 per answer, and it was the
 // bulk of what filled the ~5 MB quota. Only the most recent turns keep it on disk; older
@@ -135,7 +147,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (typeof turn.question === 'string') sanitized.question = turn.question;
   if (turn.feedback === 'up' || turn.feedback === 'down') sanitized.feedback = turn.feedback;
   if (typeof turn.model === 'string') sanitized.model = turn.model;
-  for (const flag of ['stopped', 'incomplete', 'cached'] as const) {
+  for (const flag of ['stopped', 'incomplete', 'cached', 'notFound'] as const) {
     if (turn[flag] === true) sanitized[flag] = true;
   }
   return sanitized;
@@ -155,6 +167,59 @@ export function emptyConversation(): Conversation {
 
 export function byRecentUse(a: Conversation, b: Conversation): number {
   return b.updatedAt - a.updatedAt;
+}
+
+/** ``conversations`` cut to MAX_CONVERSATIONS, most recently used first. The ones
+ *  dropped are the least recently used unpinned ones; ``keepId`` (a conversation being
+ *  created, or streamed into) is never dropped. */
+export function capConversations(
+  conversations: readonly Conversation[],
+  keepId: string | null = null,
+): Conversation[] {
+  const sorted = [...conversations].sort(byRecentUse);
+  if (sorted.length <= MAX_CONVERSATIONS) return sorted;
+  const protectedIds = new Set(
+    sorted
+      .filter((conversation) => conversation.pinned)
+      .slice(0, MAX_PINNED_CONVERSATIONS)
+      .map((conversation) => conversation.id),
+  );
+  if (keepId !== null) protectedIds.add(keepId);
+  let room = MAX_CONVERSATIONS - protectedIds.size;
+  return sorted.filter((conversation) => {
+    if (protectedIds.has(conversation.id)) return true;
+    room -= 1;
+    return room >= 0;
+  });
+}
+
+const SNIPPET_CONTEXT_CHARS = 40;
+
+/** The first turn of each conversation whose text contains ``query`` (any case), with
+ *  a snippet around the match. Titles are matched by the list itself. */
+export function searchConversations(
+  conversations: readonly Conversation[],
+  query: string,
+): Map<string, ConversationMatch> {
+  const needle = query.trim().toLowerCase();
+  const matches = new Map<string, ConversationMatch>();
+  if (!needle) return matches;
+  for (const conversation of conversations) {
+    for (const turn of conversation.turns) {
+      if (turn.role === 'error') continue;
+      const text = turn.content.replace(/\s+/g, ' ');
+      const at = text.toLowerCase().indexOf(needle);
+      if (at < 0) continue;
+      const start = Math.max(0, at - SNIPPET_CONTEXT_CHARS);
+      const end = Math.min(text.length, at + needle.length + SNIPPET_CONTEXT_CHARS);
+      matches.set(conversation.id, {
+        turnId: turn.id,
+        snippet: `${start > 0 ? '…' : ''}${text.slice(start, end).trim()}${end < text.length ? '…' : ''}`,
+      });
+      break;
+    }
+  }
+  return matches;
 }
 
 /** A conversation as written to disk: the last `maxTurns` turns, with source text kept
@@ -322,6 +387,7 @@ export function mergeConversations(
         const scope = conversation.scope ?? mine.scope;
         if (
           conversation.title === mine.title &&
+          Boolean(conversation.pinned) === Boolean(mine.pinned) &&
           JSON.stringify(scope) === JSON.stringify(mine.scope)
         ) {
           continue;
@@ -330,6 +396,7 @@ export function mergeConversations(
           ...mine,
           title: conversation.title,
           scope,
+          pinned: conversation.pinned,
           editedAt: Math.max(lastEdit(mine), conversation.editedAt ?? 0),
         });
         changed = true;
@@ -347,13 +414,8 @@ export function mergeConversations(
     deleted.some(({ id, at }) => !local.deleted?.some((d) => d.id === id && d.at === at));
   if (!changed && !tombstonesChanged) return local;
   if (!changed) return { ...local, deleted };
-  const sorted = [...byId.values()].sort(byRecentUse);
-  const conversations = sorted.slice(0, MAX_CONVERSATIONS);
   // Past the cap the streaming conversation stays, in place of the least recently used.
-  const streaming = sorted.find((c) => c.id === streamingId);
-  if (streaming && !conversations.includes(streaming)) {
-    conversations[conversations.length - 1] = streaming;
-  }
+  const conversations = capConversations([...byId.values()], streamingId);
   if (conversations.length === 0) return { ...emptyStorage(), deleted };
   const activeConversationId = conversations.some((c) => c.id === local.activeConversationId)
     ? local.activeConversationId
@@ -437,6 +499,7 @@ export function sanitizeConversation(value: unknown): Conversation | null {
     scope: sanitizeScope(raw.scope),
   };
   if (validTime(raw.editedAt, NaN) === raw.editedAt) conversation.editedAt = raw.editedAt;
+  if (raw.pinned === true) conversation.pinned = true;
   return conversation;
 }
 

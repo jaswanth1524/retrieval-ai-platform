@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { TraceSummaryResponse } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import './TracesPanel.css';
@@ -66,4 +67,5 @@ function TracesPanel({ traces, error, onSelect }: TracesPanelProps) {
   );
 }
 
-export default TracesPanel;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(TracesPanel);

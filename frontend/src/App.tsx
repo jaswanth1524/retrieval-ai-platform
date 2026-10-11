@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, startTransition, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from './api/client';
 import type {
   AccessLevel,
@@ -17,7 +17,7 @@ import type { FeedbackPayload } from './components/ChatMessage';
 import Composer from './components/Composer';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
-import CorpusPanel from './components/CorpusPanel';
+import CorpusPanel, { type DocumentMeta } from './components/CorpusPanel';
 import IconRail from './components/IconRail';
 import LazyChunkBoundary from './components/LazyChunkBoundary';
 import { loadMarkdown } from './components/markdownLoader';
@@ -28,7 +28,10 @@ import ToastRow from './components/ToastRow';
 import SearchPanel from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import FeedbackPanel from './components/FeedbackPanel';
+import { MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
 import { useChat } from './hooks/useChat';
+import { useStableHandler } from './hooks/useStableHandler';
+import { prefetchCitationContent } from './utils/contentPrefetch';
 import { useCommands } from './hooks/useCommands';
 import { useCorpus } from './hooks/useCorpus';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
@@ -38,7 +41,11 @@ import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNo
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
 import { EMPTY_OVERRIDES } from './utils/overrides';
 import { readStored, readStoredJson, writeStored } from './utils/safeStorage';
-import { DEFAULT_MAX_UPLOAD_BYTES, validateUploads } from './utils/uploadValidation';
+import {
+  acceptedExtensions,
+  DEFAULT_MAX_UPLOAD_BYTES,
+  validateUploads,
+} from './utils/uploadValidation';
 import { sliceWhole } from './utils/text';
 
 // Dialogs and the inspector render only on demand, so they load on demand too: the
@@ -104,6 +111,28 @@ function loadPersistedMode(): ChatMode {
   return readStored(MODE_STORAGE_KEY) === 'engineer' ? 'engineer' : 'reader';
 }
 
+// The browser's own PDF viewer shows an original in the document viewer; past this a
+// download serves better than holding the whole file in memory as a blob.
+const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
+
+function canPreviewOriginal(
+  filename: string,
+  originalsStored: boolean,
+  meta: DocumentMeta | undefined,
+): boolean {
+  return (
+    originalsStored &&
+    filename.toLowerCase().endsWith('.pdf') &&
+    Boolean(meta?.reindexable) &&
+    (meta?.bytes ?? 0) <= MAX_PREVIEW_BYTES
+  );
+}
+
+// Shared empty values: a fresh [] per render would re-render the memoized child.
+const NO_HIDDEN_PANELS: RailPanel[] = [];
+const HIDDEN_FEEDBACK_PANEL: RailPanel[] = ['feedback'];
+const NO_SOURCES: CitationResponse[] = [];
+
 const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
   chat: { title: 'Conversations', actionLabel: 'New' },
   corpus: { title: 'Corpus', actionLabel: 'Upload' },
@@ -129,6 +158,9 @@ function scopeLabel(
 
 function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking');
+  // The first corpus listing has come back (or failed): until then "no documents"
+  // only means "not loaded yet", and must not tell anyone to upload one.
+  const [corpusChecked, setCorpusChecked] = useState(false);
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
@@ -190,6 +222,8 @@ function App() {
     switchConversation: selectConversation,
     renameConversation,
     deleteConversation: removeConversation,
+    setPinned,
+    searchConversations,
     persistError,
     persistPartial,
     setTurnFeedback,
@@ -226,9 +260,14 @@ function App() {
   // The search scope belongs to the active conversation (see useChat).
   const selectedFilenames = scope.filenames;
   const selectedTags = scope.tags;
-  const setSelectedFilenames = (filenames: string[]) =>
-    setScope((prev) => ({ ...prev, filenames }));
-  const setSelectedTags = (tags: string[]) => setScope((prev) => ({ ...prev, tags }));
+  const setSelectedFilenames = useCallback(
+    (filenames: string[]) => setScope((prev) => ({ ...prev, filenames })),
+    [setScope],
+  );
+  const setSelectedTags = useCallback(
+    (tags: string[]) => setScope((prev) => ({ ...prev, tags })),
+    [setScope],
+  );
 
   // A pinned trace belongs to one conversation's turns, so anything that replaces the
   // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
@@ -248,7 +287,9 @@ function App() {
   const switchConversation = useCallback(
     (id: string) => {
       setPinnedTraceId(null);
-      selectConversation(id);
+      // A transition: a long conversation mounts up to 100 rendered answers, and the
+      // list's highlight and the drawer closing shouldn't wait for all of them.
+      startTransition(() => selectConversation(id));
     },
     [selectConversation],
   );
@@ -259,12 +300,27 @@ function App() {
     },
     [removeConversation],
   );
+  // A conversation search hit names the turn it matched: the thread scrolls to it.
+  const [focusTurn, setFocusTurn] = useState<{ turnId: string } | null>(null);
   const switchConversationFromList = useCallback(
-    (id: string) => {
+    (id: string, turnId?: string) => {
       switchConversation(id);
+      setFocusTurn(turnId ? { turnId } : null);
       setPanelDrawerOpen(false);
     },
     [switchConversation],
+  );
+  const pinConversation = useCallback(
+    (id: string, pinned: boolean) => {
+      if (!setPinned(id, pinned)) {
+        pushToast({
+          tone: 'warn',
+          title: 'Too many pinned conversations',
+          body: `Unpin one first — at most ${MAX_PINNED_CONVERSATIONS} stay pinned.`,
+        });
+      }
+    },
+    [setPinned, pushToast],
   );
 
   const updateAdvancedOptions = (next: QuestionOverrides) => {
@@ -277,12 +333,12 @@ function App() {
     writeStored(MODE_STORAGE_KEY, next);
   }, []);
 
-  const toggleTheme = () => {
+  const toggleTheme = useStableHandler(() => {
     const next = theme === 'dark' ? 'light' : 'dark';
     setTheme(next);
     document.documentElement.dataset.theme = next;
     writeStored('docrag-theme', next);
-  };
+  });
 
   /** Note a 401 so it isn't mistaken for an empty corpus.
    *
@@ -292,7 +348,7 @@ function App() {
    * document to start.", advice that would itself have 401'd. Returns true when it
    * handled the error, so callers keep their own fallback for everything else.
    */
-  const noteAuthFailure = (err: unknown): boolean => {
+  const noteAuthFailure = useStableHandler((err: unknown): boolean => {
     if (err instanceof ApiClientError && err.statusCode === 401) {
       setApiStatus('unauthorized');
       return true;
@@ -301,7 +357,7 @@ function App() {
     // The error itself is still shown by the caller.
     if (err instanceof ApiClientError && err.statusCode === 403) setAccess('read');
     return false;
-  };
+  });
 
   /** Ask the server which key this browser holds. An older server without /access
    *  (404) is treated as full access; a 403 on any write corrects that later. */
@@ -318,9 +374,21 @@ function App() {
     const controller = new AbortController();
     let cancelled = false;
 
-    async function checkHealth() {
+    // /config, /access and the corpus listing go out together: each round trip used to
+    // wait for the one before it (a /health probe first), and the composer said "Upload
+    // a document" until the listing, the last of them, came back.
+    async function boot() {
+      const listing = refreshDocuments(controller.signal)
+        .catch((err) => {
+          // Anything other than a 401 is non-fatal — the corpus panel just stays empty
+          // until the next refresh.
+          if (!cancelled) noteAuthFailure(err);
+        })
+        .finally(() => {
+          if (!cancelled) setCorpusChecked(true);
+        });
+      void refreshAccess(controller.signal);
       try {
-        await api.health(controller.signal);
         const configResult = await api.config(controller.signal);
         if (cancelled) return;
         setConfig(configResult);
@@ -355,23 +423,16 @@ function App() {
         ) {
           setSelectedProvider('openai');
         }
-        setApiStatus('ok');
-        void refreshAccess(controller.signal);
-        try {
-          await refreshDocuments(controller.signal);
-        } catch (err) {
-          if (cancelled) return;
-          // Anything other than a 401 is non-fatal — the corpus panel just stays empty
-          // until the next refresh.
-          noteAuthFailure(err);
-        }
+        // The listing or /access may have answered 401 first; that stands.
+        setApiStatus((prev) => (prev === 'unauthorized' ? prev : 'ok'));
       } catch {
         if (cancelled) return;
         setApiStatus('error');
       }
+      await listing;
     }
 
-    void checkHealth();
+    void boot();
     return () => {
       cancelled = true;
       // Aborting releases the in-flight request instead of just ignoring its result.
@@ -463,7 +524,7 @@ function App() {
   // A trace row is a debugging artifact, so opening one implies Engineer mode — the
   // Trace tab does not exist in Reader and the click would otherwise appear to do
   // nothing. Pins the inspector to that trace rather than the newest turn.
-  const handleSelectTrace = (traceId: string) => {
+  const handleSelectTrace = useStableHandler((traceId: string) => {
     setPinnedTraceId(traceId);
     setMode('engineer');
     setInspectorTab('trace');
@@ -474,7 +535,7 @@ function App() {
     // On a narrow screen the inspector opens as a drawer; the panel drawer the trace was
     // picked from would otherwise sit on top of it.
     setPanelDrawerOpen(false);
-  };
+  });
 
   // Widening past the breakpoint turns the drawer back into a column; forget that it was
   // open so narrowing again later doesn't pop it up unasked.
@@ -484,10 +545,10 @@ function App() {
 
   // Rail click: on narrow screens it also opens the drawer, and clicking the panel that
   // is already showing closes it again (the rail is the drawer's toggle).
-  const handleRailSelect = (panel: RailPanel) => {
+  const handleRailSelect = useStableHandler((panel: RailPanel) => {
     if (panelCollapsed) setPanelDrawerOpen((open) => !(open && panel === rail));
     setRail(panel);
-  };
+  });
 
   // Width-driven open/close, deferring to the user once they have taken a position.
   useEffect(() => {
@@ -504,6 +565,7 @@ function App() {
     const { accepted, rejected } = validateUploads(
       files,
       config?.max_upload_bytes ?? DEFAULT_MAX_UPLOAD_BYTES,
+      acceptedExtensions(config?.supported_extensions),
     );
     if (rejected.length > 0) {
       pushToast({
@@ -517,7 +579,8 @@ function App() {
       void handleUpload(accepted);
     }
   });
-  const noDocs = indexedFilenames.length === 0;
+  const noDocs = corpusChecked && indexedFilenames.length === 0;
+  const booting = apiStatus === 'checking' || !corpusChecked;
   // Auth takes precedence over noDocs: when the corpus list 401s, "no documents" is a
   // symptom, and telling the user to upload one would send them at a call that 401s too.
   const composerHint =
@@ -525,7 +588,9 @@ function App() {
       ? 'This server requires an API key — add one in Settings.'
       : noDocs
         ? 'Upload a document to start.'
-        : undefined;
+        : booting
+          ? 'Connecting…'
+          : undefined;
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
   const lastQuestion = [...turns].reverse().find((turn) => turn.role === 'user')?.content;
   const lastTurn = turns[turns.length - 1];
@@ -618,6 +683,13 @@ function App() {
     [],
   );
   const handleCitationLeave = useCallback(() => setHoveredCitation(null), []);
+  // A pointer or focus on a citation usually precedes a click on it: the viewer's code
+  // and its first page start loading now, so the click opens it without waiting.
+  const handleCitationHover = useCallback((citation: CitationResponse) => {
+    setHoveredCitation(citation);
+    void import('./components/DocumentViewer');
+    prefetchCitationContent(citation.filename, citation.chunk_id);
+  }, []);
 
   // Shown at once (ChatMessage's feedbackGiven); taken back if it couldn't be sent, so
   // the buttons don't claim a rating the server never recorded and it can be retried.
@@ -696,6 +768,13 @@ function App() {
   }, []);
 
   const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const openSettings = useCallback(() => setSettingsOpen(true), []);
+  const closeInspector = useCallback(() => setInspectorOpen(false), []);
+  const closePanelDrawer = useCallback(() => setPanelDrawerOpen(false), []);
+  const changeProvider = useCallback((provider: LlmProvider) => {
+    setSelectedProvider(provider);
+    writeStored(PROVIDER_STORAGE_KEY, provider);
+  }, []);
   const inspectorOpenRef = useRef(inspectorOpen);
   inspectorOpenRef.current = inspectorOpen;
   const toggleInspector = useCallback(() => {
@@ -761,6 +840,7 @@ function App() {
       toggleInspector,
       setMode,
       toggleTheme,
+      pinConversation,
       exportMarkdown,
       exportJson,
       searchPassages: () => {
@@ -867,7 +947,7 @@ function App() {
     }
   };
 
-  const handlePanelAction = () => {
+  const handlePanelAction = useStableHandler(() => {
     if (rail === 'chat') {
       newConversation();
       setPanelDrawerOpen(false);
@@ -878,7 +958,7 @@ function App() {
     else if (rail === 'search') setSearchResetKey((key) => key + 1);
     else if (rail === 'feedback') loadFeedback();
     else loadTraces();
-  };
+  });
 
   return (
     <div className="app-shell">
@@ -916,8 +996,8 @@ function App() {
         onSelect={handleRailSelect}
         theme={theme}
         onToggleTheme={toggleTheme}
-        onOpenSettings={() => setSettingsOpen(true)}
-        hidden={feedbackPanelAvailable ? [] : ['feedback']}
+        onOpenSettings={openSettings}
+        hidden={feedbackPanelAvailable ? NO_HIDDEN_PANELS : HIDDEN_FEEDBACK_PANEL}
       />
       <ContextPanel
         title={PANEL_META[rail].title}
@@ -927,7 +1007,7 @@ function App() {
         chunkTotal={chunkTotal}
         drawer={panelCollapsed}
         drawerOpen={panelDrawerOpen}
-        onCloseDrawer={() => setPanelDrawerOpen(false)}
+        onCloseDrawer={closePanelDrawer}
       >
         {rail === 'chat' && (
           <ConversationList
@@ -936,6 +1016,8 @@ function App() {
             onSwitch={switchConversationFromList}
             onRename={renameConversation}
             onDelete={deleteConversation}
+            onPin={pinConversation}
+            onSearch={searchConversations}
             disabled={pending}
           />
         )}
@@ -947,6 +1029,7 @@ function App() {
             onUpload={handleUpload}
             onDelete={handleDeleteDocument}
             maxUploadBytes={config?.max_upload_bytes}
+            supportedExtensions={config?.supported_extensions}
             disabled={pending}
             browseInputRef={corpusBrowseInputRef}
             onRetryUpload={handleRetryUpload}
@@ -1014,9 +1097,11 @@ function App() {
               feedbackEnabled={config?.feedback_enabled}
               onFeedback={handleFeedback}
               onOpenSource={handleOpenSource}
-              onCitationHover={setHoveredCitation}
+              onCitationHover={handleCitationHover}
               onCitationLeave={handleCitationLeave}
               documentCount={indexedFilenames.length}
+              documentsLoading={!corpusChecked}
+              focusTurn={focusTurn}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
             <ToastRow
@@ -1027,7 +1112,9 @@ function App() {
             />
             <Composer
               onSubmit={askQuestion}
-              disabled={!apiReachable || noDocs}
+              // Typing is fine while the app boots; only sending waits for it.
+              disabled={apiStatus === 'unauthorized' || noDocs}
+              sendHeld={booting}
               hint={composerHint}
               pending={pending}
               onCancel={cancel}
@@ -1040,10 +1127,7 @@ function App() {
               onSelectedTagsChange={setSelectedTags}
               config={config}
               provider={selectedProvider}
-              onProviderChange={(provider) => {
-                setSelectedProvider(provider);
-                writeStored(PROVIDER_STORAGE_KEY, provider);
-              }}
+              onProviderChange={changeProvider}
               providerLabel={currentModelLabel ?? selectedProvider}
             />
           </>
@@ -1063,8 +1147,8 @@ function App() {
               engineerMode={mode === 'engineer'}
               tab={inspectorTab}
               onTabChange={setInspectorTab}
-              onClose={() => setInspectorOpen(false)}
-              sources={inspectedTurn?.sources ?? []}
+              onClose={closeInspector}
+              sources={inspectedTurn?.sources ?? NO_SOURCES}
               traceId={inspectedTraceId ?? null}
               traceReady={inspectedTraceReady}
               onOpenSource={handleOpenSource}
@@ -1109,6 +1193,11 @@ function App() {
                   ? () => downloadOriginal(sourceView.filename)
                   : undefined
               }
+              canPreviewOriginal={canPreviewOriginal(
+                sourceView.filename,
+                Boolean(config?.raw_documents_enabled),
+                documents[sourceView.filename],
+              )}
             />
           )}
         </Suspense>

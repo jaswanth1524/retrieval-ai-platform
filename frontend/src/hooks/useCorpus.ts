@@ -3,12 +3,14 @@ import { ApiClientError, api } from '../api/client';
 import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
 import type { DocumentMeta, UploadItem } from '../components/CorpusPanel';
 import { newId } from '../utils/id';
-import { mapWithLimit } from '../utils/pool';
+import { createLimiter } from '../utils/pool';
 import type { ToastInput } from './useToasts';
 
 // With the server's 15 s Retry-After, about 10 minutes of waiting for a full queue.
 const UPLOAD_QUEUE_MAX_ATTEMPTS = 40;
-// Uploads sent at once from one batch.
+// Upload bodies sent at once. Only the sending is limited: once the server has accepted
+// a file, its job is followed on its own, so the next file goes up while earlier ones
+// are still being indexed (the server's queue, 503 + Retry-After, does the admitting).
 const UPLOAD_CONCURRENCY = 2;
 
 /** Thrown inside an upload's own flow when Cancel stops it before the server took it. */
@@ -70,6 +72,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     // The request still sending the file: Cancel aborts it instead of waiting for the
     // whole body to go up first.
     const sending = new Map<string, AbortController>();
+    // Shared by every batch: two drops in a row still send at most two files at once.
+    const sendSlots = createLimiter(UPLOAD_CONCURRENCY);
 
     const removeUpload = (id: string) => {
       setUploads((prev) => prev.filter((item) => item.id !== id));
@@ -243,7 +247,9 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     };
 
     const uploadOne = (file: File, id: string) =>
-      runIngestJob(id, file.name, (signal) => api.uploadDocument(file, signal));
+      runIngestJob(id, file.name, (signal) =>
+        sendSlots.run(() => api.uploadDocument(file, signal), signal),
+      );
 
     // Stops an upload or re-index: before the server has it, locally; after, by asking
     // the server, which refuses (409) once the job has started writing to the index.
@@ -337,9 +343,11 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         file,
       }));
       setUploads((prev) => [...prev, ...newItems]);
-      // A few at a time: each upload sends its whole file, and a 20-file drop sent 20
-      // bodies at once — then all 20 waited and re-sent together when the queue was full.
-      await mapWithLimit(files, UPLOAD_CONCURRENCY, (file, index) => uploadOne(file, newItems[index].id));
+      // A few bodies at a time (see UPLOAD_CONCURRENCY): a 20-file drop used to send 20
+      // at once, then all 20 waited and re-sent together when the queue was full. A file
+      // used to hold its slot until it was indexed, so the third one wasn't even sent
+      // until the first had finished.
+      await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
       // Once for the whole batch, not once per file. Chunk counts live server-side and
       // GET /documents scrolls the entire collection to compute them, so refreshing
       // inside uploadOne meant a 20-file drop triggered 20 full-collection scans.

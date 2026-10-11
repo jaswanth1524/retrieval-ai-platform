@@ -187,6 +187,10 @@ class AppSettings(BaseSettings):
     # once, so a single huge document reports incremental job progress and never
     # holds one giant embedding call in memory.
     ingest_batch_size: PositiveInt = 64
+    # Points written per Qdrant upsert, independent of the embedding batch above. Each
+    # upsert is a round trip with wait=True under the filename lock, so writing a
+    # 1,000-chunk document in 64-point calls held the lock through 16 of them.
+    ingest_upsert_batch_size: PositiveInt = 256
     # Upload bytes allowed to sit queued or in progress at once. Every accepted upload
     # holds its full content in memory until its ingest job finishes, and the executor
     # queue itself is unbounded — past this budget uploads get 503 + Retry-After
@@ -237,6 +241,13 @@ class AppSettings(BaseSettings):
     # small-to-big retrieval: rerank on tight chunks, generate on richer context.
     # 0 disables expansion entirely.
     context_neighbor_radius: int = Field(default=1, ge=0)
+    # Caps the neighbour text added on each side of a chunk, in characters: the text
+    # nearest the chunk is kept, cut at a word boundary. 0 = no cap (the default).
+    # Neighbours are most of the prompt, and prefill is most of the wait before the first
+    # token. 300 was measured only at CHUNK_SIZE_TOKENS=96 (about 1s less prefill on
+    # qwen2.5, same answers on 11 questions); at the default chunk size it would drop
+    # most of each neighbour, which hasn't been measured (README "Latency").
+    context_neighbor_max_chars: int = Field(default=0, ge=0)
 
     # Post-rerank diversity/dedup: after scoring, drop a survivor that is a near-
     # duplicate of a higher-ranked kept chunk (same-document neighbor within

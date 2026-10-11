@@ -7,12 +7,19 @@ import type { ContentPage } from '../../src/api/client';
 
 vi.mock('../../src/api/client', async () => {
   const actual = await vi.importActual<typeof import('../../src/api/client')>('../../src/api/client');
-  return { ...actual, api: { ...actual.api, getDocumentContent: vi.fn() } };
+  return {
+    ...actual,
+    api: { ...actual.api, getDocumentContent: vi.fn(), getDocumentOriginal: vi.fn() },
+  };
 });
 
 const getContentMock = vi.mocked(api.getDocumentContent);
+const getOriginalMock = vi.mocked(api.getDocumentOriginal);
 
-afterEach(() => getContentMock.mockReset());
+afterEach(() => {
+  getContentMock.mockReset();
+  getOriginalMock.mockReset();
+});
 
 const CONTENT = {
   filename: 'guide.md',
@@ -283,5 +290,78 @@ describe('DocumentViewer dialog behaviour', () => {
     // Otherwise first === last and the wrap assertion below passes without a trap.
     expect(focusables.length).toBeGreaterThan(1);
     expect(document.activeElement).toBe(focusables[focusables.length - 1]);
+  });
+
+  describe('original PDF preview', () => {
+    const PDF_CONTENT = {
+      filename: 'report.pdf',
+      chunks: [
+        { chunk_id: 'p1', page: 1, section: 'Intro', text: 'Page one.', chunk_ordinal: 1 },
+        { chunk_id: 'p4', page: 4, section: 'Costs', text: 'Page four.', chunk_ordinal: 2 },
+      ],
+    };
+
+    function stubObjectUrls() {
+      const created: Blob[] = [];
+      const revoked: string[] = [];
+      vi.stubGlobal('URL', {
+        ...URL,
+        createObjectURL: (blob: Blob) => {
+          created.push(blob);
+          return `blob:docrag/${created.length}`;
+        },
+        revokeObjectURL: (url: string) => revoked.push(url),
+      });
+      return { created, revoked };
+    }
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('shows the stored PDF at the cited page, as a PDF, only when asked', async () => {
+      const urls = stubObjectUrls();
+      getContentMock.mockResolvedValue(PDF_CONTENT);
+      getOriginalMock.mockResolvedValue(new Blob(['%PDF-1.4'], { type: 'application/octet-stream' }));
+      const { unmount } = render(
+        <DocumentViewer filename="report.pdf" chunkId="p4" onClose={() => {}} canPreviewOriginal />,
+      );
+      await screen.findByText('Page four.');
+      expect(getOriginalMock).not.toHaveBeenCalled();
+
+      await userEvent.click(screen.getByTestId('viewer-mode-original'));
+
+      const frame = await screen.findByTestId('viewer-original-frame');
+      expect(frame).toHaveAttribute('src', 'blob:docrag/1#page=4');
+      expect(urls.created[0].type).toBe('application/pdf');
+      expect(getOriginalMock).toHaveBeenCalledWith('report.pdf');
+
+      // Back and forth keeps the fetched copy.
+      await userEvent.click(screen.getByTestId('viewer-mode-passages'));
+      await userEvent.click(screen.getByTestId('viewer-mode-original'));
+      expect(getOriginalMock).toHaveBeenCalledTimes(1);
+
+      unmount();
+      expect(urls.revoked).toEqual(['blob:docrag/1']);
+    });
+
+    it('explains a document whose original is not stored', async () => {
+      stubObjectUrls();
+      getContentMock.mockResolvedValue(PDF_CONTENT);
+      const { ApiClientError } = await import('../../src/api/client');
+      getOriginalMock.mockRejectedValue(new ApiClientError('Not found', 404));
+      render(<DocumentViewer filename="report.pdf" chunkId="p1" onClose={() => {}} canPreviewOriginal />);
+
+      await userEvent.click(screen.getByTestId('viewer-mode-original'));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'The original file is not stored for this document.',
+      );
+    });
+
+    it('offers no preview unless the caller allows it', async () => {
+      getContentMock.mockResolvedValue(PDF_CONTENT);
+      render(<DocumentViewer filename="report.pdf" chunkId="p1" onClose={() => {}} />);
+      await screen.findByText('Page one.');
+      expect(screen.queryByTestId('viewer-mode-original')).not.toBeInTheDocument();
+    });
   });
 });

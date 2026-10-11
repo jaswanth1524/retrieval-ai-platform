@@ -551,3 +551,94 @@ def test_only_the_first_max_ocr_pages_scanned_pages_are_ocred(
 
     assert ocr_requests == [[2, 3]]
     assert [section.page for section in sections] == [1, 2, 3]
+
+
+def test_parse_epub_reads_chapters_in_spine_order_with_the_chapter_as_page() -> None:
+    from tests.samples import epub_bytes
+
+    content = epub_bytes(
+        [("Arrival", "The ship docked at dawn."), ("Departure", "They left by night.")],
+        spine_order=[1, 0],
+    )
+
+    sections = parse_document_bytes("novel.epub", content)
+
+    assert [(s.page, s.section, s.text) for s in sections] == [
+        (1, "Departure", "Departure They left by night."),
+        (2, "Arrival", "Arrival The ship docked at dawn."),
+    ]
+
+
+def test_parse_epub_skips_empty_chapters_and_fails_when_nothing_is_left() -> None:
+    from tests.samples import epub_bytes
+
+    sections = parse_document_bytes("book.epub", epub_bytes([("", ""), ("Two", "Body text.")]))
+    assert [(s.page, s.text) for s in sections] == [(2, "Two Body text.")]
+
+    with pytest.raises(documents.EmptyDocumentError):
+        parse_document_bytes("blank.epub", epub_bytes([("", "")]))
+
+
+def test_parse_epub_refuses_a_zip_bomb_a_missing_package_and_a_dtd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import zipfile
+
+    import api.parsers.epub as epub_parser
+
+    monkeypatch.setattr(epub_parser, "EPUB_MAX_EXPANDED_BYTES", 1024 * 1024)
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("OEBPS/chapter.xhtml", b"\0" * (2 * 1024 * 1024))
+    with pytest.raises(documents.DocumentParseError, match="over the 1 MiB limit"):
+        parse_document_bytes("bomb.epub", buffer.getvalue())
+
+    with pytest.raises(documents.DocumentParseError, match="Could not parse EPUB"):
+        parse_document_bytes("broken.epub", b"not a zip at all")
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+    with pytest.raises(documents.DocumentParseError, match="container.xml missing"):
+        parse_document_bytes("nocontainer.epub", buffer.getvalue())
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><!DOCTYPE c [<!ENTITY a "aaaa">]><container/>',
+        )
+    with pytest.raises(documents.DocumentParseError, match="Could not parse EPUB"):
+        parse_document_bytes("dtd.epub", buffer.getvalue())
+
+
+def test_parse_eml_indexes_headers_and_the_plain_body_but_not_attachments() -> None:
+    from tests.samples import eml_bytes
+
+    content = eml_bytes(
+        subject="Invoice 42",
+        body="Please pay the invoice by Friday.",
+        html="<p>HTML copy that must not be indexed twice.</p>",
+        attachment=True,
+    )
+
+    sections = parse_document_bytes("invoice.eml", content)
+
+    assert [s.section for s in sections] == ["Invoice 42", "Invoice 42"]
+    assert "From: Ada Lovelace <ada@example.com>" in sections[0].text
+    assert "Date: Mon, 05 Oct 2026 09:30:00 +0000" in sections[0].text
+    assert sections[1].text == "Please pay the invoice by Friday."
+    assert all("HTML copy" not in s.text and "PDF" not in s.text for s in sections)
+
+
+def test_parse_eml_falls_back_to_the_html_body() -> None:
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "Newsletter"
+    message.set_content("<h1>October</h1><p>Release notes inside.</p>", subtype="html")
+
+    sections = parse_document_bytes("news.eml", bytes(message))
+
+    assert sections[-1].section == "October"
+    assert sections[-1].text == "October Release notes inside."

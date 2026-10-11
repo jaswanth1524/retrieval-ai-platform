@@ -3,6 +3,7 @@ import { ApiClientError, api } from '../api/client';
 import type { ContentPage } from '../api/client';
 import type { DocumentChunkResponse, DocumentContentResponse } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
+import { CITATION_WINDOW_RADIUS, takePrefetchedContent } from '../utils/contentPrefetch';
 import './DocumentViewer.css';
 
 interface DocumentViewerProps {
@@ -11,6 +12,15 @@ interface DocumentViewerProps {
   onClose: () => void;
   /** Download the uploaded file itself; absent when the server keeps no originals. */
   onDownloadOriginal?: () => void;
+  /** The stored original is a PDF small enough to show here (see App). */
+  canPreviewOriginal?: boolean;
+}
+
+type ViewerMode = 'passages' | 'original';
+
+interface OriginalPreview {
+  url: string | null;
+  error: string | null;
 }
 
 // Chunks either side of the cited target fetched on open, and fetched per Load
@@ -18,7 +28,7 @@ interface DocumentViewerProps {
 // citation deep in a large document costs one small page, not the whole document.
 // Mirrors CONTENT_UNPAGED_MAX_CHUNKS (api/main.py): the most one unpaged request returns.
 const UNPAGED_MAX_CHUNKS = 2000;
-const WINDOW_RADIUS = 30;
+const WINDOW_RADIUS = CITATION_WINDOW_RADIUS;
 
 interface Loaded {
   chunks: DocumentChunkResponse[];
@@ -30,7 +40,15 @@ function ordinalOf(chunk: DocumentChunkResponse | undefined): number | null {
   return chunk?.chunk_ordinal ?? null;
 }
 
-function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: DocumentViewerProps) {
+function DocumentViewer({
+  filename,
+  chunkId,
+  onClose,
+  onDownloadOriginal,
+  canPreviewOriginal = false,
+}: DocumentViewerProps) {
+  const [mode, setMode] = useState<ViewerMode>('passages');
+  const [original, setOriginal] = useState<OriginalPreview | null>(null);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -45,12 +63,15 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
   loadedRef.current = loaded;
   const controllerRef = useRef<AbortController | null>(null);
 
-  const fetchPage = (options: ContentPage, apply: (content: DocumentContentResponse) => void) => {
+  const fetchPage = (
+    options: ContentPage,
+    apply: (content: DocumentContentResponse) => void,
+    prefetched?: Promise<DocumentContentResponse>,
+  ) => {
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
-    return api
-      .getDocumentContent(filename, controller.signal, options)
+    return (prefetched ?? api.getDocumentContent(filename, controller.signal, options))
       .then((content) => {
         if (!controller.signal.aborted) apply(content);
       })
@@ -71,15 +92,19 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
     const page: ContentPage = chunkId
       ? { around: chunkId, radius: WINDOW_RADIUS }
       : { start: 1, end: 2 * WINDOW_RADIUS + 1 };
-    void fetchPage(page, (content) =>
-      setLoaded({
-        chunks: content.chunks,
-        total: content.total_chunks ?? content.chunks.length,
-        // An older server ignores the paging and sends everything: look for it here.
-        targetFound:
-          content.target_found ??
-          (chunkId ? content.chunks.some((chunk) => chunk.chunk_id === chunkId) : null),
-      }),
+    const prefetched = chunkId ? takePrefetchedContent(filename, chunkId) : undefined;
+    void fetchPage(
+      page,
+      (content) =>
+        setLoaded({
+          chunks: content.chunks,
+          total: content.total_chunks ?? content.chunks.length,
+          // An older server ignores the paging and sends everything: look for it here.
+          targetFound:
+            content.target_found ??
+            (chunkId ? content.chunks.some((chunk) => chunk.chunk_id === chunkId) : null),
+        }),
+      prefetched,
     );
     return () => controllerRef.current?.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -125,6 +150,49 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
     }).finally(() => setLoadingMore(false));
   };
 
+  // The original is fetched the first time it is asked for, once per document: the
+  // browser's PDF viewer shows it from a blob URL, since an <iframe src> to the API
+  // couldn't send the X-API-Key header.
+  useEffect(() => {
+    setMode('passages');
+    setOriginal(null);
+  }, [filename]);
+  useEffect(() => {
+    if (mode !== 'original' || original !== null) return;
+    let live = true;
+    let url: string | null = null;
+    setOriginal({ url: null, error: null });
+    api
+      .getDocumentOriginal(filename)
+      .then((blob) => {
+        if (!live) return;
+        // Typed explicitly: the browser shows a PDF only for application/pdf.
+        url = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
+        setOriginal({ url, error: null });
+      })
+      .catch((err) => {
+        if (!live) return;
+        setOriginal({
+          url: null,
+          error:
+            err instanceof ApiClientError && err.statusCode === 404
+              ? 'The original file is not stored for this document.'
+              : err instanceof ApiClientError
+                ? err.message
+                : 'Could not load the original.',
+        });
+      });
+    return () => {
+      live = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+    // `original` is only checked for null; including it would revoke the URL it sets.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, filename]);
+  // Opens at the cited passage's page.
+  const targetPage =
+    loaded?.chunks.find((chunk) => chunkId !== null && chunk.chunk_id === chunkId)?.page ?? 1;
+
   useEffect(() => {
     if (!targetRef.current || lastScrolledChunkIdRef.current === chunkId) return;
     targetRef.current.scrollIntoView({ block: 'center' });
@@ -143,6 +211,28 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
       <div className="document-viewer__panel">
         <div className="document-viewer__header">
           <span className="document-viewer__filename">{filename}</span>
+          {canPreviewOriginal && (
+            <span className="document-viewer__modes" role="group" aria-label="View">
+              <button
+                type="button"
+                className="document-viewer__mode"
+                aria-pressed={mode === 'passages'}
+                onClick={() => setMode('passages')}
+                data-testid="viewer-mode-passages"
+              >
+                Passages
+              </button>
+              <button
+                type="button"
+                className="document-viewer__mode"
+                aria-pressed={mode === 'original'}
+                onClick={() => setMode('original')}
+                data-testid="viewer-mode-original"
+              >
+                Original PDF
+              </button>
+            </span>
+          )}
           {onDownloadOriginal && (
             <button
               type="button"
@@ -163,7 +253,27 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
             &times;
           </button>
         </div>
-        <div className="document-viewer__body">
+        {mode === 'original' && (
+          <div className="document-viewer__pdf" data-testid="viewer-original">
+            {original?.error && (
+              <p className="document-viewer__error" role="alert">
+                {original.error}
+              </p>
+            )}
+            {!original?.error && !original?.url && (
+              <p className="document-viewer__loading">Loading the original…</p>
+            )}
+            {original?.url && (
+              <iframe
+                className="document-viewer__pdf-frame"
+                title={`${filename}, page ${targetPage}`}
+                src={`${original.url}#page=${targetPage}`}
+                data-testid="viewer-original-frame"
+              />
+            )}
+          </div>
+        )}
+        <div className="document-viewer__body" hidden={mode === 'original'}>
           {error && <p className="document-viewer__error" role="alert">{error}</p>}
           {!error && chunks === null && <p className="document-viewer__loading">Loading…</p>}
           {/* Chunk ids hash the chunk text, so a re-index or re-upload since the answer

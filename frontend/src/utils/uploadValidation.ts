@@ -1,5 +1,31 @@
-// Mirrors api/documents.py SUPPORTED_EXTENSIONS.
-export const ACCEPTED_EXTENSIONS = ['.pdf', '.txt', '.md', '.markdown', '.docx', '.html', '.htm', '.csv'];
+// api/documents.py SUPPORTED_EXTENSIONS, for a server too old to report its own
+// (PublicConfigResponse.supported_extensions), and until /config has loaded.
+export const ACCEPTED_EXTENSIONS = [
+  '.pdf',
+  '.txt',
+  '.md',
+  '.markdown',
+  '.docx',
+  '.html',
+  '.htm',
+  '.csv',
+  '.epub',
+  '.eml',
+];
+
+/** The suffixes to accept: the server's list when it sent one. */
+export function acceptedExtensions(fromServer?: readonly string[]): readonly string[] {
+  return fromServer && fromServer.length > 0 ? fromServer : ACCEPTED_EXTENSIONS;
+}
+
+/** The dropzone's short list ("pdf docx md …"), without the alternate spellings. */
+export function extensionsLabel(extensions: readonly string[]): string {
+  const alternates = new Set(['.markdown', '.htm']);
+  return extensions
+    .filter((extension) => !alternates.has(extension))
+    .map((extension) => extension.replace(/^\./, ''))
+    .join(' ');
+}
 
 // Matches the backend's AppSettings.max_upload_bytes default — used only until
 // /config has loaded and supplies the server's actual configured limit.
@@ -25,15 +51,16 @@ export function formatBytes(bytes: number): string {
 export function validateUploads(
   files: Iterable<File>,
   maxUploadBytes: number,
+  extensions: readonly string[] = ACCEPTED_EXTENSIONS,
 ): { accepted: File[]; rejected: RejectedFile[] } {
   const accepted: File[] = [];
   const rejected: RejectedFile[] = [];
   for (const file of files) {
     const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-    if (!file.name.includes('.') || !ACCEPTED_EXTENSIONS.includes(extension)) {
+    if (!file.name.includes('.') || !extensions.includes(extension)) {
       rejected.push({
         filename: file.name,
-        message: `${file.name} isn't a supported type (${ACCEPTED_EXTENSIONS.join(' ')}).`,
+        message: `${file.name} isn't a supported type (${extensions.join(' ')}).`,
       });
     } else if (file.size > maxUploadBytes) {
       rejected.push({

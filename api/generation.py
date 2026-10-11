@@ -132,6 +132,12 @@ class StageTimings:
     # vanished into the unaccounted total_ms remainder in the other. Now generate_ms
     # means "the first generation call" in both, and this is the retry.
     citation_retry_ms: float = 0.0
+    # Part of rerank_ms spent queued behind another question's forward pass (the
+    # reranker scores one question at a time). 0.0 when nothing was ahead of it.
+    rerank_wait_ms: float = 0.0
+    # From the start of the request to the first streamed answer token: what the user
+    # actually waits for. 0.0 on /questions (nothing streams) and on cached answers.
+    first_token_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -144,6 +150,11 @@ class GroundedAnswer:
     trace_id: str | None = None
     # Served from api.answer_cache rather than generated for this request.
     cached: bool = False
+    # citations.answer_status: "answered", "insufficient_context" or "no_context".
+    answer_status: str = "answered"
+    # The best cross-encoder score (0-1) among the candidates, kept or not. None when
+    # retrieval found nothing to score.
+    top_rerank_score: float | None = None
     # True when the answer initially lacked citations and a stricter retry supplied
     # them (see needs_citation_retry / retry_uncited_answer).
     citation_retry_used: bool = False

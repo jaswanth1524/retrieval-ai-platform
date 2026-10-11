@@ -37,6 +37,7 @@ function actions(): CommandActions {
     importConversation: vi.fn(),
     clear: vi.fn(),
     switchConversation: vi.fn(),
+    pinConversation: vi.fn(),
   };
 }
 

@@ -14,7 +14,6 @@ from typing import Protocol
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.staticfiles import StaticFiles
 
 from api.dependencies import (
     get_app_settings,
@@ -36,6 +35,7 @@ from api.routes import questions as questions_routes
 from api.routes import search as search_routes
 from api.routes import traces as traces_routes
 from api.settings import AppSettings
+from api.static_files import FrontendFiles
 from api.version import app_version
 
 logger = logging.getLogger(__name__)
@@ -235,7 +235,7 @@ def create_app() -> FastAPI:
     # Guarded by existence so a plain `uv run uvicorn api.main:app` (no frontend
     # build) still boots instead of crashing on StaticFiles' directory check.
     if FRONTEND_DIST_DIR.is_dir():
-        app.mount("/", StaticFiles(directory=FRONTEND_DIST_DIR, html=True), name="frontend")
+        app.mount("/", FrontendFiles(directory=FRONTEND_DIST_DIR, html=True), name="frontend")
 
     return app
 

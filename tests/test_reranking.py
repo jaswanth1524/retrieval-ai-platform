@@ -361,3 +361,68 @@ def test_auto_onnx_file_picks_int8_for_jina_only() -> None:
 
 def test_reranker_onnx_file_defaults_to_auto() -> None:
     assert make_test_settings().reranker_onnx_file == "auto"
+
+
+def test_local_cross_encoder_reranker_scores_shortest_first_but_returns_input_order() -> None:
+    """fastembed pads a batch to its longest pair, so similar lengths are scored
+    together; the caller still gets one score per document in the order it sent."""
+
+    model = CountingCrossEncoder()
+    reranker = LocalCrossEncoderReranker(make_settings(rerank_cache_size=0), model=model)
+
+    scores = reranker.score("query", ["cccc", "a", "eeeee", "bb"])
+
+    assert model.calls == [["a", "bb", "cccc", "eeeee"]]
+    assert scores == [4.0, 1.0, 5.0, 2.0]
+
+
+def test_local_cross_encoder_reranker_reports_time_queued_behind_another_question() -> None:
+    import threading
+    import time
+
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingCrossEncoder:
+        def rerank(
+            self, query: str, documents: Iterable[str], batch_size: int = 64, **kwargs: Any
+        ) -> Iterable[float]:
+            docs = list(documents)
+            if query == "first":
+                started.set()
+                release.wait(5)
+            return [0.0 for _ in docs]
+
+    reranker = LocalCrossEncoderReranker(
+        make_settings(rerank_cache_size=0), model=BlockingCrossEncoder()
+    )
+    waits: dict[str, float] = {}
+    second_asked_at: list[float] = []
+
+    def ask(query: str) -> None:
+        if query == "second":
+            second_asked_at.append(time.monotonic())
+        reranker.score(query, ["doc"])
+        waits[query] = reranker.last_wait_ms
+
+    first = threading.Thread(target=ask, args=("first",))
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=ask, args=("second",))
+    second.start()
+    time.sleep(0.1)
+    released_at = time.monotonic()
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    # Per thread: the first question never waited; the second waited at least from
+    # when it asked until the first was released, however late it got to ask.
+    assert waits["first"] < 50
+    assert waits["second"] >= (released_at - second_asked_at[0]) * 1000 - 5
+
+
+def test_local_cross_encoder_reranker_reports_no_wait_for_a_fully_cached_call() -> None:
+    reranker = LocalCrossEncoderReranker(make_settings(), model=CountingCrossEncoder())
+    reranker.score("q", ["a"])
+    reranker.score("q", ["a"])
+    assert reranker.last_wait_ms == 0.0

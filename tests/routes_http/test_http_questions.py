@@ -281,6 +281,10 @@ def test_question_endpoint_includes_stage_timings(api_context: ApiTestContext) -
         # The zero-citation retry's own LLM round trip, held apart from generate_ms —
         # the sync path used to fold it in while the streaming path dropped it entirely.
         "citation_retry_ms",
+        # Time queued behind another question's rerank, and request start to the first
+        # streamed token (0.0 here: /questions doesn't stream).
+        "rerank_wait_ms",
+        "first_token_ms",
     }
     assert timings["condense_ms"] == 0.0
     # No history to condense and query expansion is off by default.

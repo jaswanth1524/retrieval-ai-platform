@@ -14,6 +14,7 @@ from api.dependencies import (
     require_full_key,
     supplied_key_bytes,
 )
+from api.documents import SUPPORTED_EXTENSIONS
 from api.qdrant_schema import index_compatibility
 from api.routes.deps import OllamaCheckDep, QdrantCheckDep, QdrantClientDep, SettingsDep
 from api.routes.questions import allowed_request_providers
@@ -62,6 +63,7 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         ),
         openai_compatible_model=settings.openai_compatible_model,
         allowed_request_providers=allowed_request_providers(settings),
+        supported_extensions=sorted(SUPPORTED_EXTENSIONS),
     )
 
 

@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import './IconRail.css';
 
 export type RailPanel = 'chat' | 'corpus' | 'search' | 'traces' | 'feedback';
@@ -80,4 +81,5 @@ function IconRail({
   );
 }
 
-export default IconRail;
+// Memoized: App re-renders on every streamed frame, and none of this depends on it.
+export default memo(IconRail);

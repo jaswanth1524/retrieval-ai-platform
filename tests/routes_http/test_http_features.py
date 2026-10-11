@@ -217,7 +217,7 @@ def test_a_job_still_embedding_after_its_first_batch_can_be_cancelled(
 def test_a_job_that_already_wrote_cannot_be_cancelled(
     api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    api_context.settings.__dict__["ingest_batch_size"] = 1
+    api_context.settings.__dict__["ingest_upsert_batch_size"] = 1
     writing, release = threading.Event(), threading.Event()
     upsert = VectorRepository.upsert
     calls: list[int] = []

@@ -1,5 +1,6 @@
 import type {
   AccessResponse,
+  AnswerStatus,
   CitationResponse,
   DocumentContentResponse,
   DocumentDeleteResponse,
@@ -267,6 +268,7 @@ export interface QuestionStreamHandlers {
     timings: TimingsResponse | null,
     traceId: string | null,
     cached?: boolean,
+    grounding?: { answerStatus?: AnswerStatus; topRerankScore?: number | null },
   ) => void;
 }
 
@@ -281,6 +283,8 @@ type QuestionStreamEvent =
       timings: TimingsResponse;
       trace_id: string | null;
       cached?: boolean;
+      answer_status?: AnswerStatus;
+      top_rerank_score?: number | null;
     }
   | { type: 'error'; detail: string };
 
@@ -466,6 +470,7 @@ export const api = {
     signal?: AbortSignal,
   ): Promise<DocumentJobStatusResponse> => {
     let intervalMs = JOB_POLL_INITIAL_MS;
+    let lastProgress = '';
     let transientFailures = 0;
     while (true) {
       let status: DocumentJobStatusResponse | null = null;
@@ -483,6 +488,13 @@ export const api = {
         onProgress?.(status);
         if (status.state === 'done' || status.state === 'failed') {
           return status;
+        }
+        // Back to the fastest interval whenever the job moves: the backoff is for a job
+        // waiting in the queue, and a finished one was reported up to 5 s late.
+        const progress = `${status.state}:${status.chunks_done}`;
+        if (progress !== lastProgress) {
+          lastProgress = progress;
+          intervalMs = JOB_POLL_INITIAL_MS;
         }
       }
       const waitMs = intervalMs;
@@ -575,6 +587,7 @@ export const api = {
                 event.timings,
                 event.trace_id,
                 event.cached ?? false,
+                { answerStatus: event.answer_status, topRerankScore: event.top_rerank_score },
               );
             } else if (event.type === 'error') throw new ApiClientError(event.detail);
           },

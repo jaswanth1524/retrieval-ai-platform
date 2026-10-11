@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CitationResponse } from '../api/types';
 import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
@@ -25,6 +25,10 @@ interface ChatThreadProps {
   /** Indexed documents available to ask about. The empty state told users to upload
    *  one even when the corpus already had some. Optional (0) for older callers. */
   documentCount?: number;
+  /** The corpus listing hasn't come back yet, so documentCount 0 means "unknown". */
+  documentsLoading?: boolean;
+  /** A turn to bring into view (a conversation search hit); a new object each time. */
+  focusTurn?: { turnId: string } | null;
 }
 
 // How close to the bottom still counts as "following along". Wide enough to survive
@@ -89,8 +93,11 @@ function ChatThread({
   onCitationHover,
   onCitationLeave,
   documentCount = 0,
+  documentsLoading = false,
+  focusTurn = null,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const railRef = useRef<HTMLDivElement>(null);
   // Whether the view should keep tracking the bottom. A ref, not state, so a scroll
   // event never costs a render.
   const pinnedRef = useRef(true);
@@ -125,18 +132,7 @@ function ChatThread({
       element.scrollHeight - element.scrollTop - element.clientHeight <= PIN_THRESHOLD_PX;
   };
 
-  // Depends on `turns` itself, not `turns.length`: useChat rebuilds the turn array on
-  // every streamed delta, so this runs as the answer grows. The previous
-  // [turns.length, pending] deps changed only when a turn was added or the request
-  // settled — neither happens mid-stream — so a long answer grew straight past the
-  // bottom of the viewport with no autoscroll until the next question.
-  useEffect(() => {
-    const isNewTurn = turns.length !== turnCountRef.current;
-    turnCountRef.current = turns.length;
-    // Asking something new always pulls the view back down; mid-answer growth only
-    // does so while the user is still at the bottom following along.
-    if (isNewTurn) pinnedRef.current = true;
-    if (!pinnedRef.current) return;
+  const scrollToBottom = () => {
     const element = containerRef.current;
     if (!element) return;
     // Jump rather than animate: a smooth scroll per delta queues dozens of competing
@@ -146,7 +142,56 @@ function ChatThread({
     // scrollHeight - clientHeight, and the comparison in handleScroll needs the value
     // the element actually holds.
     autoScrollTopRef.current = element.scrollTop;
+  };
+
+  // Depends on `turns` itself, not `turns.length`: useChat rebuilds the turn array on
+  // every streamed delta, so this runs as the answer grows. The previous
+  // [turns.length, pending] deps changed only when a turn was added or the request
+  // settled — neither happens mid-stream — so a long answer grew straight past the
+  // bottom of the viewport with no autoscroll until the next question.
+  // A layout effect, so the scroll lands in the same frame as the text that grew: one
+  // frame late, each delta briefly drew below the fold first.
+  useLayoutEffect(() => {
+    const isNewTurn = turns.length !== turnCountRef.current;
+    turnCountRef.current = turns.length;
+    // Asking something new always pulls the view back down; mid-answer growth only
+    // does so while the user is still at the bottom following along.
+    if (isNewTurn) pinnedRef.current = true;
+    if (pinnedRef.current) scrollToBottom();
   }, [turns, pending]);
+
+  // Content also grows without a turn changing: the markdown renderer arriving turns a
+  // restored chat's raw text into formatted answers of another height, and a lazily
+  // rendered block or an image settles later. Following the rail's size keeps a pinned
+  // view at the bottom through all of it; the effect above alone left a reloaded chat
+  // parked partway up.
+  // Scrolls to a search hit once its conversation has rendered (switching is a
+  // transition, so the turn may arrive a render later), then stops following the bottom
+  // so the next frame doesn't pull the view away from it.
+  const focusedRef = useRef<{ turnId: string } | null>(null);
+  useLayoutEffect(() => {
+    if (!focusTurn || focusedRef.current === focusTurn) return;
+    const target = Array.from(
+      containerRef.current?.querySelectorAll<HTMLElement>('[data-turn-id]') ?? [],
+    ).find((element) => element.dataset.turnId === focusTurn.turnId);
+    if (!target) return;
+    focusedRef.current = focusTurn;
+    pinnedRef.current = false;
+    target.scrollIntoView?.({ block: 'center' });
+    const element = containerRef.current;
+    if (element) autoScrollTopRef.current = element.scrollTop;
+  }, [focusTurn, turns]);
+
+  const showsRail = turns.length > 0 || pending;
+  useEffect(() => {
+    const rail = railRef.current;
+    if (!rail || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (pinnedRef.current) scrollToBottom();
+    });
+    observer.observe(rail);
+    return () => observer.disconnect();
+  }, [showsRail]);
 
   const lastTurn = turns[turns.length - 1];
   // One polite status line for the whole thread, always mounted so the first change is
@@ -166,7 +211,9 @@ function ChatThread({
         <p>
           {documentCount > 0
             ? `Ask a question about your ${documentCount === 1 ? 'document' : `${documentCount} documents`}.`
-            : 'Upload a document, then ask a question about it.'}
+            : documentsLoading
+              ? 'Loading your documents…'
+              : 'Upload a document, then ask a question about it.'}
         </p>
       </div>
     );
@@ -186,7 +233,7 @@ function ChatThread({
       data-testid="chat-thread"
     >
       {statusRegion}
-      <div className="chat-thread__rail">
+      <div className="chat-thread__rail" ref={railRef}>
         {turns.map((turn, index) => (
           <ChatMessage
             key={turn.id}
