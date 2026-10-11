@@ -357,6 +357,14 @@ describe('CorpusPanel', () => {
     expect(props.onUpload.mock.calls[0][0][0].name).toBe('small.txt');
   });
 
+  it('clears the file input after a pick, so the same file can be picked again', async () => {
+    setup({ maxUploadBytes: 1000 });
+
+    const input = screen.getByTestId('upload-input') as HTMLInputElement;
+    await userEvent.upload(input, makeFile('small.txt', 10));
+    expect(input.value).toBe('');
+  });
+
   it('stages multiple files from one multi-select and uploads all of them', async () => {
     const props = setup({ maxUploadBytes: 1000 });
 
@@ -423,6 +431,21 @@ describe('CorpusPanel', () => {
     await userEvent.type(input, 'hr, legal , {Enter}');
 
     expect(onSetTags).toHaveBeenCalledWith('a.txt', ['hr', 'legal']);
+  });
+
+  it('saves and cancels tag edits with buttons, not only Enter and Esc', async () => {
+    const onSetTags = vi.fn().mockResolvedValue(undefined);
+    setup({ filenames: ['a.txt'], documents: { 'a.txt': meta({ tags: ['hr'] }) }, onSetTags });
+
+    await userEvent.click(screen.getByLabelText('Edit tags for a.txt'));
+    await userEvent.type(screen.getByTestId('corpus-tags-input'), ', legal');
+    await userEvent.click(screen.getByTestId('corpus-tags-save'));
+    expect(onSetTags).toHaveBeenCalledWith('a.txt', ['hr', 'legal']);
+
+    await userEvent.click(screen.getByLabelText('Edit tags for a.txt'));
+    await userEvent.click(screen.getByTestId('corpus-tags-cancel'));
+    expect(screen.queryByTestId('corpus-tags-input')).not.toBeInTheDocument();
+    expect(onSetTags).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the tag editor open with the error when saving fails', async () => {

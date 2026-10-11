@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -144,6 +145,18 @@ def _restore_document(
     if document.get("original") != f"originals/{filename}" or info is None:
         outcome.missing_originals.append(filename)
         return
+    raw_tags = document.get("tags")
+    try:
+        tags = (
+            normalize_tags([tag for tag in raw_tags if isinstance(tag, str)])
+            if isinstance(raw_tags, list)
+            else ()
+        )
+    except DocumentError:
+        # Too many or too long: this document is rejected, not the whole import —
+        # the documents before it are already queued.
+        outcome.rejected.append(filename)
+        return
     if not has_room(min(info.file_size, max_original_bytes)):
         outcome.deferred.append(filename)
         return
@@ -151,21 +164,9 @@ def _restore_document(
     if content is None:
         outcome.rejected.append(filename)
         return
-    uploaded_at = document.get("uploaded_at")
-    raw_tags = document.get("tags")
-    tags = (
-        normalize_tags([tag for tag in raw_tags if isinstance(tag, str)])
-        if isinstance(raw_tags, list)
-        else ()
-    )
     try:
         outcome.jobs.append(
-            enqueue(
-                filename,
-                content,
-                float(uploaded_at) if isinstance(uploaded_at, int | float) else None,
-                tags,
-            )
+            enqueue(filename, content, _uploaded_at(document.get("uploaded_at")), tags)
         )
     except HTTPException as exc:
         if exc.status_code != 503:
@@ -173,6 +174,15 @@ def _restore_document(
         outcome.deferred.append(filename)
     except DocumentError:
         outcome.rejected.append(filename)
+
+
+def _uploaded_at(value: object) -> float | None:
+    """A manifest's ``uploaded_at``, if it is a real timestamp (JSON allows NaN, and
+    ``true`` is an int to Python; either would end up in every chunk's payload)."""
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if math.isfinite(value) else None
 
 
 def _restore_feedback(

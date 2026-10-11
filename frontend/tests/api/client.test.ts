@@ -163,6 +163,35 @@ describe('api client', () => {
     vi.useRealTimers();
   });
 
+  it('times out a response whose body stalls after the headers', async () => {
+    // The timeout used to be cleared as soon as the headers arrived.
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: () =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('The operation was aborted.', 'AbortError'));
+            });
+          }),
+      })),
+    );
+
+    const promise = api.health();
+    const assertion = expect(promise).rejects.toMatchObject({
+      name: 'ApiClientError',
+      message: 'Request timed out or was cancelled.',
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await assertion;
+
+    vi.useRealTimers();
+  });
+
   it('aborts the underlying fetch when a caller-provided signal is aborted', async () => {
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
       return new Promise((_resolve, reject) => {

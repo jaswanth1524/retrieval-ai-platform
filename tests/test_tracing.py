@@ -188,3 +188,21 @@ def test_build_trace_candidates_not_scored_reason() -> None:
     by_id = {c.point_id: c for c in candidates}
     assert by_id["b"].rerank_score is None
     assert by_id["b"].drop_reason == "not_scored"
+
+
+def test_build_trace_candidates_names_a_kept_chunk_cut_by_max_context_chunks() -> None:
+    """Kept by rerank but past the max_context_chunks prefix: it used to show as kept,
+    unselected and with no reason at all."""
+
+    fused = [_retrieved("a", 0.9), _retrieved("b", 0.5)]
+    scored = [_reranked("a", 0.8), _reranked("b", 0.7)]
+    kept = list(scored)
+    selected = [scored[0]]
+
+    candidates = build_trace_candidates(fused, scored, kept, selected, min_score=0.1)
+
+    by_id = {c.point_id: c for c in candidates}
+    assert by_id["a"].drop_reason is None
+    assert by_id["b"].kept is True
+    assert by_id["b"].selected_for_context is False
+    assert by_id["b"].drop_reason == "context_limit"

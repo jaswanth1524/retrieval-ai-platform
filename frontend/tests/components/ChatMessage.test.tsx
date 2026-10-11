@@ -299,6 +299,8 @@ describe('ChatMessage', () => {
       expect(await screen.findByText('Copied')).toBeInTheDocument();
       // The temporary textarea must not survive the copy.
       expect(document.querySelectorAll('textarea')).toHaveLength(0);
+      // And focus goes back to the button, not to <body>.
+      expect(screen.getByTestId('chat-message-copy')).toHaveFocus();
     });
 
     it('falls back to execCommand when a clipboard write is denied', async () => {
@@ -428,6 +430,12 @@ describe('ChatMessage', () => {
 
     const chip = screen.getByRole('button', { name: 'Source 2: guide.pdf, page 4' });
     await userEvent.hover(chip);
+    expect(onCitationHover).toHaveBeenCalledWith(source);
+    // Keyboard focus previews it too.
+    onCitationHover.mockClear();
+    await userEvent.unhover(chip);
+    chip.blur();
+    chip.focus();
     expect(onCitationHover).toHaveBeenCalledWith(source);
     await userEvent.click(chip);
     expect(onOpenSource).toHaveBeenCalledWith('guide.pdf', 'c-2');

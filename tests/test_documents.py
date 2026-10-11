@@ -232,7 +232,11 @@ def test_chunk_ids_are_stable_for_same_source_and_text() -> None:
 
 
 def test_chunk_overlap_must_be_smaller_than_chunk_size() -> None:
-    settings = make_settings(chunk_size_tokens=4, chunk_overlap_tokens=4)
+    # AppSettings refuses this at startup; model_copy skips validation, so the
+    # chunker's own guard is still exercised.
+    settings = make_settings(chunk_size_tokens=4, chunk_overlap_tokens=0).model_copy(
+        update={"chunk_overlap_tokens": 4}
+    )
     section = DocumentSection(filename="bad.txt", page=1, section="Bad", text="alpha beta")
 
     # A ChunkConfigError (DocumentError subclass) maps to 400, not the bare

@@ -1,6 +1,11 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildHistory, mergeConversations, useChat } from '../../src/hooks/useChat';
+import {
+  buildHistory,
+  historyForQuestion,
+  mergeConversations,
+  useChat,
+} from '../../src/hooks/useChat';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import { ApiClientError, api } from '../../src/api/client';
 import type { QuestionStreamHandlers } from '../../src/api/client';
@@ -176,7 +181,8 @@ describe('useChat', () => {
       incomplete: true,
     });
     expect(result.current.turns[2]).toMatchObject({ role: 'error', question: 'alpha' });
-    expect(buildHistory(result.current.turns)).toEqual([{ role: 'user', content: 'alpha' }]);
+    // Its question goes too: alone it read to the model as an unanswered question.
+    expect(buildHistory(result.current.turns)).toEqual([]);
   });
 
   it('appends an error turn with the ApiClientError message on failure, with no stray assistant turn', async () => {
@@ -290,8 +296,9 @@ describe('useChat', () => {
       await result.current.ask('second');
     });
 
+    // The failed question goes too: sent alone it was two questions in a row.
     const secondCallHistory = askQuestionStreamMock.mock.calls[1][4];
-    expect(secondCallHistory).toEqual([{ role: 'user', content: 'first' }]);
+    expect(secondCallHistory).toEqual([]);
   });
 
   it('aborts the in-flight request when the component unmounts', async () => {
@@ -698,23 +705,78 @@ describe('buildHistory', () => {
     // truncation should retreat to the space instead.
     const head = 'word '.repeat(795); // 3975 chars, ends with a space
     const longAnswer = `${head}${'z'.repeat(200)}`;
-    const history = buildHistory([makeChatTurn('assistant', longAnswer)]);
+    const history = buildHistory([
+      makeChatTurn('user', 'question'),
+      makeChatTurn('assistant', longAnswer),
+    ]);
 
-    expect(history[0].content.length).toBeLessThanOrEqual(4000);
-    expect(history[0].content).toBe(`${head.trimEnd()}…`);
+    expect(history[1].content.length).toBeLessThanOrEqual(4000);
+    expect(history[1].content).toBe(`${head.trimEnd()}…`);
     // No partial word survived the cut.
-    expect(history[0].content).not.toContain('z');
+    expect(history[1].content).not.toContain('z');
   });
 
   it('hard-cuts rather than backing off past the floor', () => {
     // The only space is far outside the backoff window, so honoring it would discard
     // most of the message; the hard cut has to win.
     const longAnswer = `a ${'b'.repeat(5000)}`;
-    const history = buildHistory([makeChatTurn('assistant', longAnswer)]);
+    const history = buildHistory([
+      makeChatTurn('user', 'question'),
+      makeChatTurn('assistant', longAnswer),
+    ]);
 
-    expect(history[0].content.length).toBeLessThanOrEqual(4000);
-    expect(history[0].content.startsWith('a b')).toBe(true);
-    expect(history[0].content.endsWith('…')).toBe(true);
+    expect(history[1].content.length).toBeLessThanOrEqual(4000);
+    expect(history[1].content.startsWith('a b')).toBe(true);
+    expect(history[1].content.endsWith('…')).toBe(true);
+  });
+});
+
+describe('history for a repeated question', () => {
+  function chatTurn(id: string, role: ChatTurn['role'], content: string): ChatTurn {
+    return { id, role, content, sources: [], timestamp: 0, timings: null, traceId: null };
+  }
+
+  it('keeps only answered questions', () => {
+    const turns = [
+      chatTurn('1', 'user', 'first'),
+      chatTurn('2', 'assistant', 'first answer'),
+      chatTurn('3', 'user', 'failed one'),
+      chatTurn('4', 'error', 'boom'),
+      chatTurn('5', 'user', 'stopped one'),
+    ];
+    expect(buildHistory(turns)).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'first answer' },
+    ]);
+  });
+
+  it('leaves out the exchange Regenerate repeats', () => {
+    const turns = [
+      chatTurn('1', 'user', 'first'),
+      chatTurn('2', 'assistant', 'first answer'),
+      chatTurn('3', 'user', 'second'),
+      chatTurn('4', 'assistant', 'second answer'),
+    ];
+    expect(historyForQuestion(turns, 'second')).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'first answer' },
+    ]);
+    // A different question keeps everything.
+    expect(historyForQuestion(turns, 'third')).toHaveLength(4);
+  });
+
+  it('never opens on an answer when the char budget splits a pair', () => {
+    const turns = [
+      chatTurn('1', 'user', 'q'.repeat(3999)),
+      chatTurn('2', 'assistant', 'short'),
+      chatTurn('3', 'user', 'last'),
+      chatTurn('4', 'assistant', 'a'.repeat(4000)),
+    ];
+    // The budget runs out at the long question: its answer alone is left out too.
+    expect(buildHistory(turns).map((message) => message.content)).toEqual([
+      'last',
+      'a'.repeat(4000),
+    ]);
   });
 });
 
@@ -943,7 +1005,7 @@ describe('useChat feature pack', () => {
     });
 
     expect(result.current.turns[1]).toMatchObject({ content: 'Partial', stopped: true });
-    expect(buildHistory(result.current.turns)).toEqual([{ role: 'user', content: 'Q' }]);
+    expect(buildHistory(result.current.turns)).toEqual([]);
   });
 
   it('imports a JSON export as a new conversation with fresh ids', () => {
@@ -1017,6 +1079,18 @@ describe('useChat feature pack', () => {
     act(() => result.current.switchConversation(scopedId));
     expect(result.current.scope).toEqual({ filenames: ['b.pdf'], tags: ['legal'] });
   });
+
+  it('prunes tags no document carries any more, ignoring case', () => {
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.setScope({ filenames: [], tags: ['Legal', 'hr'] }));
+
+    act(() => result.current.pruneScopes([], ['legal', 'finance']));
+    expect(result.current.scope).toEqual({ filenames: [], tags: ['Legal'] });
+
+    // A listing without tags (an older server) leaves them alone.
+    act(() => result.current.pruneScopes([]));
+    expect(result.current.scope.tags).toEqual(['Legal']);
+  });
 });
 
 describe('useChat scope updates', () => {
@@ -1070,6 +1144,146 @@ describe('useChat reload mid-answer', () => {
     expect(saved.conversations[0].turns[1]).toMatchObject({ content: 'Half an ans', stopped: true });
     // In memory the answer is still streaming, not stopped.
     expect(result.current.turns[1].stopped).toBeUndefined();
+  });
+
+  it('saves the question and unflushed text when the tab is hidden mid-stream', () => {
+    // A hidden tab runs no animation frames, and a mobile browser can discard it with
+    // no pagehide: the question and the answer so far were never written.
+    let handlers!: QuestionStreamHandlers;
+    askQuestionStreamMock.mockImplementation((_q, _p, _o, _f, _h, h: QuestionStreamHandlers) => {
+      handlers = h;
+      return new Promise<void>(() => {});
+    });
+    const { result } = renderHook(() => useChat());
+    act(() => {
+      void result.current.ask('Q');
+    });
+    act(() => handlers.onSources?.([], null));
+    act(() => handlers.onDelta?.('Not yet painted'));
+
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    try {
+      act(() => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+    } finally {
+      visibility.mockRestore();
+    }
+
+    const saved = JSON.parse(localStorage.getItem('docrag-chat-history') ?? 'null');
+    expect(saved.conversations[0].turns[0]).toMatchObject({ role: 'user', content: 'Q' });
+    expect(saved.conversations[0].turns[1]).toMatchObject({
+      content: 'Not yet painted',
+      stopped: true,
+    });
+    expect(result.current.turns[1]?.stopped).toBeUndefined();
+  });
+});
+
+describe('useChat cross-tab changes mid-answer', () => {
+  function startStream() {
+    let handlers!: QuestionStreamHandlers;
+    let finish!: () => void;
+    askQuestionStreamMock.mockImplementation((_q, _p, _o, _f, _h, h: QuestionStreamHandlers) => {
+      handlers = h;
+      return new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const hook = renderHook(() => useChat());
+    let pendingAsk!: Promise<void>;
+    act(() => {
+      pendingAsk = hook.result.current.ask('Q');
+    });
+    act(() => handlers.onSources?.([], 'trace-1'));
+    const conversationId = hook.result.current.activeConversationId!;
+    return {
+      hook,
+      conversationId,
+      handlers: () => handlers,
+      finish: async () => {
+        await act(async () => {
+          finish();
+          await pendingAsk;
+        });
+      },
+    };
+  }
+
+  function otherTabWrites(payload: unknown) {
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent('storage', {
+          key: 'docrag-chat-history',
+          newValue: JSON.stringify(payload),
+        }),
+      );
+    });
+  }
+
+  it("takes another tab's rename but keeps the streaming answer", async () => {
+    const { hook, conversationId, handlers, finish } = startStream();
+    const later = Date.now() + 60_000;
+    otherTabWrites({
+      version: 2,
+      activeConversationId: conversationId,
+      conversations: [
+        { id: conversationId, title: 'Renamed', createdAt: 0, updatedAt: 0, editedAt: later, turns: [] },
+      ],
+    });
+    act(() => handlers().onDone?.('Full answer', [], ZERO_TIMINGS, 'trace-1'));
+    await finish();
+
+    const { result } = hook;
+    expect(result.current.activeConversationId).toBe(conversationId);
+    expect(result.current.conversations[0].title).toBe('Renamed');
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['Q', 'Full answer']);
+  });
+
+  it("applies another tab's delete once the answer has finished streaming", async () => {
+    const { hook, conversationId, handlers, finish } = startStream();
+    otherTabWrites({
+      version: 2,
+      activeConversationId: 'other',
+      conversations: [
+        {
+          id: 'other',
+          title: 'Other',
+          createdAt: 0,
+          updatedAt: Date.now() + 60_000,
+          turns: [
+            { id: 'o1', role: 'user', content: 'other q', sources: [], timestamp: 0, timings: null, traceId: null },
+          ],
+        },
+      ],
+      deleted: [{ id: conversationId, at: Date.now() + 60_000 }],
+    });
+    act(() => handlers().onDone?.('Full answer', [], ZERO_TIMINGS, 'trace-1'));
+    await finish();
+
+    const { result } = hook;
+    // The stream finished into its own conversation, never into 'other' ...
+    expect(result.current.conversations.map((c) => c.id)).toEqual(['other']);
+    expect(result.current.activeConversationId).toBe('other');
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['other q']);
+    // ... and the delete then won: what this tab saves keeps it deleted for the other tab.
+    const saved = JSON.parse(window.localStorage.getItem('docrag-chat-history') ?? '{}');
+    expect(saved.conversations.map((c: { id: string }) => c.id)).toEqual(['other']);
+    expect(saved.deleted.map((d: { id: string }) => d.id)).toContain(conversationId);
+  });
+
+  it('keeps the streaming conversation visible until the answer is done', () => {
+    const { hook, conversationId } = startStream();
+    otherTabWrites({
+      version: 2,
+      activeConversationId: conversationId,
+      conversations: [],
+      deleted: [{ id: conversationId, at: Date.now() + 60_000 }],
+    });
+
+    expect(hook.result.current.activeConversationId).toBe(conversationId);
+    expect(hook.result.current.conversations.map((c) => c.id)).toContain(conversationId);
+    expect(hook.result.current.turns[0].content).toBe('Q');
   });
 });
 

@@ -6,8 +6,8 @@ from api.answer_cache import (
     AnswerCache,
     CachedAnswer,
     answer_cache_key,
-    bump_corpus_generation,
 )
+from api.corpus import bump_corpus_generation
 from api.settings import AppSettings
 from tests.factories import make_test_settings
 
@@ -69,3 +69,13 @@ def test_entries_expire_after_the_ttl() -> None:
     assert cache.get(("a",)) is not None
     now[0] = 20.0
     assert cache.get(("a",)) is None
+
+
+def test_cache_key_tags_ignore_letter_case() -> None:
+    """Tags match stored tags case-insensitively, so the cache must not split one
+    answer into an entry per spelling."""
+
+    settings = _settings()
+    assert answer_cache_key("q", settings, None, ["Finance"]) == answer_cache_key(
+        "q", settings, None, ["finance"]
+    )

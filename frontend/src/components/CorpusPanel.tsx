@@ -139,6 +139,27 @@ function TagEditor({ filename, tags, disabled, onSave }: TagEditorProps) {
           autoFocus
           data-testid="corpus-tags-input"
         />
+        {/* Enter and Esc did this alone: a mouse or touch user had no way to save. */}
+        <div className="corpus-panel__tags-actions">
+          <button
+            type="button"
+            className="corpus-panel__tags-button"
+            onClick={() => void save()}
+            disabled={saving}
+            data-testid="corpus-tags-save"
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            className="corpus-panel__tags-button"
+            onClick={() => setEditing(false)}
+            disabled={saving}
+            data-testid="corpus-tags-cancel"
+          >
+            Cancel
+          </button>
+        </div>
         {error && (
           <span className="corpus-panel__tags-error" role="alert">
             {error}
@@ -372,7 +393,12 @@ function CorpusPanel({
           className="corpus-panel__input"
           accept={ACCEPTED_EXTENSIONS.join(',')}
           multiple
-          onChange={(event) => handleFilesChange(event.target.files)}
+          onChange={(event) => {
+            handleFilesChange(event.target.files);
+            // Cleared, so picking the same file again (after removing it from the
+            // staged list, or after a size rejection) fires a change at all.
+            event.target.value = '';
+          }}
           disabled={submitting}
           data-testid="upload-input"
         />

@@ -95,6 +95,12 @@ function SettingsModal({
   const rerankTopK = draftOverrides.rerankTopK ?? config.rerank_top_k;
   const maxContextChunks = draftOverrides.maxContextChunks ?? config.max_context_chunks;
   const llmTemperature = draftOverrides.llmTemperature ?? config.llm_temperature;
+  // An explicit rerank top K caps the context slider: more context chunks than reranked
+  // ones is a request the server refuses.
+  const contextMax =
+    draftOverrides.rerankTopK !== null
+      ? Math.min(config.max_context_chunks_limit, draftOverrides.rerankTopK)
+      : config.max_context_chunks_limit;
 
   const save = () => {
     onOverridesChange(draftOverrides);
@@ -181,13 +187,24 @@ function SettingsModal({
               format={String}
               disabled={disabled}
               testId="settings-rerank-top-k"
-              onChange={(value) => setDraftOverrides({ ...draftOverrides, rerankTopK: value })}
+              onChange={(value) =>
+                // With both set, the server refuses more context chunks than reranked
+                // ones (422 on every question): lowering rerank lowers context with it.
+                setDraftOverrides({
+                  ...draftOverrides,
+                  rerankTopK: value,
+                  maxContextChunks:
+                    draftOverrides.maxContextChunks !== null && draftOverrides.maxContextChunks > value
+                      ? value
+                      : draftOverrides.maxContextChunks,
+                })
+              }
             />
             <SliderRow
               label="Context chunks"
-              value={maxContextChunks}
+              value={contextMax < maxContextChunks ? contextMax : maxContextChunks}
               min={1}
-              max={config.max_context_chunks_limit}
+              max={contextMax}
               step={1}
               format={String}
               disabled={disabled}

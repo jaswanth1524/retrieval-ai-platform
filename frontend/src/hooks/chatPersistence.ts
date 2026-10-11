@@ -88,6 +88,17 @@ export function isChatTurn(value: unknown): value is ChatTurn {
   );
 }
 
+// The range a Date can hold. A number outside it (an import with `"timestamp": 1e300`)
+// passed the type check, and then every render threw "Invalid time value" on it.
+const MAX_TIME_MS = 8.64e15;
+
+/** ``value`` when it is a time a Date can format, else ``fallback``. */
+export function validTime(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= MAX_TIME_MS
+    ? value
+    : fallback;
+}
+
 function isCitation(value: unknown): value is CitationResponse {
   if (!value || typeof value !== 'object') return false;
   const source = value as Partial<CitationResponse>;
@@ -113,7 +124,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
     id: turn.id,
     role: turn.role,
     content: turn.content,
-    timestamp: turn.timestamp,
+    timestamp: validTime(turn.timestamp, Date.now()),
     sources: turn.sources.filter(isCitation),
     timings:
       timings && typeof timings === 'object' && typeof (timings as { total_ms?: unknown }).total_ms === 'number'
@@ -269,7 +280,13 @@ function mergeTombstones(
  * Every tab used to rewrite the whole blob from its own memory, so asking in tab B
  * erased what tab A had just saved. "Newest" is the last edit of any kind (renames
  * included). A conversation deleted in either tab stays deleted unless it was changed
- * after the delete — losing a delete beats losing a conversation still in use. */
+ * after the delete — losing a delete beats losing a conversation still in use.
+ *
+ * ``streamingId`` names the conversation an answer is streaming into in this tab. The
+ * other tab's copy of it lacks the question and the partial answer, so it is never
+ * dropped or replaced here: a rename or scope change from the other tab is taken, its
+ * turns are not. A delete recorded meanwhile is kept in ``deleted`` and applied when the
+ * stream ends (``applyDeleteHeldDuringStream``). */
 export function mergeConversations(
   local: ChatStorageV2,
   incoming: Conversation[],
@@ -278,10 +295,12 @@ export function mergeConversations(
   preferIncomingOnTie = false,
   incomingDeleted?: DeletedConversation[],
   now = Date.now(),
+  streamingId: string | null = null,
 ): ChatStorageV2 {
   const deleted = mergeTombstones(local.deleted, incomingDeleted, now);
   const deletedAt = new Map(deleted.map(({ id, at }) => [id, at]));
   const isDeleted = (conversation: Conversation) =>
+    conversation.id !== streamingId &&
     (deletedAt.get(conversation.id) ?? -Infinity) >= lastEdit(conversation);
   const byId = new Map(local.conversations.map((conversation) => [conversation.id, conversation]));
   let changed = false;
@@ -299,6 +318,23 @@ export function mergeConversations(
       lastEdit(conversation) > lastEdit(mine) ||
       (preferIncomingOnTie && lastEdit(conversation) === lastEdit(mine))
     ) {
+      if (mine && conversation.id === streamingId) {
+        const scope = conversation.scope ?? mine.scope;
+        if (
+          conversation.title === mine.title &&
+          JSON.stringify(scope) === JSON.stringify(mine.scope)
+        ) {
+          continue;
+        }
+        byId.set(conversation.id, {
+          ...mine,
+          title: conversation.title,
+          scope,
+          editedAt: Math.max(lastEdit(mine), conversation.editedAt ?? 0),
+        });
+        changed = true;
+        continue;
+      }
       byId.set(
         conversation.id,
         mine ? keepOlderTurns(keepPassageText(conversation, mine), mine) : conversation,
@@ -311,7 +347,13 @@ export function mergeConversations(
     deleted.some(({ id, at }) => !local.deleted?.some((d) => d.id === id && d.at === at));
   if (!changed && !tombstonesChanged) return local;
   if (!changed) return { ...local, deleted };
-  const conversations = [...byId.values()].sort(byRecentUse).slice(0, MAX_CONVERSATIONS);
+  const sorted = [...byId.values()].sort(byRecentUse);
+  const conversations = sorted.slice(0, MAX_CONVERSATIONS);
+  // Past the cap the streaming conversation stays, in place of the least recently used.
+  const streaming = sorted.find((c) => c.id === streamingId);
+  if (streaming && !conversations.includes(streaming)) {
+    conversations[conversations.length - 1] = streaming;
+  }
   if (conversations.length === 0) return { ...emptyStorage(), deleted };
   const activeConversationId = conversations.some((c) => c.id === local.activeConversationId)
     ? local.activeConversationId
@@ -343,6 +385,39 @@ export function parseConversations(value: unknown): Conversation[] | null {
     .filter((conversation): conversation is Conversation => conversation !== null);
 }
 
+/** ``storage`` without conversation ``id``, with a tombstone at ``at`` so another tab's
+ *  copy of it doesn't bring it back on its next save. */
+export function withoutConversation(
+  storage: ChatStorageV2,
+  id: string,
+  at: number,
+): ChatStorageV2 {
+  const deleted = [...(storage.deleted ?? []).filter((entry) => entry.id !== id), { id, at }];
+  const remaining = storage.conversations.filter((conversation) => conversation.id !== id);
+  if (remaining.length === 0) return { ...emptyStorage(), deleted };
+  const activeConversationId =
+    storage.activeConversationId === id
+      ? [...remaining].sort(byRecentUse)[0].id
+      : storage.activeConversationId;
+  return { ...storage, activeConversationId, conversations: remaining, deleted };
+}
+
+/** Another tab deleted conversation ``id`` while an answer streamed into it here (at or
+ *  after ``since``): ``mergeConversations`` held the delete back so the stream had
+ *  somewhere to go, and this applies it once the stream is over. The tombstone is
+ *  re-stamped at ``now``, after the answer's own last edit — left at its original time,
+ *  this tab's save of the finished answer counted as an edit after the delete and
+ *  brought the conversation back in the tab that deleted it. */
+export function applyDeleteHeldDuringStream(
+  storage: ChatStorageV2,
+  id: string,
+  since: number,
+  now = Date.now(),
+): ChatStorageV2 {
+  const held = storage.deleted?.some((entry) => entry.id === id && entry.at >= since);
+  return held ? withoutConversation(storage, id, now) : storage;
+}
+
 export function emptyStorage(): ChatStorageV2 {
   const conversation = emptyConversation();
   return { version: 2, activeConversationId: conversation.id, conversations: [conversation] };
@@ -356,12 +431,12 @@ export function sanitizeConversation(value: unknown): Conversation | null {
   const conversation: Conversation = {
     id: raw.id,
     title: typeof raw.title === 'string' && raw.title ? raw.title : deriveTitle(turns),
-    createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
-    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+    createdAt: validTime(raw.createdAt, Date.now()),
+    updatedAt: validTime(raw.updatedAt, Date.now()),
     turns,
     scope: sanitizeScope(raw.scope),
   };
-  if (typeof raw.editedAt === 'number') conversation.editedAt = raw.editedAt;
+  if (validTime(raw.editedAt, NaN) === raw.editedAt) conversation.editedAt = raw.editedAt;
   return conversation;
 }
 

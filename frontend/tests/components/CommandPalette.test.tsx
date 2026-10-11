@@ -46,6 +46,18 @@ describe('CommandPalette', () => {
     expect(screen.getByTestId('palette-empty')).toBeInTheDocument();
   });
 
+  it('keeps focus in the input on Tab, so Enter runs the command that is highlighted', async () => {
+    // Rows were Tab stops whose focus never moved the highlight: Enter on a tabbed-to
+    // row ran the first command instead.
+    const { commands } = setup();
+
+    await userEvent.tab();
+    expect(screen.getByTestId('palette-input')).toHaveFocus();
+    await userEvent.keyboard('{ArrowDown}{Enter}');
+    expect(commands[1].run).toHaveBeenCalledTimes(1);
+    expect(commands[0].run).not.toHaveBeenCalled();
+  });
+
   it('runs the highlighted command on Enter and closes first', async () => {
     const { commands, onClose } = setup();
 

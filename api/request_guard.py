@@ -23,10 +23,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from api.dependencies import READ_ONLY_KEY_ERROR, get_app_settings, key_access
 from api.settings import AppSettings
 
-# Every route under these prefixes (and /metrics) is key-guarded; see CLAUDE.md. /health,
-# /health/ready, /config and the static frontend stay open.
-GUARDED_PREFIXES = ("/documents", "/questions", "/traces", "/feedback")
-GUARDED_EXACT = frozenset({"/metrics", "/export", "/access", "/search", "/import"})
+# Every route under these prefixes (and the exact paths) is key-guarded; see CLAUDE.md.
+# /health, /health/ready, /config and the static frontend stay open. The API docs are
+# guarded too: open, they listed every route and schema of a key-protected instance.
+GUARDED_PREFIXES = ("/documents", "/questions", "/traces", "/feedback", "/docs", "/redoc")
+GUARDED_EXACT = frozenset({"/metrics", "/export", "/access", "/search", "/import", "/openapi.json"})
 # Room for the multipart boundary and part headers around an upload's own bytes.
 UPLOAD_OVERHEAD_BYTES = 64 * 1024
 # JSON bodies (a question with its history, feedback) are a few tens of KB at most.

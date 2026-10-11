@@ -15,16 +15,30 @@ Guards test isolation against a real developer ``.env``. Two separate leak paths
 This autouse fixture clears every environment variable ``AppSettings`` could read before
 each test, so neither leak path can reach a test's settings even if litellm (or anything
 else) has already copied ``.env`` into the process environment.
+
+A third path: ``api.main`` (``create_app``, the lifespan) calls the cached
+``get_app_settings()`` directly, which dependency overrides don't reach, and that plain
+``AppSettings()`` read the developer's ``.env`` (a ``WARMUP_MODELS=true`` there loaded
+the real models in every HTTP test). ``.env`` is switched off for every instance here.
+
+LiteLLM also fetches its model price map from GitHub at import unless
+``LITELLM_LOCAL_MODEL_COST_MAP`` is set: tests then depended on the network and on
+that day's remote file. It is set before anything imports litellm.
 """
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Generator
+import os
 
-import pytest
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-from api.settings import AppSettings
+import logging  # noqa: E402 - after the environment above, before litellm loads
+from collections.abc import Generator  # noqa: E402
+
+import pytest  # noqa: E402
+
+from api.dependencies import get_app_settings  # noqa: E402
+from api.settings import AppSettings  # noqa: E402
 
 _SETTINGS_ENV_VARS = tuple(name.upper() for name in AppSettings.model_fields)
 
@@ -36,6 +50,20 @@ def _isolate_app_settings_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None
     for env_var in _SETTINGS_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _settings_without_dotenv(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Make every ``AppSettings()`` ignore ``.env``, not only ``make_test_settings``.
+
+    pydantic-settings reads ``model_config["env_file"]`` at construction, so this
+    covers the cached ``get_app_settings()`` that ``create_app`` and the lifespan call.
+    """
+
+    monkeypatch.setitem(AppSettings.model_config, "env_file", None)
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)

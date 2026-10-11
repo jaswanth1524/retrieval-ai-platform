@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Protocol
 
 from fastembed import SparseTextEmbedding, TextEmbedding
@@ -91,6 +92,22 @@ class LocalEmbeddingProvider:
         self._query_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="docrag-embed-query"
         )
+        # fastembed loads a lazy model on its first embed with no lock of its own, so
+        # an ingest batch and a question arriving together at cold start loaded the
+        # same ONNX session twice (twice the load time and memory). The first call per
+        # model runs under its lock; later calls skip it.
+        self._load_locks = {"dense": Lock(), "sparse": Lock()}
+        self._loaded: set[str] = set()
+
+    def _run_model[T](self, model: str, call: Callable[[], T]) -> T:
+        """Run one embed call, serializing it with any other first call to ``model``."""
+
+        if model in self._loaded:
+            return call()
+        with self._load_locks[model]:
+            result = call()
+            self._loaded.add(model)
+            return result
 
     def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
         """Embed texts with local dense and sparse models.
@@ -108,10 +125,12 @@ class LocalEmbeddingProvider:
         # boundary that must translate a load failure into EmbeddingError.
         try:
             dense_future = submit_in_context(
-                self._executor, lambda: list(self.dense_model.embed(texts))
+                self._executor,
+                lambda: self._run_model("dense", lambda: list(self.dense_model.embed(texts))),
             )
             sparse_future = submit_in_context(
-                self._executor, lambda: list(self.sparse_model.embed(texts))
+                self._executor,
+                lambda: self._run_model("sparse", lambda: list(self.sparse_model.embed(texts))),
             )
             dense_vectors = [coerce_dense_vector(vector) for vector in dense_future.result()]
             sparse_vectors = [coerce_sparse_vector(vector) for vector in sparse_future.result()]
@@ -153,10 +172,16 @@ class LocalEmbeddingProvider:
         dense_text = f"{instruction}{text}" if instruction else text
         try:
             dense_future = submit_in_context(
-                self._query_executor, lambda: list(self.dense_model.embed([dense_text]))
+                self._query_executor,
+                lambda: self._run_model(
+                    "dense", lambda: list(self.dense_model.embed([dense_text]))
+                ),
             )
             sparse_future = submit_in_context(
-                self._query_executor, lambda: list(self.sparse_model.query_embed([text]))
+                self._query_executor,
+                lambda: self._run_model(
+                    "sparse", lambda: list(self.sparse_model.query_embed([text]))
+                ),
             )
             dense_vectors = [coerce_dense_vector(v) for v in dense_future.result()]
             sparse_vectors = [coerce_sparse_vector(v) for v in sparse_future.result()]

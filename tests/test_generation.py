@@ -364,7 +364,11 @@ def test_completion_model_and_kwargs_rejects_openai_without_key() -> None:
 
 def test_completion_model_and_kwargs_rejects_unknown_provider() -> None:
     with pytest.raises(GenerationConfigError, match="Unsupported"):
-        completion_model_and_kwargs(make_settings(llm_provider="anthropic"))
+        # AppSettings refuses it at startup; model_copy skips that, as a per-request
+        # override does, so the generator's own guard is still exercised.
+        completion_model_and_kwargs(
+            make_settings().model_copy(update={"llm_provider": "anthropic"})
+        )
 
 
 def test_completion_model_and_kwargs_adds_reasoning_effort_for_reasoning_model() -> None:

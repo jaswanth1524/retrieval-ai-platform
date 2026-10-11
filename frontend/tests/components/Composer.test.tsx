@@ -132,6 +132,28 @@ describe('Composer', () => {
     expect(onSelectedFilenamesChange).toHaveBeenLastCalledWith([]);
   });
 
+  it('stops offering more tags than a question may carry, which the server refuses', async () => {
+    const tags = Array.from({ length: 21 }, (_, index) => `t${String(index).padStart(2, '0')}`);
+    const onSelectedTagsChange = vi.fn();
+    render(
+      <Composer
+        {...baseProps({
+          availableTags: tags,
+          selectedTags: tags.slice(0, 20),
+          onSelectedTagsChange,
+        })}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    expect(screen.getByTestId('scope-tags-full')).toHaveTextContent('Up to 20 tags');
+    expect(screen.getByLabelText('#t20')).toBeDisabled();
+    // A selected one can still be unticked.
+    expect(screen.getByLabelText('#t00')).toBeEnabled();
+    await userEvent.click(screen.getByLabelText('#t00'));
+    expect(onSelectedTagsChange).toHaveBeenCalledWith(tags.slice(1, 20));
+  });
+
   it('Escape in the question box stops a streaming answer', async () => {
     const props = baseProps({ pending: true });
     render(<Composer {...props} />);

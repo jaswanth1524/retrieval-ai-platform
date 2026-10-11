@@ -43,6 +43,24 @@ describe('chatStore', () => {
 
     expect(await loadChatStore()).toEqual(value);
   });
+
+  it('reconnects when the browser closed the cached connection', async () => {
+    // WebKit closes IndexedDB connections under a page; the cached one then threw on
+    // every transaction, and every later save failed without a word.
+    await saveChatStore(history([turn('q', 'user', 'old')]));
+    const original = IDBDatabase.prototype.transaction;
+    vi.spyOn(IDBDatabase.prototype, 'transaction').mockImplementationOnce(function (
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase['transaction']>
+    ) {
+      this.close();
+      return original.apply(this, args);
+    });
+
+    const value = history([turn('q', 'user', 'new')]);
+    expect(await saveChatStore(value)).toBe(true);
+    expect(await loadChatStore()).toEqual(value);
+  });
 });
 
 describe('useChat with IndexedDB', () => {

@@ -4,6 +4,17 @@ interface RetrievalTabProps {
   trace: TraceDetailResponse;
 }
 
+// Reasons whose raw name reads poorly; any other (including one a newer server adds)
+// is shown with its underscores replaced.
+const DROP_REASON_LABELS: Record<string, string> = {
+  context_limit: 'beyond context limit',
+  context_budget: 'over context budget',
+};
+
+function dropReasonLabel(reason: string): string {
+  return DROP_REASON_LABELS[reason] ?? reason.replace(/_/g, ' ');
+}
+
 /** How far each candidate moved between vector rank and rerank rank.
  *
  * Positive means the cross-encoder promoted it. Computed here rather than server-side
@@ -61,6 +72,10 @@ function latencyRows(timings: TimingsResponse): Array<[string, number, 'io' | 'm
     ['rerank', timings.rerank_ms, 'model'],
     ['ctx expand', timings.context_expansion_ms ?? 0, 'io'],
     ['generate', timings.generate_ms, 'model'],
+    // Only when it fired (rare); generate_ms excludes it, so it is a stage of its own.
+    ...(timings.citation_retry_ms
+      ? [['cite retry', timings.citation_retry_ms, 'model'] as [string, number, 'model']]
+      : []),
   ];
 }
 
@@ -142,7 +157,7 @@ function RetrievalTab({ trace }: RetrievalTabProps) {
             <div className="retrieval-tab__candidate-meta mono">
               p.{candidate.page}
               {candidate.neighbor_expanded ? ' · expanded' : ''}
-              {candidate.drop_reason ? ` · ${candidate.drop_reason.replace(/_/g, ' ')}` : ''}
+              {candidate.drop_reason ? ` · ${dropReasonLabel(candidate.drop_reason)}` : ''}
             </div>
           </div>
         ))}

@@ -39,6 +39,7 @@ import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
 import { EMPTY_OVERRIDES } from './utils/overrides';
 import { readStored, readStoredJson, writeStored } from './utils/safeStorage';
 import { DEFAULT_MAX_UPLOAD_BYTES, validateUploads } from './utils/uploadValidation';
+import { sliceWhole } from './utils/text';
 
 // Dialogs and the inspector render only on demand, so they load on demand too: the
 // first paint (thread + composer) no longer waits on their code.
@@ -85,9 +86,16 @@ function clampOverrides(
 ): QuestionOverrides {
   const within = (value: number | null, max: number, min = 1) =>
     value !== null && (value < min || value > max) ? null : value;
+  const rerankTopK = within(overrides.rerankTopK, config.rerank_top_k_limit);
+  const maxContextChunks = within(overrides.maxContextChunks, config.max_context_chunks_limit);
   return {
-    rerankTopK: within(overrides.rerankTopK, config.rerank_top_k_limit),
-    maxContextChunks: within(overrides.maxContextChunks, config.max_context_chunks_limit),
+    rerankTopK,
+    // More context chunks than reranked ones is a 422 on every question (the server's
+    // QuestionRequest rule), and the values were saved, so it outlived a reload.
+    maxContextChunks:
+      rerankTopK !== null && maxContextChunks !== null
+        ? Math.min(maxContextChunks, rerankTopK)
+        : maxContextChunks,
     llmTemperature: within(overrides.llmTemperature, config.llm_temperature_max, 0),
   };
 }
@@ -140,7 +148,13 @@ function App() {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sources');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
+  const {
+    toasts,
+    push: pushToast,
+    dismiss: dismissToast,
+    hold: holdToast,
+    release: releaseToast,
+  } = useToasts();
   const [exportingBackup, setExportingBackup] = useState(false);
   // Optimistic until /access answers: a full-key (or keyless) server is the common case.
   const [access, setAccess] = useState<AccessLevel>('full');
@@ -381,14 +395,23 @@ function App() {
 
   const [feedbackItems, setFeedbackItems] = useState<FeedbackItemResponse[] | null>(null);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
-  const loadFeedback = (signal?: AbortSignal) => {
+  // One request per list at a time: a Refresh aborts the load still in flight, whose
+  // late answer used to overwrite the newer one.
+  const feedbackRequestRef = useRef<AbortController | null>(null);
+  const loadFeedback = () => {
+    feedbackRequestRef.current?.abort();
+    const controller = new AbortController();
+    feedbackRequestRef.current = controller;
+    const { signal } = controller;
     setFeedbackItems(null);
     setFeedbackError(null);
     api
       .listFeedback(200, signal)
-      .then((response) => setFeedbackItems(response.feedback))
+      .then((response) => {
+        if (!signal.aborted) setFeedbackItems(response.feedback);
+      })
       .catch((err) => {
-        if (signal?.aborted) return;
+        if (signal.aborted) return;
         noteAuthFailure(err);
         setFeedbackError(err instanceof ApiClientError ? err.message : 'Could not load feedback.');
       });
@@ -396,10 +419,9 @@ function App() {
 
   useEffect(() => {
     if (rail !== 'feedback') return;
-    const controller = new AbortController();
-    loadFeedback(controller.signal);
-    return () => controller.abort();
-    // loadFeedback only calls setters and the API.
+    loadFeedback();
+    return () => feedbackRequestRef.current?.abort();
+    // loadFeedback only calls setters, refs and the API.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rail]);
 
@@ -409,23 +431,33 @@ function App() {
     if (rail === 'feedback' && !feedbackPanelAvailable) setRail('chat');
   }, [rail, feedbackPanelAvailable]);
 
-  const loadTraces = (signal?: AbortSignal) => {
+  const tracesRequestRef = useRef<AbortController | null>(null);
+  const loadTraces = () => {
+    tracesRequestRef.current?.abort();
+    const controller = new AbortController();
+    tracesRequestRef.current = controller;
+    const { signal } = controller;
     setTraces(null);
     setTracesError(null);
     api
       .listTraces(signal)
-      .then((response) => setTraces(response.traces))
+      .then((response) => {
+        if (!signal.aborted) setTraces(response.traces);
+      })
       .catch((err) => {
-        if (signal?.aborted) return;
+        if (signal.aborted) return;
+        // A 401 is the key banner's to explain, like every other list.
+        noteAuthFailure(err);
         setTracesError(err instanceof ApiClientError ? err.message : 'Could not load traces.');
       });
   };
 
   useEffect(() => {
     if (rail !== 'traces') return;
-    const controller = new AbortController();
-    loadTraces(controller.signal);
-    return () => controller.abort();
+    loadTraces();
+    return () => tracesRequestRef.current?.abort();
+    // loadTraces only calls setters, refs and the API.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rail]);
 
   // A trace row is a debugging artifact, so opening one implies Engineer mode — the
@@ -497,8 +529,14 @@ function App() {
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
   const lastQuestion = [...turns].reverse().find((turn) => turn.role === 'user')?.content;
   const lastTurn = turns[turns.length - 1];
+  // A question stopped before the server sent anything leaves no answer turn at all: the
+  // question itself is the last turn, and it read as "Answer ready".
   const lastOutcome =
-    lastTurn?.role === 'error' ? 'failed' : lastTurn?.stopped ? 'stopped' : 'answered';
+    lastTurn?.role === 'error'
+      ? 'failed'
+      : lastTurn?.stopped || lastTurn?.role === 'user'
+        ? 'stopped'
+        : 'answered';
   useBackgroundNotice(pending, notifyOnAnswer, lastQuestion, lastOutcome);
   // The selected provider's model. Each answer records the one it was asked of
   // (ChatTurn.model); this labels answers saved before that, and the composer.
@@ -589,7 +627,7 @@ function App() {
       .submitFeedback({
         trace_id: payload.traceId,
         question: payload.question,
-        answer_excerpt: payload.answerExcerpt.slice(0, 2000),
+        answer_excerpt: sliceWhole(payload.answerExcerpt, 2000),
         cited_filenames: payload.citedFilenames,
         rating: payload.rating,
         citation_source_number: null,
@@ -622,8 +660,8 @@ function App() {
       pushToast({
         id: 'persist-partial',
         tone: 'warn',
-        title: 'Only this conversation was saved',
-        body: 'Browser storage is full. Export anything you need to keep.',
+        title: 'Chat history was only partly saved',
+        body: 'Browser storage is full or unavailable. Export anything you need to keep.',
         sticky: true,
       });
     }
@@ -981,7 +1019,12 @@ function App() {
               documentCount={indexedFilenames.length}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
-            <ToastRow toasts={toasts} onDismiss={dismissToast} />
+            <ToastRow
+              toasts={toasts}
+              onDismiss={dismissToast}
+              onHold={holdToast}
+              onRelease={releaseToast}
+            />
             <Composer
               onSubmit={askQuestion}
               disabled={!apiReachable || noDocs}

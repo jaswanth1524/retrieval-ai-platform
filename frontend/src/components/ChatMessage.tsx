@@ -149,6 +149,9 @@ function ChatMessage({
     area.setAttribute('readonly', '');
     area.style.position = 'fixed';
     area.style.top = '-9999px';
+    // select() moves focus to the throwaway field; once it was removed, focus fell to
+    // <body> and a keyboard user lost their place. It goes back to the Copy button.
+    const previous = document.activeElement;
     document.body.appendChild(area);
     area.select();
     try {
@@ -157,6 +160,7 @@ function ChatMessage({
       return false;
     } finally {
       document.body.removeChild(area);
+      if (previous instanceof HTMLElement) previous.focus();
     }
   };
 
@@ -218,6 +222,9 @@ function ChatMessage({
             }}
             onMouseEnter={() => onCitationHover?.(source)}
             onMouseLeave={onCitationLeave}
+            // The preview a pointer gets on hover, for the keyboard too.
+            onFocus={() => onCitationHover?.(source)}
+            onBlur={onCitationLeave}
             aria-label={`Source ${number}: ${source.filename}, page ${source.page}`}
             data-testid="inline-citation"
           >

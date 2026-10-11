@@ -413,6 +413,42 @@ def test_import_reads_only_expected_members_and_caps_each_one(tmp_path: Path) ->
     assert not (tmp_path / "evil.txt").exists()
 
 
+def test_import_rejects_one_bad_document_instead_of_stopping_halfway(tmp_path: Path) -> None:
+    """Over-long tags used to raise out of the loop as a plain 400, after the earlier
+    documents' jobs were already queued and never reported."""
+
+    manifest = {
+        "manifest_version": 1,
+        "documents": [
+            {"filename": "first.txt", "original": "originals/first.txt", "uploaded_at": "NaN"},
+            {"filename": "bad.txt", "original": "originals/bad.txt", "tags": ["x" * 41]},
+            {"filename": "last.txt", "original": "originals/last.txt", "uploaded_at": True},
+        ],
+    }
+    # A real NaN, as json.dumps writes float("nan").
+    raw_manifest = json.dumps(manifest).replace('"NaN"', "NaN").encode()
+    content = _zip(
+        {
+            "manifest.json": raw_manifest,
+            "originals/first.txt": b"Intro\nalpha",
+            "originals/bad.txt": b"Intro\nbeta",
+            "originals/last.txt": b"Intro\ngamma",
+        }
+    )
+    raw = RawDocumentStore(str(tmp_path / "raw"))
+    with keyed_client("full-key", extra_overrides={get_raw_document_store: lambda: raw}) as client:
+        response = _import(client, content)
+        assert response.status_code == 202
+        body = response.json()
+        assert [job["filename"] for job in body["jobs"]] == ["first.txt", "last.txt"]
+        assert body["rejected"] == ["bad.txt"]
+        for job in body["jobs"]:
+            assert wait_for_job_with(client, job["job_id"])["state"] == "done"
+        uploaded_ats = client.get("/documents", headers=FULL).json()["uploaded_ats"]
+    # NaN and true are no timestamps: both get the import time instead.
+    assert all(isinstance(value, float) and value > 0 for value in uploaded_ats.values())
+
+
 def test_import_needs_the_full_key_and_is_size_capped(tmp_path: Path) -> None:
     with keyed_client("full-key", api_read_key="read-key", max_import_bytes=1000) as client:
         assert _import(client, b"x", headers=READ).status_code == 403

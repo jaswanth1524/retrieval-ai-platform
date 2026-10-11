@@ -223,6 +223,51 @@ def test_a_queued_job_cancelled_by_shutdown_is_failed_and_frees_its_bytes() -> N
     assert (finished.state, finished.error) == ("failed", INTERRUPTED_JOB_ERROR)
 
 
+def test_a_job_that_crashed_outside_its_own_handling_is_failed_not_left_running() -> None:
+    """The job store failing to record the outcome left the job "parsing" forever."""
+
+    from concurrent.futures import Future
+
+    from api.ingest_jobs import UNRECORDED_OUTCOME_ERROR, finish_ingest_future
+    from api.jobs import IngestJobStore
+
+    job_store = IngestJobStore(max_retained=10)
+    job = job_store.create("crashed.txt")
+    job_store.update(job.id, state="parsing")
+    future: Future[None] = Future()
+    future.add_done_callback(
+        lambda done: finish_ingest_future(done, lambda: None, job_store, job.id)
+    )
+
+    future.set_exception(OSError("database or disk is full"))
+
+    finished = job_store.get(job.id)
+    assert finished is not None
+    assert (finished.state, finished.error) == ("failed", UNRECORDED_OUTCOME_ERROR)
+
+
+def test_an_upload_is_refused_before_it_is_read_when_the_backlog_is_full(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The multipart part's size is known before the read: a full backlog 503s it
+    without buffering the bytes first."""
+
+    backlog = IngestBacklog(max_bytes=10)
+    assert backlog.try_reserve(8)
+    api_context.app.dependency_overrides[get_ingest_backlog] = lambda: backlog
+
+    async def must_not_read(*_: object, **__: object) -> bytes:
+        raise AssertionError("the upload was read into memory")
+
+    monkeypatch.setattr("api.routes.documents.read_upload_within_limit", must_not_read)
+    response = api_context.client.post(
+        "/documents", files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")}
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "15"
+
+
 def test_document_job_status_returns_404_for_unknown_job(api_context: ApiTestContext) -> None:
     response = api_context.client.get("/documents/jobs/does-not-exist")
 

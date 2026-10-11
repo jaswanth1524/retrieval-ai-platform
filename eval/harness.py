@@ -16,9 +16,9 @@ Two modes:
 ``eval/corpus/`` holds the documents the sample dataset is labeled against; ingest it
 into a fresh collection before running against ``eval/baselines/``.
 
-Both modes need a running Qdrant with an ingested corpus (and ``answer`` also an LLM),
-so this is a **local** tool, not a CI step. CI unit-tests ``eval.metrics`` and this
-module's dataset loading / arg parsing only. The pipeline-driving functions take their
+Both modes need a running Qdrant with an ingested corpus (and ``answer`` also an LLM).
+CI's ``qdrant`` job runs ``retrieval`` on the handbook set against its committed
+baseline; ``answer`` stays a local tool. The pipeline-driving functions take their
 collaborators as parameters so tests can inject in-memory fakes.
 """
 
@@ -313,7 +313,7 @@ def run_retrieval_eval(
     filename_rows: list[dict[str, float]] = []
     chunk_rows: list[dict[str, float]] = []
     passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
-    for example in examples:
+    for index, example in enumerate(examples):
         ranked = rank_for_question(
             example.question,
             repository=collaborators.repository,
@@ -328,9 +328,7 @@ def run_retrieval_eval(
             file_scores = score_ranking(ranked.filenames, example.relevant_filenames, ks)
             entry["filename"] = file_scores
             filename_rows.append(file_scores)
-        relevant_chunks = example.relevant_chunk_ids | passage_ids.get(
-            example.question, frozenset()
-        )
+        relevant_chunks = example.relevant_chunk_ids | passage_ids.get(index, frozenset())
         if relevant_chunks:
             chunk_scores = score_ranking(ranked.chunk_ids, relevant_chunks, ks)
             entry["chunk"] = chunk_scores
@@ -355,20 +353,27 @@ def _normalized(text: str) -> str:
 
 def resolve_passages(
     examples: Sequence[RetrievalExample], repository: Any, settings: AppSettings
-) -> dict[str, frozenset[str]]:
-    """Each question's ``relevant_passages``, as the ids of the chunks containing them.
+) -> dict[int, frozenset[str]]:
+    """Each example's ``relevant_passages``, as the ids of the chunks containing them.
 
-    Looks only in the question's relevant files when it names any. A passage found in
-    no chunk is a broken label (the text changed, or a typo) and fails the run rather
-    than silently scoring that question as unlabeled.
+    Keyed by the example's position (two rows may share a question). Looks only in the
+    example's relevant files when it names any, and in every indexed file when it
+    doesn't. A passage found in no chunk is a broken label (the text changed, or a typo)
+    and fails the run rather than silently scoring that question as unlabeled.
     """
 
-    wanted = [example for example in examples if example.relevant_passages]
+    wanted = [
+        (index, example) for index, example in enumerate(examples) if example.relevant_passages
+    ]
     if not wanted:
         return {}
+    every_file = (
+        frozenset(repository.filename_metadata(settings))
+        if any(not example.relevant_filenames for _, example in wanted)
+        else frozenset()
+    )
     filenames = sorted(
-        {name for example in wanted for name in example.relevant_filenames}
-        or set(repository.filename_metadata(settings))
+        every_file | {name for _, example in wanted for name in example.relevant_filenames}
     )
     chunks: dict[str, list[tuple[str, str]]] = {
         name: [
@@ -377,9 +382,9 @@ def resolve_passages(
         ]
         for name in filenames
     }
-    resolved: dict[str, frozenset[str]] = {}
-    for example in wanted:
-        search = example.relevant_filenames or frozenset(filenames)
+    resolved: dict[int, frozenset[str]] = {}
+    for index, example in wanted:
+        search = example.relevant_filenames or every_file
         ids: set[str] = set()
         for passage in example.relevant_passages:
             needle = _normalized(passage)
@@ -395,7 +400,7 @@ def resolve_passages(
                     "chunk; ingest the corpus first, or fix the label."
                 )
             ids |= found
-        resolved[example.question] = frozenset(ids)
+        resolved[index] = frozenset(ids)
     return resolved
 
 

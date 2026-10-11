@@ -218,6 +218,42 @@ def test_a_run_where_every_judge_call_failed_is_reported_not_passed() -> None:
     assert not all_scores_missing({"faithfulness": 0.8})
 
 
+def test_a_metric_that_scored_nothing_is_named_and_nan_is_written_as_null() -> None:
+    from eval.ragas_runner import metrics_without_scores, nan_to_none
+
+    nan = float("nan")
+    payload = {
+        "rows": [
+            {"faithfulness": 0.9, "answer_relevancy": nan, "index": 0},
+            {"faithfulness": nan, "answer_relevancy": nan, "index": 1},
+        ]
+    }
+    assert metrics_without_scores(payload) == ["answer_relevancy"]
+    assert metrics_without_scores({"faithfulness": nan, "context_recall": 1.0}) == ["faithfulness"]
+    assert metrics_without_scores({"rows": [{"faithfulness": 0.5}]}) == []
+    assert nan_to_none(payload)["rows"][0] == {
+        "faithfulness": 0.9,
+        "answer_relevancy": None,
+        "index": 0,
+    }
+
+
+def test_a_run_with_one_unscored_metric_fails(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import eval.ragas_runner as runner
+
+    monkeypatch.setattr(runner, "load_judges", lambda llm, embeddings: (None, None))
+    monkeypatch.setattr(
+        runner,
+        "run_ragas_evaluation",
+        lambda *args, **kwargs: {"faithfulness": 0.9, "answer_relevancy": float("nan")},
+    )
+
+    assert runner.main([str(SAMPLE_DATASET_PATH)]) == 1
+    assert "answer_relevancy" in capsys.readouterr().err
+
+
 def test_judges_are_passed_through_to_ragas_only_when_given() -> None:
     from eval.ragas_runner import EvaluationExample, run_ragas_evaluation
 
@@ -236,3 +272,14 @@ def test_judges_are_passed_through_to_ragas_only_when_given() -> None:
 
     assert "llm" not in seen[0] and "embeddings" not in seen[0]
     assert seen[1]["llm"] == "judge" and seen[1]["embeddings"] == "emb"
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_the_locked_ragas_exposes_every_default_metric() -> None:
+    # CI only imports the eval extra; this catches a RAGAS release that drops a metric
+    # the documented command asks for.
+    pytest.importorskip("ragas")
+    from eval.ragas_runner import DEFAULT_METRICS, load_ragas_runtime
+
+    _, _, metrics = load_ragas_runtime(DEFAULT_METRICS)
+    assert len(metrics) == len(DEFAULT_METRICS)

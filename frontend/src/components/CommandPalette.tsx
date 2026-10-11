@@ -125,6 +125,10 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
                 aria-selected={index === highlighted}
                 className={`palette__row${index === highlighted ? ' palette__row--active' : ''}`}
                 disabled={command.disabled}
+                // Rows are clicked, not tabbed to: focus stays in the input (the
+                // combobox pattern) and the arrow keys move the highlight. As Tab stops,
+                // Enter on a focused row ran the highlighted command instead.
+                tabIndex={-1}
                 onMouseEnter={() => setHighlighted(index)}
                 onClick={() => run(command)}
                 data-testid="palette-row"

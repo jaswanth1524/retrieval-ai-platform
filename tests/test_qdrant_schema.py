@@ -7,6 +7,7 @@ import pytest
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException
 
+from api import qdrant_schema
 from api.qdrant_schema import (
     EMBEDDING_MODEL_TAG_KEY,
     PAYLOAD_INDEXES,
@@ -18,6 +19,7 @@ from api.qdrant_schema import (
     dense_vectors_config,
     ensure_collection,
     read_collection_metadata,
+    recreate_if_empty_and_mismatched,
     sparse_vectors_config,
 )
 from api.settings import AppSettings
@@ -316,3 +318,76 @@ def test_an_existing_collection_without_idf_is_migrated_in_place() -> None:
         == models.Modifier.IDF
     )
     clear_readiness_cache()
+
+
+def test_existing_collection_with_a_different_dense_model_is_rejected() -> None:
+    """Same tag, same dimension, another dense model: the stored vectors are in a
+    different space, and only the recorded model name shows it."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    metadata = collection_metadata(settings)
+    metadata["dense_embedding_model"] = "another-384-dim-model"
+    client.create_collection(
+        collection_name=settings.qdrant_collection,
+        vectors_config=dense_vectors_config(settings),
+        sparse_vectors_config=sparse_vectors_config(settings),
+        metadata=metadata,
+    )
+
+    with pytest.raises(CollectionSchemaError, match="dense embedding model"):
+        ensure_collection(client, settings)
+
+
+def test_a_collection_without_a_recorded_dense_model_is_accepted() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    metadata = collection_metadata(settings)
+    del metadata["dense_embedding_model"]
+    client.create_collection(
+        collection_name=settings.qdrant_collection,
+        vectors_config=dense_vectors_config(settings),
+        sparse_vectors_config=sparse_vectors_config(settings),
+        metadata=metadata,
+    )
+
+    assert ensure_collection(client, settings).created is False
+
+
+def test_the_empty_collection_rebuild_never_deletes_a_collection_with_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first check saw a mismatch; by the time the lock was held another worker had
+    fixed the schema and written a point. The rebuild must stand down, not delete."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    ensure_collection(client, settings)
+    client.upsert(
+        collection_name=settings.qdrant_collection,
+        points=[
+            models.PointStruct(
+                id=1,
+                vector={
+                    "dense": [0.1, 0.2, 0.3, 0.4],
+                    "sparse": models.SparseVector(indices=[1], values=[1.0]),
+                },
+                payload={},
+            )
+        ],
+    )
+    clear_readiness_cache()
+    calls = 0
+    real_strict = qdrant_schema._ensure_collection_strict
+
+    def first_check_sees_a_mismatch(client: QdrantClient, settings: AppSettings) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise CollectionSchemaError("stale view")
+        return real_strict(client, settings)
+
+    monkeypatch.setattr(qdrant_schema, "_ensure_collection_strict", first_check_sees_a_mismatch)
+
+    assert recreate_if_empty_and_mismatched(client, settings) is False
+    assert client.count(settings.qdrant_collection, exact=True).count == 1

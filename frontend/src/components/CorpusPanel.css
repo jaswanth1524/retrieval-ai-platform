@@ -347,6 +347,11 @@
   color: var(--ink);
 }
 
+.corpus-panel__tags-actions {
+  display: flex;
+  gap: 4px;
+}
+
 .corpus-panel__tags-error {
   font-size: 11px;
   color: var(--bad);

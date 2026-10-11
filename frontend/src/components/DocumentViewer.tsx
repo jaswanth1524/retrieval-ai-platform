@@ -98,6 +98,9 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
   // Legacy points without ordinals can't be paged: the server sent them all.
   const hiddenBefore = chunks && first !== null ? first - 1 : 0;
   const hiddenAfter = chunks && loaded && last !== null ? Math.max(0, loaded.total - last) : 0;
+  // Past the unpaged cap "show all" fetches the first UNPAGED_MAX_CHUNKS; once those are
+  // on screen it would fetch them again and change nothing (Load later still pages on).
+  const firstCapLoaded = first === 1 && (chunks?.length ?? 0) >= UNPAGED_MAX_CHUNKS;
 
   const loadMore = (direction: 'earlier' | 'later' | 'all') => {
     if (!loaded || first === null || last === null) return;
@@ -212,7 +215,7 @@ function DocumentViewer({ filename, chunkId, onClose, onDownloadOriginal }: Docu
               Load later ({hiddenAfter} hidden)
             </button>
           )}
-          {chunks && loaded && hiddenBefore + hiddenAfter > 0 && (
+          {chunks && loaded && hiddenBefore + hiddenAfter > 0 && !firstCapLoaded && (
             <button
               type="button"
               className="document-viewer__show-all"

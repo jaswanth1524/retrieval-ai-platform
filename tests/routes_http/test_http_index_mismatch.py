@@ -68,16 +68,18 @@ def test_questions_search_and_writes_are_refused_with_the_way_out(
 ) -> None:
     client, _, _ = mismatch
 
+    # An upload is refused up front too, like /reindex and /import, rather than
+    # accepted with a 202 for a job that could only fail.
     for response in (
         client.post("/questions", json={"question": "alpha"}),
         client.post("/search", json={"query": "alpha"}),
         client.post("/documents/guide.txt/reindex"),
         client.post("/documents/reindex"),
+        client.post("/documents", files={"file": ("other.txt", b"Intro\ngamma", "text/plain")}),
     ):
         assert response.status_code == 409
         assert RECOVERY in response.json()["detail"]
-    job = upload_and_wait(client, "other.txt", b"Intro\ngamma")
-    assert job["state"] == "failed" and RECOVERY in job["error"]
+    assert client.get("/documents").json()["filenames"] == ["guide.txt"]
 
 
 def test_export_delete_all_import_rebuilds_the_index_for_the_new_setup(

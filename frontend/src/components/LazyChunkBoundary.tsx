@@ -10,6 +10,17 @@ interface LazyChunkBoundaryProps {
 
 interface LazyChunkBoundaryState {
   failed: boolean;
+  /** The failure was a code chunk that couldn't be fetched, not a render error. */
+  chunkMissing: boolean;
+}
+
+// What each engine says when a dynamic import's file is gone (Chrome, Firefox, Safari,
+// and Vite's CSS preload).
+const CHUNK_LOAD_ERROR =
+  /dynamically imported module|Importing a module script failed|Unable to preload|ChunkLoadError/i;
+
+function isChunkLoadError(error: unknown): boolean {
+  return error instanceof Error && CHUNK_LOAD_ERROR.test(`${error.name} ${error.message}`);
 }
 
 /** Catches a lazy-loaded dialog whose code chunk can't be fetched.
@@ -20,10 +31,12 @@ interface LazyChunkBoundaryState {
  * costs the dialog, with a reload offered to pick up the new build.
  */
 class LazyChunkBoundary extends Component<LazyChunkBoundaryProps, LazyChunkBoundaryState> {
-  state: LazyChunkBoundaryState = { failed: false };
+  state: LazyChunkBoundaryState = { failed: false, chunkMissing: false };
 
-  static getDerivedStateFromError(): LazyChunkBoundaryState {
-    return { failed: true };
+  // Any render error in the panel lands here too: blaming those on a deploy ("DocRAG
+  // was updated") sent the user to reload for a fault a reload doesn't fix.
+  static getDerivedStateFromError(error: unknown): LazyChunkBoundaryState {
+    return { failed: true, chunkMissing: isChunkLoadError(error) };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
@@ -32,14 +45,18 @@ class LazyChunkBoundary extends Component<LazyChunkBoundaryProps, LazyChunkBound
 
   private dismiss = () => {
     this.props.onDismiss();
-    this.setState({ failed: false });
+    this.setState({ failed: false, chunkMissing: false });
   };
 
   render() {
     if (!this.state.failed) return this.props.children;
     return (
       <div className="lazy-chunk-boundary" role="alert" data-testid="lazy-chunk-error">
-        <span>DocRAG was updated. Reload to open this.</span>
+        <span>
+          {this.state.chunkMissing
+            ? 'DocRAG was updated. Reload to open this.'
+            : "This panel couldn't be shown."}
+        </span>
         <button type="button" onClick={() => window.location.reload()}>
           Reload
         </button>

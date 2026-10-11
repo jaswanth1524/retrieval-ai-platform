@@ -38,7 +38,7 @@ export interface CorpusCallbacks {
   /** A corpus request succeeded: a previously rejected key now works. */
   onAuthRestored: () => void;
   pushToast: (toast: ToastInput) => unknown;
-  pruneScopes: (indexedFilenames: string[]) => void;
+  pruneScopes: (indexedFilenames: string[], indexedTags?: string[]) => void;
   removeFromScopes: (filenames: string[]) => void;
 }
 
@@ -87,7 +87,12 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       // A document deleted elsewhere (another tab, the API) stayed in scope: the header
       // still named it and the popover — which lists only indexed files — couldn't
       // uncheck it.
-      deps.current.pruneScopes(response.filenames);
+      // Tags only when the server reports them (an older one doesn't), or every tag
+      // in scope would be dropped.
+      deps.current.pruneScopes(
+        response.filenames,
+        response.tags ? Object.values(response.tags).flat() : undefined,
+      );
       setDocuments(documentsFrom(response));
       // A key that used to be rejected now works — clear the banner.
       deps.current.onAuthRestored();

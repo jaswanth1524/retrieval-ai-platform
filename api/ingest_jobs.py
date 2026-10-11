@@ -55,6 +55,10 @@ INGEST_USER_FACING_ERRORS: tuple[type[Exception], ...] = (
 
 SHUTTING_DOWN_ERROR = "The server is shutting down and could not start indexing. Retry the upload."
 
+UNRECORDED_OUTCOME_ERROR = (
+    "The server could not record how indexing ended; check the document list and "
+    "re-upload if the document is missing."
+)
 JOB_CANCELLED_ERROR = "Cancelled before anything was indexed; the document is unchanged."
 
 
@@ -258,6 +262,12 @@ BACKLOG_FULL_ERROR = (
 )
 
 
+def backlog_full_error() -> HTTPException:
+    """The 503 an upload gets while the ingest backlog has no room."""
+
+    return HTTPException(status_code=503, detail=BACKLOG_FULL_ERROR, headers={"Retry-After": "15"})
+
+
 def enqueue_ingest(
     *,
     job_store: JobStore,
@@ -279,9 +289,7 @@ def enqueue_ingest(
 
     size = len(content)
     if not backlog.try_reserve(size):
-        raise HTTPException(
-            status_code=503, detail=BACKLOG_FULL_ERROR, headers={"Retry-After": "15"}
-        )
+        raise backlog_full_error()
     sequence = ingest_sequencer.admit(filename)
 
     def release() -> None:
@@ -453,3 +461,10 @@ def finish_ingest_future(
     exc = future.exception()
     if exc is not None:
         logger.error("Ingest job %s crashed outside its own error handling.", job_id, exc_info=exc)
+        # Mostly the job store failing to record the outcome, so the indexing may have
+        # succeeded; a terminal state the poller can act on still beats "parsing"
+        # forever. The ingest metrics were already counted by run_ingest_job.
+        try:
+            job_store.update(job_id, state="failed", error=UNRECORDED_OUTCOME_ERROR)
+        except Exception:
+            logger.exception("Could not mark ingest job %s as failed.", job_id)

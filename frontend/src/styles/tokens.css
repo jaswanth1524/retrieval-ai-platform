@@ -8,7 +8,8 @@
   --rail: #0a0908;
   --rail-2: #121110;
   --rail-text: #eae5db;
-  --rail-dim: #7d766b;
+  /* 4.5:1 on --rail and --rail-2 (the panel); #7d766b was 4.2:1 on --rail-2. */
+  --rail-dim: #8a8377;
   --rail-rule: rgba(234, 229, 219, 0.12);
   --ink: #eae5db;
   --muted: #a49c8e;

@@ -158,6 +158,45 @@ describe('Inspector', () => {
     ]);
   });
 
+  it('labels drop reasons, including ones this client does not know', async () => {
+    getTrace.mockResolvedValue(
+      makeTrace({
+        candidates: [
+          makeCandidate({ point_id: 'p1', drop_reason: 'context_limit', selected_for_context: false }),
+          makeCandidate({ point_id: 'p2', drop_reason: 'some_new_reason', kept: false }),
+        ],
+      }),
+    );
+    setup({ tab: 'retrieval' });
+
+    const rows = await screen.findAllByTestId('retrieval-candidate');
+    expect(rows[0]).toHaveTextContent('beyond context limit');
+    expect(rows[1]).toHaveTextContent('some new reason');
+  });
+
+  it('draws the citation retry as its own span, so the bars add up to the total', async () => {
+    getTrace.mockResolvedValue(
+      makeTrace({
+        citation_retry_used: true,
+        timings: {
+          embed_ms: 20,
+          search_ms: 30,
+          rerank_ms: 400,
+          generate_ms: 1000,
+          citation_retry_ms: 800,
+          total_ms: 2250,
+          condense_ms: 0,
+        },
+      }),
+    );
+    setup({ tab: 'trace' });
+
+    expect(await screen.findByTestId('trace-tab')).toBeInTheDocument();
+    const spans = screen.getAllByTestId('trace-span').map((span) => span.textContent ?? '');
+    expect(spans.at(-2)).toContain('no citations, retried');
+    expect(spans.at(-1)).toMatch(/^citation retry800ms/);
+  });
+
   it('degrades to an empty state when the trace was evicted', async () => {
     getTrace.mockRejectedValue(new ApiClientError('gone', 404));
     setup({ tab: 'trace' });

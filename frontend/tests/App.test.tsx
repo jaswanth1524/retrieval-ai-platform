@@ -149,6 +149,33 @@ describe('App', () => {
     );
   });
 
+  it('lowers saved context chunks to the saved rerank top K, which the server requires', async () => {
+    localStorage.setItem(
+      'docrag-advanced-options',
+      JSON.stringify({ rerankTopK: 3, maxContextChunks: 6, llmTemperature: null }),
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem('docrag-advanced-options') ?? '{}')).toEqual({
+        rerankTopK: 3,
+        maxContextChunks: 3,
+        llmTemperature: null,
+      }),
+    );
+  });
+
   it('toggles the command palette with the keyboard shortcut', async () => {
     vi.stubGlobal(
       'fetch',

@@ -29,9 +29,6 @@ htmlcov/
 .ruff_cache/
 .mypy_cache/
 
-# Streamlit
-.streamlit/secrets.toml
-
 # Local app data
 data/
 storage/

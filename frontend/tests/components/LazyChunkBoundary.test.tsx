@@ -31,4 +31,21 @@ describe('LazyChunkBoundary', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     vi.restoreAllMocks();
   });
+
+  it('does not blame a render error on a deploy', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    function BadData(): never {
+      throw new TypeError("Cannot read properties of undefined (reading 'map')");
+    }
+    render(
+      <LazyChunkBoundary onDismiss={() => {}}>
+        <BadData />
+      </LazyChunkBoundary>,
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent("This panel couldn't be shown.");
+    expect(screen.getByRole('alert')).not.toHaveTextContent('updated');
+    vi.restoreAllMocks();
+  });
 });
