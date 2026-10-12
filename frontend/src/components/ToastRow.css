@@ -2,14 +2,25 @@
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
   padding: 8px 24px 0;
   max-width: var(--content-rail);
   width: 100%;
   margin: 0 auto;
 }
 
-/* Kept in the DOM (and the accessibility tree) as an empty live region. */
+/* Not display: contents, which takes an element (and its live region) out of the
+   accessibility tree in some browsers. */
+.toast-row__region {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.toast-row__region:not(:empty) + .toast-row__region:not(:empty) {
+  margin-top: 6px;
+}
+
+/* Kept in the DOM (and the accessibility tree) as empty live regions. */
 .toast-row--empty {
   padding: 0;
 }

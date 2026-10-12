@@ -73,6 +73,16 @@ body {
   padding: 2rem;
 }
 
+.app-main__unreachable button {
+  margin-top: 8px;
+  background: none;
+  border: 1px solid var(--rule);
+  color: var(--bad);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  padding: 3px 10px;
+}
+
 /* Below the responsive breakpoint the contextual panel (column 2) collapses to 0
    width; the panel itself opens as an overlay drawer from the rail instead
    (ContextPanel.css). */
@@ -144,6 +154,48 @@ button:disabled {
 
 a {
   color: var(--accent);
+}
+
+/* Off screen until focused: the first Tab on the page lands here. */
+.app-skip-link {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 200;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  border: 1px solid var(--rule-hi);
+  color: var(--accent);
+  transform: translateY(-200%);
+}
+
+.app-skip-link:focus {
+  transform: none;
+}
+
+/* A context panel kept mounted while another shows (App's search panel): its children
+   lay out as the panel body's own. Only a wrapper with no role, so display: contents
+   costs nothing in the accessibility tree. */
+.app-kept-panel {
+  display: contents;
+}
+
+.app-kept-panel[hidden] {
+  display: none;
+}
+
+/* Read by screen readers, not shown: status lines, words behind an icon. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* Shared by the narrow-screen drawers (context panel, inspector). Below every modal

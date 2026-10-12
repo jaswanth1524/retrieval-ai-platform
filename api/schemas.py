@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from api.citations import ANSWER_STATUSES
 from api.documents import MAX_TAGS_PER_DOCUMENT
@@ -17,6 +17,11 @@ REQUEST_RERANK_TOP_K_MAX = 50
 REQUEST_MAX_CONTEXT_CHUNKS_MAX = 20
 REQUEST_TEMPERATURE_MIN = 0.0
 REQUEST_TEMPERATURE_MAX = 2.0
+# One question's text (and a search query, and a rated question). The frontend's
+# MAX_QUESTION_CHARS (src/utils/limits.ts) must match; tests/test_schemas_limits.py checks.
+MAX_QUESTION_CHARS = 4000
+# Providers a question may name per request (routes/questions.py's allowlist reads these).
+RequestProvider = Literal["ollama", "openai", "openai_compatible"]
 
 # Bounds for the client-sent conversation history on QuestionRequest. The server
 # also has its own conversation_max_history_messages setting for further truncation;
@@ -28,6 +33,18 @@ REQUEST_HISTORY_MESSAGE_MAX_CHARS = 4000
 # self-hosted corpus — this exists to stop an unbounded client-supplied list, not to
 # constrain legitimate scoping.
 REQUEST_FILENAMES_MAX = 500
+
+# Per-item caps on client-sent lists, which were capped only in count: one feedback row
+# could carry ~1 MB of filenames, and question scopes are copied into every trace and
+# answer-cache key. Generous on purpose: uploads cap names at 255 bytes, but documents
+# indexed before that may carry longer ones; stored tags are at most 40 characters, but
+# question tags are whitespace-collapsed before matching, so a padded one still works.
+REQUEST_FILENAME_MAX_CHARS = 1024
+REQUEST_TAG_MAX_CHARS = 128
+# Trace ids are 32 hex characters (uuid4().hex).
+REQUEST_TRACE_ID_MAX_CHARS = 64
+RequestFilename = Annotated[str, StringConstraints(max_length=REQUEST_FILENAME_MAX_CHARS)]
+RequestTag = Annotated[str, StringConstraints(max_length=REQUEST_TAG_MAX_CHARS)]
 
 
 class HealthResponse(BaseModel):
@@ -179,10 +196,10 @@ class FeedbackRequest(BaseModel):
     buffer can evict trace_id before this ever reaches durable storage.
     """
 
-    trace_id: str | None = None
-    question: str = Field(min_length=1, max_length=4000)
+    trace_id: str | None = Field(default=None, max_length=REQUEST_TRACE_ID_MAX_CHARS)
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
     answer_excerpt: str = Field(min_length=1, max_length=2000)
-    cited_filenames: list[str] = Field(default_factory=list, max_length=50)
+    cited_filenames: list[RequestFilename] = Field(default_factory=list, max_length=50)
     rating: Literal["up", "down"]
     # Set only when the rating targets one specific citation (its [n] source_number
     # as shown in the answer), rather than the answer as a whole.
@@ -363,8 +380,8 @@ class HistoryMessageRequest(BaseModel):
 class QuestionRequest(BaseModel):
     """Question-answering request."""
 
-    question: str = Field(min_length=1, max_length=4000)
-    llm_provider: Literal["ollama", "openai", "openai_compatible"] | None = None
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+    llm_provider: RequestProvider | None = None
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
     max_context_chunks: int | None = Field(default=None, ge=1, le=REQUEST_MAX_CONTEXT_CHUNKS_MAX)
     llm_temperature: float | None = Field(
@@ -375,7 +392,7 @@ class QuestionRequest(BaseModel):
     # list-valued request field here: it becomes a Qdrant MatchAny filter that gets
     # rebuilt once per query variant when query expansion is on, so an unbounded list
     # is unbounded server-side work driven entirely by the client.
-    filenames: list[str] | None = Field(
+    filenames: list[RequestFilename] | None = Field(
         default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
     )
     # Prior turns of the conversation, oldest first. None/omitted (the pre-existing
@@ -386,7 +403,9 @@ class QuestionRequest(BaseModel):
     )
     # Restricts retrieval to documents carrying any of these tags (and, with
     # `filenames`, also to those files).
-    tags: list[str] | None = Field(default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT)
+    tags: list[RequestTag] | None = Field(
+        default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT
+    )
     # False skips the answer cache's lookup (Regenerate); the new answer is still cached.
     use_cache: bool = True
 
@@ -405,6 +424,16 @@ class QuestionRequest(BaseModel):
         return self
 
 
+class CitationSpanResponse(BaseModel):
+    """The passage of a cited chunk an answer's claim rests on (see api/citations.py)."""
+
+    # Code-point offsets into the chunk's full text (GET /documents/{f}/content).
+    start: int
+    end: int
+    # The passage itself: a client indexing strings differently finds it by search.
+    quote: str
+
+
 class CitationResponse(BaseModel):
     """Citation metadata returned with an answer."""
 
@@ -414,6 +443,9 @@ class CitationResponse(BaseModel):
     section: str
     chunk_id: str
     text: str
+    # Empty in the `sources` frame (sent before the answer exists) and when no passage
+    # matched the answer closely enough to point at.
+    spans: list[CitationSpanResponse] = []
 
 
 class QuestionResponse(BaseModel):
@@ -445,11 +477,13 @@ class AccessResponse(BaseModel):
 class SearchRequest(BaseModel):
     """Retrieval without an answer: the passages a question would be answered from."""
 
-    query: str = Field(min_length=1, max_length=4000)
-    filenames: list[str] | None = Field(
+    query: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+    filenames: list[RequestFilename] | None = Field(
         default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
     )
-    tags: list[str] | None = Field(default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT)
+    tags: list[RequestTag] | None = Field(
+        default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT
+    )
     # How many reranked passages to return; capped by the server's fused_top_n (400).
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
 

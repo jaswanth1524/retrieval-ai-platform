@@ -4,6 +4,7 @@ chunk -> embed -> index), each behind a single call so handlers stay thin.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 import time
@@ -40,7 +41,9 @@ from api.generation import (
     GroundedAnswer,
     SourceCitation,
     StageTimings,
+    attach_spans,
     build_grounded_messages,
+    citation_from_dict,
     condense_question,
     finalize_citations,
     fit_prompt_to_context_window,
@@ -208,30 +211,14 @@ def _cached_timings(started: float) -> StageTimings:
 
 
 def _citation_dict(source: SourceCitation) -> dict[str, Any]:
-    return {
-        "source_number": source.source_number,
-        "filename": source.filename,
-        "page": source.page,
-        "section": source.section,
-        "chunk_id": source.chunk_id,
-        "text": source.text,
-    }
+    # Every field, spans included (as lists of dicts), as CitationResponse has them.
+    return dataclasses.asdict(source)
 
 
 def timings_dict(timings: StageTimings) -> dict[str, float]:
-    return {
-        "embed_ms": timings.embed_ms,
-        "search_ms": timings.search_ms,
-        "rerank_ms": timings.rerank_ms,
-        "generate_ms": timings.generate_ms,
-        "total_ms": timings.total_ms,
-        "condense_ms": timings.condense_ms,
-        "query_expansion_ms": timings.query_expansion_ms,
-        "context_expansion_ms": timings.context_expansion_ms,
-        "citation_retry_ms": timings.citation_retry_ms,
-        "rerank_wait_ms": timings.rerank_wait_ms,
-        "first_token_ms": timings.first_token_ms,
-    }
+    # Every StageTimings field, so a new stage reaches traces and the done frame without
+    # another hand-kept list (TimingsResponse is tested to have the same fields).
+    return dataclasses.asdict(timings)
 
 
 # Below this, a suffix/prefix match between adjacent chunks is more likely a
@@ -937,7 +924,7 @@ class RagPipeline:
                 key,
                 CachedAnswer(
                     done["answer"],
-                    tuple(SourceCitation(**source) for source in done["sources"]),
+                    tuple(citation_from_dict(source) for source in done["sources"]),
                     done["trace_id"],
                     done.get("answer_status", "answered"),
                     done.get("top_rerank_score"),
@@ -1206,7 +1193,8 @@ class RagPipeline:
                 messages, answer, all_sources, self._generator, effective_settings
             )
             answer = outcome.answer
-            cited = outcome.cited
+            # Spans only now: the sources frame went out before there was an answer.
+            cited = attach_spans(answer, outcome.cited, selected)
             citation_retry_used = outcome.retry_used
 
             timings = self._phase_timings(
@@ -1372,7 +1360,7 @@ class IngestService:
         finally:
             # Even a failed ingest may have written points; cached answers could
             # describe a corpus that no longer exists either way.
-            bump_corpus_generation()
+            bump_corpus_generation({chunk.filename for chunk in chunks})
         return DocumentIngestOutcome(
             filename=sections[0].filename,
             sections_parsed=len(sections),

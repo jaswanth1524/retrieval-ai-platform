@@ -21,6 +21,8 @@ from typing import Any
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from api.dependencies import READ_ONLY_KEY_ERROR, get_app_settings, key_access
+from api.metrics import rate_limited_total
+from api.rate_limit import RateLimiter, retry_after_seconds
 from api.settings import AppSettings
 
 # Every route under these prefixes (and the exact paths) is key-guarded; see CLAUDE.md.
@@ -32,6 +34,9 @@ GUARDED_EXACT = frozenset({"/metrics", "/export", "/access", "/search", "/import
 UPLOAD_OVERHEAD_BYTES = 64 * 1024
 # JSON bodies (a question with its history, feedback) are a few tens of KB at most.
 MAX_JSON_BODY_BYTES = 1024 * 1024
+# What RATE_LIMIT_PER_MINUTE counts: requests that change something. Reads (the corpus
+# listing, an upload's progress polled every second) never are.
+RATE_LIMITED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
 def is_guarded_path(path: str) -> bool:
@@ -73,6 +78,18 @@ class _BodyTooLarge(Exception):
 class RequestGuardMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
+        # One limiter per configured rate, so a settings override (tests) gets its own.
+        self._limiters: dict[int, RateLimiter] = {}
+
+    def _rate_limited(self, scope: Scope, settings: AppSettings) -> float:
+        """Spend one of this client's tokens: 0.0 when allowed, else seconds to wait."""
+
+        per_minute = int(settings.rate_limit_per_minute)
+        if per_minute <= 0:
+            return 0.0
+        limiter = self._limiters.setdefault(per_minute, RateLimiter(per_minute))
+        client = scope.get("client")
+        return limiter.take(str(client[0]) if client else "unknown")
 
     def _settings(self, scope: Scope) -> AppSettings:
         # Through the app's dependency overrides, so tests (and anything else that
@@ -103,10 +120,21 @@ class RequestGuardMiddleware:
                 return
             access = key_access(settings, headers.get(b"x-api-key"))
             if access == "none":
+                # Counted on every method: guessing the key is the attempt to limit.
+                wait = self._rate_limited(scope, settings)
+                if wait > 0:
+                    await _reject_rate_limited(send, wait)
+                    return
                 await _reject(send, 401, "Missing or invalid API key.")
                 return
             if access == "read" and needs_full_key(method, path):
                 await _reject(send, 403, READ_ONLY_KEY_ERROR)
+                return
+
+        if method in RATE_LIMITED_METHODS:
+            wait = self._rate_limited(scope, settings)
+            if wait > 0:
+                await _reject_rate_limited(send, wait)
                 return
 
         limit = body_limit(method, path, settings)
@@ -157,11 +185,28 @@ def _too_large_detail(limit: int) -> str:
     return f"Request body is larger than the {limit}-byte limit."
 
 
-async def _reject(send: Send, status: int, detail: str) -> None:
+async def _reject_rate_limited(send: Send, wait: float) -> None:
+    rate_limited_total.inc()
+    seconds = retry_after_seconds(wait)
+    await _reject(
+        send,
+        429,
+        f"Too many requests; try again in {seconds} s.",
+        extra_headers=[(b"retry-after", str(seconds).encode())],
+    )
+
+
+async def _reject(
+    send: Send,
+    status: int,
+    detail: str,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
     body = json.dumps({"detail": detail}).encode()
     headers = [
         (b"content-type", b"application/json"),
         (b"content-length", str(len(body)).encode()),
+        *(extra_headers or []),
     ]
     await send({"type": "http.response.start", "status": status, "headers": headers})
     await send({"type": "http.response.body", "body": body})

@@ -198,6 +198,14 @@ export interface DocumentContentResponse {
   target_found?: boolean | null;
 }
 
+/** The passage of a cited chunk an answer's claim rests on. */
+export interface CitationSpan {
+  /** Code-point offsets into the chunk's text: a hint only, since JS indexes UTF-16. */
+  start: number;
+  end: number;
+  quote: string;
+}
+
 export interface CitationResponse {
   source_number: number;
   filename: string;
@@ -205,6 +213,8 @@ export interface CitationResponse {
   section: string;
   chunk_id: string;
   text: string;
+  /** Only on the final answer's sources; absent from older servers and saved turns. */
+  spans?: CitationSpan[];
 }
 
 export interface TimingsResponse {

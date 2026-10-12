@@ -1,8 +1,9 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ApiClientError, api } from '../api/client';
+import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { SearchResultResponse } from '../api/types';
 import './SearchPanel.css';
+import { MAX_QUESTION_CHARS } from '../utils/limits';
 
 interface SearchPanelProps {
   /** The active conversation's scope: the same documents a question would search. */
@@ -63,11 +64,13 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
       setResults(null);
       if (onAuthFailure(err)) return;
       setError(
-        err instanceof ApiClientError && err.statusCode === 429
+        // A 429 is the question slots being full, unless it is RATE_LIMIT_PER_MINUTE,
+        // whose message ("Too many requests; try again in N s.") says it better.
+        err instanceof ApiClientError &&
+          err.statusCode === 429 &&
+          !err.message.startsWith('Too many requests')
           ? 'The server is busy answering questions. Try again in a few seconds.'
-          : err instanceof ApiClientError
-            ? err.message
-            : 'Search failed.',
+          : apiErrorMessage(err, 'Search failed.'),
       );
     } finally {
       if (controllerRef.current === controller) setSearching(false);
@@ -89,7 +92,7 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Find passages…"
           aria-label="Search passages"
-          maxLength={4000}
+          maxLength={MAX_QUESTION_CHARS}
           data-testid="search-input"
         />
         <button
@@ -102,6 +105,16 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
         </button>
       </form>
       <p className="search-panel__scope mono">{scope}</p>
+      {/* Mounted before any search, so the first result count is read out too. */}
+      <span className="visually-hidden" role="status" data-testid="search-status">
+        {searching
+          ? 'Searching…'
+          : results === null
+            ? ''
+            : results.length === 0
+              ? 'No passages found.'
+              : `${results.length} passage${results.length === 1 ? '' : 's'} found.`}
+      </span>
       {error && (
         <p className="search-panel__message" role="alert" data-testid="search-error">
           {error}

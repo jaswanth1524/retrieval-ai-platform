@@ -46,6 +46,29 @@ from tests.routes_http.support import (
 )
 
 
+def test_answers_point_at_the_sentence_each_citation_rests_on(
+    api_context: ApiTestContext,
+) -> None:
+    text = b"Intro\nBeta is not. Alpha is documented in the guide."
+    assert upload_and_wait(api_context.client, "guide.txt", text)["state"] == "done"
+
+    sync = api_context.client.post("/questions", json={"question": "alpha"}).json()
+    streamed = api_context.client.post(
+        "/questions/stream", json={"question": "alpha", "use_cache": False}
+    )
+    events = without_stage_events(parse_sse_events(streamed.text))
+    source = sync["sources"][0]
+    chunks = api_context.client.get("/documents/guide.txt/content").json()["chunks"]
+    content = next(chunk["text"] for chunk in chunks if chunk["chunk_id"] == source["chunk_id"])
+
+    spans = source["spans"]
+    assert [span["quote"] for span in spans] == ["Alpha is documented in the guide."]
+    assert content[spans[0]["start"] : spans[0]["end"]] == spans[0]["quote"]
+    # Only the done frame has them: the sources frame went out before the answer.
+    assert events[0]["sources"][0]["spans"] == []
+    assert events[-1]["sources"][0]["spans"] == spans
+
+
 def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -> None:
     status = upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
     assert status["state"] == "done"
@@ -63,6 +86,8 @@ def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -
             "section": "Intro",
             "chunk_id": payload["sources"][0]["chunk_id"],
             "text": "Intro alpha beta",
+            # One shared word with the answer: too little to point at a passage.
+            "spans": [],
         }
     ]
     assert api_context.reranker.seen_documents == ["guide.txt › Intro\nIntro alpha beta"]
@@ -89,6 +114,26 @@ def test_question_endpoint_rejects_oversized_query(api_context: ApiTestContext) 
     response = api_context.client.post("/questions", json={"question": "a" * 4001})
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("path", ["/questions", "/search"])
+def test_scope_items_are_capped_in_length_not_only_in_count(
+    api_context: ApiTestContext, path: str
+) -> None:
+    key = "question" if path == "/questions" else "query"
+
+    def post(filenames: list[str] | None = None, tags: list[str] | None = None) -> int:
+        body: dict[str, object] = {key: "alpha"}
+        if filenames is not None:
+            body["filenames"] = filenames
+        if tags is not None:
+            body["tags"] = tags
+        return api_context.client.post(path, json=body).status_code
+
+    assert post(filenames=["a" * 1024]) == 200
+    assert post(filenames=["a" * 1025]) == 422
+    assert post(tags=["t" * 128]) == 200
+    assert post(tags=["t" * 129]) == 422
 
 
 def test_question_endpoint_accepts_history(api_context: ApiTestContext) -> None:

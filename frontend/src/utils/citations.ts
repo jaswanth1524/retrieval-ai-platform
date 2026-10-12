@@ -4,7 +4,7 @@
 // Adjacent markers ([1][2]) are two citations, as the server counts them: a `]` before
 // or a `[` after is allowed when it belongs to another numeric marker.
 const MARKER =
-  /(?<![!\\])(?<!(?<!\[\d[\d\s,–-]*)\])\[(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\](?![(:])(?!\[(?!\d[\d\s,–-]*\]))/g;
+  /(?<![!\\])(?<!(?<!\[\d[\d\s,–-]*)\])\[(\d{1,6}(?:\s*[-–]\s*\d{1,6})?(?:\s*,\s*\d{1,6}(?:\s*[-–]\s*\d{1,6})?)*)\](?![(:])(?!\[(?!\d[\d\s,–-]*\]))/g;
 const RANGE_SEP = /\s*[-–]\s*/;
 // Fenced code blocks and inline code spans: markers there are code, not citations.
 const CODE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g;
@@ -45,6 +45,12 @@ export function linkCitations(markdown: string, sourceCount: number): string {
           }),
     )
     .join('');
+}
+
+/** Undo linkCitations for a renderer that shows markdown as plain text, so it reads
+ *  "[1]" rather than "[1](#docrag-cite-1)". */
+export function unlinkCitations(markdown: string): string {
+  return markdown.replace(/\[(\d{1,6})\]\(#docrag-cite-\d{1,6}\)/g, '[$1]');
 }
 
 /** The source number a rewritten citation link points at, or null for any other link. */

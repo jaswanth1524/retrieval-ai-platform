@@ -169,6 +169,22 @@ test('the source viewer fetches a page around the citation, then more on demand'
 
   await viewer.getByTestId('viewer-load-earlier').click();
   await expect(viewer.getByTestId('viewer-load-earlier')).toHaveText('Load earlier (19 hidden)');
+
+  // Loading everything above keeps the reader on the passage they were looking at:
+  // the browser's own anchoring let the new chunks push it far down.
+  await viewer.getByTestId('viewer-show-all').scrollIntoViewIfNeeded();
+  const readerSpot = () =>
+    viewer.locator('.document-viewer__body').evaluate((body) => {
+      const top = body.getBoundingClientRect().top;
+      const first = [...body.querySelectorAll<HTMLElement>('[data-chunk-id]')].find(
+        (chunk) => chunk.getBoundingClientRect().bottom > top,
+      );
+      return { id: first?.dataset.chunkId, top: (first?.getBoundingClientRect().top ?? 0) - top };
+    });
+  const before = await readerSpot();
   await viewer.getByTestId('viewer-show-all').click();
   await expect(viewer.getByTestId('viewer-chunk')).toHaveCount(120);
+  const after = await readerSpot();
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(2);
 });

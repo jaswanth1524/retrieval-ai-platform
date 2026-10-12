@@ -10,8 +10,10 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 ## Unreleased
 
-Latency and features pass. **Re-index: None** — nothing here changes chunking or the
-index. The new EPUB and EML support applies to new uploads.
+Latency and features pass, then an improvement pass (fixes, security, accessibility,
+features). **Re-index: None** — nothing here changes chunking or the index. The new EPUB
+and EML support applies to new uploads. A CSV whose delimiter used to be mis-detected
+(see Fixed) parses correctly once re-uploaded.
 
 ### Added
 - EPUB and email (`.eml`) uploads. EPUB chapters are read in reading order, through the
@@ -39,6 +41,30 @@ index. The new EPUB and EML support applies to new uploads.
   neighbour text on each side of a retrieved chunk. At `CHUNK_SIZE_TOKENS=96`, 300 cut
   about 1 s of prefill on qwen2.5 (M1) with the same answers and citations on 11
   questions; not measured at the default chunk size.
+- Citations point at the passage an answer rests on: each cited source carries `spans`
+  (`start`, `end`, `quote` within the chunk's text), matched from the answer's citing
+  sentences without any model call (numbers match as digits or words: "45" finds
+  "forty-five"). On `/questions` and the `done` frame (the `sources`
+  frame, sent before the answer, has none). The viewer marks the passage and the hover
+  preview quotes it instead of the chunk's opening.
+- Corpus panel: read a document from its card (the viewer from its first passage);
+  select several to delete, tag or re-index at once; filter by tag; sort by name, upload
+  time or size (remembered).
+- Other conversations can be opened, started, imported or deleted while an answer
+  streams; it keeps writing to the conversation it was asked in, and the open one holds
+  sending until it finishes.
+- An unsent question is kept per conversation, across switches and reloads.
+- An empty conversation offers example questions about the newest documents, or an
+  upload button when there are none.
+- The search panel keeps its query and results when another panel is opened.
+- "API unreachable" retries on its own (2 s doubling to 30 s) and offers Retry now; a
+  trace that failed to load can be retried from the inspector.
+- `make check` runs the backend and frontend gates CI runs; `make golden` regenerates
+  the pinned snapshots.
+- `RATE_LIMIT_PER_MINUTE` (default 0, off): requests per minute per client that change
+  something (questions, searches, uploads, feedback, deletes…) or carry a wrong API key;
+  past it, 429 + `Retry-After`. Reads and upload progress polls are never limited.
+  Counted in `docrag_rate_limited_total`.
 
 ### Faster
 - The reranker scores candidates shortest first, so each batch pads to similar lengths:
@@ -67,6 +93,75 @@ index. The new EPUB and EML support applies to new uploads.
 - Fewer re-renders while an answer streams (memoized panels, stable handlers), a
   reloaded chat stays scrolled to the bottom as it renders, a hovered citation prefetches
   the viewer, and switching conversations is a transition.
+- `GET /export` streams its zip as it is written (bounded memory, nothing spooled to the
+  container's tmpfs), and reads feedback a page at a time.
+- After an upload, delete or tag change the document listing re-reads only the
+  documents that changed instead of scanning the whole collection; a restore reads it
+  once rather than once per document.
+- The listing finds stored originals with one directory read; an upload with a known
+  size is read in one call (it used to be held twice); ingest holds sparse vectors as
+  arrays; feedback pruning runs only past the cap.
+- The corpus panel re-renders only the card an upload poll changed; a long conversation
+  lays out only the turns near the viewport.
+
+### Fixed
+- The PDF "Original" view broke after switching to Passages and back (its blob URL was
+  freed on the switch), and stayed on "Loading" when switched away mid-download. The
+  download is now cancelled when the viewer closes.
+- With the markdown renderer unavailable, answers showed `[1](#docrag-cite-1)`.
+- A citation marker with an absurdly long number (`[999…9]`) turned a finished answer
+  into a server error.
+- The CSV parser could pick a letter as the delimiter of a one-column file of prose.
+- Re-indexing one document read its original into memory before checking the indexing
+  queue had room.
+- Restoring feedback could fail the whole import on a `NaN` timestamp and held the file
+  twice in memory; rows the API couldn't have stored are now skipped.
+- Retried uploads bypassed the two-at-a-time send limit; finished upload cards piled up
+  for the session; a hovered citation's preview stayed up after switching conversation
+  from the keyboard.
+- The eval harness stopped at the first non-document file (`.DS_Store`) in a corpus
+  directory.
+- "Show all" (and Load earlier) in the source viewer threw the reader far from the
+  passage they were reading; it now stays in place.
+
+### Security
+- The UI is served with a Content-Security-Policy (scripts, styles, fonts and requests
+  from its own origin only; frames only for the viewer's PDF; no other site may frame
+  it) and `X-Frame-Options: DENY`; every response carries `X-Content-Type-Options:
+  nosniff` and `Referrer-Policy: no-referrer`. A frontend served from another origin is
+  not covered by this policy. Checked in Chromium and WebKit (`frame-ancestors 'self'`:
+  with `'none'` WebKit refused the viewer's own PDF frame).
+- Request lists are capped per item, not only in count: `trace_id` 64 characters, file
+  names 1024, tags 128 (on `/questions*`, `/search` and `/feedback`). Longer values are a
+  422 where they used to be accepted.
+- A document's text can no longer open a fake `[n] filename=…` source in the prompt:
+  header-like text anywhere in a source is rewritten as `(ref) filename=…` in the prompt
+  only (with gpt-5-mini, a planted `[2] filename=payroll.xlsx` line was cited as source
+  2; rewritten, it is cited as part of the document it is in), and section labels are
+  kept to one line. One sentence was added to the system prompt saying where a source
+  starts.
+
+### Accessibility
+- Focus returns to the control that opened an inline editor (rename, edit question,
+  tags) and to the next card after a delete; the viewer's focus trap includes the PDF
+  frame and skips hidden controls; "Skip to question" link; pinned conversations are
+  announced as pinned; focus outlines show in Windows high-contrast mode; failures and
+  confirmations are announced from separate live regions; passage search announces how
+  many it found.
+
+### Development
+- `tests/golden/openapi.json` pins the API schema; its test names any breaking change
+  before the diff (`make openapi` regenerates it).
+- `httpx`, `numpy` and `grpcio`, imported by `api/` directly, are declared.
+- Frontend tests are type-checked in CI (`npm run typecheck:tests`); backend coverage
+  must stay at or above 92%.
+- The eval fingerprint also records `rrf_k`, the retrieval limits, the query expansion
+  count, the reranker batch size and the machine (the machine is never a refusal).
+- Releases run only for a tag on a commit that is on `main` and passed CI, and both the
+  amd64 and arm64 images must pass the fixable-CRITICAL scan before anything is pushed
+  (only amd64 was scanned). CI scans its image with the same gate, reviews the
+  dependencies a pull request adds, and runs weekly on `main` so new advisories against
+  the pinned versions are noticed without a push.
 
 ## 0.1.0 — 2026-10-10
 

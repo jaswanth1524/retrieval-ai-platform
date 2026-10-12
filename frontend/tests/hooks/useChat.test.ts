@@ -1078,40 +1078,53 @@ describe('useChat feature pack', () => {
     expect(result.current.importConversation([{ role: 'bogus' }])).toBe(false);
   });
 
-  it('refuses to import while an answer is streaming', async () => {
-    // The import becomes the active conversation; the rest of the stream landed in it.
+  it('keeps writing an answer to its own conversation while others are opened', async () => {
     let finish!: () => void;
     askQuestionStreamMock.mockImplementation(
       (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) =>
         new Promise<void>((resolve) => {
           handlers.onDelta?.('Part');
           finish = () => {
-            handlers.onDone?.('Part', [], ZERO_TIMINGS, null);
+            handlers.onDone?.('Whole answer.', [], ZERO_TIMINGS, null);
             resolve();
           };
         }),
     );
     const { result } = renderHook(() => useChat());
+    const askedIn = result.current.activeConversationId!;
     let asking!: Promise<void>;
     act(() => {
       asking = result.current.ask('Q');
     });
-    const exported = [
-      { id: 'x', role: 'user', content: 'Imported', sources: [], timestamp: 1, timings: null, traceId: null },
-    ];
+    expect(result.current.streamingConversationId).toBe(askedIn);
 
-    let ok = true;
+    // A new conversation, an import and a switch all go through mid-answer.
+    act(() => result.current.newConversation());
+    const fresh = result.current.activeConversationId!;
+    expect(fresh).not.toBe(askedIn);
+    let imported = false;
     act(() => {
-      ok = result.current.importConversation(exported);
+      imported = result.current.importConversation([
+        { id: 'x', role: 'user', content: 'Imported', sources: [], timestamp: 1, timings: null, traceId: null },
+      ]);
     });
+    expect(imported).toBe(true);
+    // The conversation being answered can't be deleted under the answer; others can.
+    act(() => result.current.deleteConversation(askedIn));
+    expect(result.current.conversations.some((c) => c.id === askedIn)).toBe(true);
+    act(() => result.current.deleteConversation(fresh));
+    expect(result.current.conversations.some((c) => c.id === fresh)).toBe(false);
+
     await act(async () => {
       finish();
       await asking;
     });
 
-    expect(ok).toBe(false);
-    expect(result.current.conversations).toHaveLength(1);
-    expect(result.current.turns.map((turn) => turn.content)).toEqual(['Q', 'Part']);
+    expect(result.current.streamingConversationId).toBeNull();
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['Imported']);
+    expect(result.current.askedTurns.map((turn) => turn.content)).toEqual(['Q', 'Whole answer.']);
+    act(() => result.current.switchConversation(askedIn));
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['Q', 'Whole answer.']);
   });
 
   it('keeps a search scope per conversation and prunes deleted documents from all of them', () => {

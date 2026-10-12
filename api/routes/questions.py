@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Iterator
+from dataclasses import asdict
+from typing import get_args
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -29,6 +31,7 @@ from api.schemas import (
     CitationResponse,
     QuestionRequest,
     QuestionResponse,
+    RequestProvider,
 )
 from api.settings import AppSettings
 from api.sse import (
@@ -62,7 +65,7 @@ def question_slot(slots: QuestionSlots, *, count_metric: bool = True) -> Release
     return release
 
 
-REQUEST_PROVIDERS = ("ollama", "openai", "openai_compatible")
+REQUEST_PROVIDERS: tuple[str, ...] = get_args(RequestProvider)
 
 
 def allowed_request_providers(settings: AppSettings) -> list[str]:
@@ -132,17 +135,7 @@ def register(app: FastAPI) -> None:
             )
         return QuestionResponse(
             answer=grounded.answer,
-            sources=[
-                CitationResponse(
-                    source_number=source.source_number,
-                    filename=source.filename,
-                    page=source.page,
-                    section=source.section,
-                    chunk_id=source.chunk_id,
-                    text=source.text,
-                )
-                for source in grounded.sources
-            ],
+            sources=[CitationResponse(**asdict(source)) for source in grounded.sources],
             timings=timings_response(grounded.timings),
             trace_id=grounded.trace_id,
             cached=grounded.cached,

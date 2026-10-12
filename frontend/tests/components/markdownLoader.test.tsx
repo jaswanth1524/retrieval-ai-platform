@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 
@@ -44,5 +44,19 @@ describe('markdown renderer loading', () => {
     // A later answer tries again: one failure doesn't mean plain text until a reload.
     vi.doUnmock('../../src/components/Markdown');
     await expect(loadMarkdown()).resolves.not.toBe(PlainAnswer);
+  });
+
+  it('shows a fallback answer with citation markers, not link syntax', async () => {
+    vi.doMock('../../src/components/Markdown', () => {
+      throw new Error('Failed to fetch dynamically imported module');
+    });
+    const { loadMarkdown } = await import('../../src/components/markdownLoader');
+    await loadMarkdown();
+    const { default: ChatMessage } = await import('../../src/components/ChatMessage');
+    render(<ChatMessage turn={answer} engineerMode={false} />);
+
+    // The renderer is swapped in after mount, so wait on the settled text.
+    await waitFor(() => expect(screen.getByText('**Use docker** [1].')).toBeInTheDocument());
+    expect(screen.queryByText(/docrag-cite/)).not.toBeInTheDocument();
   });
 });

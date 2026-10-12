@@ -130,6 +130,11 @@ class AppSettings(BaseSettings):
     # Questions answered at once; past it a question gets 429 + Retry-After at once
     # instead of holding a request thread for a minute (api/admission.py). 0 = no cap.
     max_concurrent_questions: int = Field(default=4, ge=0)
+    # Requests per minute each client may make that change something (POST, PATCH,
+    # DELETE on the API: questions, searches, uploads, feedback...) or that present a
+    # wrong API key; past it, 429 + Retry-After (api/rate_limit.py). Reads and job polls
+    # are never limited. 0 = off.
+    rate_limit_per_minute: int = Field(default=0, ge=0)
     # Finished answers kept for repeat questions (api/answer_cache.py); 0 turns the
     # cache off. Invalidated by every ingest, delete and tag change, and expired after
     # the TTL. Questions with conversation history are never cached.

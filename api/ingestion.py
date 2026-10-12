@@ -363,18 +363,31 @@ class _StoredEmbedding:
 
     The dense vector as float32 rather than a list of Python floats (~8x the memory):
     a whole document's vectors now wait for the write instead of one batch's. The model
-    produces float32, so the round trip is exact.
+    produces float32, so the round trip is exact. The sparse (BM25) vector likewise as
+    int64/float64 arrays: a list of Python ints and floats cost ~4x as much, and with a
+    few hundred terms per chunk it outweighed the dense vector. Those dtypes hold every
+    Python int index and float value as they were, so that round trip is exact too.
     """
 
     dense: npt.NDArray[np.float32]
-    sparse: models.SparseVector
+    sparse_indices: npt.NDArray[np.int64]
+    sparse_values: npt.NDArray[np.float64]
 
     @classmethod
     def of(cls, embedding: EmbeddedText) -> _StoredEmbedding:
-        return cls(dense=np.asarray(embedding.dense, dtype=np.float32), sparse=embedding.sparse)
+        return cls(
+            dense=np.asarray(embedding.dense, dtype=np.float32),
+            sparse_indices=np.asarray(embedding.sparse.indices, dtype=np.int64),
+            sparse_values=np.asarray(embedding.sparse.values, dtype=np.float64),
+        )
 
     def restore(self) -> EmbeddedText:
-        return EmbeddedText(dense=self.dense.tolist(), sparse=self.sparse)
+        return EmbeddedText(
+            dense=self.dense.tolist(),
+            sparse=models.SparseVector(
+                indices=self.sparse_indices.tolist(), values=self.sparse_values.tolist()
+            ),
+        )
 
 
 def _contextual_embedding_text(chunk: DocumentChunk) -> str:

@@ -1,5 +1,5 @@
-import { lazy, startTransition, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { ApiClientError, api } from './api/client';
+import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ApiClientError, api, apiErrorMessage } from './api/client';
 import type {
   AccessLevel,
   ApiStatus,
@@ -15,6 +15,8 @@ import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
 import type { FeedbackPayload } from './components/ChatMessage';
 import Composer from './components/Composer';
+import { NEW_CONVERSATION_DRAFT, pruneDrafts } from './utils/drafts';
+import { QUESTION_INPUT_ID } from './utils/id';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
 import CorpusPanel, { type DocumentMeta } from './components/CorpusPanel';
@@ -115,6 +117,10 @@ function loadPersistedMode(): ChatMode {
 // download serves better than holding the whole file in memory as a blob.
 const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 
+// Backoff between boot attempts while the API is unreachable: 2s, 4s, 8s ... 30s.
+const BOOT_RETRY_BASE_MS = 2000;
+const BOOT_RETRY_MAX_MS = 30_000;
+
 function canPreviewOriginal(
   filename: string,
   originalsStored: boolean,
@@ -169,6 +175,8 @@ function App() {
   );
   const [mode, setModeState] = useState<ChatMode>(loadPersistedMode);
   const [rail, setRail] = useState<RailPanel>('chat');
+  const [searchOpened, setSearchOpened] = useState(false);
+  if (rail === 'search' && !searchOpened) setSearchOpened(true);
   const [searchResetKey, setSearchResetKey] = useState(0);
   const [traces, setTraces] = useState<TraceSummaryResponse[] | null>(null);
   const [tracesError, setTracesError] = useState<string | null>(null);
@@ -207,11 +215,19 @@ function App() {
   const [pinnedTraceId, setPinnedTraceId] = useState<string | null>(null);
   const [hoveredCitation, setHoveredCitation] = useState<CitationResponse | null>(null);
   // Source document viewer: which document/chunk a clicked citation opens (null = closed).
-  const [sourceView, setSourceView] = useState<{ filename: string; chunkId: string } | null>(null);
+  // chunkId null: opened from the corpus panel's Read, at the document's first passage.
+  // highlights: the passages a citation rests on, marked in the cited chunk.
+  const [sourceView, setSourceView] = useState<{
+    filename: string;
+    chunkId: string | null;
+    highlights?: string[];
+  } | null>(null);
   const corpusBrowseInputRef = useRef<HTMLInputElement>(null);
   const {
     turns,
     pending,
+    streamingConversationId,
+    askedTurns,
     stage,
     ask,
     cancel,
@@ -234,6 +250,14 @@ function App() {
     editAndResend,
     importConversation,
   } = useChat();
+  // A deleted conversation's unsent draft goes with it, whichever tab deleted it. After
+  // the composer has saved it on the switch away, hence an effect on the list.
+  useEffect(() => {
+    pruneDrafts(new Set(conversations.map((conversation) => conversation.id)));
+  }, [conversations]);
+  // An answer can stream into one conversation while another is open. The open one shows
+  // its progress (and offers Stop) only when it is the one being answered.
+  const streamingHere = pending && streamingConversationId === activeConversationId;
   const {
     uploads,
     indexedFilenames,
@@ -273,20 +297,25 @@ function App() {
   // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
   // Retrieval/Trace tabs fall back to the stale pinnedTraceId and keep rendering the
   // previous conversation's trace, while the Sources tab (which reads the live turn)
-  // correctly goes empty — one inspector showing two different questions.
+  // correctly goes empty — one inspector showing two different questions. The hovered
+  // citation goes too: its button unmounts without a mouseleave/blur (a switch from the
+  // keyboard or palette), which left its preview on screen over the next conversation.
   // Stable (useChat's actions are), so the memoized conversation list skips re-rendering
   // on every streamed token.
   const clear = useCallback(() => {
     setPinnedTraceId(null);
+    setHoveredCitation(null);
     clearTurns();
   }, [clearTurns]);
   const newConversation = useCallback(() => {
     setPinnedTraceId(null);
+    setHoveredCitation(null);
     createConversation();
   }, [createConversation]);
   const switchConversation = useCallback(
     (id: string) => {
       setPinnedTraceId(null);
+      setHoveredCitation(null);
       // A transition: a long conversation mounts up to 100 rendered answers, and the
       // list's highlight and the drawer closing shouldn't wait for all of them.
       startTransition(() => selectConversation(id));
@@ -296,6 +325,7 @@ function App() {
   const deleteConversation = useCallback(
     (id: string) => {
       setPinnedTraceId(null);
+      setHoveredCitation(null);
       removeConversation(id);
     },
     [removeConversation],
@@ -370,9 +400,16 @@ function App() {
     }
   };
 
+  // Bumped to boot again: by the backoff below after a failed /config, or by the
+  // banner's "Retry now". The API may just be starting (compose boots it after Qdrant),
+  // and a one-shot boot left the page on "start the API and refresh" for good.
+  const [bootAttempt, setBootAttempt] = useState(0);
+  const retryBoot = useCallback(() => setBootAttempt((attempt) => attempt + 1), []);
+
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
     // /config, /access and the corpus listing go out together: each round trip used to
     // wait for the one before it (a /health probe first), and the composer said "Upload
@@ -428,6 +465,10 @@ function App() {
       } catch {
         if (cancelled) return;
         setApiStatus('error');
+        retryTimer = setTimeout(
+          () => setBootAttempt((attempt) => attempt + 1),
+          Math.min(BOOT_RETRY_BASE_MS * 2 ** bootAttempt, BOOT_RETRY_MAX_MS),
+        );
       }
       await listing;
     }
@@ -435,12 +476,14 @@ function App() {
     void boot();
     return () => {
       cancelled = true;
+      clearTimeout(retryTimer);
       // Aborting releases the in-flight request instead of just ignoring its result.
       controller.abort();
     };
-    // Boot once. refreshDocuments reads only setters and useChat's stable pruneScopes.
+    // Boots once, and again per retry. refreshDocuments reads only setters and useChat's
+    // stable pruneScopes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [bootAttempt]);
 
   // The markdown renderer is its own chunk; fetch it once the first paint is done, so
   // it is there before the first answer is.
@@ -474,7 +517,7 @@ function App() {
       .catch((err) => {
         if (signal.aborted) return;
         noteAuthFailure(err);
-        setFeedbackError(err instanceof ApiClientError ? err.message : 'Could not load feedback.');
+        setFeedbackError(apiErrorMessage(err, 'Could not load feedback.'));
       });
   };
 
@@ -509,7 +552,7 @@ function App() {
         if (signal.aborted) return;
         // A 401 is the key banner's to explain, like every other list.
         noteAuthFailure(err);
-        setTracesError(err instanceof ApiClientError ? err.message : 'Could not load traces.');
+        setTracesError(apiErrorMessage(err, 'Could not load traces.'));
       });
   };
 
@@ -592,8 +635,11 @@ function App() {
           ? 'Connecting…'
           : undefined;
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
-  const lastQuestion = [...turns].reverse().find((turn) => turn.role === 'user')?.content;
-  const lastTurn = turns[turns.length - 1];
+  const streamingTitle = conversations.find((c) => c.id === streamingConversationId)?.title;
+  const streamingElsewhereHint = `Still answering in “${streamingTitle ?? 'another conversation'}” — you can type, and send once it finishes.`;
+  // From the conversation asked in, which needn't be the one open by the time it ends.
+  const lastQuestion = [...askedTurns].reverse().find((turn) => turn.role === 'user')?.content;
+  const lastTurn = askedTurns[askedTurns.length - 1];
   // A question stopped before the server sent anything leaves no answer turn at all: the
   // question itself is the last turn, and it read as "Answer ready".
   const lastOutcome =
@@ -635,7 +681,7 @@ function App() {
   // (cancelled, or failed mid-stream) never gets timings, but the server still wrote an
   // error trace for it — gating on timings alone left its Inspector stuck forever.
   const inspectedTurnInFlight =
-    pending && inspectedTurn !== undefined && inspectedTurn.id === turns[turns.length - 1]?.id;
+    streamingHere && inspectedTurn !== undefined && inspectedTurn.id === turns[turns.length - 1]?.id;
   const inspectedTraceReady = inspectedTurn
     ? inspectedTurn.timings !== null || !inspectedTurnInFlight
     : true;
@@ -679,9 +725,15 @@ function App() {
 
   // Same reasoning as askQuestion above — passed to both ChatThread and Inspector.
   const handleOpenSource = useCallback(
-    (filename: string, chunkId: string) => setSourceView({ filename, chunkId }),
+    (filename: string, chunkId: string, highlights?: string[]) =>
+      setSourceView({ filename, chunkId, highlights }),
     [],
   );
+  const handleReadDocument = useCallback((filename: string) => {
+    setSourceView({ filename, chunkId: null });
+    // On a narrow screen the panel is a drawer over the viewer's opener.
+    setPanelDrawerOpen(false);
+  }, []);
   const handleCitationLeave = useCallback(() => setHoveredCitation(null), []);
   // A pointer or focus on a citation usually precedes a click on it: the viewer's code
   // and its first page start loading now, so the click opens it without waiting.
@@ -710,7 +762,7 @@ function App() {
         pushToast({
           tone: 'warn',
           title: "Couldn't send your rating",
-          body: err instanceof ApiClientError ? err.message : 'Try again in a moment.',
+          body: apiErrorMessage(err, 'Try again in a moment.'),
         });
       });
     // noteAuthFailure only calls state setters; pushToast is stable.
@@ -800,7 +852,7 @@ function App() {
         pushToast({
           tone: 'bad',
           title: 'Backup failed',
-          body: err instanceof ApiClientError ? err.message : 'Could not build the backup.',
+          body: apiErrorMessage(err, 'Could not build the backup.'),
         });
       })
       .finally(() => {
@@ -809,9 +861,31 @@ function App() {
       });
   };
 
+  const startUpload = useStableHandler(() => {
+    setRail('corpus');
+    // On a narrow screen the panel is a closed drawer: the picked files were staged
+    // out of sight, still waiting on an Upload click nobody could see.
+    if (panelCollapsed) setPanelDrawerOpen(true);
+    // The panel has to render before its hidden file input can be clicked.
+    requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
+  });
+  // Example questions for an empty conversation: about the newest documents, which the
+  // user most likely means to ask about. A click puts one in the composer to edit.
+  const suggestions = useMemo(() => {
+    const newest = [...indexedFilenames]
+      .sort((a, b) => (documents[b]?.uploadedAt ?? 0) - (documents[a]?.uploadedAt ?? 0))
+      .slice(0, 3);
+    return newest.map((filename) => `What are the key points of ${filename}?`);
+  }, [indexedFilenames, documents]);
+  const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const suggestQuestion = useCallback(
+    (text: string) => setPrefill((prev) => ({ text, nonce: (prev?.nonce ?? 0) + 1 })),
+    [],
+  );
+
   const commands = useCommands(
     {
-      pending,
+      pending: streamingHere,
       configLoaded: config !== null,
       inspectorOpen,
       mode,
@@ -828,14 +902,7 @@ function App() {
         setRail('chat');
         newConversation();
       },
-      upload: () => {
-        setRail('corpus');
-        // On a narrow screen the panel is a closed drawer: the picked files were staged
-        // out of sight, still waiting on an Upload click nobody could see.
-        if (panelCollapsed) setPanelDrawerOpen(true);
-        // The panel has to render before its hidden file input can be clicked.
-        requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
-      },
+      upload: startUpload,
       openSettings: () => setSettingsOpen(true),
       toggleInspector,
       setMode,
@@ -875,7 +942,7 @@ function App() {
         pushToast({
           tone: 'bad',
           title: 'Restore failed',
-          body: err instanceof ApiClientError ? err.message : 'Could not read the backup.',
+          body: apiErrorMessage(err, 'Could not read the backup.'),
         });
       }
       return;
@@ -912,7 +979,7 @@ function App() {
           pushToast({
             tone: 'bad',
             title: 'Download failed',
-            body: err instanceof ApiClientError ? err.message : 'Could not fetch the original.',
+            body: apiErrorMessage(err, 'Could not fetch the original.'),
           });
         });
     },
@@ -921,10 +988,6 @@ function App() {
     [pushToast],
   );
   const handleImportFile = async (file: File) => {
-    if (pending) {
-      pushToast({ tone: 'warn', title: 'Wait for the answer to finish', body: 'Then import the conversation.' });
-      return;
-    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(await file.text());
@@ -962,6 +1025,17 @@ function App() {
 
   return (
     <div className="app-shell">
+      {/* First stop for Tab: past the rail and the whole context panel to the question. */}
+      <a
+        className="app-skip-link"
+        href={`#${QUESTION_INPUT_ID}`}
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById(QUESTION_INPUT_ID)?.focus();
+        }}
+      >
+        Skip to question
+      </a>
       {fileDragActive && (
         <div className="app-drop-overlay" data-testid="app-drop-overlay">
           <p>Drop to upload</p>
@@ -1018,7 +1092,7 @@ function App() {
             onDelete={deleteConversation}
             onPin={pinConversation}
             onSearch={searchConversations}
-            disabled={pending}
+            streamingId={pending ? streamingConversationId : null}
           />
         )}
         {rail === 'corpus' && (
@@ -1042,16 +1116,21 @@ function App() {
             onSetTags={readOnly ? undefined : handleSetTags}
             readOnly={readOnly}
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
+            onRead={handleReadDocument}
           />
         )}
-        {rail === 'search' && (
-          <SearchPanel
-            filenames={selectedFilenames}
-            tags={selectedTags}
-            onOpenSource={handleOpenSource}
-            resetKey={searchResetKey}
-            onAuthFailure={noteAuthFailure}
-          />
+        {/* Kept once opened, hidden while another panel shows: its query and results
+            used to be lost on every switch to the corpus or traces and back. */}
+        {searchOpened && (
+          <div className="app-kept-panel" hidden={rail !== 'search'}>
+            <SearchPanel
+              filenames={selectedFilenames}
+              tags={selectedTags}
+              onOpenSource={handleOpenSource}
+              resetKey={searchResetKey}
+              onAuthFailure={noteAuthFailure}
+            />
+          </div>
         )}
         {rail === 'traces' && (
           <TracesPanel traces={traces} error={tracesError} onSelect={handleSelectTrace} />
@@ -1067,7 +1146,13 @@ function App() {
       <main className="app-main">
         {apiStatus === 'error' ? (
           <div className="app-main__unreachable" role="alert">
-            Cannot reach the DocRAG API &mdash; start the API service and refresh.
+            <p>
+              Cannot reach the DocRAG API &mdash; trying again on its own. Start the API service
+              if it isn&rsquo;t running.
+            </p>
+            <button type="button" onClick={retryBoot} data-testid="api-retry">
+              Retry now
+            </button>
           </div>
         ) : (
           <>
@@ -1080,15 +1165,16 @@ function App() {
               hasTurns={turns.length > 0}
               onClear={clear}
               onExport={exportMarkdown}
-              disabled={pending}
+              disabled={streamingHere}
               onOpenPalette={openPalette}
               inspectorOpen={inspectorOpen}
               onToggleInspector={toggleInspector}
             />
             <ChatThread
               turns={turns}
-              pending={pending}
-              stage={stage}
+              pending={streamingHere}
+              busy={pending}
+              stage={streamingHere ? stage : null}
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
@@ -1101,6 +1187,9 @@ function App() {
               onCitationLeave={handleCitationLeave}
               documentCount={indexedFilenames.length}
               documentsLoading={!corpusChecked}
+              suggestions={suggestions}
+              onSuggest={suggestQuestion}
+              onUpload={readOnly ? undefined : startUpload}
               focusTurn={focusTurn}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
@@ -1114,9 +1203,9 @@ function App() {
               onSubmit={askQuestion}
               // Typing is fine while the app boots; only sending waits for it.
               disabled={apiStatus === 'unauthorized' || noDocs}
-              sendHeld={booting}
-              hint={composerHint}
-              pending={pending}
+              sendHeld={booting || (pending && !streamingHere)}
+              hint={composerHint ?? (pending && !streamingHere ? streamingElsewhereHint : undefined)}
+              pending={streamingHere}
               onCancel={cancel}
               scopeLabel={currentScopeLabel}
               indexedFilenames={indexedFilenames}
@@ -1129,6 +1218,8 @@ function App() {
               provider={selectedProvider}
               onProviderChange={changeProvider}
               providerLabel={currentModelLabel ?? selectedProvider}
+              draftKey={activeConversationId ?? NEW_CONVERSATION_DRAFT}
+              prefill={prefill}
             />
           </>
         )}
@@ -1187,6 +1278,7 @@ function App() {
             <DocumentViewer
               filename={sourceView.filename}
               chunkId={sourceView.chunkId}
+              highlights={sourceView.highlights}
               onClose={() => setSourceView(null)}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable

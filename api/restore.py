@@ -11,6 +11,7 @@ are read, each through a capped read, so a zip bomb or a ``../`` name gets nowhe
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
@@ -31,6 +32,15 @@ logger = logging.getLogger(__name__)
 MAX_MEMBERS = 10_000
 _MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 _FEEDBACK_MAX_BYTES = 256 * 1024 * 1024
+# A feedback row is a few KB at most (the request caps below); a longer line is junk.
+_FEEDBACK_LINE_MAX_CHARS = 64 * 1024
+_FEEDBACK_BATCH_ROWS = 1000
+# The same limits POST /feedback enforces, so a restored row is one the API could store.
+_FEEDBACK_QUESTION_MAX = 4000
+_FEEDBACK_EXCERPT_MAX = 2000
+_FEEDBACK_CITED_MAX = 50
+_FEEDBACK_FILENAME_MAX = 1024
+_FEEDBACK_ID_MAX = 64
 
 
 class BackupImportError(ValueError):
@@ -191,41 +201,100 @@ def _restore_feedback(
     store: FeedbackStore,
     outcome: ImportOutcome,
 ) -> None:
-    raw = _read_capped(archive, info, _FEEDBACK_MAX_BYTES)
-    if raw is None:
-        logger.warning("Backup feedback.jsonl is over %d bytes; not restored.", _FEEDBACK_MAX_BYTES)
-        return
-    rows: list[Feedback] = []
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        row = _feedback_row(line)
-        if row is None:
-            outcome.feedback_skipped += 1
-        else:
-            rows.append(row)
-    added = store.import_rows(rows)
-    outcome.feedback_imported = added
-    outcome.feedback_skipped += len(rows) - added
+    """Add the backup's feedback rows, read line by line and stored in batches.
+
+    Reading the whole member and then decoding it held the file twice (up to 512 MiB);
+    this holds one line and one batch.
+    """
+
+    batch: list[Feedback] = []
+    consumed = 0
+
+    def flush() -> None:
+        added = store.import_rows(batch)
+        outcome.feedback_imported += added
+        outcome.feedback_skipped += len(batch) - added
+        batch.clear()
+
+    with (
+        archive.open(info) as handle,
+        # Only "\n" ends a row: a JSON string may hold a raw U+2028, which splitlines()
+        # treated as a line break and so cut the row in two.
+        io.TextIOWrapper(handle, encoding="utf-8", errors="replace", newline="\n") as text,
+    ):
+        while True:
+            line = text.readline(_FEEDBACK_LINE_MAX_CHARS)
+            if not line:
+                break
+            consumed += len(line)
+            too_long = not line.endswith("\n") and len(line) >= _FEEDBACK_LINE_MAX_CHARS
+            while too_long:
+                rest = text.readline(_FEEDBACK_LINE_MAX_CHARS)
+                consumed += len(rest)
+                if not rest or rest.endswith("\n") or consumed > _FEEDBACK_MAX_BYTES:
+                    break
+            if consumed > _FEEDBACK_MAX_BYTES:
+                logger.warning(
+                    "Backup feedback.jsonl is over %d bytes; restored only the rows before it.",
+                    _FEEDBACK_MAX_BYTES,
+                )
+                break
+            row = None if too_long else _feedback_row(line)
+            if row is None:
+                if line.strip():
+                    outcome.feedback_skipped += 1
+                continue
+            batch.append(row)
+            if len(batch) >= _FEEDBACK_BATCH_ROWS:
+                flush()
+    if batch:
+        flush()
 
 
 def _feedback_row(line: str) -> Feedback | None:
+    """One backup line as a feedback row, or None when it isn't one ``POST /feedback``
+    could have stored (a NaN timestamp used to fail the whole import in sqlite)."""
+
     if not line.strip():
         return None
     try:
         data = json.loads(line)
-        if data["rating"] not in ("up", "down") or not isinstance(data["question"], str):
+        if not isinstance(data, dict) or data.get("rating") not in ("up", "down"):
             return None
+        question = data["question"]
+        excerpt = str(data.get("answer_excerpt", ""))
+        row_id = str(data["id"])
+        trace_id = data.get("trace_id")
         cited = data.get("cited_filenames") or []
+        number = data.get("citation_source_number")
+        created_at = _uploaded_at(data.get("created_at"))
+        if (
+            not isinstance(question, str)
+            or not 0 < len(question) <= _FEEDBACK_QUESTION_MAX
+            or len(excerpt) > _FEEDBACK_EXCERPT_MAX
+            or not 0 < len(row_id) <= _FEEDBACK_ID_MAX
+            or (trace_id is not None and not isinstance(trace_id, str))
+            or (isinstance(trace_id, str) and len(trace_id) > _FEEDBACK_ID_MAX)
+            or not isinstance(cited, list)
+            or len(cited) > _FEEDBACK_CITED_MAX
+            or (number is not None and (isinstance(number, bool) or not isinstance(number, int)))
+            or (isinstance(number, int) and number < 1)
+            or created_at is None
+        ):
+            return None
         return Feedback(
-            id=str(data["id"]),
-            trace_id=data.get("trace_id") if isinstance(data.get("trace_id"), str) else None,
-            question=data["question"],
-            answer_excerpt=str(data.get("answer_excerpt", "")),
-            cited_filenames=[name for name in cited if isinstance(name, str)],
+            id=row_id,
+            trace_id=trace_id,
+            question=question,
+            answer_excerpt=excerpt,
+            cited_filenames=[
+                name
+                for name in cited
+                if isinstance(name, str) and len(name) <= _FEEDBACK_FILENAME_MAX
+            ],
             rating=data["rating"],
-            citation_source_number=data.get("citation_source_number")
-            if isinstance(data.get("citation_source_number"), int)
-            else None,
-            created_at=float(data["created_at"]),
+            citation_source_number=number,
+            created_at=created_at,
         )
     except (ValueError, KeyError, TypeError):
         return None

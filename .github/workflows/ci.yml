@@ -7,6 +7,11 @@ on:
   # meant a stacked PR (feature branch -> an unmerged fix branch) ran no CI at all,
   # which is exactly when review needs it most.
   pull_request:
+  # Weekly on main, even when nothing was pushed: dependencies, base images and actions
+  # are bumped by hand, so a new advisory against what is pinned would otherwise wait for
+  # the next push to be noticed (pip-audit, npm audit and the image scan below).
+  schedule:
+    - cron: "23 5 * * 1"
 
 # Read-only token: no job here writes to the repository.
 permissions:
@@ -49,9 +54,10 @@ jobs:
 
       - name: Run tests
         # Coverage on one leg only: the numbers are the same on both, and it slows the run.
+        # The floor sits 2 points under the measured total (94%), to catch untested additions.
         run: >-
           uv run pytest
-          ${{ matrix.python-version == '3.12' && '--cov=api --cov=eval --cov-report=term-missing:skip-covered' || '' }}
+          ${{ matrix.python-version == '3.12' && '--cov=api --cov=eval --cov-report=term-missing:skip-covered --cov-fail-under=92' || '' }}
 
       - name: Lint
         run: uv run ruff check .
@@ -212,6 +218,10 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # vitest strips types without checking them, so mocks could drift from api/types.ts.
+      - name: Typecheck tests
+        run: npm run typecheck:tests
+
       - name: Audit runtime dependencies
         # Runtime packages only (what the browser loads); build/test tooling advisories
         # never reach a user.
@@ -322,6 +332,30 @@ jobs:
       - name: Show logs on failure
         if: failure()
         run: docker compose -f docker-compose.yml -f .github/ci/compose.ci.yml logs --no-color
+
+      # The release's gate, run on every change: a base-image or dependency bump that
+      # brings in a fixable CRITICAL issue fails here, not first at tag time.
+      - name: Scan the image (fixable CRITICAL fails)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          image-ref: docrag:ci
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  dependency-review:
+    # What a pull request adds to the lockfiles: a dependency with a known vulnerability
+    # (or a license GitHub flags) is caught in review, before it reaches main.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
 
   docker-ocr:
     # The OCR variant adds apt packages the default image doesn't have; build it (not

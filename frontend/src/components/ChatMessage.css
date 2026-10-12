@@ -4,6 +4,15 @@
   animation: dr-in 0.3s ease both;
 }
 
+/* A long conversation (up to 100 answers) lays out and paints only the turns near the
+   viewport. Not the last few: the thread is pinned to the bottom by its measured
+   height, and those must be real. `auto` keeps each turn's last rendered height once
+   seen, so scrolling back up doesn't jump. */
+.chat-thread__rail > .chat-message:not(:nth-last-child(-n + 4)) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
+
 .chat-message:last-child {
   border-bottom: none;
 }

@@ -60,8 +60,9 @@ services:
     # Hardened: the image is immutable at runtime. Writable places are only the model
     # cache volume, /app/data when its volume is mounted, and a tmpfs /tmp (upload
     # spooling). No Linux capabilities and no privilege gain: the process needs neither.
-    # tmpfs is RAM, counted against mem_limit: a large POST /import upload or /export
-    # zip spools there, so raise API_MEM_LIMIT by the backup's size to move big ones.
+    # tmpfs is RAM, counted against mem_limit: a large POST /import upload spools there,
+    # so raise API_MEM_LIMIT by the backup's size to restore a big one. (/export streams
+    # its zip as it writes it and needs no room here.)
     read_only: true
     tmpfs:
       - /tmp

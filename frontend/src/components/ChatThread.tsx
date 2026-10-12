@@ -4,9 +4,15 @@ import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage'
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
 
+const NO_SUGGESTIONS: string[] = [];
+
 interface ChatThreadProps {
   turns: ChatTurn[];
+  /** An answer is being written into this conversation. */
   pending: boolean;
+  /** An answer is being written anywhere (here or in another conversation): retry,
+   *  regenerate and edit wait for it. Defaults to `pending`. */
+  busy?: boolean;
   // Live label for the stage the in-flight question is on, from the server's `stage`
   // SSE frames (see useChat). Optional so a caller that doesn't track it keeps the old
   // hardcoded labels rather than rendering nothing.
@@ -19,7 +25,7 @@ interface ChatThreadProps {
   onEditQuestion?: (turnId: string, question: string) => void;
   feedbackEnabled?: boolean;
   onFeedback?: (payload: FeedbackPayload) => void;
-  onOpenSource?: (filename: string, chunkId: string) => void;
+  onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
   onCitationHover?: (citation: CitationResponse) => void;
   onCitationLeave?: () => void;
   /** Indexed documents available to ask about. The empty state told users to upload
@@ -27,6 +33,11 @@ interface ChatThreadProps {
   documentCount?: number;
   /** The corpus listing hasn't come back yet, so documentCount 0 means "unknown". */
   documentsLoading?: boolean;
+  /** Example questions an empty conversation offers (onSuggest puts one in the box). */
+  suggestions?: string[];
+  onSuggest?: (question: string) => void;
+  /** Opens the file picker; absent for the read-only key. */
+  onUpload?: () => void;
   /** A turn to bring into view (a conversation search hit); a new object each time. */
   focusTurn?: { turnId: string } | null;
 }
@@ -81,6 +92,7 @@ function precedingUserQuestions(turns: ChatTurn[]): (string | undefined)[] {
 function ChatThread({
   turns,
   pending,
+  busy = pending,
   stage,
   engineerMode,
   currentModelLabel,
@@ -94,6 +106,9 @@ function ChatThread({
   onCitationLeave,
   documentCount = 0,
   documentsLoading = false,
+  suggestions = NO_SUGGESTIONS,
+  onSuggest,
+  onUpload,
   focusTurn = null,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -199,7 +214,7 @@ function ChatThread({
   // streamed token, and a polite region over it re-reads the whole answer each time.
   // One per message used to leave dozens of regions in a long conversation.
   const statusRegion = (
-    <span className="chat-thread__status" role="status" data-testid="chat-status">
+    <span className="chat-thread__status visually-hidden" role="status" data-testid="chat-status">
       {progressAnnouncement(pending, lastTurn, stage, justFinished)}
     </span>
   );
@@ -208,13 +223,41 @@ function ChatThread({
     return (
       <div className="chat-thread chat-thread--empty">
         {statusRegion}
-        <p>
-          {documentCount > 0
-            ? `Ask a question about your ${documentCount === 1 ? 'document' : `${documentCount} documents`}.`
-            : documentsLoading
-              ? 'Loading your documents…'
-              : 'Upload a document, then ask a question about it.'}
-        </p>
+        <div className="chat-thread__empty">
+          <p>
+            {documentCount > 0
+              ? `Ask a question about your ${documentCount === 1 ? 'document' : `${documentCount} documents`}.`
+              : documentsLoading
+                ? 'Loading your documents…'
+                : 'Upload a document, then ask a question about it.'}
+          </p>
+          {documentCount > 0 && onSuggest && suggestions.length > 0 && (
+            <ul className="chat-thread__suggestions" aria-label="Example questions">
+              {suggestions.map((suggestion) => (
+                <li key={suggestion}>
+                  <button
+                    type="button"
+                    className="chat-thread__suggestion"
+                    onClick={() => onSuggest(suggestion)}
+                    data-testid="chat-suggestion"
+                  >
+                    {suggestion}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {documentCount === 0 && !documentsLoading && onUpload && (
+            <button
+              type="button"
+              className="chat-thread__upload"
+              onClick={onUpload}
+              data-testid="chat-empty-upload"
+            >
+              Upload documents
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -249,7 +292,7 @@ function ChatThread({
             onRegenerate={onRegenerate}
             onEditQuestion={onEditQuestion}
             regenerateQuestion={turn.role === 'assistant' ? questions[index] : undefined}
-            busy={pending}
+            busy={busy}
             feedbackEnabled={feedbackEnabled}
             onFeedback={onFeedback}
             onOpenSource={onOpenSource}

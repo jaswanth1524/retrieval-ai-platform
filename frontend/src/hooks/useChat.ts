@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClientError, api } from '../api/client';
+import { api, apiErrorMessage } from '../api/client';
 import type {
   FeedbackRating,
   HistoryMessage,
@@ -149,7 +149,12 @@ export function stageLabel(stage: string): string {
 
 export interface UseChatResult {
   turns: ChatTurn[];
+  /** Any answer in flight, in whichever conversation. */
   pending: boolean;
+  /** The conversation the answer in flight is written to; null when none is. */
+  streamingConversationId: string | null;
+  /** The turns of the conversation asked in last (the active one's before any ask). */
+  askedTurns: ChatTurn[];
   // Human-readable label for the stage the in-flight question is on, or null when
   // nothing is in flight. Driven by real server `stage` events rather than a hardcoded
   // string, so a 30s retrieval no longer looks identical to a frozen UI.
@@ -215,6 +220,8 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
   };
 }
 
+const NO_TURNS: ChatTurn[] = [];
+
 // How long IndexedDB writes are held back so a burst of changes is written once.
 const CHAT_STORE_SAVE_DELAY_MS = 300;
 
@@ -222,6 +229,10 @@ export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
   const [pending, setPending] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
+  // Which conversation the answer in flight is written to (null when none is), and the
+  // one asked in last: other conversations can be opened while an answer streams.
+  const [streamingConversationId, setStreamingConversationId] = useState<string | null>(null);
+  const [askedConversationId, setAskedConversationId] = useState<string | null>(null);
   // True when the last persist attempt failed even after the reduced-payload retry
   // below — the session is memory-only from that point on until a write succeeds.
   const [persistError, setPersistError] = useState(false);
@@ -246,6 +257,14 @@ export function useChat(): UseChatResult {
 
   const storageRef = useRef(storage);
   storageRef.current = storage;
+  // The conversation asked in last, for what the background notice says once it ends.
+  const askedTurns = useMemo(
+    () =>
+      conversations.find((conversation) => conversation.id === askedConversationId)?.turns ??
+      activeConversation?.turns ??
+      NO_TURNS,
+    [conversations, askedConversationId, activeConversation],
+  );
   // The next IndexedDB write, held back by CHAT_STORE_SAVE_DELAY_MS (see the save effect).
   const pendingChatStoreRef = useRef<ChatStorageV2 | null>(null);
   const chatStoreTimerRef = useRef<number | undefined>(undefined);
@@ -474,6 +493,8 @@ export function useChat(): UseChatResult {
     const controller = new AbortController();
     inflightRef.current = controller;
     streamingConversationIdRef.current = conversationId;
+    setStreamingConversationId(conversationId);
+    setAskedConversationId(conversationId);
     const startedAt = Date.now();
     const updateTurns = (update: (turns: ChatTurn[]) => ChatTurn[], touch = true) =>
       setConversationTurns(conversationId, update, touch);
@@ -572,7 +593,7 @@ export function useChat(): UseChatResult {
             .map((turn) => (turn.id === assistantTurnId ? { ...turn, stopped: true } : turn)),
         );
       } else {
-        const message = err instanceof ApiClientError ? err.message : 'Something went wrong.';
+        const message = apiErrorMessage(err, 'Something went wrong.');
         // Whatever streamed before the failure is a fragment. Left unmarked it read as a
         // finished answer: it offered Regenerate and feedback, and went back to the
         // model as history on the next question.
@@ -589,6 +610,7 @@ export function useChat(): UseChatResult {
       flushDelta();
       streamingTurnIdRef.current = null;
       streamingConversationIdRef.current = null;
+      setStreamingConversationId(null);
       inflightRef.current = null;
       if (conversationId) {
         setStorage((prev) => applyDeleteHeldDuringStream(prev, conversationId, startedAt));
@@ -655,9 +677,7 @@ export function useChat(): UseChatResult {
   );
 
   const importConversation = useCallback((raw: unknown, title?: string) => {
-    // It becomes the active conversation: mid-answer, the rest of the stream would have
-    // landed in it.
-    if (pendingRef.current) return false;
+    // Fine mid-answer: the answer is written to the conversation it was asked in, by id.
     const candidate = Array.isArray(raw) ? { turns: raw } : raw;
     if (!candidate || typeof candidate !== 'object') return false;
     const record = candidate as Partial<Conversation>;
@@ -754,8 +774,13 @@ export function useChat(): UseChatResult {
     inflightRef.current?.abort();
   }, []);
 
+  // While an answer streams, only the conversation it is written to is held: the others
+  // can be opened, started, cleared and deleted (the answer goes to its own by id).
+  const isStreamingInto = (id: string | undefined | null) =>
+    pendingRef.current && id != null && id === streamingConversationIdRef.current;
+
   const clear = useCallback(() => {
-    if (pendingRef.current) return;
+    if (isStreamingInto(activeConversationRef.current?.id)) return;
     setStorage((prev) => ({
       ...prev,
       conversations: prev.conversations.map((conversation) =>
@@ -768,7 +793,6 @@ export function useChat(): UseChatResult {
   }, []);
 
   const newConversation = useCallback(() => {
-    if (pendingRef.current) return;
     setStorage((prev) => {
       // Reuse an already-empty active conversation instead of stacking blanks.
       const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
@@ -782,7 +806,6 @@ export function useChat(): UseChatResult {
   }, []);
 
   const switchConversation = useCallback((id: string) => {
-    if (pendingRef.current) return;
     setStorage((prev) =>
       prev.conversations.some((conversation) => conversation.id === id)
         ? { ...prev, activeConversationId: id }
@@ -802,7 +825,7 @@ export function useChat(): UseChatResult {
   }, []);
 
   const deleteConversation = useCallback((id: string) => {
-    if (pendingRef.current) return;
+    if (isStreamingInto(id)) return;
     setStorage((prev) => withoutConversation(prev, id, Date.now()));
   }, []);
 
@@ -875,6 +898,8 @@ export function useChat(): UseChatResult {
 
   return {
     turns,
+    streamingConversationId,
+    askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
     setScope,
     pruneScopes,

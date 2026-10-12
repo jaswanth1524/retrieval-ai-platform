@@ -2,16 +2,19 @@ import { useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 
 const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]';
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, iframe, [tabindex]';
 
 /** What Tab can actually reach inside ``container``, in order.
  *
  * ``summary`` (a <details> disclosure) is reachable but wasn't listed, so the trap
  * wrapped before it; and a button taken out of the tab order (an inactive tab,
- * tabindex=-1) was listed, so it could be the "last" item the trap waited for. */
+ * tabindex=-1) was listed, so it could be the "last" item the trap waited for. An
+ * iframe (the viewer's PDF) takes focus too; controls inside a hidden or inert part
+ * (the viewer's passages while it shows the PDF) can't, and as the "last" item they
+ * let Tab leave the dialog. */
 function tabbable(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-    (element) => element.getAttribute('tabindex') !== '-1',
+    (element) => element.getAttribute('tabindex') !== '-1' && !element.closest('[hidden], [inert]'),
   );
 }
 

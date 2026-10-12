@@ -141,6 +141,35 @@ def make_token_counter(model_name: str) -> TokenCounter:
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])|(?<=[。！？])\s*|\n{2,}")
 
 
+# For quoting only (citation spans), never for chunking: chunk text has a Markdown
+# heading flattened into the line ("…any time. ## Booking trips Book flights…"), and
+# with no capital after the period the chunker's rule saw one sentence, so a quote
+# carried the boilerplate before the heading with it.
+_SPAN_SPLIT_RE = re.compile(_SENTENCE_SPLIT_RE.pattern + r"|\s+(?=#{1,6}\s)")
+
+
+def sentence_spans(text: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of each sentence in ``text``, surrounding whitespace excluded —
+    positions in ``text`` itself, which the sentence units above (whitespace collapsed)
+    don't keep. The chunker's boundaries, plus one before a Markdown heading marker."""
+
+    spans: list[tuple[int, int]] = []
+    position = 0
+    for boundary in _SPAN_SPLIT_RE.finditer(text):
+        spans.append((position, boundary.start()))
+        position = boundary.end()
+    spans.append((position, len(text)))
+    trimmed: list[tuple[int, int]] = []
+    for start, end in spans:
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            trimmed.append((start, end))
+    return trimmed
+
+
 @dataclass(frozen=True)
 class _Unit:
     """One sentence (or forced fragment of an oversized sentence) with its metadata."""

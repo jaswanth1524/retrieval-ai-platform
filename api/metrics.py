@@ -21,6 +21,11 @@ questions_total = Counter(
     labelnames=("outcome", "error_type"),
 )
 
+rate_limited_total = Counter(
+    "docrag_rate_limited_total",
+    "Requests refused with 429 by RATE_LIMIT_PER_MINUTE.",
+)
+
 answer_cache_hits_total = Counter(
     "docrag_answer_cache_hits_total",
     "Questions answered from the answer cache (not counted in the stage histograms).",

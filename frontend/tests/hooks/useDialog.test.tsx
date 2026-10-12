@@ -77,4 +77,26 @@ describe('useDialog', () => {
     await userEvent.tab({ shift: true });
     expect(screen.getByText('prompt sent')).toHaveFocus();
   });
+
+  it('wraps past controls in a hidden part of the dialog', async () => {
+    // The viewer hides its passages (and their Load more buttons) while it shows the
+    // PDF; counted as the last item, a hidden button let Shift+Tab focus nothing.
+    function WithHiddenPart() {
+      const ref = useDialog(true, () => {});
+      return (
+        <div ref={ref}>
+          <button type="button">close</button>
+          <iframe title="pdf" />
+          <div hidden>
+            <button type="button">load more</button>
+          </div>
+        </div>
+      );
+    }
+    render(<WithHiddenPart />);
+
+    expect(screen.getByText('close')).toHaveFocus();
+    await userEvent.tab({ shift: true });
+    expect(screen.getByTitle('pdf')).toHaveFocus();
+  });
 });

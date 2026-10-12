@@ -332,15 +332,71 @@ describe('DocumentViewer dialog behaviour', () => {
       const frame = await screen.findByTestId('viewer-original-frame');
       expect(frame).toHaveAttribute('src', 'blob:docrag/1#page=4');
       expect(urls.created[0].type).toBe('application/pdf');
-      expect(getOriginalMock).toHaveBeenCalledWith('report.pdf');
+      expect(getOriginalMock).toHaveBeenCalledWith('report.pdf', expect.any(AbortSignal));
 
-      // Back and forth keeps the fetched copy.
+      // Back and forth keeps the fetched copy, and its URL stays live: revoking it on
+      // the switch left the frame pointing at a dead blob when it came back.
       await userEvent.click(screen.getByTestId('viewer-mode-passages'));
+      expect(urls.revoked).toEqual([]);
       await userEvent.click(screen.getByTestId('viewer-mode-original'));
       expect(getOriginalMock).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('viewer-original-frame')).toHaveAttribute(
+        'src',
+        'blob:docrag/1#page=4',
+      );
+      expect(urls.revoked).toEqual([]);
 
       unmount();
       expect(urls.revoked).toEqual(['blob:docrag/1']);
+    });
+
+    it('shows the original after switching away while it was still downloading', async () => {
+      stubObjectUrls();
+      getContentMock.mockResolvedValue(PDF_CONTENT);
+      let resolve: (blob: Blob) => void = () => {};
+      getOriginalMock.mockReturnValue(new Promise<Blob>((r) => (resolve = r)));
+      // Unmounted here, while URL is still stubbed (the stub is gone by RTL's cleanup).
+      const { unmount } = render(
+        <DocumentViewer filename="report.pdf" chunkId="p4" onClose={() => {}} canPreviewOriginal />,
+      );
+      await screen.findByText('Page four.');
+
+      await userEvent.click(screen.getByTestId('viewer-mode-original'));
+      await userEvent.click(screen.getByTestId('viewer-mode-passages'));
+      resolve(new Blob(['%PDF-1.4']));
+      await userEvent.click(screen.getByTestId('viewer-mode-original'));
+
+      expect(await screen.findByTestId('viewer-original-frame')).toHaveAttribute(
+        'src',
+        'blob:docrag/1#page=4',
+      );
+      expect(getOriginalMock).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('cancels the download and frees the URL when the viewer moves to another document', async () => {
+      const urls = stubObjectUrls();
+      getContentMock.mockResolvedValue(PDF_CONTENT);
+      const signals: AbortSignal[] = [];
+      getOriginalMock.mockImplementation((_name: string, signal?: AbortSignal) => {
+        if (signal) signals.push(signal);
+        return new Promise<Blob>(() => {});
+      });
+      const { rerender } = render(
+        <DocumentViewer filename="report.pdf" chunkId="p4" onClose={() => {}} canPreviewOriginal />,
+      );
+      await screen.findByText('Page four.');
+      await userEvent.click(screen.getByTestId('viewer-mode-original'));
+      expect(signals[0].aborted).toBe(false);
+
+      rerender(
+        <DocumentViewer filename="other.pdf" chunkId="p1" onClose={() => {}} canPreviewOriginal />,
+      );
+
+      expect(signals[0].aborted).toBe(true);
+      // The new document opens on its passages, not a stale "Loading the original…".
+      expect(screen.queryByTestId('viewer-original')).not.toBeInTheDocument();
+      expect(urls.revoked).toEqual([]);
     });
 
     it('explains a document whose original is not stored', async () => {
@@ -365,3 +421,38 @@ describe('DocumentViewer dialog behaviour', () => {
     });
   });
 });
+
+describe('DocumentViewer cited passages', () => {
+  it('marks each passage the answer rests on inside the cited chunk only', async () => {
+    // Emoji: the server's offsets count code points, JS strings UTF-16 units, so the
+    // passage is found by its text.
+    const text = '🌴 Holidays. 😀 Employees accrue twenty days. Unused days expire.';
+    getContentMock.mockResolvedValue({
+      filename: 'policy.md',
+      chunks: [
+        { chunk_id: 'c1', page: 1, section: 'Leave', text, chunk_ordinal: 1 },
+        { chunk_id: 'c2', page: 1, section: 'Other', text: 'Employees accrue twenty days.', chunk_ordinal: 2 },
+      ],
+      total_chunks: 2,
+    });
+    render(
+      <DocumentViewer
+        filename="policy.md"
+        chunkId="c1"
+        highlights={['Employees accrue twenty days.', 'Unused days expire.', 'Not in the text.']}
+        onClose={() => {}}
+      />,
+    );
+
+    const marks = await screen.findAllByTestId('viewer-quote');
+    expect(marks.map((mark) => mark.textContent)).toEqual([
+      'Employees accrue twenty days.',
+      'Unused days expire.',
+    ]);
+    // The chunk reads as before, and the other chunk is left alone.
+    const [cited, other] = screen.getAllByTestId('viewer-chunk');
+    expect(cited).toHaveTextContent(text);
+    expect(other.querySelector('mark')).toBeNull();
+  });
+});
+

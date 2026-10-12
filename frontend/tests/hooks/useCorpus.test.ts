@@ -239,7 +239,8 @@ describe('useCorpus', () => {
       }),
     );
     await act(() => upload);
-    expect(result.current.uploads[0].status).toBe('success');
+    // Indexed and listed: the finished card is dropped rather than kept all session.
+    expect(result.current.uploads).toEqual([]);
   });
 
   it('cancels a job the server accepts after Cancel was pressed mid-upload', async () => {
@@ -290,5 +291,51 @@ describe('useCorpus', () => {
       for (const done of finish) done();
       await upload;
     });
+  });
+
+  it('sends retried files through the same two send slots', async () => {
+    api.uploadDocument.mockRejectedValue(new ApiClientError('Server busy.', 500));
+    const { result } = setup();
+    const files = ['a.txt', 'b.txt', 'c.txt'].map((name) => new File(['x'], name));
+    await act(() => result.current.handleUpload(files));
+    expect(result.current.uploads.map((item) => item.status)).toEqual(['error', 'error', 'error']);
+
+    let sending = 0;
+    let most = 0;
+    const release: Array<() => void> = [];
+    api.uploadDocument.mockReset();
+    api.uploadDocument.mockImplementation(
+      (sent: File) =>
+        new Promise((resolve) => {
+          sending += 1;
+          most = Math.max(most, sending);
+          release.push(() => {
+            sending -= 1;
+            resolve({ job_id: `job-${sent.name}`, filename: sent.name, state: 'queued' });
+          });
+        }),
+    );
+    api.pollDocumentJob.mockImplementation(async (jobId: string) =>
+      jobStatus({ job_id: jobId, state: 'done' }),
+    );
+
+    let retries: Promise<unknown> | undefined;
+    act(() => {
+      retries = Promise.all(
+        result.current.uploads.map((item) => result.current.handleRetryUpload(item.id)),
+      );
+    });
+    await waitFor(() => expect(api.uploadDocument).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      while (release.length > 0) {
+        release.shift()?.();
+        await Promise.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      await retries;
+    });
+
+    expect(api.uploadDocument).toHaveBeenCalledTimes(3);
+    expect(most).toBe(2);
   });
 });

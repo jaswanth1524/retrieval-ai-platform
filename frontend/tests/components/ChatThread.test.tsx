@@ -342,4 +342,39 @@ describe('ChatThread progress announcement', () => {
       Element.prototype.scrollIntoView = original;
     }
   });
+
+  it('offers example questions about the documents, and an upload when there are none', async () => {
+    const onSuggest = vi.fn();
+    const onUpload = vi.fn();
+    const { rerender } = render(
+      <ChatThread
+        turns={[]}
+        pending={false}
+        engineerMode={false}
+        documentCount={0}
+        onUpload={onUpload}
+        onSuggest={onSuggest}
+        suggestions={['What are the key points of a.md?']}
+      />,
+    );
+    expect(screen.queryByTestId('chat-suggestion')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId('chat-empty-upload'));
+    expect(onUpload).toHaveBeenCalled();
+
+    rerender(
+      <ChatThread
+        turns={[]}
+        pending={false}
+        engineerMode={false}
+        documentCount={1}
+        onUpload={onUpload}
+        onSuggest={onSuggest}
+        suggestions={['What are the key points of a.md?']}
+      />,
+    );
+    expect(screen.queryByTestId('chat-empty-upload')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId('chat-suggestion'));
+    expect(onSuggest).toHaveBeenCalledWith('What are the key points of a.md?');
+  });
 });
+

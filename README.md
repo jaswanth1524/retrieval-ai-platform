@@ -7,12 +7,12 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Hybrid retrieval**: dense semantic search (`BAAI/bge-small-en-v1.5`) and sparse BM25 search (`Qdrant/BM25`, scored with Qdrant's IDF modifier so rare terms outweigh common ones), fused with Reciprocal Rank Fusion (`k=60`), then reranked with a cross-encoder (`jinaai/jina-reranker-v2-base-multilingual`). Queries are embedded symmetrically to the corpus (bge query instruction on the dense side, BM25's query-side encoding on the sparse side), and a post-rerank diversity filter drops near-duplicate chunks so context slots go to distinct passages.
 - **Token-aware chunking**: chunks are sized by the dense model's real subword tokens (not word counts) and split on sentence boundaries, so an embedded chunk never silently overflows the model's 512-token limit.
 - **Broad format support**: PDF (with table extraction and optional OCR for scanned pages), DOCX, HTML, CSV, TXT, Markdown, EPUB (chapters in reading order; the chapter number is the cited page) and email `.eml` files (headers and body; attachments are not indexed). OCR is an optional extra (`uv sync --extra ocr`). `GET /config` lists the accepted types (`supported_extensions`), and the UI follows it.
-- **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder. Each answer also reports `answer_status` — `answered`, `insufficient_context` (the model said the documents don't cover it and cited nothing) or `no_context` (nothing cleared the rerank bar) — and the best `top_rerank_score`; the UI marks those answers "not in your documents". Citation markers (`[2]`, `[1, 2]`, `[1-3]`) in the answer text are buttons that open the cited passage.
+- **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder. Each answer also reports `answer_status` — `answered`, `insufficient_context` (the model said the documents don't cover it and cited nothing) or `no_context` (nothing cleared the rerank bar) — and the best `top_rerank_score`; the UI marks those answers "not in your documents". Citation markers (`[2]`, `[1, 2]`, `[1-3]`) in the answer text are buttons that open the cited passage. Each cited source also says which part of its chunk the answer rests on (`spans`: the quoted sentence or two, matched from the answer without any model call), and the viewer marks it.
 - **Search without an answer**: `POST /search` returns the ranked passages for a query — the same hybrid search, RRF and rerank a question uses, with no LLM call — so finding things in your documents works even when the LLM is down. The UI has it as the Search panel in the left rail (and in the ⌘K palette), scoped like a question.
 - **Multi-query expansion** (opt-in): rewrite the query into several phrasings, retrieve each, and RRF-fuse before reranking — off by default (`QUERY_EXPANSION_ENABLED`).
 - **Conversation memory**: the client sends recent chat turns with each question; when history is present, one extra LLM call rewrites a follow-up ("what about the second one?") into a standalone retrieval query before hybrid search runs. The server itself stores no session state.
-- **Multi-conversation chat**: named conversations with new/switch/rename/delete, persisted locally across reloads (older single-thread history migrates automatically). Up to 10 conversations can be pinned: they are listed first and never dropped by the 20-conversation cap. The conversation search matches what was asked and answered, not just titles, and opens a match at the turn it was found in.
-- **Document management**: upload documents (or drop files anywhere on the page), track background ingestion progress (failed uploads can be retried or dismissed; `DELETE /documents/jobs/{id}` cancels a job before it writes anything), list the full indexed corpus, and delete a document's chunks. With originals kept, a document's uploaded file can be downloaded again from its card or the source viewer.
+- **Multi-conversation chat**: named conversations with new/switch/rename/delete, persisted locally across reloads (older single-thread history migrates automatically). Up to 10 conversations can be pinned: they are listed first and never dropped by the 20-conversation cap. The conversation search matches what was asked and answered, not just titles, and opens a match at the turn it was found in. Other conversations stay usable while an answer streams (it keeps writing to the one it was asked in), and an unsent question is kept per conversation.
+- **Document management**: upload documents (or drop files anywhere on the page), track background ingestion progress (failed uploads can be retried or dismissed; `DELETE /documents/jobs/{id}` cancels a job before it writes anything), list the full indexed corpus (sorted, filtered by name or tag), read a document from its card, and delete, tag or re-index several at once. With originals kept, a document's uploaded file can be downloaded again from its card or the source viewer.
 - **Re-index from stored originals** (opt-in): with `RAW_DOCUMENT_DIR` set, the original upload is kept and a document can be re-chunked and re-embedded without re-uploading it — `POST /documents/{filename}/reindex`, or `POST /documents/reindex` for every document chunked by an older chunker version (the corpus panel flags those and offers a ↻ button).
 - **Source viewer**: click a citation to open the source document reconstructed from its chunks, scrolled to and highlighting the cited passage. It fetches a page around the citation (`GET /documents/{filename}/content?around=<chunk_id>&radius=N`, or `start`/`end` ordinals) rather than the whole document, and says so when a re-index has replaced the cited passage. With originals kept, a PDF can also be shown as the original file, opened at the cited page in the browser's own PDF viewer.
 - **Per-document search scope and tags**: restrict a question to a chosen subset of the indexed corpus, or tag documents (`PATCH /documents/{filename}/tags`, edited inline in the corpus panel — no re-embedding) and scope by tag. Each conversation keeps its own scope.
@@ -21,9 +21,10 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Per-query debug traces**: every question's retrieval candidates, rerank keep/drop decisions, the exact LLM prompt, and stage timings are recorded and browsable via `GET /traces`, a per-message drawer, and a trace-history browser in the UI.
 - **Chat UX**: markdown-rendered answers (images in answers are never loaded — only their alt text shows, so a poisoned document can't make the browser fetch a URL; links open in a new tab), copy-to-clipboard with the citations as footnotes, retry on failure, edit a question and ask again in a forked conversation, chat export (Markdown/JSON) and JSON import, conversation search (list and ⌘K palette), keyboard shortcuts (⌘K palette, ⌘⇧O new chat, ⌘U upload, ⌘, settings, ⌘J theme, `/` focus the question box, Esc stop the answer), and a responsive layout with a light/dark theme that follows the OS until you pick one — on narrow screens the side panel and the inspector open as drawers. Works over plain HTTP on a LAN address (Compose serves loopback only unless `API_BIND=0.0.0.0`; set `API_KEY` too), and several tabs share one history. History lives in IndexedDB (localStorage keeps a compact copy for first paint), so it isn't capped by localStorage's ~5 MB.
 - **Evaluation harness**: retrieval-quality metrics (hit@k, recall@k, MRR, nDCG@k) at file and chunk level over a labeled dataset — measured on the same retrieval path the API runs, per stage (`--arm reranked|fused|dense|sparse`) — with a fixture corpus, a committed baseline and a regression gate that refuses to compare mismatched runs, plus an answer-generation mode feeding the RAGAS runner (`eval/harness.py`; RAGAS can judge with a local model via `--llm`). CI runs the handbook set against its baseline on every push.
-- **Access and limits**: an optional shared `API_KEY`, plus an optional read-only `API_READ_KEY` for people who should ask questions but not change the corpus (403 on uploads, deletes, re-index, tags, export, import, feedback and metrics; the UI asks `GET /access` and hides those controls). `ALLOWED_REQUEST_PROVIDERS` limits which LLM providers a question may switch to, so a caller can't pick a paid one. Unauthorized or oversized requests are refused before their body is read. At most `MAX_CONCURRENT_QUESTIONS` questions run at once; past that a question gets 429 + `Retry-After`, and uploads past the indexing queue's limit wait and retry on their own.
+- **Access and limits**: an optional shared `API_KEY`, plus an optional read-only `API_READ_KEY` for people who should ask questions but not change the corpus (403 on uploads, deletes, re-index, tags, export, import, feedback and metrics; the UI asks `GET /access` and hides those controls). `ALLOWED_REQUEST_PROVIDERS` limits which LLM providers a question may switch to, so a caller can't pick a paid one. Unauthorized or oversized requests are refused before their body is read. At most `MAX_CONCURRENT_QUESTIONS` questions run at once; past that a question gets 429 + `Retry-After`, and uploads past the indexing queue's limit wait and retry on their own. `RATE_LIMIT_PER_MINUTE` (off by default) caps each client's changes and wrong-key attempts per minute.
 - **Backup and restore**: `GET /export` (full key; "Download a backup" in the ⌘K palette) returns a zip with a manifest of every document (tags, upload time, chunker version), the stored originals and the feedback rows. `POST /import` ("Restore documents from a backup") re-indexes each stored original with its tags and upload time and adds the feedback back; documents already indexed are kept as they are.
 - **Feedback review**: with `FEEDBACK_ENABLED`, a Feedback panel lists answer ratings (filter to thumbs-down) and opens a rated answer's trace.
+- **Security headers**: the UI is served with a strict Content-Security-Policy and may not be framed; every response carries `nosniff` and `no-referrer`. Text in a document imitating a prompt source header (`[2] filename=…`) is rewritten, without its number, before it reaches the model. See [SECURITY.md](SECURITY.md).
 - **Observability**: configurable application logging (`LOG_LEVEL`; `LOG_FORMAT=json` for one JSON object per line), an `X-Request-ID` on every response that also appears in every log line and in the request's trace, `GET /metrics` (Prometheus), `GET /health` (liveness), `GET /health/ready` (readiness — probes Qdrant and the generation provider).
 - **Provider flexibility**: local Ollama by default; any self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio — `LLM_PROVIDER=openai_compatible`) or OpenAI itself are user-selectable alternatives for generation only — embeddings always stay local. Provider errors reach clients as a short reason, never the provider's raw message.
 
@@ -83,11 +84,16 @@ Qdrant server-side hybrid query is used where available (with `QDRANT_PREFER_GRP
 ├── Dockerfile
 ├── .env.example
 ├── README.md
+├── SECURITY.md
+├── CHANGELOG.md
+├── Makefile        # `make check`: the gates CI runs
 ├── pyproject.toml
 ├── api/            # FastAPI backend
 ├── frontend/       # React + Vite + TypeScript UI
 ├── eval/           # retrieval harness, RAGAS runner, fixture corpus, datasets, baselines
-└── tests/          # backend test suite
+├── tests/          # backend test suite (golden chunking and OpenAPI snapshots in tests/golden/)
+├── docs/           # design notes
+└── .github/        # CI and release workflows
 ```
 
 ## Run it
@@ -144,7 +150,10 @@ Backend (`uv`-managed, from repo root):
 uv sync --extra dev            # install backend + test + lint + typecheck deps
 uv run pytest                  # run backend test suite
 uv run ruff check .            # lint
+uv run ruff format .           # format (CI checks it)
 uv run mypy api eval           # typecheck (strict mode)
+make check                     # the backend and frontend gates CI runs (not e2e)
+make golden                    # regenerate the chunking and OpenAPI snapshots, then review the diff
 ```
 
 Frontend (`frontend/`, npm-managed):
@@ -154,25 +163,42 @@ npm ci                         # install deps (matches CI)
 npm run test                   # vitest run (all tests)
 npm run build                  # tsc -b && vite build -> frontend/dist
 npm run lint                   # oxlint
+npm run typecheck:tests        # type-check the vitest suite (vitest itself doesn't)
 npx playwright install chromium   # once: browser for the E2E suite
 npm run e2e                    # Playwright E2E: prod build + mocked API (desktop + mobile smoke)
 npm run e2e:smoke              # @smoke specs only
 ```
 
-CI (`.github/workflows/ci.yml`) runs six jobs on every push/PR (the last on pushes to `main` only), with a read-only token and superseded runs cancelled:
+CI (`.github/workflows/ci.yml`) runs seven jobs on every push/PR (dependency-review on pull requests only, docker-ocr on pushes to `main` only), with a read-only token and superseded runs cancelled:
 
-- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12; each test times out after 120 s) → ruff check → ruff format --check → mypy → import the eval extra → validate the eval datasets → `pip-audit` of the runtime dependencies.
+- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → ruff check → ruff format --check → mypy → import the eval extra → validate the eval datasets → `pip-audit` of the runtime dependencies.
 - **qdrant**: the server-only tests (`tests/test_qdrant_server.py`: server-side hybrid query, IDF, payload indexes, tags) against a `qdrant/qdrant:v1.19.1` service container — they skip locally unless `DOCRAG_TEST_QDRANT_URL` is set — then the retrieval eval on the handbook set against its committed baseline (models cached between runs).
-- **frontend**: vitest → build → lint → `npm audit --omit=dev`.
+- **frontend**: vitest → build → lint → type-check the tests → `npm audit --omit=dev`.
+- **dependency-review** (pull requests): fails on a newly added dependency with a known high-severity vulnerability.
 - **e2e**: Playwright against the production build with a mocked API.
-- **docker**: builds the image (layer cache in GitHub Actions), boots it through Compose with the hardened settings and a real Qdrant, and checks `/health`, `/health/ready`, the served UI and the reported version.
+- **docker**: builds the image (layer cache in GitHub Actions), boots it through Compose with the hardened settings and a real Qdrant, checks `/health`, `/health/ready`, the served UI and the reported version, and scans the image with Trivy (a fixable CRITICAL vulnerability fails).
+
+CI also runs weekly on `main` (Monday 05:23 UTC), so a new advisory against a pinned dependency or base image is noticed without a push.
 - **docker-ocr**: builds the image with `UV_EXTRAS=ocr`.
 
-Releases (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` that matches `version` in `pyproject.toml` publishes `ghcr.io/<owner>/<repo>:X.Y.Z` (linux/amd64 and linux/arm64) with build provenance and an SBOM, signs it with cosign (keyless), scans it with Trivy (a fixable CRITICAL vulnerability stops the release before the push; HIGH findings go to the Security tab) and creates the GitHub release from that version's `CHANGELOG.md` section, which must exist and be non-empty (`tests/test_release_metadata.py` checks it, and that `frontend/package.json` and the Qdrant pins agree). The first push of a package to GHCR may start private: set it to public in the package settings if you want anonymous pulls.
+Releases (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` that matches `version` in `pyproject.toml`, on a commit that is on `main` and whose CI passed (the release waits up to an hour for that run), publishes `ghcr.io/<owner>/<repo>:X.Y.Z` (linux/amd64 and linux/arm64) with build provenance and an SBOM, signs it with cosign (keyless), scans it with Trivy (a fixable CRITICAL vulnerability in either the amd64 or the arm64 image stops the release before the push; HIGH findings go to the Security tab) and creates the GitHub release from that version's `CHANGELOG.md` section, which must exist and be non-empty (`tests/test_release_metadata.py` checks it, and that `frontend/package.json` and the Qdrant pins agree). The first push of a package to GHCR may start private: set it to public in the package settings if you want anonymous pulls.
 
 ## Configuration
 
 All runtime configuration lives in `api/settings.py` (`AppSettings`, pydantic-settings) and is read from environment variables — see `.env.example` for the full list with defaults and explanatory comments, including hybrid-retrieval tuning (`RRF_K`, `RERANK_TOP_K`, `RERANK_MIN_SCORE`, ...), chunking (`CHUNK_SIZE_TOKENS`, `CHUNK_OVERLAP_TOKENS`, ...), conversation memory (`CONVERSATION_CONDENSE_ENABLED`, `CONVERSATION_MAX_HISTORY_MESSAGES`), and provider selection (`LLM_PROVIDER`, `OPENAI_API_KEY`, ...).
+
+## API reference
+
+The API documents itself: Swagger UI at `/docs`, ReDoc at `/redoc`, the schema at `/openapi.json` (all behind `API_KEY` when one is set). `tests/golden/openapi.json` is the committed copy; a change to the API shows up as a diff there.
+
+## Troubleshooting
+
+- **"Cannot reach Ollama" / answers fail, uploads work.** Generation needs Ollama running on the host (`ollama serve`) with the model pulled (`ollama pull llama3.1:8b`); `OLLAMA_BASE_URL` points the container at `host.docker.internal`. `/health/ready` says which dependency is down. Upload, indexing and passage search never need the LLM.
+- **409 "Questions and uploads are refused until the index matches the configuration".** The collection was indexed with a different embedding model or tag, and questions are refused rather than compared across vector spaces. Restore the previous embedding settings, or rebuild: download a backup (⌘K → Download a backup), delete every document, then restore the backup; it re-indexes from the stored originals.
+- **The API restarts, exit code 137.** Out of memory: give Docker at least 4 GB, and keep `RERANKER_BATCH_SIZE` at or below `RERANK_CANDIDATES` (see the note under Run it).
+- **"API unreachable" in the UI.** The page retries on its own and has a Retry now button; check `docker compose ps` and the API logs. A blank page after an upgrade is a stale tab: reload it.
+- **The UI is blank or blocked when served from another origin.** The bundled Content-Security-Policy allows requests to the page's own origin only. A frontend hosted elsewhere (`VITE_API_BASE_URL`) needs its own policy and `CORS_ALLOW_ORIGINS` on the API.
+- **`docker compose pull` of a release is denied.** A package pushed to GHCR for the first time can be private; make it public in its package settings, or log in to GHCR.
 
 ## Evaluation (optional)
 
@@ -330,7 +356,9 @@ existing collection automatically, with no re-ingest.
 - `Dockerfile`: multi-stage build — Node builds `frontend/`, uv builds the Python venv, and a plain `python:3.12-slim` stage runs the API as a non-root user with a container healthcheck (base images pinned by digest).
 - `api/settings.py`, `api/qdrant_schema.py`: backend configuration and Qdrant collection schema/versioning helpers.
 - `api/documents.py`, `api/parsers/`, `api/chunking.py`: the chunk model and a suffix → parser table; one parser module per format (PDF, DOCX, HTML, CSV, text/Markdown, EPUB, email); token-aware sentence windowing.
-- `api/static_files.py`: serves the built UI — the precompressed `.br`/`.gz` copies the build writes, a year of caching for content-hashed assets, revalidation for `index.html`.
+- `api/static_files.py`: serves the built UI — the precompressed `.br`/`.gz` copies the build writes, a year of caching for content-hashed assets, revalidation for `index.html`, and the UI's Content-Security-Policy.
+- `api/security_headers.py`: `nosniff` and `no-referrer` on every response, and the policy string the UI is served with.
+- `api/rate_limit.py`: the per-client token bucket behind `RATE_LIMIT_PER_MINUTE`.
 - `api/upload.py`, `api/raw_documents.py`: size-capped upload reads, and the opt-in store of original uploads.
 - `api/request_guard.py`: rejects unauthorized or oversized requests before their body is read.
 - `api/request_id.py`: the `X-Request-ID` middleware and the log filter that stamps it.
@@ -352,6 +380,8 @@ existing collection automatically, with no re-ingest.
 - `eval/harness.py`, `eval/metrics.py`: live retrieval/answer harness and its metric math.
 - `eval/ragas_runner.py`, `eval/datasets/`, `eval/corpus/`, `eval/baselines/`: optional RAGAS runner, sample datasets, the fixture corpus they are labeled against, and a committed baseline.
 - `CHANGELOG.md`: what changed per release, and whether it needs a re-index.
+- `SECURITY.md`: how to report a vulnerability, and what DocRAG does and leaves to you.
+- `Makefile`: `make check` (the backend and frontend gates CI runs), `make golden`, `make e2e`.
 - `docs/`: design notes; `docs/history/` keeps the earlier audit and task plan for reference.
 
 ## License

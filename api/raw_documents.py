@@ -83,6 +83,30 @@ class RawDocumentStore:
         path = self._path_for(filename)
         return path if _is_file(path) else None
 
+    def stored_names(self) -> set[str]:
+        """Names of every stored original, from one directory read.
+
+        For the document listing, which used to stat each document's path in turn.
+        Exact names: with originals stored, uploads that differ only by case or
+        Unicode form are refused (``ingest_jobs.refuse_near_duplicate_name``), so a
+        document's original is stored under its own name.
+        """
+
+        names: set[str] = set()
+        try:
+            with os.scandir(self._directory) as entries:
+                for entry in entries:
+                    if _TEMP_FILE_NAME.fullmatch(entry.name):
+                        continue
+                    try:
+                        if entry.is_file():
+                            names.add(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            logger.warning("Cannot list stored originals in %s", self._directory, exc_info=True)
+        return names
+
     def size(self, filename: str) -> int | None:
         """Size in bytes of the stored original, or None when none is stored."""
 

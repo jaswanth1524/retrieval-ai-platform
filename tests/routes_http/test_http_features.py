@@ -357,6 +357,85 @@ def test_an_export_restores_into_a_fresh_instance(tmp_path: Path) -> None:
         assert again["feedback_imported"] == 0 and again["feedback_skipped"] == 1
 
 
+def test_import_skips_feedback_rows_the_api_could_not_have_stored(tmp_path: Path) -> None:
+    """A NaN timestamp used to raise sqlite's IntegrityError and 500 the whole import."""
+
+    good = {
+        "id": "good",
+        "question": "q",
+        "answer_excerpt": "a",
+        "rating": "up",
+        "created_at": 1.0,
+        "cited_filenames": ["guide.txt"],
+        "citation_source_number": 2,
+    }
+    bad_rows = [
+        {**good, "id": "nan", "created_at": float("nan")},
+        {**good, "id": "bool-number", "citation_source_number": True},
+        {**good, "id": "zero-number", "citation_source_number": 0},
+        {**good, "id": "long-question", "question": "q" * 4001},
+        {**good, "id": "long-trace", "trace_id": "t" * 65},
+        {**good, "id": "x" * 65},
+        {**good, "id": "many-cited", "cited_filenames": ["a"] * 51},
+        {**good, "id": "bad-rating", "rating": "meh"},
+    ]
+    lines = [json.dumps(good)] + [json.dumps(row) for row in bad_rows]
+    lines += ["not json", "[1, 2]", "x" * 70_000]
+    # A raw U+2028 inside a JSON string is legal and must not split the row.
+    lines.append(json.dumps({**good, "id": "sep", "question": "a\u2028b"}, ensure_ascii=False))
+    content = _zip(
+        {
+            "manifest.json": json.dumps({"manifest_version": 1, "documents": []}).encode(),
+            "feedback.jsonl": ("\n".join(lines) + "\n").encode(),
+        }
+    )
+
+    with _backup_client(tmp_path, "x") as client:
+        response = _import(client, content)
+        assert response.status_code == 202
+        body = response.json()
+        assert body["feedback_imported"] == 2
+        assert body["feedback_skipped"] == len(bad_rows) + 3
+        stored = client.get("/feedback", headers=FULL).json()
+    assert sorted(row["question"] for row in stored["feedback"]) == ["a\u2028b", "q"]
+
+
+def test_import_reads_the_listing_once_and_refuses_case_twins_inside_one_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from api.repository import VectorRepository
+
+    names = ["Report.txt", "notes.txt", "report.txt", "other.txt"]
+    manifest = {
+        "manifest_version": 1,
+        "documents": [{"filename": name, "original": f"originals/{name}"} for name in names],
+    }
+    members = {"manifest.json": json.dumps(manifest).encode()}
+    members.update({f"originals/{name}": b"Intro\nalpha" for name in names})
+    calls: list[int] = []
+    listing = VectorRepository.filename_metadata
+
+    def counting_listing(self: VectorRepository, settings: Any) -> Any:
+        calls.append(1)
+        return listing(self, settings)
+
+    with _backup_client(tmp_path, "x") as client:
+        monkeypatch.setattr(VectorRepository, "filename_metadata", counting_listing)
+        body = _import(client, _zip(members)).json()
+        monkeypatch.undo()
+        for job in body["jobs"]:
+            wait_for_job_with(client, job["job_id"])
+
+    assert sorted(job["filename"] for job in body["jobs"]) == [
+        "Report.txt",
+        "notes.txt",
+        "other.txt",
+    ]
+    assert body["rejected"] == ["report.txt"]
+    # One for the skip check, one for the name check: not one per document.
+    assert len(calls) <= 2
+
+
 def wait_for_job_with(client: Any, job_id: str) -> dict[str, Any]:
     return wait_for_job(client, job_id, headers=FULL)
 

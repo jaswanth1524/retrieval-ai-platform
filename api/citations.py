@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 
+from api.chunking import sentence_spans
 from api.llm import ChatGenerator, ChatMessage, GenerationError
 from api.reranking import RerankedChunk
 from api.settings import AppSettings
@@ -14,7 +16,11 @@ from api.settings import AppSettings
 # One bracketed citation marker: [3], and the list/range forms models also write —
 # [1, 2], [1-3], [1–3], [1, 3-4]. Matching only [3] counted "[1, 2]" as uncited, which
 # cost a retry LLM call and could end with no sources at all.
-_CITATION_RE = re.compile(r"\[(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\]")
+# Numbers are capped at 6 digits: int() refuses a string past 4300 digits, so one
+# degenerate "[999…9]" in an answer turned a finished stream into a server error.
+_CITATION_RE = re.compile(
+    r"\[(\d{1,6}(?:\s*[-–]\s*\d{1,6})?(?:\s*,\s*\d{1,6}(?:\s*[-–]\s*\d{1,6})?)*)\]"
+)
 
 
 _CITATION_RANGE_SEP = re.compile(r"\s*[-–]\s*")
@@ -60,6 +66,20 @@ def _normalize_negation(text: str) -> str:
 
 
 @dataclass(frozen=True)
+class CitationSpan:
+    """The part of a cited chunk an answer's claim rests on.
+
+    ``start``/``end`` index the chunk's full text (the ``text`` that
+    ``GET /documents/{filename}/content`` returns for it) in code points; ``quote`` is
+    that slice, so a client can find it even where its string indexing differs.
+    """
+
+    start: int
+    end: int
+    quote: str
+
+
+@dataclass(frozen=True)
 class SourceCitation:
     """Source metadata returned with each generated answer."""
 
@@ -69,6 +89,16 @@ class SourceCitation:
     section: str
     chunk_id: str
     text: str
+    # Filled in once the answer exists (attach_spans); empty before generation.
+    spans: tuple[CitationSpan, ...] = ()
+
+
+def citation_from_dict(data: dict[str, Any]) -> SourceCitation:
+    """A citation back from its ``dataclasses.asdict`` form (a ``done`` frame's sources)."""
+
+    fields = {key: value for key, value in data.items() if key != "spans"}
+    spans = tuple(CitationSpan(**span) for span in data.get("spans") or ())
+    return SourceCitation(**fields, spans=spans)
 
 
 def source_citations(chunks: Sequence[RerankedChunk]) -> list[SourceCitation]:
@@ -129,6 +159,186 @@ def cited_numbers(text: str, max_number: int) -> set[int]:
             if start <= end:
                 numbers.update(range(start, min(end, max_number) + 1))
     return numbers
+
+
+# Exact spans. No model involved: each answer sentence's content words are matched
+# against the cited chunk's sentences (and pairs of them, for a claim that spans two),
+# and the best-covering one is quoted. Below these bars nothing is claimed, rather than
+# highlighting a passage that merely shares a word or two with the answer.
+SPAN_MIN_SHARED_WORDS = 2
+SPAN_MIN_COVERAGE = 0.3
+MAX_SPANS_PER_SOURCE = 3
+_WORD_RE = re.compile(r"\w+")
+_STOPWORDS = frozenset(
+    "a an and are as at be been but by can could do does for from had has have how if in "
+    "into is it its may might must no not of on or our shall should so such than that the "
+    "their them then there these they this those to was we were what when where which "
+    "who whom why will with would you your".split()
+)
+# Answer sentences: after a sentence end, and at every line break (lists, headings).
+_ANSWER_SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+|\n+")
+_LEADING_MARKERS_RE = re.compile(r"(?:\s*" + _CITATION_RE.pattern + r")+")
+
+
+_NUMBER_UNITS = {
+    word: value
+    for value, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+        "fourteen fifteen sixteen seventeen eighteen nineteen".split()
+    )
+}
+_NUMBER_TENS = {
+    word: value * 10
+    for value, word in enumerate(
+        "twenty thirty forty fifty sixty seventy eighty ninety".split(), start=2
+    )
+}
+_NUMBER_SCALES = {"hundred": 100, "thousand": 1000}
+
+
+def _words(text: str) -> list[str]:
+    """Lower-cased words, with spelled-out numbers as digits: a document saying
+    "forty-five euros" and an answer saying "45 euros" share the word "45"."""
+
+    words: list[str] = []
+    total = current = 0
+    in_number = False
+    last_unit = False
+    previous_end = 0
+
+    def flush() -> None:
+        nonlocal total, current, in_number, last_unit
+        if in_number:
+            words.append(str(total + current))
+        total = current = 0
+        in_number = last_unit = False
+
+    for match in _WORD_RE.finditer(text):
+        word = match.group(0).lower()
+        # A number runs across spaces and hyphens only: "five, six" is two numbers.
+        if in_number and text[previous_end : match.start()].strip(" -"):
+            flush()
+        previous_end = match.end()
+        if word in _NUMBER_UNITS and last_unit:
+            flush()  # "one two": two numbers, not three
+        if word in _NUMBER_UNITS or word in _NUMBER_TENS:
+            current += _NUMBER_UNITS.get(word, 0) + _NUMBER_TENS.get(word, 0)
+            in_number = True
+            last_unit = word in _NUMBER_UNITS
+        elif word in _NUMBER_SCALES and in_number:
+            last_unit = False
+            if _NUMBER_SCALES[word] == 1000:
+                total, current = (total + current) * 1000, 0
+            else:
+                current = max(current, 1) * 100
+        elif word == "and" and in_number:
+            continue  # "one hundred and five"
+        else:
+            flush()
+            words.append(word)
+    flush()
+    return words
+
+
+def _content_words(text: str) -> set[str]:
+    return {
+        word
+        for word in _words(text)
+        if word not in _STOPWORDS and (len(word) > 1 or word.isdigit())
+    }
+
+
+def _claims_by_source(answer: str, max_number: int) -> dict[int, list[set[str]]]:
+    """For each cited source number, the content words of every sentence citing it."""
+
+    claims: dict[int, list[set[str]]] = {}
+    previous: set[str] | None = None
+    for piece in _ANSWER_SENTENCE_RE.split(answer):
+        if not piece.strip():
+            continue
+        # "...twenty days. [2] Next..." splits after the period: a marker opening a
+        # piece belongs to the sentence before it.
+        leading = _LEADING_MARKERS_RE.match(piece)
+        if leading is not None and previous is not None:
+            for number in cited_numbers(leading.group(0), max_number):
+                claims.setdefault(number, []).append(previous)
+            piece = piece[leading.end() :]
+        words = _content_words(_CITATION_RE.sub(" ", piece))
+        for number in cited_numbers(piece, max_number):
+            claims.setdefault(number, []).append(words)
+        previous = words
+    return claims
+
+
+def _best_span(
+    claim: set[str], text: str, sentences: Sequence[tuple[int, int]]
+) -> tuple[tuple[float, int, int], int, int] | None:
+    # A pair only when each of its sentences carries part of the claim by itself:
+    # otherwise one shared word ("staff") pulled an unrelated sentence into the quote.
+    relevant = [
+        len(claim & _content_words(text[start:end])) >= SPAN_MIN_SHARED_WORDS
+        for start, end in sentences
+    ]
+    candidates = [*sentences]
+    candidates += [
+        (sentences[i][0], sentences[i + 1][1])
+        for i in range(len(sentences) - 1)
+        if relevant[i] and relevant[i + 1]
+    ]
+    best: tuple[tuple[float, int, int], int, int] | None = None
+    for start, end in candidates:
+        words = _content_words(text[start:end])
+        shared = len(claim & words)
+        if shared < SPAN_MIN_SHARED_WORDS:
+            continue
+        coverage = shared / len(claim)
+        if coverage < SPAN_MIN_COVERAGE:
+            continue
+        # Most of the claim covered, then the tightest passage, then the earliest.
+        key = (coverage, -len(words), -start)
+        if best is None or key > best[0]:
+            best = (key, start, end)
+    return best
+
+
+def attach_spans(
+    answer: str, cited: Sequence[SourceCitation], chunks: Sequence[RerankedChunk]
+) -> list[SourceCitation]:
+    """``cited`` with the passage of each source its citing sentences rest on.
+
+    ``chunks`` are the prompt's sources in order (source ``n`` is ``chunks[n - 1]``).
+    The 200-character excerpt a citation carries is the chunk's start, which often
+    isn't the sentence the answer used; the span is.
+    """
+
+    claims = _claims_by_source(answer, len(chunks))
+    result: list[SourceCitation] = []
+    for source in cited:
+        index = source.source_number - 1
+        if not 0 <= index < len(chunks) or source.source_number not in claims:
+            result.append(source)
+            continue
+        text = chunks[index].text
+        sentences = sentence_spans(text)
+        found: dict[tuple[int, int], tuple[float, int, int]] = {}
+        for claim in claims[source.source_number]:
+            if not claim:
+                continue
+            best = _best_span(claim, text, sentences)
+            if best is not None:
+                key, start, end = best
+                found[(start, end)] = max(key, found.get((start, end), key))
+        kept: list[tuple[int, int]] = []
+        for start, end in sorted(found, key=lambda span: found[span], reverse=True):
+            # A pair that already contains a kept sentence (or the reverse) is one passage.
+            if any(start < other_end and other_start < end for other_start, other_end in kept):
+                continue
+            kept.append((start, end))
+            if len(kept) == MAX_SPANS_PER_SOURCE:
+                break
+        spans = tuple(CitationSpan(start, end, text[start:end]) for start, end in sorted(kept))
+        result.append(replace(source, spans=spans) if spans else source)
+    return result
 
 
 def needs_citation_retry(answer: str, source_count: int) -> bool:

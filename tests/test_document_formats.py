@@ -82,6 +82,22 @@ def test_parse_csv_renders_rows_and_groups_into_sections() -> None:
     assert sections[1].section == "Rows 4-4"
 
 
+def test_parse_csv_never_splits_a_one_column_file_on_a_letter() -> None:
+    # Unrestricted, csv.Sniffer picked "l" as this file's delimiter.
+    sections = parse_document_bytes("titles.csv", b"title\nalpha beta\ngamma delta\n")
+
+    assert "title: alpha beta" in sections[0].text
+    assert "title: gamma delta" in sections[0].text
+
+
+def test_parse_csv_still_detects_semicolons_and_tabs() -> None:
+    semicolons = parse_document_bytes("a.csv", b"name;port\napi;8000\n")
+    tabs = parse_document_bytes("b.csv", b"name\tport\napi\t8000\n")
+
+    assert "name: api; port: 8000" in semicolons[0].text
+    assert "name: api; port: 8000" in tabs[0].text
+
+
 def test_parse_csv_header_only_yields_header_section() -> None:
     sections = parse_document_bytes("empty.csv", b"name,port\n")
     assert len(sections) == 1

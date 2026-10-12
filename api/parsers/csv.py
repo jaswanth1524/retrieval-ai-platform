@@ -23,7 +23,9 @@ def parse_csv_document(
         else _DEFAULT_CSV_ROWS_PER_SECTION
     )
     try:
-        dialect = csv.Sniffer().sniff(text[:2048])
+        # Only real separators: left to guess, the sniffer split a one-column file of
+        # prose ("title\nalpha beta\ngamma delta") on the letter "l".
+        dialect = csv.Sniffer().sniff(text[:2048], delimiters=",;\t|")
         delimiter = dialect.delimiter
     except csv.Error:
         delimiter = ","

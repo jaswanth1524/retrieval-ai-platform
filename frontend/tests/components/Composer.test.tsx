@@ -28,6 +28,7 @@ function makeConfig(overrides: Partial<PublicConfigResponse> = {}): PublicConfig
     rerank_top_k_limit: 50,
     max_context_chunks_limit: 20,
     llm_temperature_max: 2,
+    feedback_enabled: false,
     ...overrides,
   };
 }
@@ -397,4 +398,46 @@ describe('Composer', () => {
       expect(scopeButton).toHaveFocus();
     });
   });
+
+  it('keeps an unsent question per conversation, across a switch and a remount', async () => {
+    localStorage.clear();
+    const { rerender, unmount } = render(<Composer {...baseProps()} draftKey="one" />);
+    await userEvent.type(screen.getByTestId('question-textarea'), 'Half a question');
+
+    rerender(<Composer {...baseProps()} draftKey="two" />);
+    expect(screen.getByTestId('question-textarea')).toHaveValue('');
+    rerender(<Composer {...baseProps()} draftKey="one" />);
+    expect(screen.getByTestId('question-textarea')).toHaveValue('Half a question');
+
+    unmount();
+    render(<Composer {...baseProps()} draftKey="one" />);
+    expect(screen.getByTestId('question-textarea')).toHaveValue('Half a question');
+    localStorage.clear();
+  });
+
+  it('forgets the draft once it is sent', async () => {
+    localStorage.clear();
+    const props = baseProps();
+    const { unmount } = render(<Composer {...props} draftKey="one" />);
+    await userEvent.type(screen.getByTestId('question-textarea'), 'Ask this{Enter}');
+    expect(props.onSubmit).toHaveBeenCalledWith('Ask this');
+
+    unmount();
+    render(<Composer {...baseProps()} draftKey="one" />);
+    expect(screen.getByTestId('question-textarea')).toHaveValue('');
+  });
+
+  it('puts an example question in the box to edit, without sending it', () => {
+    const props = baseProps();
+    const { rerender } = render(<Composer {...props} prefill={{ text: 'What is X?', nonce: 1 }} />);
+
+    expect(screen.getByTestId('question-textarea')).toHaveValue('What is X?');
+    expect(screen.getByTestId('question-textarea')).toHaveFocus();
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    // The same suggestion again, after the box was cleared, comes back.
+    fireEvent.change(screen.getByTestId('question-textarea'), { target: { value: '' } });
+    rerender(<Composer {...props} prefill={{ text: 'What is X?', nonce: 2 }} />);
+    expect(screen.getByTestId('question-textarea')).toHaveValue('What is X?');
+  });
 });
+

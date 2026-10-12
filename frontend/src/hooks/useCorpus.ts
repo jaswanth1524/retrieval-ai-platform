@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { ApiClientError, api } from '../api/client';
+import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
 import type { DocumentMeta, UploadItem } from '../components/CorpusPanel';
 import { newId } from '../utils/id';
@@ -167,7 +167,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         deps.current.pushToast({
           tone: 'warn',
           title: `Couldn't cancel ${filename}`,
-          body: err instanceof ApiClientError ? err.message : 'The server did not answer.',
+          body: apiErrorMessage(err, 'The server did not answer.'),
         });
       }
     };
@@ -236,7 +236,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         setUploads((prev) =>
           prev.map((item) =>
             item.id === id
-              ? { ...item, status: 'error', error: err instanceof ApiClientError ? err.message : 'Upload failed.' }
+              ? { ...item, status: 'error', error: apiErrorMessage(err, 'Upload failed.') }
               : item,
           ),
         );
@@ -246,10 +246,12 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }
     };
 
+    // Every upload body, first try or retry, goes through the same few send slots.
+    const sendUpload = (file: File, signal: AbortSignal) =>
+      sendSlots.run(() => api.uploadDocument(file, signal), signal);
+
     const uploadOne = (file: File, id: string) =>
-      runIngestJob(id, file.name, (signal) =>
-        sendSlots.run(() => api.uploadDocument(file, signal), signal),
-      );
+      runIngestJob(id, file.name, (signal) => sendUpload(file, signal));
 
     // Stops an upload or re-index: before the server has it, locally; after, by asking
     // the server, which refuses (409) once the job has started writing to the index.
@@ -272,6 +274,13 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     const refreshAfterIngest = async () => {
       try {
         await refreshDocuments();
+        // Finished cards aren't shown (the document's own card is), so once the listing
+        // has them, drop them: kept, they piled up for the whole session.
+        setUploads((prev) =>
+          prev.some((item) => item.status === 'success')
+            ? prev.filter((item) => item.status !== 'success')
+            : prev,
+        );
       } catch (err) {
         // Non-fatal — counts just stay stale until the next refresh.
         deps.current.onAuthFailure(err);
@@ -294,7 +303,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
           deps.current.pushToast({
             tone: 'bad',
             title: 'Re-index failed',
-            body: err instanceof ApiClientError ? err.message : 'Could not start re-indexing.',
+            body: apiErrorMessage(err, 'Could not start re-indexing.'),
           });
         }
         return;
@@ -366,7 +375,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       );
       const { file, filename } = item;
       await runIngestJob(id, filename, (signal) =>
-        file ? api.uploadDocument(file, signal) : api.reindexDocument(filename, signal),
+        file ? sendUpload(file, signal) : api.reindexDocument(filename, signal),
       );
       await refreshAfterIngest();
     };

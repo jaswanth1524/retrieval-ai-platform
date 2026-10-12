@@ -438,9 +438,33 @@ describe('ChatMessage', () => {
     chip.focus();
     expect(onCitationHover).toHaveBeenCalledWith(source);
     await userEvent.click(chip);
-    expect(onOpenSource).toHaveBeenCalledWith('guide.pdf', 'c-2');
+    expect(onOpenSource).toHaveBeenCalledWith('guide.pdf', 'c-2', undefined);
     expect(screen.getAllByTestId('inline-citation')).toHaveLength(1);
     expect(screen.getByText('arr[2]')).toBeInTheDocument();
+  });
+
+  it('opens a source with the passages the answer rests on, to mark them', async () => {
+    const onOpenSource = vi.fn();
+    const source = {
+      source_number: 1,
+      filename: 'policy.md',
+      page: 1,
+      section: 'Leave',
+      chunk_id: 'c1',
+      text: 'passage',
+      spans: [{ start: 4, end: 30, quote: 'Twenty days of leave.' }],
+    };
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Twenty days [1].', sources: [source] })}
+        engineerMode={false}
+        onOpenSource={onOpenSource}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('citation-card'));
+
+    expect(onOpenSource).toHaveBeenCalledWith('policy.md', 'c1', ['Twenty days of leave.']);
   });
 
   it('renders no Regenerate button on a user or error turn', () => {
@@ -660,6 +684,8 @@ describe('ChatMessage answer-progress announcement', () => {
 
     expect(screen.queryByTestId('chat-message-edit-input')).not.toBeInTheDocument();
     expect(onEditQuestion).not.toHaveBeenCalled();
+    // Back on the button that opened the editor, not lost to <body>.
+    expect(screen.getByTestId('chat-message-edit')).toHaveFocus();
   });
 
   it('regenerates through onRegenerate (which skips the cache) when given', async () => {

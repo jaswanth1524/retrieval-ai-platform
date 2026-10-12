@@ -109,6 +109,17 @@ def test_feedback_rejects_an_invalid_rating(api_context: ApiTestContext) -> None
     assert response.status_code == 422
 
 
+def test_feedback_caps_the_trace_id_and_each_cited_filename(api_context: ApiTestContext) -> None:
+    def post(**overrides: object) -> int:
+        body = {"question": "q", "answer_excerpt": "a", "rating": "up", **overrides}
+        return api_context.client.post("/feedback", json=body).status_code
+
+    # Feedback is off here, so a body that passes validation is a 404, not a 422.
+    assert post(trace_id="t" * 64, cited_filenames=["f" * 1024]) == 404
+    assert post(trace_id="t" * 65) == 422
+    assert post(cited_filenames=["f" * 1025]) == 422
+
+
 def test_question_endpoint_returns_a_trace_id(api_context: ApiTestContext) -> None:
     status = upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")
     assert status["state"] == "done"

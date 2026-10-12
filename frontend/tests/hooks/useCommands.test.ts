@@ -81,7 +81,7 @@ describe('useCommands', () => {
     expect(first.toggleTheme).not.toHaveBeenCalled();
   });
 
-  it('binds nothing over another dialog, and skips disabled commands', () => {
+  it('binds nothing over another dialog, and starts a new chat mid-answer', () => {
     const run = actions();
     const palette = { otherDialogOpen: true, togglePalette: vi.fn(), closePalette: vi.fn() };
     const { rerender } = renderHook(
@@ -95,9 +95,11 @@ describe('useCommands', () => {
     expect(palette.togglePalette).not.toHaveBeenCalled();
     expect(run.upload).not.toHaveBeenCalled();
 
+    // Clearing waits for an answer streaming into the open conversation; a new one
+    // doesn't (the answer is written to its own conversation).
     rerender({ open: false, pending: true });
     press('o', { shiftKey: true });
-    expect(run.newConversation).not.toHaveBeenCalled();
+    expect(run.newConversation).toHaveBeenCalled();
   });
 
   it('leaves backup and restore out for a read-only key', () => {

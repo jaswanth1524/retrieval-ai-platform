@@ -139,7 +139,9 @@ def baseline_shape_problems(current: Mapping[str, Any], baseline: Mapping[str, A
     # recorded (a baseline from before the key existed) stay a note.
     current_print = current.get("fingerprint", {})
     baseline_print = baseline.get("fingerprint", {})
-    for key in sorted(set(current_print) & set(baseline_print) - {"arm"}):
+    # The machine is recorded to explain a drift, not to refuse a run: CI's baseline is
+    # amd64, and a developer's arm64 laptop must still be able to compare against it.
+    for key in sorted(set(current_print) & set(baseline_print) - {"arm", "platform_machine"}):
         if current_print[key] != baseline_print[key]:
             problems.append(
                 f"{key} differs: {current_print[key]!r} vs baseline {baseline_print[key]!r} "

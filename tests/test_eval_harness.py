@@ -244,6 +244,10 @@ def test_baseline_checks_refuse_a_run_they_cannot_compare() -> None:
     assert "reranker_onnx_file differs" in baseline_shape_problems(fp32, measured)[0]
     # A key the older baseline never recorded is only a note.
     assert baseline_shape_problems(int8, baseline) == []
+    # So is the machine: recorded to explain a drift, never a refusal.
+    on_amd64 = {**baseline, "fingerprint": {"arm": "reranked", "platform_machine": "x86_64"}}
+    on_arm64 = {**same, "fingerprint": {"arm": "reranked", "platform_machine": "arm64"}}
+    assert baseline_shape_problems(on_arm64, on_amd64) == []
     unlabeled = {**same, "aggregate": {"filename": {}, "chunk": {}}}
     assert "no metric" in baseline_shape_problems(unlabeled, baseline)[0]
 
@@ -336,3 +340,33 @@ def load_retrieval_dataset_from(rows: list[dict[str, Any]]) -> list[Any]:
     from eval.harness import _example_from_mapping
 
     return [_example_from_mapping(row, index) for index, row in enumerate(rows, 1)]
+
+
+def test_ingest_skips_dotfiles_and_unsupported_types(tmp_path: Path) -> None:
+    from eval.harness import ingestible_files
+
+    for name in ("b.md", "a.TXT", ".DS_Store", "notes.xyz", ".hidden.md"):
+        (tmp_path / name).write_text("x")
+    (tmp_path / "sub").mkdir()
+
+    files, skipped = ingestible_files(tmp_path)
+
+    assert [path.name for path in files] == ["a.TXT", "b.md"]
+    assert [path.name for path in skipped] == [".DS_Store", ".hidden.md", "notes.xyz"]
+
+
+def test_the_fingerprint_records_every_setting_that_moves_the_ranking() -> None:
+    from eval.harness import settings_fingerprint
+    from tests.factories import make_test_settings
+
+    fingerprint = settings_fingerprint(make_test_settings(), "reranked")
+
+    for key in (
+        "rrf_k",
+        "dense_retrieval_limit",
+        "sparse_retrieval_limit",
+        "query_expansion_count",
+        "reranker_batch_size",
+        "platform_machine",
+    ):
+        assert key in fingerprint

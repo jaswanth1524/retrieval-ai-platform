@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { citationNumberFromHref, citedNumbers, linkCitations } from '../../src/utils/citations';
+import {
+  citationNumberFromHref,
+  citedNumbers,
+  linkCitations,
+  unlinkCitations,
+} from '../../src/utils/citations';
 
 describe('linkCitations', () => {
   it('turns single, list and range markers into one link per cited source', () => {
@@ -29,6 +34,18 @@ describe('linkCitations', () => {
 
   it('does nothing when there are no sources', () => {
     expect(linkCitations('A [1].', 0)).toBe('A [1].');
+  });
+
+  it('leaves a marker with an absurdly long number as text', () => {
+    const text = `A [${'9'.repeat(7)}].`;
+    expect(linkCitations(text, 3)).toBe(text);
+  });
+});
+
+describe('unlinkCitations', () => {
+  it('turns citation links back into markers and leaves other links alone', () => {
+    const linked = linkCitations('A [1]. B [2-3]. [x](http://a)', 3);
+    expect(unlinkCitations(linked)).toBe('A [1]. B [2][3]. [x](http://a)');
   });
 });
 

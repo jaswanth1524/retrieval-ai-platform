@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiClientError } from '../../src/api/client';
 import { clearTraceCache, useTrace } from '../../src/hooks/useTrace';
@@ -70,6 +70,21 @@ describe('useTrace', () => {
     const { result } = renderHook(() => useTrace('boom'));
 
     await waitFor(() => expect(result.current.status).toBe('error'));
+  });
+
+  it('fetches again when a failed load is retried', async () => {
+    getTrace.mockRejectedValueOnce(new ApiClientError('API returned HTTP 500.', 500));
+    getTrace.mockResolvedValueOnce(makeTrace({ trace_id: 'flaky' }));
+
+    const { result } = renderHook(() => useTrace('flaky'));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    act(() => {
+      if (result.current.status === 'error') result.current.retry();
+    });
+
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    expect(getTrace).toHaveBeenCalledTimes(2);
   });
 
   it('fetches a given trace only once across remounts', async () => {

@@ -79,6 +79,17 @@ describe('SearchPanel', () => {
     );
   });
 
+  it("passes on the rate limit's own message, which says when to try again", async () => {
+    stubSearch(429, { detail: 'Too many requests; try again in 12 s.' });
+    setup();
+
+    await search('leave');
+
+    expect((await screen.findByTestId('search-error')).textContent).toBe(
+      'Too many requests; try again in 12 s.',
+    );
+  });
+
   it('clears when the panel action bumps resetKey', async () => {
     stubSearch(200, { results: [RESULT], timings: {} });
     const { rerender, onOpenSource, onAuthFailure } = setup();
@@ -97,5 +108,15 @@ describe('SearchPanel', () => {
 
     expect(screen.queryByTestId('search-result')).not.toBeInTheDocument();
     expect(screen.getByTestId('search-input')).toHaveValue('');
+  });
+
+  it('reads out how many passages a search found', async () => {
+    stubSearch(200, { results: [RESULT, { ...RESULT, chunk_id: 'c2', rank: 2 }] });
+    setup();
+    expect(screen.getByRole('status')).toHaveTextContent('');
+
+    await search('leave');
+
+    expect(await screen.findByRole('status')).toHaveTextContent('2 passages found.');
   });
 });

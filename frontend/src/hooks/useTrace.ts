@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ApiClientError, api } from '../api/client';
+import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { TraceDetailResponse } from '../api/types';
 
 /** What the inspector knows about one turn's trace.
@@ -14,7 +14,8 @@ export type TraceState =
   | { status: 'loading' }
   | { status: 'ready'; trace: TraceDetailResponse }
   | { status: 'unavailable'; reason: string }
-  | { status: 'error'; message: string }
+  // `retry` fetches again: the effect below otherwise re-runs only for another trace.
+  | { status: 'error'; message: string; retry: () => void }
   | { status: 'pending'; reason: string };
 
 const NO_TRACE_ID =
@@ -60,6 +61,7 @@ export function useTrace(traceId: string | null, ready = true): TraceState {
     state: initialState(traceId, ready),
   }));
   const setState = (state: TraceState) => setKeyed({ id: traceId, state });
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     if (traceId === null) {
@@ -97,14 +99,15 @@ export function useTrace(traceId: string | null, ready = true): TraceState {
         }
         setState({
           status: 'error',
-          message: err instanceof ApiClientError ? err.message : 'Could not load the trace.',
+          message: apiErrorMessage(err, 'Could not load the trace.'),
+          retry: () => setAttempt((n) => n + 1),
         });
       });
 
     return () => controller.abort();
     // setState only closes over traceId, which is already a dependency.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [traceId, ready]);
+  }, [traceId, ready, attempt]);
 
   return keyed.id === traceId ? keyed.state : initialState(traceId, ready);
 }
