@@ -520,3 +520,25 @@ def test_ingest_chunks_records_embed_and_write_stage_times() -> None:
         "embed": 1,
         "write": 1,
     }
+
+
+def test_held_vectors_round_trip_exactly() -> None:
+    import numpy as np
+
+    from api.ingestion import _StoredEmbedding
+
+    original = EmbeddedText(
+        dense=[0.1, -2.5, 3.0],
+        sparse=models.SparseVector(
+            indices=[7, 2**31 + 5, 3], values=[0.1, 1e-12, 2.718281828459045]
+        ),
+    )
+
+    restored = _StoredEmbedding.of(original).restore()
+
+    assert restored.sparse.indices == original.sparse.indices
+    assert restored.sparse.values == original.sparse.values
+    assert all(type(value) is float for value in restored.sparse.values)
+    assert all(type(index) is int for index in restored.sparse.indices)
+    # Dense: float32, as the model produced it.
+    assert restored.dense == np.asarray(original.dense, dtype=np.float32).tolist()

@@ -28,6 +28,7 @@ function makeConfig(overrides: Partial<PublicConfigResponse> = {}): PublicConfig
     rerank_top_k_limit: 50,
     max_context_chunks_limit: 20,
     llm_temperature_max: 2.0,
+    feedback_enabled: false,
     ...overrides,
   };
 }

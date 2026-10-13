@@ -17,15 +17,52 @@
   color: var(--muted);
 }
 
-/* Screen-reader-only: the thread's progress announcements (see ChatThread). */
-.chat-thread__status {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
+
+.chat-thread__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: min(520px, 100%);
+  padding: 0 16px;
+  text-align: center;
+}
+
+.chat-thread__empty p {
+  margin: 0;
+}
+
+.chat-thread__suggestions {
+  list-style: none;
+  margin: 0;
   padding: 0;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.chat-thread__suggestion,
+.chat-thread__upload {
+  width: 100%;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.chat-thread__upload {
+  width: auto;
+  text-align: center;
+  color: var(--accent);
+}
+
+.chat-thread__suggestion:hover,
+.chat-thread__upload:hover {
+  border-color: var(--accent);
 }

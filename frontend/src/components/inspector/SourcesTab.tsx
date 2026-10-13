@@ -4,7 +4,7 @@ interface SourcesTabProps {
   sources: CitationResponse[];
   /** Trace candidates, when loaded — supplies each source's rerank score for the track. */
   candidates?: TraceCandidateResponse[];
-  onOpenSource?: (filename: string, chunkId: string) => void;
+  onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
 }
 
 /** Score for a source, matched to its trace candidate by chunk id.
@@ -39,7 +39,16 @@ function SourcesTab({ sources, candidates, onOpenSource }: SourcesTabProps) {
             key={`${source.source_number}-${source.chunk_id}`}
             type="button"
             className="sources-tab__card"
-            onClick={onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined}
+            onClick={
+              onOpenSource
+                ? () =>
+                    onOpenSource(
+                      source.filename,
+                      source.chunk_id,
+                      source.spans?.map((span) => span.quote),
+                    )
+                : undefined
+            }
             disabled={!onOpenSource}
             data-testid="sources-tab-card"
           >

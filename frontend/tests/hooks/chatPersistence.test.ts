@@ -8,9 +8,12 @@ import {
   type Conversation,
   TOMBSTONE_MAX_AGE_MS,
   capConversations,
+  compactForStorage,
+  keepPassageText,
   mergeConversations,
   parseConversations,
   sanitizeConversation,
+  sanitizeTurn,
   searchConversations,
 } from '../../src/hooks/chatPersistence';
 
@@ -261,3 +264,41 @@ describe('searchConversations', () => {
     expect(searchConversations([conversation({ turns: [error] })], 'timeout').size).toBe(0);
   });
 });
+
+describe('cited passages (spans)', () => {
+  const source = {
+    source_number: 1,
+    filename: 'a.md',
+    page: 1,
+    section: 'Intro',
+    chunk_id: 'c1',
+    text: 'Alpha is documented.',
+    spans: [{ start: 0, end: 20, quote: 'Alpha is documented.' }],
+  };
+  const answer = (id: string): ChatTurn => ({ ...turn(id, 'assistant'), sources: [source] });
+
+  it('keeps valid spans and drops spans that would crash rendering, not the citation', () => {
+    expect(sanitizeTurn(answer('a'))?.sources[0].spans).toEqual(source.spans);
+    const broken = sanitizeTurn({
+      ...answer('a'),
+      sources: [{ ...source, spans: [{ start: 0, quote: 7 }] }],
+    });
+    expect(broken?.sources).toHaveLength(1);
+    expect(broken?.sources[0]).not.toHaveProperty('spans');
+  });
+
+  it('drops spans with the text on older turns, and gets both back from a full copy', () => {
+    const conversation: Conversation = {
+      ...sanitizeConversation({ id: 'c', title: 't', updatedAt: 1, turns: [] })!,
+      turns: Array.from({ length: 8 }, (_, index) => answer(`t${index}`)),
+    };
+
+    const stored = compactForStorage(conversation, 100);
+
+    expect(stored.turns[0].sources[0]).not.toHaveProperty('spans');
+    expect(stored.turns[0].sources[0].text).toBe('');
+    expect(stored.turns[7].sources[0].spans).toEqual(source.spans);
+    expect(keepPassageText(stored, conversation).turns[0].sources[0]).toEqual(source);
+  });
+});
+

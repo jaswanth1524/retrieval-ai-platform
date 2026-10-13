@@ -400,6 +400,104 @@ def test_the_document_listing_is_cached_until_the_corpus_changes(
     clear_metadata_cache()
 
 
+def _record_scans(
+    monkeypatch: pytest.MonkeyPatch, repository: VectorRepository
+) -> list[frozenset[str] | None]:
+    """Records each metadata scan: None for a full one, else the filenames it read."""
+
+    scans: list[frozenset[str] | None] = []
+    scan = repository._scan_filename_metadata
+
+    def counting_scan(
+        settings: AppSettings, only: frozenset[str] | None = None
+    ) -> dict[str, DocumentMetadata]:
+        scans.append(only)
+        return scan(settings, only=only)
+
+    monkeypatch.setattr(repository, "_scan_filename_metadata", counting_scan)
+    return scans
+
+
+def test_a_change_to_named_documents_rereads_only_those(monkeypatch: pytest.MonkeyPatch) -> None:
+    from api.corpus import bump_corpus_generation
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(settings, [make_point("a1", "a.md"), make_point("b1", "b.md", page=2)])
+    scans = _record_scans(monkeypatch, repository)
+    assert set(repository.filename_metadata(settings)) == {"a.md", "b.md"}
+
+    # An upload of c.md and another page for a.md: one filtered read of just those.
+    repository.upsert(settings, [make_point("c1", "c.md"), make_point("a2", "a.md", page=3)])
+    bump_corpus_generation(["c.md"])
+    bump_corpus_generation(["a.md"])
+    listing = repository.filename_metadata(settings)
+    assert set(listing) == {"a.md", "b.md", "c.md"}
+    assert listing["a.md"].chunk_count == 2 and listing["a.md"].page_count == 3
+    assert listing["b.md"].page_count == 2
+    assert scans == [None, frozenset({"a.md", "c.md"})]
+
+    # A delete takes the document out of the listing.
+    repository.delete_by_ids(settings, repository.point_ids_for_filename(settings, "b.md"))
+    bump_corpus_generation(["b.md"])
+    assert set(repository.filename_metadata(settings)) == {"a.md", "c.md"}
+    assert scans[-1] == frozenset({"b.md"})
+    clear_metadata_cache()
+
+
+def test_an_unnamed_change_an_old_entry_or_many_changes_rescan_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import api.repository as repository_module
+    from api.corpus import bump_corpus_generation
+    from api.repository import clear_metadata_cache
+
+    clear_metadata_cache()
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(settings, [make_point("a1", "a.md")])
+    scans = _record_scans(monkeypatch, repository)
+    repository.filename_metadata(settings)
+
+    bump_corpus_generation()  # names nothing: anything may have changed
+    repository.filename_metadata(settings)
+    assert scans == [None, None]
+
+    bump_corpus_generation([f"doc{i}.md" for i in range(51)])  # past the patch limit
+    repository.filename_metadata(settings)
+    assert scans[-1] is None
+
+    for index in range(300):  # more bumps than the change log keeps
+        bump_corpus_generation([f"doc{index}.md"])
+    repository.filename_metadata(settings)
+    assert scans[-1] is None
+
+    # Past the TTL the whole collection is read again (another process's writes),
+    # even when the change names its document.
+    monkeypatch.setattr(repository_module, "_METADATA_TTL_SECONDS", 0.0)
+    bump_corpus_generation(["a.md"])
+    repository.filename_metadata(settings)
+    assert scans[-1] is None
+    assert len(scans) == 5
+    clear_metadata_cache()
+
+
+def test_changed_since_names_what_moved_or_says_it_cannot() -> None:
+    from api.corpus import bump_corpus_generation, changed_since, corpus_generation
+
+    start = corpus_generation()
+    assert changed_since(start) == frozenset()
+    bump_corpus_generation(["a.md"])
+    bump_corpus_generation(["b.md", "a.md"])
+    assert changed_since(start) == frozenset({"a.md", "b.md"})
+    assert changed_since(start + 1) == frozenset({"b.md", "a.md"})
+    assert changed_since(start + 99) is None
+    bump_corpus_generation()
+    assert changed_since(start) is None
+
+
 def test_concurrent_listings_share_one_scan_of_the_collection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

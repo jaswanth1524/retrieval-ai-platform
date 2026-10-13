@@ -100,3 +100,15 @@ def test_the_temp_sweep_never_removes_a_stored_original_named_like_one(tmp_path:
     RawDocumentStore(str(tmp_path))
 
     assert store.read(".upload-notes.txt") == b"mine"
+
+
+def test_stored_names_lists_originals_only(tmp_path: Path) -> None:
+    store = RawDocumentStore(str(tmp_path))
+    store.save("a.txt", b"a")
+    store.save(".upload-x.txt", b"a real name with a leading dot")
+    (tmp_path / ".upload-abcd1234").write_bytes(b"a save in progress")
+    (tmp_path / "subdir").mkdir()
+
+    assert store.stored_names() == {"a.txt", ".upload-x.txt"}
+    store.delete("a.txt")
+    assert store.stored_names() == {".upload-x.txt"}

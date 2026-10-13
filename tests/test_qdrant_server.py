@@ -131,7 +131,10 @@ def test_filename_scope_and_metadata_use_the_servers_payload_index(
         "guide.md": 2,
         "notes.md": 1,
     }
-    # As DELETE /documents does: the listing is cached until the corpus changes.
+    # As DELETE /documents does: the listing is cached until the corpus changes, and
+    # a change that names its document re-reads just that one (a MatchAny scroll).
+    bump_corpus_generation(["guide.md"])
+    assert sorted(repository.filename_metadata(settings)) == ["notes.md"]
     bump_corpus_generation()
     assert sorted(repository.filename_metadata(settings)) == ["notes.md"]
 

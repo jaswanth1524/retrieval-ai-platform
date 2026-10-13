@@ -3,8 +3,9 @@ name: Release
 # Pushing a version tag (v0.2.0) publishes the image (linux/amd64 and linux/arm64) to
 # GHCR, signs it, scans it, and opens a GitHub release whose notes are that version's
 # CHANGELOG.md section. Tag the commit whose pyproject.toml `version` matches the tag;
-# the build refuses otherwise. A fixable CRITICAL vulnerability in the amd64 image stops
-# the release before anything is pushed.
+# the build refuses otherwise. Only a commit on main whose CI passed is released, and a
+# fixable CRITICAL vulnerability in either architecture's image stops the release before
+# anything is pushed.
 on:
   push:
     tags: ["v*"]
@@ -17,9 +18,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  image:
+  gate:
+    # A tag can point at any commit: one on an unreviewed branch, or one whose tests
+    # failed, used to be published and signed all the same.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read # read the CI runs of the tagged commit
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: The tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main"
+            exit 1
+          fi
+
+      - name: CI passed for the tagged commit
+        # The push to main that brought the commit ran CI; wait for it if it is still
+        # running (a tag pushed right after a merge).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in $(seq 1 120); do
+            result=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --commit "$GITHUB_SHA" --event push --json status,conclusion \
+              --jq '[.[] | select(.status == "completed")] | map(.conclusion) | first // "pending"')
+            case "$result" in
+              success) echo "CI passed for $GITHUB_SHA"; exit 0 ;;
+              pending) echo "waiting for CI on $GITHUB_SHA ($attempt)"; sleep 30 ;;
+              *) echo "::error::CI for $GITHUB_SHA ended: $result"; exit 1 ;;
+            esac
+          done
+          echo "::error::No finished CI run for $GITHUB_SHA after an hour"
+          exit 1
+
+  image:
+    needs: gate
+    runs-on: ubuntu-latest
+    # The arm64 image is built under QEMU for its scan, which takes a while.
+    timeout-minutes: 90
     permissions:
       contents: write # the GitHub release
       packages: write # push to ghcr.io
@@ -93,6 +136,28 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+      # The same gate for arm64: its Python wheels (onnxruntime, numpy, grpcio) are not
+      # amd64's, and only amd64 used to be scanned before publishing.
+      - name: Build the arm64 image for scanning
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: docrag:scan-arm64
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+
+      - name: Scan arm64 before pushing (fixable CRITICAL fails the release)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          image-ref: docrag:scan-arm64
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -118,8 +183,8 @@ jobs:
         run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
 
       - name: Scan the published image (report)
-        # The amd64 image was gated above; this records HIGH findings for both
-        # architectures' shared layers in the Security tab without blocking.
+        # Both architectures were gated above; this records HIGH findings (of the
+        # runner's architecture, amd64) in the Security tab without blocking.
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           # The program, pinned with the action (v0.35.0's own default, made explicit).

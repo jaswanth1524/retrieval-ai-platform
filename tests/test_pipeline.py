@@ -1816,3 +1816,20 @@ def test_a_partial_answer_that_cites_a_source_is_still_answered() -> None:
     )
     assert pipeline.answer("alpha").answer_status == "answered"
     assert _stream_done(pipeline, "alpha beta")["answer_status"] == "answered"
+
+
+def test_the_timings_response_has_exactly_the_pipeline_stage_fields() -> None:
+    # timings_dict / timings_response copy every StageTimings field: a stage added to one
+    # side only would vanish from traces or fail the response model.
+    import dataclasses
+
+    from api.generation import StageTimings
+    from api.routes.responses import timings_response
+    from api.schemas import TimingsResponse
+
+    names = [field.name for field in dataclasses.fields(StageTimings)]
+    assert names == list(TimingsResponse.model_fields)
+    timings = StageTimings(*range(1, len(names) + 1))
+    assert timings_response(timings) == TimingsResponse(
+        **dict(zip(names, range(1, len(names) + 1), strict=True))
+    )

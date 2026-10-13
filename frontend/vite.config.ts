@@ -37,6 +37,14 @@ function precompress(): Plugin {
   };
 }
 
+// The UI's Content-Security-Policy, as api/security_headers.py sends it. `vite preview`
+// sends it too, so the e2e suite (whose fixture fails on any console error) runs the
+// build under the real policy; tests/routes_http/test_http_security_headers.py keeps the two equal.
+const CONTENT_SECURITY_POLICY =
+  "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; " +
+  "font-src 'self'; connect-src 'self'; frame-src blob:; object-src 'none'; " +
+  "frame-ancestors 'self'; base-uri 'self'; form-action 'self'";
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), precompress()],
@@ -54,6 +62,9 @@ export default defineConfig({
         },
       },
     },
+  },
+  preview: {
+    headers: { 'Content-Security-Policy': CONTENT_SECURITY_POLICY },
   },
   server: {
     port: 5173,

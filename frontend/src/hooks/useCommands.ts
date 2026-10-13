@@ -6,6 +6,7 @@ import type { ConversationSummary } from './chatPersistence';
 
 /** What the command list shows: labels that flip, commands that can't run right now. */
 export interface CommandState {
+  /** An answer is streaming into the open conversation (which can't be cleared). */
   pending: boolean;
   /** /config has answered (Settings needs it). */
   configLoaded: boolean;
@@ -86,7 +87,6 @@ export function useCommands(
         // Not ⌘N: browsers reserve it (new window) and never deliver it to the page.
         shortcut: '⌘⇧O',
         run: () => run.current.newConversation(),
-        disabled: pending,
       },
       // Not offered to the read-only key: the server refuses its uploads (403).
       ...(readOnly
@@ -178,7 +178,6 @@ export function useCommands(
         glyph: '⇧',
         label: 'Import a conversation (JSON export)',
         run: () => run.current.importConversation(),
-        disabled: pending,
       },
       ...(activeConversation && hasTurns
         ? [
@@ -206,7 +205,6 @@ export function useCommands(
           glyph: '☰',
           label: `Open: ${conversation.title}`,
           run: () => run.current.switchConversation(conversation.id),
-          disabled: pending,
         })),
     ];
   }, [

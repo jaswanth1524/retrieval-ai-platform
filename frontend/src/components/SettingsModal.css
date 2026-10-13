@@ -172,7 +172,8 @@
 }
 
 .settings__input:focus {
-  outline: none;
+  /* Invisible normally; Windows high-contrast mode draws it, where the colour cue is lost. */
+  outline: 2px solid transparent;
   border-color: var(--accent);
 }
 

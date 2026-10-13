@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 from api.generation import ChatMessage, StageTimings
@@ -26,19 +27,7 @@ def timings_response(timings: StageTimings | None) -> TimingsResponse | None:
 
     if timings is None:
         return None
-    return TimingsResponse(
-        embed_ms=timings.embed_ms,
-        search_ms=timings.search_ms,
-        rerank_ms=timings.rerank_ms,
-        generate_ms=timings.generate_ms,
-        total_ms=timings.total_ms,
-        condense_ms=timings.condense_ms,
-        query_expansion_ms=timings.query_expansion_ms,
-        context_expansion_ms=timings.context_expansion_ms,
-        citation_retry_ms=timings.citation_retry_ms,
-        rerank_wait_ms=timings.rerank_wait_ms,
-        first_token_ms=timings.first_token_ms,
-    )
+    return TimingsResponse(**dataclasses.asdict(timings))
 
 
 def history_messages(history: list[HistoryMessageRequest] | None) -> list[ChatMessage] | None:

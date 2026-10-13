@@ -9,6 +9,8 @@ from starlette.responses import FileResponse, Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
+from api.security_headers import CONTENT_SECURITY_POLICY
+
 # Encodings the build writes next to each text asset (frontend/vite.config.ts), most
 # compact first.
 PRECOMPRESSED = (("br", ".br"), ("gzip", ".gz"))
@@ -31,6 +33,9 @@ class FrontendFiles(StaticFiles):
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         response = await super().get_response(path, scope)
+        # The page's policy, on everything the UI serves (a 404 page included).
+        response.headers["content-security-policy"] = CONTENT_SECURITY_POLICY
+        response.headers["x-frame-options"] = "DENY"
         if response.status_code in (200, 304):
             response.headers["cache-control"] = (
                 IMMUTABLE if path.startswith("assets/") else REVALIDATE
@@ -49,6 +54,8 @@ class FrontendFiles(StaticFiles):
                         "cache-control": response.headers["cache-control"],
                         "content-encoding": encoding,
                         "vary": "Accept-Encoding",
+                        "content-security-policy": CONTENT_SECURITY_POLICY,
+                        "x-frame-options": "DENY",
                     },
                 )
         if any(Path(f"{response.path}{suffix}").is_file() for _, suffix in PRECOMPRESSED):

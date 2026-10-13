@@ -1,3 +1,6 @@
+// The question field's element id: App's "Skip to question" link targets it.
+export const QUESTION_INPUT_ID = 'docrag-question';
+
 /** A random RFC 4122 v4 id.
  *
  * `crypto.randomUUID` exists only in secure contexts (HTTPS, localhost). DocRAG is

@@ -40,6 +40,12 @@ export class ApiClientError extends Error {
   }
 }
 
+/** The API's own message for a failed call (already client-safe), else ``fallback``
+ *  for anything that isn't an API error (a bug, a network stack's raw text). */
+export function apiErrorMessage(err: unknown, fallback: string): string {
+  return err instanceof ApiClientError ? err.message : fallback;
+}
+
 function retryAfterSeconds(response: Response): number | undefined {
   const value = Number(response.headers.get('Retry-After'));
   return Number.isFinite(value) && value > 0 ? value : undefined;
@@ -170,10 +176,17 @@ const UPLOAD_MAX_TIMEOUT_MS = 30 * 60_000;
 // export left "Download a backup" disabled until the page was reloaded.
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 
-/** GET ``path`` as a Blob within DOWNLOAD_TIMEOUT_MS, the body read included. */
-async function downloadBlob(path: string): Promise<{ response: Response; blob: Blob }> {
+/** GET ``path`` as a Blob within DOWNLOAD_TIMEOUT_MS, the body read included. The
+ *  caller's ``signal`` cancels it too (closing the viewer stops a 50 MB PDF download). */
+async function downloadBlob(
+  path: string,
+  signal?: AbortSignal,
+): Promise<{ response: Response; blob: Blob }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  const abortFromCaller = () => controller.abort();
+  signal?.addEventListener('abort', abortFromCaller);
+  if (signal?.aborted) controller.abort();
   try {
     let response: Response;
     try {
@@ -195,6 +208,7 @@ async function downloadBlob(path: string): Promise<{ response: Response; blob: B
     }
   } finally {
     clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -352,8 +366,8 @@ export const api = {
 
   // The exact uploaded bytes (RAW_DOCUMENT_DIR on). Fetched, not linked: a plain link
   // can't carry the X-API-Key header.
-  getDocumentOriginal: async (filename: string): Promise<Blob> =>
-    (await downloadBlob(`/documents/${encodeURIComponent(filename)}/original`)).blob,
+  getDocumentOriginal: async (filename: string, signal?: AbortSignal): Promise<Blob> =>
+    (await downloadBlob(`/documents/${encodeURIComponent(filename)}/original`, signal)).blob,
 
   listDocuments: (signal?: AbortSignal) =>
     request<DocumentListResponse>('/documents', { signal }),

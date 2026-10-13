@@ -47,6 +47,10 @@ class Feedback:
     created_at: float = field(default_factory=time.time)
 
 
+# Where a page of rows_oldest_first ended: (created_at, rowid) of its last row.
+FeedbackCursor = tuple[float, int]
+
+
 class FeedbackStore:
     """Sqlite-backed feedback store.
 
@@ -89,10 +93,16 @@ class FeedbackStore:
 
         if self._max_rows is None:
             return
+        # Counted first: the old NOT IN subquery ordered the whole table on every insert,
+        # even when (as nearly always) nothing was over the cap.
+        (count,) = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()
+        excess = count - self._max_rows
+        if excess <= 0:
+            return
         conn.execute(
-            "DELETE FROM feedback WHERE rowid NOT IN (SELECT rowid FROM feedback "
-            "ORDER BY created_at DESC, rowid DESC LIMIT ?)",
-            (self._max_rows,),
+            "DELETE FROM feedback WHERE rowid IN (SELECT rowid FROM feedback "
+            "ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+            (excess,),
         )
 
     def add(
@@ -159,6 +169,39 @@ class FeedbackStore:
                 added += cursor.rowcount
             self._trim(conn)
         return added
+
+    def rows_oldest_first(
+        self, after: FeedbackCursor | None, limit: int
+    ) -> tuple[list[Feedback], FeedbackCursor | None]:
+        """Up to ``limit`` rows after ``after``, oldest first, and the cursor of the last.
+
+        Keyset paging on (created_at, rowid), the order a backup lists rows in, so an
+        export reads one page at a time instead of the whole table.
+        """
+
+        created_at, rowid = after if after is not None else (float("-inf"), -1)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT rowid, id, trace_id, question, answer_excerpt, cited_filenames_json, "
+                "rating, citation_source_number, created_at FROM feedback "
+                "WHERE created_at > ? OR (created_at = ? AND rowid > ?) "
+                "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+                (created_at, created_at, rowid, limit),
+            ).fetchall()
+        page = [
+            Feedback(
+                id=row[1],
+                trace_id=row[2],
+                question=row[3],
+                answer_excerpt=row[4],
+                cited_filenames=json.loads(row[5]),
+                rating=row[6],
+                citation_source_number=row[7],
+                created_at=row[8],
+            )
+            for row in rows
+        ]
+        return page, ((rows[-1][8], rows[-1][0]) if rows else None)
 
     def list_recent(self, limit: int = 100) -> list[Feedback]:
         """Return the most recent feedback, newest first by when it was given (a row

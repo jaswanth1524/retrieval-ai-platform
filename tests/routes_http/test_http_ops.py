@@ -689,3 +689,38 @@ def test_built_assets_are_served_precompressed_and_cached_by_name(
     assert font.headers["content-type"] == "font/woff2"
     assert index.status_code == 200 and index.headers["cache-control"] == "no-cache"
     assert "content-encoding" not in index.headers
+
+
+def test_rate_limit_is_off_unless_configured(api_context: ApiTestContext) -> None:
+    for _ in range(30):
+        assert api_context.client.post("/search", json={"query": "alpha"}).status_code == 200
+
+
+def test_rate_limit_refuses_changes_past_the_bucket_but_never_reads() -> None:
+    from api.metrics import rate_limited_total
+
+    before = rate_limited_total._value.get()
+    with keyed_client("", rate_limit_per_minute=2) as client:
+        assert client.post("/search", json={"query": "alpha"}).status_code == 200
+        assert client.post("/search", json={"query": "alpha"}).status_code == 200
+        refused = client.post("/search", json={"query": "alpha"})
+        assert refused.status_code == 429
+        assert int(refused.headers["retry-after"]) >= 1
+        assert "Too many requests" in refused.json()["detail"]
+        # Reads (the listing, a job's progress) are never limited.
+        for _ in range(10):
+            assert client.get("/documents").status_code == 200
+        # Writes share the bucket: an upload is refused too.
+        upload = client.post("/documents", files={"file": ("a.txt", b"Intro\nalpha")})
+        assert upload.status_code == 429
+    assert rate_limited_total._value.get() == before + 2
+
+
+def test_rate_limit_slows_api_key_guessing() -> None:
+    with keyed_client("right-key", rate_limit_per_minute=2) as client:
+        wrong = {"X-API-Key": "guess"}
+        assert client.get("/documents", headers=wrong).status_code == 401
+        assert client.get("/documents", headers=wrong).status_code == 401
+        assert client.get("/documents", headers=wrong).status_code == 429
+        # The right key reads freely (a GET spends nothing).
+        assert client.get("/documents", headers={"X-API-Key": "right-key"}).status_code == 200

@@ -155,6 +155,17 @@ describe('ConversationList', () => {
     expect(props.onRename).toHaveBeenCalledWith('c1', 'Renamed');
   });
 
+  it('puts focus back on the row once a rename closes from the keyboard', async () => {
+    setup();
+    await userEvent.click(screen.getByLabelText('Rename Second chat'));
+    await userEvent.type(screen.getByLabelText('Rename Second chat'), ' 2{Enter}');
+    expect(screen.getAllByTestId('conversation-select')[1]).toHaveFocus();
+
+    await userEvent.click(screen.getByLabelText('Rename First chat'));
+    await userEvent.keyboard('{Escape}');
+    expect(screen.getAllByTestId('conversation-select')[0]).toHaveFocus();
+  });
+
   it('ignores the Enter that confirms an input-method candidate', async () => {
     const props = setup();
     await userEvent.click(screen.getByLabelText('Rename First chat'));
@@ -201,6 +212,10 @@ describe('ConversationList', () => {
     const rows = screen.getAllByTestId('conversation-item');
     expect(rows[0]).toHaveAttribute('data-pinned', 'true');
     expect(rows[0]).toHaveTextContent('Pinned one');
+    // Said in words: the star is hidden from screen readers.
+    expect(
+      within(rows[0]).getByRole('button', { name: /^Pinned: Pinned one/ }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Pin Recent' }));
     expect(onPin).toHaveBeenCalledWith('c1', true);
     await userEvent.click(screen.getByRole('button', { name: 'Unpin Pinned one' }));

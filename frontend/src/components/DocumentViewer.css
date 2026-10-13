@@ -69,6 +69,9 @@
 
 .document-viewer__body {
   overflow-y: auto;
+  /* DocumentViewer keeps the reader's place itself when chunks load above it; the
+     browser's anchoring, adjusting too, threw the position off instead. */
+  overflow-anchor: none;
   padding: 1rem;
   display: flex;
   flex-direction: column;
@@ -188,4 +191,15 @@
   width: 100%;
   border: 0;
   background: var(--card);
+}
+
+/* The cited passage within the cited chunk (CitationResponse.spans): stronger than
+   the chunk's own tint, and underlined so it reads without colour too. */
+.document-viewer__quote {
+  background: var(--accent-soft);
+  background: color-mix(in oklch, var(--accent) 28%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  text-decoration: underline 1px var(--accent);
+  text-underline-offset: 3px;
 }

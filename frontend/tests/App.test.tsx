@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App';
@@ -643,6 +643,60 @@ describe('App', () => {
     expect(screen.getByTestId('provider-openai')).toBeChecked();
   });
 
+  it('offers a skip link to the question as the first Tab stop', async () => {
+    stubUploadAndQuestionFetch();
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await vi.waitFor(() => expect(screen.getByTestId('question-textarea')).toBeEnabled());
+    (document.activeElement as HTMLElement | null)?.blur();
+
+    await userEvent.tab();
+    const skip = screen.getByRole('link', { name: 'Skip to question' });
+    expect(skip).toHaveFocus();
+    await userEvent.keyboard('{Enter}');
+    expect(screen.getByTestId('question-textarea')).toHaveFocus();
+  });
+
+  it('keeps a passage search when another panel is opened and closed', async () => {
+    const fetchMock = stubUploadAndQuestionFetch();
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith('/search')
+        ? jsonResponse({
+            results: [
+              {
+                rank: 1,
+                filename: 'a.txt',
+                page: 1,
+                section: 'Intro',
+                chunk_id: 'c1',
+                chunk_ordinal: 1,
+                text: 'Alpha passage.',
+                retrieval_score: 0.1,
+                rerank_score: 0.9,
+              },
+            ],
+          })
+        : base(input, init),
+    );
+    render(<App />);
+    await screen.findByText('api ok');
+    await userEvent.click(screen.getByTestId('rail-search'));
+    await userEvent.type(screen.getByTestId('search-input'), 'alpha');
+    await userEvent.click(screen.getByTestId('search-submit'));
+    expect(await screen.findByTestId('search-result')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId('rail-chat'));
+    expect(screen.queryByTestId('search-result')).not.toBeVisible();
+    await userEvent.click(screen.getByTestId('rail-search'));
+
+    expect(screen.getByTestId('search-input')).toHaveValue('alpha');
+    expect(screen.getByTestId('search-result')).toBeVisible();
+  });
+
   it('shows the unreachable banner when health check fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
 
@@ -651,6 +705,37 @@ describe('App', () => {
     expect(await screen.findByText('api unreachable')).toBeInTheDocument();
     expect(screen.getByText(/Cannot reach the DocRAG API/)).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent(/Cannot reach the DocRAG API/);
+  });
+
+  it('boots again once the API answers, by itself or on Retry now', async () => {
+    let up = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (!up) throw new TypeError('Failed to fetch');
+      if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+      if (url.endsWith('/documents')) return jsonResponse({ filenames: [] });
+      if (url.endsWith('/access')) return jsonResponse({ access: 'open' });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(<App />);
+      expect(await screen.findByText('api unreachable')).toBeInTheDocument();
+
+      // Still down at the first automatic retry (2s later).
+      const callsBefore = fetchMock.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(2000));
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(callsBefore);
+      expect(screen.getByText('api unreachable')).toBeInTheDocument();
+
+      up = true;
+      await userEvent.click(screen.getByTestId('api-retry'));
+      expect(await screen.findByText('api ok')).toBeInTheDocument();
+      expect(screen.queryByTestId('api-retry')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('fetches the indexed corpus on boot and renders it in the corpus panel', async () => {
@@ -749,7 +834,7 @@ describe('App', () => {
     })}\n\n`;
   }
 
-  function stubUploadAndQuestionFetch(): ReturnType<typeof vi.fn> {
+  function stubUploadAndQuestionFetch(answerFrames: string[] = [doneFrame()]): ReturnType<typeof vi.fn> {
     let jobCounter = 0;
     const jobFilenames = new Map<string, string>();
     const indexed = new Set<string>();
@@ -784,7 +869,7 @@ describe('App', () => {
         return jsonResponse({ filenames: [...indexed], chunk_counts });
       }
       if (url.endsWith('/questions/stream')) {
-        return sseResponse([doneFrame()]);
+        return sseResponse(answerFrames);
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -909,6 +994,87 @@ describe('App', () => {
 
     expect(await screen.findByText('Answer.')).toBeInTheDocument();
     expect(await screen.findByText('0.00s')).toBeInTheDocument();
+  });
+
+  it('drops a hovered citation preview when the conversation changes under it', async () => {
+    const source = {
+      source_number: 1,
+      filename: 'a.txt',
+      page: 1,
+      section: 'Intro',
+      chunk_id: 'c1',
+      text: 'Alpha passage.',
+    };
+    stubUploadAndQuestionFetch([
+      `data: ${JSON.stringify({
+        type: 'done',
+        answer: 'Alpha [1].',
+        sources: [source],
+        timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+      })}\n\n`,
+    ]);
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await vi.waitFor(() => expect(screen.getAllByTestId('corpus-panel-item')).toHaveLength(1));
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is alpha?');
+    await userEvent.click(screen.getByTestId('question-submit'));
+
+    const citation = (await screen.findAllByTestId('inline-citation'))[0];
+    fireEvent.mouseEnter(citation);
+    expect(await screen.findByTestId('source-preview')).toBeInTheDocument();
+
+    // A new chat from something that never moves the pointer off the citation (as the
+    // palette or a shortcut doesn't): the button unmounts with no mouseleave or blur.
+    fireEvent.click(screen.getByTestId('rail-chat'));
+    fireEvent.click(screen.getByTestId('context-panel-action'));
+
+    await waitFor(() => expect(screen.queryByTestId('source-preview')).not.toBeInTheDocument());
+  });
+
+  it('opens another conversation while an answer streams, and holds sending there', async () => {
+    let finishStream!: () => void;
+    const fetchMock = stubUploadAndQuestionFetch();
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!String(input).endsWith('/questions/stream')) return base(input, init);
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          finishStream = () => {
+            controller.enqueue(encoder.encode(doneFrame()));
+            controller.close();
+          };
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await userEvent.upload(screen.getByTestId('upload-input'), [makeFile('a.txt')]);
+    await userEvent.click(screen.getByTestId('upload-button'));
+    await vi.waitFor(() => expect(screen.getByTestId('question-textarea')).toBeEnabled());
+    await userEvent.type(screen.getByTestId('question-textarea'), 'First question');
+    await userEvent.click(screen.getByTestId('question-submit'));
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId('rail-chat'));
+    await userEvent.click(screen.getByTestId('context-panel-action'));
+
+    // A fresh conversation: typing works, sending waits, and there's no Stop for it.
+    expect(screen.getByTestId('question-submit')).toHaveTextContent('Ask');
+    expect(screen.getByTestId('question-hint')).toHaveTextContent('Still answering in “First question”');
+    await userEvent.type(screen.getByTestId('question-textarea'), 'Next');
+    expect(screen.getByTestId('question-submit')).toBeDisabled();
+
+    await act(async () => finishStream());
+    await vi.waitFor(() => expect(screen.getByTestId('question-submit')).toBeEnabled());
+    // The answer landed in the conversation it was asked in.
+    await userEvent.click(screen.getByRole('button', { name: /^First question/ }));
+    expect(await screen.findByText('Answer.')).toBeInTheDocument();
   });
 
   it('clicking thumbs-up on an answer POSTs feedback with the full derived payload', async () => {

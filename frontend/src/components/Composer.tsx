@@ -1,11 +1,12 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
 import './Composer.css';
 import { isImeComposing } from '../utils/keyboard';
+import { readDraft, writeDraft } from '../utils/drafts';
+import { QUESTION_INPUT_ID } from '../utils/id';
+import { MAX_QUESTION_CHARS } from '../utils/limits';
 
-// Matches the backend's QuestionRequest.question max_length in api/schemas.py.
-const MAX_QUESTION_LENGTH = 4000;
 // The most tags and files one question may be scoped to (api/schemas.py's
 // MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
 // question and every passage search, with nothing saying why.
@@ -32,7 +33,14 @@ interface ComposerProps {
   availableTags?: string[];
   selectedTags?: string[];
   onSelectedTagsChange?: (tags: string[]) => void;
+  /** Which conversation's unsent draft the box holds (kept across switches and reloads). */
+  draftKey?: string;
+  /** Text to put in the box (an example question); a new nonce puts it in again. */
+  prefill?: { text: string; nonce: number } | null;
 }
+
+// Typing is saved this long after the last keystroke.
+const DRAFT_SAVE_DELAY_MS = 300;
 
 function isCoarsePointer(): boolean {
   return typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
@@ -56,8 +64,36 @@ function Composer({
   availableTags = [],
   selectedTags = [],
   onSelectedTagsChange,
+  draftKey,
+  prefill,
 }: ComposerProps) {
-  const [value, setValue] = useState('');
+  const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
+  // Each conversation keeps its own draft: on a switch the text typed so far is saved
+  // under the conversation it was typed in, and the next one's draft comes back.
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  useEffect(() => {
+    if (!draftKey) return;
+    setValue(readDraft(draftKey));
+    const save = () => writeDraft(draftKey, valueRef.current);
+    // A reload inside the save delay would otherwise lose the last few keystrokes.
+    window.addEventListener('pagehide', save);
+    return () => {
+      window.removeEventListener('pagehide', save);
+      save();
+    };
+  }, [draftKey]);
+  useEffect(() => {
+    if (!draftKey) return;
+    const timer = setTimeout(() => writeDraft(draftKey, value), DRAFT_SAVE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [draftKey, value]);
+  // Put in to edit or send, never sent by itself; focused so Enter sends it as is.
+  useEffect(() => {
+    if (!prefill) return;
+    setValue(prefill.text);
+    textareaRef.current?.focus();
+  }, [prefill]);
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
   const [scopeQuery, setScopeQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -122,6 +158,7 @@ function Composer({
     if (!trimmed || disabled || sendHeld || pending) return;
     onSubmit(trimmed);
     setValue('');
+    if (draftKey) writeDraft(draftKey, '');
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -140,9 +177,14 @@ function Composer({
     }
   };
 
+  // Sets for the per-row checks: up to 500 selected files against every listed one was
+  // a quadratic scan on each render of the popover.
+  const selectedFileSet = useMemo(() => new Set(selectedFilenames), [selectedFilenames]);
+  const selectedTagSet = useMemo(() => new Set(selectedTags), [selectedTags]);
+
   const toggleTag = (tag: string) => {
     onSelectedTagsChange?.(
-      selectedTags.includes(tag)
+      selectedTagSet.has(tag)
         ? selectedTags.filter((name) => name !== tag)
         : [...selectedTags, tag],
     );
@@ -150,7 +192,7 @@ function Composer({
 
   const toggleFilename = (filename: string) => {
     onSelectedFilenamesChange(
-      selectedFilenames.includes(filename)
+      selectedFileSet.has(filename)
         ? selectedFilenames.filter((name) => name !== filename)
         : [...selectedFilenames, filename],
     );
@@ -174,7 +216,7 @@ function Composer({
       : indexedFilenames.filter(
           (filename) =>
             filename.toLowerCase().includes(trimmedScopeQuery) ||
-            selectedFilenames.includes(filename),
+            selectedFileSet.has(filename),
         );
 
   const tagsFull = selectedTags.length >= MAX_SCOPE_TAGS;
@@ -190,6 +232,7 @@ function Composer({
       <div className="composer__box">
         <textarea
           ref={textareaRef}
+          id={QUESTION_INPUT_ID}
           className="composer__textarea"
           value={value}
           onChange={(event) => setValue(event.target.value)}
@@ -198,7 +241,7 @@ function Composer({
           aria-label="Ask a question about your documents"
           disabled={disabled}
           rows={2}
-          maxLength={MAX_QUESTION_LENGTH}
+          maxLength={MAX_QUESTION_CHARS}
           data-testid="question-textarea"
         />
         <div className="composer__controls">
@@ -265,8 +308,8 @@ function Composer({
                       <label key={tag} className="composer__popover-item" data-testid="scope-tag">
                         <input
                           type="checkbox"
-                          checked={selectedTags.includes(tag)}
-                          disabled={tagsFull && !selectedTags.includes(tag)}
+                          checked={selectedTagSet.has(tag)}
+                          disabled={tagsFull && !selectedTagSet.has(tag)}
                           onChange={() => toggleTag(tag)}
                         />
                         <span>#{tag}</span>
@@ -278,8 +321,8 @@ function Composer({
                   <label key={filename} className="composer__popover-item" data-testid="scope-item">
                     <input
                       type="checkbox"
-                      checked={selectedFilenames.includes(filename)}
-                      disabled={filenamesFull && !selectedFilenames.includes(filename)}
+                      checked={selectedFileSet.has(filename)}
+                      disabled={filenamesFull && !selectedFileSet.has(filename)}
                       onChange={() => toggleFilename(filename)}
                     />
                     <span className="composer__popover-filename mono">{filename}</span>

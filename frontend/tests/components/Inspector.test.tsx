@@ -129,7 +129,7 @@ describe('Inspector', () => {
 
     await userEvent.click(screen.getByTestId('sources-tab-card'));
 
-    expect(onOpenSource).toHaveBeenCalledWith('guide.md', 'chunk-a');
+    expect(onOpenSource).toHaveBeenCalledWith('guide.md', 'chunk-a', undefined);
   });
 
   it('renders retrieval stat tiles and the candidate list', async () => {

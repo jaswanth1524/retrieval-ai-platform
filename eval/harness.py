@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from api.documents import CHUNKER_VERSION
+from api.documents import CHUNKER_VERSION, SUPPORTED_EXTENSIONS
 from api.generation import (
     ChatGenerator,
     ChatMessage,
@@ -298,6 +299,17 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "context_diversity_enabled": bool(settings.context_diversity_enabled),
         "context_diversity_max_similarity": float(settings.context_diversity_max_similarity),
         "dense_query_instruction": settings.dense_query_instruction,
+        # Which candidates reach the reranker, and how they are fused.
+        "rrf_k": int(settings.rrf_k),
+        "dense_retrieval_limit": int(settings.dense_retrieval_limit),
+        "sparse_retrieval_limit": int(settings.sparse_retrieval_limit),
+        "query_expansion_count": int(settings.query_expansion_count),
+        # The int8 reranker quantizes activations per batch, so the batch size can move
+        # borderline scores.
+        "reranker_batch_size": int(settings.reranker_batch_size),
+        # Recorded, not enforced (metrics.baseline_shape_problems): amd64 and arm64 score
+        # a borderline question differently, which explains a small drift.
+        "platform_machine": platform.machine(),
     }
 
 
@@ -506,6 +518,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def ingestible_files(directory: Path) -> tuple[list[Path], list[Path]]:
+    """The files in ``directory`` the API could index (sorted), and the ones it skips.
+
+    Without the filter a stray ``.DS_Store`` or README raised UnsupportedDocumentError
+    and stopped the run halfway through the corpus.
+    """
+
+    files: list[Path] = []
+    skipped: list[Path] = []
+    for path in sorted(directory.iterdir()):
+        if not path.is_file():
+            continue
+        ingestible = not path.name.startswith(".") and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        (files if ingestible else skipped).append(path)
+    return files, skipped
+
+
 def ingest_directory(directory: Path, settings: AppSettings) -> int:
     """Index each file in ``directory`` (sorted) into the configured collection."""
 
@@ -515,9 +544,11 @@ def ingest_directory(directory: Path, settings: AppSettings) -> int:
     from api.qdrant_schema import make_qdrant_client
     from api.repository import VectorRepository
 
-    files = sorted(path for path in directory.iterdir() if path.is_file())
+    files, skipped = ingestible_files(directory)
+    for path in skipped:
+        print(f"skipped {path.name}: not a supported document type")
     if not files:
-        print(f"error: no files in {directory}", file=sys.stderr)
+        print(f"error: no supported documents in {directory}", file=sys.stderr)
         return 2
     service = IngestService(
         VectorRepository(make_qdrant_client(settings)),

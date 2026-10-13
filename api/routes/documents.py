@@ -6,12 +6,13 @@ import logging
 import mimetypes
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 
 from api.chunking import TokenCounter
 from api.corpus import bump_corpus_generation
@@ -25,7 +26,7 @@ from api.documents import (
     normalize_tags,
     validate_upload_filename,
 )
-from api.export import build_export, iter_file
+from api.export import build_export
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
     FilenameConflictError,
@@ -111,6 +112,7 @@ def register(app: FastAPI) -> None:
     ) -> DocumentListResponse:
         metadata = repository.filename_metadata(settings)
         is_stale = _staleness(settings, token_counter)
+        stored_originals = raw_store.stored_names() if raw_store is not None else set()
         return DocumentListResponse(
             filenames=sorted(metadata),
             chunk_counts={name: meta.chunk_count for name, meta in metadata.items()},
@@ -126,11 +128,7 @@ def register(app: FastAPI) -> None:
                 if meta.uploaded_at is not None
             },
             stale_filenames=sorted(name for name, meta in metadata.items() if is_stale(meta)),
-            reindexable_filenames=sorted(
-                name
-                for name in metadata
-                if raw_store is not None and raw_store.path(name) is not None
-            ),
+            reindexable_filenames=sorted(set(metadata) & stored_originals),
             tags={name: list(meta.tags) for name, meta in metadata.items() if meta.tags},
         )
 
@@ -267,6 +265,13 @@ def register(app: FastAPI) -> None:
         store = require_raw_store(raw_store)
         name = stored_filename(filename)
         repository.ensure_writable(settings)
+        # Sized before reading, as the bulk path does: a full backlog would otherwise
+        # read the whole original into memory only to refuse it.
+        size = store.size(name)
+        if size is None:
+            raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
+        if not backlog.has_room(size):
+            raise backlog_full_error()
         content = store.read(name)
         if content is None:
             raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
@@ -335,7 +340,7 @@ def register(app: FastAPI) -> None:
                     repository.delete_by_ids(settings, point_ids)
                     # Right away, not after the original below: if removing that
                     # raises, cached answers must still stop citing the deleted points.
-                    bump_corpus_generation()
+                    bump_corpus_generation([filename])
                 # Also when no points remain: an original orphaned by an earlier failed
                 # ingest was otherwise undeletable, since the 404 came first.
                 removed_original = _delete_original(
@@ -370,7 +375,7 @@ def register(app: FastAPI) -> None:
             if repository.chunk_count_for_filename(settings, filename) == 0:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
             repository.set_tags(settings, filename, tags)
-        bump_corpus_generation()
+        bump_corpus_generation([filename])
         return DocumentTagsResponse(filename=filename, tags=list(tags))
 
     # Guarded like its sibling document routes: the response carries the filename (and
@@ -531,10 +536,21 @@ def register(app: FastAPI) -> None:
         raw_store: RawDocumentStoreDep,
         feedback_store: FeedbackStoreDep,
     ) -> StreamingResponse:
+        # Streamed as it is written: nothing is spooled to /tmp or held whole in memory.
         archive = build_export(settings, repository, raw_store, feedback_store)
+
+        async def body() -> AsyncIterator[bytes]:
+            # Closed however the response ends: a client that leaves cancels this, and
+            # the writer thread stops and lets go of the original it was reading.
+            try:
+                async for block in iterate_in_threadpool(archive):
+                    yield block
+            finally:
+                archive.close()
+
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         return StreamingResponse(
-            iter_file(archive),
+            body(),
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="docrag-export-{stamp}.zip"',
@@ -563,12 +579,21 @@ def register(app: FastAPI) -> None:
         raw_store: RawDocumentStoreDep,
         feedback_store: FeedbackStoreDep,
     ) -> ImportResponse:
+        # Read once for the whole backup, then kept up to date with what it queues:
+        # read per document, each job finishing mid-import moved the corpus generation
+        # and the next document paid for a fresh listing.
+        known: set[str] | None = None
+
         def enqueue(
             filename: str, content: bytes, uploaded_at: float | None, tags: tuple[str, ...]
         ) -> DocumentJobAcceptedResponse:
+            nonlocal known
             if raw_store is not None:
+                if known is None:
+                    known = set(_known_filenames(repository, settings))
                 # A DocumentError: listed under `rejected`, the rest still restored.
-                refuse_near_duplicate_name(filename, _known_filenames(repository, settings))
+                refuse_near_duplicate_name(filename, known)
+                known.add(filename)
             return enqueue_ingest(
                 job_store=job_store,
                 executor=executor,

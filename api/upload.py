@@ -12,23 +12,38 @@ class UploadTooLargeError(RuntimeError):
 
 
 async def read_upload_within_limit(file: UploadFile, max_bytes: int) -> bytes:
-    """Read an upload incrementally, aborting before buffering past ``max_bytes``.
+    """Read an upload, refusing it before buffering past ``max_bytes``.
 
-    ``UploadFile`` in this Starlette version exposes no reliable pre-read size, so the
-    only safe cap is to read in bounded chunks and stop the moment the running total
-    would exceed the limit — never buffering the full oversized body into memory.
+    When the multipart parser recorded the part's size, an oversized upload is refused
+    without reading it and a fitting one is read in a single call: collecting chunks
+    and joining them held every upload in memory twice. The size is still checked
+    against what was read, and a size that turns out short (or none at all) falls back
+    to reading in bounded chunks, stopping the moment the total passes the limit.
     """
 
     chunks: list[bytes] = []
     total = 0
+    size = file.size
+    if isinstance(size, int) and size >= 0:
+        if size > max_bytes:
+            raise _too_large(max_bytes)
+        data = await file.read(size + 1)
+        if len(data) <= size:
+            return data
+        chunks.append(data)
+        total = len(data)
     while True:
+        if total > max_bytes:
+            raise _too_large(max_bytes)
         chunk = await file.read(_READ_CHUNK_BYTES)
         if not chunk:
             break
         total += len(chunk)
-        if total > max_bytes:
-            raise UploadTooLargeError(
-                f"Upload exceeds the maximum allowed size of {max_bytes} bytes."
-            )
         chunks.append(chunk)
-    return b"".join(chunks)
+    if total > max_bytes:
+        raise _too_large(max_bytes)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
+def _too_large(max_bytes: int) -> UploadTooLargeError:
+    return UploadTooLargeError(f"Upload exceeds the maximum allowed size of {max_bytes} bytes.")

@@ -28,7 +28,7 @@ interface InspectorProps {
    *  why fetching before this flips true reliably 404s. Defaults true: a trace pinned
    *  from the trace browser is always for an already-completed turn. */
   traceReady?: boolean;
-  onOpenSource?: (filename: string, chunkId: string) => void;
+  onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
   /** Too narrow for a fourth column: show as a drawer over the chat instead. */
   overlay?: boolean;
 }
@@ -89,9 +89,17 @@ function Inspector({
     }
     if (state.status === 'error') {
       return (
-        <p className="inspector__empty inspector__empty--error" role="alert">
-          {state.message}
-        </p>
+        <div className="inspector__empty inspector__empty--error" role="alert">
+          <p>{state.message}</p>
+          <button
+            type="button"
+            className="inspector__retry"
+            onClick={state.retry}
+            data-testid="inspector-trace-retry"
+          >
+            Retry
+          </button>
+        </div>
       );
     }
     return activeTab === 'retrieval' ? (

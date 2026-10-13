@@ -1,9 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiClientError, api, extractErrorDetail, uploadTimeoutMs } from '../../src/api/client';
+import {
+  ApiClientError,
+  api,
+  apiErrorMessage,
+  extractErrorDetail,
+  uploadTimeoutMs,
+} from '../../src/api/client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+// The request body a fetch mock was called with (calls are untyped tuples).
+function sentBody(mock: { mock: { calls: unknown[][] } }, call: number): string {
+  return String((mock.mock.calls[call][1] as RequestInit).body);
+}
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -68,7 +79,7 @@ describe('api client', () => {
 
     await ask('hi', 'openai');
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    const body = JSON.parse(sentBody(fetchMock, 0));
     expect(body).toEqual({ question: 'hi', llm_provider: 'openai' });
   });
 
@@ -80,12 +91,12 @@ describe('api client', () => {
     await ask('hi', undefined, undefined, { tags: ['legal'], bypassCache: true });
     await ask('hi', undefined, undefined, { tags: [] });
 
-    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toEqual({
+    expect(JSON.parse(sentBody(fetchMock, 0))).toEqual({
       question: 'hi',
       tags: ['legal'],
       use_cache: false,
     });
-    expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual({ question: 'hi' });
+    expect(JSON.parse(sentBody(fetchMock, 1))).toEqual({ question: 'hi' });
   });
 
   it('replaces a document\'s tags with a PATCH', async () => {
@@ -107,7 +118,7 @@ describe('api client', () => {
 
     await ask('hi');
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    const body = JSON.parse(sentBody(fetchMock, 0));
     expect(body).toEqual({ question: 'hi' });
     expect('llm_provider' in body).toBe(false);
   });
@@ -122,7 +133,7 @@ describe('api client', () => {
       llmTemperature: 1.5,
     });
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    const body = JSON.parse(sentBody(fetchMock, 0));
     expect(body).toEqual({ question: 'hi', rerank_top_k: 3, llm_temperature: 1.5 });
     expect('max_context_chunks' in body).toBe(false);
   });
@@ -137,7 +148,7 @@ describe('api client', () => {
       llmTemperature: null,
     });
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    const body = JSON.parse(sentBody(fetchMock, 0));
     expect(body).toEqual({ question: 'hi' });
   });
 
@@ -555,7 +566,7 @@ describe('askQuestionStream', () => {
 
     await api.askQuestionStream('hi', undefined, undefined, ['a.txt'], undefined, {});
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    const body = JSON.parse(sentBody(fetchMock, 0));
     expect(body).toEqual({ question: 'hi', filenames: ['a.txt'] });
   });
 
@@ -564,7 +575,7 @@ describe('askQuestionStream', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await api.askQuestionStream('hi', undefined, undefined, undefined, [], {});
-    let body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    let body = JSON.parse(sentBody(fetchMock, 0));
     expect(body).toEqual({ question: 'hi' });
 
     await api.askQuestionStream(
@@ -575,7 +586,7 @@ describe('askQuestionStream', () => {
       [{ role: 'user', content: 'earlier turn' }],
       {},
     );
-    body = JSON.parse(String(fetchMock.mock.calls[1][1].body));
+    body = JSON.parse(sentBody(fetchMock, 1));
     expect(body).toEqual({
       question: 'hi',
       history: [{ role: 'user', content: 'earlier turn' }],
@@ -787,5 +798,13 @@ describe('uploadTimeoutMs', () => {
     expect(uploadTimeoutMs(0)).toBe(120_000);
     expect(uploadTimeoutMs(50 * 1024 * 1024)).toBe(120_000 + 200_000);
     expect(uploadTimeoutMs(10 * 1024 * 1024 * 1024)).toBe(30 * 60_000);
+  });
+});
+
+describe('apiErrorMessage', () => {
+  it("uses the API's message and falls back for anything else", () => {
+    expect(apiErrorMessage(new ApiClientError('Not found.', 404), 'fallback')).toBe('Not found.');
+    expect(apiErrorMessage(new TypeError('boom'), 'fallback')).toBe('fallback');
+    expect(apiErrorMessage('x', 'fallback')).toBe('fallback');
   });
 });

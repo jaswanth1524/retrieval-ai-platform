@@ -20,6 +20,8 @@ interface ConversationListProps {
   /** Matches the query against question and answer text (titles are matched here). */
   onSearch?: (query: string) => Map<string, ConversationMatch>;
   disabled?: boolean;
+  /** The conversation an answer is streaming into: it can't be deleted until it ends. */
+  streamingId?: string | null;
 }
 
 function ConversationList({
@@ -31,6 +33,7 @@ function ConversationList({
   onPin,
   onSearch,
   disabled,
+  streamingId = null,
 }: ConversationListProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
@@ -95,6 +98,20 @@ function ConversationList({
     setDraftTitle(conversation.title);
   };
 
+  // Conversation whose row should take focus back once its rename field closes from the
+  // keyboard: the field unmounts, which otherwise dropped focus to <body>. Not on blur,
+  // which means focus already went somewhere the user chose.
+  const refocusRowIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const id = refocusRowIdRef.current;
+    if (editingId !== null || id === null) return;
+    refocusRowIdRef.current = null;
+    const row = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-conversation-id]') ?? [])].find(
+      (candidate) => candidate.dataset.conversationId === id,
+    );
+    row?.querySelector<HTMLElement>('.conversation-list__select')?.focus();
+  }, [editingId]);
+
   const commitEditing = () => {
     if (editingId && draftTitle.trim()) onRename(editingId, draftTitle);
     setEditingId(null);
@@ -124,6 +141,7 @@ function ConversationList({
                 : ''
             }`}
             data-testid="conversation-item"
+            data-conversation-id={conversation.id}
             data-pinned={conversation.pinned ? 'true' : undefined}
           >
             {confirmingDeleteId === conversation.id ? (
@@ -148,9 +166,13 @@ function ConversationList({
                 onBlur={commitEditing}
                 onKeyDown={(event) => {
                   if (isImeComposing(event)) return;
-                  if (event.key === 'Enter') commitEditing();
+                  if (event.key === 'Enter') {
+                    refocusRowIdRef.current = conversation.id;
+                    commitEditing();
+                  }
                   if (event.key === 'Escape') {
                     event.stopPropagation();
+                    refocusRowIdRef.current = conversation.id;
                     setEditingId(null);
                     setDraftTitle('');
                   }
@@ -179,9 +201,14 @@ function ConversationList({
                 >
                   <span className="conversation-list__title">
                     {conversation.pinned && (
-                      <span className="conversation-list__pin-mark" aria-label="Pinned">
-                        ★{' '}
-                      </span>
+                      <>
+                        {/* aria-label on a plain span is ignored: screen readers said
+                            "black star". The words are in hidden text instead. */}
+                        <span className="conversation-list__pin-mark" aria-hidden="true">
+                          ★{' '}
+                        </span>
+                        <span className="visually-hidden">Pinned: </span>
+                      </>
                     )}
                     {conversation.title}
                   </span>
@@ -227,7 +254,10 @@ function ConversationList({
                     type="button"
                     className="conversation-list__row-action"
                     onClick={() => setConfirmingDeleteId(conversation.id)}
-                    disabled={disabled}
+                    disabled={disabled || conversation.id === streamingId}
+                    title={
+                      conversation.id === streamingId ? 'An answer is still being written here' : undefined
+                    }
                     aria-label={`Delete ${conversation.title}`}
                   >
                     ✕

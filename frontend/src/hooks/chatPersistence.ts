@@ -124,6 +124,25 @@ function isCitation(value: unknown): value is CitationResponse {
   );
 }
 
+/** The citation, without its spans when any of them isn't one: the citation still opens
+ *  its source, just with nothing marked. */
+function withValidSpans(source: CitationResponse): CitationResponse {
+  if (source.spans === undefined) return source;
+  const valid =
+    Array.isArray(source.spans) &&
+    source.spans.every(
+      (span: unknown) =>
+        !!span &&
+        typeof span === 'object' &&
+        typeof (span as { start?: unknown }).start === 'number' &&
+        typeof (span as { end?: unknown }).end === 'number' &&
+        typeof (span as { quote?: unknown }).quote === 'string',
+    );
+  if (valid) return source;
+  const { spans: _spans, ...rest } = source;
+  return rest;
+}
+
 /** A turn read from disk or an imported file, with every field the UI renders checked.
  *
  * Only the top-level shape used to be checked, so an imported file with `model: {}` or
@@ -137,7 +156,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
     role: turn.role,
     content: turn.content,
     timestamp: validTime(turn.timestamp, Date.now()),
-    sources: turn.sources.filter(isCitation),
+    sources: turn.sources.filter(isCitation).map(withValidSpans),
     timings:
       timings && typeof timings === 'object' && typeof (timings as { total_ms?: unknown }).total_ms === 'number'
         ? (timings as ChatTurn['timings'])
@@ -232,7 +251,11 @@ export function compactForStorage(conversation: Conversation, maxTurns: number):
     turns: turns.map((turn, index) =>
       index >= keepTextFrom || turn.sources.every((source) => !source.text)
         ? turn
-        : { ...turn, sources: turn.sources.map((source) => ({ ...source, text: '' })) },
+        : {
+            ...turn,
+            // The quoted passages go with the text: both are only for reading the source.
+            sources: turn.sources.map(({ spans: _spans, ...source }) => ({ ...source, text: '' })),
+          },
     ),
   };
 }
@@ -291,7 +314,8 @@ export function persistStorage(storage: ChatStorageV2): PersistOutcome {
   }
 }
 
-/** ``incoming`` with passage text put back from ``mine`` where it was stripped.
+/** ``incoming`` with passage text (and quoted spans) put back from ``mine`` where it
+ *  was stripped.
  *
  * Another tab's localStorage copy drops old passage text; merged over this tab's full
  * copy as-is, the next IndexedDB save would have stored the stripped version. */
@@ -306,7 +330,10 @@ export function keepPassageText(incoming: Conversation, mine: Conversation): Con
     return {
       ...turn,
       sources: turn.sources.map((source, index) =>
-        source.text ? source : { ...source, text: own.sources[index].text },
+        source.text
+          ? source
+          : // The quoted passages were stripped with the text (compactForStorage).
+            { ...source, text: own.sources[index].text, spans: own.sources[index].spans },
       ),
     };
   });

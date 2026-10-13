@@ -704,6 +704,30 @@ def test_reindex_all_defers_what_the_backlog_cannot_take(
         assert reads == []  # deferred without reading the original into memory
 
 
+def test_reindex_one_is_refused_by_a_full_backlog_before_reading_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        assert upload_and_wait(client, "guide.txt", b"Intro\nalpha")["state"] == "done"
+        full = IngestBacklog(max_bytes=4)
+        assert full.try_reserve(4)
+        client.app.dependency_overrides[get_ingest_backlog] = lambda: full  # type: ignore[attr-defined]
+        reads: list[str] = []
+        real_read = RawDocumentStore.read
+
+        def counting_read(self: RawDocumentStore, filename: str) -> bytes | None:
+            reads.append(filename)
+            return real_read(self, filename)
+
+        monkeypatch.setattr(RawDocumentStore, "read", counting_read)
+
+        response = client.post("/documents/guide.txt/reindex")
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"]
+        assert reads == []
+
+
 def test_reindex_is_a_409_without_raw_storage(api_context: ApiTestContext) -> None:
     off = api_context.client.post("/documents/guide.txt/reindex")
     assert off.status_code == 409

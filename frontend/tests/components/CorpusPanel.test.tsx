@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { useState } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import CorpusPanel, { type DocumentMeta, type UploadItem } from '../../src/components/CorpusPanel';
 
 function makeFile(name: string, sizeBytes: number): File {
@@ -353,8 +354,8 @@ describe('CorpusPanel', () => {
     await userEvent.click(screen.getByTestId('upload-button'));
 
     expect(props.onUpload).toHaveBeenCalledTimes(1);
-    expect(props.onUpload.mock.calls[0][0]).toHaveLength(1);
-    expect(props.onUpload.mock.calls[0][0][0].name).toBe('small.txt');
+    expect(vi.mocked(props.onUpload).mock.calls[0][0]).toHaveLength(1);
+    expect(vi.mocked(props.onUpload).mock.calls[0][0][0].name).toBe('small.txt');
   });
 
   it('clears the file input after a pick, so the same file can be picked again', async () => {
@@ -376,7 +377,7 @@ describe('CorpusPanel', () => {
     await userEvent.click(screen.getByTestId('upload-button'));
 
     expect(props.onUpload).toHaveBeenCalledTimes(1);
-    const uploaded = props.onUpload.mock.calls[0][0] as File[];
+    const uploaded = vi.mocked(props.onUpload).mock.calls[0][0] as File[];
     expect(uploaded.map((f) => f.name)).toEqual(['a.txt', 'b.txt']);
   });
 
@@ -393,7 +394,7 @@ describe('CorpusPanel', () => {
 
     await userEvent.click(screen.getByTestId('upload-button'));
 
-    const uploaded = props.onUpload.mock.calls[0][0] as File[];
+    const uploaded = vi.mocked(props.onUpload).mock.calls[0][0] as File[];
     expect(uploaded.map((f) => f.name)).toEqual(['b.txt']);
   });
 
@@ -446,6 +447,8 @@ describe('CorpusPanel', () => {
     await userEvent.click(screen.getByTestId('corpus-tags-cancel'));
     expect(screen.queryByTestId('corpus-tags-input')).not.toBeInTheDocument();
     expect(onSetTags).toHaveBeenCalledTimes(1);
+    // The control that had focus is gone; focus returns to the one that opened it.
+    expect(screen.getByLabelText('Edit tags for a.txt')).toHaveFocus();
   });
 
   it('keeps the tag editor open with the error when saving fails', async () => {
@@ -536,5 +539,108 @@ describe('CorpusPanel', () => {
     expect(items.some((item) => item.textContent?.includes('b.txt') && item.textContent.includes('failed'))).toBe(
       true,
     );
+  });
+
+  describe('reading, selecting, filtering and sorting documents', () => {
+    const THREE = {
+      filenames: ['b.md', 'a.md', 'c.md'],
+      documents: {
+        'b.md': meta({ tags: ['hr'], bytes: 300, uploadedAt: 3 }),
+        'a.md': meta({ tags: ['legal'], bytes: 100, uploadedAt: 1, reindexable: true }),
+        'c.md': meta({ tags: ['hr'], bytes: 200, uploadedAt: 2, reindexable: true }),
+      },
+    };
+    const names = () =>
+      screen.getAllByTestId('corpus-panel-item').map((card) => card.getAttribute('data-corpus-card'));
+
+    afterEach(() => localStorage.clear());
+
+    it('opens a document to read from its card, read-only key included', async () => {
+      const onRead = vi.fn();
+      setup({ ...THREE, onRead, readOnly: true });
+
+      await userEvent.click(screen.getByRole('button', { name: 'Read a.md' }));
+
+      expect(onRead).toHaveBeenCalledWith('a.md');
+      // Nothing that would change the corpus.
+      expect(screen.queryByTestId('corpus-select')).not.toBeInTheDocument();
+    });
+
+    it('sorts by name, newest or size and remembers the choice', async () => {
+      setup(THREE);
+      expect(names()).toEqual(['b.md', 'a.md', 'c.md']);
+
+      await userEvent.selectOptions(screen.getByTestId('corpus-sort'), 'name');
+      expect(names()).toEqual(['a.md', 'b.md', 'c.md']);
+      await userEvent.selectOptions(screen.getByTestId('corpus-sort'), 'newest');
+      expect(names()).toEqual(['b.md', 'c.md', 'a.md']);
+      await userEvent.selectOptions(screen.getByTestId('corpus-sort'), 'largest');
+      expect(names()).toEqual(['b.md', 'c.md', 'a.md']);
+      expect(localStorage.getItem('docrag-corpus-sort')).toBe('largest');
+    });
+
+    it('filters by tag', async () => {
+      setup(THREE);
+
+      await userEvent.selectOptions(screen.getByTestId('corpus-tag-filter'), 'hr');
+
+      expect(names()).toEqual(['b.md', 'c.md']);
+    });
+
+    it('deletes the selected documents one at a time and keeps the ones that failed', async () => {
+      const onDelete = vi.fn(async (filename: string) => {
+        if (filename === 'c.md') throw new Error('nope');
+      });
+      setup({ ...THREE, onDelete });
+
+      await userEvent.click(screen.getByLabelText('Select a.md'));
+      await userEvent.click(screen.getByLabelText('Select c.md'));
+      expect(screen.getByTestId('corpus-bulk')).toHaveTextContent('2 selected');
+      await userEvent.click(screen.getByTestId('corpus-bulk-delete'));
+      await userEvent.click(screen.getByTestId('corpus-bulk-delete-confirm'));
+
+      expect(onDelete.mock.calls.map(([filename]) => filename)).toEqual(['a.md', 'c.md']);
+      expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't delete: c.md");
+      expect(screen.getByTestId('corpus-bulk')).toHaveTextContent('1 selected');
+    });
+
+    it('adds a tag to every selected document that lacks it, and re-indexes those it can', async () => {
+      const onSetTags = vi.fn().mockResolvedValue(undefined);
+      const onReindex = vi.fn();
+      setup({ ...THREE, onSetTags, onReindex });
+
+      await userEvent.click(screen.getByTestId('corpus-select-all'));
+      await userEvent.type(screen.getByTestId('corpus-bulk-tag-input'), 'HR');
+      await userEvent.click(screen.getByTestId('corpus-bulk-tag'));
+
+      // b.md and c.md already carry "hr" (tags match case-insensitively).
+      expect(onSetTags.mock.calls).toEqual([['a.md', ['legal', 'HR']]]);
+
+      await userEvent.click(screen.getByTestId('corpus-bulk-reindex'));
+      expect(onReindex.mock.calls.map(([filename]) => filename).sort()).toEqual(['a.md', 'c.md']);
+    });
+
+    it('moves focus to the next card after a confirmed delete', async () => {
+      function Harness() {
+        const [files, setFiles] = useState(['a.md', 'b.md']);
+        return (
+          <CorpusPanel
+            filenames={files}
+            documents={{ 'a.md': meta(), 'b.md': meta() }}
+            uploads={[]}
+            onUpload={vi.fn()}
+            onDelete={async (filename) => setFiles((prev) => prev.filter((name) => name !== filename))}
+            onRead={vi.fn()}
+          />
+        );
+      }
+      render(<Harness />);
+
+      await userEvent.click(screen.getByLabelText('Delete a.md'));
+      await userEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+      // The next card's first control, not <body>.
+      expect(await screen.findByLabelText('Read b.md')).toHaveFocus();
+    });
   });
 });

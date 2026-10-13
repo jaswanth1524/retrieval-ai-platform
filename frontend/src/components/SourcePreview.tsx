@@ -17,9 +17,12 @@ function SourcePreview({ citation }: SourcePreviewProps) {
           </span>
         </div>
         <p className="source-preview__quote">
-          {/* Older turns are saved without the passage text (see useChat); the citation
-              still opens the document at this passage. */}
-          {citation.text || 'Open the source to read this passage.'}
+          {/* The passage the answer rests on when the server found one, else the
+              chunk's opening. Older turns are saved without either (see useChat); the
+              citation still opens the document at this passage. */}
+          {citation.spans?.length
+            ? citation.spans.map((span) => span.quote).join(' … ')
+            : citation.text || 'Open the source to read this passage.'}
         </p>
       </div>
     </div>

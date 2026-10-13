@@ -24,4 +24,29 @@ describe('SourcePreview', () => {
     expect(preview).toHaveTextContent('§11.3');
     expect(preview).toHaveTextContent('The limitations in Section 11.2 shall not apply to breaches of Section 9.');
   });
+
+  it('shows the passage the answer rests on instead of the chunk opening when it has one', () => {
+    render(
+      <SourcePreview
+        citation={{
+          source_number: 1,
+          filename: 'policy.md',
+          page: 1,
+          section: 'Leave',
+          chunk_id: 'c1',
+          text: 'The policy applies to all staff.',
+          spans: [
+            { start: 33, end: 70, quote: 'Employees accrue twenty days a year.' },
+            { start: 71, end: 99, quote: 'Unused days expire in March.' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('source-preview')).toHaveTextContent(
+      'Employees accrue twenty days a year. … Unused days expire in March.',
+    );
+    expect(screen.getByTestId('source-preview')).not.toHaveTextContent('applies to all staff');
+  });
 });
+

@@ -21,7 +21,7 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.http.models.models import QueryResponse
 
-from api.corpus import corpus_generation
+from api.corpus import changed_since, corpus_generation
 from api.documents import CHUNKER_VERSION
 from api.embeddings import EmbeddedText
 from api.qdrant_schema import (
@@ -47,6 +47,8 @@ _server_side_hybrid_unsupported: WeakSet[QdrantClient] = WeakSet()
 
 # filename_metadata's cache: client -> collection -> (corpus generation, time, result).
 _METADATA_TTL_SECONDS = 30.0
+# Past this many changed documents, one full scan beats a filtered re-read of each.
+_METADATA_PATCH_MAX_FILENAMES = 50
 _metadata_lock = Lock()
 _metadata_cache: WeakKeyDictionary[
     QdrantClient, dict[str, tuple[int, float, dict[str, DocumentMetadata]]]
@@ -351,7 +353,9 @@ class VectorRepository:
         UI asks after every upload, delete and page load. The result depends only on the
         corpus, so it is kept until the corpus generation moves (any ingest, delete or
         tag change in this process) or ``_METADATA_TTL_SECONDS`` passes (another
-        process's writes).
+        process's writes). When the generation moved for a few named documents, only
+        those are re-read and patched in: a bulk import used to rescan the whole
+        collection once per finished document.
         """
 
         collection = settings.qdrant_collection
@@ -368,6 +372,9 @@ class VectorRepository:
             cached = self._cached_metadata(collection, generation)
             if cached is not None:
                 return dict(cached)
+            patched = self._patched_metadata(settings, generation)
+            if patched is not None:
+                return dict(patched)
             # The generation is read before the scan, so a change landing during it
             # leaves the entry stale; the time is taken after, so a scan slower than
             # the TTL doesn't store an entry that has already expired.
@@ -380,6 +387,37 @@ class VectorRepository:
                 )
         return dict(metadata)
 
+    def _patched_metadata(
+        self, settings: AppSettings, generation: int
+    ) -> dict[str, DocumentMetadata] | None:
+        """The cached listing with just the documents changed since it was read
+        re-scanned, or None when that isn't possible (no fresh entry, too many or
+        unknown changes). Caller holds the scan lock and read ``generation`` first."""
+
+        collection = settings.qdrant_collection
+        with _metadata_lock:
+            cached = _metadata_cache.get(self._client, {}).get(collection)
+        if cached is None:
+            return None
+        cached_generation, stored_at, metadata = cached
+        if time.monotonic() - stored_at >= _METADATA_TTL_SECONDS:
+            return None
+        changed = changed_since(cached_generation)
+        if changed is None or len(changed) > _METADATA_PATCH_MAX_FILENAMES:
+            return None
+        patched = {name: meta for name, meta in metadata.items() if name not in changed}
+        if changed:
+            patched.update(self._scan_filename_metadata(settings, only=changed))
+        with _metadata_lock:
+            # The original time: the TTL still forces a full scan for writes made by
+            # another process, which no generation here records.
+            _metadata_cache.setdefault(self._client, {})[collection] = (
+                generation,
+                stored_at,
+                patched,
+            )
+        return patched
+
     def _cached_metadata(
         self, collection: str, generation: int
     ) -> dict[str, DocumentMetadata] | None:
@@ -391,7 +429,9 @@ class VectorRepository:
         fresh = time.monotonic() - stored_at < _METADATA_TTL_SECONDS
         return metadata if cached_generation == generation and fresh else None
 
-    def _scan_filename_metadata(self, settings: AppSettings) -> dict[str, DocumentMetadata]:
+    def _scan_filename_metadata(
+        self, settings: AppSettings, only: frozenset[str] | None = None
+    ) -> dict[str, DocumentMetadata]:
         """Return each indexed filename's chunk count, page count, byte size, and
         upload time — one scroll, folded together rather than a separate query per
         field (which would turn a page-count add into an N+1 against the corpus list).
@@ -402,6 +442,8 @@ class VectorRepository:
         of one ingest carries the same values — see api.documents.DocumentChunk); a
         filename ingested before those fields existed has neither in any point's
         payload, so both stay ``None``.
+
+        ``only`` limits the scroll to those filenames (a patch of a cached listing).
         """
 
         self.ensure_ready(settings, strict=False)
@@ -416,6 +458,17 @@ class VectorRepository:
         heuristic: set[str] = set()
         for point in self._scroll_all(
             settings,
+            scroll_filter=(
+                models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="filename", match=models.MatchAny(any=sorted(only))
+                        )
+                    ]
+                )
+                if only is not None
+                else None
+            ),
             with_payload=[
                 "filename",
                 "page",

@@ -34,6 +34,7 @@ from api.routes import ops as ops_routes
 from api.routes import questions as questions_routes
 from api.routes import search as search_routes
 from api.routes import traces as traces_routes
+from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
 from api.version import app_version
@@ -225,6 +226,8 @@ def create_app() -> FastAPI:
         allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
         expose_headers=["X-Request-ID"],
     )
+    # Outside CORS and the guard, so their rejections carry the headers too.
+    app.add_middleware(SecurityHeadersMiddleware)
     # Outermost, so even a CORS or guard rejection carries the id it was logged under.
     app.add_middleware(RequestIdMiddleware)
     register_exception_handlers(app)
