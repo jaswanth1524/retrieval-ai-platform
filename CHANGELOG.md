@@ -131,6 +131,9 @@ and EML support applies to new uploads. A CSV whose delimiter used to be mis-det
   nosniff` and `Referrer-Policy: no-referrer`. A frontend served from another origin is
   not covered by this policy. Checked in Chromium and WebKit (`frame-ancestors 'self'`:
   with `'none'` WebKit refused the viewer's own PDF frame).
+- Runtime base image bumped (`python:3.12-slim-bookworm`, same Python 3.12.15): its
+  `perl-base` had three fixable CRITICAL CVEs (CVE-2026-13221, CVE-2026-42496,
+  CVE-2026-8376), caught by the new CI image scan.
 - Request lists are capped per item, not only in count: `trace_id` 64 characters, file
   names 1024, tags 128 (on `/questions*`, `/search` and `/feedback`). Longer values are a
   422 where they used to be accepted.
