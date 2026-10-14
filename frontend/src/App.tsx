@@ -42,6 +42,7 @@ import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
 import { EMPTY_OVERRIDES } from './utils/overrides';
+import { initialProvider } from './utils/providers';
 import { readStored, readStoredJson, writeStored } from './utils/safeStorage';
 import {
   acceptedExtensions,
@@ -60,19 +61,9 @@ const SettingsModal = lazy(() => import('./components/SettingsModal'));
 const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
 const MODE_STORAGE_KEY = 'docrag-mode';
 const PROVIDER_STORAGE_KEY = 'docrag-provider';
+// Also read by main.tsx before the first render.
+const THEME_STORAGE_KEY = 'docrag-theme';
 
-/** Whether `provider` can be asked on this server: configured, and allowed per request. */
-function isProviderUsable(
-  provider: string | null,
-  config: PublicConfigResponse,
-): provider is LlmProvider {
-  const allowed = config.allowed_request_providers;
-  if (allowed && provider !== null && !allowed.includes(provider)) return false;
-  if (provider === 'ollama') return true;
-  if (provider === 'openai') return config.openai_available;
-  if (provider === 'openai_compatible') return Boolean(config.openai_compatible_available);
-  return false;
-}
 function loadPersistedOverrides(): QuestionOverrides {
   // Storage denied/corrupt — fall back to defaults for this session.
   const parsed = readStoredJson<Partial<QuestionOverrides>>(ADVANCED_OPTIONS_STORAGE_KEY);
@@ -117,6 +108,13 @@ function loadPersistedMode(): ChatMode {
 // download serves better than holding the whole file in memory as a blob.
 const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 
+// How long a pointer or focus rests on a citation before its viewer page is fetched.
+const CITATION_PREFETCH_DWELL_MS = 150;
+// /health while the page is up: how often, and how often once it has failed.
+const HEALTH_POLL_MS = 30_000;
+const HEALTH_RETRY_MS = 5_000;
+// A failed document listing is retried from this delay, doubling up to BOOT_RETRY_MAX_MS.
+const LISTING_RETRY_BASE_MS = 5000;
 // Backoff between boot attempts while the API is unreachable: 2s, 4s, 8s ... 30s.
 const BOOT_RETRY_BASE_MS = 2000;
 const BOOT_RETRY_MAX_MS = 30_000;
@@ -167,6 +165,10 @@ function App() {
   // The first corpus listing has come back (or failed): until then "no documents"
   // only means "not loaded yet", and must not tell anyone to upload one.
   const [corpusChecked, setCorpusChecked] = useState(false);
+  // The first listing failed with something other than a 401 (a 500, a timeout on a
+  // large corpus): unknown, not empty. It used to read as "no documents" and disabled
+  // the composer under "Upload a document to start." until a reload.
+  const [listingFailed, setListingFailed] = useState(false);
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
@@ -249,12 +251,16 @@ function App() {
     removeFromScopes,
     editAndResend,
     importConversation,
+    historyReady,
   } = useChat();
   // A deleted conversation's unsent draft goes with it, whichever tab deleted it. After
-  // the composer has saved it on the switch away, hence an effect on the list.
+  // the composer has saved it on the switch away, hence an effect on the list. Not
+  // before the full history has loaded: a conversation only IndexedDB holds would
+  // look deleted, and lose its draft.
   useEffect(() => {
+    if (!historyReady) return;
     pruneDrafts(new Set(conversations.map((conversation) => conversation.id)));
-  }, [conversations]);
+  }, [conversations, historyReady]);
   // An answer can stream into one conversation while another is open. The open one shows
   // its progress (and offers Stop) only when it is the one being answered.
   const streamingHere = pending && streamingConversationId === activeConversationId;
@@ -270,6 +276,7 @@ function App() {
     handleDismissUpload,
     handleCancelUpload,
     handleReindex,
+    handleReindexMany,
     handleReindexAllStale,
     handleDeleteDocument,
     handleSetTags,
@@ -363,11 +370,36 @@ function App() {
     writeStored(MODE_STORAGE_KEY, next);
   }, []);
 
+  // Until a theme is picked the page follows the OS — live, not only at load: switching
+  // the OS to dark at sunset left an open tab light. A pick made in another tab applies
+  // here too (each tab used to keep its own).
+  useEffect(() => {
+    const apply = (next: 'dark' | 'light') => {
+      setTheme(next);
+      document.documentElement.dataset.theme = next;
+    };
+    const media = window.matchMedia?.('(prefers-color-scheme: light)');
+    const onSystemChange = (event: MediaQueryListEvent) => {
+      if (readStored(THEME_STORAGE_KEY) === null) apply(event.matches ? 'light' : 'dark');
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== THEME_STORAGE_KEY) return;
+      if (event.newValue === 'light' || event.newValue === 'dark') apply(event.newValue);
+      else if (event.newValue === null && media) apply(media.matches ? 'light' : 'dark');
+    };
+    media?.addEventListener?.('change', onSystemChange);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      media?.removeEventListener?.('change', onSystemChange);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
+
   const toggleTheme = useStableHandler(() => {
     const next = theme === 'dark' ? 'light' : 'dark';
     setTheme(next);
     document.documentElement.dataset.theme = next;
-    writeStored('docrag-theme', next);
+    writeStored(THEME_STORAGE_KEY, next);
   });
 
   /** Note a 401 so it isn't mistaken for an empty corpus.
@@ -416,10 +448,13 @@ function App() {
     // a document" until the listing, the last of them, came back.
     async function boot() {
       const listing = refreshDocuments(controller.signal)
+        .then(() => {
+          if (!cancelled) setListingFailed(false);
+        })
         .catch((err) => {
-          // Anything other than a 401 is non-fatal — the corpus panel just stays empty
-          // until the next refresh.
-          if (!cancelled) noteAuthFailure(err);
+          // Anything other than a 401 leaves the corpus unknown; the effect below
+          // retries the listing until it answers.
+          if (!cancelled && !noteAuthFailure(err)) setListingFailed(true);
         })
         .finally(() => {
           if (!cancelled) setCorpusChecked(true);
@@ -439,27 +474,11 @@ function App() {
           writeStored(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(clamped));
           return clamped;
         });
-        // A provider picked earlier in this browser wins, if the server still offers
-        // it; otherwise sync the dropdown to the server's default.
-        const remembered = readStored(PROVIDER_STORAGE_KEY);
-        if (isProviderUsable(remembered, configResult)) {
-          setSelectedProvider(remembered);
-        } else if (configResult.llm_provider === 'openai' && configResult.openai_available) {
-          setSelectedProvider('openai');
-        } else if (
-          configResult.llm_provider === 'openai_compatible' &&
-          configResult.openai_compatible_available
-        ) {
-          setSelectedProvider('openai_compatible');
-        } else if (
-          // Ollama is the hardcoded default above, but if it's unreachable and OpenAI
-          // is configured (and allowed), don't leave the user stuck on one that will 502.
-          configResult.llm_provider === 'ollama' &&
-          !configResult.ollama_available &&
-          isProviderUsable('openai', configResult)
-        ) {
-          setSelectedProvider('openai');
-        }
+        // A provider picked earlier in this browser wins while it can answer; otherwise
+        // the server's default, then any other that can (never stuck on an Ollama that
+        // is down while OpenAI is configured). The remembered choice stays stored.
+        const startOn = initialProvider(readStored(PROVIDER_STORAGE_KEY), configResult);
+        if (startOn) setSelectedProvider(startOn);
         // The listing or /access may have answered 401 first; that stands.
         setApiStatus((prev) => (prev === 'unauthorized' ? prev : 'ok'));
       } catch {
@@ -593,9 +612,21 @@ function App() {
     setRail(panel);
   });
 
-  // Width-driven open/close, deferring to the user once they have taken a position.
+  // Width-driven open/close, deferring to the user once they have taken a position —
+  // except that a side panel opened on a wide window closes when the window narrows:
+  // below that width it is a modal drawer, which took focus and trapped Tab for an
+  // inspector nobody had just asked for.
+  const inspectorOpenedNarrowRef = useRef(false);
   useEffect(() => {
-    if (inspectorForced) return;
+    if (inspectorOpen) inspectorOpenedNarrowRef.current = tooNarrowForInspector;
+    // Only when it opens: a resize while open is the effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inspectorOpen]);
+  useEffect(() => {
+    if (inspectorForced) {
+      if (tooNarrowForInspector && !inspectorOpenedNarrowRef.current) setInspectorOpen(false);
+      return;
+    }
     if (tooNarrowForInspector) setInspectorOpen(false);
     else if (roomyEnoughForInspector) setInspectorOpen(true);
   }, [inspectorForced, tooNarrowForInspector, roomyEnoughForInspector]);
@@ -622,18 +653,102 @@ function App() {
       void handleUpload(accepted);
     }
   });
-  const noDocs = corpusChecked && indexedFilenames.length === 0;
+  // The server can go away after boot (a restart, a laptop's network dropping). The
+  // footer said "api ok" for the rest of the session, and the first sign was a failed
+  // question. /health is polled while the page is visible — every 30 s, every 5 s once
+  // it has failed — and the browser's offline/online events are taken at their word.
+  const [connectionLost, setConnectionLost] = useState(false);
+  const connectionLostRef = useRef(false);
+  connectionLostRef.current = connectionLost;
+  const booted = apiStatus === 'ok' || apiStatus === 'unauthorized';
+  useEffect(() => {
+    if (!booted) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      clearTimeout(timer);
+      timer = setTimeout(
+        () => void check(),
+        connectionLostRef.current ? HEALTH_RETRY_MS : HEALTH_POLL_MS,
+      );
+    };
+    const markLost = (lost: boolean) => {
+      // The ref too, at once: the next check is scheduled before React re-renders.
+      connectionLostRef.current = lost;
+      setConnectionLost(lost);
+    };
+    const check = async () => {
+      if (document.visibilityState !== 'hidden') {
+        try {
+          await api.health();
+          if (!cancelled) markLost(false);
+        } catch {
+          if (!cancelled) markLost(true);
+        }
+      }
+      if (!cancelled) schedule();
+    };
+    const goneOffline = () => {
+      markLost(true);
+      schedule();
+    };
+    const backOnline = () => void check();
+    window.addEventListener('offline', goneOffline);
+    window.addEventListener('online', backOnline);
+    schedule();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      window.removeEventListener('offline', goneOffline);
+      window.removeEventListener('online', backOnline);
+    };
+  }, [booted]);
+
+  // Retry a listing that failed (not a 401) while the page is open, backing off.
+  useEffect(() => {
+    if (!listingFailed) return;
+    let cancelled = false;
+    let delay = LISTING_RETRY_BASE_MS;
+    let timer: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      timer = setTimeout(() => {
+        refreshDocuments()
+          .then(() => {
+            if (!cancelled) setListingFailed(false);
+          })
+          .catch((err) => {
+            if (cancelled) return;
+            if (noteAuthFailure(err)) {
+              setListingFailed(false);
+              return;
+            }
+            delay = Math.min(delay * 2, BOOT_RETRY_MAX_MS);
+            attempt();
+          });
+      }, delay);
+    };
+    attempt();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [listingFailed, refreshDocuments, noteAuthFailure]);
+  const noDocs = corpusChecked && !listingFailed && indexedFilenames.length === 0;
   const booting = apiStatus === 'checking' || !corpusChecked;
   // Auth takes precedence over noDocs: when the corpus list 401s, "no documents" is a
   // symptom, and telling the user to upload one would send them at a call that 401s too.
   const composerHint =
     apiStatus === 'unauthorized'
       ? 'This server requires an API key — add one in Settings.'
-      : noDocs
-        ? 'Upload a document to start.'
-        : booting
-          ? 'Connecting…'
-          : undefined;
+      : connectionLost
+        ? 'Can’t reach the server right now — checking again every few seconds.'
+        : listingFailed
+          ? 'Couldn’t load the document list — retrying. You can still ask.'
+          : noDocs
+            ? 'Upload a document to start.'
+            : booting
+              ? 'Connecting…'
+              : undefined;
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
   const streamingTitle = conversations.find((c) => c.id === streamingConversationId)?.title;
   const streamingElsewhereHint = `Still answering in “${streamingTitle ?? 'another conversation'}” — you can type, and send once it finishes.`;
@@ -734,13 +849,33 @@ function App() {
     // On a narrow screen the panel is a drawer over the viewer's opener.
     setPanelDrawerOpen(false);
   }, []);
-  const handleCitationLeave = useCallback(() => setHoveredCitation(null), []);
+  // A citation's viewer page is fetched once the pointer (or focus) rests on it a
+  // moment: tabbing through an answer used to request a 61-chunk page per tab stop.
+  const prefetchTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(prefetchTimerRef.current), []);
+  const handleCitationLeave = useCallback(() => {
+    clearTimeout(prefetchTimerRef.current);
+    setHoveredCitation(null);
+  }, []);
+  // Escape dismisses the preview (WCAG 1.4.13: content shown on hover or focus can be
+  // dismissed without moving the pointer or focus).
+  useEffect(() => {
+    if (!hoveredCitation) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setHoveredCitation(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [hoveredCitation]);
   // A pointer or focus on a citation usually precedes a click on it: the viewer's code
   // and its first page start loading now, so the click opens it without waiting.
   const handleCitationHover = useCallback((citation: CitationResponse) => {
     setHoveredCitation(citation);
-    void import('./components/DocumentViewer');
-    prefetchCitationContent(citation.filename, citation.chunk_id);
+    clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = setTimeout(() => {
+      void import('./components/DocumentViewer');
+      prefetchCitationContent(citation.filename, citation.chunk_id);
+    }, CITATION_PREFETCH_DWELL_MS);
   }, []);
 
   // Shown at once (ChatMessage's feedbackGiven); taken back if it couldn't be sent, so
@@ -820,7 +955,13 @@ function App() {
   }, []);
 
   const openPalette = useCallback(() => setPaletteOpen(true), []);
-  const openSettings = useCallback(() => setSettingsOpen(true), []);
+  // Settings needs /config to render. Opened before it arrived, the flag sat set with
+  // nothing shown — every ⌘ shortcut then thought a dialog was open — and the modal
+  // popped up by itself once the config came in.
+  const configLoaded = config !== null;
+  const openSettings = useCallback(() => {
+    if (configLoaded) setSettingsOpen(true);
+  }, [configLoaded]);
   const closeInspector = useCallback(() => setInspectorOpen(false), []);
   const closePanelDrawer = useCallback(() => setPanelDrawerOpen(false), []);
   const changeProvider = useCallback((provider: LlmProvider) => {
@@ -839,15 +980,28 @@ function App() {
 
   const importInputRef = useRef<HTMLInputElement>(null);
 
+  const exportControllerRef = useRef<AbortController | null>(null);
+  useEffect(() => () => exportControllerRef.current?.abort(), []);
+
+  // Starts a backup download, or cancels the one running (the palette command toggles).
   const downloadBackup = () => {
-    if (exportingRef.current) return;
+    if (exportingRef.current) {
+      exportControllerRef.current?.abort();
+      return;
+    }
     exportingRef.current = true;
     setExportingBackup(true);
+    const controller = new AbortController();
+    exportControllerRef.current = controller;
     pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
     api
-      .exportCorpus()
+      .exportCorpus(controller.signal)
       .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
       .catch((err) => {
+        if (controller.signal.aborted) {
+          pushToast({ tone: 'info', title: 'Backup cancelled' });
+          return;
+        }
         if (noteAuthFailure(err)) return;
         pushToast({
           tone: 'bad',
@@ -857,6 +1011,7 @@ function App() {
       })
       .finally(() => {
         exportingRef.current = false;
+        exportControllerRef.current = null;
         setExportingBackup(false);
       });
   };
@@ -903,7 +1058,7 @@ function App() {
         newConversation();
       },
       upload: startUpload,
-      openSettings: () => setSettingsOpen(true),
+      openSettings,
       toggleInspector,
       setMode,
       toggleTheme,
@@ -1071,13 +1226,14 @@ function App() {
         theme={theme}
         onToggleTheme={toggleTheme}
         onOpenSettings={openSettings}
+        settingsAvailable={configLoaded}
         hidden={feedbackPanelAvailable ? NO_HIDDEN_PANELS : HIDDEN_FEEDBACK_PANEL}
       />
       <ContextPanel
         title={PANEL_META[rail].title}
         actionLabel={rail === 'corpus' && readOnly ? 'Refresh' : PANEL_META[rail].actionLabel}
         onAction={handlePanelAction}
-        apiStatus={apiStatus}
+        apiStatus={connectionLost && booted ? 'error' : apiStatus}
         chunkTotal={chunkTotal}
         drawer={panelCollapsed}
         drawerOpen={panelDrawerOpen}
@@ -1110,6 +1266,7 @@ function App() {
             onDismissUpload={handleDismissUpload}
             onCancelUpload={readOnly ? undefined : handleCancelUpload}
             onReindex={config?.raw_documents_enabled && !readOnly ? handleReindex : undefined}
+            onReindexMany={config?.raw_documents_enabled && !readOnly ? handleReindexMany : undefined}
             onReindexAllStale={
               config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
             }
@@ -1171,6 +1328,11 @@ function App() {
               onToggleInspector={toggleInspector}
             />
             <ChatThread
+              // Per conversation: "a new turn arrived" was judged by the turn count, so
+              // switching to a conversation of the same length kept the last one's
+              // scroll position and unpinned state.
+              // (Prefixed: ChatHeader, a sibling, is keyed by the same id.)
+              key={`thread-${activeConversationId ?? 'none'}`}
               turns={turns}
               pending={streamingHere}
               busy={pending}
@@ -1193,35 +1355,40 @@ function App() {
               focusTurn={focusTurn}
             />
             {hoveredCitation && <SourcePreview citation={hoveredCitation} />}
-            <ToastRow
-              toasts={toasts}
-              onDismiss={dismissToast}
-              onHold={holdToast}
-              onRelease={releaseToast}
-            />
-            <Composer
-              onSubmit={askQuestion}
-              // Typing is fine while the app boots; only sending waits for it.
-              disabled={apiStatus === 'unauthorized' || noDocs}
-              sendHeld={booting || (pending && !streamingHere)}
-              hint={composerHint ?? (pending && !streamingHere ? streamingElsewhereHint : undefined)}
-              pending={streamingHere}
-              onCancel={cancel}
-              scopeLabel={currentScopeLabel}
-              indexedFilenames={indexedFilenames}
-              selectedFilenames={selectedFilenames}
-              onSelectedFilenamesChange={setSelectedFilenames}
-              availableTags={availableTags}
-              selectedTags={selectedTags}
-              onSelectedTagsChange={setSelectedTags}
-              config={config}
-              provider={selectedProvider}
-              onProviderChange={changeProvider}
-              providerLabel={currentModelLabel ?? selectedProvider}
-              draftKey={activeConversationId ?? NEW_CONVERSATION_DRAFT}
-              prefill={prefill}
-            />
           </>
+        )}
+        {/* Outside the branch above, at a fixed position among main's children: a toast
+            pushed while the API is unreachable used to go nowhere, and the live regions
+            remounted (and so were not announced) when it came back. */}
+        <ToastRow
+          toasts={toasts}
+          onDismiss={dismissToast}
+          onHold={holdToast}
+          onRelease={releaseToast}
+        />
+        {apiStatus !== 'error' && (
+          <Composer
+            onSubmit={askQuestion}
+            // Typing is fine while the app boots; only sending waits for it.
+            disabled={apiStatus === 'unauthorized' || noDocs}
+            sendHeld={booting || (pending && !streamingHere)}
+            hint={composerHint ?? (pending && !streamingHere ? streamingElsewhereHint : undefined)}
+            pending={streamingHere}
+            onCancel={cancel}
+            scopeLabel={currentScopeLabel}
+            indexedFilenames={indexedFilenames}
+            selectedFilenames={selectedFilenames}
+            onSelectedFilenamesChange={setSelectedFilenames}
+            availableTags={availableTags}
+            selectedTags={selectedTags}
+            onSelectedTagsChange={setSelectedTags}
+            config={config}
+            provider={selectedProvider}
+            onProviderChange={changeProvider}
+            providerLabel={currentModelLabel ?? selectedProvider}
+            draftKey={activeConversationId ?? NEW_CONVERSATION_DRAFT}
+            prefill={prefill}
+          />
         )}
       </main>
       <LazyChunkBoundary

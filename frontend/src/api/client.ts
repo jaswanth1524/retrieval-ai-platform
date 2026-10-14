@@ -282,7 +282,11 @@ export interface QuestionStreamHandlers {
     timings: TimingsResponse | null,
     traceId: string | null,
     cached?: boolean,
-    grounding?: { answerStatus?: AnswerStatus; topRerankScore?: number | null },
+    grounding?: {
+      answerStatus?: AnswerStatus;
+      topRerankScore?: number | null;
+      truncated?: boolean;
+    },
   ) => void;
 }
 
@@ -299,6 +303,7 @@ type QuestionStreamEvent =
       cached?: boolean;
       answer_status?: AnswerStatus;
       top_rerank_score?: number | null;
+      truncated?: boolean;
     }
   | { type: 'error'; detail: string };
 
@@ -313,23 +318,43 @@ async function readSseStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  // Parsed by the SSE rules, not this server's exact framing: a proxy that rewrites
+  // line endings to CRLF, splits one event's data over several `data:` lines or drops
+  // the space after the colon used to make frames vanish — and a last frame with no
+  // blank line after it (the connection closed) was dropped.
+  let dataLines: string[] = [];
+  const dispatch = () => {
+    if (dataLines.length > 0) {
+      onEvent(JSON.parse(dataLines.join('\n')) as QuestionStreamEvent);
+    }
+    dataLines = [];
+  };
+  const takeLine = (line: string) => {
+    if (line === '') {
+      dispatch();
+      return;
+    }
+    if (line.startsWith(':')) return; // a comment: the keepalive ping
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'data') dataLines.push(value);
+  };
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       onChunk?.();
       buffer += decoder.decode(value, { stream: true });
-      let separatorIndex = buffer.indexOf('\n\n');
-      while (separatorIndex !== -1) {
-        const rawEvent = buffer.slice(0, separatorIndex);
-        buffer = buffer.slice(separatorIndex + 2);
-        const dataLine = rawEvent.split('\n').find((line) => line.startsWith('data: '));
-        if (dataLine) {
-          onEvent(JSON.parse(dataLine.slice('data: '.length)) as QuestionStreamEvent);
-        }
-        separatorIndex = buffer.indexOf('\n\n');
-      }
+      // A lone "\r" at the very end may be the first half of a "\r\n": wait for more.
+      const lines = buffer.split(/\r\n|\r(?!$)|\n/);
+      buffer = lines.pop() ?? '';
+      lines.forEach(takeLine);
     }
+    buffer += decoder.decode();
+    for (const line of buffer.split(/\r\n|\r|\n/)) takeLine(line);
+    dispatch();
   } finally {
     // Leaving early — a backend `error` event, a malformed frame, an abort — used to
     // leave the body locked to this reader until GC. cancel() releases the lock and
@@ -359,7 +384,9 @@ export const api = {
     return request<ImportResponse>('/import', {
       method: 'POST',
       body: form,
-      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      // Scaled to the zip like an upload: a backup is often far larger than one
+      // document, and a fixed two minutes failed big restores on a slow link.
+      timeoutMs: uploadTimeoutMs(file.size),
       signal,
     });
   },
@@ -416,8 +443,8 @@ export const api = {
 
   // The whole-corpus backup zip (manifest, stored originals, feedback). Needs the full
   // API key when one is set. Returns the file and the name the server suggested.
-  exportCorpus: async (): Promise<{ blob: Blob; filename: string }> => {
-    const { response, blob } = await downloadBlob('/export');
+  exportCorpus: async (signal?: AbortSignal): Promise<{ blob: Blob; filename: string }> => {
+    const { response, blob } = await downloadBlob('/export', signal);
     const disposition = response.headers.get('Content-Disposition') ?? '';
     const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'docrag-export.zip';
     return { blob, filename };
@@ -601,7 +628,11 @@ export const api = {
                 event.timings,
                 event.trace_id,
                 event.cached ?? false,
-                { answerStatus: event.answer_status, topRerankScore: event.top_rerank_score },
+                {
+                  answerStatus: event.answer_status,
+                  topRerankScore: event.top_rerank_score,
+                  truncated: event.truncated,
+                },
               );
             } else if (event.type === 'error') throw new ApiClientError(event.detail);
           },

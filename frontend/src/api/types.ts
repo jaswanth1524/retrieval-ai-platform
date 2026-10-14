@@ -71,6 +71,8 @@ export interface SearchResultResponse {
   rank: number;
   filename: string;
   page: number;
+  /** The last page when the passage crosses a page break (it starts on `page`). */
+  page_end?: number | null;
   section: string;
   chunk_id: string;
   chunk_ordinal: number | null;
@@ -184,6 +186,8 @@ export interface FeedbackResponse {
 export interface DocumentChunkResponse {
   chunk_id: string;
   page: number;
+  /** The last page when the passage crosses a page break (it starts on `page`). */
+  page_end?: number | null;
   section: string;
   text: string;
   chunk_ordinal: number | null;
@@ -210,6 +214,8 @@ export interface CitationResponse {
   source_number: number;
   filename: string;
   page: number;
+  /** The last page when the passage crosses a page break (it starts on `page`). */
+  page_end?: number | null;
   section: string;
   chunk_id: string;
   text: string;
@@ -240,7 +246,12 @@ export interface TimingsResponse {
 }
 
 /** How well an answer is grounded. Extensible: treat an unknown value as 'answered'. */
-export type AnswerStatus = 'answered' | 'insufficient_context' | 'no_context' | (string & {});
+export type AnswerStatus =
+  | 'answered'
+  | 'insufficient_context'
+  | 'no_context'
+  | 'uncited'
+  | (string & {});
 
 export interface HistoryMessage {
   role: 'user' | 'assistant';

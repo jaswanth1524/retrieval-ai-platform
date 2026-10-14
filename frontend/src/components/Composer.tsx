@@ -6,6 +6,7 @@ import { isImeComposing } from '../utils/keyboard';
 import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
+import { isProviderAllowed, isProviderUsable } from '../utils/providers';
 
 // The most tags and files one question may be scoped to (api/schemas.py's
 // MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
@@ -68,6 +69,9 @@ function Composer({
   prefill,
 }: ComposerProps) {
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
+  // A paste the length limit cut short: maxLength drops the excess silently, and a
+  // long question pasted from elsewhere lost its end without a word.
+  const [pasteCut, setPasteCut] = useState(false);
   // Each conversation keeps its own draft: on a switch the text typed so far is saved
   // under the conversation it was typed in, and the next one's draft comes back.
   const valueRef = useRef(value);
@@ -200,10 +204,9 @@ function Composer({
 
   // ALLOWED_REQUEST_PROVIDERS: a provider the server refuses per request is shown
   // disabled rather than offered and turned away with a 400.
-  const allowed = (name: string) =>
-    !config?.allowed_request_providers || config.allowed_request_providers.includes(name);
-  const openaiEnabled = (config?.openai_available ?? false) && allowed('openai');
-  const ollamaEnabled = (config?.ollama_available ?? false) && allowed('ollama');
+  const allowed = (name: string) => !config || isProviderAllowed(name, config);
+  const openaiEnabled = config !== null && isProviderUsable('openai', config);
+  const ollamaEnabled = config !== null && isProviderUsable('ollama', config);
   const compatibleAllowed = allowed('openai_compatible');
 
   // A search hiding an already-selected filename would make it permanently
@@ -229,13 +232,29 @@ function Composer({
           {hint}
         </p>
       )}
+      <p className="visually-hidden" role="status" data-testid="question-length-status">
+        {pasteCut ? `Pasted text cut to ${MAX_QUESTION_CHARS} characters, the limit for a question.` : ''}
+      </p>
+      {pasteCut && (
+        <p className="composer__hint composer__hint--warn" data-testid="question-length-note" aria-hidden="true">
+          Pasted text was cut to {MAX_QUESTION_CHARS.toLocaleString()} characters, the limit for a question.
+        </p>
+      )}
       <div className="composer__box">
         <textarea
           ref={textareaRef}
           id={QUESTION_INPUT_ID}
           className="composer__textarea"
           value={value}
-          onChange={(event) => setValue(event.target.value)}
+          onChange={(event) => {
+            setValue(event.target.value);
+            if (event.target.value.length < MAX_QUESTION_CHARS) setPasteCut(false);
+          }}
+          onPaste={(event) => {
+            const target = event.currentTarget;
+            const kept = target.value.length - (target.selectionEnd - target.selectionStart);
+            setPasteCut(kept + event.clipboardData.getData('text').length > MAX_QUESTION_CHARS);
+          }}
           onKeyDown={handleKeyDown}
           placeholder="Ask a question about your documents…"
           aria-label="Ask a question about your documents"

@@ -16,6 +16,8 @@ from api.chunking import (
     _sentence_units,
     _window_units,
     merge_tiny_semantic_sections,
+    window_label,
+    window_pages,
 )
 from api.parsers.common import (
     DEFAULT_SECTION,
@@ -24,6 +26,7 @@ from api.parsers.common import (
     DocumentSection,
     EmptyDocumentError,
     UnsupportedDocumentError,
+    cap_section,
     infer_section,
     normalize_text,
 )
@@ -33,12 +36,14 @@ from api.parsers.eml import parse_eml_document
 from api.parsers.epub import parse_epub_document
 from api.parsers.html import parse_html_document
 from api.parsers.pdf import parse_pdf_document
+from api.parsers.pptx import parse_pptx_document
 from api.parsers.text import (
     decode_text_document,
     looks_like_markdown,
     parse_markdown_document,
     parse_plain_text_document,
 )
+from api.parsers.xlsx import parse_xlsx_document
 from api.settings import AppSettings
 
 # Re-exported: the parser types and helpers callers have always imported from here.
@@ -126,12 +131,20 @@ def _parse_eml(
     return parse_eml_document(filename, content)
 
 
+def _parse_pptx(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_pptx_document(filename, content)
+
+
 # One parser per supported suffix (api/parsers/*); adding a format is one entry here.
 PARSERS: dict[str, Parser] = {
     ".pdf": parse_pdf_document,
     ".docx": _parse_docx,
     ".epub": _parse_epub,
     ".eml": _parse_eml,
+    ".xlsx": parse_xlsx_document,
+    ".pptx": _parse_pptx,
     ".md": _parse_markdown,
     ".markdown": _parse_markdown,
     ".html": _parse_html,
@@ -153,9 +166,13 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 # v4: section labels capped at 120 characters in every parser (Markdown headings weren't),
 # no headings detected inside fenced code blocks, CSV labels use spreadsheet row numbers,
 # and a long filename/section prefix can no longer shrink the window budget to a token.
+# v5: table rows (CSV, XLSX, Markdown tables) are never split, and a table chunk is
+# labelled with the rows it holds; a chunk crossing pages records its last page
+# (``page_end``); tiny sections are only merged within a page; chunk ids come from the
+# content, not the position, so they survive an edit elsewhere in the document.
 # Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
 # carry an older version is listed as stale, and re-indexing it applies this one.
-CHUNKER_VERSION = 4
+CHUNKER_VERSION = 5
 
 # The smallest share of CHUNK_SIZE_TOKENS a window keeps for text, whatever the
 # filename › section prefix costs. Without a floor a long name left one token per
@@ -211,6 +228,9 @@ class DocumentChunk:
     chunk_id: str
     text: str
     ordinal: int = 1
+    # The chunk's last page when it runs past ``page`` (a chunk crossing a page break);
+    # None when it is on one page. Absent on points indexed before CHUNKER_VERSION 5.
+    page_end: int | None = None
     # Document-level metadata, the same value stamped onto every chunk of one ingest
     # (redundant per-point storage, same tradeoff as `filename` itself) — set by
     # IngestService.ingest, which is the first place both the upload time and the raw
@@ -233,6 +253,7 @@ class DocumentChunk:
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
+    PAYLOAD_PAGE_END_KEY: ClassVar[str] = "page_end"
     PAYLOAD_BYTE_SIZE_KEY: ClassVar[str] = "byte_size"
     PAYLOAD_UPLOADED_AT_KEY: ClassVar[str] = "uploaded_at"
     PAYLOAD_CHUNKER_VERSION_KEY: ClassVar[str] = "chunker_version"
@@ -251,6 +272,8 @@ class DocumentChunk:
             self.PAYLOAD_TEXT_KEY: self.text,
             self.PAYLOAD_ORDINAL_KEY: self.ordinal,
         }
+        if self.page_end is not None:
+            payload[self.PAYLOAD_PAGE_END_KEY] = self.page_end
         if self.byte_size is not None:
             payload[self.PAYLOAD_BYTE_SIZE_KEY] = self.byte_size
         if self.uploaded_at is not None:
@@ -297,7 +320,8 @@ def chunk_sections(
 
     Consecutive ``boundary="physical"`` sections (PDF pages, plain-text paragraphs)
     are windowed as one continuous stream, so overlap carries across page/paragraph
-    breaks. ``boundary="semantic"`` sections (Markdown headings) are always windowed
+    breaks. ``boundary="semantic"`` sections (Markdown headings) and ``"isolated"`` ones
+    (slides, spreadsheet row ranges) are always windowed
     independently — crossing a heading would mix two topics into one chunk and make
     its section citation label lie about which topic it covers.
     """
@@ -310,6 +334,9 @@ def chunk_sections(
     merged_sections = merge_tiny_semantic_sections(sections, int(settings.min_section_words))
 
     chunks: list[DocumentChunk] = []
+    # How many earlier chunks had the same page, label and text (a repeated boilerplate
+    # paragraph): part of the id, so identical chunks still get distinct ones.
+    seen: dict[tuple[int, str, str], int] = {}
     for group in _group_sections_for_windowing(merged_sections):
         filename = group[0].filename
         # Reserve headroom for the contextual-embedding prefix (ingestion prepends
@@ -349,15 +376,19 @@ def chunk_sections(
             chunk_text = " ".join(unit.text for unit in window).strip()
             if not chunk_text:
                 continue
-            page = window[0].page
-            section = window[0].section
+            page, page_end = window_pages(window)
+            section = cap_section(window_label(window))
             ordinal = len(chunks) + 1
+            identity = (page, section, chunk_text)
+            occurrence = seen.get(identity, 0)
+            seen[identity] = occurrence + 1
             chunks.append(
                 DocumentChunk(
                     filename=filename,
                     page=page,
+                    page_end=page_end,
                     section=section,
-                    chunk_id=build_chunk_id(filename, page, section, ordinal, chunk_text),
+                    chunk_id=build_chunk_id(filename, page, section, chunk_text, occurrence),
                     text=chunk_text,
                     ordinal=ordinal,
                 )
@@ -454,8 +485,14 @@ def validate_upload_filename(filename: str) -> str:
     return safe_filename
 
 
-def build_chunk_id(filename: str, page: int, section: str, ordinal: int, text: str) -> str:
-    """Build a stable chunk id from source metadata and chunk text."""
+def build_chunk_id(filename: str, page: int, section: str, text: str, occurrence: int = 0) -> str:
+    """Build a stable chunk id from source metadata and chunk text.
 
-    raw = "\n".join([filename, str(page), section, str(ordinal), text])
+    Not from the chunk's position (CHUNKER_VERSION 5): with the ordinal in it, one
+    paragraph inserted near the top of a document gave every later chunk a new id, so
+    citations saved in a conversation no longer found their passage after a re-index.
+    ``occurrence`` tells apart identical chunks on the same page and section.
+    """
+
+    raw = "\n".join([filename, str(page), section, text, str(occurrence)])
     return sha256(raw.encode("utf-8")).hexdigest()[:20]

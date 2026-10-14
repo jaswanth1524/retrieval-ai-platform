@@ -46,7 +46,7 @@ _server_side_hybrid_unsupported: WeakSet[QdrantClient] = WeakSet()
 
 
 # filename_metadata's cache: client -> collection -> (corpus generation, time, result).
-_METADATA_TTL_SECONDS = 30.0
+# How long an entry lives is DOCUMENT_LISTING_TTL_SECONDS (writes from another process).
 # Past this many changed documents, one full scan beats a filtered re-read of each.
 _METADATA_PATCH_MAX_FILENAMES = 50
 _metadata_lock = Lock()
@@ -75,7 +75,15 @@ def clear_hybrid_fallback_cache() -> None:
 # Payload fields a search hit is read for (retrieval.scored_point_to_chunk). Fetching
 # the whole payload sent each of 50 candidates' tags, fingerprint, sizes and stamps
 # over the wire for nothing.
-SEARCH_PAYLOAD_FIELDS = ["filename", "page", "section", "chunk_id", "text", "chunk_ordinal"]
+SEARCH_PAYLOAD_FIELDS = [
+    "filename",
+    "page",
+    "page_end",
+    "section",
+    "chunk_id",
+    "text",
+    "chunk_ordinal",
+]
 # Neighbour expansion reads only these.
 NEIGHBOR_PAYLOAD_FIELDS = ["chunk_ordinal", "text"]
 # Distinct tags one facet call returns before stored_tags falls back to a full scan.
@@ -121,6 +129,8 @@ class DocumentMetadata:
 
 
 _SCROLL_PAGE_SIZE = 256
+# Points fetched per requested ordinal by fetch_neighbors (see there).
+_NEIGHBOR_COPIES_ALLOWED = 4
 
 
 def _single_filename_filter(filename: str) -> models.Filter:
@@ -352,14 +362,15 @@ class VectorRepository:
         Reading it means scrolling every point's payload — the whole collection — and the
         UI asks after every upload, delete and page load. The result depends only on the
         corpus, so it is kept until the corpus generation moves (any ingest, delete or
-        tag change in this process) or ``_METADATA_TTL_SECONDS`` passes (another
+        tag change in this process) or ``document_listing_ttl_seconds`` passes (another
         process's writes). When the generation moved for a few named documents, only
         those are re-read and patched in: a bulk import used to rescan the whole
         collection once per finished document.
         """
 
         collection = settings.qdrant_collection
-        cached = self._cached_metadata(collection, corpus_generation())
+        ttl = float(settings.document_listing_ttl_seconds)
+        cached = self._cached_metadata(collection, corpus_generation(), ttl)
         if cached is not None:
             return dict(cached)
         with _metadata_lock:
@@ -369,7 +380,7 @@ class VectorRepository:
         with scan_lock:
             # Whoever held the lock may have just stored a fresh listing.
             generation = corpus_generation()
-            cached = self._cached_metadata(collection, generation)
+            cached = self._cached_metadata(collection, generation, ttl)
             if cached is not None:
                 return dict(cached)
             patched = self._patched_metadata(settings, generation)
@@ -400,7 +411,7 @@ class VectorRepository:
         if cached is None:
             return None
         cached_generation, stored_at, metadata = cached
-        if time.monotonic() - stored_at >= _METADATA_TTL_SECONDS:
+        if time.monotonic() - stored_at >= float(settings.document_listing_ttl_seconds):
             return None
         changed = changed_since(cached_generation)
         if changed is None or len(changed) > _METADATA_PATCH_MAX_FILENAMES:
@@ -419,14 +430,14 @@ class VectorRepository:
         return patched
 
     def _cached_metadata(
-        self, collection: str, generation: int
+        self, collection: str, generation: int, ttl: float
     ) -> dict[str, DocumentMetadata] | None:
         with _metadata_lock:
             cached = _metadata_cache.get(self._client, {}).get(collection)
         if cached is None:
             return None
         cached_generation, stored_at, metadata = cached
-        fresh = time.monotonic() - stored_at < _METADATA_TTL_SECONDS
+        fresh = time.monotonic() - stored_at < ttl
         return metadata if cached_generation == generation and fresh else None
 
     def _scan_filename_metadata(
@@ -550,7 +561,11 @@ class VectorRepository:
         scan then, and when the server can't facet at all.
         """
 
-        cached = self._cached_metadata(settings.qdrant_collection, corpus_generation())
+        cached = self._cached_metadata(
+            settings.qdrant_collection,
+            corpus_generation(),
+            float(settings.document_listing_ttl_seconds),
+        )
         if cached is not None:
             return {tag for metadata in cached.values() for tag in metadata.tags}
         try:
@@ -718,7 +733,10 @@ class VectorRepository:
             ),
             with_payload=NEIGHBOR_PAYLOAD_FIELDS,
             with_vectors=False,
-            limit=len(ordinals),
+            # Room for duplicates: an ingest that failed partway leaves the previous
+            # version's points next to the new ones, sharing ordinals, and an exact limit
+            # let those copies crowd out the ordinals that were asked for.
+            limit=len(ordinals) * _NEIGHBOR_COPIES_ALLOWED,
         )
         return [
             models.ScoredPoint(id=point.id, version=0, score=0.0, payload=point.payload)

@@ -9,7 +9,14 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from api.chunking import sentence_spans
-from api.llm import ChatGenerator, ChatMessage, GenerationError
+from api.llm import (
+    ChatGenerator,
+    ChatMessage,
+    GenerationError,
+    last_finish_reason,
+    reset_finish_reason,
+)
+from api.metrics import citation_retries_total
 from api.reranking import RerankedChunk
 from api.settings import AppSettings
 
@@ -91,6 +98,8 @@ class SourceCitation:
     text: str
     # Filled in once the answer exists (attach_spans); empty before generation.
     spans: tuple[CitationSpan, ...] = ()
+    # The last page of a passage that crosses a page break; None on one page.
+    page_end: int | None = None
 
 
 def citation_from_dict(data: dict[str, Any]) -> SourceCitation:
@@ -112,6 +121,7 @@ def source_citations(chunks: Sequence[RerankedChunk]) -> list[SourceCitation]:
             section=chunk.section,
             chunk_id=chunk.chunk_id,
             text=_truncate_excerpt(chunk.text),
+            page_end=chunk.page_end,
         )
         for index, chunk in enumerate(chunks, start=1)
     ]
@@ -355,22 +365,24 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 
 # How well an answer is grounded, sent with every answer. A string, not an enum, so a
 # new value can be added without breaking a client: an unknown one reads as "answered".
-ANSWER_STATUSES = ("answered", "insufficient_context", "no_context")
+ANSWER_STATUSES = ("answered", "insufficient_context", "no_context", "uncited")
 
 
 def answer_status(answer: str, cited_count: int, source_count: int) -> str:
     """``no_context`` when nothing cleared the rerank bar, ``insufficient_context`` when
-    the model said the sources don't cover it and cited none of them, else
-    ``answered``.
+    the model said the sources don't cover it and cited none of them, ``uncited`` when
+    it answered without citing any source (even after the citation retry, or citing
+    only numbers that aren't sources), else ``answered``.
 
     Both conditions, as for the citation retry: "the documents don't cover X, but Y
-    [1]" is a partial answer, and a hint word alone would have flagged it.
+    [1]" is a partial answer, and a hint word alone would have flagged it. An uncited
+    answer used to read as ``answered``, so nothing told the reader it had no sources.
     """
 
     if source_count <= 0:
         return "no_context"
-    if cited_count == 0 and _states_insufficiency(answer):
-        return "insufficient_context"
+    if cited_count == 0:
+        return "insufficient_context" if _states_insufficiency(answer) else "uncited"
     return "answered"
 
 
@@ -480,12 +492,17 @@ def finalize_citations(
         # still comes back uncited cost just as much wall-clock as one that worked, and
         # attributing it to generate_ms is what made this stage invisible before.
         retry_start = time.monotonic()
+        first_finish = last_finish_reason()
+        citation_retries_total.inc()
         retried = retry_uncited_answer(prompt_messages, answer, generator, settings)
         retry_ms = (time.monotonic() - retry_start) * 1000
         if retried is not None:
             answer, final_messages = retried
             cited = cited_sources(answer, all_sources)
             retry_used = True
+        else:
+            # The first answer stands, and so does how it ended (truncated or not).
+            reset_finish_reason(first_finish)
     return CitationOutcome(
         answer=answer,
         cited=cited,

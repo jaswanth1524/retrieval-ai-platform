@@ -27,7 +27,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol
 
-from api.metrics import ingest_jobs_evicted_total
+from api.metrics import ingest_backlog_bytes, ingest_backlog_jobs, ingest_jobs_evicted_total
 from api.sqlite_store import enable_wal, sqlite_transaction
 
 JobState = Literal["queued", "parsing", "embedding", "done", "failed"]
@@ -86,6 +86,7 @@ class IngestBacklog:
                 return False
             self._pending += size
             self._jobs += 1
+            self._publish()
             return True
 
     def has_room(self, size: int) -> bool:
@@ -104,6 +105,12 @@ class IngestBacklog:
         with self._lock:
             self._pending = max(0, self._pending - size)
             self._jobs = max(0, self._jobs - 1)
+            self._publish()
+
+    def _publish(self) -> None:
+        # Under the lock, so the gauges never show a half-applied change.
+        ingest_backlog_bytes.set(self._pending)
+        ingest_backlog_jobs.set(self._jobs)
 
     @property
     def pending_bytes(self) -> int:

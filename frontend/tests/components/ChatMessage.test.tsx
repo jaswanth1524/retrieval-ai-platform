@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import ChatMessage, { type ChatTurn } from '../../src/components/ChatMessage';
@@ -443,6 +443,44 @@ describe('ChatMessage', () => {
     expect(screen.getByText('arr[2]')).toBeInTheDocument();
   });
 
+  it('does not re-open an inline preview when focus returns from the viewer, or on a tap', async () => {
+    const onCitationHover = vi.fn();
+    const source = {
+      source_number: 1,
+      filename: 'guide.pdf',
+      page: 4,
+      section: 'Setup',
+      chunk_id: 'c-1',
+      text: 'passage',
+    };
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Use docker [1].', sources: [source] })}
+        engineerMode={false}
+        onOpenSource={vi.fn()}
+        onCitationHover={onCitationHover}
+      />,
+    );
+    const chip = screen.getByTestId('inline-citation');
+
+    fireEvent.click(chip); // opens the viewer, which later hands focus back
+    fireEvent.focus(chip);
+    expect(onCitationHover).not.toHaveBeenCalled();
+
+    fireEvent.touchStart(chip);
+    fireEvent.mouseEnter(chip); // the mouseenter a tap fires
+    expect(onCitationHover).not.toHaveBeenCalled();
+  });
+
+  it('renders answer headings below the page title, and wide tables in a scroller', () => {
+    const content = '# Summary\n\n## Details\n\n| a | b |\n| - | - |\n| 1 | 2 |';
+    render(<ChatMessage turn={makeTurn({ role: 'assistant', content })} engineerMode={false} />);
+
+    expect(screen.getByText('Summary').tagName).toBe('H3');
+    expect(screen.getByText('Details').tagName).toBe('H4');
+    expect(screen.getByRole('table').parentElement).toHaveClass('chat-message__table-scroll');
+  });
+
   it('opens a source with the passages the answer rests on, to mark them', async () => {
     const onOpenSource = vi.fn();
     const source = {
@@ -713,6 +751,18 @@ describe('ChatMessage answer-progress announcement', () => {
     );
 
     expect(screen.getByTestId('chat-message-not-found')).toHaveTextContent('not in your documents');
+  });
+
+  it('flags an answer that cites nothing or was cut off', () => {
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'Alpha and', uncited: true, truncated: true })}
+        engineerMode={false}
+      />,
+    );
+
+    expect(screen.getByTestId('chat-message-uncited')).toHaveTextContent('no sources cited');
+    expect(screen.getByTestId('chat-message-truncated')).toHaveTextContent('cut off');
   });
 
   it('labels stopped and cached answers', () => {

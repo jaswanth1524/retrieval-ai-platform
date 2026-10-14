@@ -57,14 +57,22 @@ class DocumentSection:
     ``boundary`` marks whether the edge before the *next* section is a physical
     artifact of the source format (a PDF page break, a plain-text paragraph break —
     safe for chunk windows to cross with overlap) or a semantic one (a Markdown
-    heading — a real topic break that chunk windows must not cross).
+    heading — a real topic break that chunk windows must not cross). An ``isolated``
+    section (a slide, a range of spreadsheet rows) is a unit of its own: windowed alone
+    like a semantic one, and never folded into a neighbour however short it is, so its
+    page and label stay exact — a one-line slide is still that slide.
     """
 
     filename: str
     page: int
     section: str
     text: str
-    boundary: Literal["physical", "semantic"] = "physical"
+    boundary: Literal["physical", "semantic", "isolated"] = "physical"
+    # Table rows (CSV, XLSX): the spreadsheet row number of each line of ``text``. The
+    # chunker then keeps each row whole and labels a chunk with the rows it really
+    # holds ("<row_label_prefix>Rows 4-17"); ``section`` is used only without them.
+    line_rows: tuple[int, ...] | None = None
+    row_label_prefix: str = ""
 
 
 def normalize_text(text: str) -> str:
@@ -131,3 +139,67 @@ def check_zip_expanded_size(filename: str, content: bytes, kind: str, limit: int
             f"{kind} '{filename}' expands to {expanded // (1024 * 1024)} MiB, over the "
             f"{limit // (1024 * 1024)} MiB limit."
         )
+
+
+# XML members of an Office file (XLSX, PPTX) a DTD could hide in.
+_OFFICE_XML_SUFFIXES = (".xml", ".rels", ".vml")
+# In every encoding an XML parser detects on its own (from a BOM or the first bytes):
+# matching only ASCII let a UTF-16 member carry a DTD past the check.
+_DTD_MARKERS = tuple(
+    marker.encode(encoding)
+    for marker in ("<!DOCTYPE", "<!ENTITY")
+    for encoding in ("ascii", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+)
+_DTD_MARKER_MAX_BYTES = max(len(marker) for marker in _DTD_MARKERS)
+_DTD_SCAN_BLOCK = 64 * 1024
+
+
+def declares_dtd(xml: bytes) -> bool:
+    """True when ``xml`` holds a DTD or entity declaration, in any XML encoding."""
+
+    return any(marker in xml for marker in _DTD_MARKERS)
+
+
+def refuse_zip_xml_dtd(filename: str, content: bytes, kind: str) -> None:
+    """Refuse an Office file whose XML declares a DTD or an entity.
+
+    Office Open XML never needs either, and refusing them up front rules out entity
+    expansion and external-entity tricks whatever the XML library would do with them —
+    the EPUB parser's stance. Members are scanned in blocks, never read whole.
+    """
+
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            for info in archive.infolist():
+                if not info.filename.lower().endswith(_OFFICE_XML_SUFFIXES):
+                    continue
+                with archive.open(info) as handle:
+                    tail = b""
+                    while block := handle.read(_DTD_SCAN_BLOCK):
+                        window = tail + block
+                        if declares_dtd(window):
+                            raise DocumentParseError(
+                                f"{kind} '{filename}' declares an XML DTD, which DocRAG "
+                                "does not read."
+                            )
+                        tail = window[-_DTD_MARKER_MAX_BYTES:]
+    except DocumentParseError:
+        raise
+    except Exception as exc:  # BadZipFile, a CRC error, an encrypted member, ...
+        raise DocumentParseError(f"Could not parse {kind} '{filename}'.") from exc
+
+
+def render_row(header: list[str], row: list[str]) -> str:
+    """Render one table row as "col1: v1; col2: v2" so any chunk slice self-describes.
+
+    Empty cells are left out; a column without a header is named by its position.
+    """
+
+    parts: list[str] = []
+    for index, value in enumerate(row):
+        cell = value.strip()
+        if not cell:
+            continue
+        column = header[index] if index < len(header) and header[index] else f"col{index + 1}"
+        parts.append(f"{column}: {cell}")
+    return "; ".join(parts)

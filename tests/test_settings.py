@@ -272,3 +272,18 @@ def test_job_store_backend_accepts_sqlite() -> None:
 def test_job_store_backend_rejects_unknown_value() -> None:
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None, job_store_backend="redis")  # type: ignore[call-arg]
+
+
+def test_an_unconfigured_default_provider_is_warned_about_at_startup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from api.main import warn_on_unconfigured_provider
+    from tests.factories import make_test_settings
+
+    with caplog.at_level("WARNING", logger="api.main"):
+        warn_on_unconfigured_provider(make_test_settings(llm_provider="openai", openai_api_key=""))
+        warn_on_unconfigured_provider(make_test_settings(llm_provider="ollama"))
+
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert "OPENAI_API_KEY" in warnings[0]

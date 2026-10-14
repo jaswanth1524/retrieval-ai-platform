@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -117,6 +117,21 @@ describe('CorpusPanel', () => {
       'aria-valuenow',
       '25',
     );
+  });
+
+  it('keeps upload available while a re-index runs, but not while a file is sending', () => {
+    const reindexing: UploadItem = { id: 'r', filename: 'a.md', status: 'uploading', reindex: true };
+    setup({ filenames: ['a.md'], documents: { 'a.md': meta() }, uploads: [reindexing] });
+    expect(screen.getByTestId('upload-input')).not.toBeDisabled();
+
+    const sending: UploadItem = {
+      id: 'u',
+      filename: 'b.md',
+      status: 'uploading',
+      file: makeFile('b.md', 10),
+    };
+    setup({ uploads: [sending] });
+    expect(screen.getAllByTestId('upload-input').at(-1)).toBeDisabled();
   });
 
   it('offers re-index on documents with a stored original and flags stale ones', async () => {
@@ -473,7 +488,10 @@ describe('CorpusPanel', () => {
   });
 
   it('stages files dropped while an upload runs instead of swallowing them', () => {
-    setup({ maxUploadBytes: 1000, uploads: [{ id: 'u1', filename: 'b.txt', status: 'uploading' }] });
+    setup({
+      maxUploadBytes: 1000,
+      uploads: [{ id: 'u1', filename: 'b.txt', status: 'uploading', file: makeFile('b.txt', 10) }],
+    });
 
     fireEvent.drop(screen.getByTestId('upload-dropzone'), {
       dataTransfer: dataTransferWith([makeFile('next.txt', 10)]),
@@ -618,6 +636,60 @@ describe('CorpusPanel', () => {
 
       await userEvent.click(screen.getByTestId('corpus-bulk-reindex'));
       expect(onReindex.mock.calls.map(([filename]) => filename).sort()).toEqual(['a.md', 'c.md']);
+    });
+
+    it('never acts on a selected document the filter now hides', async () => {
+      const onDelete = vi.fn().mockResolvedValue(undefined);
+      setup({ ...THREE, onDelete });
+
+      await userEvent.click(screen.getByTestId('corpus-select-all'));
+      expect(screen.getByTestId('corpus-bulk')).toHaveTextContent('3 selected');
+      await userEvent.selectOptions(screen.getByTestId('corpus-tag-filter'), 'hr');
+      expect(screen.getByTestId('corpus-bulk')).toHaveTextContent('2 selected');
+      await userEvent.selectOptions(screen.getByTestId('corpus-tag-filter'), '');
+
+      // a.md was hidden while filtered: it left the selection, and stays out of it.
+      expect(screen.getByTestId('corpus-bulk')).toHaveTextContent('2 selected');
+      await userEvent.click(screen.getByTestId('corpus-bulk-delete'));
+      await userEvent.click(screen.getByTestId('corpus-bulk-delete-confirm'));
+      expect(onDelete.mock.calls.map(([filename]) => filename).sort()).toEqual(['b.md', 'c.md']);
+    });
+
+    it('re-indexes the selection in one batch when the parent can', async () => {
+      const onReindex = vi.fn();
+      const onReindexMany = vi.fn();
+      setup({ ...THREE, onReindex, onReindexMany });
+
+      await userEvent.click(screen.getByTestId('corpus-select-all'));
+      await userEvent.click(screen.getByTestId('corpus-bulk-reindex'));
+
+      expect(onReindexMany).toHaveBeenCalledTimes(1);
+      expect([...onReindexMany.mock.calls[0][0]].sort()).toEqual(['a.md', 'c.md']);
+      expect(onReindex).not.toHaveBeenCalled();
+    });
+
+    it('puts focus on the filter after a bulk delete empties the selection', async () => {
+      function Harness() {
+        const [files, setFiles] = useState(['a.md', 'b.md', 'c.md']);
+        return (
+          <CorpusPanel
+            filenames={files}
+            documents={{ 'a.md': meta(), 'b.md': meta(), 'c.md': meta() }}
+            uploads={[]}
+            onUpload={vi.fn()}
+            onDelete={async (filename) => setFiles((prev) => prev.filter((name) => name !== filename))}
+          />
+        );
+      }
+      render(<Harness />);
+
+      await userEvent.click(screen.getByLabelText('Select a.md'));
+      await userEvent.click(screen.getByLabelText('Select b.md'));
+      await userEvent.click(screen.getByTestId('corpus-bulk-delete'));
+      await userEvent.click(screen.getByTestId('corpus-bulk-delete-confirm'));
+
+      await waitFor(() => expect(screen.queryByTestId('corpus-bulk')).not.toBeInTheDocument());
+      expect(document.activeElement).toBe(screen.getByTestId('corpus-panel-search'));
     });
 
     it('moves focus to the next card after a confirmed delete', async () => {

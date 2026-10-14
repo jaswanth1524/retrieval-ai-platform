@@ -23,8 +23,9 @@ def _project_version() -> str:
 
 
 def changelog_section(changelog: str, version: str) -> str:
-    """The section ``release.yml`` publishes: the lines after a heading that starts
-    ``## <version>``, up to the next ``## `` heading (the same rule as its awk script)."""
+    """The section ``release.yml`` publishes: the lines after the heading ``## <version>``
+    (alone or followed by a space), up to the next ``## `` heading — the same rule as
+    its awk script."""
 
     found = False
     body: list[str] = []
@@ -32,7 +33,8 @@ def changelog_section(changelog: str, version: str) -> str:
         if line.startswith("## "):
             if found:
                 break
-            if line.startswith(f"## {version}"):
+            # The whole version: "## 0.2.0" must not match "## 0.2.0-rc.1".
+            if line == f"## {version}" or line.startswith(f"## {version} "):
                 found = True
             continue
         if found:
@@ -51,8 +53,8 @@ def test_the_changelog_has_a_section_for_the_current_version() -> None:
 def test_the_changelog_rule_matches_what_the_release_workflow_runs() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
 
-    # The same prefix match, in the workflow's own words: if one is edited, so is the other.
-    assert 'if (index($0, "## " v) == 1)' in workflow
+    # The same match, in the workflow's own words: if one is edited, so is the other.
+    assert 'if ($0 == "## " v || index($0, "## " v " ") == 1)' in workflow
     assert changelog_section("## 1.2.3 — soon\nnotes\n## 1.2.30\nother", "1.2.3") == "notes"
 
 
@@ -74,3 +76,10 @@ def test_the_qdrant_image_is_pinned_to_one_version_everywhere() -> None:
 
     assert all(len(found) == 1 for found in pins.values()), pins
     assert len({next(iter(found)) for found in pins.values()}) == 1, pins
+
+
+def test_a_version_heading_does_not_match_a_longer_version() -> None:
+    changelog = "## 0.2.0-rc.1\n- rc notes\n## 0.2.0 — 2026-11-01\n- final notes\n"
+
+    assert changelog_section(changelog, "0.2.0").strip() == "- final notes"
+    assert changelog_section(changelog, "0.2.0-rc.1").strip() == "- rc notes"

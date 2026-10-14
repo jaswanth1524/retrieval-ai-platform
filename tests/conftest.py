@@ -49,6 +49,10 @@ def _isolate_app_settings_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None
 
     for env_var in _SETTINGS_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
+    # Parse in the test process: tests patch the parsers (api.parsers.pdf.PdfReader...),
+    # which a child process would not see. tests/test_parse_isolation.py covers the
+    # child-process path with its own settings.
+    monkeypatch.setenv("PARSE_TIMEOUT_SECONDS", "0")
     yield
 
 

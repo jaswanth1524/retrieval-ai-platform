@@ -39,6 +39,28 @@ MAX_JSON_BODY_BYTES = 1024 * 1024
 RATE_LIMITED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
+def route_path(scope: Scope) -> str:
+    """The path the routes match on: without the ``root_path`` prefix.
+
+    Behind ``uvicorn --root-path /prefix`` a request's ``path`` is ``/prefix/documents``
+    while the router (Starlette strips ``root_path``) still serves it as ``/documents``,
+    so matching on the raw path let every guarded route through unchecked.
+    """
+
+    path: str = scope.get("path", "")
+    root: str = scope.get("root_path", "")
+    if root and (path == root or path.startswith(root + "/")):
+        return path[len(root) :] or "/"
+    return path
+
+
+def is_rate_limited(method: str, path: str) -> bool:
+    """Requests RATE_LIMIT_PER_MINUTE counts: changes, plus the export, which reads
+    every stored original."""
+
+    return method in RATE_LIMITED_METHODS or (method == "GET" and path == "/export")
+
+
 def is_guarded_path(path: str) -> bool:
     if path in GUARDED_EXACT:
         return True
@@ -103,7 +125,7 @@ class RequestGuardMiddleware:
         return settings
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        path = scope.get("path", "")
+        path = route_path(scope)
         method = scope.get("method", "")
         if scope["type"] != "http" or method == "OPTIONS" or not is_guarded_path(path):
             await self.app(scope, receive, send)
@@ -131,7 +153,7 @@ class RequestGuardMiddleware:
                 await _reject(send, 403, READ_ONLY_KEY_ERROR)
                 return
 
-        if method in RATE_LIMITED_METHODS:
+        if is_rate_limited(method, path):
             wait = self._rate_limited(scope, settings)
             if wait > 0:
                 await _reject_rate_limited(send, wait)

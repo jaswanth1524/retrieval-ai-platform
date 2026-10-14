@@ -391,3 +391,22 @@ def test_the_empty_collection_rebuild_never_deletes_a_collection_with_points(
 
     assert recreate_if_empty_and_mismatched(client, settings) is False
     assert client.count(settings.qdrant_collection, exact=True).count == 1
+
+
+def test_the_client_dials_the_configured_grpc_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It always used 6334, whatever QDRANT_GRPC_PORT said."""
+
+    import api.qdrant_schema as qdrant_schema
+    from tests.factories import make_test_settings
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(qdrant_schema, "QdrantClient", lambda **kwargs: seen.update(kwargs))
+
+    qdrant_schema.make_qdrant_client(
+        make_test_settings(
+            qdrant_url="http://qdrant:6333", qdrant_prefer_grpc=True, qdrant_grpc_port=7334
+        )
+    )
+
+    assert seen["grpc_port"] == 7334
+    assert seen["prefer_grpc"] is True

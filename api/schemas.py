@@ -43,6 +43,12 @@ REQUEST_FILENAME_MAX_CHARS = 1024
 REQUEST_TAG_MAX_CHARS = 128
 # Trace ids are 32 hex characters (uuid4().hex).
 REQUEST_TRACE_ID_MAX_CHARS = 64
+# Feedback limits, shared with a backup restore (api/restore.py) so a restored row is one
+# POST /feedback could have stored. A citation number is an answer's [n]: a few dozen at
+# most, and an unbounded int overflowed sqlite's INTEGER into a 500.
+FEEDBACK_EXCERPT_MAX_CHARS = 2000
+FEEDBACK_CITED_FILENAMES_MAX = 50
+FEEDBACK_CITATION_NUMBER_MAX = 1000
 RequestFilename = Annotated[str, StringConstraints(max_length=REQUEST_FILENAME_MAX_CHARS)]
 RequestTag = Annotated[str, StringConstraints(max_length=REQUEST_TAG_MAX_CHARS)]
 
@@ -51,6 +57,9 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str
+    # The running version (pyproject.toml), open like the rest of /health so an operator
+    # can tell what is deployed without a key.
+    version: str = ""
 
 
 class ReadinessResponse(BaseModel):
@@ -198,12 +207,14 @@ class FeedbackRequest(BaseModel):
 
     trace_id: str | None = Field(default=None, max_length=REQUEST_TRACE_ID_MAX_CHARS)
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
-    answer_excerpt: str = Field(min_length=1, max_length=2000)
-    cited_filenames: list[RequestFilename] = Field(default_factory=list, max_length=50)
+    answer_excerpt: str = Field(min_length=1, max_length=FEEDBACK_EXCERPT_MAX_CHARS)
+    cited_filenames: list[RequestFilename] = Field(
+        default_factory=list, max_length=FEEDBACK_CITED_FILENAMES_MAX
+    )
     rating: Literal["up", "down"]
     # Set only when the rating targets one specific citation (its [n] source_number
     # as shown in the answer), rather than the answer as a whole.
-    citation_source_number: int | None = Field(default=None, ge=1)
+    citation_source_number: int | None = Field(default=None, ge=1, le=FEEDBACK_CITATION_NUMBER_MAX)
 
 
 class FeedbackResponse(BaseModel):
@@ -242,6 +253,8 @@ class DocumentChunkResponse(BaseModel):
     section: str
     text: str
     chunk_ordinal: int | None = None
+    # The last page when the passage crosses a page break (it starts on `page`).
+    page_end: int | None = None
 
 
 class DocumentContentResponse(BaseModel):
@@ -446,6 +459,8 @@ class CitationResponse(BaseModel):
     # Empty in the `sources` frame (sent before the answer exists) and when no passage
     # matched the answer closely enough to point at.
     spans: list[CitationSpanResponse] = []
+    # The last page when the passage crosses a page break (it starts on `page`).
+    page_end: int | None = None
 
 
 class QuestionResponse(BaseModel):
@@ -458,13 +473,15 @@ class QuestionResponse(BaseModel):
     # Served from the answer cache: no retrieval or generation ran for this request.
     cached: bool = False
     # "no_context": nothing cleared the rerank bar; "insufficient_context": the model
-    # said the documents don't cover the question and cited nothing. Extensible: show
-    # an unknown value as "answered".
+    # said the documents don't cover the question and cited nothing; "uncited": it
+    # answered without citing a source. Extensible: show an unknown value as "answered".
     answer_status: str = Field(
         default="answered", json_schema_extra={"x-extensible-enum": list(ANSWER_STATUSES)}
     )
     # Best cross-encoder score (0-1) among the candidates, whether or not it was kept.
     top_rerank_score: float | None = None
+    # The provider stopped at the token limit (LLM_MAX_TOKENS): the answer is cut off.
+    truncated: bool = False
 
 
 class AccessResponse(BaseModel):
@@ -501,6 +518,8 @@ class SearchResultResponse(BaseModel):
     # RRF-fused hybrid score, then the cross-encoder's score normalized to [0, 1].
     retrieval_score: float
     rerank_score: float
+    # The last page when the passage crosses a page break (it starts on `page`).
+    page_end: int | None = None
 
 
 class SearchTimingsResponse(BaseModel):

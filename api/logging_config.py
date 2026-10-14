@@ -3,7 +3,10 @@
 The root logger defaults to WARNING, which silences every ``logger.info`` call in
 ``api``/``eval`` (request logging, ingest progress, warmup notices). This module
 configures only those two namespaces via ``dictConfig`` so uvicorn's own loggers
-(``uvicorn``, ``uvicorn.error``, ``uvicorn.access``) are left entirely untouched.
+(``uvicorn``, ``uvicorn.error``, ``uvicorn.access``) are left untouched — with one
+exception: under ``LOG_FORMAT=json`` uvicorn's plain-text access line is silenced and
+``api.access`` (written by ``RequestIdMiddleware``) logs each request as JSON instead,
+with its request id, which uvicorn's line can't carry.
 
 ``propagate`` is kept True: our StreamHandler lives on the ``api``/``eval`` loggers
 themselves, and nothing in this app or uvicorn's default config attaches a handler
@@ -35,6 +38,9 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "request_id": getattr(record, "request_id", "-"),
         }
+        http = getattr(record, "http", None)
+        if isinstance(http, dict):
+            entry["http"] = http
         if record.exc_info:
             entry["exception"] = self.formatException(record.exc_info)
         return json.dumps(entry, ensure_ascii=False)
@@ -52,6 +58,14 @@ def configure_logging(level: str, log_format: Literal["text", "json"] = "text") 
     formatter: dict[str, object] = (
         {"()": JsonFormatter} if log_format == "json" else {"format": _LOG_FORMAT}
     )
+    json_logs = log_format == "json"
+    # api.access replaces uvicorn's access line under JSON only; in text mode uvicorn's
+    # line stays, and a second one per request would just repeat it.
+    access_loggers: dict[str, object] = {
+        "api.access": {"level": "INFO" if json_logs else "WARNING", "propagate": True},
+    }
+    if json_logs:
+        access_loggers["uvicorn.access"] = {"level": "WARNING"}
     logging.config.dictConfig(
         {
             "version": 1,
@@ -77,6 +91,7 @@ def configure_logging(level: str, log_format: Literal["text", "json"] = "text") 
                     "handlers": ["default"],
                     "propagate": True,
                 },
+                **access_loggers,
             },
         }
     )

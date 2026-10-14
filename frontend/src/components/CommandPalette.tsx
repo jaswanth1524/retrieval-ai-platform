@@ -31,9 +31,22 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
     return commands.filter((command) => command.label.toLowerCase().includes(needle));
   }, [commands, query]);
 
+  // The next command from `from` in direction `step` that can run: arrowing onto a
+  // disabled one used to leave Enter doing nothing, with no reason given.
+  const nextEnabled = (from: number, step: 1 | -1): number => {
+    for (let offset = 1; offset <= matches.length; offset += 1) {
+      const index = (from + step * offset + matches.length * offset) % matches.length;
+      if (!matches[index].disabled) return index;
+    }
+    return from;
+  };
+
   // Typing shrinks the list, so an index from the previous query can point past its end.
   useEffect(() => {
-    setHighlighted(0);
+    const first = matches.findIndex((command) => !command.disabled);
+    setHighlighted(first === -1 ? 0 : first);
+    // The list follows the query; recomputed matches alone mustn't move the highlight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query]);
 
   // The search input owns focus, not the first result — useDialog focuses the first
@@ -60,12 +73,10 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
   const handleKeyDown = (event: React.KeyboardEvent) => {
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      setHighlighted((prev) => (matches.length === 0 ? 0 : (prev + 1) % matches.length));
+      setHighlighted((prev) => (matches.length === 0 ? 0 : nextEnabled(prev, 1)));
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      setHighlighted((prev) =>
-        matches.length === 0 ? 0 : (prev - 1 + matches.length) % matches.length,
-      );
+      setHighlighted((prev) => (matches.length === 0 ? 0 : nextEnabled(prev, -1)));
     } else if (event.key === 'Enter' && !isImeComposing(event)) {
       event.preventDefault();
       run(matches[highlighted]);

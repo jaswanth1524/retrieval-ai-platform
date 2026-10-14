@@ -138,7 +138,12 @@ def make_token_counter(model_name: str) -> TokenCounter:
 # Latin sentence ends need a following space and capital; CJK full-width ones (。！？)
 # end a sentence on their own — CJK has no spaces, so without them a whole Chinese or
 # Japanese paragraph was one "sentence".
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])|(?<=[。！？])\s*|\n{2,}")
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])|(?<=[。！？])\s*|\n{2,}"
+    # Each row of a Markdown table (PDF tables are rendered as one) is its own unit, so
+    # a chunk boundary never falls inside a row. (CHUNKER_VERSION 5.)
+    r"|\n(?=\|)"
+)
 
 
 # For quoting only (citation spans), never for chunking: chunk text has a Markdown
@@ -178,6 +183,9 @@ class _Unit:
     tokens: int
     page: int
     section: str
+    # The spreadsheet row this unit is (part of), for table sections; else None.
+    row: int | None = None
+    row_label_prefix: str = ""
 
 
 def _sentence_units(
@@ -187,7 +195,20 @@ def _sentence_units(
 
     units: list[_Unit] = []
     for section in group:
-        for raw_sentence in _SENTENCE_SPLIT_RE.split(section.text):
+        rows: list[int | None]
+        if section.line_rows is not None:
+            # A table: one unit per row, never split at a full stop inside a cell, and
+            # never joined to the next row (rows are separated by single newlines,
+            # which the sentence splitter doesn't break on — a 50-row block used to be
+            # one "sentence" packed word by word, so chunks started mid-row).
+            sentences = section.text.split("\n")
+            rows = list(section.line_rows)
+            if len(rows) != len(sentences):
+                rows = [None] * len(sentences)
+        else:
+            sentences = _SENTENCE_SPLIT_RE.split(section.text)
+            rows = [None] * len(sentences)
+        for raw_sentence, row in zip(sentences, rows, strict=True):
             # Collapse intra-sentence whitespace (newlines, runs of spaces) to single
             # spaces so chunk text is clean and stable regardless of source formatting.
             sentence = " ".join(raw_sentence.split())
@@ -200,9 +221,32 @@ def _sentence_units(
                         tokens=tokens,
                         page=section.page,
                         section=section.section,
+                        row=row,
+                        row_label_prefix=section.row_label_prefix,
                     )
                 )
     return units
+
+
+def window_label(window: list[_Unit]) -> str:
+    """A chunk's section label: the rows it holds when it is all table rows
+    ("Rows 4-17", "Row 9"), else its first unit's section."""
+
+    rows = [unit.row for unit in window]
+    if any(row is None for row in rows):
+        return window[0].section
+    numbers = [row for row in rows if row is not None]
+    first, last = min(numbers), max(numbers)
+    span = f"Row {first}" if first == last else f"Rows {first}-{last}"
+    return f"{window[0].row_label_prefix}{span}"
+
+
+def window_pages(window: list[_Unit]) -> tuple[int, int | None]:
+    """A chunk's page, and its last page when it runs onto later ones (else None)."""
+
+    first = window[0].page
+    last = max(unit.page for unit in window)
+    return first, (last if last != first else None)
 
 
 def _split_oversized(
@@ -310,8 +354,8 @@ def _group_sections_for_windowing(
     """Group sections into runs that should be windowed as one continuous stream.
 
     Consecutive same-filename ``physical`` sections merge into one group (chunk
-    overlap crosses the boundary between them); each ``semantic`` section is always
-    its own singleton group (windowed alone, exactly as before this change).
+    overlap crosses the boundary between them); each ``semantic`` or ``isolated``
+    section is always its own singleton group (windowed alone).
     """
 
     groups: list[list[DocumentSection]] = []
@@ -334,8 +378,8 @@ def merge_tiny_semantic_sections(
 ) -> list[DocumentSection]:
     """Fold undersized Markdown heading sections into a neighbor before windowing.
 
-    Only operates on ``boundary == "semantic"`` runs (Markdown headings) — physical
-    sections don't need this, cross-boundary windowing already absorbs short
+    Only operates on ``boundary == "semantic"`` runs (Markdown headings) on one page —
+    physical sections don't need this, cross-boundary windowing already absorbs short
     paragraphs/pages into their neighbors.
     """
 
@@ -347,7 +391,14 @@ def merge_tiny_semantic_sections(
             index += 1
             continue
         run_start = index
-        while index < len(sections) and sections[index].boundary == "semantic":
+        # Only within one page: a tiny section folded into the next one is cited under
+        # that one's page, and in an EPUB (a chapter is a page) a short chapter's text
+        # was cited as the next chapter. (CHUNKER_VERSION 5.)
+        while (
+            index < len(sections)
+            and sections[index].boundary == "semantic"
+            and sections[index].page == sections[run_start].page
+        ):
             index += 1
         result.extend(_merge_semantic_run(sections[run_start:index], min_words))
     return result

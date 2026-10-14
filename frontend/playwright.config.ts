@@ -10,8 +10,10 @@ export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  // One retry in CI only to *detect* flakes (a pass on retry is still a flake).
+  // One retry in CI only to *detect* flakes: a pass on retry still fails the run
+  // (failOnFlakyTests), with the flaky test named in the report.
   retries: process.env.CI ? 1 : 0,
+  failOnFlakyTests: !!process.env.CI,
   workers: process.env.CI ? 2 : undefined,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   timeout: 30_000,

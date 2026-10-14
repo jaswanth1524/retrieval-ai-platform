@@ -29,7 +29,6 @@ from api.documents import (
     CHUNKER_VERSION,
     chunk_sections,
     chunking_fingerprint,
-    parse_document_bytes,
 )
 from api.errors import public_error_message
 from api.generation import (
@@ -55,7 +54,9 @@ from api.generation import (
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, ingest_chunks
+from api.llm import reset_finish_reason, stopped_at_token_limit
 from api.metrics import ingest_stage_seconds
+from api.parse_isolation import parse_with_limit
 from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
@@ -170,6 +171,8 @@ class DoneEvent(TypedDict):
     # citations.answer_status, and the best cross-encoder score among the candidates.
     answer_status: NotRequired[str]
     top_rerank_score: NotRequired[float | None]
+    # The provider cut the answer off at the token limit.
+    truncated: NotRequired[bool]
 
 
 StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent
@@ -745,7 +748,9 @@ class RagPipeline:
             reranker=self._reranker,
             settings=effective_settings,
         )
-        diverse_outcome, diversity_dropped = select_diverse(outcome, effective_settings)
+        diverse_outcome, diversity_dropped = select_diverse(
+            outcome, effective_settings, drop_neighbours=for_generation
+        )
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
@@ -852,6 +857,7 @@ class RagPipeline:
                     cached=True,
                     answer_status=hit.answer_status,
                     top_rerank_score=hit.top_rerank_score,
+                    truncated=hit.truncated,
                 )
         grounded = self._answer_uncached(question, overrides, filenames, history, tags)
         if key is not None and self._answer_cache is not None:
@@ -863,6 +869,7 @@ class RagPipeline:
                     grounded.trace_id,
                     grounded.answer_status,
                     grounded.top_rerank_score,
+                    grounded.truncated,
                 ),
             )
         return grounded
@@ -902,6 +909,7 @@ class RagPipeline:
                     "cached": True,
                     "answer_status": hit.answer_status,
                     "top_rerank_score": hit.top_rerank_score,
+                    "truncated": hit.truncated,
                 }
                 return
         done: DoneEvent | None = None
@@ -928,6 +936,7 @@ class RagPipeline:
                     done["trace_id"],
                     done.get("answer_status", "answered"),
                     done.get("top_rerank_score"),
+                    done.get("truncated", False),
                 ),
             )
 
@@ -975,6 +984,7 @@ class RagPipeline:
             selected = fitted.context_chunks
 
             generate_start = time.monotonic()
+            reset_finish_reason()
             grounded = generate_grounded_answer(
                 query=question,
                 context_chunks=selected,
@@ -986,6 +996,8 @@ class RagPipeline:
             # block just timed covers two LLM calls when it fired. Split it back out so
             # generate_ms means the same thing here as it does on the streaming path.
             generate_ms = (time.monotonic() - generate_start) * 1000 - grounded.citation_retry_ms
+            # The last call made the answer: the citation retry's when it fired.
+            truncated = stopped_at_token_limit()
             timings = self._phase_timings(
                 phase,
                 total_start=total_start,
@@ -1045,6 +1057,7 @@ class RagPipeline:
             trace_id=trace_id,
             answer_status=answer_status(grounded.answer, len(grounded.sources), len(selected)),
             top_rerank_score=_top_rerank_score(phase),
+            truncated=truncated,
         )
 
     def _answer_stream_uncached(
@@ -1167,6 +1180,7 @@ class RagPipeline:
                 return  # the finally below records the trace as closed early
             generate_start = time.monotonic()
             first_token_ms = 0.0
+            reset_finish_reason()
             for delta in self._generator.stream(messages, effective_settings):
                 if not parts:
                     first_token_ms = (time.monotonic() - total_start) * 1000
@@ -1193,6 +1207,8 @@ class RagPipeline:
                 messages, answer, all_sources, self._generator, effective_settings
             )
             answer = outcome.answer
+            # The last call made the answer: the citation retry's when it fired.
+            truncated = stopped_at_token_limit()
             # Spans only now: the sources frame went out before there was an answer.
             cited = attach_spans(answer, outcome.cited, selected)
             citation_retry_used = outcome.retry_used
@@ -1240,6 +1256,7 @@ class RagPipeline:
                 "trace_id": trace_id,
                 "answer_status": answer_status(answer, len(cited), len(selected)),
                 "top_rerank_score": _top_rerank_score(phase),
+                "truncated": truncated,
             }
         except QuestionAbandoned:
             return  # the finally below records the trace as closed early
@@ -1312,7 +1329,7 @@ class IngestService:
         # upload here unless it is empty, in which case it is rebuilt for this one.
         self._repository.ensure_writable(self._settings)
         parse_start = time.monotonic()
-        sections = parse_document_bytes(filename, content, self._settings)
+        sections = parse_with_limit(filename, content, self._settings)
         chunk_start = time.monotonic()
         ingest_stage_seconds.labels(stage="parse").observe(chunk_start - parse_start)
         chunks = chunk_sections(sections, self._settings, self._token_counter)
@@ -1342,6 +1359,14 @@ class IngestService:
             len(chunks),
             CHUNKER_VERSION,
         )
+        writing = False
+
+        def start_writing() -> None:
+            nonlocal writing
+            if before_first_write is not None:
+                before_first_write()  # may refuse: a cancel that arrived in time
+            writing = True
+
         try:
             result: IngestResult = ingest_chunks(
                 self._repository,
@@ -1354,13 +1379,16 @@ class IngestService:
                 # A re-upload or re-index replaces the document's points; its tags are
                 # a property of the document, not of one upload, so they carry over.
                 carry_tags=True,
-                before_first_write=before_first_write,
+                before_first_write=start_writing,
                 tags=tags,
             )
         finally:
             # Even a failed ingest may have written points; cached answers could
-            # describe a corpus that no longer exists either way.
-            bump_corpus_generation({chunk.filename for chunk in chunks})
+            # describe a corpus that no longer exists either way. One that stopped
+            # before its first write (cancelled, refused, an embedding error) changed
+            # nothing, and used to empty the answer cache all the same.
+            if writing:
+                bump_corpus_generation({chunk.filename for chunk in chunks})
         return DocumentIngestOutcome(
             filename=sections[0].filename,
             sections_parsed=len(sections),

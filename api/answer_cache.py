@@ -34,6 +34,7 @@ class CachedAnswer:
     trace_id: str | None
     answer_status: str = "answered"
     top_rerank_score: float | None = None
+    truncated: bool = False
 
 
 CacheKey = tuple[object, ...]

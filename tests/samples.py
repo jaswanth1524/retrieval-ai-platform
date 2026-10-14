@@ -104,3 +104,54 @@ def eml_bytes(
             b"%PDF-1.4 not indexed", maintype="application", subtype="pdf", filename="a.pdf"
         )
     return bytes(message)
+
+
+def xlsx_bytes(sheets: dict[str, list[list[object]]]) -> bytes:
+    """A workbook with one sheet per entry, rows appended in order."""
+
+    import io
+
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    for title, rows in sheets.items():
+        sheet = workbook.create_sheet(title)
+        for row in rows:
+            sheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def pptx_bytes(slides: list[dict[str, object]]) -> bytes:
+    """A deck: each slide may have a ``title``, ``body`` lines, a ``table`` (rows) and
+    ``notes``."""
+
+    import io
+
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    presentation = Presentation()
+    for spec in slides:
+        layout = presentation.slide_layouts[5 if "title" in spec else 6]
+        slide = presentation.slides.add_slide(layout)
+        if "title" in spec:
+            slide.shapes.title.text = str(spec["title"])
+        if "body" in spec:
+            box = slide.shapes.add_textbox(Inches(1), Inches(1.5), Inches(6), Inches(2))
+            box.text_frame.text = "\n".join(spec["body"])  # type: ignore[arg-type]
+        if "table" in spec:
+            rows: list[list[str]] = spec["table"]  # type: ignore[assignment]
+            shape = slide.shapes.add_table(
+                len(rows), len(rows[0]), Inches(1), Inches(4), Inches(6), Inches(1)
+            )
+            for r, row in enumerate(rows):
+                for c, value in enumerate(row):
+                    shape.table.cell(r, c).text = value
+        if "notes" in spec:
+            slide.notes_slide.notes_text_frame.text = str(spec["notes"])
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()

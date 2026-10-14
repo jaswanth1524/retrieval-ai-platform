@@ -36,7 +36,9 @@ def test_health_endpoint(api_context: ApiTestContext) -> None:
     response = api_context.client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    from api.version import app_version
+
+    assert response.json() == {"status": "ok", "version": app_version()}
 
 
 def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
@@ -67,7 +69,7 @@ def test_health_endpoint_never_probes_dependencies(api_context: ApiTestContext) 
     response = api_context.client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
 
 
 def test_config_endpoint_exposes_non_secret_settings(api_context: ApiTestContext) -> None:

@@ -89,6 +89,21 @@ describe('DocumentViewer', () => {
     expect(await screen.findByTestId('viewer-passage-missing')).toHaveTextContent('re-indexed');
   });
 
+  it('drops the missing-passage notice when a later citation is already on screen', async () => {
+    getContentMock.mockResolvedValue(CONTENT);
+
+    const { rerender } = render(<DocumentViewer filename="guide.md" chunkId="gone" onClose={vi.fn()} />);
+    expect(await screen.findByTestId('viewer-passage-missing')).toBeInTheDocument();
+
+    // c2 arrived with the first page, so no new fetch: the notice used to stay up.
+    rerender(<DocumentViewer filename="guide.md" chunkId="c2" onClose={vi.fn()} />);
+
+    await waitFor(() =>
+      expect(screen.queryByTestId('viewer-passage-missing')).not.toBeInTheDocument(),
+    );
+    expect(getContentMock).toHaveBeenCalledTimes(1);
+  });
+
   it('shows no such notice when the cited passage is found', async () => {
     getContentMock.mockResolvedValue(CONTENT);
 

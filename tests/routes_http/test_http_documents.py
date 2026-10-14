@@ -985,6 +985,10 @@ def test_document_content_pages_around_a_chunk_or_by_ordinal_range(
     bad = client.get("/documents/long.txt/content", params={"start": 5, "end": 2})
     assert bad.status_code == 422
     assert client.get("/documents/long.txt/content", params={"radius": 1000}).status_code == 422
+    # A 400-digit ordinal reached Qdrant's range filter and 500'd.
+    for huge in ("1000001", "9" * 400):
+        assert client.get("/documents/long.txt/content", params={"start": huge}).status_code == 422
+        assert client.get("/documents/long.txt/content", params={"end": huge}).status_code == 422
     assert client.get("/documents/none.txt/content", params={"start": 1}).status_code == 404
 
 

@@ -28,6 +28,7 @@ from api.schemas import (
     ReadinessResponse,
 )
 from api.settings import AppSettings
+from api.version import app_version
 
 
 def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicConfigResponse:
@@ -74,7 +75,7 @@ def register(app: FastAPI) -> None:
     # token — so a burst of slow questions holding every token failed the healthcheck.
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
-        return HealthResponse(status="ok")
+        return HealthResponse(status="ok", version=app_version())
 
     @app.get("/health/ready")
     def health_ready(

@@ -44,13 +44,19 @@ def jaccard(a: AbstractSet[str], b: AbstractSet[str]) -> float:
     return len(a & b) / union if union else 0.0
 
 
-def select_diverse(outcome: RerankOutcome, settings: AppSettings) -> tuple[RerankOutcome, set[str]]:
+def select_diverse(
+    outcome: RerankOutcome, settings: AppSettings, *, drop_neighbours: bool = True
+) -> tuple[RerankOutcome, set[str]]:
     """Filter ``outcome.kept`` for diversity, returning the new outcome + dropped ids.
 
     Iterates the min-score-cleared, rerank-ordered candidates (``outcome.scored``),
     greedily keeping ones that are neither an ordinal-neighbor of an already-kept
     same-document chunk nor textually near-duplicate of any kept chunk, up to
     ``rerank_top_k``. Returns the dropped point ids for tracing (``near_duplicate``).
+
+    ``drop_neighbours=False`` keeps ordinal neighbours: dropping one only makes sense
+    when neighbour expansion will put its text back (an answer's context). A search
+    shows passages as they are, so it lost an adjacent relevant one for nothing.
     """
 
     if not settings.context_diversity_enabled:
@@ -60,7 +66,7 @@ def select_diverse(outcome: RerankOutcome, settings: AppSettings) -> tuple[Reran
     # 0 means neighbor expansion is disabled entirely (see context_neighbor_radius's
     # docstring) — with no expansion, ordinal-adjacent chunks aren't near-identical and
     # shouldn't be dropped on that basis alone; shingle dedup below still applies.
-    radius = int(settings.context_neighbor_radius)
+    radius = int(settings.context_neighbor_radius) if drop_neighbours else 0
     threshold = float(settings.context_diversity_max_similarity)
     top_k = int(settings.rerank_top_k)
 

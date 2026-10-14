@@ -45,7 +45,9 @@ function contrast(a: string, b: string): number {
 
 describe('theme tokens', () => {
   for (const theme of [":root[data-theme='dark']", ":root[data-theme='light']"]) {
-    for (const text of ['dim', 'muted', 'warn']) {
+    // Every colour used for text, not only the quiet ones: light --accent was 4.2:1 on
+    // --sunk before anything checked it.
+    for (const text of ['dim', 'muted', 'warn', 'accent', 'bad', 'good', 'data']) {
       it(`--${text} is readable on every surface in ${theme}`, () => {
         for (const surface of ['paper', 'card', 'sunk']) {
           expect(contrast(token(theme, text), token(theme, surface))).toBeGreaterThanOrEqual(4.5);

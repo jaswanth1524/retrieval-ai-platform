@@ -10,6 +10,10 @@
   color: var(--dim);
 }
 
+.composer__hint--warn {
+  color: var(--warn);
+}
+
 .composer__box {
   max-width: var(--content-rail);
   margin: 0 auto;

@@ -121,3 +121,15 @@ describe('withCitationFootnotes', () => {
     expect(withCitationFootnotes('No sources.', [])).toBe('No sources.');
   });
 });
+
+describe('formatTurnTime', () => {
+  it('shows only the time for today, and the date too for an older message', async () => {
+    const { formatTurnTime } = await import('../../src/utils/exportChat');
+    const now = new Date(2026, 9, 13, 15, 0).getTime();
+    const earlierToday = new Date(2026, 9, 13, 9, 30).getTime();
+    const lastWeek = new Date(2026, 9, 6, 9, 30).getTime();
+
+    expect(formatTurnTime(earlierToday, now)).not.toMatch(/2026/);
+    expect(formatTurnTime(lastWeek, now)).toMatch(/2026/);
+  });
+});

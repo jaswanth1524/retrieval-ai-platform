@@ -1,4 +1,5 @@
 import type { CitationResponse, TraceCandidateResponse } from '../../api/types';
+import { pageLabel } from '../../utils/pages';
 
 interface SourcesTabProps {
   sources: CitationResponse[];
@@ -58,7 +59,7 @@ function SourcesTab({ sources, candidates, onOpenSource }: SourcesTabProps) {
               </span>
               <span className="sources-tab__filename">{source.filename}</span>
               <span className="sources-tab__location">
-                p.{source.page} &middot; {source.section}
+                {pageLabel(source.page, source.page_end)} &middot; {source.section}
               </span>
             </span>
             <span className="sources-tab__quote">{source.text}</span>

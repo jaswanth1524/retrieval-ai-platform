@@ -62,7 +62,7 @@ test('the feedback panel lists ratings and filters to thumbs-down', async ({ pag
   await page.getByTestId('rail-feedback').click();
 
   await expect(page.getByTestId('feedback-panel-row')).toHaveCount(2);
-  await page.getByRole('button', { name: '👎 Down' }).click();
+  await page.getByRole('button', { name: 'Down', exact: true }).click();
   await expect(page.getByTestId('feedback-panel-row')).toHaveCount(1);
   await expect(page.getByTestId('feedback-panel-row')).toContainText('Where are uploads stored?');
 });

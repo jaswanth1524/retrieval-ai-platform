@@ -149,6 +149,8 @@ export function stageLabel(stage: string): string {
 
 export interface UseChatResult {
   turns: ChatTurn[];
+  /** False until the full history has loaded from IndexedDB (true where there is none). */
+  historyReady: boolean;
   /** Any answer in flight, in whichever conversation. */
   pending: boolean;
   /** The conversation the answer in flight is written to; null when none is. */
@@ -366,11 +368,40 @@ export function useChat(): UseChatResult {
     if (chatStoreAvailable()) void saveChatStore(snapshot);
   };
 
+  // While an answer streams: the other conversations and the selection as last seen,
+  // to tell a delta (skipped) from a rename, pin, delete or switch elsewhere (saved).
+  const outsideStreamRef = useRef<{
+    others: Conversation[];
+    active: string | null;
+    deleted: ChatStorageV2['deleted'];
+  } | null>(null);
+
   useEffect(() => {
     // Skip writes while a stream is in flight — the assistant turn's content mutates
     // on every delta, and persisting each one would thrash localStorage. `pagehide`
-    // below covers a reload or navigation that lands mid-stream.
-    if (pending) return;
+    // below covers a reload or navigation that lands mid-stream. A change outside the
+    // streaming conversation is saved at once, though: conversations stay usable
+    // mid-answer, and a rename or delete made then used to wait for the answer to end
+    // (other tabs didn't see it, and closing the tab lost it).
+    if (pending) {
+      const streamingId = streamingConversationIdRef.current;
+      const seen = {
+        others: storage.conversations.filter((conversation) => conversation.id !== streamingId),
+        active: storage.activeConversationId,
+        deleted: storage.deleted,
+      };
+      const before = outsideStreamRef.current;
+      outsideStreamRef.current = seen;
+      const changed =
+        before !== null &&
+        (before.active !== seen.active ||
+          before.deleted !== seen.deleted ||
+          before.others.length !== seen.others.length ||
+          before.others.some((conversation, index) => conversation !== seen.others[index]));
+      if (changed && chatStoreReady) persistStreamSnapshot();
+      return;
+    }
+    outsideStreamRef.current = null;
     const outcome = persistStorage(storage);
     setPersistError(outcome === 'failed');
     setPersistPartial(outcome === 'partial');
@@ -571,6 +602,8 @@ export function useChat(): UseChatResult {
               ...(status === 'insufficient_context' || status === 'no_context'
                 ? { notFound: true }
                 : {}),
+              ...(status === 'uncited' ? { uncited: true } : {}),
+              ...(grounding?.truncated ? { truncated: true } : {}),
             }));
           },
         },
@@ -785,8 +818,9 @@ export function useChat(): UseChatResult {
       ...prev,
       conversations: prev.conversations.map((conversation) =>
         conversation.id === prev.activeConversationId
-          ? // The title came from the first question, which is gone now.
-            { ...conversation, turns: [], title: 'New chat', updatedAt: Date.now() }
+          ? // The title came from the first question, which is gone now. An edit (not
+            // just activity), so the empty version wins over other tabs' copies.
+            { ...conversation, turns: [], title: 'New chat', updatedAt: Date.now(), editedAt: Date.now() }
           : conversation,
       ),
     }));
@@ -898,6 +932,7 @@ export function useChat(): UseChatResult {
 
   return {
     turns,
+    historyReady: chatStoreReady,
     streamingConversationId,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,

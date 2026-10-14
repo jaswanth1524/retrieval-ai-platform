@@ -76,6 +76,22 @@ def test_drops_ordinal_neighbor_and_refills() -> None:
     assert kept_ids == ["c1", "c3"]  # freed slot refilled from the distant chunk
 
 
+def test_a_search_keeps_ordinal_neighbours_but_still_drops_duplicates() -> None:
+    """Without neighbour expansion after it, dropping an adjacent chunk only lost a
+    relevant passage."""
+
+    settings = make_settings(rerank_top_k=3, context_diversity_max_similarity=0.5)
+    out = outcome_of(
+        chunk("c1", ordinal=5, text="first distinct passage about alpha"),
+        chunk("c2", ordinal=6, text="second passage overlapping alpha ideas"),
+        chunk("c3", ordinal=40, text="first distinct passage about alpha"),
+    )
+    result, dropped = select_diverse(out, settings, drop_neighbours=False)
+
+    assert [c.point_id for c in result.kept] == ["c1", "c2"]
+    assert dropped == {"c3"}
+
+
 def test_drops_textual_near_duplicate_across_files() -> None:
     settings = make_settings(rerank_top_k=2, context_diversity_max_similarity=0.5)
     shared = "the deployment guide explains docker compose setup steps in detail"

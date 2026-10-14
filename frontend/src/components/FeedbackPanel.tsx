@@ -12,10 +12,11 @@ interface FeedbackPanelProps {
 
 type Filter = 'all' | FeedbackRating;
 
-const FILTERS: { key: Filter; label: string }[] = [
+// The emoji is decoration: read aloud it made "thumbs down Down".
+const FILTERS: { key: Filter; label: string; glyph?: string }[] = [
   { key: 'all', label: 'All' },
-  { key: 'down', label: '👎 Down' },
-  { key: 'up', label: '👍 Up' },
+  { key: 'down', label: 'Down', glyph: '👎' },
+  { key: 'up', label: 'Up', glyph: '👍' },
 ];
 
 /** Recorded answer ratings (GET /feedback), newest first — thumbs-down rows are the
@@ -44,6 +45,7 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
             aria-pressed={filter === option.key}
             onClick={() => setFilter(option.key)}
           >
+            {option.glyph && <span aria-hidden="true">{option.glyph} </span>}
             {option.label}
           </button>
         ))}

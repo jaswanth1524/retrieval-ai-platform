@@ -5,9 +5,9 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 ## Features
 
 - **Hybrid retrieval**: dense semantic search (`BAAI/bge-small-en-v1.5`) and sparse BM25 search (`Qdrant/BM25`, scored with Qdrant's IDF modifier so rare terms outweigh common ones), fused with Reciprocal Rank Fusion (`k=60`), then reranked with a cross-encoder (`jinaai/jina-reranker-v2-base-multilingual`). Queries are embedded symmetrically to the corpus (bge query instruction on the dense side, BM25's query-side encoding on the sparse side), and a post-rerank diversity filter drops near-duplicate chunks so context slots go to distinct passages.
-- **Token-aware chunking**: chunks are sized by the dense model's real subword tokens (not word counts) and split on sentence boundaries, so an embedded chunk never silently overflows the model's 512-token limit.
-- **Broad format support**: PDF (with table extraction and optional OCR for scanned pages), DOCX, HTML, CSV, TXT, Markdown, EPUB (chapters in reading order; the chapter number is the cited page) and email `.eml` files (headers and body; attachments are not indexed). OCR is an optional extra (`uv sync --extra ocr`). `GET /config` lists the accepted types (`supported_extensions`), and the UI follows it.
-- **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder. Each answer also reports `answer_status` — `answered`, `insufficient_context` (the model said the documents don't cover it and cited nothing) or `no_context` (nothing cleared the rerank bar) — and the best `top_rerank_score`; the UI marks those answers "not in your documents". Citation markers (`[2]`, `[1, 2]`, `[1-3]`) in the answer text are buttons that open the cited passage. Each cited source also says which part of its chunk the answer rests on (`spans`: the quoted sentence or two, matched from the answer without any model call), and the viewer marks it.
+- **Token-aware chunking**: chunks are sized by the dense model's real subword tokens (not word counts) and split on sentence boundaries — table rows are never split, and a table chunk names the rows it holds — so an embedded chunk never silently overflows the model's 512-token limit. A passage that runs onto the next page is cited with both pages (`p.3–4`), and chunk ids depend on the content, not the position, so citations survive a re-index of an edited document. Each upload is parsed in its own process, stopped after `PARSE_TIMEOUT_SECONDS`.
+- **Broad format support**: PDF (with table extraction and optional OCR for scanned pages), DOCX, HTML (text the page hides — `hidden`, `aria-hidden`, inline `display:none` — is not indexed), CSV, TXT, Markdown, EPUB (chapters in reading order; the chapter number is the cited page), email `.eml` files (headers and body; attachments are not indexed), Excel `.xlsx` (each sheet is a page, its rows cited by spreadsheet row number; cells hold their last computed values) and PowerPoint `.pptx` (each slide is a page titled by its slide title, with tables and speaker notes). OCR is an optional extra (`uv sync --extra ocr`). `GET /config` lists the accepted types (`supported_extensions`), and the UI follows it.
+- **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder. Each answer also reports `answer_status` — `answered`, `uncited` (it answered but cited none of its sources, even after the retry), `insufficient_context` (the model said the documents don't cover it and cited nothing) or `no_context` (nothing cleared the rerank bar) — the best `top_rerank_score`, and `truncated` when the model stopped at its token limit; the UI marks those answers ("not in your documents", "no sources cited", "cut off"). Citation markers (`[2]`, `[1, 2]`, `[1-3]`) in the answer text are buttons that open the cited passage. Each cited source also says which part of its chunk the answer rests on (`spans`: the quoted sentence or two, matched from the answer without any model call), and the viewer marks it.
 - **Search without an answer**: `POST /search` returns the ranked passages for a query — the same hybrid search, RRF and rerank a question uses, with no LLM call — so finding things in your documents works even when the LLM is down. The UI has it as the Search panel in the left rail (and in the ⌘K palette), scoped like a question.
 - **Multi-query expansion** (opt-in): rewrite the query into several phrasings, retrieve each, and RRF-fuse before reranking — off by default (`QUERY_EXPANSION_ENABLED`).
 - **Conversation memory**: the client sends recent chat turns with each question; when history is present, one extra LLM call rewrites a follow-up ("what about the second one?") into a standalone retrieval query before hybrid search runs. The server itself stores no session state.
@@ -25,7 +25,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Backup and restore**: `GET /export` (full key; "Download a backup" in the ⌘K palette) returns a zip with a manifest of every document (tags, upload time, chunker version), the stored originals and the feedback rows. `POST /import` ("Restore documents from a backup") re-indexes each stored original with its tags and upload time and adds the feedback back; documents already indexed are kept as they are.
 - **Feedback review**: with `FEEDBACK_ENABLED`, a Feedback panel lists answer ratings (filter to thumbs-down) and opens a rated answer's trace.
 - **Security headers**: the UI is served with a strict Content-Security-Policy and may not be framed; every response carries `nosniff` and `no-referrer`. Text in a document imitating a prompt source header (`[2] filename=…`) is rewritten, without its number, before it reaches the model. See [SECURITY.md](SECURITY.md).
-- **Observability**: configurable application logging (`LOG_LEVEL`; `LOG_FORMAT=json` for one JSON object per line), an `X-Request-ID` on every response that also appears in every log line and in the request's trace, `GET /metrics` (Prometheus), `GET /health` (liveness), `GET /health/ready` (readiness — probes Qdrant and the generation provider).
+- **Observability**: configurable application logging (`LOG_LEVEL`; `LOG_FORMAT=json` for one JSON object per line, with one access line per request carrying its id), an `X-Request-ID` on every response that also appears in every log line and in the request's trace, `GET /metrics` (Prometheus: stage latencies, answers by grounding status, truncated answers, citation retries, feedback ratings, LLM tokens reported by the provider, questions running, the indexing backlog, document count, build version), `GET /health` (liveness, with the running version), `GET /health/ready` (readiness — probes Qdrant and the generation provider).
 - **Provider flexibility**: local Ollama by default; any self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio — `LLM_PROVIDER=openai_compatible`) or OpenAI itself are user-selectable alternatives for generation only — embeddings always stay local. Provider errors reach clients as a short reason, never the provider's raw message.
 
 ## Stack
@@ -133,9 +133,11 @@ npm --prefix frontend run dev             # Vite dev server, proxies API calls t
 > For scanned PDFs, build the image with OCR: `UV_EXTRAS=ocr docker compose up --build`.
 >
 > The API container runs with a read-only root filesystem, no Linux capabilities and
-> `no-new-privileges`. It writes only to the model cache volume, a tmpfs `/tmp` and, when
-> mounted, the `/app/data` volume — mount that volume before turning on
-> `JOB_STORE_BACKEND=sqlite`, `RAW_DOCUMENT_DIR` or `FEEDBACK_ENABLED`.
+> `no-new-privileges`. It writes only to the model cache volume, a tmpfs `/tmp` and the
+> `/app/data` volume (`docrag_data`), where `JOB_STORE_BACKEND=sqlite`,
+> `RAW_DOCUMENT_DIR=./data/originals` and `FEEDBACK_ENABLED` keep their files. A store
+> that is turned on but can't write its directory stops the API at startup with a
+> message naming the setting.
 > That peak is reached when the model loads, so a container that boots and answers one
 > question has already hit its high-water mark. If you raise `RERANKER_BATCH_SIZE` above
 > `RERANK_CANDIDATES`, the reranker scores every candidate in one forward pass instead
@@ -152,7 +154,7 @@ uv run pytest                  # run backend test suite
 uv run ruff check .            # lint
 uv run ruff format .           # format (CI checks it)
 uv run mypy api eval           # typecheck (strict mode)
-make check                     # the backend and frontend gates CI runs (not e2e)
+make check                     # the backend and frontend gates CI runs, coverage floor and audits included (not e2e)
 make golden                    # regenerate the chunking and OpenAPI snapshots, then review the diff
 ```
 
@@ -169,17 +171,16 @@ npm run e2e                    # Playwright E2E: prod build + mocked API (deskto
 npm run e2e:smoke              # @smoke specs only
 ```
 
-CI (`.github/workflows/ci.yml`) runs seven jobs on every push/PR (dependency-review on pull requests only, docker-ocr on pushes to `main` only), with a read-only token and superseded runs cancelled:
+CI (`.github/workflows/ci.yml`) runs seven jobs on every push/PR (dependency-review on pull requests only, docker-ocr everywhere but pull requests), with a read-only token and superseded runs cancelled. It also runs weekly on `main` (Monday 05:23 UTC), so a new advisory against a pinned dependency or base image is noticed without a push, and can be started by hand from the Actions tab.
 
-- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → ruff check → ruff format --check → mypy → import the eval extra → validate the eval datasets → `pip-audit` of the runtime dependencies.
+- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → import the eval extra; then, on 3.12, ruff check → ruff format --check → mypy → validate the eval datasets → `pip-audit` of the runtime dependencies.
 - **qdrant**: the server-only tests (`tests/test_qdrant_server.py`: server-side hybrid query, IDF, payload indexes, tags) against a `qdrant/qdrant:v1.19.1` service container — they skip locally unless `DOCRAG_TEST_QDRANT_URL` is set — then the retrieval eval on the handbook set against its committed baseline (models cached between runs).
 - **frontend**: vitest → build → lint → type-check the tests → `npm audit --omit=dev`.
-- **dependency-review** (pull requests): fails on a newly added dependency with a known high-severity vulnerability.
-- **e2e**: Playwright against the production build with a mocked API.
+- **dependency-review** (pull requests): fails on a newly added dependency with a known high-severity vulnerability. It needs the repository's Dependency graph (Settings → Code security); while that is off the job is skipped with a notice.
+- **e2e**: Playwright against the production build with a mocked API; a test that passes only on its retry fails the run.
 - **docker**: builds the image (layer cache in GitHub Actions), boots it through Compose with the hardened settings and a real Qdrant, checks `/health`, `/health/ready`, the served UI and the reported version, and scans the image with Trivy (a fixable CRITICAL vulnerability fails).
 
-CI also runs weekly on `main` (Monday 05:23 UTC), so a new advisory against a pinned dependency or base image is noticed without a push.
-- **docker-ocr**: builds the image with `UV_EXTRAS=ocr`.
+- **docker-ocr**: builds the image with `UV_EXTRAS=ocr`, imports its OCR engine inside it and scans it with Trivy like the default image.
 
 Releases (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` that matches `version` in `pyproject.toml`, on a commit that is on `main` and whose CI passed (the release waits up to an hour for that run), publishes `ghcr.io/<owner>/<repo>:X.Y.Z` (linux/amd64 and linux/arm64) with build provenance and an SBOM, signs it with cosign (keyless), scans it with Trivy (a fixable CRITICAL vulnerability in either the amd64 or the arm64 image stops the release before the push; HIGH findings go to the Security tab) and creates the GitHub release from that version's `CHANGELOG.md` section, which must exist and be non-empty (`tests/test_release_metadata.py` checks it, and that `frontend/package.json` and the Qdrant pins agree). The first push of a package to GHCR may start private: set it to public in the package settings if you want anonymous pulls.
 
@@ -191,6 +192,38 @@ All runtime configuration lives in `api/settings.py` (`AppSettings`, pydantic-se
 
 The API documents itself: Swagger UI at `/docs`, ReDoc at `/redoc`, the schema at `/openapi.json` (all behind `API_KEY` when one is set). `tests/golden/openapi.json` is the committed copy; a change to the API shows up as a diff there.
 
+From a script (drop the `X-API-Key` header when no key is set):
+
+```bash
+KEY="X-API-Key: $API_KEY"
+# Upload: 202 with a job id; indexing runs in the background.
+job=$(curl -fsS -H "$KEY" -F file=@handbook.pdf http://127.0.0.1:8000/documents | jq -r .job_id)
+# Poll until the state is "done" (or "failed", with an error).
+curl -fsS -H "$KEY" "http://127.0.0.1:8000/documents/jobs/$job" | jq '{state, error}'
+# Ask: the whole answer at once, with its sources and answer_status.
+curl -fsS -H "$KEY" -H 'Content-Type: application/json' \
+  -d '{"question": "How many days of leave do I get?"}' \
+  http://127.0.0.1:8000/questions | jq '{answer, answer_status, sources: [.sources[] | {filename, page}]}'
+# Or streamed as Server-Sent Events: stage*, sources, delta*, done.
+curl -N -H "$KEY" -H 'Content-Type: application/json' \
+  -d '{"question": "How many days of leave do I get?"}' http://127.0.0.1:8000/questions/stream
+# Passages only, no LLM:
+curl -fsS -H "$KEY" -H 'Content-Type: application/json' -d '{"query": "leave policy"}' \
+  http://127.0.0.1:8000/search | jq '.results[] | {filename, page, rerank_score}'
+```
+
+To scrape the metrics with Prometheus when `API_KEY` is set (`/metrics` needs the full key; `http_headers` needs a recent Prometheus — on an older one, put the header on a proxy in front):
+
+```yaml
+scrape_configs:
+  - job_name: docrag
+    static_configs:
+      - targets: ["docrag-host:8000"]
+    http_headers:
+      X-API-Key:
+        secrets: ["<your API_KEY>"]
+```
+
 ## Troubleshooting
 
 - **"Cannot reach Ollama" / answers fail, uploads work.** Generation needs Ollama running on the host (`ollama serve`) with the model pulled (`ollama pull llama3.1:8b`); `OLLAMA_BASE_URL` points the container at `host.docker.internal`. `/health/ready` says which dependency is down. Upload, indexing and passage search never need the LLM.
@@ -198,6 +231,8 @@ The API documents itself: Swagger UI at `/docs`, ReDoc at `/redoc`, the schema a
 - **The API restarts, exit code 137.** Out of memory: give Docker at least 4 GB, and keep `RERANKER_BATCH_SIZE` at or below `RERANK_CANDIDATES` (see the note under Run it).
 - **"API unreachable" in the UI.** The page retries on its own and has a Retry now button; check `docker compose ps` and the API logs. A blank page after an upgrade is a stale tab: reload it.
 - **The UI is blank or blocked when served from another origin.** The bundled Content-Security-Policy allows requests to the page's own origin only. A frontend hosted elsewhere (`VITE_API_BASE_URL`) needs its own policy and `CORS_ALLOW_ORIGINS` on the API.
+- **The API won't start: "… needs a writable directory".** A store turned on in `.env` (`RAW_DOCUMENT_DIR`, `JOB_STORE_BACKEND=sqlite`, `FEEDBACK_ENABLED`) points outside the `/app/data` volume, where the container can't write. Keep their paths under `./data/` (the defaults).
+- **Uploads fail with 413 behind nginx, or answers stop after a minute.** The proxy's limits, not DocRAG's: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 - **`docker compose pull` of a release is denied.** A package pushed to GHCR for the first time can be private; make it public in its package settings, or log in to GHCR.
 
 ## Evaluation (optional)
@@ -313,6 +348,52 @@ baseline checks) are unit-tested with fakes; the handbook eval runs for real in 
 > so a corpus is chunked consistently. Re-uploading replaces a document's chunks
 > automatically.
 
+## Behind a reverse proxy
+
+DocRAG speaks plain HTTP; for anything beyond your own machine put it behind a proxy that
+terminates TLS (the API key travels in a header). What the proxy has to allow:
+
+- **Upload size**: `MAX_UPLOAD_BYTES` (50 MB) per document and `MAX_IMPORT_BYTES` (256 MB)
+  for a backup restore. nginx's default `client_max_body_size` is 1 MB, which turns
+  every larger upload into a 413.
+- **Streaming**: answers stream as Server-Sent Events, with a `: ping` every 15 s while
+  the server works. The proxy must not buffer the response (the API sends
+  `X-Accel-Buffering: no` for nginx) and must allow a read timeout above 15 s.
+- **The real client address**: set `FORWARDED_ALLOW_IPS` in `.env` to the proxy's address
+  as the API container sees it (uvicorn reads it). Without it every request appears to
+  come from the proxy: all users share one `RATE_LIMIT_PER_MINUTE` bucket and logs show
+  the proxy.
+- **A sub-path** (`https://host/docrag/`): strip the prefix in the proxy, or run uvicorn
+  with `--root-path /docrag` (the API's checks apply to the path without it).
+
+nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name docs.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+    client_max_body_size 300m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+Caddy (TLS certificates are automatic; streaming and large bodies work by default):
+
+```caddy
+docs.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
 ## Backup and upgrade
 
 The simplest backup is the app's own: `GET /export` (or "Download a backup" in the ⌘K
@@ -328,10 +409,10 @@ knows lives in two places:
   `-H "api-key: $QDRANT_API_KEY"` when set); it is written under `/qdrant/snapshots` in
   the container — copy it out with `docker compose cp qdrant:/qdrant/snapshots ./backup`.
   Restore by uploading it to `/collections/docrag_documents/snapshots/upload`.
-- **`/app/data`** (the `docrag_job_store` volume, when enabled): the sqlite job store,
-  the feedback database, and stored originals (`RAW_DOCUMENT_DIR`). Back it up with the
-  volume, e.g. `docker run --rm -v <project>_docrag_job_store:/data -v "$PWD":/backup
-  busybox tar czf /backup/docrag-data.tgz -C /data .`.
+- **`/app/data`** (the `docrag_data` volume): the sqlite job store, the feedback
+  database, and stored originals (`RAW_DOCUMENT_DIR`). Back it up with the volume, e.g.
+  `docker run --rm -v <project>_docrag_data:/data -v "$PWD":/backup busybox tar czf
+  /backup/docrag-data.tgz -C /data .`.
 
 **After changing the embedding model** (`DENSE_EMBEDDING_MODEL`/`EMBEDDING_MODEL_TAG`, or the
 sparse model) the existing index no longer matches: questions, search and uploads answer
@@ -341,7 +422,9 @@ every document, then restore it — the emptied collection is rebuilt for the ne
 the first restore or upload. Without stored originals, delete everything and upload the
 files again.
 
-To upgrade: back up both, pull, then `docker compose up -d --build`. Bump `QDRANT_IMAGE`
+To upgrade: back up both, then pull the new source and `docker compose up -d --build`
+— or, running a published image, set `DOCRAG_VERSION` to the new release and
+`docker compose pull && docker compose up -d`. Bump `QDRANT_IMAGE`
 on its own, after a snapshot — Qdrant reads older storage but not newer. Check
 `CHANGELOG.md` for releases that need a re-index (with originals kept, the corpus panel
 offers ↻ on documents chunked by an older chunker). The IDF modifier is applied to an

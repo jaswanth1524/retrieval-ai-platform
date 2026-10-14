@@ -10,6 +10,7 @@ from api.dependencies import (
     require_api_key,
     require_full_key,
 )
+from api.metrics import feedback_total
 from api.routes.deps import FeedbackStoreDep
 from api.schemas import (
     FEEDBACK_LIST_MAX_LIMIT,
@@ -45,6 +46,7 @@ def register(app: FastAPI) -> None:
             rating=request.rating,
             citation_source_number=request.citation_source_number,
         )
+        feedback_total.labels(rating=request.rating).inc()
         return FeedbackResponse(id=feedback.id)
 
     # The read side of the same feature: without it, captured ratings are reachable

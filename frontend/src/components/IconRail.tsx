@@ -23,6 +23,8 @@ interface IconRailProps {
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
   onOpenSettings: () => void;
+  /** False until the server's config has loaded: Settings has nothing to show yet. */
+  settingsAvailable?: boolean;
   /** Rail entries to leave out (the feedback panel when feedback is off or read-only). */
   hidden?: RailPanel[];
 }
@@ -33,6 +35,7 @@ function IconRail({
   theme,
   onToggleTheme,
   onOpenSettings,
+  settingsAvailable = true,
   hidden = [],
 }: IconRailProps) {
   return (
@@ -69,10 +72,11 @@ function IconRail({
       </button>
       <button
         type="button"
-        title="Settings"
+        title={settingsAvailable ? 'Settings' : 'Settings — available once the server answers'}
         aria-label="Settings"
         className="icon-rail__button"
         onClick={onOpenSettings}
+        disabled={!settingsAvailable}
         data-testid="open-settings"
       >
         <span aria-hidden="true">⚙</span>

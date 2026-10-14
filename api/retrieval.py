@@ -46,6 +46,8 @@ class RetrievedChunk:
     # None for points indexed before chunk_ordinal existed — neighbor expansion
     # skips those gracefully rather than treating a missing ordinal as an error.
     chunk_ordinal: int | None = None
+    # The chunk's last page when it crosses a page break (DocumentChunk.page_end).
+    page_end: int | None = None
 
 
 def points_to_chunks(points: Sequence[models.ScoredPoint]) -> list[RetrievedChunk]:
@@ -101,6 +103,7 @@ def scored_point_to_chunk(point: models.ScoredPoint) -> RetrievedChunk:
         text=payload_string(payload, "text"),
         score=float(point.score),
         chunk_ordinal=payload_optional_int(payload, "chunk_ordinal"),
+        page_end=payload_optional_int(payload, "page_end"),
     )
 
 

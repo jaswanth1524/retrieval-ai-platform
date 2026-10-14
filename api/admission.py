@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from threading import BoundedSemaphore, Lock
 
+from api.metrics import question_slots_in_use
+
 Release = Callable[[], None]
 
 
@@ -25,10 +27,9 @@ class QuestionSlots:
         """A release callback when a slot was free, else None. Never blocks."""
 
         semaphore = self._semaphore
-        if semaphore is None:
-            return _noop
-        if not semaphore.acquire(blocking=False):
+        if semaphore is not None and not semaphore.acquire(blocking=False):
             return None
+        question_slots_in_use.inc()
         released = False
         guard = Lock()
 
@@ -41,10 +42,8 @@ class QuestionSlots:
                 if released:
                     return
                 released = True
-            semaphore.release()
+            question_slots_in_use.dec()
+            if semaphore is not None:
+                semaphore.release()
 
         return release
-
-
-def _noop() -> None:
-    return None

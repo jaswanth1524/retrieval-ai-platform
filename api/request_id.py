@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import re
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Executor, Future
@@ -22,6 +23,10 @@ HEADER = "X-Request-ID"
 _VALID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 request_id_var: ContextVar[str | None] = ContextVar("docrag_request_id", default=None)
+
+# One record per request, emitted only under LOG_FORMAT=json (see api/logging_config.py),
+# where it stands in for uvicorn's access line, which can't carry the request id.
+access_logger = logging.getLogger("api.access")
 
 
 def current_request_id() -> str | None:
@@ -52,8 +57,13 @@ class RequestIdMiddleware:
         request_id = supplied if _VALID.match(supplied) else uuid.uuid4().hex
         token = request_id_var.set(request_id)
 
+        started = time.monotonic()
+        status = 0
+
         async def send_with_id(message: Message) -> None:
+            nonlocal status
             if message["type"] == "http.response.start":
+                status = int(message.get("status", 0))
                 headers = [
                     (key, value)
                     for key, value in message.get("headers", [])
@@ -66,6 +76,22 @@ class RequestIdMiddleware:
         try:
             await self.app(scope, receive, send_with_id)
         finally:
+            if access_logger.isEnabledFor(logging.INFO):
+                access_logger.info(
+                    "%s %s %s",
+                    scope.get("method", ""),
+                    scope.get("path", ""),
+                    status or "-",
+                    extra={
+                        "http": {
+                            "method": scope.get("method", ""),
+                            "path": scope.get("path", ""),
+                            # 0: the response never started (the client left first).
+                            "status": status,
+                            "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                        }
+                    },
+                )
             request_id_var.reset(token)
 
 

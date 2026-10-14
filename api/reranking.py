@@ -70,6 +70,7 @@ class RerankedChunk:
     rerank_score: float
     chunk_ordinal: int | None = None
     expanded_text: str | None = None
+    page_end: int | None = None
 
 
 _custom_model_lock = threading.Lock()
@@ -295,6 +296,7 @@ def rerank_candidates_detailed(
             retrieval_score=candidate.score,
             rerank_score=_sigmoid(float(score)),
             chunk_ordinal=candidate.chunk_ordinal,
+            page_end=candidate.page_end,
         )
         for candidate, score in zip(candidates_to_score, scores, strict=True)
     ]

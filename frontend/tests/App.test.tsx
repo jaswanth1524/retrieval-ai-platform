@@ -223,6 +223,42 @@ describe('App', () => {
     expect(screen.queryByTestId('command-palette')).not.toBeInTheDocument();
   });
 
+  it('keeps Settings closed until the config has loaded, without blocking shortcuts', async () => {
+    let answerConfig: (() => void) | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/config')) {
+          await new Promise<void>((resolve) => {
+            answerConfig = resolve;
+          });
+          return jsonResponse(makeConfigPayload());
+        }
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: ['g.md'], chunk_counts: { 'g.md': 4 } });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    const button = screen.getByTestId('open-settings');
+    expect(button).toBeDisabled();
+
+    // The shortcut can't half-open it either, so ⌘K still works afterwards (a half-open
+    // Settings made every shortcut think a dialog was up).
+    await userEvent.keyboard('{Control>},{/Control}');
+    await userEvent.keyboard('{Control>}k{/Control}');
+    expect(await screen.findByTestId('command-palette')).toBeInTheDocument();
+    await userEvent.keyboard('{Escape}');
+
+    await waitFor(() => expect(answerConfig).toBeDefined());
+    await act(async () => answerConfig?.());
+    await screen.findByText('api ok');
+    // Nothing pops up by itself when the config lands.
+    expect(screen.queryByTestId('settings-modal')).not.toBeInTheDocument();
+    expect(screen.getByTestId('open-settings')).not.toBeDisabled();
+  });
+
   it('saving settings shows a toast instead of a banner', async () => {
     vi.stubGlobal(
       'fetch',
@@ -265,6 +301,44 @@ describe('App', () => {
 
     await userEvent.click(screen.getByTestId('inspector-close'));
     expect(screen.queryByTestId('inspector')).not.toBeInTheDocument();
+  });
+
+  it('closes an inspector opened on a wide window when the window narrows', async () => {
+    // Controllable media queries: start wide (neither breakpoint), then go narrow.
+    const listeners = new Map<string, (event: MediaQueryListEvent) => void>();
+    let narrow = false;
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query.includes('max-width: 1119px') ? narrow : false,
+      media: query,
+      addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) =>
+        listeners.set(query, listener),
+      removeEventListener: () => listeners.delete(query),
+    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: ['g.md'], chunk_counts: { 'g.md': 4 } });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+    await userEvent.click(screen.getByTestId('toggle-inspector'));
+    expect(await screen.findByTestId('inspector')).toBeInTheDocument();
+
+    narrow = true;
+    act(() => {
+      listeners.get('(max-width: 1119px)')?.({ matches: true } as MediaQueryListEvent);
+    });
+
+    // Not turned into a modal drawer that grabs focus: closed instead.
+    await waitFor(() => expect(screen.queryByTestId('inspector')).not.toBeInTheDocument());
+    // Opened again on the narrow window, it is the drawer the user asked for.
+    await userEvent.click(screen.getByTestId('toggle-inspector'));
+    expect(await screen.findByTestId('inspector')).toBeInTheDocument();
   });
 
   it('a trace-row click opens the Trace tab and forces engineer mode', async () => {
@@ -600,6 +674,39 @@ describe('App', () => {
     expect(setItemSpy).toHaveBeenCalledWith('docrag-theme', themeAfterToggle);
   });
 
+  it('takes a theme picked in another tab, and follows the OS until one is picked', async () => {
+    vi.restoreAllMocks();
+    let systemListener: ((event: MediaQueryListEvent) => void) | undefined;
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: false,
+      media: query,
+      addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+        if (query.includes('prefers-color-scheme')) systemListener = listener;
+      },
+      removeEventListener: () => {},
+    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: [], chunk_counts: {} });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    document.documentElement.dataset.theme = 'dark';
+    render(<App />);
+    await screen.findByText('api ok');
+
+    act(() => systemListener?.({ matches: true } as MediaQueryListEvent));
+    expect(document.documentElement.dataset.theme).toBe('light');
+
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: 'docrag-theme', newValue: 'dark' }));
+    });
+    expect(document.documentElement.dataset.theme).toBe('dark');
+  });
+
   it('still flips the visible theme when localStorage.setItem throws', async () => {
     vi.stubGlobal(
       'fetch',
@@ -641,6 +748,134 @@ describe('App', () => {
 
     await userEvent.click(screen.getByTestId('composer-provider-button'));
     expect(screen.getByTestId('provider-openai')).toBeChecked();
+  });
+
+  it('does not keep a remembered Ollama that is down when OpenAI can answer', async () => {
+    // The remembered choice used to win whether or not Ollama was reachable.
+    vi.restoreAllMocks(); // an earlier test stubs Storage.setItem to throw
+    localStorage.setItem('docrag-provider', 'ollama');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.endsWith('/config')) {
+          return jsonResponse(makeConfigPayload({ ollama_available: false, openai_available: true }));
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText('api ok');
+
+    await userEvent.click(screen.getByTestId('composer-provider-button'));
+    expect(screen.getByTestId('provider-openai')).toBeChecked();
+    // Only this session's pick: the stored preference is kept for when Ollama is back.
+    expect(localStorage.getItem('docrag-provider')).toBe('ollama');
+  });
+
+  it('treats a failed document listing as unknown, not empty, and retries it', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let listings = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+          if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+          if (url.endsWith('/documents')) {
+            listings += 1;
+            if (listings === 1) {
+              return new Response(JSON.stringify({ detail: 'boom' }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            return jsonResponse({ filenames: ['guide.txt'], chunk_counts: { 'guide.txt': 1 } });
+          }
+          throw new Error(`unexpected fetch: ${url}`);
+        }),
+      );
+
+      render(<App />);
+      expect(await screen.findByTestId('question-hint')).toHaveTextContent(
+        'Couldn’t load the document list',
+      );
+      expect(screen.queryByText('Upload a document to start.')).not.toBeInTheDocument();
+      expect(screen.getByTestId('question-textarea')).not.toBeDisabled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      await waitFor(() => expect(listings).toBe(2));
+      await waitFor(() => expect(screen.queryByTestId('question-hint')).not.toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('notices when the server goes away after boot, and when it comes back', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let up = true;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (!up) throw new TypeError('Failed to fetch');
+          if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+          if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+          if (url.endsWith('/documents')) {
+            return jsonResponse({ filenames: ['g.md'], chunk_counts: { 'g.md': 1 } });
+          }
+          throw new Error(`unexpected fetch: ${url}`);
+        }),
+      );
+
+      render(<App />);
+      expect(await screen.findByText('api ok')).toBeInTheDocument();
+
+      up = false;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(await screen.findByText('api unreachable')).toBeInTheDocument();
+      expect(screen.getByTestId('question-hint')).toHaveTextContent('Can’t reach the server');
+      // The conversation stays on screen: not the boot-time "cannot reach" page.
+      expect(screen.getByTestId('question-textarea')).toBeInTheDocument();
+
+      up = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(await screen.findByText('api ok')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('marks the server unreachable the moment the browser goes offline', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: ['g.md'], chunk_counts: { 'g.md': 1 } });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    render(<App />);
+    await screen.findByText('api ok');
+
+    // Sent until the listener (registered once booted) has seen it.
+    await waitFor(() => {
+      act(() => {
+        window.dispatchEvent(new Event('offline'));
+      });
+      expect(screen.getByText('api unreachable')).toBeInTheDocument();
+    });
   });
 
   it('offers a skip link to the question as the first Tab stop', async () => {
@@ -705,6 +940,8 @@ describe('App', () => {
     expect(await screen.findByText('api unreachable')).toBeInTheDocument();
     expect(screen.getByText(/Cannot reach the DocRAG API/)).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent(/Cannot reach the DocRAG API/);
+    // The toast live regions stay mounted, so a failure toast pushed now is announced.
+    expect(screen.getByTestId('toast-failures')).toBeInTheDocument();
   });
 
   it('boots again once the API answers, by itself or on Retry now', async () => {
@@ -797,6 +1034,7 @@ describe('App', () => {
         const url = String(input);
         if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
         if (url.endsWith('/config')) return jsonResponse(makeConfigPayload());
+        if (url.endsWith('/documents')) return jsonResponse({ filenames: [], chunk_counts: {} });
         throw new Error(`unexpected fetch: ${url}`);
       }),
     );
@@ -1023,6 +1261,15 @@ describe('App', () => {
     await userEvent.click(screen.getByTestId('question-submit'));
 
     const citation = (await screen.findAllByTestId('inline-citation'))[0];
+    fireEvent.mouseEnter(citation);
+    const preview = await screen.findByTestId('source-preview');
+    // The citation is described by the preview it shows, for screen readers.
+    expect(citation).toHaveAttribute('aria-describedby', preview.id);
+    expect(preview).toHaveAttribute('role', 'tooltip');
+    // Escape dismisses it without moving the pointer (WCAG 1.4.13).
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('source-preview')).not.toBeInTheDocument());
+    fireEvent.mouseLeave(citation);
     fireEvent.mouseEnter(citation);
     expect(await screen.findByTestId('source-preview')).toBeInTheDocument();
 

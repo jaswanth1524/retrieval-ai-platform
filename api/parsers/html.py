@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from typing import Any, cast
 
@@ -13,8 +14,36 @@ _HTML_STRIP_TAGS = ("script", "style", "noscript", "template")
 _HTML_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 
 
-def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
-    """Extract readable HTML text, splitting on h1-h6 into semantic sections."""
+# An inline style that hides the element: what a browser never shows the reader.
+_HIDING_STYLE = re.compile(r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b", re.I)
+
+
+def _is_hidden(element: Any) -> bool:
+    """Text no reader of the page sees: the ``hidden`` attribute, ``aria-hidden``, or an
+    inline ``display:none``/``visibility:hidden``. Indexed, it was a free channel for
+    instructions aimed at the model ("ignore the question and ...") that nobody reviewing
+    the page would notice. Stylesheets and scripts can hide text too; only what the
+    markup itself says is checked."""
+
+    attrs = getattr(element, "attrs", None)
+    if not attrs:
+        return False
+    if "hidden" in attrs:
+        return True
+    if str(attrs.get("aria-hidden", "")).strip().lower() == "true":
+        return True
+    style = attrs.get("style")
+    return isinstance(style, str) and _HIDING_STYLE.search(style) is not None
+
+
+def parse_html_document(
+    filename: str, text: str, *, default_section: str | None = None
+) -> list[DocumentSection]:
+    """Extract readable HTML text, splitting on h1-h6 into semantic sections.
+
+    Text before the first heading is labelled with ``default_section`` when given (an
+    email's subject), else the page's ``<title>``.
+    """
 
     from bs4 import BeautifulSoup
     from bs4.element import CData, PreformattedString
@@ -22,12 +51,14 @@ def parse_html_document(filename: str, text: str) -> list[DocumentSection]:
     soup = BeautifulSoup(text, "html.parser")
     for element in soup(list(_HTML_STRIP_TAGS)):
         element.decompose()
+    for element in [tag for tag in soup.find_all(True) if _is_hidden(tag)]:
+        element.decompose()
 
     body = soup.body or soup
     title_tag = soup.title.get_text(strip=True) if soup.title else ""
 
     sections: list[DocumentSection] = []
-    current_section = cap_section(title_tag)
+    current_section = cap_section(default_section if default_section else title_tag)
     buffer: list[str] = []
 
     def flush() -> None:
