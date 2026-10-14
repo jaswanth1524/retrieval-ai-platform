@@ -127,6 +127,11 @@ function isCitation(value: unknown): value is CitationResponse {
 /** The citation, without its spans when any of them isn't one: the citation still opens
  *  its source, just with nothing marked. */
 function withValidSpans(source: CitationResponse): CitationResponse {
+  // A page range is shown as text: anything but a whole number is dropped.
+  if (source.page_end != null && !Number.isInteger(source.page_end)) {
+    const { page_end: _pageEnd, ...rest } = source;
+    return withValidSpans(rest);
+  }
   if (source.spans === undefined) return source;
   const valid =
     Array.isArray(source.spans) &&
@@ -166,7 +171,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (typeof turn.question === 'string') sanitized.question = turn.question;
   if (turn.feedback === 'up' || turn.feedback === 'down') sanitized.feedback = turn.feedback;
   if (typeof turn.model === 'string') sanitized.model = turn.model;
-  for (const flag of ['stopped', 'incomplete', 'cached', 'notFound'] as const) {
+  for (const flag of ['stopped', 'incomplete', 'cached', 'notFound', 'uncited', 'truncated'] as const) {
     if (turn[flag] === true) sanitized[flag] = true;
   }
   return sanitized;
@@ -267,6 +272,10 @@ export function isOnlyEmpty(storage: ChatStorageV2): boolean {
   return (
     storage.conversations.length === 1 &&
     storage.conversations[0].turns.length === 0 &&
+    // A conversation emptied by Clear (or renamed) is an edit the other tabs must see:
+    // removing the key told them nothing (a storage event with no value), and their
+    // next save wrote the cleared turns back.
+    !storage.conversations[0].editedAt &&
     // A recorded delete still has to reach the other tabs.
     !storage.deleted?.length
   );

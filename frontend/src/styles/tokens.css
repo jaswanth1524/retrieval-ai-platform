@@ -42,9 +42,11 @@
   --dim: #6b645a;
   --rule: rgba(20, 18, 15, 0.15);
   --rule-hi: rgba(20, 18, 15, 0.34);
-  --accent: oklch(55% 0.16 45);
+  /* At least 4.5:1 on --paper, --card and --sunk, like every text colour here (55% was
+     4.2:1 on --sunk). */
+  --accent: oklch(52% 0.16 45);
   --accent-ink: #ffffff;
-  --accent-soft: oklch(55% 0.16 45 / 0.1);
+  --accent-soft: oklch(52% 0.16 45 / 0.1);
   --data: oklch(46% 0.09 232);
   --good: oklch(48% 0.11 150);
   /* Also used as text (stale labels, trace warnings): 60% lightness was 3.2-3.9:1. */

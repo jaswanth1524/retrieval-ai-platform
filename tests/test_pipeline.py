@@ -1833,3 +1833,102 @@ def test_the_timings_response_has_exactly_the_pipeline_stage_fields() -> None:
     assert timings_response(timings) == TimingsResponse(
         **dict(zip(names, range(1, len(names) + 1), strict=True))
     )
+
+
+def test_an_answer_that_cites_nothing_is_reported_as_uncited() -> None:
+    """It used to read as "answered": nothing told the reader it had no sources."""
+
+    pipeline = _status_pipeline(FakeGenerator("Alpha is beta, as everyone knows."))
+
+    assert pipeline.answer("alpha").answer_status == "uncited"
+    assert _stream_done(pipeline, "alpha beta")["answer_status"] == "uncited"
+
+
+class _LengthLimitedGenerator(FakeGenerator):
+    """Reports, as LiteLLM's generator does, that the provider stopped at max_tokens."""
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        from api.llm import reset_finish_reason
+
+        answer = super().complete(messages, settings)
+        reset_finish_reason("length")
+        return answer
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Any:
+        from api.llm import reset_finish_reason
+
+        yield from super().stream(messages, settings)
+        reset_finish_reason("length")
+
+
+def test_an_answer_cut_off_at_the_token_limit_is_flagged_in_both_modes_and_the_cache() -> None:
+    pipeline = _status_pipeline(_LengthLimitedGenerator("Alpha is documented [1] and"))
+
+    grounded = pipeline.answer("alpha")
+    assert grounded.truncated is True
+    assert pipeline.answer("alpha").cached and pipeline.answer("alpha").truncated is True
+
+    done = _stream_done(pipeline, "alpha beta")
+    assert done["truncated"] is True
+    replayed = _stream_done(pipeline, "alpha beta")
+    assert replayed["cached"] and replayed["truncated"] is True
+
+    plain = _status_pipeline(FakeGenerator("Alpha is documented [1]."))
+    assert plain.answer("alpha").truncated is False
+    assert _stream_done(plain, "alpha beta")["truncated"] is False
+
+
+def test_only_an_ingest_that_reached_its_first_write_moves_the_corpus_generation() -> None:
+    """A cancelled or refused upload changed nothing, yet emptied the answer cache."""
+
+    from api.corpus import corpus_generation
+    from api.ingestion import IngestionError
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    service = IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings)
+
+    def refuse() -> None:
+        raise IngestionError("cancelled")
+
+    before = corpus_generation()
+    with pytest.raises(IngestionError):
+        service.ingest("guide.txt", b"Intro\nalpha beta", before_first_write=refuse)
+    assert corpus_generation() == before
+
+    service.ingest("guide.txt", b"Intro\nalpha beta")
+    assert corpus_generation() > before
+
+
+def test_fetch_neighbors_finds_every_ordinal_past_leftover_copies() -> None:
+    """A partial re-ingest leaves old and new points with the same ordinals; with a
+    limit of exactly one point per ordinal, the copies crowded out the rest."""
+
+    import uuid
+
+    settings = make_settings(chunk_size_tokens=8, chunk_overlap_tokens=0)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(
+        repository,
+        StaticEmbeddingProvider([make_embedding(1.0) for _ in range(5)]),
+        settings,
+        token_counter=WordTokenCounter(),
+    ).ingest(
+        "guide.md",
+        b"# Notes\nOne two three. Four five six. Seven eight nine. Ten eleven twelve. "
+        b"Thirteen fourteen fifteen.",
+    )
+    points, _ = client.scroll(settings.qdrant_collection, with_vectors=True, limit=100)
+    first = next(point for point in points if (point.payload or {}).get("chunk_ordinal") == 1)
+    client.upsert(
+        settings.qdrant_collection,
+        [
+            models.PointStruct(id=str(uuid.uuid4()), vector=first.vector, payload=first.payload)
+            for _ in range(2)
+        ],
+    )
+
+    fetched = repository.fetch_neighbors(settings, "guide.md", [1, 2, 3])
+
+    assert {(point.payload or {}).get("chunk_ordinal") for point in fetched} == {1, 2, 3}

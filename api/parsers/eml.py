@@ -56,7 +56,9 @@ def parse_eml_document(filename: str, content: bytes) -> list[DocumentSection]:
         text = _part_text(body)
         if body.get_content_subtype() == "html":
             try:
-                sections.extend(parse_html_document(filename, text))
+                # The subject, not the HTML's <title> (often generic or absent), labels
+                # the text before the body's first heading — as for a plain-text body.
+                sections.extend(parse_html_document(filename, text, default_section=label))
             except EmptyDocumentError:
                 pass
         elif normalize_text(text):

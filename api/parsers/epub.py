@@ -16,6 +16,7 @@ from api.parsers.common import (
     DocumentSection,
     EmptyDocumentError,
     check_zip_expanded_size,
+    declares_dtd,
 )
 from api.parsers.html import parse_html_document
 
@@ -106,7 +107,7 @@ def _read_xml(filename: str, archive: ZipFile, path: str) -> ElementTree.Element
         raise DocumentParseError(f"Could not parse EPUB '{filename}': {path} missing.") from exc
     # Package files never need a DTD; refusing one rules out entity-expansion tricks
     # regardless of what the XML parser would do with it.
-    if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
+    if declares_dtd(raw):
         raise DocumentParseError(f"Could not parse EPUB '{filename}'.")
     try:
         return ElementTree.fromstring(raw)

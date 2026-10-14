@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, Literal, Protocol, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -14,6 +15,7 @@ from litellm import exceptions as litellm_exceptions
 from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
+from api.metrics import llm_tokens_total
 from api.settings import AppSettings
 
 _OLLAMA_MODEL_PREFIXES = ("ollama/", "ollama_chat/")
@@ -168,6 +170,56 @@ def _connection_error(exc: Exception, settings: AppSettings) -> GenerationError:
     return _provider_failure(exc)
 
 
+# How the most recent LiteLLM call on this thread ended, read by the pipeline right
+# after it generates (the ChatGenerator protocol returns text only). Per thread: each
+# question generates on its own thread, and a stream is consumed on the thread that
+# started it.
+_last_call = threading.local()
+
+
+def reset_finish_reason(reason: str | None = None) -> None:
+    _last_call.finish_reason = reason
+
+
+def last_finish_reason() -> str | None:
+    """The provider's ``finish_reason`` for this thread's latest call, if it gave one."""
+
+    reason = getattr(_last_call, "finish_reason", None)
+    return reason if isinstance(reason, str) else None
+
+
+def stopped_at_token_limit() -> bool:
+    """True when this thread's latest call was cut off at ``max_tokens``."""
+
+    return last_finish_reason() == "length"
+
+
+def _record_finish_reason(response: object) -> None:
+    choices = read_value(response, "choices")
+    if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)) and choices:
+        reason = read_value(choices[0], "finish_reason")
+        if isinstance(reason, str) and reason:
+            _last_call.finish_reason = reason
+
+
+def _count_usage(response: object, settings: AppSettings) -> None:
+    """Add a response's reported token usage to ``docrag_llm_tokens_total``.
+
+    Only what the provider reports: a stream carries usage on its last chunk when the
+    provider sends it (LiteLLM fills it in for Ollama); ``stream_options`` isn't sent to
+    ask for it, since some OpenAI-compatible servers reject the field.
+    """
+
+    usage = read_value(response, "usage")
+    if usage is None:
+        return
+    provider = settings.llm_provider.lower().strip()
+    for kind, key in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
+        value = read_value(usage, key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            llm_tokens_total.labels(provider=provider, kind=kind).inc(value)
+
+
 class LiteLLMGenerator:
     """Generate answers with LiteLLM while keeping provider selection configurable."""
 
@@ -188,6 +240,7 @@ class LiteLLMGenerator:
         """
 
         model, provider_kwargs = completion_model_and_kwargs(settings)
+        reset_finish_reason()
         try:
             response = self.completion_client(
                 model=model,
@@ -213,6 +266,8 @@ class LiteLLMGenerator:
             if _never_connected(exc):
                 raise _connection_error(exc, settings) from exc
             raise _provider_failure(exc) from exc
+        _record_finish_reason(response)
+        _count_usage(response, settings)
         return extract_completion_text(response)
 
     def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterator[str]:
@@ -226,6 +281,7 @@ class LiteLLMGenerator:
         """
 
         model, provider_kwargs = completion_model_and_kwargs(settings)
+        reset_finish_reason()
         try:
             response = self.completion_client(
                 model=model,
@@ -241,13 +297,20 @@ class LiteLLMGenerator:
             # completion_client's return type is `object` (it must also cover the
             # non-streaming response `complete` uses) — with stream=True it is
             # actually an iterable of chunks; cast narrows that for the loop below.
+            last_with_usage: object | None = None
             try:
                 for chunk in cast(Iterable[object], response):
+                    _record_finish_reason(chunk)
+                    if read_value(chunk, "usage") is not None:
+                        last_with_usage = chunk
                     delta = extract_delta_text(chunk)
                     if delta:
                         yield delta
             finally:
                 _close_stream(response)
+            if last_with_usage is not None:
+                # The last report only: some providers repeat running totals per chunk.
+                _count_usage(last_with_usage, settings)
         except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
             raise _connection_error(exc, settings) from exc
         except Exception as exc:

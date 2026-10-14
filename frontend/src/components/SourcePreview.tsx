@@ -1,4 +1,6 @@
 import type { CitationResponse } from '../api/types';
+import { SOURCE_PREVIEW_ID } from '../hooks/usePreviewTrigger';
+import { pageLabel } from '../utils/pages';
 import './SourcePreview.css';
 
 interface SourcePreviewProps {
@@ -7,13 +9,13 @@ interface SourcePreviewProps {
 
 function SourcePreview({ citation }: SourcePreviewProps) {
   return (
-    <div className="source-preview" data-testid="source-preview">
+    <div className="source-preview" id={SOURCE_PREVIEW_ID} role="tooltip" data-testid="source-preview">
       <div className="source-preview__card">
         <div className="source-preview__header">
           <span className="source-preview__index">{citation.source_number}</span>
           <span className="source-preview__file">{citation.filename}</span>
           <span className="source-preview__loc">
-            p.{citation.page} &middot; {citation.section}
+            {pageLabel(citation.page, citation.page_end)} &middot; {citation.section}
           </span>
         </div>
         <p className="source-preview__quote">

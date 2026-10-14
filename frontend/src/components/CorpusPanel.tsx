@@ -78,6 +78,9 @@ interface CorpusPanelProps {
   /** Stop an upload or re-index that is waiting or hasn't started writing yet. */
   onCancelUpload?: (uploadId: string) => void;
   onReindex?: (filename: string) => void;
+  /** Re-index several documents at once (the bulk bar): one listing refresh at the end.
+   *  Without it the bulk bar calls `onReindex` per document. */
+  onReindexMany?: (filenames: string[]) => void;
   /** Re-index every stale document that has a stored original, in one request. */
   onReindexAllStale?: () => void;
   /** Replace a document's tags; rejects with a message to show on failure. */
@@ -480,7 +483,7 @@ interface BulkBarProps {
   disabled?: boolean;
   /** Names among the selection with a stored original (re-indexable). */
   reindexable: string[];
-  onReindex?: (filename: string) => void;
+  onReindex?: (filenames: string[]) => void;
   onAddTag?: (tag: string) => Promise<void>;
   onDelete: () => Promise<void>;
   onClear: () => void;
@@ -560,7 +563,7 @@ function BulkBar({ selected, disabled, reindexable, onReindex, onAddTag, onDelet
             <button
               type="button"
               className="corpus-panel__bulk-button"
-              onClick={() => reindexable.forEach((filename) => onReindex(filename))}
+              onClick={() => onReindex(reindexable)}
               disabled={disabled || busy}
               data-testid="corpus-bulk-reindex"
             >
@@ -605,6 +608,7 @@ function CorpusPanel({
   onDismissUpload,
   onCancelUpload,
   onReindex,
+  onReindexMany,
   onReindexAllStale,
   onSetTags,
   readOnly = false,
@@ -628,7 +632,10 @@ function CorpusPanel({
   // Where focus goes after a confirmed delete: the card now in the deleted one's place.
   // Its Confirm button unmounts with it, which otherwise dropped focus to <body>.
   const refocusIndexRef = useRef<number | null>(null);
-  const submitting = uploads.some((item) => item.status === 'uploading');
+  // Files of this browser's still being sent or indexed — not re-indexes or a backup's
+  // documents (no file of their own), which used to disable the upload input, so ⌘U and
+  // the Upload buttons silently did nothing for as long as a re-index ran.
+  const submitting = uploads.some((item) => item.status === 'uploading' && item.file !== undefined);
 
   const handleFilesChange = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
@@ -803,11 +810,21 @@ function CorpusPanel({
   const filteredCards = [...visibleIndexed, ...visibleUploads];
   const cardCount = indexedCards.length + uploadCards.length;
 
-  // Selection is of indexed documents; one deleted (here or in another tab) leaves it.
+  // Selection is of the indexed documents on screen: one deleted (here or in another
+  // tab) leaves it, and so does one the search or tag filter hides — "Delete 3" must
+  // never include a document the user can't see.
   const selectedNames = useMemo(
-    () => indexedCards.filter((card) => selected.has(card.filename)).map((card) => card.filename),
-    [indexedCards, selected],
+    () => visibleIndexed.filter((card) => selected.has(card.filename)).map((card) => card.filename),
+    [visibleIndexed, selected],
   );
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const visible = new Set(visibleIndexed.map((card) => card.filename));
+      const kept = [...prev].filter((filename) => visible.has(filename));
+      return kept.length === prev.size ? prev : new Set(kept);
+    });
+  }, [visibleIndexed]);
   const canBulk = !readOnly && indexedCards.length > 1;
   const visibleNames = visibleIndexed.map((card) => card.filename);
   const allVisibleSelected =
@@ -839,6 +856,9 @@ function CorpusPanel({
     }
     setSelected(new Set(failed));
     setDeleteError(failed.length > 0 ? `Couldn't delete: ${failed.join(', ')}` : null);
+    // The bulk bar (and its focused Confirm) unmounts when nothing is left selected;
+    // without this, focus fell to <body>.
+    if (failed.length === 0) searchRef.current?.focus();
   };
 
   const bulkAddTag = async (tag: string) => {
@@ -1023,10 +1043,13 @@ function CorpusPanel({
         <BulkBar
           selected={selectedNames}
           disabled={disabled}
-          reindexable={indexedCards
+          reindexable={visibleIndexed
             .filter((card) => card.canReindex && selected.has(card.filename))
             .map((card) => card.filename)}
-          onReindex={onReindex}
+          onReindex={
+            onReindexMany ??
+            (onReindex ? (names: string[]) => names.forEach((name) => onReindex(name)) : undefined)
+          }
           onAddTag={onSetTags ? bulkAddTag : undefined}
           onDelete={bulkDelete}
           onClear={() => setSelected(new Set())}

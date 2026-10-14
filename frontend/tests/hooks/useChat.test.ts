@@ -548,7 +548,7 @@ describe('useChat', () => {
     expect(result.current.conversations.find((c) => c.id === id)).toBeUndefined();
   });
 
-  it('clear() empties turns and removes the persisted storage entry', async () => {
+  it('clear() empties turns and saves the emptied conversation', async () => {
     askQuestionStreamMock.mockImplementationOnce(
       async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
         handlers.onDone?.('an answer', [], ZERO_TIMINGS, 'trace-1');
@@ -567,7 +567,36 @@ describe('useChat', () => {
     });
 
     expect(result.current.turns).toEqual([]);
-    expect(localStorage.getItem('docrag-chat-history')).toBeNull();
+    // Saved, not removed: other tabs have to learn the conversation was cleared.
+    const persisted = JSON.parse(localStorage.getItem('docrag-chat-history') ?? 'null');
+    expect(persisted.conversations).toHaveLength(1);
+    expect(persisted.conversations[0].turns).toEqual([]);
+  });
+
+  it('clears the conversation in another tab too', async () => {
+    const { result: mine } = renderHook(() => useChat());
+    await act(async () => {
+      await mine.current.ask('a question');
+    });
+    const beforeClear = localStorage.getItem('docrag-chat-history');
+    expect(beforeClear).not.toBeNull();
+    // A later millisecond than the answer, as any real clear is.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    act(() => mine.current.clear());
+    const afterClear = localStorage.getItem('docrag-chat-history');
+
+    // The other tab saw the conversation with its turns, then the clear.
+    localStorage.setItem('docrag-chat-history', beforeClear as string);
+    const { result: theirs } = renderHook(() => useChat());
+    expect(theirs.current.turns.length).toBeGreaterThan(0);
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'docrag-chat-history', newValue: afterClear }),
+      );
+    });
+
+    expect(theirs.current.turns).toEqual([]);
   });
 
   it('warns and resets to empty on an unparseable persisted blob', () => {
@@ -897,6 +926,27 @@ describe('useChat storage robustness', () => {
     });
   });
 
+  it('saves a rename made in another conversation while an answer streams', () => {
+    seed([
+      { id: 'other', updatedAt: 1, turns: [savedTurn('o1', 'user', 'old question')] },
+      { id: 'asking', updatedAt: 2 },
+    ]);
+    askQuestionStreamMock.mockImplementation(() => new Promise<void>(() => {}));
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.switchConversation('asking'));
+    act(() => {
+      void result.current.ask('A long answer, please');
+    });
+    expect(result.current.pending).toBe(true);
+
+    act(() => result.current.renameConversation('other', 'Renamed mid-answer'));
+
+    // Saved while the answer is still streaming, not when it ends.
+    expect(saved().conversations.find((c) => c.id === 'other')?.title).toBe('Renamed mid-answer');
+    // The streaming answer itself is only saved as cut off, as on pagehide.
+    expect(result.current.pending).toBe(true);
+  });
+
   it('resets the title on Clear, so the next question names the conversation', () => {
     seed([{ id: 'c', updatedAt: 1 }]);
     const { result } = renderHook(() => useChat());
@@ -977,6 +1027,25 @@ describe('useChat feature pack', () => {
 
     expect(result.current.turns[1]).toMatchObject({ content: 'Not in the documents.', notFound: true });
     expect(sanitizeTurn(JSON.parse(JSON.stringify(result.current.turns[1])))?.notFound).toBe(true);
+  });
+
+  it('flags an uncited or cut-off answer, and keeps both flags', async () => {
+    askQuestionStreamMock.mockImplementation(async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+      handlers.onDone?.('Alpha is beta and', [], ZERO_TIMINGS, null, false, {
+        answerStatus: 'uncited',
+        truncated: true,
+      });
+    });
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('Q', 'ollama');
+    });
+
+    expect(result.current.turns[1]).toMatchObject({ uncited: true, truncated: true });
+    expect(result.current.turns[1].notFound).toBeUndefined();
+    const restored = sanitizeTurn(JSON.parse(JSON.stringify(result.current.turns[1])));
+    expect(restored).toMatchObject({ uncited: true, truncated: true });
   });
 
   it('does not flag an answered question', async () => {

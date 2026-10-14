@@ -94,6 +94,9 @@ def make_qdrant_client(settings: AppSettings) -> QdrantClient:
     return QdrantClient(
         url=settings.qdrant_url,
         prefer_grpc=settings.qdrant_prefer_grpc,
+        # Without it the client always dialled 6334, so a host-run API with
+        # QDRANT_PREFER_GRPC=true and QDRANT_GRPC_PORT changed couldn't connect.
+        grpc_port=int(settings.qdrant_grpc_port),
         api_key=settings.qdrant_api_key or None,
     )
 

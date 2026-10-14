@@ -10,12 +10,59 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 ## Unreleased
 
-Latency and features pass, then an improvement pass (fixes, security, accessibility,
-features). **Re-index: None** — nothing here changes chunking or the index. The new EPUB
-and EML support applies to new uploads. A CSV whose delimiter used to be mis-detected
-(see Fixed) parses correctly once re-uploaded.
+Latency and features pass, then two improvement passes (fixes, security, accessibility,
+features). **Re-index: recommended** — chunker version 5 (see Changed). Every document
+is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
+stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
+before. No embedding change: the index stays compatible, and nothing is refused. The
+re-index also picks up the parser fixes below (a mis-detected CSV delimiter, hidden HTML
+text no longer indexed, an HTML-only email labelled by its subject).
+
+**Upgrading with Compose:** the API's `/app/data` volume is now mounted by default, as
+`docrag_data`. If you had uncommented the old `docrag_job_store` line, copy that volume
+into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
+<project>_docrag_data:/to busybox cp -a /from/. /to/`).
+
+### Changed
+- **Chunker version 5.** Table rows (CSV, XLSX and Markdown tables, which PDF tables are
+  rendered as) are never split across chunks, and a table chunk is labelled with the
+  rows it actually holds (`Rows 4-17`, not its whole 50-row group). A chunk that runs
+  onto the next page records it (`page_end`, shown as "p.3–4" and given to the model as
+  `page=3-4`). A short section is folded into its neighbour only on the same page (a
+  short EPUB chapter was cited as the next chapter). Chunk ids come from the content,
+  not the position, so an edit near the top of a document no longer gives every later
+  passage a new id — a re-index keeps saved citations pointing at their passages. The
+  handbook and sample retrieval evals score the same as with version 4.
+- Uploads are parsed in a child process stopped after `PARSE_TIMEOUT_SECONDS` (300): a
+  pathological file used to hold an ingest worker indefinitely, and parsing competed
+  with questions for the GIL. `PARSE_TIMEOUT_SECONDS=0` restores in-process parsing.
+- The document listing is re-read in full after `DOCUMENT_LISTING_TTL_SECONDS` (300; it
+  was 30). Changes made by the API itself apply at once as before; the setting only
+  bounds how long another process's writes go unseen.
 
 ### Added
+- Excel (`.xlsx`) and PowerPoint (`.pptx`) uploads (`openpyxl`, `python-pptx`). Each
+  sheet is a page, its rows rendered like a CSV's and labelled with spreadsheet row
+  numbers (`Costs · Rows 2-51`); each slide is a page titled by its slide title, with
+  its tables and speaker notes. A slide or a sheet's row range is never merged into its
+  neighbour, so even a one-line slide is cited as itself. `MAX_SPREADSHEET_CELLS`
+  (200 000) caps a workbook; XML DTDs and zip bombs are refused as for DOCX and EPUB.
+- `answer_status` gains `uncited` (an answer that cites none of its sources, even after
+  the citation retry — it used to read as `answered`), and answers carry `truncated`
+  when the model stopped at its token limit. The UI flags both ("no sources cited",
+  "cut off").
+- Metrics: `docrag_answers_total{status}`, `docrag_answers_truncated_total`,
+  `docrag_citation_retries_total`, `docrag_feedback_total{rating}`,
+  `docrag_llm_tokens_total{provider,kind}` (what the provider reports),
+  `docrag_question_slots_in_use`, `docrag_ingest_backlog_bytes`/`_jobs`,
+  `docrag_corpus_documents` and `docrag_build_info{version}`. `/health` reports the
+  version. Under `LOG_FORMAT=json` each request gets one JSON access line with its
+  request id (uvicorn's plain-text access line is silenced then).
+- A cancelled or refused upload no longer empties the answer cache (only an ingest that
+  started writing does). Passage search keeps adjacent passages it used to drop as
+  neighbours of a better one (only answers expand neighbours back in).
+- The README has a reverse-proxy guide (nginx, Caddy, `FORWARDED_ALLOW_IPS`,
+  `--root-path`), curl examples and a Prometheus scrape config.
 - EPUB and email (`.eml`) uploads. EPUB chapters are read in reading order, through the
   HTML parser; the chapter's position is its page. An email's headers (subject, sender,
   recipients, date) are a section of their own, then the plain-text body (or the HTML one
@@ -105,6 +152,49 @@ and EML support applies to new uploads. A CSV whose delimiter used to be mis-det
   lays out only the turns near the viewport.
 
 ### Fixed
+- A client that left a streamed answer kept the pipeline running to the end of the
+  answer (Starlette never closes a plain iterator): the question slot and the LLM stayed
+  busy until garbage collection. The same for `/original` downloads, whose file stayed
+  open. Both now stop as soon as the client leaves.
+- A per-request provider that isn't configured (`openai` with no key) is refused with a
+  400 before any retrieval, instead of failing after the rerank — on the stream, after
+  the sources had been sent.
+- Backup restores no longer fail with a 500 halfway through on a damaged, encrypted or
+  unsupported zip member: that member is listed in `rejected` and the rest goes on.
+- A huge `citation_source_number` on `/feedback`, or a 400-digit `start`/`end` on
+  `/documents/{f}/content`, was a 500 (now a 422).
+- Neighbour expansion could miss a neighbouring chunk next to leftover copies from an
+  interrupted re-index.
+- The UI kept a remembered Ollama selected while Ollama was down (every question
+  failed) instead of switching to a provider that could answer; the stored preference
+  is kept for when it is back.
+- A failed first document listing (a 500, a timeout) was shown as an empty corpus,
+  disabling the question box under "Upload a document to start"; it is retried now.
+- Settings opened before the server's config loaded blocked every shortcut and popped
+  up by itself later; clearing a conversation didn't reach other tabs (their next save
+  brought it back); bulk actions could include documents hidden by the filter, a bulk
+  delete dropped focus, and a bulk re-index refreshed the listing once per document;
+  a re-index or restore blocked uploads; toasts shown while the API was unreachable
+  were lost; a large backup restore timed out after two minutes, and a backup download
+  can now be cancelled (the same palette command); the viewer's "passage changed" note
+  stayed up for a later citation that was found; drafts could be pruned before the
+  history had loaded; switching between conversations of the same length kept the
+  scroll position; an inspector opened on a wide window became a focus-trapping drawer
+  when the window narrowed.
+- The UI notices when the server goes away after boot (it said "api ok" for the rest of
+  the session): `/health` is checked every 30 s while the page is visible, and the
+  browser's offline event is believed at once. Renames, pins, deletes and switches made
+  in other conversations while an answer streams are saved straight away. The theme
+  follows the OS live until one is picked, and a pick in one tab applies to the others.
+- `QDRANT_GRPC_PORT` is used by the API's Qdrant client (it always dialled 6334). A
+  default LLM provider that isn't configured is warned about at startup. The release
+  gate fails within minutes for a tag on a commit CI never ran for, instead of after an
+  hour, and `## 0.2.0` no longer matches a `## 0.2.0-rc.1` CHANGELOG heading.
+- The answer stream is read by the SSE rules: a proxy that rewrites line endings, splits
+  an event's data over several lines or drops the space after `data:` no longer makes
+  frames vanish, and a last frame with no blank line after it is kept.
+- A pasted question cut at the length limit says so; ⌘K's arrow keys skip commands that
+  can't run; a message from another day shows its date (exports always do).
 - The PDF "Original" view broke after switching to Passages and back (its blob URL was
   freed on the switch), and stayed on "Loading" when switched away mid-download. The
   download is now cancelled when the viewer closes.
@@ -125,6 +215,25 @@ and EML support applies to new uploads. A CSV whose delimiter used to be mis-det
   passage they were reading; it now stays in place.
 
 ### Security
+- Behind `uvicorn --root-path`, the request guard compared the prefixed path and let
+  every guarded route through unchecked (no early 401, no body cap, no rate limit, open
+  API docs). It now matches the path the routes see.
+- Section labels and file names get the same `[n] filename=` rewriting as source text
+  in the prompt (a heading could still start a fake source on the real header's line).
+- HTML text hidden from readers (`hidden`, `aria-hidden="true"`, inline
+  `display:none`/`visibility:hidden`) is no longer indexed — it was a channel for
+  instructions aimed at the model that nobody reviewing the page would see. Applies to
+  HTML, EPUB and HTML email.
+- `GET /export` runs one at a time (a second is a 409) and counts against
+  `RATE_LIMIT_PER_MINUTE`: each export reads every stored original.
+- Narrowed: `citation_source_number` at most 1000, `/content` `start`/`end` at most
+  1 000 000.
+- Qdrant's anonymous telemetry is turned off in the Compose file.
+- OCR renders each page within a pixel budget (`OCR_MAX_PAGE_PIXELS`, 40 MP): a tiny PDF
+  declaring a page hundreds of inches wide asked for gigabytes. Large pages are rendered
+  at a lower resolution, and a page too large even at 72 dpi is skipped.
+- The XML DTD check for XLSX, PPTX and EPUB also catches UTF-16 and UTF-32 encoded
+  members.
 - The UI is served with a Content-Security-Policy (scripts, styles, fonts and requests
   from its own origin only; frames only for the viewer's PDF; no other site may frame
   it) and `X-Frame-Options: DENY`; every response carries `X-Content-Type-Options:
@@ -145,6 +254,13 @@ and EML support applies to new uploads. A CSV whose delimiter used to be mis-det
   starts.
 
 ### Accessibility
+- The citation preview closes with Escape, and the inline `[n]` markers behave like the
+  citation cards (no reopening when focus returns from the viewer, no stuck preview on
+  touch). Answer headings start at `<h3>`, below the page's own; wide tables scroll
+  inside the answer; long words wrap. The feedback filters' emoji are no longer read
+  aloud; held-down shortcuts don't repeat. The citation being previewed points screen
+  readers at the preview (`aria-describedby`, `role="tooltip"`). Light theme `--accent`
+  is darker (it was 4.2:1 on `--sunk`); the contrast test now checks every text colour.
 - Focus returns to the control that opened an inline editor (rename, edit question,
   tags) and to the next card after a delete; the viewer's focus trap includes the PDF
   frame and skips hidden controls; "Skip to question" link; pinned conversations are
@@ -153,6 +269,14 @@ and EML support applies to new uploads. A CSV whose delimiter used to be mis-det
   many it found.
 
 ### Development
+- `make check` runs what CI runs, coverage floor, dataset validation and dependency
+  audits included. CI can be started by hand; lint and typecheck run once (on 3.12);
+  dependency review skips with a notice while the repository's Dependency graph is
+  off; the OCR image is also booted (its engine imported) and scanned; e2e fails on a
+  test that only passed on retry.
+- An enabled store (`RAW_DOCUMENT_DIR`, sqlite jobs, feedback) that can't write its
+  directory stops startup with the setting named, instead of a 500 on first use.
+  `FORWARDED_ALLOW_IPS` is documented in `.env.example`.
 - `tests/golden/openapi.json` pins the API schema; its test names any breaking change
   before the diff (`make openapi` regenerates it).
 - `httpx`, `numpy` and `grpcio`, imported by `api/` directly, are declared.

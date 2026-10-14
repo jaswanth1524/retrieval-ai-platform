@@ -25,7 +25,7 @@ from api.chunking import HeuristicTokenCounter
 from api.documents import chunk_sections, parse_document_bytes
 from api.settings import AppSettings
 from tests.factories import make_test_settings
-from tests.samples import eml_bytes, epub_bytes, pdf_bytes
+from tests.samples import eml_bytes, epub_bytes, pdf_bytes, pptx_bytes, xlsx_bytes
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "chunks.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +88,19 @@ def _documents() -> dict[str, bytes]:
     )
     documents["report.pdf"] = pdf_bytes(
         ["Quarterly report page one about retrieval quality.", "Page two covers latency."]
+    )
+    documents["budget.xlsx"] = xlsx_bytes(
+        {
+            "Costs": [["Item", "Amount"], ["Servers", 1200], [], ["Licences", 300.5]],
+            "Owners": [["Team", "Lead"], ["Search", "Ada"]],
+        }
+    )
+    documents["deck.pptx"] = pptx_bytes(
+        [
+            {"title": "Roadmap", "body": ["Ship hybrid search.", "Add spans."]},
+            {"title": "Numbers", "table": [["Quarter", "Users"], ["Q1", "40"]]},
+            {"body": ["A slide without a title."], "notes": "Say the date."},
+        ]
     )
     return documents
 

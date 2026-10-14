@@ -100,6 +100,25 @@ def test_feedback_records_a_rating_and_survives_a_restart(
     assert reloaded[0].citation_source_number == 1
 
 
+@pytest.mark.parametrize("number", [1001, 10**20])
+def test_feedback_rejects_an_out_of_range_citation_number(
+    api_context: ApiTestContext, number: int
+) -> None:
+    """An unbounded number reached sqlite, whose INTEGER overflowed into a 500."""
+
+    response = api_context.client.post(
+        "/feedback",
+        json={
+            "question": "q",
+            "answer_excerpt": "a",
+            "rating": "up",
+            "citation_source_number": number,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_feedback_rejects_an_invalid_rating(api_context: ApiTestContext) -> None:
     response = api_context.client.post(
         "/feedback",

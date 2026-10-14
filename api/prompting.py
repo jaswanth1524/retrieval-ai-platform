@@ -270,7 +270,7 @@ def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
     # has no use for a 20-hex id, and seeing one invited it to copy every source's
     # metadata into a trailing references list — pure decode time on a local model.
     return (
-        f"[{index}] filename={_one_line(chunk.filename)}; page={chunk.page}; "
+        f"[{index}] filename={_one_line(chunk.filename)}; page={_pages(chunk)}; "
         f"section={_one_line(chunk.section)}\n{_escape_source_headers(text)}"
     )
 
@@ -297,10 +297,16 @@ def _escape_source_headers(text: str) -> str:
     return _SOURCE_HEADER_LOOKALIKE.sub("(ref)", text)
 
 
+def _pages(chunk: RerankedChunk) -> str:
+    # "3-4" for a passage that crosses a page break, so the model cites it as both.
+    return f"{chunk.page}-{chunk.page_end}" if chunk.page_end else str(chunk.page)
+
+
 def _one_line(value: str) -> str:
     # A section label (or name) spanning lines could end the header early and put a
-    # fake one on the next line.
-    return " ".join(value.split())
+    # fake one on the next line; one holding "[2] filename=..." (a heading is document
+    # text too) put a second, fake header on the real header's line.
+    return _escape_source_headers(" ".join(value.split()))
 
 
 # Words that make a follow-up unresolvable on its own — it refers back to something only

@@ -156,8 +156,12 @@ class GroundedAnswer:
     trace_id: str | None = None
     # Served from api.answer_cache rather than generated for this request.
     cached: bool = False
-    # citations.answer_status: "answered", "insufficient_context" or "no_context".
+    # citations.answer_status: "answered", "uncited", "insufficient_context" or
+    # "no_context".
     answer_status: str = "answered"
+    # The provider stopped at the token limit (finish_reason "length"): the answer is
+    # cut off mid-way. Only as reliable as the provider's finish_reason.
+    truncated: bool = False
     # The best cross-encoder score (0-1) among the candidates, kept or not. None when
     # retrieval found nothing to score.
     top_rerank_score: float | None = None

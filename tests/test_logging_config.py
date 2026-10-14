@@ -72,3 +72,54 @@ def test_concurrent_query_variants_keep_the_request_id_in_their_threads() -> Non
         assert _map_concurrently(seen, [1, 2, 3]) == ["req-123"] * 3
     finally:
         request_id_var.reset(token)
+
+
+def _serve_one(app: object, headers: list[tuple[bytes, bytes]]) -> None:
+    import asyncio
+
+    from api.request_id import RequestIdMiddleware
+
+    async def endpoint(scope: object, receive: object, send: object) -> None:
+        await send({"type": "http.response.start", "status": 204, "headers": []})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": b""})  # type: ignore[operator]
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: object) -> None:
+        return None
+
+    scope = {"type": "http", "method": "GET", "path": "/documents", "headers": headers}
+    asyncio.run(RequestIdMiddleware(endpoint)(scope, receive, send))  # type: ignore[arg-type]
+
+
+def test_json_logs_write_one_access_line_per_request_with_its_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """uvicorn's access line can't carry the request id, so under JSON it is replaced."""
+
+    import json
+
+    configure_logging("INFO", "json")
+    try:
+        assert not logging.getLogger("uvicorn.access").isEnabledFor(logging.INFO)
+        _serve_one(object(), [(b"x-request-id", b"req-7")])
+    finally:
+        configure_logging("INFO")
+
+    line = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+    assert line["logger"] == "api.access"
+    assert line["request_id"] == "req-7"
+    assert line["http"]["method"] == "GET"
+    assert line["http"]["path"] == "/documents"
+    assert line["http"]["status"] == 204
+    assert line["http"]["duration_ms"] >= 0
+
+
+def test_text_logs_leave_the_access_line_to_uvicorn(capsys: pytest.CaptureFixture[str]) -> None:
+    configure_logging("INFO")
+
+    _serve_one(object(), [])
+
+    assert "api.access" not in capsys.readouterr().err
+    assert not logging.getLogger("api.access").isEnabledFor(logging.INFO)

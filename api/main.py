@@ -24,7 +24,9 @@ from api.dependencies import (
 )
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
+from api.llm import GenerationConfigError, completion_model_and_kwargs
 from api.logging_config import configure_logging
+from api.metrics import build_info
 from api.qdrant_schema import check_dense_dimension
 from api.request_guard import RequestGuardMiddleware
 from api.request_id import RequestIdMiddleware
@@ -37,6 +39,7 @@ from api.routes import traces as traces_routes
 from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
+from api.storage import check_writable_storage
 from api.version import app_version
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,21 @@ mimetypes.add_type("font/woff2", ".woff2")
 # starts costing memory on top of just having the model resident. See the field's
 # docstring in api/settings.py for the full 8 / 16 / 50 -> 2.66 / 3.53 / 6.33 GB ladder.
 MEASURED_SAFE_RERANKER_BATCH_SIZE = 8
+
+
+def warn_on_unconfigured_provider(settings: AppSettings) -> None:
+    """Log at startup when the default LLM provider can't be used as configured
+    (``LLM_PROVIDER=openai`` with no key, an OpenAI-compatible server with no URL).
+
+    A warning, not a refusal: upload, indexing and passage search never need the LLM,
+    and another provider may still be picked per question. Unwarned, the first sign was
+    every question failing.
+    """
+
+    try:
+        completion_model_and_kwargs(settings)
+    except GenerationConfigError as exc:
+        logger.warning("Questions will fail until this is fixed: %s", exc)
 
 
 def warn_on_risky_reranker_config(settings: AppSettings) -> None:
@@ -185,6 +203,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
 
     settings = get_app_settings()
+    check_writable_storage(settings)
     if settings.warmup_models:
         await run_in_threadpool(
             run_model_warmup,
@@ -200,6 +219,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Create the FastAPI app."""
 
+    build_info.info({"version": app_version()})
     app = FastAPI(
         title="DocRAG API",
         version=app_version(),
@@ -209,6 +229,7 @@ def create_app() -> FastAPI:
     settings = get_app_settings()
     configure_logging(settings.log_level, settings.log_format)
     warn_on_risky_reranker_config(settings)
+    warn_on_unconfigured_provider(settings)
     # Inside CORS (add_middleware wraps outward), so its 401/413 answers still carry CORS
     # headers for a separately-hosted frontend.
     app.add_middleware(RequestGuardMiddleware)

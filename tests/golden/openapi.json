@@ -63,6 +63,17 @@
       "title": "Page",
       "type": "integer"
      },
+     "page_end": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page End"
+     },
      "section": {
       "title": "Section",
       "type": "string"
@@ -140,6 +151,17 @@
      "page": {
       "title": "Page",
       "type": "integer"
+     },
+     "page_end": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page End"
      },
      "section": {
       "title": "Section",
@@ -582,6 +604,7 @@
      "citation_source_number": {
       "anyOf": [
        {
+        "maximum": 1000.0,
         "minimum": 1.0,
         "type": "integer"
        },
@@ -667,6 +690,11 @@
     "properties": {
      "status": {
       "title": "Status",
+      "type": "string"
+     },
+     "version": {
+      "default": "",
+      "title": "Version",
       "type": "string"
      }
     },
@@ -1076,7 +1104,8 @@
       "x-extensible-enum": [
        "answered",
        "insufficient_context",
-       "no_context"
+       "no_context",
+       "uncited"
       ]
      },
      "cached": {
@@ -1122,6 +1151,11 @@
        }
       ],
       "title": "Trace Id"
+     },
+     "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
      }
     },
     "required": [
@@ -1239,6 +1273,17 @@
      "page": {
       "title": "Page",
       "type": "integer"
+     },
+     "page_end": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page End"
      },
      "rank": {
       "title": "Rank",
@@ -2245,6 +2290,7 @@
       "schema": {
        "anyOf": [
         {
+         "maximum": 1000000,
          "minimum": 1,
          "type": "integer"
         },
@@ -2262,6 +2308,7 @@
       "schema": {
        "anyOf": [
         {
+         "maximum": 1000000,
          "minimum": 1,
          "type": "integer"
         },

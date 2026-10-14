@@ -48,6 +48,7 @@ def content_chunk(payload: dict[str, object]) -> DocumentChunkResponse:
         section=str(payload.get("section", "")),
         text=str(payload.get("text", "")),
         chunk_ordinal=payload_optional_int(payload, "chunk_ordinal"),
+        page_end=payload_optional_int(payload, "page_end"),
     )
 
 

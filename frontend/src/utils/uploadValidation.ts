@@ -11,6 +11,8 @@ export const ACCEPTED_EXTENSIONS = [
   '.csv',
   '.epub',
   '.eml',
+  '.xlsx',
+  '.pptx',
 ];
 
 /** The suffixes to accept: the server's list when it sent one. */

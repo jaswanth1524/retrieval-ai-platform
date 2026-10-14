@@ -441,3 +441,21 @@ describe('Composer', () => {
   });
 });
 
+
+describe('Composer length limit', () => {
+  it('says so when a paste is cut at the question limit', async () => {
+    const { MAX_QUESTION_CHARS } = await import('../../src/utils/limits');
+    render(<Composer {...baseProps()} />);
+    const textarea = screen.getByTestId('question-textarea');
+    textarea.focus();
+
+    await userEvent.paste('x'.repeat(MAX_QUESTION_CHARS + 50));
+
+    expect((textarea as HTMLTextAreaElement).value).toHaveLength(MAX_QUESTION_CHARS);
+    expect(screen.getByTestId('question-length-status')).toHaveTextContent('cut to');
+    expect(screen.getByTestId('question-length-note')).toBeInTheDocument();
+
+    await userEvent.clear(textarea);
+    expect(screen.queryByTestId('question-length-note')).not.toBeInTheDocument();
+  });
+});

@@ -450,7 +450,6 @@ def test_a_change_to_named_documents_rereads_only_those(monkeypatch: pytest.Monk
 def test_an_unnamed_change_an_old_entry_or_many_changes_rescan_everything(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import api.repository as repository_module
     from api.corpus import bump_corpus_generation
     from api.repository import clear_metadata_cache
 
@@ -476,9 +475,9 @@ def test_an_unnamed_change_an_old_entry_or_many_changes_rescan_everything(
 
     # Past the TTL the whole collection is read again (another process's writes),
     # even when the change names its document.
-    monkeypatch.setattr(repository_module, "_METADATA_TTL_SECONDS", 0.0)
+    expired = settings.model_copy(update={"document_listing_ttl_seconds": 1e-9})
     bump_corpus_generation(["a.md"])
-    repository.filename_metadata(settings)
+    repository.filename_metadata(expired)
     assert scans[-1] is None
     assert len(scans) == 5
     clear_metadata_cache()

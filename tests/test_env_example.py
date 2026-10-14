@@ -47,3 +47,15 @@ def test_env_example_values_are_unquoted_and_unpadded() -> None:
         if value != value.strip() or value[:1] in ("'", '"'):
             problems.append(f"line {number}: {line!r}")
     assert problems == []
+
+
+def test_every_setting_appears_in_env_example() -> None:
+    """Documented, active or commented out: a setting added to AppSettings alone is one
+    an operator reading .env.example never learns exists."""
+
+    text = ENV_EXAMPLE.read_text()
+    mentioned = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", text, flags=re.MULTILINE))
+    missing = sorted(
+        name.upper() for name in AppSettings.model_fields if name.upper() not in mentioned
+    )
+    assert missing == []

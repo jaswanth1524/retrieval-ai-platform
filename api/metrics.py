@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram, Info
 
 # Buckets tuned for a local-Ollama RAG pipeline: sub-second retrieval/rerank stages,
 # multi-second-to-70s+ generation, and a total that can span both regimes.
@@ -74,6 +74,59 @@ ingest_jobs_evicted_total = Counter(
 traces_evicted_total = Counter(
     "docrag_traces_evicted_total",
     "Query traces silently dropped from the in-memory ring buffer past its retention cap.",
+)
+
+
+build_info = Info("docrag_build", "The running DocRAG version.")
+
+# How answers were grounded (citations.answer_status), cache hits included: the share of
+# "uncited" and "insufficient_context" is the quality signal to watch.
+answers_total = Counter(
+    "docrag_answers_total",
+    "Answers returned, labeled by grounding status (answered, uncited, ...).",
+    labelnames=("status",),
+)
+
+answers_truncated_total = Counter(
+    "docrag_answers_truncated_total",
+    "Answers the provider cut off at the token limit (LLM_MAX_TOKENS).",
+)
+
+citation_retries_total = Counter(
+    "docrag_citation_retries_total",
+    "Answers that cited nothing and were regenerated once to add citations.",
+)
+
+feedback_total = Counter(
+    "docrag_feedback_total",
+    "Answer ratings recorded through POST /feedback, labeled by rating.",
+    labelnames=("rating",),
+)
+
+llm_tokens_total = Counter(
+    "docrag_llm_tokens_total",
+    "Tokens the LLM provider reported using, labeled by provider and kind.",
+    labelnames=("provider", "kind"),
+)
+
+question_slots_in_use = Gauge(
+    "docrag_question_slots_in_use",
+    "Questions and searches running now (bounded by MAX_CONCURRENT_QUESTIONS).",
+)
+
+ingest_backlog_bytes = Gauge(
+    "docrag_ingest_backlog_bytes",
+    "Bytes of uploads admitted and not yet indexed (bounded by INGEST_MAX_PENDING_BYTES).",
+)
+
+ingest_backlog_jobs = Gauge(
+    "docrag_ingest_backlog_jobs",
+    "Ingest jobs admitted and not yet finished.",
+)
+
+corpus_documents = Gauge(
+    "docrag_corpus_documents",
+    "Indexed documents, as of the last document listing.",
 )
 
 

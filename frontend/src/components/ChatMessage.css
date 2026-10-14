@@ -68,6 +68,36 @@
   font-size: 15px;
   line-height: 1.7;
   color: var(--ink);
+  /* A long URL or identifier wraps instead of widening the thread on a phone. */
+  overflow-wrap: anywhere;
+}
+
+/* Answer headings are h3-h6 (see ChatMessage.tsx); sized as the h1-h4 they were. */
+.chat-message__markdown h3 {
+  font-size: 1.3em;
+}
+
+.chat-message__markdown h4 {
+  font-size: 1.15em;
+}
+
+.chat-message__markdown h5,
+.chat-message__markdown h6 {
+  font-size: 1em;
+}
+
+.chat-message__table-scroll {
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+
+.chat-message__table-scroll table {
+  margin: 0;
+}
+
+.chat-message__markdown td {
+  /* Cells keep words whole and scroll instead (overflow-wrap above would split them). */
+  overflow-wrap: normal;
 }
 
 /* The answer before the markdown renderer has loaded (or if it can't). */
@@ -299,6 +329,13 @@
   border: 1px solid var(--rule);
   border-radius: var(--radius-sm);
   padding: 0 5px;
+}
+
+/* Something to check about this answer (no citations, cut off). --warn is in the
+   contrast test's checked set. */
+.chat-message__flag--warn {
+  color: var(--warn);
+  border-color: currentColor;
 }
 
 /* An inline [n] citation in the answer text: opens the source it cites. */

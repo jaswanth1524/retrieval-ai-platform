@@ -220,6 +220,27 @@ def _table_to_markdown(rows: Sequence[Sequence[object]]) -> str:
     return "\n".join([lines[0], header_sep, *lines[1:]])
 
 
+# OCR renders a page at OCR_DPI, as an RGB bitmap in memory. MAX_OCR_PAGES bounds how
+# many pages, not how big one is: a MediaBox of a few hundred inches square (a valid PDF
+# of a few hundred bytes) asked for gigabytes. A page past OCR_MAX_PAGE_PIXELS is
+# rendered at a lower resolution, down to OCR_MIN_DPI, and skipped below that.
+OCR_DPI = 200.0
+OCR_MIN_DPI = 72.0
+OCR_MAX_PAGE_PIXELS = 40_000_000
+
+
+def ocr_resolution(width_pt: float, height_pt: float) -> float | None:
+    """The resolution to render a page at for OCR, or None when it is too large."""
+
+    area_in = (width_pt / 72.0) * (height_pt / 72.0)
+    if area_in <= 0:
+        return None
+    if area_in * OCR_DPI * OCR_DPI <= OCR_MAX_PAGE_PIXELS:
+        return OCR_DPI
+    dpi = (OCR_MAX_PAGE_PIXELS / area_in) ** 0.5
+    return dpi if dpi >= OCR_MIN_DPI else None
+
+
 def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> list[DocumentSection]:
     """OCR the given PDF pages when the ``ocr`` extra is installed.
 
@@ -244,8 +265,19 @@ def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> li
             if page_number > len(pdf.pages):
                 continue
             page = pdf.pages[page_number - 1]
+            resolution = ocr_resolution(float(page.width), float(page.height))
+            if resolution is None:
+                logger.warning(
+                    "PDF %s: page %d is too large to OCR (%.0f x %.0f pt); skipping it.",
+                    filename,
+                    page_number,
+                    page.width,
+                    page.height,
+                )
+                page.close()
+                continue
             try:
-                image = page.to_image(resolution=200)
+                image = page.to_image(resolution=resolution)
                 import numpy as np
 
                 ocr_result, _ = engine(np.array(image.original))

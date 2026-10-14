@@ -105,6 +105,25 @@ describe('CommandPalette', () => {
     expect(commands[0].run).not.toHaveBeenCalled();
   });
 
+  it('moves the highlight past disabled commands, in both directions', async () => {
+    const commands = makeCommands([{}, { disabled: true }, {}]);
+    setup(commands);
+
+    await userEvent.keyboard('{ArrowDown}');
+    await userEvent.keyboard('{Enter}');
+    expect(commands[2].run).toHaveBeenCalled();
+    expect(commands[1].run).not.toHaveBeenCalled();
+  });
+
+  it('starts on the first command that can run', async () => {
+    const commands = makeCommands([{ disabled: true }, {}, {}]);
+    setup(commands);
+
+    await userEvent.keyboard('{Enter}');
+
+    expect(commands[1].run).toHaveBeenCalled();
+  });
+
   it('closes on Escape and on a backdrop click', async () => {
     const { onClose } = setup();
     await userEvent.keyboard('{Escape}');

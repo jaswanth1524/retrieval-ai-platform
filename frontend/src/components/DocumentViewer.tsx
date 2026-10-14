@@ -6,6 +6,7 @@ import type { DocumentChunkResponse, DocumentContentResponse } from '../api/type
 import { useDialog } from '../hooks/useDialog';
 import { CITATION_WINDOW_RADIUS, takePrefetchedContent } from '../utils/contentPrefetch';
 import './DocumentViewer.css';
+import { pageLabel } from '../utils/pages';
 
 interface DocumentViewerProps {
   filename: string;
@@ -130,7 +131,12 @@ function DocumentViewer({
   // that chunk is already on screen (a second citation into the same open document).
   useEffect(() => {
     const current = loadedRef.current;
-    if (current && current.chunks.some((chunk) => chunk.chunk_id === chunkId)) return;
+    if (current && current.chunks.some((chunk) => chunk.chunk_id === chunkId)) {
+      // Found on screen, so it exists: a "passage changed" note left by an earlier
+      // citation whose chunk was missing no longer applies to this one.
+      if (current.targetFound === false) setLoaded({ ...current, targetFound: true });
+      return;
+    }
     setLoaded(null);
     setError(null);
     lastScrolledChunkIdRef.current = null;
@@ -391,7 +397,7 @@ function DocumentViewer({
                 data-testid="viewer-chunk"
               >
                 <div className="document-viewer__chunk-meta mono">
-                  p.{chunk.page} &middot; {chunk.section}
+                  {pageLabel(chunk.page, chunk.page_end)} &middot; {chunk.section}
                 </div>
                 <p className="document-viewer__chunk-text">
                   {isTarget && highlights?.length ? (

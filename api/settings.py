@@ -25,6 +25,10 @@ class AppSettings(BaseSettings):
     # meaningful at query volume, free to enable since the client already exposes both
     # transports over the same connection details.
     qdrant_prefer_grpc: bool = False
+    # The gRPC port the client dials when qdrant_prefer_grpc is on (the host it uses is
+    # qdrant_url's). Compose also maps it on the host, and pins it to 6334 for the API
+    # container, which reaches Qdrant inside the compose network.
+    qdrant_grpc_port: int = Field(default=6334, ge=1, le=65535)
     # Qdrant's own API key (the server's QDRANT__SERVICE__API_KEY). Empty (default)
     # sends none. Without it anyone who can reach Qdrant's port reads or drops the
     # collection directly, around API_KEY entirely.
@@ -187,6 +191,15 @@ class AppSettings(BaseSettings):
     # of thousands of blank pages held both ingest workers for hours.
     max_pdf_pages: int = Field(default=2000, ge=1)
     max_ocr_pages: int = Field(default=100, ge=0)
+    # An XLSX workbook with more cells than this (counted across sheets, empty ones
+    # included as openpyxl reads them) is refused. Every cell is held as text while the
+    # sheet is rendered; this bounds a small file that declares a huge sheet.
+    max_spreadsheet_cells: int = Field(default=200_000, ge=1)
+    # Each upload is parsed in a child process that is stopped after this many seconds
+    # (api/parse_isolation.py): a pathological file used to hold an ingest worker
+    # indefinitely, competing with questions for the GIL. 0 parses in the API process
+    # with no limit.
+    parse_timeout_seconds: float = Field(default=300.0, ge=0)
 
     # Chunks are embedded and upserted in batches of this size rather than all at
     # once, so a single huge document reports incremental job progress and never
@@ -208,6 +221,12 @@ class AppSettings(BaseSettings):
     # or running at once (IngestBacklog): past it an upload gets 503 + Retry-After
     # even with byte budget left, so the store never evicts a job still in flight.
     ingest_jobs_max_retained: PositiveInt = 50
+    # The document listing (GET /documents) is read by scrolling every point, and kept
+    # between changes made by this process, which it updates in place. This only bounds
+    # how long a change made by *another* process (a second API worker, the eval
+    # harness's ingest) can go unseen. It was 30 s, which made the panel rescan a large
+    # collection twice a minute for writes a single-process deployment never has.
+    document_listing_ttl_seconds: float = Field(default=300.0, gt=0)
 
     # "memory" (default) matches every prior release: jobs are lost on restart, and a
     # client polling a job whose process just restarted gets a 404 even if the ingest
@@ -215,9 +234,9 @@ class AppSettings(BaseSettings):
     # (stdlib sqlite3, no new dependency) so that poll survives a restart. Traces
     # remain in-memory-only either way — see api/tracing.py's TraceStore docstring.
     job_store_backend: Literal["memory", "sqlite"] = "memory"
-    # Only read when job_store_backend="sqlite". The containing directory must exist
-    # and be writable by the process; docker-compose.yml doesn't mount one by default,
-    # so an operator opting into this backend needs to add a volume for it.
+    # Only read when job_store_backend="sqlite". The containing directory (created if
+    # missing) must be writable (in Docker, under /app/data: the docrag_data volume);
+    # startup fails naming the setting otherwise (api/storage.py).
     job_store_path: str = "./data/jobs.db"
 
     # None (default) matches every prior release: an uploaded document's raw bytes are

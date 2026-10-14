@@ -1,10 +1,27 @@
 import type { CitationResponse } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
+import { pageLabel } from './pages';
 
 export const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
   minute: '2-digit',
 });
+
+const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+
+/** A message's time, with its date unless it is from today: a conversation reopened
+ * days later showed "09:30" on every turn with nothing saying which day. */
+export function formatTurnTime(timestamp: number, now = Date.now()): string {
+  return new Date(timestamp).toDateString() === new Date(now).toDateString()
+    ? TIME_FORMATTER.format(timestamp)
+    : DATE_TIME_FORMATTER.format(timestamp);
+}
 
 function speakerLabel(role: ChatTurn['role']): string {
   if (role === 'user') return 'You';
@@ -14,7 +31,7 @@ function speakerLabel(role: ChatTurn['role']): string {
 
 function citationLines(sources: CitationResponse[]): string {
   return sources
-    .map((s) => `[${s.source_number}] ${s.filename} · p.${s.page} · ${s.section}`)
+    .map((s) => `[${s.source_number}] ${s.filename} · ${pageLabel(s.page, s.page_end)} · ${s.section}`)
     .join('\n');
 }
 
@@ -26,7 +43,8 @@ export function withCitationFootnotes(content: string, sources: CitationResponse
 
 export function chatToMarkdown(turns: ChatTurn[]): string {
   const blocks = turns.map((turn) => {
-    const heading = `## ${speakerLabel(turn.role)} (${TIME_FORMATTER.format(turn.timestamp)})`;
+    // Always dated: an export is read later, away from the conversation.
+    const heading = `## ${speakerLabel(turn.role)} (${DATE_TIME_FORMATTER.format(turn.timestamp)})`;
     return [heading, withCitationFootnotes(turn.content, turn.sources)]
       .filter(Boolean)
       .join('\n\n');

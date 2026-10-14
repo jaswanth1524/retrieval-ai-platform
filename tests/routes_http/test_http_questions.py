@@ -88,6 +88,8 @@ def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -
             "text": "Intro alpha beta",
             # One shared word with the answer: too little to point at a passage.
             "spans": [],
+            # On one page: no last page.
+            "page_end": None,
         }
     ]
     assert api_context.reranker.seen_documents == ["guide.txt › Intro\nIntro alpha beta"]
@@ -702,6 +704,28 @@ def test_a_provider_outside_the_allowlist_is_refused_before_a_slot_is_taken() ->
         allowed = client.post("/questions", json={"question": "alpha", "llm_provider": "ollama"})
         assert allowed.status_code == 200
         assert client.get("/config").json()["allowed_request_providers"] == ["ollama"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "detail"),
+    [("openai", "OPENAI_API_KEY"), ("openai_compatible", "OPENAI_COMPATIBLE_BASE_URL")],
+)
+def test_an_unconfigured_provider_is_refused_before_any_retrieval(
+    api_context: ApiTestContext, provider: str, detail: str
+) -> None:
+    """It used to embed, search and rerank first, and fail only at generation — on the
+    stream, after the sources frame had gone out."""
+
+    assert upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    embedded_before = len(api_context.embeddings.seen_text_batches)
+
+    for route in ("/questions", "/questions/stream"):
+        refused = api_context.client.post(
+            route, json={"question": "alpha", "llm_provider": provider}
+        )
+        assert refused.status_code == 400
+        assert detail in refused.json()["detail"]
+    assert len(api_context.embeddings.seen_text_batches) == embedded_before
 
 
 def test_every_provider_is_allowed_per_request_by_default(api_context: ApiTestContext) -> None:

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import io
 
-from api.parsers.common import DocumentParseError, DocumentSection, EmptyDocumentError
+from api.parsers.common import (
+    DocumentParseError,
+    DocumentSection,
+    EmptyDocumentError,
+    render_row,
+)
 from api.settings import AppSettings
 
 _DEFAULT_CSV_ROWS_PER_SECTION = 50
@@ -61,25 +66,21 @@ def parse_csv_document(
     sections: list[DocumentSection] = []
     for start in range(0, len(data_rows), rows_per_section):
         group = data_rows[start : start + rows_per_section]
-        rendered_rows = [_render_csv_row(header, row) for _, row in group]
-        text_block = "\n".join(line for line in rendered_rows if line)
-        if not text_block:
+        rendered = [(number, render_row(header, row)) for number, row in group]
+        rendered = [(number, line) for number, line in rendered if line]
+        if not rendered:
             continue
         label = f"Rows {group[0][0]}-{group[-1][0]}"
-        sections.append(DocumentSection(filename=filename, page=1, section=label, text=text_block))
+        sections.append(
+            DocumentSection(
+                filename=filename,
+                page=1,
+                section=label,
+                text="\n".join(line for _, line in rendered),
+                # Chunks keep rows whole and are labelled with the rows they hold.
+                line_rows=tuple(number for number, _ in rendered),
+            )
+        )
     if not sections:
         raise EmptyDocumentError(f"CSV '{filename}' has no data rows.")
     return sections
-
-
-def _render_csv_row(header: list[str], row: list[str]) -> str:
-    """Render one CSV data row as "col1: v1; col2: v2" so any chunk slice self-describes."""
-
-    parts: list[str] = []
-    for index, value in enumerate(row):
-        cell = value.strip()
-        if not cell:
-            continue
-        column = header[index] if index < len(header) and header[index] else f"col{index + 1}"
-        parts.append(f"{column}: {cell}")
-    return "; ".join(parts)

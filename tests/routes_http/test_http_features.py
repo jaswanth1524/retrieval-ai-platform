@@ -373,6 +373,8 @@ def test_import_skips_feedback_rows_the_api_could_not_have_stored(tmp_path: Path
         {**good, "id": "nan", "created_at": float("nan")},
         {**good, "id": "bool-number", "citation_source_number": True},
         {**good, "id": "zero-number", "citation_source_number": 0},
+        {**good, "id": "huge-number", "citation_source_number": 10**20},
+        {**good, "id": "over-number", "citation_source_number": 1001},
         {**good, "id": "long-question", "question": "q" * 4001},
         {**good, "id": "long-trace", "trace_id": "t" * 65},
         {**good, "id": "x" * 65},
@@ -526,6 +528,64 @@ def test_import_rejects_one_bad_document_instead_of_stopping_halfway(tmp_path: P
         uploaded_ats = client.get("/documents", headers=FULL).json()["uploaded_ats"]
     # NaN and true are no timestamps: both get the import time instead.
     assert all(isinstance(value, float) and value > 0 for value in uploaded_ats.values())
+
+
+def test_import_skips_a_damaged_member_instead_of_failing_halfway(tmp_path: Path) -> None:
+    """A CRC mismatch, encryption or an unknown compression method in one member used
+    to raise out of the import as a 500, after earlier documents were already queued."""
+
+    row = {
+        "question": "q",
+        "answer_excerpt": "a",
+        "rating": "up",
+        "created_at": 1.0,
+    }
+    manifest = {
+        "manifest_version": 1,
+        "documents": [
+            {"filename": "first.txt", "original": "originals/first.txt"},
+            {"filename": "broken.txt", "original": "originals/broken.txt"},
+            {"filename": "last.txt", "original": "originals/last.txt"},
+        ],
+    }
+    content = _zip(
+        {
+            "manifest.json": json.dumps(manifest).encode(),
+            "originals/first.txt": b"Intro\nalpha",
+            "originals/broken.txt": b"Intro\nbroken-original",
+            "originals/last.txt": b"Intro\ngamma",
+            # Long enough that rows are read in several blocks before the last one,
+            # where the CRC mismatch surfaces.
+            "feedback.jsonl": "".join(
+                json.dumps({**row, "id": f"row-{index}"}) + "\n" for index in range(3000)
+            ).encode()
+            + b"#damaged-tail#",
+        }
+    )
+    # Stored (not deflated) members: flipping their bytes leaves a CRC mismatch, which
+    # zipfile reports only once the member has been read to its end.
+    content = content.replace(b"broken-original", b"broken-0riginal")
+    content = content.replace(b"#damaged-tail#", b"#damaged-tai1#")
+
+    with _backup_client(tmp_path, "x") as client:
+        response = _import(client, content)
+        assert response.status_code == 202
+        body = response.json()
+        assert [job["filename"] for job in body["jobs"]] == ["first.txt", "last.txt"]
+        assert set(body["rejected"]) == {"broken.txt", "feedback.jsonl"}
+        # The rows read before the damage were kept.
+        assert 0 < body["feedback_imported"] < 3000
+        for job in body["jobs"]:
+            wait_for_job_with(client, job["job_id"])
+
+
+def test_import_with_a_damaged_manifest_is_a_400(tmp_path: Path) -> None:
+    content = _zip({"manifest.json": json.dumps({"manifest_version": 1, "documents": []}).encode()})
+    content = content.replace(b'"documents"', b'"d0cuments"')
+    with _backup_client(tmp_path, "x") as client:
+        response = _import(client, content)
+    assert response.status_code == 400
+    assert "damaged or encrypted" in response.json()["detail"]
 
 
 def test_import_needs_the_full_key_and_is_size_capped(tmp_path: Path) -> None:

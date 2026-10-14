@@ -50,6 +50,7 @@ def register(app: FastAPI) -> None:
                     text=chunk.text,
                     retrieval_score=chunk.retrieval_score,
                     rerank_score=chunk.rerank_score,
+                    page_end=chunk.page_end,
                 )
                 for rank, chunk in enumerate(phase.context_chunks, start=1)
             ],

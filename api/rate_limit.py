@@ -7,9 +7,10 @@ trusted user; on, each client gets a token bucket of ``per_minute`` requests tha
 refills continuously, and the request guard answers 429 + ``Retry-After`` when it is
 empty.
 
-A client is its address as the ASGI server reports it. Behind a reverse proxy, run
-uvicorn with ``--forwarded-allow-ips`` set to the proxy so that is the real client and
-not the proxy itself (otherwise every user shares one bucket).
+A client is its address as the ASGI server reports it. Behind a reverse proxy, set
+``FORWARDED_ALLOW_IPS`` (uvicorn reads it from the environment, so it works in Docker
+too) to the proxy's address so that is the real client and not the proxy itself
+(otherwise every user shares one bucket).
 """
 
 from __future__ import annotations

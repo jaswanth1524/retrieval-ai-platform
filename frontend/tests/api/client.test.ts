@@ -464,6 +464,35 @@ describe('askQuestionStream', () => {
     );
   });
 
+  it('reads frames the way any SSE source may send them', async () => {
+    // CRLF endings (a proxy rewrote them), a comment, one event's data split over two
+    // lines and split across chunks, no space after the colon, and a last frame with
+    // no blank line after it.
+    const done = JSON.stringify({
+      type: 'done',
+      answer: 'Hello',
+      sources: [],
+      timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1, generate_ms: 1, total_ms: 4 },
+      trace_id: null,
+    });
+    const frames = [
+      ': ping\r\n\r\n',
+      'data: {"type": "delta",\r\ndata:  "text": "Hel"}\r',
+      '\n\r\n',
+      'data:{"type": "delta", "text": "lo"}\n\n',
+      `data: ${done}`,
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(frames)));
+    const onDelta = vi.fn();
+    const onDone = vi.fn();
+
+    await api.askQuestionStream('hi', undefined, undefined, undefined, undefined, { onDelta, onDone });
+
+    expect(onDelta.mock.calls).toEqual([['Hel'], ['lo']]);
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(onDone.mock.calls[0][0]).toBe('Hello');
+  });
+
   it('reports a mid-stream abort as ApiClientError, not a raw DOMException', async () => {
     // The response headers arrive, deltas flow, and only then does the caller abort —
     // so the rejection comes out of reader.read(), not out of fetch(). That path used
@@ -789,6 +818,56 @@ describe('exportCorpus', () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(403, { detail: 'This API key is read-only.' })));
 
     await expect(api.exportCorpus()).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("is cancelled by the caller's signal", async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+          }),
+      ),
+    );
+    const controller = new AbortController();
+
+    const download = api.exportCorpus(controller.signal);
+    controller.abort();
+
+    await expect(download).rejects.toThrow('cancelled');
+  });
+});
+
+describe('importBackup', () => {
+  it('scales its timeout to the size of the zip', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          (_input: RequestInfo | URL, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+            }),
+        ),
+      );
+      const zip = new File(['x'], 'backup.zip');
+      Object.defineProperty(zip, 'size', { value: 50 * 1024 * 1024 });
+
+      const restore = api.importBackup(zip);
+      const outcome = restore.then(
+        () => 'resolved',
+        () => 'rejected',
+      );
+      // Past the fixed two minutes it used to give up at, still going.
+      await vi.advanceTimersByTimeAsync(150_000);
+      expect(await Promise.race([outcome, Promise.resolve('pending')])).toBe('pending');
+      await vi.advanceTimersByTimeAsync(uploadTimeoutMs(zip.size));
+      expect(await outcome).toBe('rejected');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

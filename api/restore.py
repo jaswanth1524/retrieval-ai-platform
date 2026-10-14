@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import zipfile
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import IO, Any
@@ -25,7 +26,15 @@ from fastapi import HTTPException
 from api.documents import DocumentError, normalize_tags, validate_upload_filename
 from api.export import MANIFEST_VERSION
 from api.feedback import Feedback, FeedbackStore
-from api.schemas import DocumentJobAcceptedResponse
+from api.schemas import (
+    FEEDBACK_CITATION_NUMBER_MAX,
+    FEEDBACK_CITED_FILENAMES_MAX,
+    FEEDBACK_EXCERPT_MAX_CHARS,
+    MAX_QUESTION_CHARS,
+    REQUEST_FILENAME_MAX_CHARS,
+    REQUEST_TRACE_ID_MAX_CHARS,
+    DocumentJobAcceptedResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +45,11 @@ _FEEDBACK_MAX_BYTES = 256 * 1024 * 1024
 _FEEDBACK_LINE_MAX_CHARS = 64 * 1024
 _FEEDBACK_BATCH_ROWS = 1000
 # The same limits POST /feedback enforces, so a restored row is one the API could store.
-_FEEDBACK_QUESTION_MAX = 4000
-_FEEDBACK_EXCERPT_MAX = 2000
-_FEEDBACK_CITED_MAX = 50
-_FEEDBACK_FILENAME_MAX = 1024
-_FEEDBACK_ID_MAX = 64
+_FEEDBACK_QUESTION_MAX = MAX_QUESTION_CHARS
+_FEEDBACK_EXCERPT_MAX = FEEDBACK_EXCERPT_MAX_CHARS
+_FEEDBACK_CITED_MAX = FEEDBACK_CITED_FILENAMES_MAX
+_FEEDBACK_FILENAME_MAX = REQUEST_FILENAME_MAX_CHARS
+_FEEDBACK_ID_MAX = REQUEST_TRACE_ID_MAX_CHARS
 
 
 class BackupImportError(ValueError):
@@ -61,12 +70,34 @@ class ImportOutcome:
 Enqueue = Callable[[str, bytes, float | None, tuple[str, ...]], DocumentJobAcceptedResponse]
 
 
+# What reading one damaged member raises: a CRC mismatch or truncation (BadZipFile,
+# EOFError, zlib.error), an encrypted member (RuntimeError), an unsupported compression
+# method (NotImplementedError). The member is skipped; the rest of the import goes on —
+# documents before it are already queued, and a 500 hid their job ids.
+_UNREADABLE_MEMBER = (
+    zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+    RuntimeError,
+    NotImplementedError,
+    OSError,
+)
+
+
+class _UnreadableMemberError(Exception):
+    pass
+
+
 def _read_capped(archive: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> bytes | None:
     """The member's bytes, or None when it decompresses past ``limit`` (the header's
-    sizes aren't trusted)."""
+    sizes aren't trusted). ``_UnreadableMemberError`` when it can't be read at all."""
 
-    with archive.open(info) as handle:
-        data = handle.read(limit + 1)
+    try:
+        with archive.open(info) as handle:
+            data = handle.read(limit + 1)
+    except _UNREADABLE_MEMBER as exc:
+        logger.warning("Backup member %r could not be read: %s", info.filename, exc)
+        raise _UnreadableMemberError(info.filename) from exc
     return None if len(data) > limit else data
 
 
@@ -102,7 +133,12 @@ def restore_backup(
                 enqueue=enqueue,
             )
         if feedback_store is not None and "feedback.jsonl" in members:
-            _restore_feedback(archive, members["feedback.jsonl"], feedback_store, outcome)
+            try:
+                _restore_feedback(archive, members["feedback.jsonl"], feedback_store, outcome)
+            except _UNREADABLE_MEMBER as exc:
+                # The rows before the damage are stored; the member is reported.
+                logger.warning("Backup feedback.jsonl could not be read to the end: %s", exc)
+                outcome.rejected.append("feedback.jsonl")
     return outcome
 
 
@@ -110,7 +146,10 @@ def _manifest(archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo]) -> 
     info = members.get("manifest.json")
     if info is None:
         raise BackupImportError("The archive has no manifest.json; is it a DocRAG backup?")
-    raw = _read_capped(archive, info, _MANIFEST_MAX_BYTES)
+    try:
+        raw = _read_capped(archive, info, _MANIFEST_MAX_BYTES)
+    except _UnreadableMemberError:
+        raise BackupImportError("manifest.json in the archive is damaged or encrypted.") from None
     try:
         manifest = json.loads(raw) if raw is not None else None
     except ValueError:
@@ -170,7 +209,10 @@ def _restore_document(
     if not has_room(min(info.file_size, max_original_bytes)):
         outcome.deferred.append(filename)
         return
-    content = _read_capped(archive, info, max_original_bytes)
+    try:
+        content = _read_capped(archive, info, max_original_bytes)
+    except _UnreadableMemberError:
+        content = None
     if content is None:
         outcome.rejected.append(filename)
         return
@@ -208,7 +250,6 @@ def _restore_feedback(
     """
 
     batch: list[Feedback] = []
-    consumed = 0
 
     def flush() -> None:
         added = store.import_rows(batch)
@@ -216,6 +257,24 @@ def _restore_feedback(
         outcome.feedback_skipped += len(batch) - added
         batch.clear()
 
+    try:
+        _read_feedback_lines(archive, info, batch, flush, outcome)
+    except _UNREADABLE_MEMBER:
+        if batch:
+            flush()  # keep the rows read before the damage
+        raise
+    if batch:
+        flush()
+
+
+def _read_feedback_lines(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    batch: list[Feedback],
+    flush: Callable[[], None],
+    outcome: ImportOutcome,
+) -> None:
+    consumed = 0
     with (
         archive.open(info) as handle,
         # Only "\n" ends a row: a JSON string may hold a raw U+2028, which splitlines()
@@ -247,8 +306,6 @@ def _restore_feedback(
             batch.append(row)
             if len(batch) >= _FEEDBACK_BATCH_ROWS:
                 flush()
-    if batch:
-        flush()
 
 
 def _feedback_row(line: str) -> Feedback | None:
@@ -278,7 +335,7 @@ def _feedback_row(line: str) -> Feedback | None:
             or not isinstance(cited, list)
             or len(cited) > _FEEDBACK_CITED_MAX
             or (number is not None and (isinstance(number, bool) or not isinstance(number, int)))
-            or (isinstance(number, int) and number < 1)
+            or (isinstance(number, int) and not 1 <= number <= FEEDBACK_CITATION_NUMBER_MAX)
             or created_at is None
         ):
             return None

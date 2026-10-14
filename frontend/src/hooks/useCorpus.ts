@@ -294,6 +294,23 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest();
     };
 
+    // Several documents chosen at once: started together and followed together, with
+    // one listing refresh at the end — handleReindex per document refreshed the whole
+    // listing once per document.
+    const handleReindexMany = async (filenames: string[]) => {
+      const items = filenames.map((filename) => ({ id: newId(), filename }));
+      setUploads((prev) => [
+        ...prev,
+        ...items.map(({ id, filename }): UploadItem => ({ id, filename, status: 'uploading', reindex: true })),
+      ]);
+      await Promise.allSettled(
+        items.map(({ id, filename }) =>
+          runIngestJob(id, filename, (signal) => api.reindexDocument(filename, signal)),
+        ),
+      );
+      await refreshAfterIngest();
+    };
+
     const handleReindexAllStale = async () => {
       let response;
       try {
@@ -422,6 +439,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleDismissUpload,
       handleCancelUpload,
       handleReindex,
+      handleReindexMany,
       handleReindexAllStale,
       handleDeleteDocument,
       handleSetTags,

@@ -48,10 +48,18 @@ jobs:
           for attempt in $(seq 1 120); do
             result=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
               --commit "$GITHUB_SHA" --event push --json status,conclusion \
-              --jq '[.[] | select(.status == "completed")] | map(.conclusion) | first // "pending"')
+              --jq 'if length == 0 then "none" else ([.[] | select(.status == "completed")] | map(.conclusion) | first // "pending") end')
             case "$result" in
               success) echo "CI passed for $GITHUB_SHA"; exit 0 ;;
               pending) echo "waiting for CI on $GITHUB_SHA ($attempt)"; sleep 30 ;;
+              none)
+                # A commit inside a merged PR, never the head of a push to main, has no
+                # run and never will: fail after a few minutes, not after an hour.
+                if [ "$attempt" -ge 10 ]; then
+                  echo "::error::No CI push run exists for $GITHUB_SHA; tag the commit main was pushed at"
+                  exit 1
+                fi
+                echo "no CI run for $GITHUB_SHA yet ($attempt)"; sleep 30 ;;
               *) echo "::error::CI for $GITHUB_SHA ended: $result"; exit 1 ;;
             esac
           done
@@ -87,7 +95,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           notes=$(awk -v v="$version" '
-            $0 ~ "^## " { if (found) exit; if (index($0, "## " v) == 1) { found = 1; next } }
+            $0 ~ "^## " { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) { found = 1; next } }
             found && NF { print }
           ' CHANGELOG.md)
           if [ -z "$notes" ]; then
@@ -207,7 +215,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           # The "## <version>" section, up to the next "## " heading.
           awk -v v="$version" '
-            $0 ~ "^## " { if (found) exit; if (index($0, "## " v) == 1) { found = 1; next } }
+            $0 ~ "^## " { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) { found = 1; next } }
             found { print }
           ' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then

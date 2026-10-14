@@ -166,11 +166,12 @@ export function useCommands(
             {
               id: 'export-corpus',
               glyph: '⇩',
-              label: 'Download a backup of all documents (zip)',
-              // Building the zip can take a while for a large corpus; without a guard
-              // every impatient re-run started another full export on the server.
+              // While one downloads, the same command cancels it: the server streams one
+              // export at a time, so a stalled one otherwise blocked the next for good.
+              label: exportingBackup
+                ? 'Cancel the backup download'
+                : 'Download a backup of all documents (zip)',
               run: () => run.current.downloadBackup(),
-              disabled: exportingBackup,
             },
           ]),
       {
@@ -228,6 +229,8 @@ export function useCommands(
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!isShortcutModifier(event) || event.altKey) return;
+      // A held key repeats: ⌘J flickered the theme, ⌘K opened and closed the palette.
+      if (event.repeat) return;
       // Never stack a second dialog over Settings or the document viewer.
       if (paletteRef.current.otherDialogOpen) return;
       const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;

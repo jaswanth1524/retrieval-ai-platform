@@ -42,6 +42,7 @@ def _run(
     method: str = "POST",
     headers: list[tuple[bytes, bytes]] | None = None,
     chunks: list[bytes] | None = None,
+    root_path: str = "",
 ) -> tuple[_Downstream, list[Message], int]:
     downstream = _Downstream()
     host = FastAPI()
@@ -65,6 +66,7 @@ def _run(
         "type": "http",
         "method": method,
         "path": path,
+        "root_path": root_path,
         "headers": headers or [],
         "app": host,
     }
@@ -197,3 +199,70 @@ def test_api_docs_need_the_key_when_one_is_set() -> None:
         assert _status(sent) == 401
     downstream, sent, _ = _run(_settings(), path="/openapi.json", method="GET")
     assert downstream.called
+
+
+def test_a_root_path_prefix_does_not_get_requests_past_the_guard() -> None:
+    """Behind `uvicorn --root-path /docrag`, scope["path"] is "/docrag/documents" while
+    the router serves "/documents": matching the raw path skipped every check."""
+
+    settings = _settings(api_key="secret", max_upload_bytes=1000)
+    downstream, sent, reads = _run(
+        settings, path="/docrag/documents", root_path="/docrag", chunks=[b"x" * 10]
+    )
+    assert _status(sent) == 401
+    assert reads == 0
+    assert not downstream.called
+
+    _, sent, reads = _run(
+        settings,
+        path="/docrag/documents",
+        root_path="/docrag",
+        headers=[(b"x-api-key", b"secret"), (b"content-length", b"999999")],
+    )
+    assert _status(sent) == 413
+    assert reads == 0
+
+
+def test_route_path_strips_only_a_whole_root_path_segment() -> None:
+    from api.request_guard import route_path
+
+    assert route_path({"path": "/x/documents", "root_path": "/x"}) == "/documents"
+    assert route_path({"path": "/x", "root_path": "/x"}) == "/"
+    assert route_path({"path": "/xy/documents", "root_path": "/x"}) == "/xy/documents"
+    assert route_path({"path": "/documents"}) == "/documents"
+
+
+def test_the_export_counts_against_the_rate_limit() -> None:
+    settings = _settings(rate_limit_per_minute=1)
+    downstream = RequestGuardMiddleware(_Downstream())
+    host = FastAPI()
+    host.dependency_overrides[get_app_settings] = lambda: settings
+    statuses: list[int] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def call(path: str) -> None:
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        scope: Scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "headers": [],
+            "client": ("10.0.0.9", 1),
+            "app": host,
+        }
+        await downstream(scope, receive, send)
+        statuses.append(_status(sent))
+
+    async def main() -> None:
+        await call("/export")
+        await call("/export")
+        await call("/documents")  # other reads never count
+
+    asyncio.run(main())
+    assert statuses == [200, 429, 200]

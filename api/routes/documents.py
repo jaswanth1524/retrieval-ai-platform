@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response, StreamingResponse
-from starlette.concurrency import iterate_in_threadpool
+from fastapi.responses import FileResponse, Response
 
 from api.chunking import TokenCounter
 from api.corpus import bump_corpus_generation
@@ -40,6 +40,7 @@ from api.ingest_jobs import (
 )
 from api.ingestion import filename_write_lock, ingest_sequencer
 from api.jobs import JobNotFoundError, JobStore
+from api.metrics import corpus_documents
 from api.raw_documents import RawDocumentStore
 from api.repository import DocumentMetadata, VectorRepository
 from api.restore import BackupImportError, restore_backup
@@ -68,13 +69,18 @@ from api.schemas import (
     ImportResponse,
 )
 from api.settings import AppSettings
+from api.streaming import ClosingStreamingResponse
 from api.upload import read_upload_within_limit
 
 logger = logging.getLogger(__name__)
 
 _ORIGINAL_CHUNK_BYTES = 64 * 1024
+# Held while an export streams; a second one meanwhile is a 409.
+_export_running = threading.Lock()
 # A page of /content is at most 2 * this + 1 chunks.
 CONTENT_MAX_RADIUS = 100
+# Far past any real document; a 400-digit `start` used to reach Qdrant's filter and 500.
+CONTENT_MAX_ORDINAL = 1_000_000
 # /content with no paging parameters returns at most this many chunks.
 CONTENT_UNPAGED_MAX_CHUNKS = 2000
 
@@ -111,6 +117,7 @@ def register(app: FastAPI) -> None:
         token_counter: TokenCounterDep,
     ) -> DocumentListResponse:
         metadata = repository.filename_metadata(settings)
+        corpus_documents.set(len(metadata))
         is_stale = _staleness(settings, token_counter)
         stored_originals = raw_store.stored_names() if raw_store is not None else set()
         return DocumentListResponse(
@@ -432,8 +439,8 @@ def register(app: FastAPI) -> None:
         settings: SettingsDep,
         around: Annotated[str | None, Query(max_length=200)] = None,
         radius: Annotated[int, Query(ge=0, le=CONTENT_MAX_RADIUS)] = 30,
-        start: Annotated[int | None, Query(ge=1)] = None,
-        end: Annotated[int | None, Query(ge=1)] = None,
+        start: Annotated[int | None, Query(ge=1, le=CONTENT_MAX_ORDINAL)] = None,
+        end: Annotated[int | None, Query(ge=1, le=CONTENT_MAX_ORDINAL)] = None,
     ) -> DocumentContentResponse:
         # No parameters: the whole document, as before. `around` (a chunk id) returns
         # `radius` chunks either side of it; `start`/`end` a range of ordinals. A 50 MB
@@ -525,7 +532,8 @@ def register(app: FastAPI) -> None:
                 while block := handle.read(_ORIGINAL_CHUNK_BYTES):
                     yield block
 
-        return StreamingResponse(chunks(), media_type=media_type, headers=headers)
+        # Closing: a client that leaves mid-download lets go of the file at once.
+        return ClosingStreamingResponse(chunks(), media_type=media_type, headers=headers)
 
     # Everything beyond the vectors, as one zip: manifest, stored originals, feedback.
     # See api/export.py. Operator data, so the full key only.
@@ -535,22 +543,33 @@ def register(app: FastAPI) -> None:
         settings: SettingsDep,
         raw_store: RawDocumentStoreDep,
         feedback_store: FeedbackStoreDep,
-    ) -> StreamingResponse:
-        # Streamed as it is written: nothing is spooled to /tmp or held whole in memory.
-        archive = build_export(settings, repository, raw_store, feedback_store)
+    ) -> ClosingStreamingResponse:
+        # One at a time: each export reads every stored original on its own thread,
+        # and nothing else bounds how many a client could start.
+        if not _export_running.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409, detail="An export is already running. Try again when it ends."
+            )
+        try:
+            # Streamed as it is written: nothing is spooled to /tmp or held in memory.
+            archive = build_export(settings, repository, raw_store, feedback_store)
+        except BaseException:
+            _export_running.release()
+            raise
+        released = threading.Event()
 
-        async def body() -> AsyncIterator[bytes]:
-            # Closed however the response ends: a client that leaves cancels this, and
-            # the writer thread stops and lets go of the original it was reading.
-            try:
-                async for block in iterate_in_threadpool(archive):
-                    yield block
-            finally:
-                archive.close()
+        def close() -> None:
+            # However the response ends, a client that leaves included: the writer
+            # thread stops and lets go of the original it was reading.
+            archive.close()
+            if not released.is_set():
+                released.set()
+                _export_running.release()
 
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        return StreamingResponse(
-            body(),
+        return ClosingStreamingResponse(
+            archive,
+            close=close,
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="docrag-export-{stamp}.zip"',

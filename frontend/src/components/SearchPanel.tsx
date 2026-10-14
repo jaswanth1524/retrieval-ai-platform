@@ -4,6 +4,7 @@ import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { SearchResultResponse } from '../api/types';
 import './SearchPanel.css';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
+import { pageLabel } from '../utils/pages';
 
 interface SearchPanelProps {
   /** The active conversation's scope: the same documents a question would search. */
@@ -140,7 +141,7 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
             </span>
           </span>
           <span className="search-panel__where mono">
-            p. {result.page}
+            {pageLabel(result.page, result.page_end)}
             {result.section ? ` · ${result.section}` : ''}
           </span>
           <span className="search-panel__snippet">

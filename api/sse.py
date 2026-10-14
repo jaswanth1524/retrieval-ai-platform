@@ -6,7 +6,7 @@ import contextvars
 import json
 import queue
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 
 from api.admission import Release
 
@@ -32,7 +32,7 @@ def with_keepalive[T](
     stop: threading.Event | None = None,
     on_start: Callable[[], None] | None = None,
     on_finish: Callable[[], None] | None = None,
-) -> Iterator[T | None]:
+) -> Generator[T | None]:
     """Yield ``source``'s items, and ``None`` whenever ``interval`` passes without one.
 
     ``source`` runs on its own thread so a blocking step inside it (retrieval, the

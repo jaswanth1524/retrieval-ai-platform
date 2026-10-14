@@ -9,7 +9,6 @@ from dataclasses import asdict
 from typing import get_args
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 from api.admission import QuestionSlots, Release
@@ -18,9 +17,12 @@ from api.dependencies import (
 )
 from api.errors import public_error_message, question_error_type
 from api.generation import GenerationConfigError
+from api.llm import completion_model_and_kwargs
 from api.metrics import (
     NO_ERROR_TYPE,
     answer_cache_hits_total,
+    answers_total,
+    answers_truncated_total,
     observe_question_timings,
     questions_total,
 )
@@ -42,6 +44,7 @@ from api.sse import (
     sse_event,
     with_keepalive,
 )
+from api.streaming import ClosingStreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,14 @@ def question_slot(slots: QuestionSlots, *, count_metric: bool = True) -> Release
     return release
 
 
+def count_answer(status: str, truncated: bool) -> None:
+    """One answer returned (generated or from the cache), by grounding status."""
+
+    answers_total.labels(status=status).inc()
+    if truncated:
+        answers_truncated_total.inc()
+
+
 REQUEST_PROVIDERS: tuple[str, ...] = get_args(RequestProvider)
 
 
@@ -79,14 +90,18 @@ def allowed_request_providers(settings: AppSettings) -> list[str]:
 
 
 def check_request_provider(provider: str | None, settings: AppSettings) -> None:
-    """400 for a per-request provider the operator hasn't allowed — before a question
-    slot is taken, so a refused request costs nothing."""
+    """400 for a per-request provider the operator hasn't allowed or hasn't configured
+    (``openai`` with no OPENAI_API_KEY) — before a question slot is taken, so a refused
+    request costs nothing. Unchecked, it ran embedding, search and the rerank first and
+    failed only at generation, after the stream had already sent its sources."""
 
-    if provider is None or provider in allowed_request_providers(settings):
+    if provider is None:
         return
-    raise GenerationConfigError(
-        f"LLM provider '{provider}' is not allowed on this server (ALLOWED_REQUEST_PROVIDERS)."
-    )
+    if provider not in allowed_request_providers(settings):
+        raise GenerationConfigError(
+            f"LLM provider '{provider}' is not allowed on this server (ALLOWED_REQUEST_PROVIDERS)."
+        )
+    completion_model_and_kwargs(settings.model_copy(update={"llm_provider": provider}))
 
 
 def register(app: FastAPI) -> None:
@@ -123,6 +138,7 @@ def register(app: FastAPI) -> None:
         finally:
             release()
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+        count_answer(grounded.answer_status, grounded.truncated)
         if grounded.cached:
             answer_cache_hits_total.inc()
         elif grounded.timings is not None:
@@ -141,6 +157,7 @@ def register(app: FastAPI) -> None:
             cached=grounded.cached,
             answer_status=grounded.answer_status,
             top_rerank_score=grounded.top_rerank_score,
+            truncated=grounded.truncated,
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
@@ -149,7 +166,7 @@ def register(app: FastAPI) -> None:
         pipeline: RagPipelineDep,
         slots: QuestionSlotsDep,
         settings: SettingsDep,
-    ) -> StreamingResponse:
+    ) -> ClosingStreamingResponse:
         check_request_provider(request.llm_provider, settings)
         # Taken here, before the 200 is committed, so a full server can still say 429.
         lease = StreamLease(question_slot(slots))
@@ -166,25 +183,30 @@ def register(app: FastAPI) -> None:
             # `error` event instead of a raw 500 the client would otherwise never see
             # — the HTTP status is already committed by the time an error can occur
             # here (partway through an already-started streamed response).
+            events = with_keepalive(
+                pipeline.answer_stream(
+                    request.question,
+                    overrides,
+                    filenames=request.filenames,
+                    history=history_messages(request.history),
+                    tags=request.tags,
+                    use_cache=request.use_cache,
+                    should_stop=stop.is_set,
+                ),
+                SSE_KEEPALIVE_SECONDS,
+                stop=stop,
+                on_start=lease.hand_off,
+                on_finish=lease.release,
+            )
             try:
-                for event in with_keepalive(
-                    pipeline.answer_stream(
-                        request.question,
-                        overrides,
-                        filenames=request.filenames,
-                        history=history_messages(request.history),
-                        tags=request.tags,
-                        use_cache=request.use_cache,
-                        should_stop=stop.is_set,
-                    ),
-                    SSE_KEEPALIVE_SECONDS,
-                    stop=stop,
-                    on_start=lease.hand_off,
-                    on_finish=lease.release,
-                ):
+                for event in events:
                     if event is None:
                         yield SSE_KEEPALIVE_FRAME
                         continue
+                    if event["type"] == "done":
+                        count_answer(
+                            event.get("answer_status", "answered"), event.get("truncated", False)
+                        )
                     if event["type"] == "done" and event.get("cached"):
                         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
                         answer_cache_hits_total.inc()
@@ -202,9 +224,14 @@ def register(app: FastAPI) -> None:
                 logger.warning("Streamed question failed: %s", exc, exc_info=True)
                 yield sse_event({"type": "error", "detail": public_error_message(exc)})
             finally:
+                # Sets `stop` when this generator is closed early (the client left).
+                events.close()
                 lease.release_if_not_handed_off()
 
-        return StreamingResponse(
+        # Closing (not a plain StreamingResponse): a client that leaves mid-answer
+        # closes event_source at once, which sets `stop` and stops the pipeline thread
+        # before its next stage, instead of whenever the generator was collected.
+        return ClosingStreamingResponse(
             event_source(),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
