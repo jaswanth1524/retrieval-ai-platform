@@ -193,6 +193,23 @@
   .composer__send {
     flex-shrink: 0;
   }
+
+  /* A popover anchored at its chip's left edge (min-width 220px) ran past the right
+     edge when the chip sat mid-row (the provider chip on a phone). Here it spans the
+     control row instead, so it always fits the column. */
+  .composer__controls {
+    position: relative;
+  }
+
+  .composer__popover-anchor {
+    position: static;
+  }
+
+  .composer__popover {
+    right: 0;
+    min-width: 0;
+    max-width: none;
+  }
 }
 
 .composer__send {

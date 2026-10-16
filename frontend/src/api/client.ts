@@ -19,8 +19,11 @@ import type {
   ImportResponse,
   LlmProvider,
   PublicConfigResponse,
+  DocumentTask,
   QuestionOptions,
   QuestionOverrides,
+  SummaryCoverage,
+  WorkspaceListResponse,
   TimingsResponse,
   TraceDetailResponse,
   TraceListResponse,
@@ -65,9 +68,30 @@ export function setApiKey(key: string): void {
   writeStored(API_KEY_STORAGE_KEY, key || null);
 }
 
+// The workspace this browser works in (WORKSPACES_ENABLED); '' is the default one,
+// which needs no header — so a server without workspaces never sees it.
+const WORKSPACE_STORAGE_KEY = 'docrag-workspace';
+// Held per tab: storage only seeds the next tab. Read from storage on every request,
+// switching in one tab silently sent the other tab's questions to the new workspace.
+let currentWorkspace: string | null = null;
+
+export function getWorkspace(): string {
+  currentWorkspace ??= readStored(WORKSPACE_STORAGE_KEY) ?? '';
+  return currentWorkspace;
+}
+
+export function setWorkspace(name: string): void {
+  currentWorkspace = name;
+  writeStored(WORKSPACE_STORAGE_KEY, name || null);
+}
+
 function authHeaders(): Record<string, string> {
   const key = getApiKey();
-  return key ? { 'X-API-Key': key } : {};
+  const workspace = getWorkspace();
+  return {
+    ...(key ? { 'X-API-Key': key } : {}),
+    ...(workspace ? { 'X-Workspace': workspace } : {}),
+  };
 }
 
 // Without a timeout, a hung backend (a stalled Ollama call, a network blip) leaves
@@ -261,6 +285,21 @@ function questionRequestBody(
   return body;
 }
 
+function summaryRequestBody(
+  task: DocumentTask,
+  llmProvider?: LlmProvider,
+  overrides?: QuestionOverrides,
+  options?: QuestionOptions,
+): Record<string, unknown> {
+  // Only what a summary uses: retrieval overrides, scope and history don't apply to it.
+  const body: Record<string, unknown> = { mode: task.mode, filenames: task.filenames };
+  if (task.instruction) body.instruction = task.instruction;
+  if (llmProvider) body.llm_provider = llmProvider;
+  if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
+  if (options?.bypassCache) body.use_cache = false;
+  return body;
+}
+
 /** A page of GET /documents/{filename}/content. */
 export interface ContentPage {
   around?: string;
@@ -273,9 +312,12 @@ export interface QuestionStreamHandlers {
   // Which pipeline stage the server just started, before any token exists. Retrieval
   // can run for tens of seconds on a whole-corpus question, so this is the difference
   // between a progress indicator and a frozen one.
-  onStage?: (stage: string) => void;
+  // `progress`: step of steps through a multi-step stage (a summary's parts).
+  onStage?: (stage: string, progress?: { step: number; steps: number }) => void;
   onSources?: (sources: CitationResponse[], traceId: string | null) => void;
   onDelta?: (text: string) => void;
+  // Suggested next questions, after `done` (FOLLOWUPS_ENABLED on the server).
+  onFollowups?: (questions: string[]) => void;
   onDone?: (
     answer: string,
     sources: CitationResponse[],
@@ -286,12 +328,14 @@ export interface QuestionStreamHandlers {
       answerStatus?: AnswerStatus;
       topRerankScore?: number | null;
       truncated?: boolean;
+      /** Summaries only: passages read, of the passages the documents hold. */
+      coverage?: SummaryCoverage;
     },
   ) => void;
 }
 
 type QuestionStreamEvent =
-  | { type: 'stage'; stage: string }
+  | { type: 'stage'; stage: string; step?: number; steps?: number }
   | { type: 'sources'; sources: CitationResponse[]; trace_id: string | null }
   | { type: 'delta'; text: string }
   | {
@@ -304,7 +348,10 @@ type QuestionStreamEvent =
       answer_status?: AnswerStatus;
       top_rerank_score?: number | null;
       truncated?: boolean;
+      chunks_read?: number;
+      chunks_total?: number;
     }
+  | { type: 'followups'; questions: string[] }
   | { type: 'error'; detail: string };
 
 async function readSseStream(
@@ -410,6 +457,31 @@ export const api = {
       signal,
     });
   },
+
+  // Workspaces besides the default (GET answers {enabled: false} when they are off).
+  listWorkspaces: (signal?: AbortSignal) =>
+    request<WorkspaceListResponse>('/workspaces', { signal }),
+
+  createWorkspace: (name: string) =>
+    request<{ name: string }>('/workspaces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }),
+
+  // Only an empty one (409 while it holds documents).
+  deleteWorkspace: (name: string) =>
+    request<{ name: string }>(`/workspaces/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // The server fetches the URL's document and indexes it like an upload (URL_INGEST_ENABLED);
+  // poll the job the same way. 400 names why a URL can't be fetched.
+  uploadFromUrl: (url: string, signal?: AbortSignal) =>
+    request<DocumentJobAcceptedResponse>('/documents/from-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+      signal,
+    }),
 
   // Re-chunks and re-embeds a document from its stored original; poll the job like an
   // upload's. 409 when the server keeps no originals, 404 when this one has none.
@@ -586,11 +658,14 @@ export const api = {
     try {
       let response: Response;
       try {
-        response = await fetch(`${BASE_URL}/questions/stream`, {
+        const task = options?.task;
+        response = await fetch(`${BASE_URL}${task ? '/questions/summary/stream' : '/questions/stream'}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify(
-            questionRequestBody(question, llmProvider, overrides, filenames, history, options),
+            task
+              ? summaryRequestBody(task, llmProvider, overrides, options)
+              : questionRequestBody(question, llmProvider, overrides, filenames, history, options),
           ),
           signal: timeoutController.signal,
         });
@@ -617,8 +692,14 @@ export const api = {
         await readSseStream(
           response,
           (event) => {
-            if (event.type === 'stage') handlers.onStage?.(event.stage);
-            else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
+            if (event.type === 'stage') {
+              handlers.onStage?.(
+                event.stage,
+                typeof event.step === 'number' && typeof event.steps === 'number'
+                  ? { step: event.step, steps: event.steps }
+                  : undefined,
+              );
+            } else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
             else if (event.type === 'delta') handlers.onDelta?.(event.text);
             else if (event.type === 'done') {
               sawDone = true;
@@ -632,8 +713,15 @@ export const api = {
                   answerStatus: event.answer_status,
                   topRerankScore: event.top_rerank_score,
                   truncated: event.truncated,
+                  ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'
+                    ? { coverage: { read: event.chunks_read, total: event.chunks_total } }
+                    : {}),
                 },
               );
+            } else if (event.type === 'followups') {
+              if (Array.isArray(event.questions)) {
+                handlers.onFollowups?.(event.questions.filter((item) => typeof item === 'string'));
+              }
             } else if (event.type === 'error') throw new ApiClientError(event.detail);
           },
           resetIdleTimeout,

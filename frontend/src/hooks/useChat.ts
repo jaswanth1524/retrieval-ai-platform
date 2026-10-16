@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, apiErrorMessage } from '../api/client';
+import { api, apiErrorMessage, getWorkspace } from '../api/client';
 import type {
   FeedbackRating,
   HistoryMessage,
@@ -19,6 +19,7 @@ import {
   applyDeleteHeldDuringStream,
   byRecentUse,
   capConversations,
+  conversationWorkspace,
   deriveTitle,
   emptyConversation,
   isOnlyEmpty,
@@ -140,10 +141,16 @@ const STAGE_LABELS: Record<string, string> = {
   condensing: 'reading the conversation…',
   searching: 'searching documents…',
   verifying_citations: 'checking citations…',
+  reading_documents: 'reading the document…',
+  summarizing: 'taking notes…',
+  combining: 'combining notes…',
 };
 const DEFAULT_STAGE_LABEL = 'retrieving…';
 
-export function stageLabel(stage: string): string {
+export function stageLabel(stage: string, progress?: { step: number; steps: number }): string {
+  if (stage === 'summarizing' && progress && progress.steps > 1) {
+    return `taking notes, part ${progress.step} of ${progress.steps}…`;
+  }
   return STAGE_LABELS[stage] ?? DEFAULT_STAGE_LABEL;
 }
 
@@ -167,6 +174,9 @@ export interface UseChatResult {
   activeConversationId: string | null;
   // The active conversation's search scope.
   scope: ConversationScope;
+  /** The workspace the active conversation's questions went to ('' = default), or null
+   *  while it has none and so belongs to whichever workspace asks first. */
+  conversationWorkspace: string | null;
   /** A scope, or an updater of the current one — updaters compose, so two setters
    *  called in the same tick (clear files, then clear tags) don't undo each other. */
   setScope: (scope: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => void;
@@ -530,7 +540,19 @@ export function useChat(): UseChatResult {
     const updateTurns = (update: (turns: ChatTurn[]) => ChatTurn[], touch = true) =>
       setConversationTurns(conversationId, update, touch);
 
-    updateTurns((prev) => [...prev, makeTurn('user', question)]);
+    const task = options?.task;
+    // The first question binds the conversation to the workspace it was asked in
+    // (api/client sends that one's header); the default is recorded as no field.
+    const workspace = getWorkspace();
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) => {
+        if (conversation.id !== conversationId || conversation.turns.length > 0) return conversation;
+        const { workspace: _previous, ...rest } = conversation;
+        return workspace ? { ...rest, workspace } : rest;
+      }),
+    }));
+    updateTurns((prev) => [...prev, { ...makeTurn('user', question), ...(task ? { task } : {}) }]);
     setPending(true);
     // Seeded before the first server frame arrives so there is never a gap with a
     // pending request and no label at all.
@@ -576,18 +598,21 @@ export function useChat(): UseChatResult {
         filenames,
         history,
         {
-          onStage: (serverStage) => {
-            setStage(stageLabel(serverStage));
+          onStage: (serverStage, progress) => {
+            setStage(stageLabel(serverStage, progress));
           },
           onSources: (sources, traceId) => {
             // Sources land the moment retrieval finishes, which is exactly when
             // generation starts — no separate server frame needed for it.
-            setStage('generating answer…');
+            setStage(task ? 'writing the summary…' : 'generating answer…');
             updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
           },
           onDelta: (text) => {
             bufferedDeltaRef.current += text;
             if (frameId === null) frameId = requestAnimationFrame(flushDelta);
+          },
+          onFollowups: (questions) => {
+            if (questions.length > 0) updateAssistantTurn((turn) => ({ ...turn, followups: questions }));
           },
           onDone: (answer, sources, timings, traceId, cached, grounding) => {
             flushDelta();
@@ -604,6 +629,9 @@ export function useChat(): UseChatResult {
                 : {}),
               ...(status === 'uncited' ? { uncited: true } : {}),
               ...(grounding?.truncated ? { truncated: true } : {}),
+              ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
+                ? { coverage: grounding.coverage }
+                : {}),
             }));
           },
         },
@@ -636,7 +664,7 @@ export function useChat(): UseChatResult {
           ...prev.map((turn) =>
             turn.id === assistantTurnId && turn.content !== '' ? { ...turn, incomplete: true } : turn,
           ),
-          { ...makeTurn('error', message), question },
+          { ...makeTurn('error', message), question, ...(task ? { task } : {}) },
         ]);
       }
     } finally {
@@ -698,6 +726,7 @@ export function useChat(): UseChatResult {
         updatedAt: now,
         turns: prior,
         scope: source.scope,
+        ...(source.workspace ? { workspace: source.workspace } : {}),
       };
       setStorage((prev) => ({
         ...prev,
@@ -729,6 +758,9 @@ export function useChat(): UseChatResult {
       updatedAt: now,
       turns,
     };
+    // An export carries only turns: it joins the workspace it is imported into.
+    const workspace = getWorkspace();
+    if (workspace) conversation.workspace = workspace;
     setStorage((prev) => ({
       ...prev,
       activeConversationId: conversation.id,
@@ -759,9 +791,14 @@ export function useChat(): UseChatResult {
     keep: (filename: string) => boolean,
     keepTag: (tag: string) => boolean = () => true,
   ) => {
+    // Only the conversations the current workspace's listing speaks for: another
+    // workspace's documents are simply not in it.
+    const current = getWorkspace();
     setStorage((prev) => {
       let changed = false;
       const conversations = prev.conversations.map((conversation) => {
+        const bound = conversationWorkspace(conversation);
+        if (bound !== null && bound !== current) return conversation;
         const filenames = conversation.scope?.filenames ?? [];
         const tags = conversation.scope?.tags ?? [];
         const kept = filenames.filter(keep);
@@ -913,6 +950,9 @@ export function useChat(): UseChatResult {
       updatedAt: conversation.updatedAt,
       turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
       ...(conversation.pinned ? { pinned: true } : {}),
+      ...(conversation.workspace && conversation.turns.length > 0
+        ? { workspace: conversation.workspace }
+        : {}),
     }));
     const prev = summariesRef.current;
     const same =
@@ -923,7 +963,8 @@ export function useChat(): UseChatResult {
           summary.title === next[index].title &&
           summary.updatedAt === next[index].updatedAt &&
           summary.turnCount === next[index].turnCount &&
-          summary.pinned === next[index].pinned,
+          summary.pinned === next[index].pinned &&
+          summary.workspace === next[index].workspace,
       );
     if (same) return prev;
     summariesRef.current = next;
@@ -936,6 +977,7 @@ export function useChat(): UseChatResult {
     streamingConversationId,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
+    conversationWorkspace: activeConversation ? conversationWorkspace(activeConversation) : null,
     setScope,
     pruneScopes,
     removeFromScopes,

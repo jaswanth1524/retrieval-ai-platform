@@ -1,6 +1,6 @@
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
 
-const PROVIDERS: readonly LlmProvider[] = ['ollama', 'openai', 'openai_compatible'];
+const PROVIDERS: readonly LlmProvider[] = ['ollama', 'openai', 'openai_compatible', 'anthropic'];
 
 /** Whether the server lets a question pick `provider` (ALLOWED_REQUEST_PROVIDERS). */
 export function isProviderAllowed(provider: string, config: PublicConfigResponse): boolean {
@@ -20,6 +20,7 @@ export function isProviderUsable(
   if (provider === 'ollama') return config.ollama_available;
   if (provider === 'openai') return config.openai_available;
   if (provider === 'openai_compatible') return Boolean(config.openai_compatible_available);
+  if (provider === 'anthropic') return Boolean(config.anthropic_available);
   return false;
 }
 

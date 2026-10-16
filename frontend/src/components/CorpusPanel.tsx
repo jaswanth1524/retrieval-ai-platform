@@ -1,6 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DragEvent, RefObject } from 'react';
-import type { DocumentIngestResponse, IngestJobState } from '../api/types';
 import { useStableHandler } from '../hooks/useStableHandler';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { readStored, writeStored } from '../utils/safeStorage';
@@ -12,51 +11,14 @@ import {
   validateUploads,
 } from '../utils/uploadValidation';
 import type { RejectedFile } from '../utils/uploadValidation';
-import ConfirmInline from './ConfirmInline';
+import BulkBar from './corpus/BulkBar';
+import { progressPercent } from './corpus/cardHelpers';
+import DocumentCard from './corpus/DocumentCard';
+import UrlIngestForm from './corpus/UrlIngestForm';
+import type { DocCard, DocumentMeta, UploadItem } from './corpus/types';
 import './CorpusPanel.css';
-import { isImeComposing } from '../utils/keyboard';
 
-// Both are structural details of UploadItem below and have no consumers outside this
-// file — kept unexported so the module's public surface is just UploadItem + default.
-type UploadItemStatus = 'uploading' | 'success' | 'error';
-
-interface UploadProgress {
-  // 'waiting': the server's indexing queue was full (503); retrying after its Retry-After.
-  state: IngestJobState | 'waiting';
-  chunksDone: number;
-  chunksTotal: number;
-}
-
-export interface UploadItem {
-  id: string;
-  filename: string;
-  status: UploadItemStatus;
-  progress?: UploadProgress;
-  result?: DocumentIngestResponse;
-  error?: string;
-  /** Kept until the upload succeeds or is dismissed, so a failed one can be retried. */
-  file?: File;
-  /** A re-index of the stored original rather than an upload — retried the same way. */
-  reindex?: boolean;
-  /** Cancel was pressed and hasn't settled yet. */
-  cancelling?: boolean;
-}
-
-/** One indexed document's metadata, from GET /documents. */
-export interface DocumentMeta {
-  chunks: number;
-  // Absent for a document indexed before this metadata was stamped at ingest time —
-  // the detail line simply omits it.
-  pages?: number;
-  bytes?: number;
-  /** Seconds since the epoch. */
-  uploadedAt?: number;
-  /** Indexed by an older chunker. */
-  stale: boolean;
-  /** Has a stored original the server can re-index from (and serve back). */
-  reindexable: boolean;
-  tags: string[];
-}
+export type { DocumentMeta, UploadItem } from './corpus/types';
 
 interface CorpusPanelProps {
   /** Indexed documents, in display order. */
@@ -91,160 +53,10 @@ interface CorpusPanelProps {
   onOpenOriginal?: (filename: string) => void;
   /** Open a document's indexed text in the viewer, from its first passage. */
   onRead?: (filename: string) => void;
-}
-
-interface TagEditorProps {
-  filename: string;
-  tags: string[];
-  disabled?: boolean;
-  onSave: (filename: string, tags: string[]) => Promise<void>;
-}
-
-/** A document's tags as chips, edited inline as a comma-separated list. */
-function TagEditor({ filename, tags, disabled, onSave }: TagEditorProps) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Closing the editor unmounts the control that had focus (the field, Save, Cancel);
-  // focus goes back to the button that opened it rather than to <body>.
-  const editButtonRef = useRef<HTMLButtonElement>(null);
-  const refocusRef = useRef(false);
-  const close = () => {
-    refocusRef.current = true;
-    setEditing(false);
-  };
-  useEffect(() => {
-    if (editing || !refocusRef.current) return;
-    refocusRef.current = false;
-    editButtonRef.current?.focus();
-  }, [editing]);
-
-  const save = async () => {
-    const next = draft
-      .split(',')
-      .map((tag) => tag.trim())
-      .filter(Boolean);
-    setSaving(true);
-    setError(null);
-    try {
-      await onSave(filename, next);
-      close();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not save tags.');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  if (editing) {
-    return (
-      <div className="corpus-panel__tags-edit">
-        <input
-          type="text"
-          className="corpus-panel__tags-input"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (isImeComposing(event)) return;
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              void save();
-            } else if (event.key === 'Escape') {
-              // Cancels the edit only — not the drawer this panel may sit in.
-              event.stopPropagation();
-              close();
-            }
-          }}
-          placeholder="legal, 2026"
-          aria-label={`Tags for ${filename}, comma separated`}
-          disabled={saving}
-          autoFocus
-          data-testid="corpus-tags-input"
-        />
-        {/* Enter and Esc did this alone: a mouse or touch user had no way to save. */}
-        <div className="corpus-panel__tags-actions">
-          <button
-            type="button"
-            className="corpus-panel__tags-button"
-            onClick={() => void save()}
-            disabled={saving}
-            data-testid="corpus-tags-save"
-          >
-            Save
-          </button>
-          <button
-            type="button"
-            className="corpus-panel__tags-button"
-            onClick={close}
-            disabled={saving}
-            data-testid="corpus-tags-cancel"
-          >
-            Cancel
-          </button>
-        </div>
-        {error && (
-          <span className="corpus-panel__tags-error" role="alert">
-            {error}
-          </span>
-        )}
-      </div>
-    );
-  }
-  return (
-    <div className="corpus-panel__tags" data-testid="corpus-tags">
-      {tags.map((tag) => (
-        <span key={tag} className="corpus-panel__tag">
-          #{tag}
-        </span>
-      ))}
-      <button
-        ref={editButtonRef}
-        type="button"
-        className="corpus-panel__tags-button"
-        onClick={() => {
-          setDraft(tags.join(', '));
-          setError(null);
-          setEditing(true);
-        }}
-        disabled={disabled}
-        aria-label={`Edit tags for ${filename}`}
-        data-testid="corpus-tags-edit"
-      >
-        {tags.length > 0 ? '✎' : '+ tag'}
-      </button>
-    </div>
-  );
-}
-
-function extensionOf(filename: string): string {
-  const dot = filename.lastIndexOf('.');
-  return dot === -1 ? '' : filename.slice(dot + 1).toUpperCase();
-}
-
-function progressPercent(progress?: UploadProgress): number {
-  if (!progress) return 0;
-  if (progress.chunksTotal > 0) return Math.round((progress.chunksDone / progress.chunksTotal) * 100);
-  return progress.state === 'embedding' ? 50 : 0;
-}
-
-interface DocCard {
-  key: string;
-  filename: string;
-  /** Set for cards backed by an upload (in flight or failed) rather than the index. */
-  uploadId?: string;
-  canRetry?: boolean;
-  cancelling?: boolean;
-  status: 'indexed' | 'indexing' | 'failed';
-  stale?: boolean;
-  canReindex?: boolean;
-  hasOriginal?: boolean;
-  detail: string;
-  pct: number;
-  error?: string;
-  tags: string[];
-  bytes?: number;
-  uploadedAt?: number;
+  /** Summarize one document, or compare two, as a turn in the conversation. */
+  onSummarize?: (filenames: string[]) => void;
+  /** Index a document the server fetches from a URL; absent when that is off. */
+  onUploadFromUrl?: (url: string) => void;
 }
 
 // 'listed': the order the corpus arrives in (the server's listing, then this session's
@@ -281,319 +93,6 @@ function compareCards(sort: SortKey): ((a: DocCard, b: DocCard) => number) | nul
   return byName;
 }
 
-interface DocumentCardProps {
-  card: DocCard;
-  disabled?: boolean;
-  readOnly: boolean;
-  confirming: boolean;
-  deleting: boolean;
-  selectable: boolean;
-  selected: boolean;
-  onToggleSelect: (filename: string) => void;
-  onAskDelete: (key: string) => void;
-  onCancelDelete: () => void;
-  onConfirmDelete: (filename: string) => void;
-  onRead?: (filename: string) => void;
-  onOpenOriginal?: (filename: string) => void;
-  onReindex?: (filename: string) => void;
-  onCancelUpload?: (uploadId: string) => void;
-  onRetryUpload?: (uploadId: string) => void;
-  onDismissUpload?: (uploadId: string) => void;
-  onSetTags?: (filename: string, tags: string[]) => Promise<void>;
-}
-
-/** One document (or upload) card. Memoized with stable card objects and callbacks, so
- *  an upload's progress poll re-renders that card, not every card in a large corpus. */
-const DocumentCard = memo(function DocumentCard({
-  card,
-  disabled,
-  readOnly,
-  confirming,
-  deleting,
-  selectable,
-  selected,
-  onToggleSelect,
-  onAskDelete,
-  onCancelDelete,
-  onConfirmDelete,
-  onRead,
-  onOpenOriginal,
-  onReindex,
-  onCancelUpload,
-  onRetryUpload,
-  onDismissUpload,
-  onSetTags,
-}: DocumentCardProps) {
-  return (
-    <article
-      className={`corpus-panel__card${selected ? ' corpus-panel__card--selected' : ''}`}
-      data-testid="corpus-panel-item"
-      data-corpus-card={card.filename}
-    >
-      <div className="corpus-panel__card-top">
-        {selectable && (
-          <input
-            type="checkbox"
-            className="corpus-panel__select"
-            checked={selected}
-            onChange={() => onToggleSelect(card.filename)}
-            disabled={disabled}
-            aria-label={`Select ${card.filename}`}
-            data-testid="corpus-select"
-          />
-        )}
-        <span className="corpus-panel__ext">{extensionOf(card.filename)}</span>
-        <span className="corpus-panel__name">{card.filename}</span>
-        {confirming ? (
-          <ConfirmInline
-            className="corpus-panel__confirm"
-            prompt="Delete?"
-            confirmLabel="Confirm"
-            onCancel={onCancelDelete}
-            onConfirm={() => onConfirmDelete(card.filename)}
-            busy={deleting}
-          />
-        ) : card.status === 'indexed' ? (
-          <div className="corpus-panel__card-actions">
-            {onRead && (
-              <button
-                type="button"
-                className="corpus-panel__read"
-                onClick={() => onRead(card.filename)}
-                aria-label={`Read ${card.filename}`}
-                title="Read the indexed text"
-                data-testid="corpus-read"
-              >
-                ☰
-              </button>
-            )}
-            {card.hasOriginal && onOpenOriginal && (
-              <button
-                type="button"
-                className="corpus-panel__open-original"
-                onClick={() => onOpenOriginal(card.filename)}
-                aria-label={`Download the original of ${card.filename}`}
-                title="Download the uploaded file"
-              >
-                ⇱
-              </button>
-            )}
-            {card.canReindex && (
-              <button
-                type="button"
-                className={`corpus-panel__reindex${card.stale ? ' corpus-panel__reindex--stale' : ''}`}
-                onClick={() => onReindex?.(card.filename)}
-                disabled={disabled}
-                aria-label={`Re-index ${card.filename}`}
-                title={
-                  card.stale
-                    ? 'Indexed by an older chunker — re-index from the stored original'
-                    : 'Re-index from the stored original'
-                }
-              >
-                ↻
-              </button>
-            )}
-            {!readOnly && (
-              <button
-                type="button"
-                className="corpus-panel__remove"
-                onClick={() => onAskDelete(card.key)}
-                disabled={disabled}
-                aria-label={`Delete ${card.filename}`}
-              >
-                ✕
-              </button>
-            )}
-          </div>
-        ) : card.status === 'indexing' ? (
-          !readOnly &&
-          onCancelUpload &&
-          card.uploadId !== undefined && (
-            <button
-              type="button"
-              className="corpus-panel__cancel"
-              onClick={() => onCancelUpload(card.uploadId!)}
-              disabled={card.cancelling}
-              aria-label={`Cancel indexing ${card.filename}`}
-              title="Stop before anything is written to the index"
-              data-testid="corpus-cancel-upload"
-            >
-              Cancel
-            </button>
-          )
-        ) : (
-          card.status === 'failed' &&
-          card.uploadId !== undefined && (
-            <div className="corpus-panel__failed-actions">
-              {card.canRetry && onRetryUpload && (
-                <button
-                  type="button"
-                  className="corpus-panel__retry"
-                  onClick={() => onRetryUpload(card.uploadId!)}
-                  disabled={disabled}
-                  aria-label={`Retry ${card.filename}`}
-                >
-                  Retry
-                </button>
-              )}
-              {onDismissUpload && (
-                <button
-                  type="button"
-                  className="corpus-panel__remove"
-                  onClick={() => onDismissUpload(card.uploadId!)}
-                  aria-label={`Dismiss ${card.filename}`}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-          )
-        )}
-      </div>
-      <div className="corpus-panel__status">
-        <span className={`corpus-panel__dot corpus-panel__dot--${card.status}`} aria-hidden="true" />
-        {card.status === 'failed' ? (
-          <span role="status">{`failed — ${card.detail}`}</span>
-        ) : (
-          <span>{card.detail}</span>
-        )}
-      </div>
-      {card.status === 'indexing' && (
-        <div
-          className="corpus-panel__bar"
-          role="progressbar"
-          aria-label={`Indexing ${card.filename}`}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={card.pct}
-        >
-          <div className="corpus-panel__bar-fill" style={{ width: `${card.pct}%` }} />
-        </div>
-      )}
-      {card.status === 'indexed' && onSetTags && (
-        <TagEditor filename={card.filename} tags={card.tags} disabled={disabled} onSave={onSetTags} />
-      )}
-    </article>
-  );
-});
-
-interface BulkBarProps {
-  selected: string[];
-  disabled?: boolean;
-  /** Names among the selection with a stored original (re-indexable). */
-  reindexable: string[];
-  onReindex?: (filenames: string[]) => void;
-  onAddTag?: (tag: string) => Promise<void>;
-  onDelete: () => Promise<void>;
-  onClear: () => void;
-}
-
-/** What to do with every selected document at once. */
-function BulkBar({ selected, disabled, reindexable, onReindex, onAddTag, onDelete, onClear }: BulkBarProps) {
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [tagDraft, setTagDraft] = useState('');
-  const count = selected.length;
-  const label = `${count} document${count === 1 ? '' : 's'}`;
-
-  const run = async (work: () => Promise<void>) => {
-    setBusy(true);
-    try {
-      await work();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="corpus-panel__bulk" role="group" aria-label="Selected documents" data-testid="corpus-bulk">
-      <span className="corpus-panel__bulk-count mono">{count} selected</span>
-      {confirmingDelete ? (
-        <ConfirmInline
-          className="corpus-panel__confirm"
-          prompt={`Delete ${label}?`}
-          confirmLabel="Delete"
-          onCancel={() => setConfirmingDelete(false)}
-          onConfirm={() =>
-            void run(async () => {
-              await onDelete();
-              setConfirmingDelete(false);
-            })
-          }
-          busy={busy}
-          confirmTestId="corpus-bulk-delete-confirm"
-        />
-      ) : (
-        <>
-          {onAddTag && (
-            <form
-              className="corpus-panel__bulk-tag"
-              onSubmit={(event) => {
-                event.preventDefault();
-                const tag = tagDraft.trim();
-                if (!tag) return;
-                void run(async () => {
-                  await onAddTag(tag);
-                  setTagDraft('');
-                });
-              }}
-            >
-              <input
-                type="text"
-                className="corpus-panel__bulk-input"
-                value={tagDraft}
-                onChange={(event) => setTagDraft(event.target.value)}
-                placeholder="tag"
-                aria-label={`Tag to add to ${label}`}
-                disabled={disabled || busy}
-                data-testid="corpus-bulk-tag-input"
-              />
-              <button
-                type="submit"
-                className="corpus-panel__bulk-button"
-                disabled={disabled || busy || !tagDraft.trim()}
-                data-testid="corpus-bulk-tag"
-              >
-                + tag
-              </button>
-            </form>
-          )}
-          {onReindex && reindexable.length > 0 && (
-            <button
-              type="button"
-              className="corpus-panel__bulk-button"
-              onClick={() => onReindex(reindexable)}
-              disabled={disabled || busy}
-              data-testid="corpus-bulk-reindex"
-            >
-              ↻ Re-index {reindexable.length}
-            </button>
-          )}
-          <button
-            type="button"
-            className="corpus-panel__bulk-button corpus-panel__bulk-delete"
-            onClick={() => setConfirmingDelete(true)}
-            disabled={disabled || busy}
-            data-testid="corpus-bulk-delete"
-          >
-            Delete {count}
-          </button>
-          <button
-            type="button"
-            className="corpus-panel__bulk-button"
-            onClick={onClear}
-            disabled={busy}
-            data-testid="corpus-bulk-clear"
-          >
-            Clear
-          </button>
-        </>
-      )}
-    </div>
-  );
-}
-
 function CorpusPanel({
   filenames,
   documents,
@@ -614,6 +113,8 @@ function CorpusPanel({
   readOnly = false,
   onOpenOriginal,
   onRead,
+  onSummarize,
+  onUploadFromUrl,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFile[]>([]);
@@ -760,7 +261,7 @@ function CorpusPanel({
         ? {
             key: `upload:${item.id}`,
             uploadId: item.id,
-            canRetry: item.file !== undefined || item.reindex === true,
+            canRetry: item.file !== undefined || item.reindex === true || Boolean(item.sourceUrl),
             filename: item.filename,
             status: 'failed',
             detail: item.error ?? 'Ingestion failed.',
@@ -912,6 +413,9 @@ function CorpusPanel({
         />
       </label>
       )}
+      {!readOnly && onUploadFromUrl && (
+        <UrlIngestForm disabled={disabled} onSubmit={onUploadFromUrl} />
+      )}
 
       {stagedFiles.length > 0 && (
         <div className="corpus-panel__staged" data-testid="upload-staged-list">
@@ -1051,6 +555,7 @@ function CorpusPanel({
             (onReindex ? (names: string[]) => names.forEach((name) => onReindex(name)) : undefined)
           }
           onAddTag={onSetTags ? bulkAddTag : undefined}
+          onCompare={onSummarize}
           onDelete={bulkDelete}
           onClear={() => setSelected(new Set())}
         />
@@ -1080,6 +585,7 @@ function CorpusPanel({
             onCancelDelete={cancelDelete}
             onConfirmDelete={handleDelete}
             onRead={onRead}
+            onSummarize={onSummarize}
             onOpenOriginal={onOpenOriginal}
             onReindex={onReindex}
             onCancelUpload={onCancelUpload}

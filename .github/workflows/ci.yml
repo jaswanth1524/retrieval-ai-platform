@@ -60,7 +60,7 @@ jobs:
         # The floor sits 2 points under the measured total (94%), to catch untested additions.
         run: >-
           uv run pytest
-          ${{ matrix.python-version == '3.12' && '--cov=api --cov=eval --cov-report=term-missing:skip-covered --cov-fail-under=92' || '' }}
+          ${{ matrix.python-version == '3.12' && '--cov=api --cov=eval --cov=cli --cov-report=term-missing:skip-covered --cov-fail-under=92' || '' }}
 
       - name: Lint
         # 3.12 only: mypy checks for python_version 3.12 (pyproject.toml) on either leg,
@@ -74,7 +74,19 @@ jobs:
 
       - name: Typecheck
         if: matrix.python-version == '3.12'
-        run: uv run mypy api eval
+        run: uv run mypy api eval cli
+
+      - name: Build and smoke-test the CLI package
+        # cli/pyproject.toml is a separate distribution (uv tool install ./cli): build
+        # the wheel, install it into a throwaway venv and run the commands it declares.
+        if: matrix.python-version == '3.12'
+        run: |
+          out=$(mktemp -d)
+          uv build ./cli --wheel --out-dir "$out/dist"
+          uv venv "$out/venv"
+          VIRTUAL_ENV="$out/venv" uv pip install "$(ls "$out"/dist/*.whl)[mcp]"
+          "$out/venv/bin/docrag" --help
+          "$out/venv/bin/python" -c "import cli.mcp_server"
 
       - name: Import eval extra
         # ragas has previously broken on import alone (an unpinned transitive
@@ -90,6 +102,7 @@ jobs:
           uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
           uv run python -m eval.harness validate eval/datasets/retrieval_eval.sample.jsonl
           uv run python -m eval.harness validate eval/datasets/handbook_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/multilingual_eval.jsonl
 
       - name: Audit runtime dependencies
         # Once: the lockfile is the same on every Python version.

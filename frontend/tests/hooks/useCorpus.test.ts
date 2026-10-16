@@ -7,6 +7,7 @@ import { useCorpus } from '../../src/hooks/useCorpus';
 const api = vi.hoisted(() => ({
   listDocuments: vi.fn(),
   uploadDocument: vi.fn(),
+  uploadFromUrl: vi.fn(),
   pollDocumentJob: vi.fn(),
   cancelDocumentJob: vi.fn(),
   deleteDocument: vi.fn(),
@@ -50,6 +51,29 @@ describe('useCorpus', () => {
   beforeEach(() => {
     for (const mock of Object.values(api)) mock.mockReset();
     api.listDocuments.mockResolvedValue({ filenames: [] });
+  });
+
+  it('indexes a URL like an upload, names the card after the server, and retries the URL', async () => {
+    const url = 'https://example.com/docs/policy';
+    api.uploadFromUrl
+      .mockRejectedValueOnce(new ApiClientError('The URL answered 503; nothing was fetched.', 400))
+      .mockResolvedValueOnce({ job_id: 'job-1', filename: 'policy.html', state: 'queued' });
+    api.pollDocumentJob.mockResolvedValue(
+      jobStatus({ state: 'done', filename: 'policy.html', result: { filename: 'policy.html' } as never }),
+    );
+    const { result } = setup();
+
+    await act(() => result.current.handleUploadFromUrl(url));
+    const failed = result.current.uploads[0];
+    expect(failed).toMatchObject({ filename: url, status: 'error', sourceUrl: url });
+    expect(failed.error).toContain('answered 503');
+
+    api.listDocuments.mockResolvedValue({ filenames: ['policy.html'] });
+    await act(() => result.current.handleRetryUpload(failed.id));
+    expect(api.uploadFromUrl).toHaveBeenLastCalledWith(url, expect.anything());
+    // Done: its card gives way to the document's own once the listing has it.
+    expect(result.current.uploads).toEqual([]);
+    expect(result.current.indexedFilenames).toEqual(['policy.html']);
   });
 
   it('keeps one metadata record per document, in the listing order', async () => {

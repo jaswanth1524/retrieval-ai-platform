@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 _PROVIDER_FAILURE_REASONS: tuple[tuple[type[Exception], str], ...] = (
     (
         litellm_exceptions.AuthenticationError,
-        "the provider rejected its credentials (check OPENAI_API_KEY)",
+        "the provider rejected its credentials (check OPENAI_API_KEY / ANTHROPIC_API_KEY)",
     ),
     (
         litellm_exceptions.PermissionDeniedError,
@@ -90,7 +90,7 @@ _PROVIDER_FAILURE_REASONS: tuple[tuple[type[Exception], str], ...] = (
     (litellm_exceptions.RateLimitError, "the provider is rate limiting requests; retry shortly"),
     (
         litellm_exceptions.NotFoundError,
-        "the provider does not know this model (check LLM_MODEL / OPENAI_MODEL)",
+        "the provider does not know this model (check LLM_MODEL / OPENAI_MODEL / ANTHROPIC_MODEL)",
     ),
     (
         litellm_exceptions.ContextWindowExceededError,
@@ -365,8 +365,10 @@ def supports_reasoning(model: str) -> bool:
     """
 
     # openai/<name> is a model served by an OpenAI-compatible server, not OpenAI: its
-    # name says nothing LiteLLM's metadata could know about.
-    if model.startswith((*_OLLAMA_MODEL_PREFIXES, "openai/")):
+    # name says nothing LiteLLM's metadata could know about. anthropic/<name>: Claude
+    # thinks only when asked to (extended thinking is never enabled here), so the
+    # reasoning headroom would only inflate the budget.
+    if model.startswith((*_OLLAMA_MODEL_PREFIXES, "openai/", "anthropic/")):
         return False
     try:
         return bool(litellm.supports_reasoning(model))
@@ -427,6 +429,12 @@ def completion_model_and_kwargs(settings: AppSettings) -> tuple[str, dict[str, s
             "api_base": settings.openai_compatible_base_url,
             "api_key": settings.openai_compatible_api_key or "not-needed",
         }
+    if provider == "anthropic":
+        if not settings.anthropic_api_key:
+            raise GenerationConfigError(
+                "ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic."
+            )
+        return f"anthropic/{settings.anthropic_model}", {"api_key": settings.anthropic_api_key}
     raise GenerationConfigError(f"Unsupported LLM_PROVIDER '{settings.llm_provider}'.")
 
 

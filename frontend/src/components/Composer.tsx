@@ -208,6 +208,7 @@ function Composer({
   const openaiEnabled = config !== null && isProviderUsable('openai', config);
   const ollamaEnabled = config !== null && isProviderUsable('ollama', config);
   const compatibleAllowed = allowed('openai_compatible');
+  const anthropicEnabled = config !== null && isProviderUsable('anthropic', config);
 
   // A search hiding an already-selected filename would make it permanently
   // unselectable (the checkbox list is the only way to remove it from scope), so a
@@ -415,6 +416,22 @@ function Composer({
                     />
                     <span>Self-hosted &middot; {config.openai_compatible_model}</span>
                   </label>
+                )}
+                {config.anthropic_available && (
+                  <label className="composer__popover-item">
+                    <input
+                      type="radio"
+                      name="composer-provider"
+                      checked={provider === 'anthropic'}
+                      disabled={!anthropicEnabled}
+                      onChange={() => onProviderChange('anthropic')}
+                      data-testid="provider-anthropic"
+                    />
+                    <span>Anthropic &middot; {config.anthropic_model}</span>
+                  </label>
+                )}
+                {config.anthropic_available && !anthropicEnabled && (
+                  <p className="composer__popover-note">Not allowed on this server.</p>
                 )}
               </div>
             )}

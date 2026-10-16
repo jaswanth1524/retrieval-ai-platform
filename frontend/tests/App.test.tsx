@@ -1433,3 +1433,96 @@ describe('App', () => {
     expect(screen.getByTestId('upload-dropzone')).toBeInTheDocument();
   });
 });
+
+describe('App workspaces', () => {
+  const turn = (id: string, role: 'user' | 'assistant', content: string) => ({
+    id, role, content, sources: [], timestamp: 1_700_000_000_000, timings: null, traceId: null,
+  });
+
+  function stubServer() {
+    const listedFor: (string | undefined)[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost');
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (url.pathname === '/health') return jsonResponse({ status: 'ok' });
+      if (url.pathname === '/config') return jsonResponse(makeConfigPayload({ workspaces_enabled: true }));
+      if (url.pathname === '/access') return jsonResponse({ access: 'open' });
+      if (url.pathname === '/workspaces') return jsonResponse({ enabled: true, workspaces: ['legal'] });
+      if (url.pathname === '/documents') {
+        listedFor.push(headers['X-Workspace']);
+        const filenames = headers['X-Workspace'] === 'legal' ? ['contract.txt'] : ['guide.md'];
+        return jsonResponse({ filenames, chunk_counts: Object.fromEntries(filenames.map((f) => [f, 1])) });
+      }
+      throw new Error(`unexpected fetch: ${url.pathname}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return listedFor;
+  }
+
+  afterEach(async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('');
+  });
+
+  it('opens a fresh chat when the workspace changes, and returns to a conversation’s own workspace', async () => {
+    localStorage.setItem(
+      'docrag-chat-history',
+      JSON.stringify({
+        version: 2,
+        activeConversationId: 'default-chat',
+        conversations: [
+          { id: 'default-chat', title: 'Guide question', createdAt: 2, updatedAt: 2,
+            turns: [turn('d1', 'user', 'What is in the guide?'), turn('d2', 'assistant', 'Hybrid retrieval.')] },
+          { id: 'legal-chat', title: 'Contract question', createdAt: 1, updatedAt: 1, workspace: 'legal',
+            turns: [turn('l1', 'user', 'What does the contract say?'), turn('l2', 'assistant', 'Kappa.')] },
+        ],
+      }),
+    );
+    const listedFor = stubServer();
+    render(<App />);
+    expect(await screen.findByText('What is in the guide?')).toBeInTheDocument();
+
+    await openCorpusPanel();
+    const select = await screen.findByTestId('workspace-select');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await userEvent.selectOptions(select, 'legal');
+
+    // The guide conversation stays in the default workspace: a new chat opens here.
+    await waitFor(() => expect(screen.queryByText('What is in the guide?')).not.toBeInTheDocument());
+    await waitFor(() => expect(listedFor.at(-1)).toBe('legal'));
+
+    // Opening the guide conversation brings the default workspace back.
+    await userEvent.click(screen.getByTestId('rail-chat'));
+    const row = screen.getAllByTestId('conversation-select').find((r) => r.textContent?.includes('Guide question'))!;
+    await userEvent.click(row);
+    expect(await screen.findByText('What is in the guide?')).toBeInTheDocument();
+    await waitFor(() => expect(listedFor.at(-1)).toBeUndefined());
+
+    // The legal one is labelled, and opening it switches to legal.
+    const legalRow = screen.getAllByTestId('conversation-select').find((r) => r.textContent?.includes('Contract question'))!;
+    expect(legalRow).toHaveTextContent('legal');
+    await userEvent.click(legalRow);
+    expect(await screen.findByText('What does the contract say?')).toBeInTheDocument();
+    await waitFor(() => expect(listedFor.at(-1)).toBe('legal'));
+    await openCorpusPanel();
+    expect(screen.getByTestId('workspace-select')).toHaveValue('legal');
+  });
+
+  it('says so when a conversation’s workspace was deleted, instead of switching', async () => {
+    localStorage.setItem(
+      'docrag-chat-history',
+      JSON.stringify({
+        version: 2,
+        activeConversationId: 'gone-chat',
+        conversations: [
+          { id: 'gone-chat', title: 'Old', createdAt: 1, updatedAt: 1, workspace: 'archive',
+            turns: [turn('g1', 'user', 'Old question'), turn('g2', 'assistant', 'Old answer.')] },
+        ],
+      }),
+    );
+    const listedFor = stubServer();
+    render(<App />);
+    expect(await screen.findByText('Workspace no longer exists')).toBeInTheDocument();
+    expect(listedFor.every((header) => header === undefined)).toBe(true);
+  });
+});

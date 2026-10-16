@@ -1,9 +1,8 @@
 import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClientError, api, apiErrorMessage } from './api/client';
+import { api, apiErrorMessage } from './api/client';
 import type {
-  AccessLevel,
-  ApiStatus,
   CitationResponse,
+  DocumentTask,
   FeedbackItemResponse,
   LlmProvider,
   PublicConfigResponse,
@@ -19,7 +18,8 @@ import { NEW_CONVERSATION_DRAFT, pruneDrafts } from './utils/drafts';
 import { QUESTION_INPUT_ID } from './utils/id';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
-import CorpusPanel, { type DocumentMeta } from './components/CorpusPanel';
+import CorpusPanel from './components/CorpusPanel';
+import WorkspaceBar from './components/corpus/WorkspaceBar';
 import IconRail from './components/IconRail';
 import LazyChunkBoundary from './components/LazyChunkBoundary';
 import { loadMarkdown } from './components/markdownLoader';
@@ -35,21 +35,42 @@ import { useChat } from './hooks/useChat';
 import { useStableHandler } from './hooks/useStableHandler';
 import { prefetchCitationContent } from './utils/contentPrefetch';
 import { useCommands } from './hooks/useCommands';
+import { useConnectionMonitor } from './hooks/useConnectionMonitor';
+import { usePanelList } from './hooks/usePanelList';
+import { useAppBoot } from './hooks/useAppBoot';
+import { useWorkspaces } from './hooks/useWorkspaces';
+import { useBackupActions } from './hooks/useBackupActions';
+import { useInspectorVisibility } from './hooks/useInspectorVisibility';
 import { useCorpus } from './hooks/useCorpus';
 import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
 import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
-import { EMPTY_OVERRIDES } from './utils/overrides';
 import { initialProvider } from './utils/providers';
-import { readStored, readStoredJson, writeStored } from './utils/safeStorage';
+import { readStored, writeStored } from './utils/safeStorage';
 import {
   acceptedExtensions,
   DEFAULT_MAX_UPLOAD_BYTES,
   validateUploads,
 } from './utils/uploadValidation';
 import { sliceWhole } from './utils/text';
+import {
+  ADVANCED_OPTIONS_STORAGE_KEY,
+  MODE_STORAGE_KEY,
+  PROVIDER_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  loadPersistedOverrides,
+  clampOverrides,
+  loadPersistedMode,
+  CITATION_PREFETCH_DWELL_MS,
+  canPreviewOriginal,
+  NO_HIDDEN_PANELS,
+  HIDDEN_FEEDBACK_PANEL,
+  NO_SOURCES,
+  PANEL_META,
+  scopeLabel,
+} from './appHelpers';
 
 // Dialogs and the inspector render only on demand, so they load on demand too: the
 // first paint (thread + composer) no longer waits on their code.
@@ -58,118 +79,7 @@ const DocumentViewer = lazy(() => import('./components/DocumentViewer'));
 const Inspector = lazy(() => import('./components/Inspector'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 
-const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
-const MODE_STORAGE_KEY = 'docrag-mode';
-const PROVIDER_STORAGE_KEY = 'docrag-provider';
-// Also read by main.tsx before the first render.
-const THEME_STORAGE_KEY = 'docrag-theme';
-
-function loadPersistedOverrides(): QuestionOverrides {
-  // Storage denied/corrupt — fall back to defaults for this session.
-  const parsed = readStoredJson<Partial<QuestionOverrides>>(ADVANCED_OPTIONS_STORAGE_KEY);
-  if (!parsed) return EMPTY_OVERRIDES;
-  return {
-    rerankTopK: parsed.rerankTopK ?? null,
-    maxContextChunks: parsed.maxContextChunks ?? null,
-    llmTemperature: parsed.llmTemperature ?? null,
-  };
-}
-
-/** Drop saved overrides the server would now reject.
- *
- * Overrides are saved in the browser, limits live on the server: an operator lowering
- * FUSED_TOP_N below a saved "Rerank top K" made every question fail with a 422 — and
- * the slider, clamped by the browser to the new max, couldn't show why. */
-function clampOverrides(
-  overrides: QuestionOverrides,
-  config: PublicConfigResponse,
-): QuestionOverrides {
-  const within = (value: number | null, max: number, min = 1) =>
-    value !== null && (value < min || value > max) ? null : value;
-  const rerankTopK = within(overrides.rerankTopK, config.rerank_top_k_limit);
-  const maxContextChunks = within(overrides.maxContextChunks, config.max_context_chunks_limit);
-  return {
-    rerankTopK,
-    // More context chunks than reranked ones is a 422 on every question (the server's
-    // QuestionRequest rule), and the values were saved, so it outlived a reload.
-    maxContextChunks:
-      rerankTopK !== null && maxContextChunks !== null
-        ? Math.min(maxContextChunks, rerankTopK)
-        : maxContextChunks,
-    llmTemperature: within(overrides.llmTemperature, config.llm_temperature_max, 0),
-  };
-}
-
-function loadPersistedMode(): ChatMode {
-  return readStored(MODE_STORAGE_KEY) === 'engineer' ? 'engineer' : 'reader';
-}
-
-// The browser's own PDF viewer shows an original in the document viewer; past this a
-// download serves better than holding the whole file in memory as a blob.
-const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
-
-// How long a pointer or focus rests on a citation before its viewer page is fetched.
-const CITATION_PREFETCH_DWELL_MS = 150;
-// /health while the page is up: how often, and how often once it has failed.
-const HEALTH_POLL_MS = 30_000;
-const HEALTH_RETRY_MS = 5_000;
-// A failed document listing is retried from this delay, doubling up to BOOT_RETRY_MAX_MS.
-const LISTING_RETRY_BASE_MS = 5000;
-// Backoff between boot attempts while the API is unreachable: 2s, 4s, 8s ... 30s.
-const BOOT_RETRY_BASE_MS = 2000;
-const BOOT_RETRY_MAX_MS = 30_000;
-
-function canPreviewOriginal(
-  filename: string,
-  originalsStored: boolean,
-  meta: DocumentMeta | undefined,
-): boolean {
-  return (
-    originalsStored &&
-    filename.toLowerCase().endsWith('.pdf') &&
-    Boolean(meta?.reindexable) &&
-    (meta?.bytes ?? 0) <= MAX_PREVIEW_BYTES
-  );
-}
-
-// Shared empty values: a fresh [] per render would re-render the memoized child.
-const NO_HIDDEN_PANELS: RailPanel[] = [];
-const HIDDEN_FEEDBACK_PANEL: RailPanel[] = ['feedback'];
-const NO_SOURCES: CitationResponse[] = [];
-
-const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
-  chat: { title: 'Conversations', actionLabel: 'New' },
-  corpus: { title: 'Corpus', actionLabel: 'Upload' },
-  search: { title: 'Search passages', actionLabel: 'Clear' },
-  traces: { title: 'Traces', actionLabel: 'Refresh' },
-  feedback: { title: 'Feedback', actionLabel: 'Refresh' },
-};
-
-function scopeLabel(
-  indexedFilenames: string[],
-  selectedFilenames: string[],
-  selectedTags: string[] = [],
-): string {
-  const tagPart = selectedTags.length > 0 ? ` · #${selectedTags.join(' #')}` : '';
-  if (selectedFilenames.length === 0) {
-    return selectedTags.length > 0
-      ? `Tagged${tagPart}`
-      : `All ${indexedFilenames.length} documents`;
-  }
-  if (selectedFilenames.length === 1) return `${selectedFilenames[0]}${tagPart}`;
-  return `${selectedFilenames.length} documents${tagPart}`;
-}
-
 function App() {
-  const [apiStatus, setApiStatus] = useState<ApiStatus>('checking');
-  // The first corpus listing has come back (or failed): until then "no documents"
-  // only means "not loaded yet", and must not tell anyone to upload one.
-  const [corpusChecked, setCorpusChecked] = useState(false);
-  // The first listing failed with something other than a 401 (a 500, a timeout on a
-  // large corpus): unknown, not empty. It used to read as "no documents" and disabled
-  // the composer under "Upload a document to start." until a reload.
-  const [listingFailed, setListingFailed] = useState(false);
-  const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
   const [theme, setTheme] = useState<'dark' | 'light'>(
@@ -180,13 +90,6 @@ function App() {
   const [searchOpened, setSearchOpened] = useState(false);
   if (rail === 'search' && !searchOpened) setSearchOpened(true);
   const [searchResetKey, setSearchResetKey] = useState(0);
-  const [traces, setTraces] = useState<TraceSummaryResponse[] | null>(null);
-  const [tracesError, setTracesError] = useState<string | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
-  // Set once the user opens or closes the inspector themselves. The width-driven
-  // auto-collapse must not override a deliberate choice — otherwise crossing a
-  // breakpoint silently undoes what the user just did.
-  const [inspectorForced, setInspectorForced] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sources');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -197,17 +100,18 @@ function App() {
     hold: holdToast,
     release: releaseToast,
   } = useToasts();
-  const [exportingBackup, setExportingBackup] = useState(false);
-  // Optimistic until /access answers: a full-key (or keyless) server is the common case.
-  const [access, setAccess] = useState<AccessLevel>('full');
-  const readOnly = access === 'read';
-  const [restoring, setRestoring] = useState(false);
   const [notifyOnAnswer, setNotifyOnAnswer] = useState(
     () => readStored(NOTIFY_STORAGE_KEY) === 'true',
   );
   const restoreInputRef = useRef<HTMLInputElement>(null);
-  const exportingRef = useRef(false);
   const { tooNarrowForInspector, roomyEnoughForInspector, panelCollapsed } = useResponsiveLayout();
+  // Reopening on a new turn should follow the conversation again rather than resurface
+  // whatever trace row was last clicked.
+  const { inspectorOpen, showInspector, closeInspector, toggleInspector } = useInspectorVisibility(
+    tooNarrowForInspector,
+    roomyEnoughForInspector,
+    () => setPinnedTraceId(null),
+  );
   // Narrow screens only: whether the context panel's drawer is showing. On wider screens
   // the panel is a grid column and this is ignored.
   const [panelDrawerOpen, setPanelDrawerOpen] = useState(false);
@@ -246,6 +150,7 @@ function App() {
     persistPartial,
     setTurnFeedback,
     scope,
+    conversationWorkspace,
     setScope,
     pruneScopes,
     removeFromScopes,
@@ -276,6 +181,7 @@ function App() {
     handleDismissUpload,
     handleCancelUpload,
     handleReindex,
+    handleUploadFromUrl,
     handleReindexMany,
     handleReindexAllStale,
     handleDeleteDocument,
@@ -283,11 +189,67 @@ function App() {
     trackJobs,
   } = useCorpus({
     onAuthFailure: (err) => noteAuthFailure(err),
-    onAuthRestored: () => setApiStatus((prev) => (prev === 'unauthorized' ? 'ok' : prev)),
+    onAuthRestored: () => noteAuthRestored(),
     pushToast,
     pruneScopes,
     removeFromScopes,
   });
+
+  // The server's config, key and reachability; the corpus's first listing.
+  const applyConfig = (configResult: PublicConfigResponse) => {
+    setAdvancedOptions((prev) => {
+      const clamped = clampOverrides(prev, configResult);
+      const changed =
+        clamped.rerankTopK !== prev.rerankTopK ||
+        clamped.maxContextChunks !== prev.maxContextChunks ||
+        clamped.llmTemperature !== prev.llmTemperature;
+      if (!changed) return prev;
+      writeStored(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(clamped));
+      return clamped;
+    });
+    // A provider picked earlier in this browser wins while it can answer; otherwise
+    // the server's default, then any other that can (never stuck on an Ollama that
+    // is down while OpenAI is configured). The remembered choice stays stored.
+    const startOn = initialProvider(readStored(PROVIDER_STORAGE_KEY), configResult);
+    if (startOn) setSelectedProvider(startOn);
+  };
+  const {
+    apiStatus,
+    corpusChecked,
+    listingFailed,
+    config,
+    access,
+    noteAuthFailure,
+    noteAuthRestored,
+    refreshAccess,
+    retryBoot,
+  } = useAppBoot({
+    refreshDocuments,
+    onConfig: applyConfig,
+    beforeListing: (signal) => dropRememberedIfGone(signal),
+  });
+  const readOnly = access === 'read';
+  const workspacesEnabled = Boolean(config?.workspaces_enabled);
+  const { workspace, workspaces, dropRememberedIfGone, chooseWorkspace, createWorkspace, deleteWorkspace } =
+    useWorkspaces({
+      enabled: workspacesEnabled,
+      conversationWorkspace,
+      activeConversationId,
+      newConversation: () => newConversation(),
+      refreshDocuments,
+      noteAuthFailure,
+      pushToast,
+      onSwitched: () => setSourceView(null),
+    });
+  const { exportingBackup, restoring, downloadBackup, restoreBackup, downloadOriginal } =
+    useBackupActions({
+      pushToast,
+      noteAuthFailure,
+      onRestoreQueued: async (jobs) => {
+        setRail('corpus');
+        await trackJobs(jobs);
+      },
+    });
   // The search scope belongs to the active conversation (see useChat).
   const selectedFilenames = scope.filenames;
   const selectedTags = scope.tags;
@@ -402,108 +364,6 @@ function App() {
     writeStored(THEME_STORAGE_KEY, next);
   });
 
-  /** Note a 401 so it isn't mistaken for an empty corpus.
-   *
-   * /health and /config are unauthenticated, so a server with API_KEY set answers both
-   * and the app looks healthy — while every /documents call 401s. Swallowing that left
-   * indexedFilenames empty, which disabled the composer under the hint "Upload a
-   * document to start.", advice that would itself have 401'd. Returns true when it
-   * handled the error, so callers keep their own fallback for everything else.
-   */
-  const noteAuthFailure = useStableHandler((err: unknown): boolean => {
-    if (err instanceof ApiClientError && err.statusCode === 401) {
-      setApiStatus('unauthorized');
-      return true;
-    }
-    // A 403 means a read-only key (API_READ_KEY): hide what it can't do from now on.
-    // The error itself is still shown by the caller.
-    if (err instanceof ApiClientError && err.statusCode === 403) setAccess('read');
-    return false;
-  });
-
-  /** Ask the server which key this browser holds. An older server without /access
-   *  (404) is treated as full access; a 403 on any write corrects that later. */
-  const refreshAccess = async (signal?: AbortSignal) => {
-    try {
-      setAccess((await api.access(signal)).access);
-    } catch (err) {
-      if (err instanceof ApiClientError && err.statusCode === 404) setAccess('full');
-      else noteAuthFailure(err);
-    }
-  };
-
-  // Bumped to boot again: by the backoff below after a failed /config, or by the
-  // banner's "Retry now". The API may just be starting (compose boots it after Qdrant),
-  // and a one-shot boot left the page on "start the API and refresh" for good.
-  const [bootAttempt, setBootAttempt] = useState(0);
-  const retryBoot = useCallback(() => setBootAttempt((attempt) => attempt + 1), []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-
-    // /config, /access and the corpus listing go out together: each round trip used to
-    // wait for the one before it (a /health probe first), and the composer said "Upload
-    // a document" until the listing, the last of them, came back.
-    async function boot() {
-      const listing = refreshDocuments(controller.signal)
-        .then(() => {
-          if (!cancelled) setListingFailed(false);
-        })
-        .catch((err) => {
-          // Anything other than a 401 leaves the corpus unknown; the effect below
-          // retries the listing until it answers.
-          if (!cancelled && !noteAuthFailure(err)) setListingFailed(true);
-        })
-        .finally(() => {
-          if (!cancelled) setCorpusChecked(true);
-        });
-      void refreshAccess(controller.signal);
-      try {
-        const configResult = await api.config(controller.signal);
-        if (cancelled) return;
-        setConfig(configResult);
-        setAdvancedOptions((prev) => {
-          const clamped = clampOverrides(prev, configResult);
-          const changed =
-            clamped.rerankTopK !== prev.rerankTopK ||
-            clamped.maxContextChunks !== prev.maxContextChunks ||
-            clamped.llmTemperature !== prev.llmTemperature;
-          if (!changed) return prev;
-          writeStored(ADVANCED_OPTIONS_STORAGE_KEY, JSON.stringify(clamped));
-          return clamped;
-        });
-        // A provider picked earlier in this browser wins while it can answer; otherwise
-        // the server's default, then any other that can (never stuck on an Ollama that
-        // is down while OpenAI is configured). The remembered choice stays stored.
-        const startOn = initialProvider(readStored(PROVIDER_STORAGE_KEY), configResult);
-        if (startOn) setSelectedProvider(startOn);
-        // The listing or /access may have answered 401 first; that stands.
-        setApiStatus((prev) => (prev === 'unauthorized' ? prev : 'ok'));
-      } catch {
-        if (cancelled) return;
-        setApiStatus('error');
-        retryTimer = setTimeout(
-          () => setBootAttempt((attempt) => attempt + 1),
-          Math.min(BOOT_RETRY_BASE_MS * 2 ** bootAttempt, BOOT_RETRY_MAX_MS),
-        );
-      }
-      await listing;
-    }
-
-    void boot();
-    return () => {
-      cancelled = true;
-      clearTimeout(retryTimer);
-      // Aborting releases the in-flight request instead of just ignoring its result.
-      controller.abort();
-    };
-    // Boots once, and again per retry. refreshDocuments reads only setters and useChat's
-    // stable pruneScopes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bootAttempt]);
-
   // The markdown renderer is its own chunk; fetch it once the first paint is done, so
   // it is there before the first answer is.
   useEffect(() => {
@@ -516,37 +376,16 @@ function App() {
     return () => clearTimeout(timer);
   }, []);
 
-  const [feedbackItems, setFeedbackItems] = useState<FeedbackItemResponse[] | null>(null);
-  const [feedbackError, setFeedbackError] = useState<string | null>(null);
-  // One request per list at a time: a Refresh aborts the load still in flight, whose
-  // late answer used to overwrite the newer one.
-  const feedbackRequestRef = useRef<AbortController | null>(null);
-  const loadFeedback = () => {
-    feedbackRequestRef.current?.abort();
-    const controller = new AbortController();
-    feedbackRequestRef.current = controller;
-    const { signal } = controller;
-    setFeedbackItems(null);
-    setFeedbackError(null);
-    api
-      .listFeedback(200, signal)
-      .then((response) => {
-        if (!signal.aborted) setFeedbackItems(response.feedback);
-      })
-      .catch((err) => {
-        if (signal.aborted) return;
-        noteAuthFailure(err);
-        setFeedbackError(apiErrorMessage(err, 'Could not load feedback.'));
-      });
-  };
-
-  useEffect(() => {
-    if (rail !== 'feedback') return;
-    loadFeedback();
-    return () => feedbackRequestRef.current?.abort();
-    // loadFeedback only calls setters, refs and the API.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rail]);
+  const {
+    items: feedbackItems,
+    error: feedbackError,
+    load: loadFeedback,
+  } = usePanelList<FeedbackItemResponse>(
+    rail === 'feedback',
+    async (signal) => (await api.listFeedback(200, signal)).feedback,
+    noteAuthFailure,
+    'Could not load feedback.',
+  );
 
   // The feedback panel needs feedback on and the full key (GET /feedback is operator data).
   const feedbackPanelAvailable = Boolean(config?.feedback_enabled) && !readOnly;
@@ -554,34 +393,16 @@ function App() {
     if (rail === 'feedback' && !feedbackPanelAvailable) setRail('chat');
   }, [rail, feedbackPanelAvailable]);
 
-  const tracesRequestRef = useRef<AbortController | null>(null);
-  const loadTraces = () => {
-    tracesRequestRef.current?.abort();
-    const controller = new AbortController();
-    tracesRequestRef.current = controller;
-    const { signal } = controller;
-    setTraces(null);
-    setTracesError(null);
-    api
-      .listTraces(signal)
-      .then((response) => {
-        if (!signal.aborted) setTraces(response.traces);
-      })
-      .catch((err) => {
-        if (signal.aborted) return;
-        // A 401 is the key banner's to explain, like every other list.
-        noteAuthFailure(err);
-        setTracesError(apiErrorMessage(err, 'Could not load traces.'));
-      });
-  };
-
-  useEffect(() => {
-    if (rail !== 'traces') return;
-    loadTraces();
-    return () => tracesRequestRef.current?.abort();
-    // loadTraces only calls setters, refs and the API.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rail]);
+  const {
+    items: traces,
+    error: tracesError,
+    load: loadTraces,
+  } = usePanelList<TraceSummaryResponse>(
+    rail === 'traces',
+    async (signal) => (await api.listTraces(signal)).traces,
+    noteAuthFailure,
+    'Could not load traces.',
+  );
 
   // A trace row is a debugging artifact, so opening one implies Engineer mode — the
   // Trace tab does not exist in Reader and the click would otherwise appear to do
@@ -590,10 +411,9 @@ function App() {
     setPinnedTraceId(traceId);
     setMode('engineer');
     setInspectorTab('trace');
-    setInspectorOpen(true);
-    // Opening a trace is an explicit request to see the inspector, so it outranks the
-    // width rule the same way a manual toggle does.
-    setInspectorForced(true);
+    // An explicit request to see the inspector: it outranks the width rule the same way
+    // a manual toggle does.
+    showInspector();
     // On a narrow screen the inspector opens as a drawer; the panel drawer the trace was
     // picked from would otherwise sit on top of it.
     setPanelDrawerOpen(false);
@@ -611,25 +431,6 @@ function App() {
     if (panelCollapsed) setPanelDrawerOpen((open) => !(open && panel === rail));
     setRail(panel);
   });
-
-  // Width-driven open/close, deferring to the user once they have taken a position —
-  // except that a side panel opened on a wide window closes when the window narrows:
-  // below that width it is a modal drawer, which took focus and trapped Tab for an
-  // inspector nobody had just asked for.
-  const inspectorOpenedNarrowRef = useRef(false);
-  useEffect(() => {
-    if (inspectorOpen) inspectorOpenedNarrowRef.current = tooNarrowForInspector;
-    // Only when it opens: a resize while open is the effect below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inspectorOpen]);
-  useEffect(() => {
-    if (inspectorForced) {
-      if (tooNarrowForInspector && !inspectorOpenedNarrowRef.current) setInspectorOpen(false);
-      return;
-    }
-    if (tooNarrowForInspector) setInspectorOpen(false);
-    else if (roomyEnoughForInspector) setInspectorOpen(true);
-  }, [inspectorForced, tooNarrowForInspector, roomyEnoughForInspector]);
 
   const apiReachable = apiStatus === 'ok';
 
@@ -653,86 +454,9 @@ function App() {
       void handleUpload(accepted);
     }
   });
-  // The server can go away after boot (a restart, a laptop's network dropping). The
-  // footer said "api ok" for the rest of the session, and the first sign was a failed
-  // question. /health is polled while the page is visible — every 30 s, every 5 s once
-  // it has failed — and the browser's offline/online events are taken at their word.
-  const [connectionLost, setConnectionLost] = useState(false);
-  const connectionLostRef = useRef(false);
-  connectionLostRef.current = connectionLost;
   const booted = apiStatus === 'ok' || apiStatus === 'unauthorized';
-  useEffect(() => {
-    if (!booted) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const schedule = () => {
-      clearTimeout(timer);
-      timer = setTimeout(
-        () => void check(),
-        connectionLostRef.current ? HEALTH_RETRY_MS : HEALTH_POLL_MS,
-      );
-    };
-    const markLost = (lost: boolean) => {
-      // The ref too, at once: the next check is scheduled before React re-renders.
-      connectionLostRef.current = lost;
-      setConnectionLost(lost);
-    };
-    const check = async () => {
-      if (document.visibilityState !== 'hidden') {
-        try {
-          await api.health();
-          if (!cancelled) markLost(false);
-        } catch {
-          if (!cancelled) markLost(true);
-        }
-      }
-      if (!cancelled) schedule();
-    };
-    const goneOffline = () => {
-      markLost(true);
-      schedule();
-    };
-    const backOnline = () => void check();
-    window.addEventListener('offline', goneOffline);
-    window.addEventListener('online', backOnline);
-    schedule();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-      window.removeEventListener('offline', goneOffline);
-      window.removeEventListener('online', backOnline);
-    };
-  }, [booted]);
+  const connectionLost = useConnectionMonitor(booted);
 
-  // Retry a listing that failed (not a 401) while the page is open, backing off.
-  useEffect(() => {
-    if (!listingFailed) return;
-    let cancelled = false;
-    let delay = LISTING_RETRY_BASE_MS;
-    let timer: ReturnType<typeof setTimeout>;
-    const attempt = () => {
-      timer = setTimeout(() => {
-        refreshDocuments()
-          .then(() => {
-            if (!cancelled) setListingFailed(false);
-          })
-          .catch((err) => {
-            if (cancelled) return;
-            if (noteAuthFailure(err)) {
-              setListingFailed(false);
-              return;
-            }
-            delay = Math.min(delay * 2, BOOT_RETRY_MAX_MS);
-            attempt();
-          });
-      }, delay);
-    };
-    attempt();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [listingFailed, refreshDocuments, noteAuthFailure]);
   const noDocs = corpusChecked && !listingFailed && indexedFilenames.length === 0;
   const booting = apiStatus === 'checking' || !corpusChecked;
   // Auth takes precedence over noDocs: when the corpus list 401s, "no documents" is a
@@ -771,7 +495,9 @@ function App() {
       ? config.llm_model
       : selectedProvider === 'openai_compatible'
         ? config.openai_compatible_model || 'OpenAI-compatible'
-        : config.openai_model
+        : selectedProvider === 'anthropic'
+          ? config.anthropic_model || 'Anthropic'
+          : config.openai_model
     : undefined;
 
   // The turn the inspector describes: the one pinned by a trace-row click, else the
@@ -809,23 +535,43 @@ function App() {
   // React.memo(ChatMessage) and reintroduce a full-list re-render on every SSE delta.
   const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
   const currentScopeLabel = scopeLabel(indexedFilenames, selectedFilenames, selectedTags);
+  // `task`: a summary or comparison (its own documents; the scope doesn't apply).
   const askQuestion = useCallback(
-    (question: string) =>
+    (question: string, task?: DocumentTask) =>
       ask(question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
         modelLabel: currentModelLabel,
+        ...(task ? { task } : {}),
       }),
     [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
   // Regenerate must produce a new answer, not the cached copy of the one on screen.
   const regenerateQuestion = useCallback(
-    (question: string) =>
+    (question: string, task?: DocumentTask) =>
       ask(question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
         bypassCache: true,
         modelLabel: currentModelLabel,
+        ...(task ? { task } : {}),
       }),
     [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
+  );
+  // One document summarized, or two compared, as a turn in the open conversation.
+  const summarizeDocuments = useCallback(
+    (filenames: string[]) => {
+      const task: DocumentTask =
+        filenames.length === 2
+          ? { mode: 'compare', filenames: filenames.slice(0, 2) }
+          : { mode: 'summarize', filenames: filenames.slice(0, 1) };
+      const label =
+        task.mode === 'compare'
+          ? `Compare ${task.filenames[0]} and ${task.filenames[1]}`
+          : `Summarize ${task.filenames[0]}`;
+      // On a narrow screen the corpus panel is a drawer over the conversation.
+      setPanelDrawerOpen(false);
+      void askQuestion(label, task);
+    },
+    [askQuestion],
   );
   const editQuestion = useCallback(
     (turnId: string, question: string) => {
@@ -962,59 +708,12 @@ function App() {
   const openSettings = useCallback(() => {
     if (configLoaded) setSettingsOpen(true);
   }, [configLoaded]);
-  const closeInspector = useCallback(() => setInspectorOpen(false), []);
   const closePanelDrawer = useCallback(() => setPanelDrawerOpen(false), []);
   const changeProvider = useCallback((provider: LlmProvider) => {
     setSelectedProvider(provider);
     writeStored(PROVIDER_STORAGE_KEY, provider);
   }, []);
-  const inspectorOpenRef = useRef(inspectorOpen);
-  inspectorOpenRef.current = inspectorOpen;
-  const toggleInspector = useCallback(() => {
-    // Reopening on a new turn should follow the conversation again rather than
-    // resurface whatever trace row was last clicked.
-    if (!inspectorOpenRef.current) setPinnedTraceId(null);
-    setInspectorForced(true);
-    setInspectorOpen((prev) => !prev);
-  }, []);
-
   const importInputRef = useRef<HTMLInputElement>(null);
-
-  const exportControllerRef = useRef<AbortController | null>(null);
-  useEffect(() => () => exportControllerRef.current?.abort(), []);
-
-  // Starts a backup download, or cancels the one running (the palette command toggles).
-  const downloadBackup = () => {
-    if (exportingRef.current) {
-      exportControllerRef.current?.abort();
-      return;
-    }
-    exportingRef.current = true;
-    setExportingBackup(true);
-    const controller = new AbortController();
-    exportControllerRef.current = controller;
-    pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
-    api
-      .exportCorpus(controller.signal)
-      .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
-      .catch((err) => {
-        if (controller.signal.aborted) {
-          pushToast({ tone: 'info', title: 'Backup cancelled' });
-          return;
-        }
-        if (noteAuthFailure(err)) return;
-        pushToast({
-          tone: 'bad',
-          title: 'Backup failed',
-          body: apiErrorMessage(err, 'Could not build the backup.'),
-        });
-      })
-      .finally(() => {
-        exportingRef.current = false;
-        exportControllerRef.current = null;
-        setExportingBackup(false);
-      });
-  };
 
   const startUpload = useStableHandler(() => {
     setRail('corpus');
@@ -1051,6 +750,8 @@ function App() {
       readOnly,
       restoring,
       exportingBackup,
+      scopedFilenames: selectedFilenames,
+      answerInFlight: pending,
     },
     {
       newConversation: () => {
@@ -1078,6 +779,7 @@ function App() {
       importConversation: () => importInputRef.current?.click(),
       clear,
       switchConversation,
+      summarize: summarizeDocuments,
     },
     {
       otherDialogOpen: settingsOpen || sourceView !== null,
@@ -1086,62 +788,6 @@ function App() {
     },
   );
 
-  const handleRestoreFile = async (file: File) => {
-    setRestoring(true);
-    pushToast({ tone: 'info', title: 'Restoring backup…', body: file.name });
-    let result;
-    try {
-      result = await api.importBackup(file);
-    } catch (err) {
-      if (!noteAuthFailure(err)) {
-        pushToast({
-          tone: 'bad',
-          title: 'Restore failed',
-          body: apiErrorMessage(err, 'Could not read the backup.'),
-        });
-      }
-      return;
-    } finally {
-      setRestoring(false);
-    }
-    const notes = [
-      result.skipped.length > 0 && `${result.skipped.length} already indexed (kept as is)`,
-      result.deferred.length > 0 &&
-        `${result.deferred.length} waiting for room in the queue — restore the same file again later`,
-      result.missing_originals.length > 0 &&
-        `${result.missing_originals.length} had no stored original in the backup`,
-      result.rejected.length > 0 && `${result.rejected.length} couldn't be used`,
-      result.feedback_imported > 0 && `${result.feedback_imported} ratings restored`,
-    ].filter(Boolean);
-    pushToast({
-      tone: result.deferred.length + result.rejected.length > 0 ? 'warn' : 'good',
-      title: `Restoring ${result.jobs.length} document${result.jobs.length === 1 ? '' : 's'}`,
-      body: notes.length > 0 ? `${notes.join('; ')}.` : undefined,
-    });
-    if (result.jobs.length > 0) {
-      setRail('corpus');
-      await trackJobs(result.jobs);
-    }
-  };
-
-  const downloadOriginal = useCallback(
-    (filename: string) => {
-      api
-        .getDocumentOriginal(filename)
-        .then((blob) => downloadFile(filename, blob.type || 'application/octet-stream', blob))
-        .catch((err) => {
-          if (noteAuthFailure(err)) return;
-          pushToast({
-            tone: 'bad',
-            title: 'Download failed',
-            body: apiErrorMessage(err, 'Could not fetch the original.'),
-          });
-        });
-    },
-    // noteAuthFailure only calls state setters; pushToast is stable.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pushToast],
-  );
   const handleImportFile = async (file: File) => {
     let parsed: unknown;
     try {
@@ -1216,7 +862,7 @@ function App() {
         onChange={(event) => {
           const file = event.target.files?.[0];
           event.target.value = '';
-          if (file) void handleRestoreFile(file);
+          if (file) void restoreBackup(file);
         }}
         data-testid="restore-backup-input"
       />
@@ -1251,6 +897,17 @@ function App() {
             streamingId={pending ? streamingConversationId : null}
           />
         )}
+        {rail === 'corpus' && workspacesEnabled && (
+          <WorkspaceBar
+            current={workspace}
+            workspaces={workspaces}
+            disabled={pending}
+            readOnly={readOnly}
+            onSwitch={chooseWorkspace}
+            onCreate={createWorkspace}
+            onDelete={deleteWorkspace}
+          />
+        )}
         {rail === 'corpus' && (
           <CorpusPanel
             filenames={indexedFilenames}
@@ -1274,6 +931,8 @@ function App() {
             readOnly={readOnly}
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
             onRead={handleReadDocument}
+            onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
+            onSummarize={summarizeDocuments}
           />
         )}
         {/* Kept once opened, hidden while another panel shows: its query and results
@@ -1341,6 +1000,7 @@ function App() {
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
               onRegenerate={regenerateQuestion}
+              onAskFollowup={askQuestion}
               onEditQuestion={editQuestion}
               feedbackEnabled={config?.feedback_enabled}
               onFeedback={handleFeedback}
@@ -1393,7 +1053,7 @@ function App() {
       </main>
       <LazyChunkBoundary
         onDismiss={() => {
-          setInspectorOpen(false);
+          closeInspector();
           setPaletteOpen(false);
           setSettingsOpen(false);
           setSourceView(null);

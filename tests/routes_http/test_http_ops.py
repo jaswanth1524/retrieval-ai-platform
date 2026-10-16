@@ -470,6 +470,21 @@ def test_config_reports_the_openai_compatible_provider(api_context: ApiTestConte
     assert payload["openai_compatible_model"] == "qwen"
 
 
+def test_config_reports_the_anthropic_provider_without_its_key(
+    api_context: ApiTestContext,
+) -> None:
+    payload = api_context.client.get("/config").json()
+    assert payload["anthropic_available"] is False
+
+    configured = make_settings(anthropic_api_key="sk-ant-secret", anthropic_model="claude-x")
+    api_context.app.dependency_overrides[get_app_settings] = lambda: configured
+
+    response = api_context.client.get("/config")
+    assert response.json()["anthropic_available"] is True
+    assert response.json()["anthropic_model"] == "claude-x"
+    assert "sk-ant-secret" not in response.text
+
+
 def test_the_api_version_comes_from_pyproject(api_context: ApiTestContext) -> None:
     import tomllib
 

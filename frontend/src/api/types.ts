@@ -36,6 +36,13 @@ export interface PublicConfigResponse {
   /** An OpenAI-compatible server (vLLM, llama.cpp, LM Studio) is configured. */
   openai_compatible_available?: boolean;
   openai_compatible_model?: string;
+  /** WORKSPACES_ENABLED: separate corpora chosen per request; absent on older servers. */
+  workspaces_enabled?: boolean;
+  /** URL_INGEST_ENABLED: documents can be added from a URL; absent on older servers. */
+  url_ingest_enabled?: boolean;
+  /** ANTHROPIC_API_KEY is set; absent on older servers. */
+  anthropic_available?: boolean;
+  anthropic_model?: string;
   /** Providers a question may pick per request (ALLOWED_REQUEST_PROVIDERS). */
   allowed_request_providers?: string[];
   // Upload suffixes the server accepts (".pdf", ".epub", ...); absent on older servers.
@@ -258,10 +265,33 @@ export interface HistoryMessage {
   content: string;
 }
 
-export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible';
+export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible' | 'anthropic';
 
 /** Per-question options beyond the retrieval overrides. */
+/** A whole-document task (POST /questions/summary): summarize one document, or
+ *  compare two. Kept on the turn that asked it, so Retry and Regenerate repeat it. */
+export interface DocumentTask {
+  mode: 'summarize' | 'compare';
+  filenames: string[];
+  /** What to concentrate on; a general summary when absent. */
+  instruction?: string;
+}
+
+/** GET /workspaces: the workspaces besides the default one. */
+export interface WorkspaceListResponse {
+  enabled: boolean;
+  workspaces: string[];
+}
+
+/** How much of the documents a summary read (fewer than all when sampled). */
+export interface SummaryCoverage {
+  read: number;
+  total: number;
+}
+
 export interface QuestionOptions {
+  /** Ask this whole-document task instead of a retrieval question. */
+  task?: DocumentTask;
   /** Only documents carrying one of these tags. */
   tags?: string[];
   /** Skip the server's answer cache (Regenerate). */

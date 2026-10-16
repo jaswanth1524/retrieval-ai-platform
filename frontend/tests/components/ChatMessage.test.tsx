@@ -341,6 +341,73 @@ describe('ChatMessage', () => {
     expect(onRetry).toHaveBeenCalledWith('What is DocRAG?');
   });
 
+  it('retries a failed summary as the same summary, and offers no edit for one', async () => {
+    const onRetry = vi.fn();
+    const task = { mode: 'summarize' as const, filenames: ['a.pdf'] };
+    const { unmount } = render(
+      <ChatMessage
+        turn={makeTurn({ role: 'error', content: 'boom', question: 'Summarize a.pdf', task })}
+        engineerMode={false}
+        onRetry={onRetry}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId('chat-message-retry'));
+    expect(onRetry).toHaveBeenCalledWith('Summarize a.pdf', task);
+    unmount();
+
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'user', content: 'Summarize a.pdf', task })}
+        engineerMode={false}
+        onEditQuestion={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /edit/i })).not.toBeInTheDocument();
+  });
+
+  it('regenerates a summary as a summary and says when it read only part of the document', async () => {
+    const onRegenerate = vi.fn();
+    const task = { mode: 'compare' as const, filenames: ['a.pdf', 'b.pdf'] };
+    render(
+      <ChatMessage
+        turn={makeTurn({ role: 'assistant', content: 'They differ [1].', coverage: { read: 40, total: 300 } })}
+        engineerMode={false}
+        regenerateQuestion="Compare a.pdf and b.pdf"
+        regenerateTask={task}
+        onRetry={vi.fn()}
+        onRegenerate={onRegenerate}
+      />,
+    );
+
+    expect(screen.getByTestId('chat-message-coverage')).toHaveTextContent('read 40 of 300 passages');
+    await userEvent.click(screen.getByTestId('chat-message-regenerate'));
+    expect(onRegenerate).toHaveBeenCalledWith('Compare a.pdf and b.pdf', task);
+  });
+
+  it('offers suggested follow-ups as one-click questions, held while another is answered', async () => {
+    const onAskFollowup = vi.fn();
+    const turn = makeTurn({
+      role: 'assistant',
+      content: 'Alpha [1].',
+      followups: ['What about beta?', 'Where is gamma?'],
+    });
+    const { rerender } = render(
+      <ChatMessage turn={turn} engineerMode={false} onAskFollowup={onAskFollowup} />,
+    );
+
+    const chips = screen.getAllByTestId('chat-message-followup');
+    expect(chips.map((chip) => chip.textContent)).toEqual(['What about beta?', 'Where is gamma?']);
+    await userEvent.click(chips[1]);
+    expect(onAskFollowup).toHaveBeenCalledWith('Where is gamma?');
+
+    rerender(<ChatMessage turn={turn} engineerMode={false} onAskFollowup={onAskFollowup} busy />);
+    expect(screen.getAllByTestId('chat-message-followup')[0]).toBeDisabled();
+    // Without the handler (an older answer), nothing is offered.
+    rerender(<ChatMessage turn={turn} engineerMode={false} />);
+    expect(screen.queryByTestId('chat-message-followup')).not.toBeInTheDocument();
+  });
+
   it('renders no Retry button when the error turn has no retained question', () => {
     render(<ChatMessage turn={makeTurn({ role: 'error', content: 'boom' })} engineerMode={false} onRetry={vi.fn()} />);
 

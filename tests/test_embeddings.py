@@ -226,3 +226,32 @@ def test_embed_query_reuses_a_recent_query_embedding() -> None:
         provider.embed_query(f"filler {index}")
     provider.embed_query("what is docrag")
     assert dense.seen[-1] == "PREFIX: what is docrag"  # evicted, so embedded again
+
+
+def test_the_passage_prefix_reaches_only_the_dense_corpus_side() -> None:
+    settings = make_test_settings(
+        dense_passage_prefix="passage: ", dense_query_instruction="query: "
+    )
+    dense = RecordingDenseModel()
+    sparse = RecordingSparseModel()
+    provider = LocalEmbeddingProvider(settings, dense_model=dense, sparse_model=sparse)
+
+    provider.embed_texts(["Alpha.", "Beta."])
+    provider.embed_query("alpha?")
+
+    assert dense.seen == ["passage: Alpha.", "passage: Beta.", "query: alpha?"]
+    assert sparse.embed_seen == ["Alpha.", "Beta."]
+    assert sparse.query_seen == ["alpha?"]
+
+
+def test_bm25_gets_a_stemmer_language_only_when_it_is_not_english() -> None:
+    from api.embeddings import sparse_model_options
+
+    assert sparse_model_options(make_test_settings()) == {}
+    assert sparse_model_options(make_test_settings(sparse_language=" German ")) == {
+        "language": "german"
+    }
+    other = make_test_settings(
+        sparse_embedding_model="prithivida/Splade_PP_en_v1", sparse_language="german"
+    )
+    assert sparse_model_options(other) == {}

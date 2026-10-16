@@ -405,9 +405,14 @@
   line-height: 1;
 }
 
-.corpus-panel__read:hover,
+.corpus-panel__read:hover:not(:disabled),
 .corpus-panel__read:focus-visible {
   color: var(--accent);
+}
+
+.corpus-panel__read:disabled {
+  cursor: default;
+  opacity: 0.4;
 }
 
 .corpus-panel__controls {
@@ -491,4 +496,77 @@
 .corpus-panel__bulk-delete:hover:not(:disabled) {
   color: var(--bad);
   border-color: var(--bad);
+}
+
+/* "From URL": a single row under the dropzone. */
+.corpus-panel__url {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+/* Looks like the filter field (.corpus-panel__search). */
+.corpus-panel__url-input {
+  flex: 1 1 160px;
+  min-width: 0;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--fm);
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.corpus-panel__url-input:focus {
+  outline: 2px solid transparent;
+  border-color: var(--accent);
+}
+
+.corpus-panel__url .corpus-panel__reject {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* Workspace picker above the corpus (WORKSPACES_ENABLED). */
+.corpus-panel__workspace {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+/* On its own line: beside the select it left too little room, and Delete wrapped
+   alone onto a second row at the panel's usual width. */
+.corpus-panel__workspace-label {
+  flex-basis: 100%;
+  color: var(--rail-dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.corpus-panel__workspace-select {
+  flex: 1 1 120px;
+  min-width: 0;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--fm);
+  font-size: 12px;
+  padding: 4px 6px;
+}
+
+.corpus-panel__workspace-form {
+  display: flex;
+  flex: 1 1 100%;
+  gap: 6px;
+}
+
+.corpus-panel__workspace .corpus-panel__reject {
+  flex-basis: 100%;
+  margin: 0;
 }

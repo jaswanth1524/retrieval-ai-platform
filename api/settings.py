@@ -41,6 +41,14 @@ class AppSettings(BaseSettings):
     # retrieval, and fastembed does not apply it for us. Empty string disables it.
     # Query-side only, so changing it needs no re-ingest.
     dense_query_instruction: str = "Represent this sentence for searching relevant passages: "
+    # Prepended to every *corpus* text before dense embedding (never to queries, never
+    # to BM25). Empty for bge; "passage: " for the e5 family, which is trained on that
+    # pair with DENSE_QUERY_INSTRUCTION="query: ". Recorded with the collection: changing
+    # it is a new vector space, like changing the model.
+    dense_passage_prefix: str = ""
+    # BM25's stemmer language (Qdrant/BM25 only), e.g. "german", "french", "spanish".
+    # Recorded with the collection like the models: a change needs a re-index.
+    sparse_language: str = "english"
     reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
     embedding_model_tag: str = "fastembed:BAAI/bge-small-en-v1.5"
 
@@ -104,12 +112,14 @@ class AppSettings(BaseSettings):
 
     # Checked at startup (case-insensitive): a typo used to boot fine and then fail
     # every question with a 400 that blamed the client.
-    llm_provider: Literal["ollama", "openai", "openai_compatible"] = "ollama"
+    llm_provider: Literal["ollama", "openai", "openai_compatible", "anthropic"] = "ollama"
     # Providers a question may pick per request (`llm_provider` on /questions*), as a
     # JSON list, e.g. ["ollama"]. Unset: any configured provider. LLM_PROVIDER itself
     # is always allowed. Restricting it stops a caller — anyone with the read key, or
     # anyone at all without API_KEY — from switching to a paid provider at will.
-    allowed_request_providers: list[Literal["ollama", "openai", "openai_compatible"]] | None = None
+    allowed_request_providers: (
+        list[Literal["ollama", "openai", "openai_compatible", "anthropic"]] | None
+    ) = None
     llm_model: str = "llama3.1:8b"
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_max_tokens: PositiveInt = 512
@@ -153,6 +163,11 @@ class AppSettings(BaseSettings):
     openai_compatible_model: str = ""
     openai_compatible_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Optional Anthropic (Claude) generation, selected with LLM_PROVIDER=anthropic or
+    # per question. Like OpenAI it is a hosted add-on: upload, indexing and passage
+    # search never call it, and embeddings stay local.
+    anthropic_api_key: str | None = Field(default=None)
+    anthropic_model: str = "claude-sonnet-5-5"
     # Reasoning models (gpt-5 family) spend hidden reasoning tokens out of the same
     # max_completion_tokens budget as the visible answer. "low" keeps that spend modest
     # while still reasoning; "minimal" nearly eliminates it. "" leaves the provider
@@ -334,6 +349,51 @@ class AppSettings(BaseSettings):
     # reminder to cite. Never loops; falls back to the original answer if the retry
     # still lacks citations. See api/generation.py.
     citation_retry_enabled: bool = True
+
+    # Suggested follow-up questions (default OFF: one more LLM call per answer, which on
+    # a local model is seconds). When on, an answer that cited its sources gets up to
+    # FOLLOWUP_COUNT short questions those sources can answer, sent after the answer
+    # (a `followups` frame after `done` on the stream; `followups` on /questions).
+    followups_enabled: bool = False
+    followup_count: int = Field(default=3, ge=1, le=5)
+    followup_max_tokens: PositiveInt = 128
+
+    # Whole-document summaries and comparisons (POST /questions/summary): the document's
+    # passages are read in order, in parts of at most SUMMARY_BATCH_CHARS characters
+    # (lowered to fit LLM_CONTEXT_WINDOW / OLLAMA_NUM_CTX when known), each part is turned
+    # into cited notes, and the notes are combined into one answer. At most
+    # SUMMARY_MAX_BATCHES parts per request: a longer document is read at evenly spaced
+    # passages, and the answer reports how many it read. Each part is one LLM call, so
+    # this bounds the time a summary takes. SUMMARY_MAX_TOKENS is the final answer's
+    # budget (summaries run longer than answers); notes keep LLM_MAX_TOKENS.
+    # POST /documents/from-url (off by default): the server downloads a document from a
+    # URL and indexes it like an upload (MAX_UPLOAD_BYTES applies). Only public
+    # addresses are fetched unless URL_INGEST_ALLOW_PRIVATE is set — the request comes
+    # from inside the deployment, so a private one could reach Qdrant or cloud metadata.
+    # Separate corpora on one server (api/workspaces.py), off by default: each is its own
+    # Qdrant collection (QDRANT_COLLECTION__ws_<name>) and originals directory, chosen
+    # per request with the X-Workspace header and created with POST /workspaces. Not
+    # access control — any key that can use the API can use every workspace.
+    workspaces_enabled: bool = False
+
+    # Keep a workspace's index in step with a folder (api/watch.py): every
+    # WATCH_INTERVAL_SECONDS, new and changed supported files are indexed like uploads.
+    # Empty (default) = off. WATCH_DELETE_MISSING also deletes the document of a file
+    # that disappears — only ones the watcher saw in the folder itself. WATCH_WORKSPACE
+    # names the workspace it indexes into (needs WORKSPACES_ENABLED; created at startup
+    # if it doesn't exist yet); empty = the default workspace.
+    watch_dir: str = ""
+    watch_interval_seconds: float = Field(default=30.0, ge=2.0, le=86_400.0)
+    watch_delete_missing: bool = False
+    watch_workspace: str = ""
+
+    url_ingest_enabled: bool = False
+    url_ingest_allow_private: bool = False
+    url_ingest_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+
+    summary_batch_chars: int = Field(default=9000, ge=1000, le=200_000)
+    summary_max_batches: int = Field(default=8, ge=1, le=64)
+    summary_max_tokens: PositiveInt = 1024
 
     # Optional single shared API key. Empty (the default) keeps every route fully open,
     # preserving the zero-config self-host story. When set, every route except

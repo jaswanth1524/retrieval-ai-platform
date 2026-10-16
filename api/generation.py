@@ -54,6 +54,7 @@ from api.prompting import (
     estimate_prompt_tokens,
     fit_prompt_to_context_window,
     format_context_chunk,
+    generate_followups,
     generate_query_variants,
     needs_condense,
 )
@@ -97,6 +98,7 @@ __all__ = [
     "fit_prompt_to_context_window",
     "format_context_chunk",
     "generate_grounded_answer",
+    "generate_followups",
     "generate_query_variants",
     "needs_citation_retry",
     "needs_condense",
@@ -178,6 +180,8 @@ class GroundedAnswer:
     # Never surfaced through the HTTP response (see api/schemas.py's QuestionResponse), only
     # through the debug trace.
     prompt_messages: list[ChatMessage] = field(default_factory=list)
+    # Suggested follow-up questions (FOLLOWUPS_ENABLED); empty when off or none came.
+    followups: list[str] = field(default_factory=list)
 
 
 def generate_grounded_answer(

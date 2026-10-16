@@ -18,16 +18,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
+    get_ingest_backlog,
+    get_ingest_executor,
+    get_ingest_job_store,
+    get_qdrant_client,
+    get_raw_document_store,
     get_reranker,
     get_token_counter,
     shutdown_executors,
 )
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
+from api.ingest_jobs import delete_indexed_document, enqueue_ingest
+from api.ingest_service import IngestService
 from api.llm import GenerationConfigError, completion_model_and_kwargs
 from api.logging_config import configure_logging
 from api.metrics import build_info
 from api.qdrant_schema import check_dense_dimension
+from api.raw_documents import RawDocumentStore
+from api.repository import VectorRepository
 from api.request_guard import RequestGuardMiddleware
 from api.request_id import RequestIdMiddleware
 from api.routes import documents as documents_routes
@@ -36,11 +45,20 @@ from api.routes import ops as ops_routes
 from api.routes import questions as questions_routes
 from api.routes import search as search_routes
 from api.routes import traces as traces_routes
+from api.routes import workspaces as workspaces_routes
 from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
 from api.storage import check_writable_storage
 from api.version import app_version
+from api.watch import FolderWatcher
+from api.workspaces import (
+    WorkspaceError,
+    settings_for,
+    validate_name,
+    workspace_exists,
+    workspace_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +216,64 @@ def _build_for_warmup[T](name: str, factory: Callable[[], T]) -> T | None:
         return None
 
 
+def watch_target(settings: AppSettings) -> AppSettings:
+    """The settings of the workspace WATCH_DIR indexes into (WATCH_WORKSPACE; the app's
+    own for the default). A bad name, or a workspace with workspaces off, stops startup
+    with the setting named — rather than a watcher quietly indexing somewhere else."""
+
+    name = settings.watch_workspace.strip()
+    if not name:
+        return settings
+    if not settings.workspaces_enabled:
+        raise RuntimeError("WATCH_WORKSPACE needs WORKSPACES_ENABLED=true.")
+    try:
+        validate_name(name)
+    except WorkspaceError as exc:
+        raise RuntimeError(f"WATCH_WORKSPACE: {exc}") from exc
+    return settings_for(settings, name)
+
+
+def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
+    """Start indexing WATCH_DIR into WATCH_WORKSPACE (api/watch.py)."""
+
+    target = watch_target(settings)
+    repository = VectorRepository(get_qdrant_client())
+    raw_store = get_raw_document_store()
+    if target is not settings:
+        # Named in the configuration, so made here if it doesn't exist yet (a request
+        # never creates a workspace by naming it).
+        name = workspace_of(target)
+        if not workspace_exists(get_qdrant_client(), settings.qdrant_collection, name):
+            logger.info("Creating workspace %r for WATCH_DIR.", name)
+        repository.ensure_writable(target)
+        if raw_store is not None and target.raw_document_dir:
+            raw_store = RawDocumentStore(target.raw_document_dir)
+    settings = target
+    service = IngestService(repository, get_embedding_provider(), settings, get_token_counter())
+
+    def list_indexed() -> dict[str, float | None]:
+        metadata = repository.filename_metadata(settings)
+        return {name: meta.uploaded_at for name, meta in metadata.items()}
+
+    def enqueue(filename: str, content: bytes) -> None:
+        enqueue_ingest(
+            job_store=get_ingest_job_store(),
+            executor=get_ingest_executor(),
+            backlog=get_ingest_backlog(),
+            ingest_service=service,
+            filename=filename,
+            content=content,
+            raw_store=raw_store,
+        )
+
+    def delete(filename: str) -> None:
+        delete_indexed_document(repository, settings, raw_store, filename)
+
+    watcher = FolderWatcher(settings, list_indexed, enqueue, delete)
+    watcher.start()
+    return watcher
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
@@ -212,7 +288,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             get_token_counter(),
             settings,
         )
-    yield
+    watcher = start_folder_watcher(settings) if settings.watch_dir else None
+    try:
+        yield
+    finally:
+        if watcher is not None:
+            watcher.stop()
     shutdown_executors()
 
 
@@ -244,7 +325,7 @@ def create_app() -> FastAPI:
         # separately-hosted-frontend fallback documented in .env.example) was therefore
         # impossible. The single-origin Docker path never preflights, which is why this
         # went unnoticed.
-        allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Request-ID", "X-Workspace"],
         expose_headers=["X-Request-ID"],
     )
     # Outside CORS and the guard, so their rejections carry the headers too.
@@ -273,6 +354,7 @@ def register_routes(app: FastAPI) -> None:
     traces_routes.register(app)
     questions_routes.register(app)
     search_routes.register(app)
+    workspaces_routes.register(app)
 
 
 app = create_app()

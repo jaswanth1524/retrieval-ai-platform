@@ -161,6 +161,8 @@ def collection_metadata(settings: AppSettings) -> dict[str, str]:
         EMBEDDING_MODEL_TAG_KEY: settings.embedding_model_tag,
         "dense_embedding_model": settings.dense_embedding_model,
         "sparse_embedding_model": settings.sparse_embedding_model,
+        "sparse_language": settings.sparse_language,
+        "dense_passage_prefix": settings.dense_passage_prefix,
     }
 
 
@@ -423,6 +425,20 @@ def validate_collection_schema(
             f"'{actual_sparse if actual_sparse is not None else '<missing>'}', but the "
             f"configured model is '{settings.sparse_embedding_model}'. {RECOVERY_HINT}"
         )
+
+    # Recorded since the multilingual profile; a collection without them was built with
+    # the defaults (English stemming, no passage prefix), so a missing value means those.
+    for key, default, label in (
+        ("sparse_language", "english", "a BM25 stemmer language"),
+        ("dense_passage_prefix", "", "a dense passage prefix"),
+    ):
+        actual = metadata.get(key, default)
+        expected = str(getattr(settings, key))
+        if actual != expected:
+            raise CollectionSchemaError(
+                f"Collection '{settings.qdrant_collection}' was indexed with {label} of "
+                f"{actual!r}, but the configured one is {expected!r}. {RECOVERY_HINT}"
+            )
 
     params = collection_info.config.params
     vectors = params.vectors

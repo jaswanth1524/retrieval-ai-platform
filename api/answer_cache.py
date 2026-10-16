@@ -35,6 +35,9 @@ class CachedAnswer:
     answer_status: str = "answered"
     top_rerank_score: float | None = None
     truncated: bool = False
+    # Summaries only: (passages read, passages in the documents).
+    coverage: tuple[int, int] | None = None
+    followups: tuple[str, ...] = ()
 
 
 CacheKey = tuple[object, ...]
@@ -57,6 +60,8 @@ def answer_cache_key(
         tuple(sorted({tag.casefold() for tag in tags or ()})),
         settings.llm_provider.lower().strip(),
         model,
+        # The workspace: the same question over another corpus is another answer.
+        settings.qdrant_collection,
         int(settings.rerank_top_k),
         int(settings.max_context_chunks),
         float(settings.llm_temperature),

@@ -109,6 +109,7 @@ def restore_backup(
     has_room: Callable[[int], bool],
     enqueue: Enqueue,
     feedback_store: FeedbackStore | None,
+    workspace: str = "",
 ) -> ImportOutcome:
     try:
         archive = zipfile.ZipFile(upload)
@@ -134,7 +135,9 @@ def restore_backup(
             )
         if feedback_store is not None and "feedback.jsonl" in members:
             try:
-                _restore_feedback(archive, members["feedback.jsonl"], feedback_store, outcome)
+                _restore_feedback(
+                    archive, members["feedback.jsonl"], feedback_store, outcome, workspace
+                )
             except _UNREADABLE_MEMBER as exc:
                 # The rows before the damage are stored; the member is reported.
                 logger.warning("Backup feedback.jsonl could not be read to the end: %s", exc)
@@ -242,8 +245,10 @@ def _restore_feedback(
     info: zipfile.ZipInfo,
     store: FeedbackStore,
     outcome: ImportOutcome,
+    workspace: str,
 ) -> None:
-    """Add the backup's feedback rows, read line by line and stored in batches.
+    """Add the backup's feedback rows to ``workspace``, read line by line and stored in
+    batches.
 
     Reading the whole member and then decoding it held the file twice (up to 512 MiB);
     this holds one line and one batch.
@@ -252,7 +257,7 @@ def _restore_feedback(
     batch: list[Feedback] = []
 
     def flush() -> None:
-        added = store.import_rows(batch)
+        added = store.import_rows(batch, workspace)
         outcome.feedback_imported += added
         outcome.feedback_skipped += len(batch) - added
         batch.clear()

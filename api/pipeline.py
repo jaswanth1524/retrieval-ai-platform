@@ -11,7 +11,6 @@ import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
 from collections.abc import Set as AbstractSet
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, NotRequired, TypedDict
 
@@ -21,15 +20,17 @@ from api.answer_cache import (
     CacheKey,
     answer_cache_key,
 )
-from api.chunking import HeuristicTokenCounter, TokenCounter
 from api.citations import answer_status
-from api.corpus import bump_corpus_generation
+
+# Neighbour expansion and ingestion live in their own modules now; their names are
+# re-exported here (``x as x``) so every existing ``from api.pipeline import`` works.
+from api.context_expansion import _VARIANT_EXECUTOR as _VARIANT_EXECUTOR
+from api.context_expansion import _clip_head as _clip_head
+from api.context_expansion import _clip_tail as _clip_tail
+from api.context_expansion import _map_concurrently as _map_concurrently
+from api.context_expansion import _strip_overlap as _strip_overlap
+from api.context_expansion import expand_with_neighbors as expand_with_neighbors
 from api.diversity import select_diverse
-from api.documents import (
-    CHUNKER_VERSION,
-    chunk_sections,
-    chunking_fingerprint,
-)
 from api.errors import public_error_message
 from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
@@ -46,17 +47,16 @@ from api.generation import (
     condense_question,
     finalize_citations,
     fit_prompt_to_context_window,
+    generate_followups,
     generate_grounded_answer,
     generate_query_variants,
     needs_condense,
     source_citations,
     will_retry_citations,
 )
-from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
-from api.ingestion import IngestResult, ingest_chunks
+from api.ingest_service import DocumentIngestOutcome as DocumentIngestOutcome
+from api.ingest_service import IngestService as IngestService
 from api.llm import reset_finish_reason, stopped_at_token_limit
-from api.metrics import ingest_stage_seconds
-from api.parse_isolation import parse_with_limit
 from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
@@ -149,6 +149,10 @@ class StageEvent(TypedDict):
 
     type: Literal["stage"]
     stage: str
+    # Progress through a multi-step stage (a summary's parts): step ``step`` of
+    # ``steps``, both 1-based. Absent on single-step stages.
+    step: NotRequired[int]
+    steps: NotRequired[int]
 
 
 class DeltaEvent(TypedDict):
@@ -156,6 +160,17 @@ class DeltaEvent(TypedDict):
 
     type: Literal["delta"]
     text: str
+
+
+class FollowupsEvent(TypedDict):
+    """SSE event after ``done`` (FOLLOWUPS_ENABLED): questions to suggest next.
+
+    After ``done``, not inside it, so the answer and its citations are final while the
+    extra LLM call runs; a client that doesn't know the frame ignores it.
+    """
+
+    type: Literal["followups"]
+    questions: list[str]
 
 
 class DoneEvent(TypedDict):
@@ -173,26 +188,25 @@ class DoneEvent(TypedDict):
     top_rerank_score: NotRequired[float | None]
     # The provider cut the answer off at the token limit.
     truncated: NotRequired[bool]
+    # Summaries only: passages read, of the passages the documents hold. Fewer than
+    # the total when a long document was read at evenly spaced passages.
+    chunks_read: NotRequired[int]
+    chunks_total: NotRequired[int]
 
 
-StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent
+StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent | FollowupsEvent
 
 
-# Query-expansion variants are embedded and searched side by side: four sequential
-# embed+search round trips were the whole cost of turning expansion on. Neighbour
-# expansion fetches its per-file scrolls here too.
-_VARIANT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="docrag-variants")
+def _cited_chunks(
+    cited: Sequence[SourceCitation], selected: Sequence[RerankedChunk]
+) -> list[RerankedChunk]:
+    """The prompt chunks an answer cites (source ``n`` is ``selected[n - 1]``)."""
 
-
-def _map_concurrently[T, R](function: Callable[[T], R], items: Sequence[T]) -> list[R]:
-    """``[function(item) for item in items]``, in parallel when there is more than one."""
-
-    if len(items) <= 1:
-        return [function(item) for item in items]
-    futures = [
-        submit_in_context(_VARIANT_EXECUTOR, functools.partial(function, item)) for item in items
+    return [
+        selected[source.source_number - 1]
+        for source in cited
+        if 0 < source.source_number <= len(selected)
     ]
-    return [future.result() for future in futures]
 
 
 def _top_rerank_score(phase: RetrievalPhase) -> float | None:
@@ -222,184 +236,6 @@ def timings_dict(timings: StageTimings) -> dict[str, float]:
     # Every StageTimings field, so a new stage reaches traces and the done frame without
     # another hand-kept list (TimingsResponse is tested to have the same fields).
     return dataclasses.asdict(timings)
-
-
-# Below this, a suffix/prefix match between adjacent chunks is more likely a
-# coincidence (a shared "the"/"and") than the sentence overlap chunking wrote.
-_MIN_OVERLAP_CHARS = 20
-# Upper bound on characters per dense-model token, used only to cap how much text an
-# overlap can span. Real text averages ~4; this is generous so a genuine overlap of
-# long words is never missed.
-_MAX_CHARS_PER_TOKEN = 10
-
-
-def _strip_overlap(previous: str, following: str, overlap_tokens: int) -> str:
-    """Drop the prefix of ``following`` that repeats the tail of ``previous``.
-
-    Adjacent chunks share up to ``overlap_tokens`` of whole trailing sentences (chunks
-    are space-joined sentences), so a word-boundary suffix/prefix match finds the text
-    written twice. Returns "" when ``following`` lies entirely inside that tail, and
-    ``following`` unchanged when no overlap is found (or chunking used none).
-
-    The *shortest* match wins and the match is capped near the configured overlap:
-    in repetitive text (identical CSV rows, log lines) several lengths match, and
-    over-trimming would silently drop real content while under-trimming only resends
-    a line the model already saw.
-    """
-
-    if overlap_tokens <= 0:
-        return following
-    limit = min(len(previous), len(following), overlap_tokens * _MAX_CHARS_PER_TOKEN)
-    for end in range(_MIN_OVERLAP_CHARS, limit + 1):
-        if end < len(following) and not following[end].isspace():
-            continue
-        start = len(previous) - end
-        if start > 0 and not previous[start - 1].isspace():
-            continue
-        if previous.endswith(following[:end]):
-            return following[end:].lstrip()
-    return following
-
-
-def _clip_head(text: str, max_chars: int) -> str:
-    """The start of ``text``, at most ``max_chars`` long, cut at a word boundary.
-    ``max_chars`` 0 keeps everything."""
-
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    head = text[:max_chars]
-    mid_word = not head[-1].isspace() and not text[max_chars].isspace()
-    if mid_word and any(character.isspace() for character in head):
-        head = head.rsplit(None, 1)[0]
-    return head.rstrip()
-
-
-def _clip_tail(text: str, max_chars: int) -> str:
-    """The end of ``text``, at most ``max_chars`` long, cut at a word boundary."""
-
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    tail = text[-max_chars:]
-    mid_word = not tail[0].isspace() and not text[-max_chars - 1].isspace()
-    if mid_word and any(character.isspace() for character in tail):
-        tail = tail.split(None, 1)[1]
-    return tail.lstrip()
-
-
-def expand_with_neighbors(
-    chunks: Sequence[RerankedChunk],
-    repository: VectorRepository,
-    settings: AppSettings,
-) -> list[RerankedChunk]:
-    """Expand each reranked chunk's generation context with its immediate neighbors.
-
-    Small-to-big retrieval: rerank on tight chunks, but let the model generate from a
-    wider window around each one. Chunks with no recorded ``chunk_ordinal`` (indexed
-    before this field existed) are returned unchanged rather than erroring.
-
-    Neighbours are fetched **once per distinct filename**, not once per chunk: the
-    surviving chunks are usually a handful drawn from one or two documents, so a
-    per-chunk round trip meant up to ``rerank_top_k`` sequential Qdrant scrolls on every
-    question for data one query per file could return.
-
-    Every prompt token costs prefill time, so no text is sent twice: a neighbour that is
-    itself one of ``chunks`` (it gets its own block) or already appeared in a
-    higher-ranked chunk's block is skipped, and the overlap chunking repeats at each
-    boundary between consecutive ordinals is trimmed.
-
-    ``context_neighbor_max_chars`` (0 = no cap) keeps only the text nearest the chunk:
-    the last that many characters before it and the first that many after it. The
-    sentences right at the boundary are what resolve a chunk that starts or ends
-    mid-thought; the far side of a neighbour mostly adds prefill.
-    """
-
-    radius = int(settings.context_neighbor_radius)
-    if radius <= 0:
-        return list(chunks)
-    overlap_tokens = int(settings.chunk_overlap_tokens)
-    max_chars = int(settings.context_neighbor_max_chars)
-
-    def wanted_ordinals(chunk: RerankedChunk) -> list[int]:
-        assert chunk.chunk_ordinal is not None
-        return [
-            chunk.chunk_ordinal + delta
-            for delta in range(-radius, radius + 1)
-            if delta != 0 and chunk.chunk_ordinal + delta >= 1
-        ]
-
-    emitted: set[tuple[str, int]] = {
-        (chunk.filename, chunk.chunk_ordinal) for chunk in chunks if chunk.chunk_ordinal is not None
-    }
-
-    # Union every chunk's neighbour ordinals per filename, then one fetch per filename.
-    ordinals_by_file: dict[str, set[int]] = {}
-    for chunk in chunks:
-        if chunk.chunk_ordinal is None:
-            continue
-        ordinals_by_file.setdefault(chunk.filename, set()).update(
-            ordinal
-            for ordinal in wanted_ordinals(chunk)
-            if (chunk.filename, ordinal) not in emitted
-        )
-
-    # (filename, ordinal) -> text, so each chunk can pick its own neighbours back out.
-    # The per-file scrolls are independent round trips, so they run concurrently.
-    wanted = [
-        (filename, sorted(ordinals)) for filename, ordinals in ordinals_by_file.items() if ordinals
-    ]
-    fetched = _map_concurrently(
-        lambda item: repository.fetch_neighbors(settings, item[0], item[1]), wanted
-    )
-    neighbor_text: dict[tuple[str, int], str] = {}
-    for (filename, _), points in zip(wanted, fetched, strict=True):
-        for point in points:
-            payload = point.payload or {}
-            ordinal = payload.get("chunk_ordinal")
-            text = payload.get("text")
-            if isinstance(ordinal, int) and not isinstance(ordinal, bool) and text:
-                neighbor_text[(filename, ordinal)] = str(text)
-
-    expanded: list[RerankedChunk] = []
-    for chunk in chunks:
-        if chunk.chunk_ordinal is None:
-            expanded.append(chunk)
-            continue
-        neighbors: list[tuple[int, str]] = []
-        for ordinal in wanted_ordinals(chunk):
-            key = (chunk.filename, ordinal)
-            if key in emitted or key not in neighbor_text:
-                continue
-            emitted.add(key)
-            neighbors.append((ordinal, neighbor_text[key]))
-        if not neighbors:
-            expanded.append(chunk)
-            continue
-
-        parts = sorted([*neighbors, (chunk.chunk_ordinal, chunk.text)])
-        before: list[str] = []
-        center: list[str] = []
-        after: list[str] = []
-        previous: tuple[int, str] | None = None
-        for ordinal, text in parts:
-            if previous is not None and ordinal == previous[0] + 1:
-                trimmed = _strip_overlap(previous[1], text, overlap_tokens)
-            else:
-                trimmed = text
-            if trimmed:
-                if ordinal < chunk.chunk_ordinal:
-                    before.append(trimmed)
-                elif ordinal == chunk.chunk_ordinal:
-                    center.append(trimmed)
-                else:
-                    after.append(trimmed)
-            previous = (ordinal, text)
-        merged = [
-            _clip_tail("\n\n".join(before), max_chars),
-            *center,
-            _clip_head("\n\n".join(after), max_chars),
-        ]
-        expanded.append(replace(chunk, expanded_text="\n\n".join(part for part in merged if part)))
-    return expanded
 
 
 class QuestionAbandoned(Exception):
@@ -858,6 +694,7 @@ class RagPipeline:
                     answer_status=hit.answer_status,
                     top_rerank_score=hit.top_rerank_score,
                     truncated=hit.truncated,
+                    followups=list(hit.followups),
                 )
         grounded = self._answer_uncached(question, overrides, filenames, history, tags)
         if key is not None and self._answer_cache is not None:
@@ -870,6 +707,7 @@ class RagPipeline:
                     grounded.answer_status,
                     grounded.top_rerank_score,
                     grounded.truncated,
+                    followups=tuple(grounded.followups),
                 ),
             )
         return grounded
@@ -911,8 +749,11 @@ class RagPipeline:
                     "top_rerank_score": hit.top_rerank_score,
                     "truncated": hit.truncated,
                 }
+                if hit.followups:
+                    yield {"type": "followups", "questions": list(hit.followups)}
                 return
         done: DoneEvent | None = None
+        followups: list[str] = []
         events = self._answer_stream_uncached(
             question, overrides, filenames, history, tags, should_stop
         )
@@ -920,6 +761,8 @@ class RagPipeline:
             for event in events:
                 if event["type"] == "done":
                     done = event
+                elif event["type"] == "followups":
+                    followups = event["questions"]
                 yield event
         finally:
             # Closing this generator (the client left) must close the inner one now: its
@@ -937,6 +780,7 @@ class RagPipeline:
                     done.get("answer_status", "answered"),
                     done.get("top_rerank_score"),
                     done.get("truncated", False),
+                    followups=tuple(followups),
                 ),
             )
 
@@ -1051,13 +895,26 @@ class RagPipeline:
                     citation_retry_used=grounded.citation_retry_used,
                 )
             )
+        status = answer_status(grounded.answer, len(grounded.sources), len(selected))
+        followups = (
+            generate_followups(
+                question.strip(),
+                grounded.answer,
+                _cited_chunks(grounded.sources, selected),
+                self._generator,
+                effective_settings,
+            )
+            if effective_settings.followups_enabled and status == "answered"
+            else []
+        )
         return replace(
             grounded,
             timings=timings,
             trace_id=trace_id,
-            answer_status=answer_status(grounded.answer, len(grounded.sources), len(selected)),
+            answer_status=status,
             top_rerank_score=_top_rerank_score(phase),
             truncated=truncated,
+            followups=followups,
         )
 
     def _answer_stream_uncached(
@@ -1248,16 +1105,31 @@ class RagPipeline:
                     )
                 )
             finalized = True
+            status = answer_status(answer, len(cited), len(selected))
             yield {
                 "type": "done",
                 "answer": answer,
                 "sources": [_citation_dict(source) for source in cited],
                 "timings": timings_dict(timings),
                 "trace_id": trace_id,
-                "answer_status": answer_status(answer, len(cited), len(selected)),
+                "answer_status": status,
                 "top_rerank_score": _top_rerank_score(phase),
                 "truncated": truncated,
             }
+            if (
+                effective_settings.followups_enabled
+                and status == "answered"
+                and not (should_stop is not None and should_stop())
+            ):
+                followups = generate_followups(
+                    question.strip(),
+                    answer,
+                    _cited_chunks(cited, selected),
+                    self._generator,
+                    effective_settings,
+                )
+                if followups:
+                    yield {"type": "followups", "questions": followups}
         except QuestionAbandoned:
             return  # the finally below records the trace as closed early
         except Exception as exc:
@@ -1274,124 +1146,3 @@ class RagPipeline:
                 # return once `should_stop` reported the client gone.
                 _store_error_trace("Stream closed before completion.")
                 finalized = True
-
-
-@dataclass(frozen=True)
-class DocumentIngestOutcome:
-    """Result of parsing, chunking, and indexing one uploaded document."""
-
-    filename: str
-    sections_parsed: int
-    chunks_ingested: int
-    collection_name: str
-
-
-class IngestService:
-    """Composes parsing, chunking, embedding, and indexing behind a single call."""
-
-    def __init__(
-        self,
-        repository: VectorRepository,
-        embedding_provider: IngestEmbeddingProvider,
-        settings: AppSettings,
-        token_counter: TokenCounter | None = None,
-    ) -> None:
-        self._repository = repository
-        self._embedding_provider = embedding_provider
-        self._settings = settings
-        # Default to the heuristic (no model fetch) so direct constructions in tests
-        # stay hermetic; production DI passes the dense model's real tokenizer.
-        self._token_counter = token_counter or HeuristicTokenCounter()
-
-    def ingest(
-        self,
-        filename: str,
-        content: bytes,
-        on_progress: Callable[[int, int], None] | None = None,
-        on_indexed: Callable[[], None] | None = None,
-        uploaded_at: float | None = None,
-        precondition: Callable[[], None] | None = None,
-        *,
-        before_first_write: Callable[[], None] | None = None,
-        tags: tuple[str, ...] | None = None,
-    ) -> DocumentIngestOutcome:
-        """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
-
-        ``on_indexed`` runs under the filename write lock once indexing succeeded (see
-        ``ingest_chunks``). ``uploaded_at`` overrides the upload stamp — a re-index of a
-        stored original keeps the document's original upload time rather than "now".
-        ``precondition`` is checked under that lock before anything is written, and
-        ``before_first_write`` right before the first batch lands (see ``ingest_chunks``).
-        ``tags`` sets the document's tags (a restore) instead of carrying its current ones.
-        """
-
-        # Before parsing: an index built for another embedding setup refuses the
-        # upload here unless it is empty, in which case it is rebuilt for this one.
-        self._repository.ensure_writable(self._settings)
-        parse_start = time.monotonic()
-        sections = parse_with_limit(filename, content, self._settings)
-        chunk_start = time.monotonic()
-        ingest_stage_seconds.labels(stage="parse").observe(chunk_start - parse_start)
-        chunks = chunk_sections(sections, self._settings, self._token_counter)
-        ingest_stage_seconds.labels(stage="chunk").observe(time.monotonic() - chunk_start)
-        # Stamped here (not in chunk_sections) because this is the first point in the
-        # pipeline that has both the raw upload's byte count and the upload instant —
-        # chunking itself works purely from parsed text.
-        upload_stamp = uploaded_at if uploaded_at is not None else time.time()
-        upload_size = len(content)
-        fingerprint = chunking_fingerprint(self._settings)
-        # Read after chunking: the tokenizer loads (or fails to) on first use.
-        counter_mode = getattr(self._token_counter, "mode", None)
-        chunks = [
-            replace(
-                chunk,
-                byte_size=upload_size,
-                uploaded_at=upload_stamp,
-                chunker_version=CHUNKER_VERSION,
-                chunking_fingerprint=fingerprint,
-                token_counter=counter_mode if counter_mode in ("hf", "heuristic") else None,
-            )
-            for chunk in chunks
-        ]
-        logger.info(
-            "Chunked %s into %d chunks (chunker v%d).",
-            sections[0].filename,
-            len(chunks),
-            CHUNKER_VERSION,
-        )
-        writing = False
-
-        def start_writing() -> None:
-            nonlocal writing
-            if before_first_write is not None:
-                before_first_write()  # may refuse: a cancel that arrived in time
-            writing = True
-
-        try:
-            result: IngestResult = ingest_chunks(
-                self._repository,
-                self._settings,
-                chunks,
-                self._embedding_provider,
-                on_progress,
-                on_indexed,
-                precondition,
-                # A re-upload or re-index replaces the document's points; its tags are
-                # a property of the document, not of one upload, so they carry over.
-                carry_tags=True,
-                before_first_write=start_writing,
-                tags=tags,
-            )
-        finally:
-            # Even a failed ingest may have written points; cached answers could
-            # describe a corpus that no longer exists either way. One that stopped
-            # before its first write (cancelled, refused, an embedding error) changed
-            # nothing, and used to empty the answer cache all the same.
-            if writing:
-                bump_corpus_generation({chunk.filename for chunk in chunks})
-        return DocumentIngestOutcome(
-            filename=sections[0].filename,
-            sections_parsed=len(sections),
-            chunks_ingested=result.points_count,
-            collection_name=result.collection_name,
-        )

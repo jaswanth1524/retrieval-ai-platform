@@ -20,6 +20,10 @@ export interface CommandState {
   readOnly: boolean;
   restoring: boolean;
   exportingBackup: boolean;
+  /** The documents the conversation's scope names: one can be summarized, two compared. */
+  scopedFilenames?: string[];
+  /** An answer is streaming anywhere: a summary would have to wait for it. */
+  answerInFlight?: boolean;
 }
 
 /** What the commands do. Read when a command runs, so they needn't be stable. */
@@ -40,6 +44,7 @@ export interface CommandActions {
   clear: () => void;
   switchConversation: (id: string) => void;
   pinConversation: (id: string, pinned: boolean) => void;
+  summarize?: (filenames: string[]) => void;
 }
 
 interface PaletteControls {
@@ -74,6 +79,8 @@ export function useCommands(
     readOnly,
     restoring,
     exportingBackup,
+    scopedFilenames,
+    answerInFlight = false,
   } = state;
 
   const commands = useMemo<Command[]>(() => {
@@ -141,6 +148,20 @@ export function useCommands(
         run: () => run.current.exportJson(),
         disabled: !hasTurns,
       },
+      ...(scopedFilenames?.length === 1 || scopedFilenames?.length === 2
+        ? [
+            {
+              id: 'summarize-scope',
+              glyph: '∑',
+              label:
+                scopedFilenames.length === 1
+                  ? `Summarize ${scopedFilenames[0]}`
+                  : `Compare ${scopedFilenames[0]} and ${scopedFilenames[1]}`,
+              run: () => run.current.summarize?.(scopedFilenames),
+              disabled: answerInFlight,
+            },
+          ]
+        : []),
       {
         id: 'search-passages',
         glyph: '⌕',
@@ -220,6 +241,8 @@ export function useCommands(
     readOnly,
     restoring,
     exportingBackup,
+    scopedFilenames,
+    answerInFlight,
   ]);
 
   // Read at keypress time so the listener is registered once.

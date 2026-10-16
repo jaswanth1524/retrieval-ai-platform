@@ -410,3 +410,41 @@ def test_the_client_dials_the_configured_grpc_port(monkeypatch: pytest.MonkeyPat
 
     assert seen["grpc_port"] == 7334
     assert seen["prefer_grpc"] is True
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("sparse_language", "german", "BM25 stemmer language"),
+        ("dense_passage_prefix", "passage: ", "passage prefix"),
+    ],
+)
+def test_a_changed_multilingual_setting_is_refused_until_reindexed(
+    setting: str, value: str, message: str
+) -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    ensure_collection(client, settings)
+
+    changed = settings.model_copy(update={setting: value})
+    qdrant_schema.clear_readiness_cache()
+    with pytest.raises(CollectionSchemaError, match=message):
+        ensure_collection(client, changed)
+
+
+def test_a_collection_from_before_the_multilingual_settings_reads_as_the_defaults() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    legacy = collection_metadata(settings)
+    del legacy["sparse_language"], legacy["dense_passage_prefix"]
+    client.create_collection(
+        collection_name=settings.qdrant_collection,
+        vectors_config=dense_vectors_config(settings),
+        sparse_vectors_config=sparse_vectors_config(settings),
+        metadata=legacy,
+    )
+
+    ensure_collection(client, settings)  # accepted: English stemming, no prefix
+    qdrant_schema.clear_readiness_cache()
+    with pytest.raises(CollectionSchemaError, match="BM25 stemmer language"):
+        ensure_collection(client, settings.model_copy(update={"sparse_language": "french"}))

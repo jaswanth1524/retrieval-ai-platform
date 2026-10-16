@@ -102,6 +102,24 @@ describe('useCommands', () => {
     expect(run.newConversation).toHaveBeenCalled();
   });
 
+  it('offers to summarize one scoped document or compare two, held while an answer streams', () => {
+    const palette = { otherDialogOpen: false, togglePalette: vi.fn(), closePalette: vi.fn() };
+    const run = { ...actions(), summarize: vi.fn() };
+    const command = (overrides: Partial<CommandState>) =>
+      renderHook(() => useCommands(state(overrides), run, palette)).result.current.find(
+        (item) => item.id === 'summarize-scope',
+      );
+
+    expect(command({})).toBeUndefined();
+    expect(command({ scopedFilenames: ['a', 'b', 'c'] })).toBeUndefined();
+    expect(command({ scopedFilenames: ['a.pdf'] })?.label).toBe('Summarize a.pdf');
+    const compare = command({ scopedFilenames: ['a.pdf', 'b.pdf'] });
+    expect(compare?.label).toBe('Compare a.pdf and b.pdf');
+    compare?.run();
+    expect(run.summarize).toHaveBeenCalledWith(['a.pdf', 'b.pdf']);
+    expect(command({ scopedFilenames: ['a.pdf'], answerInFlight: true })?.disabled).toBe(true);
+  });
+
   it('leaves backup and restore out for a read-only key', () => {
     const { result } = renderHook(() =>
       useCommands(state({ readOnly: true }), actions(), {

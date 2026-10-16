@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { CitationResponse } from '../api/types';
+import type { CitationResponse, DocumentTask } from '../api/types';
 import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
@@ -19,10 +19,12 @@ interface ChatThreadProps {
   stage?: string | null;
   engineerMode: boolean;
   currentModelLabel?: string;
-  onRetry?: (question: string) => void;
+  onRetry?: (question: string, task?: DocumentTask) => void;
   // Regenerate (skips the answer cache); falls back to onRetry when absent.
-  onRegenerate?: (question: string) => void;
+  onRegenerate?: (question: string, task?: DocumentTask) => void;
   onEditQuestion?: (turnId: string, question: string) => void;
+  // Ask one of the latest answer's suggested follow-ups.
+  onAskFollowup?: (question: string) => void;
   feedbackEnabled?: boolean;
   onFeedback?: (payload: FeedbackPayload) => void;
   onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
@@ -80,11 +82,11 @@ function progressAnnouncement(
 // reconstructible from position.
 // One pass over the thread: searching backward from every assistant turn made each
 // render quadratic in conversation length.
-function precedingUserQuestions(turns: ChatTurn[]): (string | undefined)[] {
-  let lastQuestion: string | undefined;
+function precedingUserTurns(turns: ChatTurn[]): (ChatTurn | undefined)[] {
+  let lastQuestion: ChatTurn | undefined;
   return turns.map((turn) => {
     const preceding = lastQuestion;
-    if (turn.role === 'user') lastQuestion = turn.content;
+    if (turn.role === 'user') lastQuestion = turn;
     return preceding;
   });
 }
@@ -98,6 +100,7 @@ function ChatThread({
   currentModelLabel,
   onRetry,
   onRegenerate,
+  onAskFollowup,
   onEditQuestion,
   feedbackEnabled,
   onFeedback,
@@ -266,7 +269,7 @@ function ChatThread({
   // useChat), so while pending is true but the last turn is still the user's question,
   // there's no ChatTurn yet to attach a skeleton to — render a placeholder in its slot.
   const awaitingFirstEvent = pending && lastTurn?.role !== 'assistant';
-  const questions = precedingUserQuestions(turns);
+  const questions = precedingUserTurns(turns);
 
   return (
     <div
@@ -291,8 +294,10 @@ function ChatThread({
             onRetry={onRetry}
             onRegenerate={onRegenerate}
             onEditQuestion={onEditQuestion}
-            regenerateQuestion={turn.role === 'assistant' ? questions[index] : undefined}
+            regenerateQuestion={turn.role === 'assistant' ? questions[index]?.content : undefined}
+            regenerateTask={turn.role === 'assistant' ? questions[index]?.task : undefined}
             busy={busy}
+            onAskFollowup={turn.id === lastTurn?.id ? onAskFollowup : undefined}
             feedbackEnabled={feedbackEnabled}
             onFeedback={onFeedback}
             onOpenSource={onOpenSource}

@@ -626,7 +626,7 @@ def test_a_delete_overtaken_by_a_newer_upload_at_the_lock_keeps_that_upload(
 def test_reindex_rechunks_a_stale_document_from_its_original_and_keeps_its_upload_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import api.pipeline as pipeline_module
+    import api.ingest_service as pipeline_module
     from api.documents import CHUNKER_VERSION
 
     with raw_storage_client(tmp_path, monkeypatch) as client:
@@ -656,7 +656,7 @@ def test_reindex_rechunks_a_stale_document_from_its_original_and_keeps_its_uploa
 def test_reindex_all_requeues_only_stale_documents_with_originals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import api.pipeline as pipeline_module
+    import api.ingest_service as pipeline_module
     from api.documents import CHUNKER_VERSION
 
     with raw_storage_client(tmp_path, monkeypatch) as client:
@@ -678,7 +678,7 @@ def test_reindex_all_requeues_only_stale_documents_with_originals(
 def test_reindex_all_defers_what_the_backlog_cannot_take(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import api.pipeline as pipeline_module
+    import api.ingest_service as pipeline_module
     from api.documents import CHUNKER_VERSION
 
     with raw_storage_client(tmp_path, monkeypatch) as client:

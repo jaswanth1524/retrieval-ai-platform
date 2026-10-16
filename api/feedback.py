@@ -45,10 +45,58 @@ class Feedback:
     # specific citation (its `[n]` source_number as shown in the answer).
     citation_source_number: int | None
     created_at: float = field(default_factory=time.time)
+    # The workspace the rated answer came from ("" = the default). Not part of a
+    # backup's rows: a backup holds one workspace, and its rows join the workspace
+    # it is restored into.
+    workspace: str = ""
 
 
 # Where a page of rows_oldest_first ended: (created_at, rowid) of its last row.
 FeedbackCursor = tuple[float, int]
+
+
+# Keyed by (workspace, id): the same rating restored into two workspaces is two rows,
+# and restoring a backup into the workspace it came from twice still adds nothing.
+_CREATE_TABLE = """
+    CREATE TABLE IF NOT EXISTS {name} (
+        id TEXT NOT NULL,
+        trace_id TEXT,
+        question TEXT NOT NULL,
+        answer_excerpt TEXT NOT NULL,
+        cited_filenames_json TEXT NOT NULL,
+        rating TEXT NOT NULL,
+        citation_source_number INTEGER,
+        created_at REAL NOT NULL,
+        workspace TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (workspace, id)
+    )
+"""
+_COLUMNS = (
+    "id, trace_id, question, answer_excerpt, cited_filenames_json, rating, "
+    "citation_source_number, created_at"
+)
+
+
+def _migrate_to_workspace_key(conn: sqlite3.Connection) -> None:
+    """Rebuild a table from before workspaces (keyed by id alone, no workspace column)
+    in place, in the same transaction; its rows land in the default workspace, in their
+    original order."""
+
+    info = {row[1]: row[5] for row in conn.execute("PRAGMA table_info(feedback)")}
+    if info.get("workspace"):  # already part of the primary key
+        return
+    workspace = "workspace" if "workspace" in info else "''"
+    # sqlite3 runs DDL outside a transaction unless one is open: open it, so a failure
+    # anywhere below leaves the old table as it was (committed when the caller's block ends).
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute(_CREATE_TABLE.format(name="feedback_migrated"))
+    conn.execute(
+        f"INSERT INTO feedback_migrated ({_COLUMNS}, workspace) "
+        f"SELECT {_COLUMNS}, {workspace} FROM feedback ORDER BY rowid"
+    )
+    conn.execute("DROP TABLE feedback")
+    conn.execute("ALTER TABLE feedback_migrated RENAME TO feedback")
 
 
 class FeedbackStore:
@@ -68,21 +116,13 @@ class FeedbackStore:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         enable_wal(path)
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS feedback (
-                    id TEXT PRIMARY KEY,
-                    trace_id TEXT,
-                    question TEXT NOT NULL,
-                    answer_excerpt TEXT NOT NULL,
-                    cited_filenames_json TEXT NOT NULL,
-                    rating TEXT NOT NULL,
-                    citation_source_number INTEGER,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
+            conn.execute(_CREATE_TABLE.format(name="feedback"))
+            _migrate_to_workspace_key(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS feedback_created_at ON feedback (created_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS feedback_workspace_created_at "
+                "ON feedback (workspace, created_at)"
+            )
 
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_transaction(self._path)
@@ -114,6 +154,7 @@ class FeedbackStore:
         cited_filenames: list[str],
         rating: FeedbackRating,
         citation_source_number: int | None,
+        workspace: str = "",
     ) -> Feedback:
         feedback = Feedback(
             id=str(uuid.uuid4()),
@@ -123,12 +164,13 @@ class FeedbackStore:
             cited_filenames=cited_filenames,
             rating=rating,
             citation_source_number=citation_source_number,
+            workspace=workspace,
         )
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO feedback (id, trace_id, question, answer_excerpt, "
-                "cited_filenames_json, rating, citation_source_number, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "cited_filenames_json, rating, citation_source_number, created_at, workspace) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feedback.id,
                     feedback.trace_id,
@@ -138,23 +180,24 @@ class FeedbackStore:
                     feedback.rating,
                     feedback.citation_source_number,
                     feedback.created_at,
+                    feedback.workspace,
                 ),
             )
             self._trim(conn)
         return feedback
 
-    def import_rows(self, rows: Sequence[Feedback]) -> int:
-        """Insert rows from a backup, keeping their ids and timestamps; rows whose id is
-        already here are skipped, so restoring the same backup twice adds nothing.
-        Returns how many were added."""
+    def import_rows(self, rows: Sequence[Feedback], workspace: str = "") -> int:
+        """Insert rows from a backup into ``workspace``, keeping their ids and timestamps;
+        rows whose id is already here are skipped, so restoring the same backup twice adds
+        nothing. Returns how many were added."""
 
         added = 0
         with self._lock, self._connect() as conn:
             for row in sorted(rows, key=lambda item: item.created_at):
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO feedback (id, trace_id, question, answer_excerpt, "
-                    "cited_filenames_json, rating, citation_source_number, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "cited_filenames_json, rating, citation_source_number, created_at, "
+                    "workspace) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row.id,
                         row.trace_id,
@@ -164,6 +207,7 @@ class FeedbackStore:
                         row.rating,
                         row.citation_source_number,
                         row.created_at,
+                        workspace,
                     ),
                 )
                 added += cursor.rowcount
@@ -171,22 +215,24 @@ class FeedbackStore:
         return added
 
     def rows_oldest_first(
-        self, after: FeedbackCursor | None, limit: int
+        self, after: FeedbackCursor | None, limit: int, workspace: str | None = None
     ) -> tuple[list[Feedback], FeedbackCursor | None]:
-        """Up to ``limit`` rows after ``after``, oldest first, and the cursor of the last.
+        """Up to ``limit`` rows after ``after``, oldest first, and the cursor of the last;
+        only ``workspace``'s rows when it is given (None = every workspace).
 
         Keyset paging on (created_at, rowid), the order a backup lists rows in, so an
         export reads one page at a time instead of the whole table.
         """
 
         created_at, rowid = after if after is not None else (float("-inf"), -1)
+        scope, params = _workspace_filter(workspace)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT rowid, id, trace_id, question, answer_excerpt, cited_filenames_json, "
-                "rating, citation_source_number, created_at FROM feedback "
-                "WHERE created_at > ? OR (created_at = ? AND rowid > ?) "
+                "rating, citation_source_number, created_at, workspace FROM feedback "
+                f"WHERE (created_at > ? OR (created_at = ? AND rowid > ?)){scope} "
                 "ORDER BY created_at ASC, rowid ASC LIMIT ?",
-                (created_at, created_at, rowid, limit),
+                (created_at, created_at, rowid, *params, limit),
             ).fetchall()
         page = [
             Feedback(
@@ -198,21 +244,25 @@ class FeedbackStore:
                 rating=row[6],
                 citation_source_number=row[7],
                 created_at=row[8],
+                workspace=row[9],
             )
             for row in rows
         ]
         return page, ((rows[-1][8], rows[-1][0]) if rows else None)
 
-    def list_recent(self, limit: int = 100) -> list[Feedback]:
+    def list_recent(self, limit: int = 100, workspace: str | None = None) -> list[Feedback]:
         """Return the most recent feedback, newest first by when it was given (a row
-        restored from a backup keeps its original time)."""
+        restored from a backup keeps its original time); only ``workspace``'s when it is
+        given (None = every workspace)."""
 
+        scope, params = _workspace_filter(workspace)
+        where = f"WHERE {scope.removeprefix(' AND ')} " if scope else ""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, trace_id, question, answer_excerpt, cited_filenames_json, "
-                "rating, citation_source_number, created_at FROM feedback "
+                f"rating, citation_source_number, created_at, workspace FROM feedback {where}"
                 "ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                (limit,),
+                (*params, limit),
             ).fetchall()
         return [
             Feedback(
@@ -224,6 +274,13 @@ class FeedbackStore:
                 rating=row[5],
                 citation_source_number=row[6],
                 created_at=row[7],
+                workspace=row[8],
             )
             for row in rows
         ]
+
+
+def _workspace_filter(workspace: str | None) -> tuple[str, tuple[str, ...]]:
+    """An `` AND workspace = ?`` clause and its parameter, or nothing for None."""
+
+    return ("", ()) if workspace is None else (" AND workspace = ?", (workspace,))

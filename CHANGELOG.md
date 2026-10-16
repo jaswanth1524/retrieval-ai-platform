@@ -24,6 +24,16 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Internal: `api/pipeline.py` split into `api/context_expansion.py` (neighbour expansion)
+  and `api/ingest_service.py` (`IngestService`), re-exported from `api.pipeline`; the
+  corpus panel's card, bulk bar, tag editor and types moved to `components/corpus/`, and
+  App's helpers and connection monitor to `appHelpers.ts` / `useConnectionMonitor`, its
+  boot to `useAppBoot`, its workspace handling to `useWorkspaces`, backups to
+  `useBackupActions`, the inspector's open/close rule to `useInspectorVisibility`, and the
+  traces and feedback panels share `usePanelList`. No behaviour change (the OpenAPI
+  document only gained the additions below).
+- `GET /config` always reports the app's own settings (never a workspace's), so the UI
+  boots even when the workspace it remembers was deleted.
 - **Chunker version 5.** Table rows (CSV, XLSX and Markdown tables, which PDF tables are
   rendered as) are never split across chunks, and a table chunk is labelled with the
   rows it actually holds (`Rows 4-17`, not its whole 50-row group). A chunk that runs
@@ -41,6 +51,57 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Workspaces (`WORKSPACES_ENABLED`, off by default): separate corpora, one Qdrant
+  collection (`<QDRANT_COLLECTION>__ws_<name>`) and originals folder each, chosen per
+  request with `X-Workspace`; `GET/POST /workspaces`, `DELETE /workspaces/{name}` (empty
+  only). The answer cache, the filename lock and the ingest sequencer are per workspace.
+  The UI has a workspace menu in the corpus panel, and each conversation belongs to the
+  workspace of its first question: choosing another workspace opens a fresh chat, and
+  opening a conversation switches back to its workspace (the list names it). The
+  workspace in use is held per browser tab. Answer feedback is kept per workspace too:
+  `GET /feedback`, a backup and a restore cover only the request's workspace (the
+  feedback file gains a `workspace` column in place, its rows in the default one), and
+  `eval.harness from-feedback --store` takes `--workspace`. **Re-index: none** — the
+  default workspace is the existing collection.
+- `POST /documents/from-url` (`URL_INGEST_ENABLED`, off by default): the server fetches a
+  document and indexes it like an upload; public addresses only unless
+  `URL_INGEST_ALLOW_PRIVATE`, the checked address pinned for the connection, redirects
+  re-checked, `MAX_UPLOAD_BYTES` and `URL_INGEST_TIMEOUT_SECONDS` apply. **Re-index: none.**
+- A watched folder (`WATCH_DIR`, `WATCH_INTERVAL_SECONDS`, `WATCH_DELETE_MISSING`): new and
+  changed files are indexed as they appear, into the default workspace or
+  `WATCH_WORKSPACE` (created at startup when missing; a bad name, or workspaces off,
+  stops startup naming the setting). **Re-index: none.**
+- The `docrag` command (status, documents, ingest, add-url, ask, search, summarize,
+  export, import) and an MCP server, `docrag-mcp`, both over the REST API. They are their
+  own small package (`uv tool install ./cli`, `./cli[mcp]` for the server; httpx only,
+  none of the server's dependencies); `python -m cli` / `python -m cli.mcp_server` run
+  them from the repository. CI builds the wheel and runs it. **Re-index: none.**
+- A multilingual profile: `SPARSE_LANGUAGE` (BM25 stemming) and `DENSE_PASSAGE_PREFIX`
+  (e5-style models), both recorded with the collection and checked like the dense model;
+  README "Multilingual documents" lists the supported models. A small Spanish/German/
+  French fixture (`eval/corpus_multilingual/`, `eval/datasets/multilingual_eval.jsonl`,
+  including English questions about the non-English documents) is validated in CI; it
+  has no baseline yet. **Re-index: none** for the defaults; switching to the profile is
+  a new vector space (re-index).
+- Whole-document summaries and comparisons: `POST /questions/summary` and
+  `/questions/summary/stream` read every passage of one document (or two, to compare),
+  in parts of `SUMMARY_BATCH_CHARS`, as cited notes combined into one answer; at most
+  `SUMMARY_MAX_BATCHES` parts (a longer document is read at evenly spaced passages,
+  reported as `chunks_read`/`chunks_total`), with `SUMMARY_MAX_TOKENS` for the answer.
+  Same key, slot, rate limit, citation retry and answer cache as a question. The UI has
+  ∑ on each document card, Compare for two selected documents, and a ⌘K command for a
+  scoped document; Retry and Regenerate repeat the summary. **Re-index: none.**
+- Suggested follow-up questions (`FOLLOWUPS_ENABLED`, off by default; `FOLLOWUP_COUNT`,
+  `FOLLOWUP_MAX_TOKENS`): one extra LLM call after an answer that cited its sources,
+  sent as `followups` on `/questions` and a `followups` frame after `done` on the
+  stream, and shown as one-click questions under the latest answer. **Re-index: none.**
+- Anthropic (Claude) generation: `LLM_PROVIDER=anthropic` or per question, with
+  `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` (default `claude-sonnet-5-5`). Optional like
+  OpenAI; embeddings stay local. `GET /config` reports `anthropic_available`/
+  `anthropic_model`. **Re-index: none.**
+- `eval/harness.py from-feedback`: drafts a labeled retrieval dataset from answer
+  ratings (the feedback store or a backup zip) — thumbs-up questions labeled with their
+  cited documents, thumbs-down questions written to a review file. **Re-index: none.**
 - Excel (`.xlsx`) and PowerPoint (`.pptx`) uploads (`openpyxl`, `python-pptx`). Each
   sheet is a page, its rows rendered like a CSV's and labelled with spreadsheet row
   numbers (`Costs · Rows 2-51`); each slide is a page titled by its slide title, with
@@ -152,6 +213,9 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Corpus panel: the URL field's placeholder no longer runs out of room, and the workspace
+  label sits on its own line so Delete doesn't wrap alone. On a phone, the composer's
+  provider menu spans the control row instead of running off the right edge.
 - A client that left a streamed answer kept the pipeline running to the end of the
   answer (Starlette never closes a plain iterator): the question slot and the LLM stayed
   busy until garbage collection. The same for `/original` downloads, whose file stayed

@@ -32,6 +32,7 @@ from api.ingest_jobs import (
     FilenameConflictError,
     backlog_full_error,
     cancel_ingest_job,
+    delete_indexed_document,
     enqueue_ingest,
     original_still_stored,
     refuse_near_duplicate_name,
@@ -41,7 +42,6 @@ from api.ingest_jobs import (
 from api.ingestion import filename_write_lock, ingest_sequencer
 from api.jobs import JobNotFoundError, JobStore
 from api.metrics import corpus_documents
-from api.raw_documents import RawDocumentStore
 from api.repository import DocumentMetadata, VectorRepository
 from api.restore import BackupImportError, restore_backup
 from api.routes.deps import (
@@ -67,10 +67,13 @@ from api.schemas import (
     DocumentTagsRequest,
     DocumentTagsResponse,
     ImportResponse,
+    UrlIngestRequest,
 )
 from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
 from api.upload import read_upload_within_limit
+from api.url_fetch import fetch_document
+from api.workspaces import document_key, filename_of, workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +193,50 @@ def register(app: FastAPI) -> None:
             ingest_service=ingest_service,
             filename=filename,
             content=content,
+            raw_store=raw_store,
+        )
+
+    # The server downloads the document (URL_INGEST_ENABLED, off by default) and it
+    # takes the upload's path from there: same name checks, backlog, job and polling.
+    # api/url_fetch.py guards against fetching private addresses (SSRF).
+    @app.post(
+        "/documents/from-url",
+        response_model=DocumentJobAcceptedResponse,
+        status_code=202,
+        dependencies=[Depends(require_full_key)],
+        responses={404: {"description": "URL ingest is off (URL_INGEST_ENABLED)."}},
+    )
+    async def upload_document_from_url(
+        request: UrlIngestRequest,
+        ingest_service: IngestServiceDep,
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+    ) -> DocumentJobAcceptedResponse:
+        if not settings.url_ingest_enabled:
+            raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+        await run_in_threadpool(repository.ensure_writable, settings)
+        fetched = await run_in_threadpool(
+            fetch_document, request.url, settings, filename=request.filename
+        )
+        if raw_store is not None:
+            known = await run_in_threadpool(_known_filenames, repository, settings)
+            try:
+                refuse_near_duplicate_name(fetched.filename, known)
+            except FilenameConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info("Fetched %s (%d bytes) for indexing.", fetched.final_url, len(fetched.content))
+        return await run_in_threadpool(
+            enqueue_ingest,
+            job_store=job_store,
+            executor=executor,
+            backlog=backlog,
+            ingest_service=ingest_service,
+            filename=fetched.filename,
+            content=fetched.content,
             raw_store=raw_store,
         )
 
@@ -324,41 +371,8 @@ def register(app: FastAPI) -> None:
         # would still report success. The raw copy (when stored) is removed under the
         # same lock, or a deleted document's original bytes would accumulate forever.
         filename = stored_filename(filename)
-        # Sequenced like an ingest, and admitted before waiting for the lock, so an
-        # upload already queued for this name is refused when it reaches the lock
-        # instead of indexing the document straight back after the delete.
-        sequence = ingest_sequencer.admit(filename)
-        try:
-            with filename_write_lock(filename):
-                # The lock isn't fair: an upload admitted after this delete can reach
-                # it first and be indexed. Deleting then would remove the newer
-                # document the user just uploaded, so the delete stands down.
-                superseded = ingest_sequencer.superseded_by(filename, sequence)
-                if superseded == "upload":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"A newer upload of '{filename}' was indexed after this "
-                        "delete was requested; it was kept.",
-                    )
-                if superseded == "delete":
-                    raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-                point_ids = repository.point_ids_for_filename(settings, filename)
-                if point_ids:
-                    repository.delete_by_ids(settings, point_ids)
-                    # Right away, not after the original below: if removing that
-                    # raises, cached answers must still stop citing the deleted points.
-                    bump_corpus_generation([filename])
-                # Also when no points remain: an original orphaned by an earlier failed
-                # ingest was otherwise undeletable, since the 404 came first.
-                removed_original = _delete_original(
-                    raw_store, filename, points_gone=bool(point_ids)
-                )
-                if not point_ids and not removed_original:
-                    raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-                ingest_sequencer.mark_applied(filename, sequence, deleted=True)
-        finally:
-            ingest_sequencer.release(filename)
-        return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
+        deleted = delete_indexed_document(repository, settings, raw_store, filename)
+        return DocumentDeleteResponse(filename=filename, points_deleted=deleted)
 
     # Payload-only: no re-embedding, so it is instant even for a large document.
     @app.patch(
@@ -377,7 +391,7 @@ def register(app: FastAPI) -> None:
         # Under the filename lock ingest also reads tags under (ingest_chunks'
         # carry_tags), so a re-upload in flight either sees this change or runs after
         # it and carries it over — it never writes the tags from before it.
-        with filename_write_lock(filename):
+        with filename_write_lock(document_key(settings, filename)):
             # A count, not a scroll of every point id just to see whether there is one.
             if repository.chunk_count_for_filename(settings, filename) == 0:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
@@ -636,6 +650,7 @@ def register(app: FastAPI) -> None:
                 has_room=backlog.has_room,
                 enqueue=enqueue,
                 feedback_store=feedback_store,
+                workspace=workspace_of(settings),
             )
         except BackupImportError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -663,25 +678,5 @@ def _staleness(
 def _known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
     """Every indexed filename plus those with an upload or delete in flight."""
 
-    return [*repository.filename_metadata(settings), *ingest_sequencer.in_flight()]
-
-
-def _delete_original(
-    raw_store: RawDocumentStore | None, filename: str, *, points_gone: bool
-) -> bool:
-    """Remove the stored original; True when one was removed.
-
-    Once the points are gone the delete has happened: a failure removing the original
-    (a read-only or permission-locked RAW_DOCUMENT_DIR) is logged rather than turned
-    into a 500, and a second DELETE removes the orphan through the no-points path.
-    """
-
-    if raw_store is None:
-        return False
-    try:
-        return raw_store.delete(filename)
-    except OSError:
-        if not points_gone:
-            raise
-        logger.exception("Could not remove the stored original of '%s'", filename)
-        return True
+    in_flight = (filename_of(settings, key) for key in ingest_sequencer.in_flight())
+    return [*repository.filename_metadata(settings), *(name for name in in_flight if name)]

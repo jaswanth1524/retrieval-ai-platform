@@ -25,3 +25,11 @@ def test_the_frontends_fallback_upload_types_match_the_api() -> None:
     block = re.search(r"ACCEPTED_EXTENSIONS = \[(.*?)\];", source, flags=re.DOTALL)
     assert block is not None
     assert set(re.findall(r"'(\.[a-z]+)'", block.group(1))) == set(SUPPORTED_EXTENSIONS)
+
+
+def test_the_frontend_workspace_name_rule_matches_the_api() -> None:
+    from api.workspaces import _NAME_RE
+
+    match = re.search(r"export const WORKSPACE_NAME_PATTERN = /(.+)/;", LIMITS_TS.read_text())
+    assert match is not None
+    assert match.group(1) == _NAME_RE.pattern

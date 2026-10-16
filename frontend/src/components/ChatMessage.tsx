@@ -1,7 +1,13 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Components } from 'react-markdown';
-import type { CitationResponse, FeedbackRating, TimingsResponse } from '../api/types';
+import type {
+  CitationResponse,
+  DocumentTask,
+  FeedbackRating,
+  SummaryCoverage,
+  TimingsResponse,
+} from '../api/types';
 import { formatTurnTime, withCitationFootnotes } from '../utils/exportChat';
 import { citationNumberFromHref, linkCitations } from '../utils/citations';
 import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
@@ -116,6 +122,13 @@ export interface ChatTurn {
   uncited?: boolean;
   // The provider stopped at the token limit, so the answer ends mid-way.
   truncated?: boolean;
+  // A whole-document task (summary, comparison) rather than a question: on the user
+  // turn that asked it, and on its error turn, so Retry and Regenerate repeat the task.
+  task?: DocumentTask;
+  // A summary that read only part of a long document (evenly spaced passages).
+  coverage?: SummaryCoverage;
+  // Questions the server suggests asking next (FOLLOWUPS_ENABLED).
+  followups?: string[];
 }
 
 interface ChatMessageProps {
@@ -124,15 +137,18 @@ interface ChatMessageProps {
   // Set only on the single turn actively streaming; undefined means "not this one".
   streamStage?: string;
   currentModelLabel?: string;
-  onRetry?: (question: string) => void;
+  // `task`: the whole-document task the question was (a summary), repeated as one.
+  onRetry?: (question: string, task?: DocumentTask) => void;
   // Regenerate skips the server's answer cache; onRetry is used when this is absent.
-  onRegenerate?: (question: string) => void;
+  onRegenerate?: (question: string, task?: DocumentTask) => void;
   // Edit a user turn and ask again (a fork — the original conversation is kept).
   onEditQuestion?: (turnId: string, question: string) => void;
   // The question a "Regenerate" click on this (assistant) turn should re-ask —
   // undefined on any turn that isn't a regenerate-able assistant answer. Computed by
-  // ChatThread from array position; see precedingUserQuestions there.
+  // ChatThread from array position; see precedingUserTurns there.
   regenerateQuestion?: string;
+  // The task of that question, when it was a summary or comparison.
+  regenerateTask?: DocumentTask;
   // Off (undefined/false) unless the server has AppSettings.feedback_enabled set —
   // sourced from PublicConfigResponse.feedback_enabled via App.tsx.
   feedbackEnabled?: boolean;
@@ -146,6 +162,18 @@ interface ChatMessageProps {
   onCitationLeave?: () => void;
   // A question is in flight: Regenerate and Retry would be silently ignored by useChat.
   busy?: boolean;
+  // Ask one of the turn's suggested follow-ups; set only on the latest answer.
+  onAskFollowup?: (question: string) => void;
+}
+
+/** Ask again, naming the task only when there is one (a plain question keeps its call). */
+function askAgain(
+  ask: (question: string, task?: DocumentTask) => void,
+  question: string,
+  task: DocumentTask | undefined,
+): void {
+  if (task) ask(question, task);
+  else ask(question);
 }
 
 function formatDuration(totalMs: number): string {
@@ -165,12 +193,14 @@ function ChatMessage({
   onRegenerate,
   onEditQuestion,
   regenerateQuestion,
+  regenerateTask,
   feedbackEnabled,
   onFeedback,
   onOpenSource,
   onCitationHover,
   onCitationLeave,
   busy = false,
+  onAskFollowup,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -355,7 +385,9 @@ function ChatMessage({
           ) : (
             <>
               <p className="chat-message__question">{turn.content}</p>
-              {onEditQuestion && (
+              {/* A summary's text is a label, not the request: editing it would send a
+                  plain question, so summaries are asked again from the corpus panel. */}
+              {onEditQuestion && !turn.task && (
                 <button
                   ref={editButtonRef}
                   type="button"
@@ -442,6 +474,15 @@ function ChatMessage({
                   no sources cited
                 </span>
               )}
+              {turn.coverage && (
+                <span
+                  className="chat-message__flag"
+                  title="The document is longer than one summary reads (SUMMARY_MAX_BATCHES): it was read at evenly spaced passages"
+                  data-testid="chat-message-coverage"
+                >
+                  read {turn.coverage.read} of {turn.coverage.total} passages
+                </span>
+              )}
               {turn.truncated && (
                 <span
                   className="chat-message__flag chat-message__flag--warn"
@@ -472,7 +513,7 @@ function ChatMessage({
                   type="button"
                   className="chat-message__regenerate"
                   disabled={busy}
-                  onClick={() => (onRegenerate ?? onRetry)(regenerateQuestion)}
+                  onClick={() => askAgain(onRegenerate ?? onRetry, regenerateQuestion, regenerateTask)}
                   data-testid="chat-message-regenerate"
                 >
                   Regenerate
@@ -533,6 +574,22 @@ function ChatMessage({
                 ))}
               </div>
             )}
+            {turn.followups && onAskFollowup && !streamStage && (
+              <div className="chat-message__followups" role="group" aria-label="Suggested follow-up questions">
+                {turn.followups.map((question) => (
+                  <button
+                    key={question}
+                    type="button"
+                    className="chat-message__followup"
+                    disabled={busy}
+                    onClick={() => onAskFollowup(question)}
+                    data-testid="chat-message-followup"
+                  >
+                    {question}
+                  </button>
+                ))}
+              </div>
+            )}
             {showMeta && timings && (
               <div className="chat-message__engineer-meta mono">
                 <span>{formatDuration(timings.total_ms)}</span>
@@ -558,7 +615,7 @@ function ChatMessage({
                 type="button"
                 className="chat-message__retry"
                 disabled={busy}
-                onClick={() => onRetry(turn.question!)}
+                onClick={() => askAgain(onRetry, turn.question!, turn.task)}
                 data-testid="chat-message-retry"
               >
                 Retry

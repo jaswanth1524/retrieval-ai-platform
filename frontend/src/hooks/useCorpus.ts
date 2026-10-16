@@ -287,6 +287,22 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }
     };
 
+    // The server fetches the document; the card shows the URL until it names the file.
+    const startFromUrl = (id: string, url: string) => async (signal: AbortSignal) => {
+      const accepted = await api.uploadFromUrl(url, signal);
+      setUploads((prev) =>
+        prev.map((item) => (item.id === id ? { ...item, filename: accepted.filename } : item)),
+      );
+      return accepted;
+    };
+
+    const handleUploadFromUrl = async (url: string) => {
+      const id = newId();
+      setUploads((prev) => [...prev, { id, filename: url, status: 'uploading', sourceUrl: url }]);
+      await runIngestJob(id, url, startFromUrl(id, url));
+      await refreshAfterIngest();
+    };
+
     const handleReindex = async (filename: string) => {
       const id = newId();
       setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true }]);
@@ -382,7 +398,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     const handleRetryUpload = async (id: string) => {
       const item = uploadsRef.current.find((candidate) => candidate.id === id);
-      if (!item || (!item.file && !item.reindex)) return;
+      if (!item || (!item.file && !item.reindex && !item.sourceUrl)) return;
       setUploads((prev) =>
         prev.map((candidate) =>
           candidate.id === id
@@ -390,9 +406,13 @@ export function useCorpus(callbacks: CorpusCallbacks) {
             : candidate,
         ),
       );
-      const { file, filename } = item;
+      const { file, filename, sourceUrl } = item;
       await runIngestJob(id, filename, (signal) =>
-        file ? sendUpload(file, signal) : api.reindexDocument(filename, signal),
+        file
+          ? sendUpload(file, signal)
+          : sourceUrl
+            ? startFromUrl(id, sourceUrl)(signal)
+            : api.reindexDocument(filename, signal),
       );
       await refreshAfterIngest();
     };
@@ -438,6 +458,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleRetryUpload,
       handleDismissUpload,
       handleCancelUpload,
+      handleUploadFromUrl,
       handleReindex,
       handleReindexMany,
       handleReindexAllStale,

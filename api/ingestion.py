@@ -19,6 +19,7 @@ from api.embeddings import EmbeddedText, EmbeddingError
 from api.metrics import ingest_stage_seconds
 from api.qdrant_schema import check_dense_dimension
 from api.settings import AppSettings
+from api.workspaces import document_key
 
 
 class IngestionError(RuntimeError):
@@ -279,7 +280,7 @@ def ingest_chunks(
 
     with ExitStack() as locks:
         for filename in filenames:
-            locks.enter_context(filename_write_lock(filename))
+            locks.enter_context(filename_write_lock(document_key(settings, filename)))
         # Registered after the locks, so it runs first on exit: the time locks are held.
         write_start = time.monotonic()
         locks.callback(

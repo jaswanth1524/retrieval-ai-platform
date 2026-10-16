@@ -40,7 +40,7 @@ def test_chunk_overlap_must_be_below_chunk_size_at_startup() -> None:
 
 def test_llm_provider_is_checked_at_startup_case_insensitively() -> None:
     with pytest.raises(ValidationError):
-        AppSettings(_env_file=None, llm_provider="anthropic")  # type: ignore[call-arg]
+        AppSettings(_env_file=None, llm_provider="cohere")  # type: ignore[call-arg]
     settings = AppSettings(_env_file=None, llm_provider=" OpenAI ")  # type: ignore[call-arg]
     assert settings.llm_provider == "openai"
 
