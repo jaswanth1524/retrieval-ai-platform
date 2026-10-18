@@ -156,3 +156,24 @@ test('a job already writing to the index refuses Cancel and keeps going', async 
   await expect(card.getByRole('button', { name: 'Delete big.txt' })).toBeVisible({ timeout: 10_000 });
 });
 
+
+test('a card with every action keeps its file name on one line', async ({ page, api }) => {
+  // Five actions (read, summarize, original, re-index, delete) left the name 24-36px and
+  // broke it mid-word ("roa / dm / ap. / ppt / x"); they now wrap under it instead.
+  api.config = { raw_documents_enabled: true };
+  api.documents = ['roadmap.pptx', 'SECURITY.md'];
+  api.reindexableFilenames = ['roadmap.pptx', 'SECURITY.md'];
+  await page.reload();
+  await page.getByRole('button', { name: 'Corpus' }).click();
+
+  for (const name of ['roadmap.pptx', 'SECURITY.md']) {
+    const card = page.getByTestId('corpus-panel-item').filter({ hasText: name });
+    await expect(card.getByRole('button', { name: `Summarize ${name}` })).toBeVisible();
+    await expect(card.getByRole('button', { name: `Re-index ${name}` })).toBeVisible();
+    const lines = await card.locator('.corpus-panel__name').evaluate((element) => {
+      const lineHeight = parseFloat(getComputedStyle(element).lineHeight);
+      return Math.round(element.getBoundingClientRect().height / lineHeight);
+    });
+    expect(lines, `${name} wraps over ${lines} lines`).toBe(1);
+  }
+});

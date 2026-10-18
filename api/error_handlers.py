@@ -21,7 +21,11 @@ from api.errors import (
 from api.generation import GenerationConfigError, GenerationError
 from api.ingestion import IngestionError
 from api.jobs import JobNotFoundError
-from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
+from api.qdrant_schema import (
+    CollectionSchemaError,
+    VectorStoreUnavailableError,
+    WorkspaceGoneError,
+)
 from api.reranking import RerankingError
 from api.retrieval import RetrievalError, RetrievalPayloadError
 from api.tracing import TraceNotFoundError
@@ -38,6 +42,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(IngestionError, bad_gateway_handler)
     app.add_exception_handler(RetrievalPayloadError, internal_error_handler)
     app.add_exception_handler(RetrievalError, bad_request_handler)
+    # Before its parent's (Starlette picks the most specific registered class).
+    app.add_exception_handler(WorkspaceGoneError, not_found_handler)
     app.add_exception_handler(CollectionSchemaError, conflict_handler)
     app.add_exception_handler(VectorStoreUnavailableError, service_unavailable_handler)
     app.add_exception_handler(ResponseHandlingException, vector_store_transport_handler)

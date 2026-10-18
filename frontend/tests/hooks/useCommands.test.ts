@@ -118,6 +118,9 @@ describe('useCommands', () => {
     compare?.run();
     expect(run.summarize).toHaveBeenCalledWith(['a.pdf', 'b.pdf']);
     expect(command({ scopedFilenames: ['a.pdf'], answerInFlight: true })?.disabled).toBe(true);
+    // Booting, or a refused key: like the composer's Send.
+    expect(command({ scopedFilenames: ['a.pdf'] })?.disabled).toBeFalsy();
+    expect(command({ scopedFilenames: ['a.pdf'], summarizeDisabled: true })?.disabled).toBe(true);
   });
 
   it('leaves backup and restore out for a read-only key', () => {

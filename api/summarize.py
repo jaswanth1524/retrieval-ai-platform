@@ -57,6 +57,7 @@ from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
 from api.settings import AppSettings
 from api.tracing import QueryTrace, TraceConfig, TraceMode, TraceSink
+from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,13 @@ _SYSTEM_PROMPT = (
 class SummaryTooLargeError(RetrievalError):
     """A document has more passages than a summary will read (a 400, like any request
     the server can't serve as asked)."""
+
+
+class NothingToCompareError(RetrievalError):
+    """A document to compare has no readable text (a 400). A RetrievalError, not a
+    DocumentNotFoundError: the stream reports it as an error frame, and only these
+    messages are passed through there (api/errors.py), so the name still reaches the
+    client."""
 
 
 @dataclass(frozen=True)
@@ -144,9 +152,13 @@ def _evenly_spaced[T](items: Sequence[T], count: int) -> list[T]:
     return [items[index] for index in indexes]
 
 
+def _header_size(chunk: RerankedChunk) -> int:
+    # The header ("[12] filename=...; page=...; section=...") a passage is sent under.
+    return len(chunk.filename) + len(chunk.section) + 48
+
+
 def _packed_size(chunk: RerankedChunk) -> int:
-    # The header ("[12] filename=...; page=...; section=...") counts too.
-    return len(chunk.text) + len(chunk.filename) + len(chunk.section) + 48
+    return len(chunk.text) + _header_size(chunk)
 
 
 def _pack(chunks: Sequence[RerankedChunk], budget: int) -> list[list[RerankedChunk]]:
@@ -158,7 +170,11 @@ def _pack(chunks: Sequence[RerankedChunk], budget: int) -> list[list[RerankedChu
     used = 0
     for chunk in chunks:
         if _packed_size(chunk) > budget:
-            chunk = replace(chunk, text=chunk.text[: max(budget - 200, 200)])
+            # Cut to what the budget leaves after its header: a fixed allowance for the
+            # header let a long filename and section push the part past the budget. A
+            # header can't outgrow it (names ≤ 255, sections ≤ MAX_SECTION_CHARS, a
+            # budget ≥ _MIN_BATCH_CHARS), but a passage always keeps some text.
+            chunk = replace(chunk, text=chunk.text[: max(budget - _header_size(chunk), 1)])
         size = _packed_size(chunk)
         if current and used + size > budget:
             parts.append(current)
@@ -168,6 +184,23 @@ def _pack(chunks: Sequence[RerankedChunk], budget: int) -> list[list[RerankedChu
     if current:
         parts.append(current)
     return parts
+
+
+def batch_shares(needs: Sequence[int], max_batches: int) -> list[int]:
+    """How many of ``max_batches`` parts each document may use, given how many it would
+    need to be read whole: an even split, with whatever a smaller document doesn't need
+    passed on to the others (so a short document compared with a long one doesn't
+    leave half the parts unused while the long one is sampled thinly). Every document
+    gets at least one."""
+
+    shares = [0] * len(needs)
+    remaining = max_batches
+    # Smallest need first: what it leaves of its even share goes to the larger ones.
+    for position, index in enumerate(sorted(range(len(needs)), key=lambda i: needs[i])):
+        even = remaining // (len(needs) - position)
+        shares[index] = max(1, min(needs[index], even))
+        remaining -= shares[index]
+    return shares
 
 
 def select_parts(
@@ -356,8 +389,15 @@ class DocumentSummarizer:
 
     def check_documents(self, filenames: Sequence[str]) -> None:
         """404 for a document with no passages, 400 for one too long to summarize —
-        checked by the routes before a question slot is taken (a count, no payloads)."""
+        checked by the routes before a question slot is taken (a count, no payloads).
 
+        First, 409 when the collection was built for another embedding setup, as for a
+        question (``qdrant_schema.RECOVERY_HINT``): a summary reads stored text, not
+        vectors, but a mismatched index is one to rebuild, not to keep answering from —
+        one rule for every answer (owner's decision).
+        """
+
+        self._repository.ensure_ready(self._settings)
         for filename in filenames:
             self._checked_count(self._settings, filename)
 
@@ -506,6 +546,7 @@ class DocumentSummarizer:
                     timings=timings_dict(timings) if timings is not None else None,
                     error=error,
                     request_id=current_request_id(),
+                    workspace=workspace_of(self._settings),
                 )
             )
 
@@ -513,13 +554,26 @@ class DocumentSummarizer:
             yield {"type": "stage", "stage": "reading_documents"}
             read_start = time.monotonic()
             budget = batch_char_budget(settings)
-            per_document = max(1, int(settings.summary_max_batches) // len(request.filenames))
-            documents: list[tuple[str, list[list[RerankedChunk]]]] = []
+            readable: list[tuple[str, list[RerankedChunk]]] = []
             chunks_total = 0
             for filename in request.filenames:
                 chunks = self._document_chunks(settings, filename)
+                if not chunks and request.mode == "compare":
+                    # Compared with nothing, the other document would be "compared"
+                    # alone and the answer would read as if both had been.
+                    raise NothingToCompareError(
+                        f"'{filename}' has no readable text to compare (its passages are empty)."
+                    )
                 chunks_total += len(chunks)
-                documents.append((filename, select_parts(chunks, budget, per_document)))
+                readable.append((filename, chunks))
+            shares = batch_shares(
+                [len(_pack(chunks, budget)) for _, chunks in readable],
+                int(settings.summary_max_batches),
+            )
+            documents = [
+                (filename, select_parts(chunks, budget, share))
+                for (filename, chunks), share in zip(readable, shares, strict=True)
+            ]
             read_ms = (time.monotonic() - read_start) * 1000
 
             # One source number per passage read, across every document and part.
@@ -583,7 +637,9 @@ class DocumentSummarizer:
                             build_notes_messages(task, filename, index, len(doc_parts), excerpts),
                             settings,
                         ).strip()
-                        if text and NOTHING_RELEVANT not in text.upper():
+                        # Only a reply that is the marker: notes that merely mention
+                        # it ("... not NOTHING RELEVANT here [2]") still carry findings.
+                        if text and text.strip(" .").upper() != NOTHING_RELEVANT:
                             notes.append((filename, index, len(doc_parts), text))
                 if not notes:
                     notes.append(("the documents", 1, 1, NOTHING_RELEVANT))

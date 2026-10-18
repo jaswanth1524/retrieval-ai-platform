@@ -157,3 +157,28 @@ def test_summaries_are_counted_in_metrics(api_context: ApiTestContext) -> None:
 
     body = api_context.client.get("/metrics").text
     assert 'docrag_summaries_total{mode="summarize",outcome="ok"}' in body
+
+
+def test_comparing_with_a_document_that_has_no_readable_text_names_it(
+    api_context: ApiTestContext,
+) -> None:
+    from qdrant_client import models
+
+    _ingest(api_context.client, "a.txt", b"Plan\nPlan A costs five.")
+    _ingest(api_context.client, "empty.txt", b"Plan\nSoon to be blank.")
+    api_context.qdrant.set_payload(
+        collection_name=api_context.settings.qdrant_collection,
+        payload={"text": "  "},
+        points=models.Filter(
+            must=[models.FieldCondition(key="filename", match=models.MatchValue(value="empty.txt"))]
+        ),
+    )
+    body = {"mode": "compare", "filenames": ["a.txt", "empty.txt"]}
+
+    refused = api_context.client.post("/questions/summary", json=body)
+    assert refused.status_code == 400
+    assert "'empty.txt' has no readable text" in refused.json()["detail"]
+
+    events = parse_sse_events(api_context.client.post("/questions/summary/stream", json=body).text)
+    assert events[-1]["type"] == "error"
+    assert "'empty.txt' has no readable text" in events[-1]["detail"]

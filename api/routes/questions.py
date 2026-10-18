@@ -99,12 +99,26 @@ def allowed_request_providers(settings: AppSettings) -> list[str]:
     return [name for name in REQUEST_PROVIDERS if name in allowed or name == default]
 
 
-def check_request_provider(provider: str | None, settings: AppSettings) -> None:
-    """400 for a per-request provider the operator hasn't allowed or hasn't configured
-    (``openai`` with no OPENAI_API_KEY) — before a question slot is taken, so a refused
-    request costs nothing. Unchecked, it ran embedding, search and the rerank first and
-    failed only at generation, after the stream had already sent its sources."""
+# Anthropic's API refuses a temperature above this (OpenAI's go to 2).
+ANTHROPIC_TEMPERATURE_MAX = 1.0
 
+
+def check_request_provider(
+    provider: str | None, settings: AppSettings, temperature: float | None = None
+) -> None:
+    """400 for a per-request provider the operator hasn't allowed or hasn't configured
+    (``openai`` with no OPENAI_API_KEY), or a temperature the effective provider refuses
+    — before a question slot is taken, so a refused request costs nothing. Unchecked, it
+    ran embedding, search and the rerank first and failed only at generation, after the
+    stream had already sent its sources."""
+
+    effective = (provider or settings.llm_provider).lower().strip()
+    effective_temperature = temperature if temperature is not None else settings.llm_temperature
+    if effective == "anthropic" and float(effective_temperature) > ANTHROPIC_TEMPERATURE_MAX:
+        raise GenerationConfigError(
+            f"Anthropic models take a temperature of at most {ANTHROPIC_TEMPERATURE_MAX:g}; "
+            f"got {float(effective_temperature):g}."
+        )
     if provider is None:
         return
     if provider not in allowed_request_providers(settings):
@@ -138,7 +152,7 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> QuestionResponse:
-        check_request_provider(request.llm_provider, settings)
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
         release = question_slot(slots)
         try:
             grounded = pipeline.answer(
@@ -190,7 +204,7 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> ClosingStreamingResponse:
-        check_request_provider(request.llm_provider, settings)
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
         # Taken here, before the 200 is committed, so a full server can still say 429.
         lease = StreamLease(question_slot(slots))
         stop = threading.Event()
@@ -277,7 +291,7 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> SummaryResponse:
-        check_request_provider(request.llm_provider, settings)
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
         task = summary_request(request)
         summarizer.check_documents(task.filenames)
         release = question_slot(slots, count_metric=False)
@@ -310,7 +324,7 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> ClosingStreamingResponse:
-        check_request_provider(request.llm_provider, settings)
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
         task = summary_request(request)
         # Before the 200: an unknown or oversized document is a plain 404 / 400.
         summarizer.check_documents(task.filenames)

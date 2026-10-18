@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from fastembed import SparseTextEmbedding, TextEmbedding
 from qdrant_client import models
 
+from api.model_files import colocate
 from api.request_id import submit_in_context
 from api.settings import AppSettings
 
@@ -92,16 +93,24 @@ class LocalEmbeddingProvider:
         sparse_model: SparseEmbeddingModel | None = None,
     ) -> None:
         self.settings = settings
-        self.dense_model = dense_model or TextEmbedding(
-            model_name=settings.dense_embedding_model,
-            lazy_load=True,
-            threads=settings.embedding_threads or None,
-        )
-        self.sparse_model = sparse_model or SparseTextEmbedding(
-            model_name=settings.sparse_embedding_model,
-            lazy_load=True,
-            **sparse_model_options(settings),
-        )
+        if dense_model is None:
+            dense_model = TextEmbedding(
+                model_name=settings.dense_embedding_model,
+                lazy_load=True,
+                threads=settings.embedding_threads or None,
+            )
+            # Downloaded by the constructor, loaded on first use: in between, keep a
+            # large model's external weights where ONNX Runtime accepts them.
+            colocate(dense_model)
+        self.dense_model = dense_model
+        if sparse_model is None:
+            sparse_model = SparseTextEmbedding(
+                model_name=settings.sparse_embedding_model,
+                lazy_load=True,
+                **sparse_model_options(settings),
+            )
+            colocate(sparse_model)
+        self.sparse_model = sparse_model
         # One long-lived pair of workers instead of a fresh pool per call. Every query
         # embeds, so spawning and joining two OS threads was pure per-request overhead
         # on the hot path. The provider is a process-wide singleton (see

@@ -1404,6 +1404,7 @@ describe('App', () => {
       cited_filenames: ['a.txt'],
       rating: 'up',
       citation_source_number: null,
+      kind: 'question',
     });
   });
 
@@ -1524,5 +1525,177 @@ describe('App workspaces', () => {
     render(<App />);
     expect(await screen.findByText('Workspace no longer exists')).toBeInTheDocument();
     expect(listedFor.every((header) => header === undefined)).toBe(true);
+  });
+});
+
+describe('App workspace switching', () => {
+  type Reply = Response | Promise<Response>;
+  const listing = (filenames: string[]) =>
+    jsonResponse({ filenames, chunk_counts: Object.fromEntries(filenames.map((f) => [f, 1])) });
+  const CORPUS: Record<string, string[]> = { '': ['guide.md', 'shared.md'], legal: ['contract.txt', 'shared.md'] };
+
+  function server(
+    routes: {
+      config?: () => Reply;
+      workspaces?: () => Reply;
+      documents?: (workspace: string) => Reply;
+    } = {},
+  ) {
+    const calls: { path: string; workspace?: string }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), 'http://localhost');
+        const workspace = ((init?.headers ?? {}) as Record<string, string>)['X-Workspace'];
+        calls.push({ path: url.pathname, workspace });
+        if (url.pathname === '/health') return jsonResponse({ status: 'ok' });
+        if (url.pathname === '/config') {
+          return routes.config?.() ?? jsonResponse(makeConfigPayload({ workspaces_enabled: true }));
+        }
+        if (url.pathname === '/access') return jsonResponse({ access: 'open' });
+        if (url.pathname === '/workspaces') {
+          return routes.workspaces?.() ?? jsonResponse({ enabled: true, workspaces: ['legal'] });
+        }
+        if (url.pathname === '/documents') {
+          return routes.documents?.(workspace ?? '') ?? listing(CORPUS[workspace ?? '']);
+        }
+        if (url.pathname === '/search') {
+          return jsonResponse({
+            results: [
+              { rank: 1, filename: 'guide.md', page: 1, section: 'Intro', chunk_id: 'c1', chunk_ordinal: 0,
+                text: 'Hybrid retrieval.', retrieval_score: 0.5, rerank_score: 0.9 },
+            ],
+            timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1 },
+          });
+        }
+        throw new Error(`unexpected fetch: ${url.pathname}`);
+      }),
+    );
+    return calls;
+  }
+
+  afterEach(async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('');
+  });
+
+  const card = (name: string) =>
+    screen.queryAllByTestId('corpus-panel-item').find((item) => item.dataset.corpusCard === name);
+
+  it('leaves nothing of the previous workspace’s corpus to act on while the next one loads', async () => {
+    let answerLegal!: () => void;
+    server({
+      documents: (workspace) =>
+        workspace === 'legal'
+          ? new Promise((resolve) => (answerLegal = () => resolve(listing(CORPUS.legal))))
+          : listing(CORPUS['']),
+    });
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await waitFor(() => expect(card('guide.md')).toBeDefined());
+    await userEvent.click(screen.getByLabelText('Select shared.md'));
+    expect(screen.getByTestId('corpus-bulk')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+
+    await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
+
+    // Not the default workspace's cards, nor its selection ("1 selected" over a
+    // shared.md that exists in both), and not "Upload a document to start." either.
+    expect(card('guide.md')).toBeUndefined();
+    expect(card('shared.md')).toBeUndefined();
+    expect(screen.queryByTestId('corpus-bulk')).not.toBeInTheDocument();
+    expect(screen.getByTestId('question-hint')).not.toHaveTextContent('Upload a document to start.');
+
+    await act(async () => answerLegal());
+    await waitFor(() => expect(card('contract.txt')).toBeDefined());
+    expect(card('shared.md')).toBeDefined();
+    expect(screen.queryByTestId('corpus-bulk')).not.toBeInTheDocument();
+  });
+
+  it('retries a listing that failed after a switch instead of showing an empty corpus', async () => {
+    server({
+      documents: (workspace) =>
+        workspace === 'legal'
+          ? new Response(JSON.stringify({ detail: 'Qdrant is down.' }), { status: 503 })
+          : listing(CORPUS['']),
+    });
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+
+    await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
+
+    await waitFor(() =>
+      expect(screen.getByTestId('question-hint')).toHaveTextContent('Couldn’t load the document list — retrying.'),
+    );
+  });
+
+  it('clears search results of the previous workspace', async () => {
+    server();
+    render(<App />);
+    await screen.findByText('api ok');
+    await userEvent.click(screen.getByTestId('rail-search'));
+    await userEvent.type(screen.getByTestId('search-input'), 'retrieval{Enter}');
+    expect(await screen.findByTestId('search-result')).toBeInTheDocument();
+
+    await openCorpusPanel();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
+    await userEvent.click(screen.getByTestId('rail-search'));
+
+    expect(screen.queryByTestId('search-result')).not.toBeInTheDocument();
+    expect(screen.getByTestId('search-input')).toHaveValue('');
+  });
+
+  it('asks for /config and /access without waiting on the remembered workspace’s check', async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('legal');
+    const calls = server({ workspaces: () => new Promise<Response>(() => {}) });
+    render(<App />);
+
+    expect(await screen.findByText('api ok')).toBeInTheDocument();
+    expect(calls.find((call) => call.path === '/access')?.workspace).toBeUndefined();
+    // The listing still waits: it may be read from a workspace that is gone.
+    expect(calls.some((call) => call.path === '/documents')).toBe(false);
+  });
+
+  it('falls back to the default workspace when the one in use was deleted elsewhere', async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('legal');
+    const calls = server({
+      documents: (workspace) =>
+        workspace === 'legal'
+          ? new Response(JSON.stringify({ detail: "No workspace named 'legal'." }), { status: 404 })
+          : listing(CORPUS['']),
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Workspace no longer exists')).toBeInTheDocument();
+    await waitFor(() => expect(calls.filter((c) => c.path === '/documents').at(-1)?.workspace).toBeUndefined());
+    await openCorpusPanel();
+    expect(screen.getByTestId('workspace-select')).toHaveValue('');
+    await waitFor(() => expect(card('guide.md')).toBeDefined());
+  });
+
+  it('reads the workspace list again after Settings are saved', async () => {
+    const calls = server();
+    render(<App />);
+    await screen.findByText('api ok');
+    await waitFor(() => expect(calls.filter((c) => c.path === '/workspaces')).toHaveLength(1));
+
+    await userEvent.click(screen.getByTestId('open-settings'));
+    await userEvent.click(await screen.findByTestId('settings-save'));
+
+    await waitFor(() => expect(calls.filter((c) => c.path === '/workspaces')).toHaveLength(2));
+  });
+
+  it('keeps Summarize disabled until the app has booted', async () => {
+    server({ config: () => new Promise<Response>(() => {}) });
+    render(<App />);
+    await openCorpusPanel();
+    await waitFor(() => expect(card('guide.md')).toBeDefined());
+    expect(screen.getByLabelText('Summarize guide.md')).toBeDisabled();
   });
 });

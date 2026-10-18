@@ -18,6 +18,8 @@ interface DocumentCardProps {
   onConfirmDelete: (filename: string) => void;
   onRead?: (filename: string) => void;
   onSummarize?: (filenames: string[]) => void;
+  /** Summarize can't run right now (booting, the key was refused) — like the composer. */
+  summarizeDisabled?: boolean;
   onOpenOriginal?: (filename: string) => void;
   onReindex?: (filename: string) => void;
   onCancelUpload?: (uploadId: string) => void;
@@ -42,6 +44,7 @@ const DocumentCard = memo(function DocumentCard({
   onConfirmDelete,
   onRead,
   onSummarize,
+  summarizeDisabled,
   onOpenOriginal,
   onReindex,
   onCancelUpload,
@@ -97,7 +100,7 @@ const DocumentCard = memo(function DocumentCard({
                 type="button"
                 className="corpus-panel__read"
                 onClick={() => onSummarize([card.filename])}
-                disabled={disabled}
+                disabled={disabled || summarizeDisabled}
                 aria-label={`Summarize ${card.filename}`}
                 title="Summarize the whole document"
                 data-testid="corpus-summarize"

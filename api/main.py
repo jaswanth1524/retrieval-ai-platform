@@ -29,7 +29,12 @@ from api.dependencies import (
 )
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
-from api.ingest_jobs import delete_indexed_document, enqueue_ingest
+from api.ingest_jobs import (
+    delete_indexed_document,
+    enqueue_ingest,
+    known_filenames,
+    refuse_near_duplicate_name,
+)
 from api.ingest_service import IngestService
 from api.llm import GenerationConfigError, completion_model_and_kwargs
 from api.logging_config import configure_logging
@@ -245,7 +250,7 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
         name = workspace_of(target)
         if not workspace_exists(get_qdrant_client(), settings.qdrant_collection, name):
             logger.info("Creating workspace %r for WATCH_DIR.", name)
-        repository.ensure_writable(target)
+        repository.ensure_writable(target, create_workspace=True)
         if raw_store is not None and target.raw_document_dir:
             raw_store = RawDocumentStore(target.raw_document_dir)
     settings = target
@@ -255,7 +260,12 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
         metadata = repository.filename_metadata(settings)
         return {name: meta.uploaded_at for name, meta in metadata.items()}
 
-    def enqueue(filename: str, content: bytes) -> None:
+    def enqueue(filename: str, content: bytes, mtime: float) -> None:
+        if raw_store is not None:
+            # As an upload is: with originals stored, Report.pdf and report.pdf would
+            # overwrite each other's original on a case-insensitive disk. The
+            # FilenameConflictError is logged by the watcher and the file skipped.
+            refuse_near_duplicate_name(filename, known_filenames(repository, settings))
         enqueue_ingest(
             job_store=get_ingest_job_store(),
             executor=get_ingest_executor(),
@@ -264,6 +274,9 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
             filename=filename,
             content=content,
             raw_store=raw_store,
+            # The file's mtime, not the time the job runs: it is how the watcher tells
+            # an indexed document is this exact version of the file (api/watch.py).
+            uploaded_at=mtime,
         )
 
     def delete(filename: str) -> None:

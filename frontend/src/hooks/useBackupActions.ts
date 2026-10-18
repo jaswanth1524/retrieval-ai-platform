@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, apiErrorMessage } from '../api/client';
+import { api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { DocumentJobAcceptedResponse } from '../api/types';
 import { downloadFile } from '../utils/exportChat';
 import { useStableHandler } from './useStableHandler';
@@ -8,8 +8,8 @@ import type { ToastInput } from './useToasts';
 interface BackupOptions {
   pushToast: (toast: ToastInput) => unknown;
   noteAuthFailure: (err: unknown) => boolean;
-  /** The restore queued these documents (follow them like uploads). */
-  onRestoreQueued: (jobs: DocumentJobAcceptedResponse[]) => Promise<void> | void;
+  /** The restore queued these documents (follow them like uploads), in `workspace`. */
+  onRestoreQueued: (jobs: DocumentJobAcceptedResponse[], workspace: string) => Promise<void> | void;
 }
 
 /** Corpus backups (GET /export, POST /import) and stored-original downloads, each
@@ -57,9 +57,11 @@ export function useBackupActions({ pushToast, noteAuthFailure, onRestoreQueued }
   const restoreBackup = useStableHandler(async (file: File) => {
     setRestoring(true);
     pushToast({ tone: 'info', title: 'Restoring backup…', body: file.name });
+    // Restored into the workspace in use now; a big zip can take a switch to send.
+    const workspace = getWorkspace();
     let result;
     try {
-      result = await api.importBackup(file);
+      result = await api.importBackup(file, undefined, workspace);
     } catch (err) {
       if (!noteAuthFailure(err)) {
         pushToast({
@@ -86,7 +88,7 @@ export function useBackupActions({ pushToast, noteAuthFailure, onRestoreQueued }
       title: `Restoring ${result.jobs.length} document${result.jobs.length === 1 ? '' : 's'}`,
       body: notes.length > 0 ? `${notes.join('; ')}.` : undefined,
     });
-    if (result.jobs.length > 0) await onRestoreQueued(result.jobs);
+    if (result.jobs.length > 0) await onRestoreQueued(result.jobs, workspace);
   });
 
   const notify = useStableHandler(pushToast);

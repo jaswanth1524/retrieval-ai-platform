@@ -10,7 +10,10 @@ interface BulkBarProps {
   onAddTag?: (tag: string) => Promise<void>;
   /** Compare the selection, offered when exactly two documents are selected. */
   onCompare?: (filenames: string[]) => void;
-  onDelete: () => Promise<void>;
+  /** Can't compare right now (booting, the key was refused) — like the composer. */
+  compareDisabled?: boolean;
+  /** Absent for the read-only key, which can only compare. */
+  onDelete?: () => Promise<void>;
   onClear: () => void;
 }
 
@@ -22,6 +25,7 @@ export default function BulkBar({
   onReindex,
   onAddTag,
   onCompare,
+  compareDisabled,
   onDelete,
   onClear,
 }: BulkBarProps) {
@@ -43,7 +47,7 @@ export default function BulkBar({
   return (
     <div className="corpus-panel__bulk" role="group" aria-label="Selected documents" data-testid="corpus-bulk">
       <span className="corpus-panel__bulk-count mono">{count} selected</span>
-      {confirmingDelete ? (
+      {confirmingDelete && onDelete ? (
         <ConfirmInline
           className="corpus-panel__confirm"
           prompt={`Delete ${label}?`}
@@ -98,7 +102,7 @@ export default function BulkBar({
               type="button"
               className="corpus-panel__bulk-button"
               onClick={() => onCompare(selected)}
-              disabled={disabled || busy}
+              disabled={disabled || busy || compareDisabled}
               title="Compare the two selected documents"
               data-testid="corpus-bulk-compare"
             >
@@ -116,15 +120,17 @@ export default function BulkBar({
               ↻ Re-index {reindexable.length}
             </button>
           )}
-          <button
-            type="button"
-            className="corpus-panel__bulk-button corpus-panel__bulk-delete"
-            onClick={() => setConfirmingDelete(true)}
-            disabled={disabled || busy}
-            data-testid="corpus-bulk-delete"
-          >
-            Delete {count}
-          </button>
+          {onDelete && (
+            <button
+              type="button"
+              className="corpus-panel__bulk-button corpus-panel__bulk-delete"
+              onClick={() => setConfirmingDelete(true)}
+              disabled={disabled || busy}
+              data-testid="corpus-bulk-delete"
+            >
+              Delete {count}
+            </button>
+          )}
           <button
             type="button"
             className="corpus-panel__bulk-button"

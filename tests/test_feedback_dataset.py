@@ -208,3 +208,115 @@ def test_the_store_can_be_read_for_one_workspace(
     )
     assert code == 0
     assert [example.question for example in load_retrieval_dataset(output)] == ["Legal q?"]
+
+
+def test_the_cli_reads_the_default_workspace_unless_told_otherwise(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store_path = tmp_path / "feedback.sqlite3"
+    store = FeedbackStore(str(store_path))
+    for question, workspace in (("Default q?", ""), ("Legal q?", "legal")):
+        store.add(
+            trace_id=None,
+            question=question,
+            answer_excerpt="An answer [1].",
+            cited_filenames=["a.pdf"],
+            rating="up",
+            citation_source_number=None,
+            workspace=workspace,
+        )
+    output = tmp_path / "out.jsonl"
+    store_args = ["from-feedback", "--store", str(store_path), "--output", str(output)]
+
+    assert main(store_args) == 0
+    assert [example.question for example in load_retrieval_dataset(output)] == ["Default q?"]
+    assert main([*store_args, "--all-workspaces"]) == 0
+    assert len(load_retrieval_dataset(output)) == 2
+
+    export = tmp_path / "backup.zip"
+    with zipfile.ZipFile(export, "w") as archive:
+        archive.writestr("feedback.jsonl", "")
+    capsys.readouterr()
+    for scope in (["--workspace", "legal"], ["--all-workspaces"]):
+        args = ["from-feedback", "--export", str(export), "--output", str(output), *scope]
+        assert main(args) == 2
+        assert "apply to --store only" in capsys.readouterr().err
+
+
+def test_only_question_ratings_are_labels(tmp_path: Path) -> None:
+    store_path = tmp_path / "feedback.sqlite3"
+    store = FeedbackStore(str(store_path))
+    for question, kind in (
+        ("What is alpha?", "question"),
+        ('Summarize the document "a.pdf".', "summary"),
+        ("How is beta used?", "follow_up"),
+    ):
+        store.add(
+            trace_id=None,
+            question=question,
+            answer_excerpt="An answer [1].",
+            cited_filenames=["a.pdf"],
+            rating="up",
+            citation_source_number=None,
+            kind=kind,  # type: ignore[arg-type]
+        )
+    dataset = build_dataset(rows_from_store(store_path, ""))
+
+    assert [row["question"] for row in dataset.examples] == ["What is alpha?"]
+    assert dataset.not_questions == 2
+    assert [row["source"] for row in dataset.review] == [
+        "feedback (a rated summary, not a question: left out of the dataset)",
+        "feedback (a rated follow-up, not a question: left out of the dataset)",
+    ]
+
+    # Rows from before kinds: a summary's or comparison's task text gives it away.
+    legacy = build_dataset(
+        [
+            _row('Summarize the document "a.pdf".', "up", at=1),
+            _row('Compare the documents "a.pdf" and "b.pdf".', "up", at=2),
+            _row("What is gamma?", "up", at=3),
+        ]
+    )
+    assert [row["question"] for row in legacy.examples] == ["What is gamma?"]
+    assert legacy.not_questions == 2
+
+
+def test_the_store_is_read_without_writing_to_it(tmp_path: Path) -> None:
+    import os
+    import sqlite3
+
+    store_path = tmp_path / "feedback.sqlite3"
+    with sqlite3.connect(store_path) as conn:
+        # A file from before workspaces and kinds: reading must not migrate it.
+        conn.execute(
+            "CREATE TABLE feedback (id TEXT PRIMARY KEY, trace_id TEXT, "
+            "question TEXT NOT NULL, answer_excerpt TEXT NOT NULL, "
+            "cited_filenames_json TEXT NOT NULL, rating TEXT NOT NULL, "
+            "citation_source_number INTEGER, created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO feedback VALUES ('1', NULL, 'Old q?', 'a', '[\"a.pdf\"]', 'up', NULL, 1)"
+        )
+    conn.close()
+    os.chmod(store_path, 0o444)
+    os.chmod(tmp_path, 0o555)  # no journal or WAL file could be created either
+    try:
+        assert [row.question for row in rows_from_store(store_path, "")] == ["Old q?"]
+        assert list(rows_from_store(store_path, "legal")) == []
+    finally:
+        os.chmod(tmp_path, 0o755)
+        os.chmod(store_path, 0o644)
+    with sqlite3.connect(store_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+    conn.close()
+    assert "workspace" not in columns and "kind" not in columns
+
+    garbage = tmp_path / "garbage.sqlite3"
+    garbage.write_bytes(b"not a database at all" * 100)
+    with pytest.raises(FeedbackDataError, match="not a readable feedback store"):
+        list(rows_from_store(garbage))
+    empty = tmp_path / "empty.sqlite3"
+    sqlite3.connect(empty).close()
+    empty.write_bytes(b"")  # a valid, empty database file
+    with pytest.raises(FeedbackDataError, match="no feedback table"):
+        list(rows_from_store(empty))

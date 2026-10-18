@@ -4,6 +4,7 @@ import type { Components } from 'react-markdown';
 import type {
   CitationResponse,
   DocumentTask,
+  FeedbackKind,
   FeedbackRating,
   SummaryCoverage,
   TimingsResponse,
@@ -91,6 +92,7 @@ export interface FeedbackPayload {
   answerExcerpt: string;
   citedFilenames: string[];
   traceId: string | null;
+  kind: FeedbackKind;
 }
 
 export interface ChatTurn {
@@ -129,6 +131,9 @@ export interface ChatTurn {
   coverage?: SummaryCoverage;
   // Questions the server suggests asking next (FOLLOWUPS_ENABLED).
   followups?: string[];
+  // An answer to a question asked with the conversation as history (rated as a
+  // "follow_up"; see FeedbackKind).
+  followUp?: boolean;
 }
 
 interface ChatMessageProps {
@@ -223,6 +228,8 @@ function ChatMessage({
       answerExcerpt: turn.content,
       citedFilenames: [...new Set(turn.sources.map((source) => source.filename))],
       traceId: turn.traceId,
+      // A summary's question is a label for the task; it was asked without history.
+      kind: regenerateTask ? 'summary' : turn.followUp ? 'follow_up' : 'question',
     });
   };
 

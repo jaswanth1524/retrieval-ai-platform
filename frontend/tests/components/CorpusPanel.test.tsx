@@ -103,6 +103,39 @@ describe('CorpusPanel', () => {
     expect(screen.queryByTestId('corpus-bulk-compare')).not.toBeInTheDocument();
   });
 
+  it('lets the read-only key compare two documents, and nothing else in bulk', async () => {
+    // The server allows summaries for the read key; selection used to be full-key only.
+    const props = setup({
+      filenames: ['a.txt', 'b.txt'],
+      documents: { 'a.txt': meta({ reindexable: true }), 'b.txt': meta({ reindexable: true }) },
+      readOnly: true,
+      onSummarize: vi.fn(),
+      onReindex: vi.fn(),
+      onReindexMany: vi.fn(),
+      onSetTags: vi.fn(),
+    });
+    for (const box of screen.getAllByTestId('corpus-select')) await userEvent.click(box);
+
+    await userEvent.click(screen.getByTestId('corpus-bulk-compare'));
+    expect(props.onSummarize).toHaveBeenCalledWith(['a.txt', 'b.txt']);
+    expect(screen.queryByTestId('corpus-bulk-delete')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('corpus-bulk-tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('corpus-bulk-reindex')).not.toBeInTheDocument();
+  });
+
+  it('keeps Summarize and Compare disabled while summaries can’t be asked', async () => {
+    const props = setup({
+      filenames: ['a.txt', 'b.txt'],
+      documents: { 'a.txt': meta(), 'b.txt': meta() },
+      onSummarize: vi.fn(),
+      summarizeDisabled: true,
+    });
+    expect(screen.getByLabelText('Summarize a.txt')).toBeDisabled();
+    for (const box of screen.getAllByTestId('corpus-select')) await userEvent.click(box);
+    expect(screen.getByTestId('corpus-bulk-compare')).toBeDisabled();
+    expect(props.onSummarize).not.toHaveBeenCalled();
+  });
+
   it('focuses Cancel on a delete confirm, and Escape backs out of it', async () => {
     setup({ filenames: ['a.txt'], documents: { 'a.txt': meta({ chunks: 3 }) } });
 

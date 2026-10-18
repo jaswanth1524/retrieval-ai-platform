@@ -11,6 +11,7 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from api.settings import AppSettings
+from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,14 @@ PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
 
 class CollectionSchemaError(RuntimeError):
     """Raised when an existing Qdrant collection does not match DocRAG's schema."""
+
+
+class WorkspaceGoneError(CollectionSchemaError):
+    """A workspace's collection doesn't exist: the workspace was deleted, possibly while
+    this request or job was under way. Only creating the workspace (``POST
+    /workspaces``, ``WATCH_WORKSPACE`` at startup) makes its collection; anything else
+    finding it missing is refused (404) rather than bringing the workspace back.
+    """
 
 
 def check_dense_dimension(size: int, settings: AppSettings) -> None:
@@ -219,7 +228,11 @@ _ensure_collection_lock = Lock()
 
 
 def ensure_collection(
-    client: QdrantClient, settings: AppSettings, *, strict: bool = True
+    client: QdrantClient,
+    settings: AppSettings,
+    *,
+    strict: bool = True,
+    create_workspace: bool = False,
 ) -> CollectionReady:
     """Create or validate the configured Qdrant collection, caching success per client.
 
@@ -230,8 +243,12 @@ def ensure_collection(
     stay strict.
     """
 
+    # A missing collection is created for the default workspace; for another one only
+    # with create_workspace (see WorkspaceGoneError).
     try:
-        return _ensure_collection_strict(client, settings)
+        return _ensure_collection_strict(client, settings, create_workspace=create_workspace)
+    except WorkspaceGoneError:
+        raise
     except CollectionSchemaError:
         if strict:
             raise
@@ -242,7 +259,9 @@ def ensure_collection(
         )
 
 
-def recreate_if_empty_and_mismatched(client: QdrantClient, settings: AppSettings) -> bool:
+def recreate_if_empty_and_mismatched(
+    client: QdrantClient, settings: AppSettings, *, create_workspace: bool = False
+) -> bool:
     """Replace an *empty* collection that doesn't match the configuration; True if it did.
 
     The last step of the documented recovery: once every document is deleted, the next
@@ -252,8 +271,10 @@ def recreate_if_empty_and_mismatched(client: QdrantClient, settings: AppSettings
     """
 
     try:
-        _ensure_collection_strict(client, settings)
+        _ensure_collection_strict(client, settings, create_workspace=create_workspace)
         return False
+    except WorkspaceGoneError:
+        raise
     except CollectionSchemaError:
         pass
     collection_name = settings.qdrant_collection
@@ -276,7 +297,8 @@ def recreate_if_empty_and_mismatched(client: QdrantClient, settings: AppSettings
             client.delete_collection(collection_name)
             _readiness_cache.get(client, {}).pop(_readiness_key(settings), None)
             recreated = True
-    _ensure_collection_strict(client, settings)
+    # Recreating one that existed a moment ago is not bringing back a deleted workspace.
+    _ensure_collection_strict(client, settings, create_workspace=create_workspace or recreated)
     return recreated
 
 
@@ -311,7 +333,9 @@ def _readiness_key(settings: AppSettings) -> _ReadinessKey:
     )
 
 
-def _ensure_collection_strict(client: QdrantClient, settings: AppSettings) -> CollectionReady:
+def _ensure_collection_strict(
+    client: QdrantClient, settings: AppSettings, *, create_workspace: bool = False
+) -> CollectionReady:
     cache_key = _readiness_key(settings)
     cached = _readiness_cache.get(client, {}).get(cache_key)
     if cached is not None:
@@ -322,7 +346,7 @@ def _ensure_collection_strict(client: QdrantClient, settings: AppSettings) -> Co
         cached = _readiness_cache.get(client, {}).get(cache_key)
         if cached is not None:
             return cached
-        ready = _ensure_collection_uncached(client, settings)
+        ready = _ensure_collection_uncached(client, settings, create_workspace)
         _readiness_cache.setdefault(client, {})[cache_key] = ready
         return ready
 
@@ -340,11 +364,13 @@ def clear_readiness_cache() -> None:
     _readiness_cache.clear()
 
 
-def _ensure_collection_uncached(client: QdrantClient, settings: AppSettings) -> CollectionReady:
+def _ensure_collection_uncached(
+    client: QdrantClient, settings: AppSettings, create_workspace: bool = False
+) -> CollectionReady:
     """Create or validate the configured Qdrant collection against Qdrant itself."""
 
     try:
-        return _ensure_collection_against_qdrant(client, settings)
+        return _ensure_collection_against_qdrant(client, settings, create_workspace)
     except ResponseHandlingException as exc:
         # The cause (the URL it tried, a socket error) stays in the log.
         logger.warning("Qdrant is unreachable.", exc_info=True)
@@ -352,12 +378,15 @@ def _ensure_collection_uncached(client: QdrantClient, settings: AppSettings) -> 
 
 
 def _ensure_collection_against_qdrant(
-    client: QdrantClient, settings: AppSettings
+    client: QdrantClient, settings: AppSettings, create_workspace: bool = False
 ) -> CollectionReady:
     """Create or validate the collection, letting connection failures propagate."""
 
     collection_name = settings.qdrant_collection
     if not client.collection_exists(collection_name):
+        workspace = workspace_of(settings)
+        if workspace and not create_workspace:
+            raise WorkspaceGoneError(f"No workspace named '{workspace}'.")
         try:
             client.create_collection(
                 collection_name=collection_name,
@@ -434,6 +463,10 @@ def validate_collection_schema(
     ):
         actual = metadata.get(key, default)
         expected = str(getattr(settings, key))
+        if key == "sparse_language":
+            # Normalized as AppSettings normalizes it: a collection recorded as
+            # "English" (or "") before that was in place is the same English index.
+            actual = str(actual).strip().lower() or default
         if actual != expected:
             raise CollectionSchemaError(
                 f"Collection '{settings.qdrant_collection}' was indexed with {label} of "

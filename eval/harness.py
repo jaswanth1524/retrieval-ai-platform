@@ -482,10 +482,17 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument(
         "--review", type=Path, help="Optional .jsonl of thumbs-down questions to label by hand."
     )
-    feedback.add_argument(
+    scope = feedback.add_mutually_exclusive_group()
+    scope.add_argument(
         "--workspace",
-        help="With --store: only this workspace's ratings ('' = the default one); all by "
-        "default. An export holds one workspace already.",
+        default=None,
+        help="With --store: only this workspace's ratings (default: the default workspace, "
+        "''). An export holds one workspace already.",
+    )
+    scope.add_argument(
+        "--all-workspaces",
+        action="store_true",
+        help="With --store: every workspace's ratings in one dataset.",
     )
     return parser
 
@@ -493,11 +500,22 @@ def build_parser() -> argparse.ArgumentParser:
 def dataset_from_feedback(args: argparse.Namespace) -> int:
     """``from-feedback``: write the draft dataset, then validate it like ``validate``."""
 
+    if args.export and (args.workspace is not None or args.all_workspaces):
+        # Silently ignored, it would read as "this workspace's ratings" when the
+        # dataset holds whichever workspace the backup was taken from.
+        print(
+            "error: --workspace/--all-workspaces apply to --store only; an export holds the "
+            "one workspace it was taken from",
+            file=sys.stderr,
+        )
+        return 2
+    # One corpus per dataset: the default workspace unless another (or all) is asked for.
+    # Reading every workspace by default mixed labels from corpora the dataset is never
+    # run against together.
+    workspace = None if args.all_workspaces else (args.workspace or "")
     try:
         rows = (
-            rows_from_store(args.store, args.workspace)
-            if args.store
-            else rows_from_export(args.export)
+            rows_from_store(args.store, workspace) if args.store else rows_from_export(args.export)
         )
         dataset = build_dataset(rows)
     except FeedbackDataError as exc:
@@ -505,9 +523,10 @@ def dataset_from_feedback(args: argparse.Namespace) -> int:
         return 2
     print(
         f"read {dataset.ratings_read} ratings: {len(dataset.examples)} labeled examples, "
-        f"{len(dataset.review)} rated-down questions to review "
+        f"{len(dataset.review) - dataset.not_questions} rated-down questions to review "
         f"(skipped {dataset.citation_ratings} citation ratings, "
-        f"{dataset.uncited} thumbs-up answers that cited nothing)"
+        f"{dataset.uncited} thumbs-up answers that cited nothing; "
+        f"{dataset.not_questions} summary or follow-up ratings went to the review only)"
     )
     if args.review is not None:
         write_jsonl(args.review, dataset.review)

@@ -24,6 +24,8 @@ export interface CommandState {
   scopedFilenames?: string[];
   /** An answer is streaming anywhere: a summary would have to wait for it. */
   answerInFlight?: boolean;
+  /** Summaries can't be asked at all right now (booting, the key was refused). */
+  summarizeDisabled?: boolean;
 }
 
 /** What the commands do. Read when a command runs, so they needn't be stable. */
@@ -81,6 +83,7 @@ export function useCommands(
     exportingBackup,
     scopedFilenames,
     answerInFlight = false,
+    summarizeDisabled = false,
   } = state;
 
   const commands = useMemo<Command[]>(() => {
@@ -158,7 +161,7 @@ export function useCommands(
                   ? `Summarize ${scopedFilenames[0]}`
                   : `Compare ${scopedFilenames[0]} and ${scopedFilenames[1]}`,
               run: () => run.current.summarize?.(scopedFilenames),
-              disabled: answerInFlight,
+              disabled: answerInFlight || summarizeDisabled,
             },
           ]
         : []),
@@ -243,6 +246,7 @@ export function useCommands(
     exportingBackup,
     scopedFilenames,
     answerInFlight,
+    summarizeDisabled,
   ]);
 
   // Read at keypress time so the listener is registered once.

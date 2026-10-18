@@ -79,14 +79,19 @@ jobs:
       - name: Build and smoke-test the CLI package
         # cli/pyproject.toml is a separate distribution (uv tool install ./cli): build
         # the wheel, install it into a throwaway venv and run the commands it declares.
+        # From outside the checkout and with `python -I`: a plain `python -c` puts the
+        # working directory on sys.path, so it imported the source tree's cli/, not the
+        # wheel's. The assert proves the installed copy was the one loaded.
         if: matrix.python-version == '3.12'
         run: |
           out=$(mktemp -d)
           uv build ./cli --wheel --out-dir "$out/dist"
           uv venv "$out/venv"
           VIRTUAL_ENV="$out/venv" uv pip install "$(ls "$out"/dist/*.whl)[mcp]"
+          cd "$out"
           "$out/venv/bin/docrag" --help
-          "$out/venv/bin/python" -c "import cli.mcp_server"
+          test -x "$out/venv/bin/docrag-mcp"
+          "$out/venv/bin/python" -I -c 'import sys, cli; from importlib.metadata import entry_points; [entry_points(group="console_scripts")[name].load() for name in ("docrag", "docrag-mcp")]; assert cli.__file__.startswith(sys.prefix), cli.__file__'
 
       - name: Import eval extra
         # ragas has previously broken on import alone (an unpinned transitive
@@ -108,10 +113,11 @@ jobs:
         # Once: the lockfile is the same on every Python version.
         if: matrix.python-version == '3.12'
         # What the image ships (core deps) plus the optional OCR extra — the parsers
-        # here read untrusted uploads. The eval extra is excluded: it never ships, and
-        # ragas carries advisories with no fixed release to move to.
+        # here read untrusted uploads — and the mcp extra the docrag-cli package
+        # installs (its httpx is a core dep too). The eval extra is excluded: it never
+        # ships, and ragas carries advisories with no fixed release to move to.
         run: |
-          uv export --frozen --extra ocr --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
+          uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
           uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
 
   qdrant:

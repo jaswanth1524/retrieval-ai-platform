@@ -25,7 +25,7 @@ from fastapi import HTTPException
 
 from api.documents import DocumentError, normalize_tags, validate_upload_filename
 from api.export import MANIFEST_VERSION
-from api.feedback import Feedback, FeedbackStore
+from api.feedback import FEEDBACK_KINDS, Feedback, FeedbackStore
 from api.schemas import (
     FEEDBACK_CITATION_NUMBER_MAX,
     FEEDBACK_CITED_FILENAMES_MAX,
@@ -35,6 +35,7 @@ from api.schemas import (
     REQUEST_TRACE_ID_MAX_CHARS,
     DocumentJobAcceptedResponse,
 )
+from api.workspaces import WorkspaceClosingError
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +224,13 @@ def _restore_document(
         outcome.jobs.append(
             enqueue(filename, content, _uploaded_at(document.get("uploaded_at")), tags)
         )
+    except WorkspaceClosingError:
+        # The workspace is being deleted: that delete either goes through, and the
+        # workspace is gone, or doesn't, and the document comes in on the next try.
+        # Either way it is this document's outcome, not the whole import's.
+        outcome.deferred.append(filename)
     except HTTPException as exc:
-        if exc.status_code != 503:
+        if exc.status_code != 503:  # the indexing queue is full: deferred
             raise
         outcome.deferred.append(filename)
     except DocumentError:
@@ -330,8 +336,11 @@ def _feedback_row(line: str) -> Feedback | None:
         cited = data.get("cited_filenames") or []
         number = data.get("citation_source_number")
         created_at = _uploaded_at(data.get("created_at"))
+        # A backup from before kinds has none: every rating then was of an answer.
+        kind = data.get("kind", "question")
         if (
-            not isinstance(question, str)
+            kind not in FEEDBACK_KINDS
+            or not isinstance(question, str)
             or not 0 < len(question) <= _FEEDBACK_QUESTION_MAX
             or len(excerpt) > _FEEDBACK_EXCERPT_MAX
             or not 0 < len(row_id) <= _FEEDBACK_ID_MAX
@@ -357,6 +366,7 @@ def _feedback_row(line: str) -> Feedback | None:
             rating=data["rating"],
             citation_source_number=number,
             created_at=created_at,
+            kind=kind,
         )
     except (ValueError, KeyError, TypeError):
         return None

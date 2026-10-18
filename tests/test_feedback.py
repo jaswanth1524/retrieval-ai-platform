@@ -245,3 +245,52 @@ def test_the_same_rating_can_be_restored_into_two_workspaces_but_only_once_into_
     assert store.import_rows(rows, workspace="archive") == 0
     assert store.import_rows(rows, workspace="legal") == 0
     assert len(store.list_recent(10)) == 2
+
+
+def test_the_row_cap_applies_to_each_workspace_on_its_own(tmp_path: Path) -> None:
+    store = FeedbackStore(str(tmp_path / "feedback.db"), max_rows=2)
+    _rate(store, "quiet default q")  # the oldest row in the file
+    for index in range(3):
+        _rate(store, f"legal q{index}", workspace="legal")
+
+    # Across workspaces, the busy one's ratings pushed out the quiet one's.
+    assert [row.question for row in store.list_recent(10, workspace="")] == ["quiet default q"]
+    assert [row.question for row in store.list_recent(10, workspace="legal")] == [
+        "legal q2",
+        "legal q1",
+    ]
+
+
+def test_kind_is_stored_and_a_file_without_the_column_gets_it_in_place(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "feedback.db"
+    with sqlite3.connect(path) as conn:
+        # The table as it was with workspaces, before kinds.
+        conn.execute(
+            "CREATE TABLE feedback (id TEXT NOT NULL, trace_id TEXT, question TEXT NOT NULL, "
+            "answer_excerpt TEXT NOT NULL, cited_filenames_json TEXT NOT NULL, rating TEXT "
+            "NOT NULL, citation_source_number INTEGER, created_at REAL NOT NULL, workspace "
+            "TEXT NOT NULL DEFAULT '', PRIMARY KEY (workspace, id))"
+        )
+        conn.execute(
+            "INSERT INTO feedback VALUES ('old', NULL, 'old q', 'a', '[]', 'up', NULL, 1.0, '')"
+        )
+    conn.close()
+
+    store = FeedbackStore(str(path))
+    store.add(
+        trace_id=None,
+        question="Summarize a.txt",
+        answer_excerpt="a",
+        cited_filenames=[],
+        rating="up",
+        citation_source_number=None,
+        kind="summary",
+    )
+    assert [(row.question, row.kind) for row in store.list_recent(10)] == [
+        ("Summarize a.txt", "summary"),
+        ("old q", "question"),
+    ]
+    page, _ = FeedbackStore(str(path)).rows_oldest_first(None, 10)  # reopened: no re-add
+    assert [row.kind for row in page] == ["question", "summary"]

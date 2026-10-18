@@ -399,6 +399,12 @@ def _workspace_raw_store(directory: str) -> RawDocumentStore:
     return RawDocumentStore(directory)
 
 
+def clear_workspace_raw_stores() -> None:
+    """Forget the per-workspace originals stores (a workspace was deleted)."""
+
+    _workspace_raw_store.cache_clear()
+
+
 def get_request_raw_store(
     base: Annotated[RawDocumentStore | None, Depends(get_raw_document_store)],
     settings: Annotated[AppSettings, Depends(get_request_settings)],

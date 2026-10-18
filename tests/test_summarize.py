@@ -43,6 +43,9 @@ class FakeRepository:
         self.documents = documents
         self.counts: dict[str, int] = {}
 
+    def ensure_ready(self, settings: AppSettings) -> None:
+        return None
+
     def chunk_count_for_filename(self, settings: AppSettings, filename: str) -> int:
         return self.counts.get(filename, len(self.documents.get(filename, [])))
 
@@ -134,7 +137,88 @@ def test_select_parts_samples_evenly_across_a_long_document() -> None:
 def test_a_passage_longer_than_a_part_is_cut_from_its_end() -> None:
     parts = select_parts([_chunk(0, 5000)], budget=1000, max_parts=1)
     assert len(parts) == 1
-    assert parts[0][0].text == "x" * 800
+    # What the budget leaves after the passage's header ("a.txt", no section, 48).
+    assert parts[0][0].text == "x" * (1000 - 5 - 48)
+
+
+def test_a_cut_passage_leaves_room_for_a_long_header() -> None:
+    from dataclasses import replace
+
+    from api.summarize import _packed_size
+
+    long_header = replace(_chunk(0, 5000), filename="n" * 255 + ".txt", section="s" * 120)
+    for budget in (1000, 1500):
+        parts = select_parts([long_header, _chunk(1, 5000)], budget=budget, max_parts=5)
+        assert all(sum(_packed_size(chunk) for chunk in part) <= budget for part in parts)
+        assert parts[0][0].text  # still some text
+
+
+def test_batch_shares_pass_a_small_documents_unused_parts_on() -> None:
+    from api.summarize import batch_shares
+
+    assert batch_shares([1, 10], 6) == [1, 5]
+    assert batch_shares([10, 1], 6) == [5, 1]
+    assert batch_shares([10, 10], 6) == [3, 3]
+    assert batch_shares([2, 2], 6) == [2, 2]
+    assert batch_shares([5, 5], 1) == [1, 1]  # never below one each
+    assert batch_shares([0], 4) == [1]
+
+
+def test_a_compared_short_document_leaves_its_parts_to_the_long_one() -> None:
+    long_text = "word " * 150
+    repository = FakeRepository(
+        {
+            "short.txt": [_payload("short.txt", 1, "Plan A costs 5.")],
+            "long.txt": [_payload("long.txt", index, long_text) for index in range(1, 11)],
+        }
+    )
+    generator = ScriptedGenerator(answer="A [1] and B [2].")
+    settings = _settings(summary_batch_chars=1000, summary_max_batches=6)
+
+    result = _summarizer(repository, generator, settings).summarize(
+        SummaryRequest(mode="compare", filenames=("short.txt", "long.txt"))
+    )
+
+    # 1 part for the short one, the other 5 for the long one (an even split gave it 3).
+    notes_calls = [call for call in generator.calls if "Excerpts from" in call[-1]["content"]]
+    assert len(notes_calls) == 6
+    assert result.chunks_read == 1 + 5
+
+
+def test_a_compared_document_with_no_readable_text_is_an_error() -> None:
+    repository = FakeRepository(
+        {
+            "a.txt": [_payload("a.txt", 1, "Plan A costs 5.")],
+            "empty.txt": [{"filename": "empty.txt", "chunk_id": "c", "text": "  "}],
+        }
+    )
+    generator = ScriptedGenerator()
+
+    from api.summarize import NothingToCompareError
+
+    with pytest.raises(NothingToCompareError, match="'empty.txt' has no readable text"):
+        _summarizer(repository, generator).summarize(
+            SummaryRequest(mode="compare", filenames=("a.txt", "empty.txt"))
+        )
+    assert generator.calls == []
+
+
+def test_only_notes_that_are_the_marker_are_dropped() -> None:
+    texts = [f"Passage {index} " + "word " * 150 for index in range(1, 4)]  # a part each
+    repository = FakeRepository(
+        {"a.txt": [_payload("a.txt", index, text) for index, text in enumerate(texts, 1)]}
+    )
+    mentions = "Alpha is defined [1]; the rest is NOTHING RELEVANT to cost."
+    generator = ScriptedGenerator(notes=[mentions, " nothing relevant. ", "Gamma [3]."])
+    settings = _settings(summary_batch_chars=1000, summary_max_batches=8)
+
+    _summarizer(repository, generator, settings).summarize(
+        SummaryRequest(mode="summarize", filenames=("a.txt",))
+    )
+
+    combine = generator.calls[-1][-1]["content"]
+    assert "Alpha is defined [1]" in combine and "Gamma [3]" in combine
+    assert "part 2 of 3" not in combine  # the marker-only note is left out
 
 
 def test_the_part_size_shrinks_to_fit_a_known_context_window() -> None:
@@ -331,3 +415,18 @@ def test_a_document_with_no_readable_passages_reports_no_context() -> None:
     assert generator.calls == []
     assert result.grounded.answer_status == "no_context"
     assert (result.chunks_read, result.chunks_total) == (0, 0)
+
+
+def test_a_summary_trace_records_its_workspace() -> None:
+    from api.workspaces import settings_for
+
+    repository = FakeRepository({"a.txt": [_payload("a.txt", 1, "Alpha.")]})
+    traces = Traces()
+    _summarizer(
+        repository,
+        ScriptedGenerator(answer="Alpha [1]."),
+        settings_for(_settings(), "legal"),
+        trace_store=traces,
+    ).summarize(SummaryRequest(mode="summarize", filenames=("a.txt",)))
+
+    assert [trace.workspace for trace in traces.traces] == ["legal"]

@@ -1579,3 +1579,152 @@ describe('useChat workspaces', () => {
     expect(result.current.conversationWorkspace).toBe('legal');
   });
 });
+
+describe('useChat removeFromScopes', () => {
+  afterEach(() => setWorkspace(''));
+
+  it("prunes the conversations of the workspace a document was deleted from", async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('Answer', [], ZERO_TIMINGS, null, false);
+      },
+    );
+    setWorkspace('legal');
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.setScope({ filenames: ['shared.md'], tags: [] }));
+    await act(async () => {
+      await result.current.ask('Q');
+    });
+
+    // The delete was started in legal and ends after a switch to the default workspace.
+    setWorkspace('');
+    act(() => result.current.removeFromScopes(['shared.md'], 'legal'));
+    expect(result.current.scope.filenames).toEqual([]);
+  });
+
+  it("leaves a fresh chat of the workspace in use alone when another workspace's delete ends", () => {
+    // No questions yet, so bound to no workspace: it belongs to the default one in use,
+    // whose own shared.md is still there.
+    const { result } = renderHook(() => useChat());
+    act(() => result.current.setScope({ filenames: ['shared.md'], tags: [] }));
+
+    act(() => result.current.removeFromScopes(['shared.md'], 'legal'));
+    expect(result.current.scope.filenames).toEqual(['shared.md']);
+
+    act(() => result.current.removeFromScopes(['shared.md']));
+    expect(result.current.scope.filenames).toEqual([]);
+  });
+});
+
+describe('useChat follow-up suggestions', () => {
+  it('finishes the answer at done, and attaches suggestions arriving later to that answer', async () => {
+    let sendFollowups!: (questions: string[]) => void;
+    let closeStream!: () => void;
+    askQuestionStreamMock.mockImplementationOnce(
+      (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onSources?.([], 'trace-1');
+        handlers.onDone?.('First answer.', [], ZERO_TIMINGS, 'trace-1');
+        sendFollowups = (questions) => handlers.onFollowups?.(questions);
+        return new Promise<void>((resolve) => (closeStream = resolve));
+      },
+    );
+    let finishSecond!: () => void;
+    askQuestionStreamMock.mockImplementationOnce(
+      (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) =>
+        new Promise<void>((resolve) => {
+          finishSecond = () => {
+            handlers.onDone?.('Second answer.', [], ZERO_TIMINGS, 'trace-2');
+            resolve();
+          };
+        }),
+    );
+    const { result } = renderHook(() => useChat());
+
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.ask('First?');
+    });
+    // Done, though the stream is still open for suggestions: not streaming any more.
+    expect(result.current.pending).toBe(false);
+    expect(result.current.streamingConversationId).toBeNull();
+    expect(result.current.stage).toBeNull();
+    const firstAnswerId = result.current.turns[1].id;
+
+    act(() => sendFollowups(['Why?', 'Why?', '  ', 'How?']));
+    expect(result.current.turns[1].followups).toEqual(['Why?', 'How?']);
+
+    // The next question goes out at once, not after the suggestions stream closes.
+    let second!: Promise<void>;
+    act(() => {
+      second = result.current.ask('Second?');
+    });
+    expect(askQuestionStreamMock).toHaveBeenCalledTimes(2);
+    expect(result.current.pending).toBe(true);
+    // ...and stops waiting for suggestions to an answer that is no longer the last.
+    expect((askQuestionStreamMock.mock.calls[0][6] as AbortSignal).aborted).toBe(true);
+
+    // A late suggestion lands on its own answer, never on the one streaming now; the
+    // first stream ending doesn't end the second question.
+    act(() => sendFollowups(['Late?']));
+    await act(async () => {
+      closeStream();
+      await first;
+    });
+    expect(result.current.pending).toBe(true);
+    expect(result.current.turns.find((turn) => turn.id === firstAnswerId)?.followups).toEqual(['Late?']);
+    expect(result.current.turns.filter((turn) => turn.followups)).toHaveLength(1);
+
+    await act(async () => {
+      finishSecond();
+      await second;
+    });
+    expect(result.current.pending).toBe(false);
+    expect(result.current.turns[3]).toMatchObject({ role: 'assistant', content: 'Second answer.' });
+  });
+
+  it('Stop after done leaves the finished answer alone', async () => {
+    askQuestionStreamMock.mockImplementationOnce(
+      (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers, signal?: AbortSignal) => {
+        handlers.onDone?.('First answer.', [], ZERO_TIMINGS, null);
+        // Still open for suggestions; an abort would end it as a cancellation.
+        return new Promise<void>((_resolve, reject) =>
+          signal?.addEventListener('abort', () => reject(new ApiClientError('cancelled'))),
+        );
+      },
+    );
+    const { result } = renderHook(() => useChat());
+    act(() => {
+      void result.current.ask('First?');
+    });
+    await act(async () => {
+      result.current.cancel();
+      await Promise.resolve();
+    });
+    expect(result.current.turns[1]).toMatchObject({ content: 'First answer.' });
+    expect(result.current.turns[1].stopped).toBeUndefined();
+    expect((askQuestionStreamMock.mock.calls[0][6] as AbortSignal).aborted).toBe(false);
+  });
+});
+
+describe('useChat follow-up flag (feedback kind)', () => {
+  it('marks an answer asked with the conversation as history, not the first or a summary', async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('An answer.', [], ZERO_TIMINGS, null);
+      },
+    );
+    const { result } = renderHook(() => useChat());
+    await act(() => result.current.ask('First?'));
+    await act(() => result.current.ask('Then?'));
+    await act(() =>
+      result.current.ask('Summarize a.pdf', undefined, undefined, undefined, {
+        task: { mode: 'summarize', filenames: ['a.pdf'] },
+      }),
+    );
+
+    const answers = result.current.turns.filter((turn) => turn.role === 'assistant');
+    expect(answers.map((turn) => Boolean(turn.followUp))).toEqual([false, true, false]);
+    // Kept across a reload.
+    expect(sanitizeTurn(answers[1])?.followUp).toBe(true);
+  });
+});

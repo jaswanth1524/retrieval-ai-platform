@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
 import type { AccessLevel, ApiStatus, PublicConfigResponse } from '../api/types';
 import { BOOT_RETRY_BASE_MS, BOOT_RETRY_MAX_MS, LISTING_RETRY_BASE_MS } from '../appHelpers';
@@ -87,11 +87,11 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
 
     // /config, /access and the corpus listing go out together: each round trip used to
     // wait for the one before it (a /health probe first), and the composer said "Upload
-    // a document" until the listing, the last of them, came back.
+    // a document" until the listing, the last of them, came back. Only the listing waits
+    // for beforeListing (it is read from a workspace; /config and /access are not).
     async function boot() {
-      await runBeforeListing(controller.signal);
-      if (cancelled) return;
-      const listing = runRefreshDocuments(controller.signal)
+      const listing = runBeforeListing(controller.signal)
+        .then(() => (cancelled ? undefined : runRefreshDocuments(controller.signal)))
         .then(() => {
           if (!cancelled) setListingFailed(false);
         })
@@ -133,6 +133,26 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bootAttempt]);
 
+  /**
+   * The corpus again, from scratch: another workspace is in use. Until it answers the
+   * corpus is unknown (not empty, which said "Upload a document to start."), and a
+   * failure is retried like a failed first listing instead of leaving it empty.
+   */
+  const relistSequence = useRef(0);
+  const relistCorpus = useStableHandler(async () => {
+    const sequence = ++relistSequence.current;
+    setCorpusChecked(false);
+    try {
+      await runRefreshDocuments();
+      if (sequence === relistSequence.current) setListingFailed(false);
+    } catch (err) {
+      if (sequence === relistSequence.current && !noteAuthFailure(err)) setListingFailed(true);
+    } finally {
+      // A newer switch has its own listing on the way.
+      if (sequence === relistSequence.current) setCorpusChecked(true);
+    }
+  });
+
   // Retry a listing that failed (not a 401) while the page is open, backing off.
   useEffect(() => {
     if (!listingFailed) return;
@@ -172,6 +192,7 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
     noteAuthFailure,
     noteAuthRestored,
     refreshAccess,
+    relistCorpus,
     retryBoot,
   };
 }

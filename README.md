@@ -181,7 +181,7 @@ npm run e2e:smoke              # @smoke specs only
 
 CI (`.github/workflows/ci.yml`) runs seven jobs on every push/PR (dependency-review on pull requests only, docker-ocr everywhere but pull requests), with a read-only token and superseded runs cancelled. It also runs weekly on `main` (Monday 05:23 UTC), so a new advisory against a pinned dependency or base image is noticed without a push, and can be started by hand from the Actions tab.
 
-- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → import the eval extra; then, on 3.12, ruff check → ruff format --check → mypy → validate the eval datasets → `pip-audit` of the runtime dependencies.
+- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → import the eval extra; then, on 3.12, ruff check → ruff format --check → mypy → validate the eval datasets → `pip-audit` of the runtime dependencies (core, the `ocr` extra and the CLI's `mcp` extra).
 - **qdrant**: the server-only tests (`tests/test_qdrant_server.py`: server-side hybrid query, IDF, payload indexes, tags) against a `qdrant/qdrant:v1.19.1` service container — they skip locally unless `DOCRAG_TEST_QDRANT_URL` is set — then the retrieval eval on the handbook set against its committed baseline (models cached between runs).
 - **frontend**: vitest → build → lint → type-check the tests → `npm audit --omit=dev`.
 - **dependency-review** (pull requests): fails on a newly added dependency with a known high-severity vulnerability. It needs the repository's Dependency graph (Settings → Code security); while that is off the job is skipped with a notice.
@@ -263,7 +263,9 @@ docrag export backup.zip                 # and: import backup.zip
 ```
 
 `--json` gives machine-readable output; the exit code is 1 when a request (or any upload)
-failed. Uploads that meet a full indexing queue wait and retry, as the UI does.
+failed. Uploads that meet a full indexing queue wait and retry, as the UI does. `ingest`,
+`add-url` and `import` wait for indexing for up to `--timeout` seconds (default 3600, 0 =
+no limit); anything still indexing then is reported and goes on on the server.
 
 The MCP server offers `list_documents`, `search_passages`, `ask`, `summarize` and
 `read_document` to an MCP client, all read-only (the read-only key is enough). Answers keep
@@ -458,7 +460,7 @@ which documents were right. Only the latest rating of a question counts, and rat
 single citation are skipped. The output is validated like `validate` before it is kept:
 
 ```bash
-uv run python -m eval.harness from-feedback --store data/feedback.sqlite3 \
+uv run python -m eval.harness from-feedback --store data/feedback.db \
   --output eval/datasets/from_feedback.jsonl --review review.jsonl
 # or from a backup: --export docrag-backup.zip
 ```

@@ -8,22 +8,25 @@ so those questions go to a review file for a person to label instead of into the
 dataset with a guess.
 
 Reads the feedback sqlite file (``FEEDBACK_STORE_PATH``) or a ``GET /export`` zip's
-``feedback.jsonl``. Only answer-level ratings count: a rating of one citation carries
-the answer's cited filenames, not which of them that citation was.
+``feedback.jsonl``. Only answer-level ratings of questions count: a rating of one
+citation carries the answer's cited filenames, not which of them that citation was, and
+a rated summary or follow-up suggestion is not a question retrieval answered (those go to
+the review file, marked as such).
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from api.feedback import FeedbackStore
-
-_STORE_PAGE = 500
+# A rating recorded before kinds were (no ``kind``) whose question reads like the task
+# text of a summary or comparison (api/summarize.task_description) was one.
+_SUMMARY_TASK_PREFIXES = ("Summarize ", "Compare ")
 
 
 class FeedbackDataError(ValueError):
@@ -38,6 +41,8 @@ class FeedbackRow:
     rating: str
     citation_source_number: int | None
     created_at: float
+    # "question", "follow_up" or "summary"; None for a rating recorded before kinds.
+    kind: str | None = None
 
 
 @dataclass
@@ -49,6 +54,8 @@ class FeedbackDataset:
     ratings_read: int = 0
     citation_ratings: int = 0
     uncited: int = 0
+    # Latest ratings of summaries and follow-up suggestions (sent to review, not labeled).
+    not_questions: int = 0
 
 
 def _row(data: dict[str, Any]) -> FeedbackRow | None:
@@ -62,6 +69,7 @@ def _row(data: dict[str, Any]) -> FeedbackRow | None:
     number = data.get("citation_source_number")
     created = data.get("created_at")
     excerpt = data.get("answer_excerpt")
+    kind = data.get("kind")
     return FeedbackRow(
         question=" ".join(question.split()),
         answer_excerpt=excerpt if isinstance(excerpt, str) else "",
@@ -69,35 +77,65 @@ def _row(data: dict[str, Any]) -> FeedbackRow | None:
         rating=rating,
         citation_source_number=number if isinstance(number, int) else None,
         created_at=float(created) if isinstance(created, (int, float)) else 0.0,
+        kind=kind if isinstance(kind, str) else None,
     )
 
 
 def rows_from_store(path: Path, workspace: str | None = None) -> Iterator[FeedbackRow]:
     """Every rating in a feedback sqlite file, oldest first; only ``workspace``'s
     ("" = the default one) when it is given. A labeled dataset is run against one
-    corpus, and each workspace is a corpus of its own."""
+    corpus, and each workspace is a corpus of its own.
+
+    Opened read-only, with plain SELECTs: ``FeedbackStore`` would create the file's
+    table, migrate an older layout in place and switch it to WAL — writes to a live
+    server's store from an offline tool. A file from before workspaces or kinds is read
+    as it is (no workspace column = all the default workspace's).
+    """
 
     if not path.is_file():
         raise FeedbackDataError(f"No feedback store at {path}.")
-    store = FeedbackStore(str(path))
-    cursor = None
-    while True:
-        page, cursor = store.rows_oldest_first(cursor, _STORE_PAGE, workspace)
-        for item in page:
-            row = _row(
-                {
-                    "question": item.question,
-                    "answer_excerpt": item.answer_excerpt,
-                    "cited_filenames": item.cited_filenames,
-                    "rating": item.rating,
-                    "citation_source_number": item.citation_source_number,
-                    "created_at": item.created_at,
-                }
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+            if not columns:
+                raise FeedbackDataError(f"{path} has no feedback table.")
+            kind = "kind" if "kind" in columns else "NULL"
+            where = ""
+            params: tuple[str, ...] = ()
+            if workspace is not None:
+                if "workspace" in columns:
+                    where, params = "WHERE workspace = ? ", (workspace,)
+                elif workspace:
+                    return  # every row is the default workspace's
+            rows = conn.execute(
+                "SELECT question, answer_excerpt, cited_filenames_json, rating, "
+                f"citation_source_number, created_at, {kind} FROM feedback {where}"
+                "ORDER BY created_at ASC, rowid ASC",
+                params,
             )
-            if row is not None:
-                yield row
-        if cursor is None or len(page) < _STORE_PAGE:
-            return
+            for question, excerpt, cited_json, rating, number, created, row_kind in rows:
+                try:
+                    cited = json.loads(cited_json)
+                except (TypeError, ValueError):
+                    cited = []
+                row = _row(
+                    {
+                        "question": question,
+                        "answer_excerpt": excerpt,
+                        "cited_filenames": cited,
+                        "rating": rating,
+                        "citation_source_number": number,
+                        "created_at": created,
+                        "kind": row_kind,
+                    }
+                )
+                if row is not None:
+                    yield row
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise FeedbackDataError(f"{path} is not a readable feedback store ({exc}).") from exc
 
 
 def rows_from_export(path: Path) -> Iterator[FeedbackRow]:
@@ -120,23 +158,46 @@ def rows_from_export(path: Path) -> Iterator[FeedbackRow]:
                     yield row
 
 
+def _kind_of(row: FeedbackRow) -> str:
+    if row.kind is not None:
+        return row.kind
+    return "summary" if row.question.startswith(_SUMMARY_TASK_PREFIXES) else "question"
+
+
 def build_dataset(rows: Iterable[FeedbackRow]) -> FeedbackDataset:
     """The latest answer-level rating of each question decides where it goes: a
     thumbs-up with cited documents becomes a labeled example, a thumbs-down a question
-    to review. Questions are matched ignoring case and spacing."""
+    to review. Questions are matched ignoring case and spacing.
+
+    Only ratings of answers to questions are labels. A rated summary or follow-up
+    suggestion goes to review, marked as not a question: its cited documents are every
+    passage a summary read, or say nothing about what retrieval should have found.
+    """
 
     result = FeedbackDataset()
-    latest: dict[str, FeedbackRow] = {}
+    latest: dict[tuple[str, str], FeedbackRow] = {}
     for row in rows:
         result.ratings_read += 1
         if row.citation_source_number is not None:
             result.citation_ratings += 1
             continue
-        key = " ".join(row.question.split()).casefold()
+        key = (_kind_of(row), " ".join(row.question.split()).casefold())
         if key not in latest or row.created_at >= latest[key].created_at:
             latest[key] = row
-    for row in sorted(latest.values(), key=lambda item: item.created_at):
-        if row.rating == "up":
+    for (kind, _), row in sorted(latest.items(), key=lambda item: item[1].created_at):
+        if kind != "question":
+            result.not_questions += 1
+            result.review.append(
+                {
+                    "question": " ".join(row.question.split()),
+                    "relevant_filenames": [],
+                    "answer_excerpt": row.answer_excerpt,
+                    "cited_filenames": sorted(set(row.cited_filenames)),
+                    "source": f"feedback (a rated {kind.replace('_', '-')}, not a question: "
+                    "left out of the dataset)",
+                }
+            )
+        elif row.rating == "up":
             if not row.cited_filenames:
                 result.uncited += 1
                 continue

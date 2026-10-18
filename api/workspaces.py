@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 
+from fastapi import HTTPException
 from qdrant_client import QdrantClient
 
 from api.settings import AppSettings
@@ -29,6 +30,19 @@ _SEPARATOR = "__ws_"
 # header value alike, and never confusable with the separator.
 _NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
 MAX_WORKSPACES = 50
+
+
+class WorkspaceClosingError(HTTPException):
+    """409: the workspace is being deleted, so nothing is admitted into it now
+    (``ingest_jobs.admit_or_refuse``). Its own type so a caller (restore) can tell it
+    from any other refusal."""
+
+    def __init__(self, workspace: str) -> None:
+        super().__init__(
+            status_code=409,
+            detail=f"Workspace '{workspace}' is being deleted; nothing can be added to or "
+            "removed from it now.",
+        )
 
 
 class WorkspaceError(ValueError):

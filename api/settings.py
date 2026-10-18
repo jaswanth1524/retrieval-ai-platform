@@ -439,6 +439,26 @@ class AppSettings(BaseSettings):
     def _normalize_llm_provider(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
 
+    @field_validator("sparse_language", mode="before")
+    @classmethod
+    def _normalize_sparse_language(cls, value: object) -> object:
+        # One spelling per language: it is recorded with the collection and compared
+        # on every check, so "English", " english" or "" (fastembed's default, which is
+        # English) must not read as a different index needing a re-ingest.
+        if isinstance(value, str):
+            return value.strip().lower() or "english"
+        return value
+
+    @field_validator("qdrant_collection")
+    @classmethod
+    def _collection_without_workspace_separator(cls, value: str) -> str:
+        # A workspace's collection is "<QDRANT_COLLECTION>__ws_<name>"
+        # (api/workspaces.py), and the separator is how a collection is told to be a
+        # workspace's: a base name containing it would read as a workspace itself.
+        if "__ws_" in value:
+            raise ValueError("QDRANT_COLLECTION must not contain '__ws_' (used for workspaces).")
+        return value
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: object) -> object:

@@ -538,6 +538,16 @@
       "title": "Id",
       "type": "string"
      },
+     "kind": {
+      "default": "question",
+      "enum": [
+       "question",
+       "follow_up",
+       "summary"
+      ],
+      "title": "Kind",
+      "type": "string"
+     },
      "question": {
       "title": "Question",
       "type": "string"
@@ -622,6 +632,16 @@
       "maxItems": 50,
       "title": "Cited Filenames",
       "type": "array"
+     },
+     "kind": {
+      "default": "question",
+      "enum": [
+       "question",
+       "follow_up",
+       "summary"
+      ],
+      "title": "Kind",
+      "type": "string"
      },
      "question": {
       "maxLength": 4000,
@@ -1268,6 +1288,11 @@
      },
      "timings": {
       "$ref": "#/components/schemas/SearchTimingsResponse"
+     },
+     "weak_matches": {
+      "default": false,
+      "title": "Weak Matches",
+      "type": "boolean"
      }
     },
     "required": [
@@ -2415,6 +2440,9 @@
      "404": {
       "description": "URL ingest is off (URL_INGEST_ENABLED)."
      },
+     "409": {
+      "description": "The remote server named the document after one already indexed (pass `filename` to replace it); or, with stored originals, the name differs from an existing document's only by letter case or accents."
+     },
      "422": {
       "content": {
        "application/json": {
@@ -2456,6 +2484,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2509,6 +2553,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -3255,24 +3315,6 @@
   "/health/ready": {
    "get": {
     "operationId": "health_ready_health_ready_get",
-    "parameters": [
-     {
-      "in": "header",
-      "name": "X-Workspace",
-      "required": false,
-      "schema": {
-       "anyOf": [
-        {
-         "type": "string"
-        },
-        {
-         "type": "null"
-        }
-       ],
-       "title": "X-Workspace"
-      }
-     }
-    ],
     "responses": {
      "200": {
       "content": {
@@ -3281,16 +3323,6 @@
        }
       },
       "description": "Successful Response"
-     },
-     "422": {
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/HTTPValidationError"
-        }
-       }
-      },
-      "description": "Validation Error"
      }
     },
     "summary": "Health Ready"
@@ -3787,6 +3819,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -3841,6 +3889,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],

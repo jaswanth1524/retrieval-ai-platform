@@ -82,9 +82,12 @@ def register(app: FastAPI) -> None:
     async def health() -> HealthResponse:
         return HealthResponse(status="ok", version=app_version())
 
+    # The app's settings, never an X-Workspace one, as /config: a probe or a browser
+    # holding a since-deleted workspace must not get a 404 (or 400 with workspaces off)
+    # from a readiness check, and the index checked is the app's own collection.
     @app.get("/health/ready")
     def health_ready(
-        settings: SettingsDep,
+        settings: Annotated[AppSettings, Depends(get_app_settings)],
         check_qdrant: QdrantCheckDep,
         qdrant_client: QdrantClientDep,
         check_ollama: OllamaCheckDep,

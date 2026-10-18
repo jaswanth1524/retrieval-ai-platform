@@ -357,5 +357,10 @@ describe('document tasks (summaries)', () => {
     const answered = { ...turn('a', 'assistant'), followups: ['Next?', 3, 'x'.repeat(500), 'More?'] };
     expect(sanitizeTurn(answered)?.followups).toEqual(['Next?', 'More?']);
     expect(sanitizeTurn({ ...answered, followups: [1, 2] })).not.toHaveProperty('followups');
+    // Each suggestion is a button's React key: a repeat broke rendering (and the e2e
+    // console-error check); an empty one rendered as a blank button.
+    expect(
+      sanitizeTurn({ ...answered, followups: ['Next?', '', '   ', 'Next?', 'More?'] })?.followups,
+    ).toEqual(['Next?', 'More?']);
   });
 });

@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { ApiClientError, api, apiErrorMessage } from '../api/client';
+import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
 import type { DocumentMeta, UploadItem } from '../components/CorpusPanel';
 import { newId } from '../utils/id';
@@ -41,12 +41,18 @@ export interface CorpusCallbacks {
   onAuthRestored: () => void;
   pushToast: (toast: ToastInput) => unknown;
   pruneScopes: (indexedFilenames: string[], indexedTags?: string[]) => void;
-  removeFromScopes: (filenames: string[]) => void;
+  /** `workspace`: the one the documents were removed from (its conversations' scopes). */
+  removeFromScopes: (filenames: string[], workspace?: string) => void;
 }
 
 /** The indexed corpus and everything that changes it: uploads and their jobs, re-index,
  *  delete and tags. Actions keep their identity across renders (they read the latest
- *  callbacks and uploads through refs), so panels receiving them can skip re-rendering. */
+ *  callbacks and uploads through refs), so panels receiving them can skip re-rendering.
+ *
+ *  The corpus is the workspace in use's (api/client getWorkspace). Every change goes to
+ *  the workspace it was started in — an upload waiting for room in the queue, a retry, a
+ *  bulk delete — even after a switch, and one that ends in a workspace no longer in use
+ *  leaves the lists here (now another workspace's) alone. */
 export function useCorpus(callbacks: CorpusCallbacks) {
   const deps = useRef(callbacks);
   deps.current = callbacks;
@@ -79,14 +85,18 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       setUploads((prev) => prev.filter((item) => item.id !== id));
     };
 
+    const isCurrent = (workspace: string) => workspace === getWorkspace();
+
     // Listings can come back out of order (a slow one started before a delete landing
     // after it put the deleted document back); only the latest one requested applies.
     let listingSequence = 0;
 
     const refreshDocuments = async (signal?: AbortSignal) => {
+      const workspace = getWorkspace();
       const sequence = ++listingSequence;
-      const response = await api.listDocuments(signal);
-      if (sequence !== listingSequence) return;
+      const response = await api.listDocuments(signal, workspace);
+      // Another workspace's listing, from before a switch.
+      if (sequence !== listingSequence || !isCurrent(workspace)) return;
       setIndexedFilenames(response.filenames);
       // A document deleted elsewhere (another tab, the API) stayed in scope: the header
       // still named it and the popover — which lists only indexed files — couldn't
@@ -102,6 +112,19 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       deps.current.onAuthRestored();
     };
 
+    // Another workspace is in use: nothing listed so far is its, and a card left from the
+    // previous one could act on it (its documents' names may exist here too). Failed and
+    // in-flight uploads stay, shown only in their own workspace (App filters them).
+    const resetForWorkspace = () => {
+      listingSequence += 1;
+      setIndexedFilenames([]);
+      setDocuments({});
+      setUploads((prev) =>
+        prev.some((item) => item.status === 'success')
+          ? prev.filter((item) => item.status !== 'success')
+          : prev,
+      );
+    };
 
     // Starts one ingest job (an upload, or a re-index of a stored original) and follows
     // it to the end, reflecting progress on the UploadItem `id`.
@@ -153,10 +176,15 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }
     };
 
-    const requestServerCancel = async (id: string, jobId: string, filename: string) => {
+    const requestServerCancel = async (
+      id: string,
+      jobId: string,
+      filename: string,
+      workspace: string,
+    ) => {
       try {
         // The poll below then sees the job end as cancelled.
-        await api.cancelDocumentJob(jobId);
+        await api.cancelDocumentJob(jobId, undefined, workspace);
       } catch (err) {
         // Already finished: the poll is about to report how.
         if (err instanceof ApiClientError && err.statusCode === 404) return;
@@ -172,16 +200,18 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }
     };
 
+    // `workspace`: the one the job was started in (its UploadItem's); `start` sends there.
     const runIngestJob = async (
       id: string,
       filename: string,
+      workspace: string,
       start: (signal: AbortSignal) => Promise<DocumentJobAcceptedResponse>,
     ) => {
       try {
         const accepted = await startWhenQueueHasRoom(id, start);
         jobIds.set(id, accepted.job_id);
         // Cancel pressed while the upload itself was still being sent.
-        if (cancelRequested.has(id)) void requestServerCancel(id, accepted.job_id, filename);
+        if (cancelRequested.has(id)) void requestServerCancel(id, accepted.job_id, filename, workspace);
         const status = await api.pollDocumentJob(accepted.job_id, (jobStatus) => {
           setUploads((prev) =>
             prev.map((item) =>
@@ -197,7 +227,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
                 : item,
             ),
           );
-        });
+        }, undefined, workspace);
         if (status.state === 'failed' && status.cancelled) {
           // What the user asked for; nothing was indexed, so there is nothing to show.
           removeUpload(id);
@@ -222,7 +252,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
           ),
         );
         const indexedName = status.result?.filename;
-        if (indexedName) {
+        // Indexed in a workspace no longer in use: the list here is another one's.
+        if (indexedName && isCurrent(workspace)) {
           // Dedupe by name — re-uploading the same filename replaces its chunks
           // server-side, so the corpus list should not grow a second entry for it.
           setIndexedFilenames((prev) => (prev.includes(indexedName) ? prev : [...prev, indexedName]));
@@ -247,11 +278,11 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     };
 
     // Every upload body, first try or retry, goes through the same few send slots.
-    const sendUpload = (file: File, signal: AbortSignal) =>
-      sendSlots.run(() => api.uploadDocument(file, signal), signal);
+    const sendUpload = (file: File, signal: AbortSignal, workspace: string) =>
+      sendSlots.run(() => api.uploadDocument(file, signal, workspace), signal);
 
-    const uploadOne = (file: File, id: string) =>
-      runIngestJob(id, file.name, (signal) => sendUpload(file, signal));
+    const uploadOne = (file: File, id: string, workspace: string) =>
+      runIngestJob(id, file.name, workspace, (signal) => sendUpload(file, signal, workspace));
 
     // Stops an upload or re-index: before the server has it, locally; after, by asking
     // the server, which refuses (409) once the job has started writing to the index.
@@ -263,7 +294,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       );
       const jobId = jobIds.get(id);
       if (jobId) {
-        void requestServerCancel(id, jobId, item.filename);
+        void requestServerCancel(id, jobId, item.filename, item.workspace ?? '');
         return;
       }
       cancelRequested.add(id);
@@ -271,7 +302,14 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       wakeWaiting.get(id)?.();
     };
 
-    const refreshAfterIngest = async () => {
+    const refreshAfterIngest = async (workspace: string) => {
+      // Finished in a workspace no longer in use: its listing is fetched on the way back.
+      if (!isCurrent(workspace)) {
+        setUploads((prev) =>
+          prev.filter((item) => item.status !== 'success' || item.workspace !== workspace),
+        );
+        return;
+      }
       try {
         await refreshDocuments();
         // Finished cards aren't shown (the document's own card is), so once the listing
@@ -288,8 +326,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     };
 
     // The server fetches the document; the card shows the URL until it names the file.
-    const startFromUrl = (id: string, url: string) => async (signal: AbortSignal) => {
-      const accepted = await api.uploadFromUrl(url, signal);
+    const startFromUrl = (id: string, url: string, workspace: string) => async (signal: AbortSignal) => {
+      const accepted = await api.uploadFromUrl(url, signal, workspace);
       setUploads((prev) =>
         prev.map((item) => (item.id === id ? { ...item, filename: accepted.filename } : item)),
       );
@@ -298,39 +336,51 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     const handleUploadFromUrl = async (url: string) => {
       const id = newId();
-      setUploads((prev) => [...prev, { id, filename: url, status: 'uploading', sourceUrl: url }]);
-      await runIngestJob(id, url, startFromUrl(id, url));
-      await refreshAfterIngest();
+      const workspace = getWorkspace();
+      setUploads((prev) => [
+        ...prev,
+        { id, filename: url, status: 'uploading', sourceUrl: url, workspace },
+      ]);
+      await runIngestJob(id, url, workspace, startFromUrl(id, url, workspace));
+      await refreshAfterIngest(workspace);
     };
 
-    const handleReindex = async (filename: string) => {
+    const handleReindex = async (filename: string, workspace = getWorkspace()) => {
       const id = newId();
-      setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true }]);
-      await runIngestJob(id, filename, (signal) => api.reindexDocument(filename, signal));
-      await refreshAfterIngest();
+      setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true, workspace }]);
+      await runIngestJob(id, filename, workspace, (signal) =>
+        api.reindexDocument(filename, signal, workspace),
+      );
+      await refreshAfterIngest(workspace);
     };
 
     // Several documents chosen at once: started together and followed together, with
     // one listing refresh at the end — handleReindex per document refreshed the whole
     // listing once per document.
-    const handleReindexMany = async (filenames: string[]) => {
+    const handleReindexMany = async (filenames: string[], workspace = getWorkspace()) => {
       const items = filenames.map((filename) => ({ id: newId(), filename }));
       setUploads((prev) => [
         ...prev,
-        ...items.map(({ id, filename }): UploadItem => ({ id, filename, status: 'uploading', reindex: true })),
+        ...items.map(
+          ({ id, filename }): UploadItem => ({ id, filename, status: 'uploading', reindex: true, workspace }),
+        ),
       ]);
       await Promise.allSettled(
         items.map(({ id, filename }) =>
-          runIngestJob(id, filename, (signal) => api.reindexDocument(filename, signal)),
+          runIngestJob(id, filename, workspace, (signal) =>
+            api.reindexDocument(filename, signal, workspace),
+          ),
         ),
       );
-      await refreshAfterIngest();
+      await refreshAfterIngest(workspace);
     };
 
+    // No arguments: it is an onClick handler as it stands.
     const handleReindexAllStale = async () => {
+      const workspace = getWorkspace();
       let response;
       try {
-        response = await api.reindexStaleDocuments();
+        response = await api.reindexStaleDocuments(undefined, workspace);
       } catch (err) {
         if (!deps.current.onAuthFailure(err)) {
           deps.current.pushToast({
@@ -353,47 +403,56 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         filename: job.filename,
         status: 'uploading',
         reindex: true,
+        workspace,
       }));
       setUploads((prev) => [...prev, ...items]);
       await Promise.allSettled(
         response.jobs.map((job, index) =>
-          runIngestJob(items[index].id, job.filename, () => Promise.resolve(job)),
+          runIngestJob(items[index].id, job.filename, workspace, () => Promise.resolve(job)),
         ),
       );
-      await refreshAfterIngest();
+      await refreshAfterIngest(workspace);
     };
 
     // Follows jobs the server already started (a backup restore), like uploads.
-    const trackJobs = async (jobs: DocumentJobAcceptedResponse[]) => {
+    // `workspace`: the one the restore was sent to.
+    const trackJobs = async (jobs: DocumentJobAcceptedResponse[], workspace = getWorkspace()) => {
       const items: UploadItem[] = jobs.map((job) => ({
         id: newId(),
         filename: job.filename,
         status: 'uploading',
+        workspace,
       }));
       setUploads((prev) => [...prev, ...items]);
       await Promise.allSettled(
-        jobs.map((job, index) => runIngestJob(items[index].id, job.filename, () => Promise.resolve(job))),
+        jobs.map((job, index) =>
+          runIngestJob(items[index].id, job.filename, workspace, () => Promise.resolve(job)),
+        ),
       );
-      await refreshAfterIngest();
+      await refreshAfterIngest(workspace);
     };
 
     const handleUpload = async (files: File[]) => {
+      const workspace = getWorkspace();
       const newItems: UploadItem[] = files.map((file) => ({
         id: newId(),
         filename: file.name,
         status: 'uploading',
         file,
+        workspace,
       }));
       setUploads((prev) => [...prev, ...newItems]);
       // A few bodies at a time (see UPLOAD_CONCURRENCY): a 20-file drop used to send 20
       // at once, then all 20 waited and re-sent together when the queue was full. A file
       // used to hold its slot until it was indexed, so the third one wasn't even sent
       // until the first had finished.
-      await Promise.allSettled(files.map((file, index) => uploadOne(file, newItems[index].id)));
+      await Promise.allSettled(
+        files.map((file, index) => uploadOne(file, newItems[index].id, workspace)),
+      );
       // Once for the whole batch, not once per file. Chunk counts live server-side and
       // GET /documents scrolls the entire collection to compute them, so refreshing
       // inside uploadOne meant a 20-file drop triggered 20 full-collection scans.
-      await refreshAfterIngest();
+      await refreshAfterIngest(workspace);
     };
 
     const handleRetryUpload = async (id: string) => {
@@ -406,28 +465,32 @@ export function useCorpus(callbacks: CorpusCallbacks) {
             : candidate,
         ),
       );
-      const { file, filename, sourceUrl } = item;
-      await runIngestJob(id, filename, (signal) =>
+      // Retried where it was first sent, whichever workspace is in use now.
+      const { file, filename, sourceUrl, workspace = '' } = item;
+      await runIngestJob(id, filename, workspace, (signal) =>
         file
-          ? sendUpload(file, signal)
+          ? sendUpload(file, signal, workspace)
           : sourceUrl
-            ? startFromUrl(id, sourceUrl)(signal)
-            : api.reindexDocument(filename, signal),
+            ? startFromUrl(id, sourceUrl, workspace)(signal)
+            : api.reindexDocument(filename, signal, workspace),
       );
-      await refreshAfterIngest();
+      await refreshAfterIngest(workspace);
     };
 
     const handleDismissUpload = (id: string) => {
       setUploads((prev) => prev.filter((item) => item.id !== id));
     };
 
-    const handleDeleteDocument = async (filename: string) => {
-      await api.deleteDocument(filename);
+    const handleDeleteDocument = async (filename: string, workspace = getWorkspace()) => {
+      await api.deleteDocument(filename, undefined, workspace);
+      // A deleted document can never remain in a search scope — of that workspace's
+      // conversations: another may hold a document of the same name.
+      deps.current.removeFromScopes([filename], workspace);
+      // Deleted from a workspace no longer in use: the list here is another one's.
+      if (!isCurrent(workspace)) return;
       // Any listing already on its way predates the delete.
       listingSequence += 1;
-      // A deleted document can never remain in the corpus or the active search scope.
       setIndexedFilenames((prev) => prev.filter((name) => name !== filename));
-      deps.current.removeFromScopes([filename]);
       setDocuments((prev) => {
         if (!(filename in prev)) return prev;
         const next = { ...prev };
@@ -436,11 +499,11 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       });
     };
 
-    const handleSetTags = async (filename: string, tags: string[]) => {
-      const result = await api.setDocumentTags(filename, tags);
+    const handleSetTags = async (filename: string, tags: string[], workspace = getWorkspace()) => {
+      const result = await api.setDocumentTags(filename, tags, undefined, workspace);
       // Deleted while the request was out: don't bring back a record for it, whose
-      // tags would linger in the scope popover.
-      if (!indexedRef.current.includes(filename)) return;
+      // tags would linger in the scope popover. Nor one into another workspace's list.
+      if (!isCurrent(workspace) || !indexedRef.current.includes(filename)) return;
       setDocuments((prev) => ({
         ...prev,
         // Indexed moments ago and not refreshed yet: the rest arrives with the next
@@ -454,6 +517,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     return {
       refreshDocuments,
+      resetForWorkspace,
       handleUpload,
       handleRetryUpload,
       handleDismissUpload,

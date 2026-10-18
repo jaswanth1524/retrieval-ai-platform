@@ -169,6 +169,18 @@ function withValidSpans(source: CitationResponse): CitationResponse {
 const MAX_FOLLOWUPS = 5;
 const FOLLOWUP_MAX_CHARS = 200;
 
+/** Suggested follow-ups as the thread can render them: strings with text, each once —
+ *  they are the buttons' React keys, so a repeated one (a model can suggest the same
+ *  question twice) broke rendering. From the stream and from disk alike. */
+export function cleanFollowups(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const followups = (value as unknown[]).filter(
+    (item): item is string =>
+      typeof item === 'string' && item.trim().length > 0 && item.length <= FOLLOWUP_MAX_CHARS,
+  );
+  return [...new Set(followups)].slice(0, MAX_FOLLOWUPS);
+}
+
 /** ``value`` as a document task when it is one the server would accept, else null. */
 export function sanitizeTask(value: unknown): DocumentTask | null {
   if (!value || typeof value !== 'object') return null;
@@ -212,17 +224,14 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (typeof turn.question === 'string') sanitized.question = turn.question;
   if (turn.feedback === 'up' || turn.feedback === 'down') sanitized.feedback = turn.feedback;
   if (typeof turn.model === 'string') sanitized.model = turn.model;
-  for (const flag of ['stopped', 'incomplete', 'cached', 'notFound', 'uncited', 'truncated'] as const) {
+  const flags = ['stopped', 'incomplete', 'cached', 'notFound', 'uncited', 'truncated', 'followUp'] as const;
+  for (const flag of flags) {
     if (turn[flag] === true) sanitized[flag] = true;
   }
   const task = sanitizeTask(turn.task);
   if (task) sanitized.task = task;
-  if (Array.isArray(turn.followups)) {
-    const followups = (turn.followups as unknown[])
-      .filter((item): item is string => typeof item === 'string' && item.length <= FOLLOWUP_MAX_CHARS)
-      .slice(0, MAX_FOLLOWUPS);
-    if (followups.length > 0) sanitized.followups = followups;
-  }
+  const followups = cleanFollowups(turn.followups);
+  if (followups.length > 0) sanitized.followups = followups;
   const coverage = turn.coverage as unknown;
   if (coverage && typeof coverage === 'object') {
     const { read, total } = coverage as Record<string, unknown>;

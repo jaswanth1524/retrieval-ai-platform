@@ -222,6 +222,10 @@ class FeedbackRequest(BaseModel):
     # Set only when the rating targets one specific citation (its [n] source_number
     # as shown in the answer), rather than the answer as a whole.
     citation_source_number: int | None = Field(default=None, ge=1, le=FEEDBACK_CITATION_NUMBER_MAX)
+    # What was rated: an answer to a question (the default, and all a client that
+    # predates this sends), a suggested follow-up question, or a summary/comparison.
+    # Only "question" ratings become retrieval labels (eval/feedback_dataset.py).
+    kind: Literal["question", "follow_up", "summary"] = "question"
 
 
 class FeedbackResponse(BaseModel):
@@ -244,6 +248,7 @@ class FeedbackItemResponse(BaseModel):
     rating: Literal["up", "down"]
     citation_source_number: int | None
     created_at: float
+    kind: Literal["question", "follow_up", "summary"] = "question"
 
 
 class FeedbackListResponse(BaseModel):
@@ -602,6 +607,10 @@ class SearchTimingsResponse(BaseModel):
 class SearchResponse(BaseModel):
     results: list[SearchResultResponse]
     timings: SearchTimingsResponse
+    # No passage cleared RERANK_MIN_SCORE (the bar an answer's sources must clear); the
+    # results are the closest ones, best first. Typical of a one- or two-word search,
+    # which the cross-encoder scores low even against a passage containing the words.
+    weak_matches: bool = False
 
 
 class ImportResponse(BaseModel):

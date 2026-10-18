@@ -52,6 +52,26 @@ describe('SearchPanel', () => {
     expect(onOpenSource).toHaveBeenCalledWith('policy.pdf', 'c1');
   });
 
+  it('notes when the passages are only the closest ones', async () => {
+    const weak = { results: [{ ...RESULT, rerank_score: 0.11 }], timings: {}, weak_matches: true };
+    stubSearch(200, weak);
+    setup();
+
+    await search('laptop');
+
+    expect(await screen.findByTestId('search-weak')).toHaveTextContent('No strong matches');
+    expect(screen.getByTestId('search-status')).toHaveTextContent(
+      'No strong matches; 1 closest passage shown.',
+    );
+    expect(screen.getByTestId('search-result')).toBeInTheDocument();
+
+    stubSearch(200, { results: [RESULT], timings: {}, weak_matches: false });
+    await search(' leave');
+    await screen.findByText('0.91');
+    expect(screen.queryByTestId('search-weak')).not.toBeInTheDocument();
+    expect(screen.getByTestId('search-status')).toHaveTextContent('1 passage found.');
+  });
+
   it('searches only the conversation scope', async () => {
     const fetchMock = stubSearch(200, { results: [], timings: {} });
     setup({ filenames: ['policy.pdf'], tags: ['hr'] });

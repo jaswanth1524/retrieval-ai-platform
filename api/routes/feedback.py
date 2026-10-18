@@ -49,6 +49,7 @@ def register(app: FastAPI) -> None:
             # The workspace the rated answer came from (X-Workspace), so its list and
             # its backups carry only its own ratings.
             workspace=workspace_of(settings),
+            kind=request.kind,
         )
         feedback_total.labels(rating=request.rating).inc()
         return FeedbackResponse(id=feedback.id)
@@ -79,6 +80,7 @@ def register(app: FastAPI) -> None:
                     rating=item.rating,
                     citation_source_number=item.citation_source_number,
                     created_at=item.created_at,
+                    kind=item.kind,
                 )
                 for item in feedback_store.list_recent(limit, workspace_of(settings))
             ]

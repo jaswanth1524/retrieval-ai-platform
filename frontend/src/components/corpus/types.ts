@@ -24,6 +24,9 @@ export interface UploadItem {
   reindex?: boolean;
   /** Fetched by the server from this URL (POST /documents/from-url) — retried the same way. */
   sourceUrl?: string;
+  /** The workspace it was sent to ('' or absent = the default): a retry, a cancel and
+   *  its job polls go there, whichever is in use by then. */
+  workspace?: string;
   /** Cancel was pressed and hasn't settled yet. */
   cancelling?: boolean;
 }

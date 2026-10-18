@@ -187,6 +187,7 @@ function App() {
     handleDeleteDocument,
     handleSetTags,
     trackJobs,
+    resetForWorkspace,
   } = useCorpus({
     onAuthFailure: (err) => noteAuthFailure(err),
     onAuthRestored: () => noteAuthRestored(),
@@ -222,6 +223,7 @@ function App() {
     noteAuthFailure,
     noteAuthRestored,
     refreshAccess,
+    relistCorpus,
     retryBoot,
   } = useAppBoot({
     refreshDocuments,
@@ -230,24 +232,63 @@ function App() {
   });
   const readOnly = access === 'read';
   const workspacesEnabled = Boolean(config?.workspaces_enabled);
-  const { workspace, workspaces, dropRememberedIfGone, chooseWorkspace, createWorkspace, deleteWorkspace } =
-    useWorkspaces({
-      enabled: workspacesEnabled,
-      conversationWorkspace,
-      activeConversationId,
-      newConversation: () => newConversation(),
-      refreshDocuments,
-      noteAuthFailure,
-      pushToast,
-      onSwitched: () => setSourceView(null),
-    });
+  const {
+    workspace,
+    workspaces,
+    dropRememberedIfGone,
+    reloadWorkspaces,
+    chooseWorkspace,
+    createWorkspace,
+    deleteWorkspace,
+  } = useWorkspaces({
+    enabled: workspacesEnabled,
+    apiStatus,
+    conversationWorkspace,
+    activeConversationId,
+    newConversation: () => newConversation(),
+    relistCorpus,
+    noteAuthFailure,
+    pushToast,
+    // Nothing of the previous workspace stays on screen to act on: its corpus (and the
+    // panel's selection, keyed below), a viewer of its file, its search results.
+    onSwitched: () => {
+      resetForWorkspace();
+      setSourceView(null);
+      setSearchResetKey((key) => key + 1);
+    },
+  });
+  // The corpus panel's changes go to the workspace it was showing when they started: a
+  // bulk delete or tag loop keeps these for its whole run (the panel is keyed by
+  // workspace), so a switch halfway doesn't send the rest to the next workspace.
+  const deleteDocumentHere = useCallback(
+    (filename: string) => handleDeleteDocument(filename, workspace),
+    [handleDeleteDocument, workspace],
+  );
+  const setTagsHere = useCallback(
+    (filename: string, tags: string[]) => handleSetTags(filename, tags, workspace),
+    [handleSetTags, workspace],
+  );
+  const reindexHere = useCallback(
+    (filename: string) => void handleReindex(filename, workspace),
+    [handleReindex, workspace],
+  );
+  const reindexManyHere = useCallback(
+    (filenames: string[]) => void handleReindexMany(filenames, workspace),
+    [handleReindexMany, workspace],
+  );
+  // Each upload card is shown in its own workspace: one still indexing (or failed) in
+  // another keeps going there, and is back on the way back.
+  const workspaceUploads = useMemo(
+    () => uploads.filter((item) => (item.workspace ?? '') === workspace),
+    [uploads, workspace],
+  );
   const { exportingBackup, restoring, downloadBackup, restoreBackup, downloadOriginal } =
     useBackupActions({
       pushToast,
       noteAuthFailure,
-      onRestoreQueued: async (jobs) => {
+      onRestoreQueued: async (jobs, restoredTo) => {
         setRail('corpus');
-        await trackJobs(jobs);
+        await trackJobs(jobs, restoredTo);
       },
     });
   // The search scope belongs to the active conversation (see useChat).
@@ -556,23 +597,25 @@ function App() {
       }),
     [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
+  // Like the composer's Send: not before the app has booted, nor with a refused key.
+  const summarizeDisabled = booting || apiStatus === 'unauthorized';
   // One document summarized, or two compared, as a turn in the open conversation.
-  const summarizeDocuments = useCallback(
-    (filenames: string[]) => {
-      const task: DocumentTask =
-        filenames.length === 2
-          ? { mode: 'compare', filenames: filenames.slice(0, 2) }
-          : { mode: 'summarize', filenames: filenames.slice(0, 1) };
-      const label =
-        task.mode === 'compare'
-          ? `Compare ${task.filenames[0]} and ${task.filenames[1]}`
-          : `Summarize ${task.filenames[0]}`;
-      // On a narrow screen the corpus panel is a drawer over the conversation.
-      setPanelDrawerOpen(false);
-      void askQuestion(label, task);
-    },
-    [askQuestion],
-  );
+  // Stable: every memoized document card receives it, and it used to change with the
+  // scope and the provider (askQuestion's), re-rendering all of them.
+  const summarizeDocuments = useStableHandler((filenames: string[]) => {
+    if (summarizeDisabled) return;
+    const task: DocumentTask =
+      filenames.length === 2
+        ? { mode: 'compare', filenames: filenames.slice(0, 2) }
+        : { mode: 'summarize', filenames: filenames.slice(0, 1) };
+    const label =
+      task.mode === 'compare'
+        ? `Compare ${task.filenames[0]} and ${task.filenames[1]}`
+        : `Summarize ${task.filenames[0]}`;
+    // On a narrow screen the corpus panel is a drawer over the conversation.
+    setPanelDrawerOpen(false);
+    void askQuestion(label, task);
+  });
   const editQuestion = useCallback(
     (turnId: string, question: string) => {
       setPinnedTraceId(null);
@@ -636,6 +679,7 @@ function App() {
         cited_filenames: payload.citedFilenames,
         rating: payload.rating,
         citation_source_number: null,
+        kind: payload.kind,
       })
       .catch((err) => {
         setTurnFeedback(payload.turnId, undefined);
@@ -752,6 +796,7 @@ function App() {
       exportingBackup,
       scopedFilenames: selectedFilenames,
       answerInFlight: pending,
+      summarizeDisabled,
     },
     {
       newConversation: () => {
@@ -910,11 +955,14 @@ function App() {
         )}
         {rail === 'corpus' && (
           <CorpusPanel
+            // A fresh panel per workspace: a selection, a pending confirm or a bulk
+            // action of the previous one can't act on this one's documents.
+            key={workspace}
             filenames={indexedFilenames}
             documents={documents}
-            uploads={uploads}
+            uploads={workspaceUploads}
             onUpload={handleUpload}
-            onDelete={handleDeleteDocument}
+            onDelete={deleteDocumentHere}
             maxUploadBytes={config?.max_upload_bytes}
             supportedExtensions={config?.supported_extensions}
             disabled={pending}
@@ -922,17 +970,18 @@ function App() {
             onRetryUpload={handleRetryUpload}
             onDismissUpload={handleDismissUpload}
             onCancelUpload={readOnly ? undefined : handleCancelUpload}
-            onReindex={config?.raw_documents_enabled && !readOnly ? handleReindex : undefined}
-            onReindexMany={config?.raw_documents_enabled && !readOnly ? handleReindexMany : undefined}
+            onReindex={config?.raw_documents_enabled && !readOnly ? reindexHere : undefined}
+            onReindexMany={config?.raw_documents_enabled && !readOnly ? reindexManyHere : undefined}
             onReindexAllStale={
               config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
             }
-            onSetTags={readOnly ? undefined : handleSetTags}
+            onSetTags={readOnly ? undefined : setTagsHere}
             readOnly={readOnly}
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
             onRead={handleReadDocument}
             onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
             onSummarize={summarizeDocuments}
+            summarizeDisabled={summarizeDisabled}
           />
         )}
         {/* Kept once opened, hidden while another panel shows: its query and results
@@ -1032,6 +1081,9 @@ function App() {
             // Typing is fine while the app boots; only sending waits for it.
             disabled={apiStatus === 'unauthorized' || noDocs}
             sendHeld={booting || (pending && !streamingHere)}
+            // Only the startup wait queues a send; waiting for another conversation's
+            // answer to finish doesn't send this one by itself later.
+            sendQueueable={booting && !(pending && !streamingHere)}
             hint={composerHint ?? (pending && !streamingHere ? streamingElsewhereHint : undefined)}
             pending={streamingHere}
             onCancel={cancel}
@@ -1090,8 +1142,9 @@ function App() {
                 refreshDocuments().catch((err) => {
                   noteAuthFailure(err);
                 });
-                // A different key may unlock more (or less).
+                // A different key may unlock more (or less), workspaces included.
                 void refreshAccess();
+                if (workspacesEnabled) void reloadWorkspaces();
               }}
               disabled={pending}
               notifyOnAnswer={notifyOnAnswer}

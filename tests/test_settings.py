@@ -287,3 +287,9 @@ def test_an_unconfigured_default_provider_is_warned_about_at_startup(
     warnings = [record.getMessage() for record in caplog.records]
     assert len(warnings) == 1
     assert "OPENAI_API_KEY" in warnings[0]
+
+
+def test_a_collection_name_with_the_workspace_separator_is_refused() -> None:
+    with pytest.raises(ValidationError, match="__ws_"):
+        AppSettings(_env_file=None, qdrant_collection="docs__ws_legal")  # type: ignore[call-arg]
+    assert AppSettings(_env_file=None, qdrant_collection="docs_ws").qdrant_collection == "docs_ws"  # type: ignore[call-arg]

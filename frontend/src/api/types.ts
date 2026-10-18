@@ -93,6 +93,9 @@ export interface SearchResultResponse {
 export interface SearchResponse {
   results: SearchResultResponse[];
   timings: { embed_ms: number; search_ms: number; rerank_ms: number };
+  /** Nothing cleared the relevance bar an answer's sources must clear; these are the
+   *  closest passages (typical of a one- or two-word search). Absent from older servers. */
+  weak_matches?: boolean;
 }
 
 export interface FeedbackItemResponse {
@@ -104,6 +107,8 @@ export interface FeedbackItemResponse {
   rating: FeedbackRating;
   citation_source_number: number | null;
   created_at: number;
+  /** Absent from rows recorded before the kind was (read as "question"). */
+  kind?: FeedbackKind;
 }
 
 export interface FeedbackListResponse {
@@ -177,6 +182,10 @@ export interface DocumentDeleteResponse {
 
 export type FeedbackRating = 'up' | 'down';
 
+/** What was rated: a standalone question, one asked with the conversation as history,
+ *  or a summary/comparison. The server defaults to "question". */
+export type FeedbackKind = 'question' | 'follow_up' | 'summary';
+
 export interface FeedbackRequest {
   trace_id: string | null;
   question: string;
@@ -184,6 +193,7 @@ export interface FeedbackRequest {
   cited_filenames: string[];
   rating: FeedbackRating;
   citation_source_number: number | null;
+  kind?: FeedbackKind;
 }
 
 export interface FeedbackResponse {

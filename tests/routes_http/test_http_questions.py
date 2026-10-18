@@ -734,6 +734,49 @@ def test_an_unconfigured_provider_is_refused_before_any_retrieval(
     assert len(api_context.embeddings.seen_text_batches) == embedded_before
 
 
+def test_an_anthropic_temperature_above_one_is_refused_before_any_work(
+    api_context: ApiTestContext,
+) -> None:
+    from api.dependencies import get_app_settings
+    from api.generation import GenerationConfigError
+    from api.routes.questions import check_request_provider
+
+    keyed = make_settings(anthropic_api_key="sk-ant-test")
+    api_context.app.dependency_overrides[get_app_settings] = lambda: keyed
+    assert upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    embedded_before = len(api_context.embeddings.seen_text_batches)
+    api_context.generator.messages = []
+
+    question = {"question": "alpha", "llm_provider": "anthropic", "llm_temperature": 1.5}
+    summary = {
+        "mode": "summarize",
+        "filenames": ["guide.txt"],
+        "llm_provider": "anthropic",
+        "llm_temperature": 1.5,
+    }
+    for route, body in (
+        ("/questions", question),
+        ("/questions/stream", question),
+        ("/questions/summary", summary),
+        ("/questions/summary/stream", summary),
+    ):
+        refused = api_context.client.post(route, json=body)
+        assert refused.status_code == 400, route
+        assert "temperature of at most 1" in refused.json()["detail"]
+    assert len(api_context.embeddings.seen_text_batches) == embedded_before
+    assert api_context.generator.messages == []  # nothing generated
+
+    # 1.0 is fine, as is 1.5 for a provider that takes it; and an anthropic default
+    # provider is held to it too.
+    check_request_provider("anthropic", keyed, 1.0)
+    check_request_provider("ollama", keyed, 1.5)
+    anthropic_default = make_settings(llm_provider="anthropic", anthropic_api_key="k")
+    with pytest.raises(GenerationConfigError, match="at most 1"):
+        check_request_provider(None, anthropic_default, 1.5)
+    with pytest.raises(GenerationConfigError, match="at most 1"):
+        check_request_provider(None, anthropic_default.model_copy(update={"llm_temperature": 1.2}))
+
+
 def test_every_provider_is_allowed_per_request_by_default(api_context: ApiTestContext) -> None:
     assert api_context.client.get("/config").json()["allowed_request_providers"] == [
         "ollama",

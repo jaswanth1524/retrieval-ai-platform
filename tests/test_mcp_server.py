@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Iterator
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from mcp.client.session import ClientSession
@@ -91,6 +93,8 @@ def test_formatting_notes_partial_reads_and_status() -> None:
     assert "Answer status: uncited" in text and "Read 4 of 9 passages" in text
     assert text.endswith("Suggested follow-ups: What else?")
     assert format_passages([]) == "No passages matched."
+    weak = format_passages([{"rank": 1, "filename": "a.txt", "text": "x"}], weak=True)
+    assert weak.startswith("No passage clearly matches") and "1. a.txt" in weak
     long = format_passages(
         [
             {
@@ -120,3 +124,97 @@ async def test_the_stdio_server_starts_and_lists_its_tools() -> None:
         # Nothing listens on port 9: the tool says so instead of failing the session.
         result = await session.call_tool("list_documents", {})
         assert "Cannot reach DocRAG" in text_of(result)
+
+
+def mock_server(handler: Any) -> MCPServer:
+    return build_server(
+        lambda: DocragClient("http://x", "", transport=httpx.MockTransport(handler))
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_error_after_the_answer_still_returns_the_answer() -> None:
+    """The follow-ups failing (or the connection dropping) after `done` lost the answer."""
+
+    done = {"type": "done", "answer": "Kept [1].", "sources": [], "answer_status": "answered"}
+    error = {"type": "error", "detail": "follow-ups failed"}
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in (done, error))
+    server = mock_server(lambda _: httpx.Response(200, text=body))
+
+    assert text_of(await server.call_tool("ask", {"question": "q"})) == "Kept [1]."
+    summary = text_of(await server.call_tool("summarize", {"filenames": ["a.txt"]}))
+    assert summary == "Kept [1]."
+
+
+@pytest.mark.asyncio
+async def test_read_document_caps_what_it_returns_and_says_where_to_go_on() -> None:
+    """A page of 100 long passages came back whole: hundreds of kilobytes in one result."""
+
+    requested: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        requested.append(params)
+        first, last = int(params["start"]), int(params["end"])
+        chunks = [
+            {
+                "chunk_ordinal": n,
+                "page": 1,
+                "section": "S",
+                "text": ("x" * 50_000) if n == 1 else f"passage {n} " + "w" * 2_000,
+            }
+            for n in range(first, min(last, 300) + 1)
+        ]
+        return httpx.Response(200, json={"chunks": chunks, "total_chunks": 300})
+
+    server = mock_server(handler)
+
+    first = text_of(await server.call_tool("read_document", {"filename": "a.txt", "count": 100}))
+    assert len(first) < 30_000
+    assert "[passage cut]" in first and "passage 2 " in first
+    shown = int(first.rsplit("more with start=", 1)[1].rstrip(".]")) - 1
+    assert 2 <= shown < 100
+    assert f"[Showing passages up to {shown} of 300; more with start={shown + 1}.]" in first
+
+    later = text_of(
+        await server.call_tool(
+            "read_document", {"filename": "a.txt", "start": shown + 1, "count": 100}
+        )
+    )
+    assert f"[{shown + 1}] p.1" in later and "[passage cut]" not in later
+
+    # The last page needs no note.
+    tail = text_of(await server.call_tool("read_document", {"filename": "a.txt", "start": 300}))
+    assert "more with start" not in tail and "passage 300 " in tail
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_tool_call_closes_the_answer_stream() -> None:
+    """Cancelling the coroutine left the request's thread streaming the answer, holding a
+    server question slot, until the answer ended."""
+
+    import asyncio
+    import threading
+    import time
+
+    started, closed = threading.Event(), threading.Event()
+
+    class Pings(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            started.set()
+            while not closed.is_set():
+                time.sleep(0.01)  # the server's keepalives, sped up
+                yield b": ping\n\n"
+
+        def close(self) -> None:
+            closed.set()
+
+    server = mock_server(
+        lambda _: httpx.Response(200, stream=Pings(), headers={"content-type": "text/event-stream"})
+    )
+    call = asyncio.create_task(server.call_tool("ask", {"question": "q"}))
+    assert await asyncio.to_thread(started.wait, 5)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert await asyncio.to_thread(closed.wait, 5)

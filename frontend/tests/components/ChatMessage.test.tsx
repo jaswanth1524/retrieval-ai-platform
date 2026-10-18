@@ -586,6 +586,35 @@ describe('ChatMessage', () => {
   });
 
   describe('feedback', () => {
+    it('says what kind of answer was rated: a follow-up, or a summary', async () => {
+      const onFeedback = vi.fn();
+      const { unmount } = render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'Then this.', followUp: true })}
+          engineerMode={false}
+          regenerateQuestion="And then?"
+          feedbackEnabled
+          onFeedback={onFeedback}
+        />,
+      );
+      await userEvent.click(screen.getByTestId('chat-message-feedback-up'));
+      expect(onFeedback).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'follow_up' }));
+      unmount();
+
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'A summary.' })}
+          engineerMode={false}
+          regenerateQuestion="Summarize a.pdf"
+          regenerateTask={{ mode: 'summarize', filenames: ['a.pdf'] }}
+          feedbackEnabled
+          onFeedback={onFeedback}
+        />,
+      );
+      await userEvent.click(screen.getByTestId('chat-message-feedback-down'));
+      expect(onFeedback).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'summary' }));
+    });
+
     it('renders no feedback buttons when feedbackEnabled is not set', () => {
       render(
         <ChatMessage
@@ -628,6 +657,7 @@ describe('ChatMessage', () => {
         answerExcerpt: 'The answer is 42 [1].',
         citedFilenames: ['doc.pdf'],
         traceId: 'trace-1',
+        kind: 'question',
       });
       expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
       expect(screen.getByTestId('chat-message-feedback-down')).toBeDisabled();

@@ -133,10 +133,14 @@
   gap: 7px;
 }
 
+/* Wraps: with five actions (read, summarize, original, re-index, delete) the name was
+   left 24-36px and broke mid-word ("roa / dm / ap. / ppt / x"). The name keeps room
+   for a whole short filename, and the actions move under it when they don't fit. */
 .corpus-panel__card-top {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
-  gap: 8px;
+  gap: 6px 8px;
 }
 
 .corpus-panel__ext {
@@ -152,11 +156,12 @@
 }
 
 .corpus-panel__name {
-  flex: 1;
+  flex: 1 1 9rem;
   min-width: 0;
   font-size: 12.5px;
   line-height: 1.35;
-  word-break: break-word;
+  /* Only a name longer than the whole row breaks, and then between any characters. */
+  overflow-wrap: anywhere;
   color: var(--rail-text);
 }
 
@@ -219,6 +224,7 @@
 /* ConfirmInline supplies the buttons; the card's top row only needs it not to shrink. */
 .corpus-panel__confirm {
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 .corpus-panel__failed-actions {
@@ -266,6 +272,8 @@
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
+  /* Right-aligned, on the name's row or (wrapped) on a row of their own. */
+  margin-left: auto;
 }
 
 .corpus-panel__reindex {

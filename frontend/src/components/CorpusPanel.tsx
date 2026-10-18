@@ -55,6 +55,9 @@ interface CorpusPanelProps {
   onRead?: (filename: string) => void;
   /** Summarize one document, or compare two, as a turn in the conversation. */
   onSummarize?: (filenames: string[]) => void;
+  /** Summaries can't be asked right now (booting, the key was refused): the buttons
+   *  stay, disabled, like the composer's Send. */
+  summarizeDisabled?: boolean;
   /** Index a document the server fetches from a URL; absent when that is off. */
   onUploadFromUrl?: (url: string) => void;
 }
@@ -114,6 +117,7 @@ function CorpusPanel({
   onOpenOriginal,
   onRead,
   onSummarize,
+  summarizeDisabled = false,
   onUploadFromUrl,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
@@ -326,7 +330,9 @@ function CorpusPanel({
       return kept.length === prev.size ? prev : new Set(kept);
     });
   }, [visibleIndexed]);
-  const canBulk = !readOnly && indexedCards.length > 1;
+  // The read-only key selects too, but only to compare (the server allows it summaries);
+  // the bar offers it nothing else.
+  const canBulk = indexedCards.length > 1 && (!readOnly || onSummarize !== undefined);
   const visibleNames = visibleIndexed.map((card) => card.filename);
   const allVisibleSelected =
     visibleNames.length > 0 && visibleNames.every((filename) => selected.has(filename));
@@ -551,12 +557,15 @@ function CorpusPanel({
             .filter((card) => card.canReindex && selected.has(card.filename))
             .map((card) => card.filename)}
           onReindex={
-            onReindexMany ??
-            (onReindex ? (names: string[]) => names.forEach((name) => onReindex(name)) : undefined)
+            readOnly
+              ? undefined
+              : (onReindexMany ??
+                (onReindex ? (names: string[]) => names.forEach((name) => onReindex(name)) : undefined))
           }
-          onAddTag={onSetTags ? bulkAddTag : undefined}
+          onAddTag={onSetTags && !readOnly ? bulkAddTag : undefined}
           onCompare={onSummarize}
-          onDelete={bulkDelete}
+          compareDisabled={summarizeDisabled}
+          onDelete={readOnly ? undefined : bulkDelete}
           onClear={() => setSelected(new Set())}
         />
       )}
@@ -586,6 +595,7 @@ function CorpusPanel({
             onConfirmDelete={handleDelete}
             onRead={onRead}
             onSummarize={onSummarize}
+            summarizeDisabled={summarizeDisabled}
             onOpenOriginal={onOpenOriginal}
             onReindex={onReindex}
             onCancelUpload={onCancelUpload}

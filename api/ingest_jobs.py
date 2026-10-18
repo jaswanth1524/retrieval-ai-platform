@@ -21,7 +21,12 @@ from api.documents import (
     normalize_filename,
 )
 from api.embeddings import EmbeddingError
-from api.ingestion import IngestionError, filename_write_lock, ingest_sequencer
+from api.ingestion import (
+    ClosedForWorkError,
+    IngestionError,
+    filename_write_lock,
+    ingest_sequencer,
+)
 from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobStore
 from api.metrics import (
     NO_ERROR_TYPE,
@@ -37,7 +42,7 @@ from api.schemas import (
     DocumentJobAcceptedResponse,
 )
 from api.settings import AppSettings
-from api.workspaces import document_key
+from api.workspaces import WorkspaceClosingError, document_key, filename_of, workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +280,15 @@ def backlog_full_error() -> HTTPException:
     return HTTPException(status_code=503, detail=BACKLOG_FULL_ERROR, headers={"Retry-After": "15"})
 
 
+def admit_or_refuse(key: str) -> int:
+    """``ingest_sequencer.admit(key)``, or a 409 while its workspace is being deleted."""
+
+    try:
+        return ingest_sequencer.admit(key)
+    except ClosedForWorkError as exc:
+        raise WorkspaceClosingError(exc.group) from None
+
+
 def enqueue_ingest(
     *,
     job_store: JobStore,
@@ -298,14 +312,18 @@ def enqueue_ingest(
     if not backlog.try_reserve(size):
         raise backlog_full_error()
     key = document_key(ingest_service.settings, filename)
-    sequence = ingest_sequencer.admit(key)
+    try:
+        sequence = admit_or_refuse(key)
+    except HTTPException:
+        backlog.release(size)
+        raise
 
     def release() -> None:
         backlog.release(size)
         ingest_sequencer.release(key)
 
     try:
-        job = job_store.create(filename)
+        job = job_store.create(filename, workspace_of(ingest_service.settings))
     except BaseException:
         release()
         raise
@@ -425,6 +443,15 @@ def refuse_near_duplicate_name(filename: str, existing: Iterable[str]) -> None:
             )
 
 
+def known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
+    """Every indexed filename in ``settings``' workspace plus those with an upload or
+    delete in flight: what a new name is checked against by
+    ``refuse_near_duplicate_name`` (uploads, URL ingest, import and the folder watcher)."""
+
+    in_flight = (filename_of(settings, key) for key in ingest_sequencer.in_flight())
+    return [*repository.filename_metadata(settings), *(name for name in in_flight if name)]
+
+
 def require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
     """The raw store, or a 409: re-indexing reads originals only kept when it's on."""
 
@@ -500,7 +527,7 @@ def delete_indexed_document(
     # upload already queued for this name is refused when it reaches the lock
     # instead of indexing the document straight back after the delete.
     key = document_key(settings, filename)
-    sequence = ingest_sequencer.admit(key)
+    sequence = admit_or_refuse(key)
     try:
         with filename_write_lock(key):
             # The lock isn't fair: an upload admitted after this delete can reach

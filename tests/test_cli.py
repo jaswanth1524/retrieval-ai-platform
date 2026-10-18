@@ -227,3 +227,485 @@ def test_the_installed_command_names_itself_docrag(monkeypatch: pytest.MonkeyPat
     assert build_parser().prog == "docrag"
     monkeypatch.setattr("sys.argv", ["/repo/cli/__main__.py", "status"])
     assert build_parser().prog == "python -m cli"
+
+
+def test_status_names_the_model_of_the_provider_in_use() -> None:
+    """It printed llm_model (Ollama's) for every provider: "openai (qwen2.5:latest)"."""
+
+    from cli.__main__ import provider_model
+
+    config = {
+        "llm_model": "llama3.1:8b",
+        "openai_model": "gpt-5-mini",
+        "openai_compatible_model": "qwen2.5-7b",
+        "anthropic_model": "claude-sonnet-5-5",
+    }
+
+    assert provider_model(config, "ollama") == "llama3.1:8b"
+    assert provider_model(config, "openai") == "gpt-5-mini"
+    assert provider_model(config, "openai_compatible") == "qwen2.5-7b"
+    assert provider_model(config, "anthropic") == "claude-sonnet-5-5"
+    assert provider_model({"openai_compatible_model": ""}, "openai_compatible") == "?"
+
+
+def test_status_prints_the_default_providers_model(client: DocragClient) -> None:
+    code, out = run(client, "status")
+
+    assert code == 0
+    assert "generation: ollama (llama3.1:8b)" in out
+
+
+# -- review fixes ----------------------------------------------------------------------
+
+
+DONE = {"type": "done", "answer": "The answer [1].", "sources": [], "answer_status": "answered"}
+
+
+def frame(event: dict[str, object]) -> bytes:
+    return f"data: {json.dumps(event)}\n\n".encode()
+
+
+class BrokenStream(httpx.SyncByteStream):
+    """A body that sends ``chunks`` and then loses the connection."""
+
+    def __init__(self, *chunks: bytes) -> None:
+        self.chunks = chunks
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self.chunks
+        raise httpx.ReadError("connection reset")
+
+
+def mock_client(handler: object, slept: list[float] | None = None) -> DocragClient:
+    return DocragClient(
+        "http://x",
+        "",
+        transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
+        sleep=(slept.append if slept is not None else lambda _: None),
+    )
+
+
+def test_ingest_uploads_one_file_per_stored_name(client: DocragClient, tmp_path: Path) -> None:
+    """The server keeps only the basename: a/notes.md and b/Notes.md overwrote each other."""
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "notes.md").write_text("# A\nAlpha from folder a.")
+    (tmp_path / "b" / "Notes.md").write_text("# B\nBeta from folder b.")
+
+    code, out = run(client, "ingest", str(tmp_path))
+
+    assert code == 0
+    assert out.count("ok    ") == 1
+    assert (
+        f"skip  {tmp_path / 'b' / 'Notes.md'} (another file is already indexed as notes.md" in out
+    )
+    assert "1 indexed, 0 failed, 1 skipped" in out
+    _, listing = run(client, "--json", "documents")
+    assert json.loads(listing)["filenames"] == ["notes.md"]
+
+
+def test_an_explicitly_named_dotfile_is_not_dropped(client: DocragClient, tmp_path: Path) -> None:
+    root = corpus(tmp_path)
+
+    files, _ = ingestible([root / ".hidden.txt"], {".txt"})
+    assert files == [root / ".hidden.txt"]
+    code, out = run(client, "ingest", str(root / ".hidden.txt"))
+    assert code == 0 and "ok    " in out and "1 indexed" in out
+
+
+def test_ingest_skips_files_over_the_servers_upload_limit(tmp_path: Path) -> None:
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/config":
+            return httpx.Response(
+                200, json={"supported_extensions": [".txt"], "max_upload_bytes": 5}
+            )
+        posted.append(request.url.path)
+        return httpx.Response(500)
+
+    (tmp_path / "big.txt").write_text("more than five bytes")
+
+    code, out = run(mock_client(handler), "ingest", str(tmp_path / "big.txt"))
+
+    assert code == 0 and posted == []
+    assert "big.txt (too large: 20 bytes, the limit is 5)" in out
+    assert "0 indexed, 0 failed, 1 skipped" in out
+
+
+def test_an_unreadable_file_fails_alone_and_the_ingest_goes_on(
+    client: DocragClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = corpus(tmp_path)
+    real = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self.name == "guide.txt":
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    code, out = run(client, "ingest", str(root))
+
+    assert code == 1
+    assert "guide.txt: Cannot read" in out and "Permission denied" in out
+    assert "1 indexed, 1 failed, 1 skipped" in out
+
+
+def test_an_error_after_done_keeps_the_answer() -> None:
+    """Only the follow-ups were still coming: the web UI's sawDone guard."""
+
+    followups = {"type": "followups", "questions": ["Next?"]}
+    error = {"type": "error", "detail": "follow-ups failed"}
+    bodies = [
+        frame(DONE) + frame(followups) + frame(error),
+        frame(DONE) + b"data: {not json\n\n",
+    ]
+    for body in bodies:
+        result = mock_client(lambda _, body=body: httpx.Response(200, content=body)).ask("q")
+        assert result.done["answer"] == "The answer [1]."
+
+    reset = mock_client(
+        lambda _: httpx.Response(200, stream=BrokenStream(frame(DONE), frame(followups)))
+    ).ask("q")
+    assert reset.done["answer"] == "The answer [1]." and reset.followups == ["Next?"]
+
+    # Before `done` the same reset is still a failure.
+    with pytest.raises(DocragError, match="Cannot reach DocRAG"):
+        mock_client(lambda _: httpx.Response(200, stream=BrokenStream(b""))).ask("q")
+
+
+def test_export_never_truncates_an_existing_backup(tmp_path: Path) -> None:
+    target = tmp_path / "backup.zip"
+    target.write_bytes(b"the old backup")
+
+    def interrupted(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BrokenStream(b"PK\x03\x04 half a zip"))
+
+    with pytest.raises(DocragError, match="The download was interrupted") as caught:
+        mock_client(interrupted).export(target)
+    assert "Cannot reach" not in str(caught.value)
+    assert target.read_bytes() == b"the old backup"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["backup.zip"]
+
+    refused = mock_client(lambda _: httpx.Response(403, json={"detail": "full key needed"}))
+    with pytest.raises(DocragError, match="full key needed"):
+        refused.export(target)
+    assert target.read_bytes() == b"the old backup"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["backup.zip"]
+
+    assert mock_client(lambda _: httpx.Response(200, content=b"new zip")).export(target) == 7
+    assert target.read_bytes() == b"new zip"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["backup.zip"]
+
+
+def import_server(states: dict[str, object], **report: object) -> DocragClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/import":
+            jobs = [{"job_id": job, "filename": f"{job}.txt", "state": "queued"} for job in states]
+            body = {
+                "jobs": jobs,
+                "deferred": [],
+                "skipped": [],
+                "missing_originals": [],
+                "rejected": [],
+                "feedback_imported": 0,
+                "feedback_skipped": 0,
+                **report,
+            }
+            return httpx.Response(200, json=body)
+        job = request.url.path.rsplit("/", 1)[-1]
+        state = states[job]
+        if isinstance(state, int):
+            return httpx.Response(state, json={"detail": "Unknown job."})
+        return httpx.Response(200, json={"job_id": job, "filename": f"{job}.txt", "state": state})
+
+    return mock_client(handler)
+
+
+def test_import_waits_for_every_job_and_fails_on_any_failure(tmp_path: Path) -> None:
+    archive = tmp_path / "backup.zip"
+    archive.write_bytes(b"zip")
+    docrag = import_server({"evicted": 404, "broken": "failed", "fine": "done"})
+
+    code, out = run(docrag, "import", str(archive))
+    assert code == 1
+    assert "unknown evicted.txt: Unknown job." in out
+    assert "failed broken.txt" in out and "done   fine.txt" in out
+
+    # --json waits too, and reports every job's final state.
+    code, out = run(docrag, "import", str(archive), "--json")
+    assert code == 1
+    states = [status["state"] for status in json.loads(out)["results"]]
+    assert states == ["unknown", "failed", "done"]
+
+    assert run(import_server({"fine": "done"}), "import", str(archive))[0] == 0
+    code, out = run(import_server({"fine": "done"}, deferred=["later.txt"]), "import", str(archive))
+    assert code == 1 and "defer  later.txt" in out
+    assert run(import_server({}, rejected=["bad.txt"]), "--json", "import", str(archive))[0] == 1
+
+
+def test_local_failures_are_error_lines_not_tracebacks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    html = mock_client(lambda _: httpx.Response(200, text="<html>a proxy</html>"))
+    assert run(html, "status")[0] == 1
+    assert "error: The server sent a response that is not JSON" in capsys.readouterr().err
+
+    garbled = mock_client(lambda _: httpx.Response(200, content=b"data: {oops\n\n"))
+    assert run(garbled, "ask", "q", "--quiet")[0] == 1
+    assert "error: The server sent a malformed stream frame." in capsys.readouterr().err
+    not_an_object = mock_client(lambda _: httpx.Response(200, content=b"data: 1\n\n"))
+    assert run(not_an_object, "ask", "q", "--quiet")[0] == 1
+    assert "malformed stream frame" in capsys.readouterr().err
+
+    zipped = mock_client(lambda _: httpx.Response(200, content=b"zip"))
+    assert run(zipped, "export", str(tmp_path / "no-such-dir" / "backup.zip"))[0] == 1
+    assert "error: Cannot write" in capsys.readouterr().err
+
+    assert run(zipped, "import", str(tmp_path / "missing.zip"))[0] == 1
+    assert "error: Cannot read" in capsys.readouterr().err
+
+
+def test_global_flags_also_work_after_the_subcommand(client: DocragClient, tmp_path: Path) -> None:
+    from cli.__main__ import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["ask", "q", "--json", "--url", "http://srv", "--workspace", "w"])
+    assert (args.json, args.url, args.workspace) == (True, "http://srv", "w")
+    # A flag given before the subcommand survives it.
+    args = parser.parse_args(["--json", "--api-key", "k", "status"])
+    assert (args.json, args.api_key, args.url) == (True, "k", None)
+    assert parser.parse_args(["status"]).json is False
+    # add-url's own argument no longer replaces the server's address.
+    args = parser.parse_args(["--url", "http://srv", "add-url", "https://e.com/x.html"])
+    assert (args.url, args.source_url) == ("http://srv", "https://e.com/x.html")
+
+    run(client, "ingest", str(corpus(tmp_path)))
+    code, out = run(client, "ask", "alpha", "--json")
+    assert code == 0 and json.loads(out)["answer"] == "Alpha is documented [1]."
+
+
+def test_output_the_console_cannot_encode_is_replaced(
+    client: DocragClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cp1252 (a Windows console) has no "→": the ok line raised UnicodeEncodeError."""
+
+    raw = io.BytesIO()
+    console = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr("sys.stdout", console)
+
+    code = main(["ingest", str(corpus(tmp_path) / "guide.txt")], client=client)
+
+    console.flush()
+    assert code == 0
+    assert b"guide.txt ? guide.txt" in raw.getvalue()
+
+
+def test_busy_answers_and_searches_are_retried_after_retry_after(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if len(calls) % 2 == 1:
+            return httpx.Response(429, headers={"Retry-After": "2"}, json={"detail": "busy"})
+        if request.url.path == "/search":
+            return httpx.Response(200, json={"results": []})
+        if request.url.path == "/documents":
+            return httpx.Response(202, json={"job_id": "j", "filename": "a.txt"})
+        return httpx.Response(200, content=frame(DONE))
+
+    slept: list[float] = []
+    docrag = mock_client(handler, slept)
+    path = tmp_path / "a.txt"
+    path.write_text("x")
+
+    assert docrag.ask("q").done["answer"] == "The answer [1]."
+    assert docrag.summarize(["a.txt"]).done["answer"] == "The answer [1]."
+    assert docrag.search("q") == []
+    assert docrag.upload(path)["job_id"] == "j"
+    assert slept == [2.0, 2.0, 2.0, 2.0]
+
+    # Bounded: a server that stays busy is reported, not waited on forever.
+    always: list[int] = []
+
+    def busy(_: httpx.Request) -> httpx.Response:
+        always.append(1)
+        return httpx.Response(429, json={"detail": "All question slots are busy."})
+
+    with pytest.raises(DocragError, match="busy") as caught:
+        mock_client(busy).ask("q")
+    assert caught.value.status_code == 429 and len(always) == 4
+
+
+def jobs_server(finish_after: dict[str, int]) -> tuple[DocragClient, list[str]]:
+    """Uploads get a job each; job ``name`` is done after ``finish_after[name]`` polls
+    (never, when absent). The log shows the order of uploads and polls."""
+
+    log: list[str] = []
+    polls: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/config":
+            return httpx.Response(200, json={"supported_extensions": [".txt"]})
+        if request.url.path == "/documents/from-url":
+            log.append("from-url")
+            return httpx.Response(202, json={"job_id": "url.txt", "state": "queued"})
+        if request.url.path == "/documents":
+            name = request.content.split(b'filename="')[1].split(b'"')[0].decode()
+            log.append(f"upload {name}")
+            return httpx.Response(202, json={"job_id": name, "filename": name, "state": "queued"})
+        name = request.url.path.rsplit("/", 1)[1]
+        log.append(f"poll {name}")
+        polls[name] = polls.get(name, 0) + 1
+        done = name in finish_after and polls[name] >= finish_after[name]
+        if done:
+            log.append(f"done {name}")
+        return httpx.Response(
+            200,
+            json={
+                "job_id": name,
+                "filename": name,
+                "state": "done" if done else "embedding",
+                "chunks_done": 1,
+            },
+        )
+
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    docrag = DocragClient(
+        "http://x", "", transport=httpx.MockTransport(handler), sleep=sleep, clock=lambda: now[0]
+    )
+    return docrag, log
+
+
+def test_ingest_sends_several_files_before_waiting_and_reports_json(tmp_path: Path) -> None:
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("Intro\nText.")
+    (tmp_path / "skip.bin").write_bytes(b"\x00")
+    docrag, log = jobs_server({"a.txt": 3, "b.txt": 1, "c.txt": 2})
+
+    code, out = run(docrag, "ingest", str(tmp_path), "--json")
+    assert code == 0
+    # All three on the server before the first poll: it indexes them side by side.
+    assert log[:3] == ["upload a.txt", "upload b.txt", "upload c.txt"]
+    report = json.loads(out)
+    assert [item["filename"] for item in report["indexed"]] == ["b.txt", "c.txt", "a.txt"]
+    assert report["failed"] == []
+    assert report["skipped"] == [{"path": str(tmp_path / "skip.bin"), "reason": "unsupported type"}]
+
+
+def test_ingest_stops_waiting_at_the_timeout(tmp_path: Path) -> None:
+    (tmp_path / "quick.txt").write_text("Intro\nText.")
+    (tmp_path / "stuck.txt").write_text("Intro\nText.")
+    docrag, _ = jobs_server({"quick.txt": 1})
+
+    code, out = run(docrag, "ingest", str(tmp_path), "--timeout", "5")
+    assert code == 1
+    assert "ok    " in out and "quick.txt" in out
+    assert "still embedding when the wait ended" in out
+    assert out.strip().endswith("1 indexed, 1 failed, 0 skipped")
+
+
+def test_add_url_prints_json_and_honours_the_timeout() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/documents/from-url":
+            return httpx.Response(202, json={"job_id": "j", "filename": "x.txt", "state": "queued"})
+        return httpx.Response(200, json={"job_id": "j", "filename": "x.txt", "state": "done"})
+
+    code, out = run(mock_client(handler), "add-url", "https://e.com/x.txt", "--json")
+    assert code == 0 and json.loads(out)["state"] == "done"
+
+    docrag, _ = jobs_server({})
+    code, out = run(docrag, "add-url", "https://e.com/slow", "--json", "--timeout", "3")
+    assert code == 1 and "still embedding" in json.loads(out)["error"]
+
+
+def test_wait_for_job_gives_up_after_its_timeout() -> None:
+    docrag, log = jobs_server({})
+    with pytest.raises(DocragError, match=r"Still embedding after 4 s \(job j\)"):
+        docrag.wait_for_job("j", timeout=4)
+    assert 4 <= len(log) <= 6
+
+
+def test_a_stream_stops_when_asked_even_between_events() -> None:
+    """Only keepalive comments arrive while the server retrieves: the stop is still seen."""
+
+    closed: list[bool] = []
+
+    class Pings(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            while True:
+                yield b": ping\n\n"
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Pings(), headers={"content-type": "text/event-stream"})
+
+    checks = [0]
+
+    def should_stop() -> bool:
+        checks[0] += 1
+        return checks[0] > 3
+
+    from cli.client import Cancelled
+
+    with pytest.raises(Cancelled):
+        mock_client(handler).ask("q", should_stop=should_stop)
+    assert closed == [True]  # the connection was closed: the server stops the answer
+
+
+def test_index_files_keeps_at_most_a_window_of_jobs_indexing(tmp_path: Path) -> None:
+    """Uploading a whole folder at once let finished jobs fall out of the server's job
+    store (they then read as unknown) and later uploads wait on 503s."""
+
+    paths = []
+    for index in range(7):
+        path = tmp_path / f"f{index}.txt"
+        path.write_text("Intro\nText.")
+        paths.append(path)
+    docrag, log = jobs_server({path.name: 1 + index % 3 for index, path in enumerate(paths)})
+
+    statuses = docrag.index_files(paths, window=2)
+    assert [statuses[path]["state"] for path in paths] == ["done"] * 7
+    indexing = most = 0
+    for entry in log:
+        if entry.startswith("upload "):
+            indexing += 1
+        elif entry.startswith("done "):
+            indexing -= 1
+        most = max(most, indexing)
+    assert most == 2
+
+
+def test_files_not_yet_sent_when_the_wait_ends_are_reported(tmp_path: Path) -> None:
+    paths = []
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("Intro\nText.")
+        paths.append(tmp_path / name)
+    docrag, _ = jobs_server({})  # nothing ever finishes
+
+    statuses = docrag.index_files(paths, window=1, timeout=3)
+    assert [statuses[path]["state"] for path in paths] == ["embedding", "not_sent", "not_sent"]
+
+
+def test_search_says_when_the_passages_are_only_the_closest() -> None:
+    passage = {"rank": 1, "filename": "it.txt", "page": 1, "text": "Laptops.", "rerank_score": 0.1}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [passage], "timings": {}, "weak_matches": True})
+
+    code, out = run(mock_client(handler), "search", "laptop")
+    assert code == 0
+    assert out.startswith("(no strong matches; the closest passages:)")
+    assert "1. it.txt p.1 (0.10)" in out
+    # --json keeps its shape: the list of passages.
+    code, out = run(mock_client(handler), "search", "laptop", "--json")
+    assert json.loads(out) == [passage]

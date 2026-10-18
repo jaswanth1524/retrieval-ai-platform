@@ -73,7 +73,36 @@ def test_search_returns_ranked_passages_without_calling_the_llm(
         first.keys()
     )
     assert set(body["timings"]) == {"embed_ms", "search_ms", "rerank_ms"}
+    assert body["weak_matches"] is False
     assert api_context.generator.messages == []
+
+
+def test_a_search_with_nothing_over_the_bar_shows_the_closest_passages_flagged() -> None:
+    """A one-word search ("laptop") came back empty: the cross-encoder scores a bare
+    keyword about 0.1 even against the passage holding it, under RERANK_MIN_SCORE."""
+
+    from api.dependencies import get_reranker
+
+    class KeywordReranker:
+        def score(self, query: str, documents: Sequence[str]) -> list[float]:
+            # Logits whose sigmoids sit under the 0.15 bar, the matching passage first.
+            return [-2.0 if query in document else -4.0 for document in documents]
+
+    with keyed_client("", extra_overrides={get_reranker: KeywordReranker}) as client:
+        assert (
+            upload_and_wait(client, "it.txt", b"Intro\nEvery laptop is replaced.")["state"]
+            == "done"
+        )
+        assert upload_and_wait(client, "food.txt", b"Intro\nLunch is at noon.")["state"] == "done"
+
+        body = client.post("/search", json={"query": "laptop"}).json()
+        assert body["weak_matches"] is True
+        assert [result["filename"] for result in body["results"]] == ["it.txt", "food.txt"]
+        assert body["results"][0]["rerank_score"] < 0.15
+
+        # An answer still never rests on passages under the bar.
+        answer = client.post("/questions", json={"question": "laptop"}).json()
+        assert answer["answer_status"] == "no_context" and answer["sources"] == []
 
 
 def test_search_skips_llm_query_expansion_even_when_it_is_on() -> None:
@@ -400,6 +429,42 @@ def test_import_skips_feedback_rows_the_api_could_not_have_stored(tmp_path: Path
         assert body["feedback_skipped"] == len(bad_rows) + 3
         stored = client.get("/feedback", headers=FULL).json()
     assert sorted(row["question"] for row in stored["feedback"]) == ["a\u2028b", "q"]
+
+
+def test_feedback_kind_is_recorded_listed_exported_and_restored(tmp_path: Path) -> None:
+    base = {"question": "q", "answer_excerpt": "a", "rating": "up"}
+    with _backup_client(tmp_path, "src") as client:
+        assert client.post("/feedback", json=base, headers=FULL).status_code == 201
+        summary = {**base, "question": "Summarize a.txt", "kind": "summary"}
+        assert client.post("/feedback", json=summary, headers=FULL).status_code == 201
+        bad = client.post("/feedback", json={**base, "kind": "other"}, headers=FULL)
+        assert bad.status_code == 422
+        listed = client.get("/feedback", headers=FULL).json()["feedback"]
+        assert sorted((row["question"], row["kind"]) for row in listed) == [
+            ("Summarize a.txt", "summary"),
+            ("q", "question"),
+        ]
+        exported = client.get("/export", headers=FULL).content
+    jsonl = zipfile.ZipFile(io.BytesIO(exported)).read("feedback.jsonl").decode()
+    rows = [json.loads(line) for line in jsonl.splitlines()]
+    assert sorted(row["kind"] for row in rows) == ["question", "summary"]
+
+    good = {**base, "id": "f1", "created_at": 1.0, "kind": "follow_up"}
+    legacy = {**base, "id": "f2", "created_at": 2.0}  # a backup from before kinds
+    invalid = {**base, "id": "f3", "created_at": 3.0, "kind": "nonsense"}
+    content = _zip(
+        {
+            "manifest.json": json.dumps({"manifest_version": 1, "documents": []}).encode(),
+            "feedback.jsonl": "".join(
+                json.dumps(row) + "\n" for row in (good, legacy, invalid)
+            ).encode(),
+        }
+    )
+    with _backup_client(tmp_path, "dst") as client:
+        body = _import(client, content).json()
+        assert (body["feedback_imported"], body["feedback_skipped"]) == (2, 1)
+        restored = client.get("/feedback", headers=FULL).json()["feedback"]
+    assert sorted(row["kind"] for row in restored) == ["follow_up", "question"]
 
 
 def test_import_reads_the_listing_once_and_refuses_case_twins_inside_one_backup(

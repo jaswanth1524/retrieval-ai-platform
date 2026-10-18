@@ -60,6 +60,16 @@ def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
     }
 
 
+def test_health_ready_ignores_the_workspace_header(api_context: ApiTestContext) -> None:
+    api_context.app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: True
+
+    # Workspaces off: a header naming one would be a 400 on a workspace route, and with
+    # them on a deleted one a 404. Readiness reports on the app itself either way.
+    response = api_context.client.get("/health/ready", headers={"X-Workspace": "gone"})
+
+    assert response.status_code == 200 and response.json()["status"] == "ok"
+
+
 def test_health_endpoint_never_probes_dependencies(api_context: ApiTestContext) -> None:
     def raise_if_called(_client: object) -> bool:
         raise AssertionError("check_qdrant_reachable must not run for /health")

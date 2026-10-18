@@ -64,6 +64,40 @@ describe('Composer', () => {
     expect(textarea).toHaveValue('');
   });
 
+  it('sends a question asked while the app starts once it is ready', async () => {
+    const props = baseProps({ sendHeld: true, sendQueueable: true });
+    const { rerender } = render(<Composer {...props} />);
+
+    await userEvent.type(screen.getByTestId('question-textarea'), 'What is the refund window?');
+    await userEvent.keyboard('{Enter}');
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByTestId('question-queued')).toHaveTextContent('Sending as soon as DocRAG is ready');
+
+    rerender(<Composer {...props} sendHeld={false} sendQueueable={false} />);
+    expect(props.onSubmit).toHaveBeenCalledWith('What is the refund window?');
+    expect(screen.getByTestId('question-textarea')).toHaveValue('');
+    expect(screen.queryByTestId('question-queued')).not.toBeInTheDocument();
+  });
+
+  it('keeps the question when startup ends unable to send, and never queues other holds', async () => {
+    const props = baseProps({ sendHeld: true, sendQueueable: true });
+    const { rerender } = render(<Composer {...props} />);
+    await userEvent.type(screen.getByTestId('question-textarea'), 'Kept?');
+    await userEvent.keyboard('{Enter}');
+    // An API key turned out to be needed: nothing is sent, the question stays.
+    rerender(<Composer {...props} sendHeld={false} sendQueueable={false} disabled />);
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByTestId('question-textarea')).toHaveValue('Kept?');
+    rerender(<Composer {...props} sendHeld={false} sendQueueable={false} />);
+    expect(props.onSubmit).not.toHaveBeenCalled(); // the dropped queue doesn't come back
+
+    // Held while another conversation's answer streams: Enter does nothing, later too.
+    rerender(<Composer {...props} sendHeld sendQueueable={false} />);
+    await userEvent.keyboard('{Enter}');
+    rerender(<Composer {...props} sendHeld={false} sendQueueable={false} />);
+    expect(props.onSubmit).not.toHaveBeenCalled();
+  });
+
   it('inserts a newline instead of submitting on Shift+Enter', async () => {
     const props = baseProps();
     render(<Composer {...props} />);

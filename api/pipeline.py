@@ -60,7 +60,12 @@ from api.llm import reset_finish_reason, stopped_at_token_limit
 from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
-from api.reranking import RerankedChunk, Reranker, rerank_candidates_detailed
+from api.reranking import (
+    RerankedChunk,
+    Reranker,
+    RerankOutcome,
+    rerank_candidates_detailed,
+)
 from api.retrieval import (
     QueryEmbeddingProvider,
     RetrievalConfigError,
@@ -78,6 +83,7 @@ from api.tracing import (
     TraceStatus,
     build_trace_candidates,
 )
+from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +126,9 @@ class RetrievalPhase:
     rerank_wait_ms: float = 0.0
     diversity_dropped_ids: frozenset[str] = frozenset()
     query_variants: list[str] = field(default_factory=list)
+    # Search only: nothing cleared rerank_min_score, so context_chunks are the closest
+    # passages instead (see _retrieve_and_rerank).
+    below_min_score: bool = False
 
 
 class SourcesEvent(TypedDict):
@@ -368,6 +377,7 @@ class RagPipeline:
             condensed_question=condensed_question,
             history_message_count=history_message_count,
             request_id=current_request_id(),
+            workspace=workspace_of(self._settings),
         )
 
     def _finished_trace(
@@ -419,6 +429,7 @@ class RagPipeline:
             query_variants=phase.query_variants,
             citation_retry_used=citation_retry_used,
             request_id=current_request_id(),
+            workspace=workspace_of(self._settings),
         )
 
     def _truncate_history(
@@ -587,6 +598,24 @@ class RagPipeline:
         diverse_outcome, diversity_dropped = select_diverse(
             outcome, effective_settings, drop_neighbours=for_generation
         )
+        # A search (no answer) where nothing clears rerank_min_score shows the closest
+        # passages anyway, flagged. The bar is set for grounding an answer; the
+        # cross-encoder scores a bare keyword low against a passage that has it
+        # ("laptop": 0.11 for the IT equipment policy, which it ranks first), so a
+        # one-word search came back empty while three documents held the word. An
+        # answer never uses passages below the bar.
+        below_min_score = False
+        if not for_generation and not diverse_outcome.kept and outcome.scored:
+            unfloored = effective_settings.model_copy(update={"rerank_min_score": 0.0})
+            diverse_outcome, diversity_dropped = select_diverse(
+                RerankOutcome(
+                    scored=outcome.scored,
+                    kept=outcome.scored[: int(effective_settings.rerank_top_k)],
+                ),
+                unfloored,
+                drop_neighbours=False,
+            )
+            below_min_score = bool(diverse_outcome.kept)
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
@@ -621,6 +650,7 @@ class RagPipeline:
             context_expansion_ms=context_expansion_ms,
             diversity_dropped_ids=frozenset(diversity_dropped),
             query_variants=variants,
+            below_min_score=below_min_score,
         )
 
     def retrieve(
@@ -753,24 +783,13 @@ class RagPipeline:
                     yield {"type": "followups", "questions": list(hit.followups)}
                 return
         done: DoneEvent | None = None
-        followups: list[str] = []
         events = self._answer_stream_uncached(
             question, overrides, filenames, history, tags, should_stop
         )
-        try:
-            for event in events:
-                if event["type"] == "done":
-                    done = event
-                elif event["type"] == "followups":
-                    followups = event["questions"]
-                yield event
-        finally:
-            # Closing this generator (the client left) must close the inner one now: its
-            # `finally` records the "closed early" trace. Left to garbage collection, it
-            # ran whenever the inner generator was freed — never, while anything (a
-            # tracer, a traceback) still held it.
-            events.close()
-        if key is not None and done is not None and self._answer_cache is not None:
+
+        def store(followups: Sequence[str]) -> None:
+            if key is None or done is None or self._answer_cache is None:
+                return
             self._answer_cache.put(
                 key,
                 CachedAnswer(
@@ -783,6 +802,25 @@ class RagPipeline:
                     followups=tuple(followups),
                 ),
             )
+
+        try:
+            for event in events:
+                # Cached as soon as the answer is complete, before its frame goes out:
+                # follow-up questions are generated after it, and a client that leaves
+                # then (or as `done` arrives) closes this generator at the yield, so a
+                # store after the loop never ran. The follow-ups, if any come, are added.
+                if event["type"] == "done":
+                    done = event
+                    store(())
+                elif event["type"] == "followups":
+                    store(event["questions"])
+                yield event
+        finally:
+            # Closing this generator (the client left) must close the inner one now: its
+            # `finally` records the "closed early" trace. Left to garbage collection, it
+            # ran whenever the inner generator was freed — never, while anything (a
+            # tracer, a traceback) still held it.
+            events.close()
 
     def _answer_uncached(
         self,

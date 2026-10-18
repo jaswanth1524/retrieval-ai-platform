@@ -85,9 +85,27 @@ export function setWorkspace(name: string): void {
   writeStored(WORKSPACE_STORAGE_KEY, name || null);
 }
 
-function authHeaders(): Record<string, string> {
+// Told when a request sent with a workspace's header comes back 404 "No workspace named
+// …": that workspace was deleted elsewhere (another tab, the CLI). Given the workspace
+// the request was sent with, which needn't be the one in use by then.
+const WORKSPACE_MISSING_PREFIX = 'No workspace named';
+let workspaceMissingListener: ((workspace: string) => void) | null = null;
+
+export function onWorkspaceMissing(listener: ((workspace: string) => void) | null): void {
+  workspaceMissingListener = listener;
+}
+
+function noteWorkspaceMissing(sentWorkspace: string, status: number, detail: string): void {
+  if (status === 404 && sentWorkspace && detail.startsWith(WORKSPACE_MISSING_PREFIX)) {
+    workspaceMissingListener?.(sentWorkspace);
+  }
+}
+
+/** `workspace`: the one to send instead of the one in use — an operation started in a
+ *  workspace keeps going to it after a switch ('' = the default, no header). */
+function authHeaders(workspace?: string): Record<string, string> {
   const key = getApiKey();
-  const workspace = getWorkspace();
+  workspace ??= getWorkspace();
   return {
     ...(key ? { 'X-API-Key': key } : {}),
     ...(workspace ? { 'X-Workspace': workspace } : {}),
@@ -103,10 +121,18 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 interface RequestOptions extends Omit<RequestInit, 'headers'> {
   timeoutMs?: number;
   headers?: Record<string, string>;
+  /** Sent instead of the workspace in use (see authHeaders). */
+  workspace?: string;
 }
 
 async function request<T>(path: string, options?: RequestOptions): Promise<T> {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, headers, ...init } = options ?? {};
+  const {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    signal: callerSignal,
+    headers,
+    workspace = getWorkspace(),
+    ...init
+  } = options ?? {};
   const timeoutController = new AbortController();
   const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
   // Let the caller's own signal (e.g. aborted on component unmount) cancel the
@@ -124,7 +150,7 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
     try {
       response = await fetch(`${BASE_URL}${path}`, {
         ...init,
-        headers: { ...authHeaders(), ...headers },
+        headers: { ...authHeaders(workspace), ...headers },
         signal: timeoutController.signal,
       });
     } catch (err) {
@@ -134,11 +160,9 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
       throw new ApiClientError(`API request failed: ${(err as Error).message}`);
     }
     if (!response.ok) {
-      throw new ApiClientError(
-        await extractErrorDetail(response),
-        response.status,
-        retryAfterSeconds(response),
-      );
+      const detail = await extractErrorDetail(response);
+      noteWorkspaceMissing(workspace, response.status, detail);
+      throw new ApiClientError(detail, response.status, retryAfterSeconds(response));
     }
     try {
       return (await response.json()) as T;
@@ -206,6 +230,7 @@ async function downloadBlob(
   path: string,
   signal?: AbortSignal,
 ): Promise<{ response: Response; blob: Blob }> {
+  const workspace = getWorkspace();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   const abortFromCaller = () => controller.abort();
@@ -215,7 +240,7 @@ async function downloadBlob(
     let response: Response;
     try {
       response = await fetch(`${BASE_URL}${path}`, {
-        headers: authHeaders(),
+        headers: authHeaders(workspace),
         signal: controller.signal,
       });
     } catch (err) {
@@ -223,7 +248,9 @@ async function downloadBlob(
       throw new ApiClientError(`API request failed: ${(err as Error).message}`);
     }
     if (!response.ok) {
-      throw new ApiClientError(await extractErrorDetail(response), response.status);
+      const detail = await extractErrorDetail(response);
+      noteWorkspaceMissing(workspace, response.status, detail);
+      throw new ApiClientError(detail, response.status);
     }
     try {
       return { response, blob: await response.blob() };
@@ -415,17 +442,21 @@ async function readSseStream(
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/health', { signal }),
 
-  config: (signal?: AbortSignal) => request<PublicConfigResponse>('/config', { signal }),
+  // Neither depends on a workspace, so neither names one: a remembered workspace deleted
+  // since would 404 /access (it resolves the request's workspace), which read as an
+  // older server and granted full access.
+  config: (signal?: AbortSignal) =>
+    request<PublicConfigResponse>('/config', { signal, workspace: '' }),
 
   // Which key this browser holds: "read" hides what the server would refuse (403).
-  access: (signal?: AbortSignal) => request<AccessResponse>('/access', { signal }),
+  access: (signal?: AbortSignal) => request<AccessResponse>('/access', { signal, workspace: '' }),
 
   // Recorded answer ratings, newest first (full key; 404 when feedback is off).
   listFeedback: (limit = 200, signal?: AbortSignal) =>
     request<FeedbackListResponse>(`/feedback?limit=${limit}`, { signal }),
 
   // Restores a backup zip from exportCorpus: each document is re-indexed as a job.
-  importBackup: (file: File, signal?: AbortSignal) => {
+  importBackup: (file: File, signal?: AbortSignal, workspace?: string) => {
     const form = new FormData();
     form.append('file', file);
     return request<ImportResponse>('/import', {
@@ -435,6 +466,7 @@ export const api = {
       // document, and a fixed two minutes failed big restores on a slow link.
       timeoutMs: uploadTimeoutMs(file.size),
       signal,
+      workspace,
     });
   },
 
@@ -443,10 +475,12 @@ export const api = {
   getDocumentOriginal: async (filename: string, signal?: AbortSignal): Promise<Blob> =>
     (await downloadBlob(`/documents/${encodeURIComponent(filename)}/original`, signal)).blob,
 
-  listDocuments: (signal?: AbortSignal) =>
-    request<DocumentListResponse>('/documents', { signal }),
+  // `workspace` on the corpus calls below: the workspace the operation was started in
+  // (see authHeaders); the one in use when absent.
+  listDocuments: (signal?: AbortSignal, workspace?: string) =>
+    request<DocumentListResponse>('/documents', { signal, workspace }),
 
-  uploadDocument: (file: File, signal?: AbortSignal) => {
+  uploadDocument: (file: File, signal?: AbortSignal, workspace?: string) => {
     const form = new FormData();
     // Do NOT set Content-Type manually — the browser sets the multipart boundary.
     form.append('file', file);
@@ -455,6 +489,7 @@ export const api = {
       body: form,
       timeoutMs: uploadTimeoutMs(file.size),
       signal,
+      workspace,
     });
   },
 
@@ -475,42 +510,49 @@ export const api = {
 
   // The server fetches the URL's document and indexes it like an upload (URL_INGEST_ENABLED);
   // poll the job the same way. 400 names why a URL can't be fetched.
-  uploadFromUrl: (url: string, signal?: AbortSignal) =>
+  // The server answers once it has fetched the document (up to URL_INGEST_TIMEOUT_SECONDS,
+  // 30 s by default): the 15 s default reported a fetch still running as failed.
+  uploadFromUrl: (url: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobAcceptedResponse>('/documents/from-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
+      workspace,
     }),
 
   // Re-chunks and re-embeds a document from its stored original; poll the job like an
   // upload's. 409 when the server keeps no originals, 404 when this one has none.
-  reindexDocument: (filename: string, signal?: AbortSignal) =>
+  reindexDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobAcceptedResponse>(`/documents/${encodeURIComponent(filename)}/reindex`, {
       method: 'POST',
       signal,
+      workspace,
     }),
 
   // Stops an ingest job that is still queued or hasn't written to the index yet (409 once
   // it has: point ids are deterministic, so a half-written document can't be rolled
   // back). The job then ends `failed` with `cancelled: true`; keep polling to see it.
-  cancelDocumentJob: (jobId: string, signal?: AbortSignal) =>
+  cancelDocumentJob: (jobId: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobStatusResponse>(`/documents/jobs/${encodeURIComponent(jobId)}`, {
       method: 'DELETE',
       signal,
+      workspace,
     }),
 
   // Re-indexes every document chunked by an older chunker that has a stored original.
-  reindexStaleDocuments: (signal?: AbortSignal) =>
-    request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal }),
+  reindexStaleDocuments: (signal?: AbortSignal, workspace?: string) =>
+    request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal, workspace }),
 
   // Replaces a document's tags (an empty list clears them). Payload-only on the server.
-  setDocumentTags: (filename: string, tags: string[], signal?: AbortSignal) =>
+  setDocumentTags: (filename: string, tags: string[], signal?: AbortSignal, workspace?: string) =>
     request<DocumentTagsResponse>(`/documents/${encodeURIComponent(filename)}/tags`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags }),
       signal,
+      workspace,
     }),
 
   // The whole-corpus backup zip (manifest, stored originals, feedback). Needs the full
@@ -522,10 +564,11 @@ export const api = {
     return { blob, filename };
   },
 
-  deleteDocument: (filename: string, signal?: AbortSignal) =>
+  deleteDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
       method: 'DELETE',
       signal,
+      workspace,
     }),
 
   // Reconstructs a document from its stored chunks (ordinal order) for the source
@@ -581,6 +624,7 @@ export const api = {
     jobId: string,
     onProgress?: (status: DocumentJobStatusResponse) => void,
     signal?: AbortSignal,
+    workspace?: string,
   ): Promise<DocumentJobStatusResponse> => {
     let intervalMs = JOB_POLL_INITIAL_MS;
     let lastProgress = '';
@@ -590,6 +634,7 @@ export const api = {
       try {
         status = await request<DocumentJobStatusResponse>(`/documents/jobs/${encodeURIComponent(jobId)}`, {
           signal,
+          workspace,
         });
         transientFailures = 0;
       } catch (err) {
@@ -654,6 +699,7 @@ export const api = {
     // An already-aborted signal never fires 'abort', so the question was sent anyway.
     if (signal?.aborted) timeoutController.abort();
     let sawDone = false;
+    const workspace = getWorkspace();
 
     try {
       let response: Response;
@@ -661,7 +707,7 @@ export const api = {
         const task = options?.task;
         response = await fetch(`${BASE_URL}${task ? '/questions/summary/stream' : '/questions/stream'}`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          headers: { 'Content-Type': 'application/json', ...authHeaders(workspace) },
           body: JSON.stringify(
             task
               ? summaryRequestBody(task, llmProvider, overrides, options)
@@ -677,11 +723,9 @@ export const api = {
       }
 
       if (!response.ok) {
-        throw new ApiClientError(
-      await extractErrorDetail(response),
-      response.status,
-      retryAfterSeconds(response),
-    );
+        const detail = await extractErrorDetail(response);
+        noteWorkspaceMissing(workspace, response.status, detail);
+        throw new ApiClientError(detail, response.status, retryAfterSeconds(response));
       }
 
       // Body reading needs the same error translation the fetch above already has.

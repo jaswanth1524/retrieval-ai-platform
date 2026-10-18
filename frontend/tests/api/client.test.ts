@@ -5,6 +5,7 @@ import {
   apiErrorMessage,
   extractErrorDetail,
   getWorkspace,
+  onWorkspaceMissing,
   setWorkspace,
   uploadTimeoutMs,
 } from '../../src/api/client';
@@ -971,5 +972,98 @@ describe('workspace header', () => {
     localStorage.setItem('docrag-workspace', 'research');
     expect(getWorkspace()).toBe('legal');
     expect(localStorage.getItem('docrag-workspace')).toBe('research');
+  });
+});
+
+describe('workspace an operation started in', () => {
+  afterEach(() => {
+    setWorkspace('');
+    onWorkspaceMissing(null);
+  });
+  const headers = (mock: { mock: { calls: unknown[][] } }, call: number) =>
+    (mock.mock.calls[call][1] as RequestInit).headers as Record<string, string>;
+
+  it('is sent instead of the one in use, the default (no header) included', async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      // Also a finished job, for the poll.
+      Promise.resolve(jsonResponse(200, { filename: 'a.txt', state: 'done' })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Started in the default workspace; another is in use by the time it is sent.
+    setWorkspace('legal');
+    await api.deleteDocument('a.txt', undefined, '');
+    await api.setDocumentTags('a.txt', ['x'], undefined, '');
+    setWorkspace('');
+    await api.reindexDocument('a.txt', undefined, 'legal');
+    await api.pollDocumentJob('job-1', undefined, undefined, 'legal');
+
+    expect(headers(fetchMock, 0)['X-Workspace']).toBeUndefined();
+    expect(headers(fetchMock, 1)['X-Workspace']).toBeUndefined();
+    expect(headers(fetchMock, 2)['X-Workspace']).toBe('legal');
+    expect(headers(fetchMock, 3)['X-Workspace']).toBe('legal');
+  });
+
+  it('is never sent with /config or /access, which a deleted workspace would 404', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(200, { access: 'full' })));
+    vi.stubGlobal('fetch', fetchMock);
+    setWorkspace('legal');
+
+    await api.config();
+    await api.access();
+
+    expect(headers(fetchMock, 0)['X-Workspace']).toBeUndefined();
+    expect(headers(fetchMock, 1)['X-Workspace']).toBeUndefined();
+  });
+
+  it('is reported when the server no longer has it, naming the workspace the request went to', async () => {
+    const missing = vi.fn();
+    onWorkspaceMissing(missing);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(() =>
+        Promise.resolve(jsonResponse(404, { detail: "No workspace named 'legal'." })),
+      ),
+    );
+    setWorkspace('');
+
+    await expect(api.listDocuments(undefined, 'legal')).rejects.toMatchObject({ statusCode: 404 });
+    expect(missing).toHaveBeenCalledWith('legal');
+
+    // A plain 404 (a document that isn't there) is not that.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(404, { detail: 'No such document.' }))),
+    );
+    setWorkspace('legal');
+    await expect(api.deleteDocument('a.txt')).rejects.toMatchObject({ statusCode: 404 });
+    expect(missing).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('uploadFromUrl', () => {
+  it('waits longer than the server may take to fetch the document', async () => {
+    vi.useFakeTimers();
+    let aborted = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }),
+      ),
+    );
+
+    const promise = api.uploadFromUrl('https://example.com/a.pdf');
+    promise.catch(() => {});
+    // URL_INGEST_TIMEOUT_SECONDS is 30 by default; the old 15 s budget gave up first.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(aborted).toBe(true);
+    vi.useRealTimers();
   });
 });

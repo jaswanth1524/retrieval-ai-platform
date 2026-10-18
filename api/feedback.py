@@ -24,11 +24,15 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Literal
+from typing import Literal, get_args
 
 from api.sqlite_store import enable_wal, sqlite_transaction
 
 FeedbackRating = Literal["up", "down"]
+# What was rated: an answer to a question, a suggested follow-up question, or a summary
+# or comparison. Only "question" ratings label retrieval (eval/feedback_dataset.py).
+FeedbackKind = Literal["question", "follow_up", "summary"]
+FEEDBACK_KINDS: tuple[str, ...] = get_args(FeedbackKind)
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,7 @@ class Feedback:
     # backup's rows: a backup holds one workspace, and its rows join the workspace
     # it is restored into.
     workspace: str = ""
+    kind: FeedbackKind = "question"
 
 
 # Where a page of rows_oldest_first ended: (created_at, rowid) of its last row.
@@ -68,6 +73,7 @@ _CREATE_TABLE = """
         citation_source_number INTEGER,
         created_at REAL NOT NULL,
         workspace TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT 'question',
         PRIMARY KEY (workspace, id)
     )
 """
@@ -99,6 +105,15 @@ def _migrate_to_workspace_key(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE feedback_migrated RENAME TO feedback")
 
 
+def _add_kind_column(conn: sqlite3.Connection) -> None:
+    """Add ``kind`` to a table from before it was recorded, in place: every rating
+    then was of an answer to a question."""
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+    if "kind" not in columns:
+        conn.execute("ALTER TABLE feedback ADD COLUMN kind TEXT NOT NULL DEFAULT 'question'")
+
+
 class FeedbackStore:
     """Sqlite-backed feedback store.
 
@@ -118,6 +133,7 @@ class FeedbackStore:
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE.format(name="feedback"))
             _migrate_to_workspace_key(conn)
+            _add_kind_column(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS feedback_created_at ON feedback (created_at)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS feedback_workspace_created_at "
@@ -127,22 +143,29 @@ class FeedbackStore:
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_transaction(self._path)
 
-    def _trim(self, conn: sqlite3.Connection) -> None:
-        """Keep the newest ``max_rows`` by when they were given, not by insert order:
-        rows restored from a backup are inserted last but can be the oldest."""
+    def _trim(self, conn: sqlite3.Connection, workspace: str) -> None:
+        """Keep ``workspace``'s newest ``max_rows`` by when they were given, not by
+        insert order: rows restored from a backup are inserted last but can be the
+        oldest.
+
+        Per workspace: across all of them, a busy workspace's ratings pushed out a quiet
+        one's (and a restore into one workspace could empty another).
+        """
 
         if self._max_rows is None:
             return
         # Counted first: the old NOT IN subquery ordered the whole table on every insert,
         # even when (as nearly always) nothing was over the cap.
-        (count,) = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM feedback WHERE workspace = ?", (workspace,)
+        ).fetchone()
         excess = count - self._max_rows
         if excess <= 0:
             return
         conn.execute(
             "DELETE FROM feedback WHERE rowid IN (SELECT rowid FROM feedback "
-            "ORDER BY created_at ASC, rowid ASC LIMIT ?)",
-            (excess,),
+            "WHERE workspace = ? ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+            (workspace, excess),
         )
 
     def add(
@@ -155,6 +178,7 @@ class FeedbackStore:
         rating: FeedbackRating,
         citation_source_number: int | None,
         workspace: str = "",
+        kind: FeedbackKind = "question",
     ) -> Feedback:
         feedback = Feedback(
             id=str(uuid.uuid4()),
@@ -165,12 +189,13 @@ class FeedbackStore:
             rating=rating,
             citation_source_number=citation_source_number,
             workspace=workspace,
+            kind=kind,
         )
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO feedback (id, trace_id, question, answer_excerpt, "
-                "cited_filenames_json, rating, citation_source_number, created_at, workspace) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "cited_filenames_json, rating, citation_source_number, created_at, workspace, "
+                "kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feedback.id,
                     feedback.trace_id,
@@ -181,9 +206,10 @@ class FeedbackStore:
                     feedback.citation_source_number,
                     feedback.created_at,
                     feedback.workspace,
+                    feedback.kind,
                 ),
             )
-            self._trim(conn)
+            self._trim(conn, feedback.workspace)
         return feedback
 
     def import_rows(self, rows: Sequence[Feedback], workspace: str = "") -> int:
@@ -197,7 +223,7 @@ class FeedbackStore:
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO feedback (id, trace_id, question, answer_excerpt, "
                     "cited_filenames_json, rating, citation_source_number, created_at, "
-                    "workspace) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "workspace, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row.id,
                         row.trace_id,
@@ -208,10 +234,11 @@ class FeedbackStore:
                         row.citation_source_number,
                         row.created_at,
                         workspace,
+                        row.kind,
                     ),
                 )
                 added += cursor.rowcount
-            self._trim(conn)
+            self._trim(conn, workspace)
         return added
 
     def rows_oldest_first(
@@ -229,7 +256,7 @@ class FeedbackStore:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT rowid, id, trace_id, question, answer_excerpt, cited_filenames_json, "
-                "rating, citation_source_number, created_at, workspace FROM feedback "
+                "rating, citation_source_number, created_at, workspace, kind FROM feedback "
                 f"WHERE (created_at > ? OR (created_at = ? AND rowid > ?)){scope} "
                 "ORDER BY created_at ASC, rowid ASC LIMIT ?",
                 (created_at, created_at, rowid, *params, limit),
@@ -245,6 +272,7 @@ class FeedbackStore:
                 citation_source_number=row[7],
                 created_at=row[8],
                 workspace=row[9],
+                kind=_kind(row[10]),
             )
             for row in rows
         ]
@@ -260,7 +288,7 @@ class FeedbackStore:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, trace_id, question, answer_excerpt, cited_filenames_json, "
-                f"rating, citation_source_number, created_at, workspace FROM feedback {where}"
+                f"rating, citation_source_number, created_at, workspace, kind FROM feedback {where}"
                 "ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
@@ -275,9 +303,21 @@ class FeedbackStore:
                 citation_source_number=row[6],
                 created_at=row[7],
                 workspace=row[8],
+                kind=_kind(row[9]),
             )
             for row in rows
         ]
+
+
+def _kind(value: object) -> FeedbackKind:
+    """A stored kind, read back; anything unrecognized (written by a newer version) as
+    "question", the meaning every row had before kinds existed."""
+
+    if value == "follow_up":
+        return "follow_up"
+    if value == "summary":
+        return "summary"
+    return "question"
 
 
 def _workspace_filter(workspace: str | None) -> tuple[str, tuple[str, ...]]:

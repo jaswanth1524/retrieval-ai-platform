@@ -76,6 +76,12 @@ def test_questions_search_and_writes_are_refused_with_the_way_out(
         client.post("/documents/guide.txt/reindex"),
         client.post("/documents/reindex"),
         client.post("/documents", files={"file": ("other.txt", b"Intro\ngamma", "text/plain")}),
+        # Summaries read stored text, not vectors, but follow the same rule (owner's
+        # decision): a mismatched index is rebuilt before it answers anything.
+        client.post("/questions/summary", json={"mode": "summarize", "filenames": ["guide.txt"]}),
+        client.post(
+            "/questions/summary/stream", json={"mode": "summarize", "filenames": ["guide.txt"]}
+        ),
     ):
         assert response.status_code == 409
         assert RECOVERY in response.json()["detail"]

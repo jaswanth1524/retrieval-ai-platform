@@ -19,6 +19,7 @@ import {
   applyDeleteHeldDuringStream,
   byRecentUse,
   capConversations,
+  cleanFollowups,
   conversationWorkspace,
   deriveTitle,
   emptyConversation,
@@ -184,8 +185,9 @@ export interface UseChatResult {
    *  (when ``indexedTags`` is given), from every conversation's scope. */
   pruneScopes: (indexedFilenames: string[], indexedTags?: string[]) => void;
   /** Drop just these filenames from every conversation's scope. Unlike pruneScopes it
-   *  needs no snapshot of the whole corpus, which can be stale by the time it runs. */
-  removeFromScopes: (filenames: string[]) => void;
+   *  needs no snapshot of the whole corpus, which can be stale by the time it runs.
+   *  `workspace`: the one they were deleted from (the one in use when absent). */
+  removeFromScopes: (filenames: string[], workspace?: string) => void;
   ask: (
     question: string,
     provider?: LlmProvider,
@@ -233,6 +235,11 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
 }
 
 const NO_TURNS: ChatTurn[] = [];
+
+interface TrailingStream {
+  conversationId: string | null;
+  controller: AbortController;
+}
 
 // How long IndexedDB writes are held back so a burst of changes is written once.
 const CHAT_STORE_SAVE_DELAY_MS = 300;
@@ -477,10 +484,14 @@ export function useChat(): UseChatResult {
   // Tracks the in-flight question's controller: doubles as a reentrancy guard and lets
   // unmount cancel a hung request.
   const inflightRef = useRef<AbortController | null>(null);
+  // Answered streams still open for their suggested follow-ups (see runAsk's finish).
+  const trailingRef = useRef(new Set<TrailingStream>());
 
   useEffect(() => {
+    const trailing = trailingRef.current;
     return () => {
       inflightRef.current?.abort();
+      trailing.forEach((stream) => stream.controller.abort());
     };
   }, []);
 
@@ -539,6 +550,7 @@ export function useChat(): UseChatResult {
     const startedAt = Date.now();
     const updateTurns = (update: (turns: ChatTurn[]) => ChatTurn[], touch = true) =>
       setConversationTurns(conversationId, update, touch);
+    let trailing: TrailingStream | null = null;
 
     const task = options?.task;
     // The first question binds the conversation to the workspace it was asked in
@@ -568,6 +580,9 @@ export function useChat(): UseChatResult {
         if (!existing) {
           const created: ChatTurn = { ...makeTurn('assistant', ''), id: assistantTurnId };
           if (options?.modelLabel) created.model = options.modelLabel;
+          // Asked with the conversation as history: rated as a follow-up (feedback kind).
+          // A summary sends none.
+          if (!task && history.length > 0) created.followUp = true;
           return [...prev, update(created)];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
@@ -589,6 +604,32 @@ export function useChat(): UseChatResult {
       bufferedDeltaRef.current = '';
       updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false);
     };
+
+    // The answer is finished at `done`, though the stream stays open for the suggested
+    // follow-ups the server works out after it: until then the answer read as still
+    // streaming (no Regenerate or rating, Stop on screen, no "Answer ready") and the next
+    // question waited for suggestions nobody had asked for yet. Run once — at `done`, or
+    // when the stream ends without one — so a question asked in between keeps its state.
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      flushDelta();
+      streamingTurnIdRef.current = null;
+      streamingConversationIdRef.current = null;
+      setStreamingConversationId(null);
+      if (inflightRef.current === controller) inflightRef.current = null;
+      if (conversationId) {
+        setStorage((prev) => applyDeleteHeldDuringStream(prev, conversationId, startedAt));
+      }
+      setPending(false);
+      setStage(null);
+    };
+    // A newer question in this conversation makes these suggestions moot (only the last
+    // answer shows its own): stop waiting for them, freeing the server's question slot.
+    trailingRef.current.forEach((trailing) => {
+      if (trailing.conversationId === conversationId) trailing.controller.abort();
+    });
 
     try {
       await api.askQuestionStream(
@@ -612,7 +653,18 @@ export function useChat(): UseChatResult {
             if (frameId === null) frameId = requestAnimationFrame(flushDelta);
           },
           onFollowups: (questions) => {
-            if (questions.length > 0) updateAssistantTurn((turn) => ({ ...turn, followups: questions }));
+            const followups = cleanFollowups(questions);
+            if (followups.length === 0) return;
+            // Onto this answer by id, and never creating it: by now it may have been
+            // cleared or deleted, and other questions may have been asked since.
+            setConversationTurns(
+              conversationId,
+              (prev) =>
+                prev.some((turn) => turn.id === assistantTurnId)
+                  ? prev.map((turn) => (turn.id === assistantTurnId ? { ...turn, followups } : turn))
+                  : prev,
+              false,
+            );
           },
           onDone: (answer, sources, timings, traceId, cached, grounding) => {
             flushDelta();
@@ -633,6 +685,10 @@ export function useChat(): UseChatResult {
                 ? { coverage: grounding.coverage }
                 : {}),
             }));
+            finish();
+            // Still open for follow-ups; aborted on unmount or by a newer question here.
+            trailing = { conversationId, controller };
+            trailingRef.current.add(trailing);
           },
         },
         controller.signal,
@@ -668,16 +724,8 @@ export function useChat(): UseChatResult {
         ]);
       }
     } finally {
-      flushDelta();
-      streamingTurnIdRef.current = null;
-      streamingConversationIdRef.current = null;
-      setStreamingConversationId(null);
-      inflightRef.current = null;
-      if (conversationId) {
-        setStorage((prev) => applyDeleteHeldDuringStream(prev, conversationId, startedAt));
-      }
-      setPending(false);
-      setStage(null);
+      if (trailing) trailingRef.current.delete(trailing);
+      finish();
     }
     // Only refs and stable setters are closed over — see activeConversationRef above.
   }, [setConversationTurns]);
@@ -790,15 +838,17 @@ export function useChat(): UseChatResult {
   const keepInScopes = useCallback((
     keep: (filename: string) => boolean,
     keepTag: (tag: string) => boolean = () => true,
+    current = getWorkspace(),
   ) => {
-    // Only the conversations the current workspace's listing speaks for: another
-    // workspace's documents are simply not in it.
-    const current = getWorkspace();
+    // Only the conversations of the workspace the change was seen in: another
+    // workspace's documents are simply not in its listing.
     setStorage((prev) => {
       let changed = false;
       const conversations = prev.conversations.map((conversation) => {
         const bound = conversationWorkspace(conversation);
-        if (bound !== null && bound !== current) return conversation;
+        // One with no questions yet belongs to the workspace in use, so a delete that
+        // ends after a switch away from its workspace leaves it alone.
+        if (bound === null ? current !== getWorkspace() : bound !== current) return conversation;
         const filenames = conversation.scope?.filenames ?? [];
         const tags = conversation.scope?.tags ?? [];
         const kept = filenames.filter(keep);
@@ -831,9 +881,9 @@ export function useChat(): UseChatResult {
   );
 
   const removeFromScopes = useCallback(
-    (filenames: string[]) => {
+    (filenames: string[], workspace?: string) => {
       const removed = new Set(filenames);
-      keepInScopes((name) => !removed.has(name));
+      keepInScopes((name) => !removed.has(name), undefined, workspace);
     },
     [keepInScopes],
   );
