@@ -12,7 +12,9 @@ import {
   keepPassageText,
   mergeConversations,
   parseConversations,
+  conversationWorkspace,
   sanitizeConversation,
+  sanitizeTask,
   sanitizeTurn,
   searchConversations,
 } from '../../src/hooks/chatPersistence';
@@ -95,6 +97,19 @@ describe('mergeConversations across tabs', () => {
 });
 
 describe('sanitizeConversation', () => {
+  it('keeps a valid workspace name and drops anything else', () => {
+    const base = { id: 'c1', turns: [turn('q', 'user')] };
+    const legal = sanitizeConversation({ ...base, workspace: 'legal' })!;
+    expect(legal.workspace).toBe('legal');
+    expect(conversationWorkspace(legal)).toBe('legal');
+    for (const workspace of ['Legal', '../x', '', 7]) {
+      expect(sanitizeConversation({ ...base, workspace })!.workspace).toBeUndefined();
+    }
+    // No field means the default workspace; no questions means no workspace yet.
+    expect(conversationWorkspace(sanitizeConversation(base)!)).toBe('');
+    expect(conversationWorkspace(sanitizeConversation({ id: 'c2', turns: [], workspace: 'legal' })!)).toBeNull();
+  });
+
   it('drops what a hand-edited import could carry that crashes rendering', () => {
     // model: {} was rendered as a React child and a null source dereferenced: once
     // saved, the page crashed on every load.
@@ -302,3 +317,50 @@ describe('cited passages (spans)', () => {
   });
 });
 
+
+describe('document tasks (summaries)', () => {
+  it('keeps a task the server would accept and drops one it would refuse', () => {
+    expect(sanitizeTask({ mode: 'summarize', filenames: ['a.pdf'], instruction: 'risks' })).toEqual({
+      mode: 'summarize',
+      filenames: ['a.pdf'],
+      instruction: 'risks',
+    });
+    expect(sanitizeTask({ mode: 'compare', filenames: ['a.pdf', 'b.pdf'], instruction: '  ' })).toEqual({
+      mode: 'compare',
+      filenames: ['a.pdf', 'b.pdf'],
+    });
+    for (const bad of [
+      null,
+      'summarize',
+      { mode: 'outline', filenames: ['a.pdf'] },
+      { mode: 'summarize', filenames: ['a.pdf', 'b.pdf'] },
+      { mode: 'compare', filenames: ['a.pdf', 'a.pdf'] },
+      { mode: 'compare', filenames: ['a.pdf'] },
+      { mode: 'summarize', filenames: [7] },
+      { mode: 'summarize', filenames: [''] },
+    ]) {
+      expect(sanitizeTask(bad)).toBeNull();
+    }
+  });
+
+  it('round-trips a summary turn and its partial coverage, and drops bad values', () => {
+    const asked = { ...turn('q'), task: { mode: 'summarize' as const, filenames: ['a.pdf'] } };
+    expect(sanitizeTurn(asked)?.task).toEqual({ mode: 'summarize', filenames: ['a.pdf'] });
+    const answered = { ...turn('a', 'assistant'), coverage: { read: 40, total: 300 } };
+    expect(sanitizeTurn(answered)?.coverage).toEqual({ read: 40, total: 300 });
+    expect(sanitizeTurn({ ...answered, coverage: { read: 300, total: 300 } })).not.toHaveProperty('coverage');
+    expect(sanitizeTurn({ ...answered, coverage: { read: -1, total: 3 } })).not.toHaveProperty('coverage');
+    expect(sanitizeTurn({ ...asked, task: { mode: 'x' } })).not.toHaveProperty('task');
+  });
+
+  it('keeps suggested follow-ups that are strings, within the server caps', () => {
+    const answered = { ...turn('a', 'assistant'), followups: ['Next?', 3, 'x'.repeat(500), 'More?'] };
+    expect(sanitizeTurn(answered)?.followups).toEqual(['Next?', 'More?']);
+    expect(sanitizeTurn({ ...answered, followups: [1, 2] })).not.toHaveProperty('followups');
+    // Each suggestion is a button's React key: a repeat broke rendering (and the e2e
+    // console-error check); an empty one rendered as a blank button.
+    expect(
+      sanitizeTurn({ ...answered, followups: ['Next?', '', '   ', 'Next?', 'More?'] })?.followups,
+    ).toEqual(['Next?', 'More?']);
+  });
+});

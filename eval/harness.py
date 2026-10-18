@@ -44,6 +44,13 @@ from api.pipeline import RagPipeline
 from api.reranking import Reranker
 from api.retrieval import QueryEmbeddingProvider, embed_query, points_to_chunks
 from api.settings import AppSettings, get_settings
+from eval.feedback_dataset import (
+    FeedbackDataError,
+    build_dataset,
+    rows_from_export,
+    rows_from_store,
+    write_jsonl,
+)
 from eval.metrics import aggregate, baseline_shape_problems, compare_to_baseline, score_ranking
 
 DEFAULT_KS: tuple[int, ...] = (1, 3, 5, 8)
@@ -459,7 +466,83 @@ def build_parser() -> argparse.ArgumentParser:
     answer = sub.add_parser("answer", help="Generate answers for RAGAS scoring.")
     answer.add_argument("dataset", type=Path, help="Path to .json or .jsonl labeled dataset.")
     answer.add_argument("--output", type=Path, required=True, help="Answers JSON output path.")
+
+    feedback = sub.add_parser(
+        "from-feedback",
+        help="Draft a labeled dataset from answer ratings (no Qdrant).",
+    )
+    source = feedback.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--store", type=Path, help="The feedback sqlite file (FEEDBACK_STORE_PATH)."
+    )
+    source.add_argument("--export", type=Path, help="A GET /export zip (its feedback.jsonl).")
+    feedback.add_argument(
+        "--output", type=Path, required=True, help="Labeled .jsonl from thumbs-up ratings."
+    )
+    feedback.add_argument(
+        "--review", type=Path, help="Optional .jsonl of thumbs-down questions to label by hand."
+    )
+    scope = feedback.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--workspace",
+        default=None,
+        help="With --store: only this workspace's ratings (default: the default workspace, "
+        "''). An export holds one workspace already.",
+    )
+    scope.add_argument(
+        "--all-workspaces",
+        action="store_true",
+        help="With --store: every workspace's ratings in one dataset.",
+    )
     return parser
+
+
+def dataset_from_feedback(args: argparse.Namespace) -> int:
+    """``from-feedback``: write the draft dataset, then validate it like ``validate``."""
+
+    if args.export and (args.workspace is not None or args.all_workspaces):
+        # Silently ignored, it would read as "this workspace's ratings" when the
+        # dataset holds whichever workspace the backup was taken from.
+        print(
+            "error: --workspace/--all-workspaces apply to --store only; an export holds the "
+            "one workspace it was taken from",
+            file=sys.stderr,
+        )
+        return 2
+    # One corpus per dataset: the default workspace unless another (or all) is asked for.
+    # Reading every workspace by default mixed labels from corpora the dataset is never
+    # run against together.
+    workspace = None if args.all_workspaces else (args.workspace or "")
+    try:
+        rows = (
+            rows_from_store(args.store, workspace) if args.store else rows_from_export(args.export)
+        )
+        dataset = build_dataset(rows)
+    except FeedbackDataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"read {dataset.ratings_read} ratings: {len(dataset.examples)} labeled examples, "
+        f"{len(dataset.review) - dataset.not_questions} rated-down questions to review "
+        f"(skipped {dataset.citation_ratings} citation ratings, "
+        f"{dataset.uncited} thumbs-up answers that cited nothing; "
+        f"{dataset.not_questions} summary or follow-up ratings went to the review only)"
+    )
+    if args.review is not None:
+        write_jsonl(args.review, dataset.review)
+        print(f"wrote {len(dataset.review)} questions to review to {args.review}")
+    if not dataset.examples:
+        print("error: no thumbs-up answer with citations to label from", file=sys.stderr)
+        return 2
+    write_jsonl(args.output, dataset.examples)
+    # The same check `validate` runs, so the file is known to load in `retrieval`.
+    try:
+        examples = load_retrieval_dataset(args.output)
+    except HarnessDataError as exc:  # pragma: no cover - build_dataset writes valid rows
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"wrote {len(examples)} examples to {args.output}: OK")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -470,6 +553,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "ingest":
         return ingest_directory(args.directory, get_settings())
+    if args.command == "from-feedback":
+        return dataset_from_feedback(args)
 
     try:
         examples = load_retrieval_dataset(args.dataset)

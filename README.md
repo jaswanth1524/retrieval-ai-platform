@@ -8,6 +8,13 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Token-aware chunking**: chunks are sized by the dense model's real subword tokens (not word counts) and split on sentence boundaries — table rows are never split, and a table chunk names the rows it holds — so an embedded chunk never silently overflows the model's 512-token limit. A passage that runs onto the next page is cited with both pages (`p.3–4`), and chunk ids depend on the content, not the position, so citations survive a re-index of an edited document. Each upload is parsed in its own process, stopped after `PARSE_TIMEOUT_SECONDS`.
 - **Broad format support**: PDF (with table extraction and optional OCR for scanned pages), DOCX, HTML (text the page hides — `hidden`, `aria-hidden`, inline `display:none` — is not indexed), CSV, TXT, Markdown, EPUB (chapters in reading order; the chapter number is the cited page), email `.eml` files (headers and body; attachments are not indexed), Excel `.xlsx` (each sheet is a page, its rows cited by spreadsheet row number; cells hold their last computed values) and PowerPoint `.pptx` (each slide is a page titled by its slide title, with tables and speaker notes). OCR is an optional extra (`uv sync --extra ocr`). `GET /config` lists the accepted types (`supported_extensions`), and the UI follows it.
 - **Grounded, cited answers**: every answer is generated only from retrieved context and cites filename, page, section, and chunk ID — streamed token-by-token over SSE or returned in full. An answer that comes back without citations is retried once with a stricter reminder. Each answer also reports `answer_status` — `answered`, `uncited` (it answered but cited none of its sources, even after the retry), `insufficient_context` (the model said the documents don't cover it and cited nothing) or `no_context` (nothing cleared the rerank bar) — the best `top_rerank_score`, and `truncated` when the model stopped at its token limit; the UI marks those answers ("not in your documents", "no sources cited", "cut off"). Citation markers (`[2]`, `[1, 2]`, `[1-3]`) in the answer text are buttons that open the cited passage. Each cited source also says which part of its chunk the answer rests on (`spans`: the quoted sentence or two, matched from the answer without any model call), and the viewer marks it.
+- **Whole-document summaries and comparisons**: a question sees the top few retrieved passages, so "summarize this document" got whatever ranked highest. `POST /questions/summary` (and `/stream`) reads every passage of one document (`"mode": "summarize"`) or two (`"mode": "compare"`), in order, optionally with a focus (`"instruction": "deadlines"`): a document that fits one prompt is answered in one call, a longer one is turned into cited notes part by part and the notes combined. Citations are the usual filename/page/section/chunk_id, checked and retried like an answer's. At most `SUMMARY_MAX_BATCHES` parts are read (each is one LLM call); a longer document is read at evenly spaced passages and the answer says how many it read (`chunks_read` of `chunks_total`). In the UI: ∑ on a document's card, Compare when two are selected, or the ⌘K palette for a scoped document; Retry and Regenerate repeat the summary.
+- **Suggested follow-ups** (opt-in): with `FOLLOWUPS_ENABLED`, an answer that cited its sources gets up to `FOLLOWUP_COUNT` short questions those passages can answer, shown as one-click questions under the latest answer (`followups` on `/questions`, a `followups` frame after `done` on the stream). One extra LLM call per answer, so off by default.
+- **Workspaces** (opt-in, `WORKSPACES_ENABLED`): separate corpora on one server — each its own Qdrant collection and originals folder — picked per request with the `X-Workspace` header (the corpus panel's workspace menu, `--workspace` on the CLI). Without the header nothing changes. In the UI a conversation stays with the workspace it was asked in: opening it switches back there. Answer feedback, backups and restores are per workspace too. Only an empty workspace can be deleted. Not access control: every key can use every workspace.
+- **Index from a URL** (opt-in, `URL_INGEST_ENABLED`): `POST /documents/from-url` (the corpus panel's URL field, `add-url` on the CLI) has the server fetch a page or file and index it like an upload. Only public addresses are fetched unless `URL_INGEST_ALLOW_PRIVATE` is set; the connection goes to the exact address that was checked (so DNS can't swap in an internal one), redirects are re-checked hop by hop, and `MAX_UPLOAD_BYTES` caps the download.
+- **Watched folder** (opt-in, `WATCH_DIR`): new and changed files in a folder are indexed on their own every `WATCH_INTERVAL_SECONDS`, into the default workspace or `WATCH_WORKSPACE`; `WATCH_DELETE_MISSING` also removes the documents of files deleted from it (only ones the watcher saw there).
+- **Command line and MCP**: `docrag` (`uv tool install ./cli`, or `python -m cli` in the repository) ingests folders, asks, searches, summarizes, exports and restores over the REST API; `docrag-mcp` (`./cli[mcp]`, or `python -m cli.mcp_server`) offers search, cited answers, summaries and document reading as tools to MCP clients such as Claude Desktop. See [Command line and MCP](#command-line-and-mcp).
+- **Multilingual documents**: an opt-in profile swaps in a multilingual embedding model and BM25 stemming for the corpus's language; the reranker is multilingual already. See [Multilingual documents](#multilingual-documents).
 - **Search without an answer**: `POST /search` returns the ranked passages for a query — the same hybrid search, RRF and rerank a question uses, with no LLM call — so finding things in your documents works even when the LLM is down. The UI has it as the Search panel in the left rail (and in the ⌘K palette), scoped like a question.
 - **Multi-query expansion** (opt-in): rewrite the query into several phrasings, retrieve each, and RRF-fuse before reranking — off by default (`QUERY_EXPANSION_ENABLED`).
 - **Conversation memory**: the client sends recent chat turns with each question; when history is present, one extra LLM call rewrites a follow-up ("what about the second one?") into a standalone retrieval query before hybrid search runs. The server itself stores no session state.
@@ -26,7 +33,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Feedback review**: with `FEEDBACK_ENABLED`, a Feedback panel lists answer ratings (filter to thumbs-down) and opens a rated answer's trace.
 - **Security headers**: the UI is served with a strict Content-Security-Policy and may not be framed; every response carries `nosniff` and `no-referrer`. Text in a document imitating a prompt source header (`[2] filename=…`) is rewritten, without its number, before it reaches the model. See [SECURITY.md](SECURITY.md).
 - **Observability**: configurable application logging (`LOG_LEVEL`; `LOG_FORMAT=json` for one JSON object per line, with one access line per request carrying its id), an `X-Request-ID` on every response that also appears in every log line and in the request's trace, `GET /metrics` (Prometheus: stage latencies, answers by grounding status, truncated answers, citation retries, feedback ratings, LLM tokens reported by the provider, questions running, the indexing backlog, document count, build version), `GET /health` (liveness, with the running version), `GET /health/ready` (readiness — probes Qdrant and the generation provider).
-- **Provider flexibility**: local Ollama by default; any self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio — `LLM_PROVIDER=openai_compatible`) or OpenAI itself are user-selectable alternatives for generation only — embeddings always stay local. Provider errors reach clients as a short reason, never the provider's raw message.
+- **Provider flexibility**: local Ollama by default; any self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio — `LLM_PROVIDER=openai_compatible`), OpenAI, or Anthropic's Claude (`LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY`; `ANTHROPIC_MODEL`, default `claude-sonnet-5-5`) are user-selectable alternatives for generation only — embeddings always stay local, and uploads and indexing never call a hosted API. Provider errors reach clients as a short reason, never the provider's raw message.
 
 ## Stack
 
@@ -90,6 +97,7 @@ Qdrant server-side hybrid query is used where available (with `QDRANT_PREFER_GRP
 ├── pyproject.toml
 ├── api/            # FastAPI backend
 ├── frontend/       # React + Vite + TypeScript UI
+├── cli/            # `python -m cli` and the MCP server, over the REST API
 ├── eval/           # retrieval harness, RAGAS runner, fixture corpus, datasets, baselines
 ├── tests/          # backend test suite (golden chunking and OpenAPI snapshots in tests/golden/)
 ├── docs/           # design notes
@@ -153,7 +161,7 @@ uv sync --extra dev            # install backend + test + lint + typecheck deps
 uv run pytest                  # run backend test suite
 uv run ruff check .            # lint
 uv run ruff format .           # format (CI checks it)
-uv run mypy api eval           # typecheck (strict mode)
+uv run mypy api eval cli         # typecheck (strict mode)
 make check                     # the backend and frontend gates CI runs, coverage floor and audits included (not e2e)
 make golden                    # regenerate the chunking and OpenAPI snapshots, then review the diff
 ```
@@ -173,7 +181,7 @@ npm run e2e:smoke              # @smoke specs only
 
 CI (`.github/workflows/ci.yml`) runs seven jobs on every push/PR (dependency-review on pull requests only, docker-ocr everywhere but pull requests), with a read-only token and superseded runs cancelled. It also runs weekly on `main` (Monday 05:23 UTC), so a new advisory against a pinned dependency or base image is noticed without a push, and can be started by hand from the Actions tab.
 
-- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → import the eval extra; then, on 3.12, ruff check → ruff format --check → mypy → validate the eval datasets → `pip-audit` of the runtime dependencies.
+- **backend** (Python 3.12 and 3.13): `uv sync --locked` (a lockfile that drifted from `pyproject.toml` fails) → pytest (with coverage on 3.12, which must stay at or above 92%; each test times out after 120 s; `tests/test_openapi_snapshot.py` names any breaking API change) → import the eval extra; then, on 3.12, ruff check → ruff format --check → mypy → validate the eval datasets → `pip-audit` of the runtime dependencies (core, the `ocr` extra and the CLI's `mcp` extra).
 - **qdrant**: the server-only tests (`tests/test_qdrant_server.py`: server-side hybrid query, IDF, payload indexes, tags) against a `qdrant/qdrant:v1.19.1` service container — they skip locally unless `DOCRAG_TEST_QDRANT_URL` is set — then the retrieval eval on the handbook set against its committed baseline (models cached between runs).
 - **frontend**: vitest → build → lint → type-check the tests → `npm audit --omit=dev`.
 - **dependency-review** (pull requests): fails on a newly added dependency with a known high-severity vulnerability. It needs the repository's Dependency graph (Settings → Code security); while that is off the job is skipped with a notice.
@@ -207,6 +215,10 @@ curl -fsS -H "$KEY" -H 'Content-Type: application/json' \
 # Or streamed as Server-Sent Events: stage*, sources, delta*, done.
 curl -N -H "$KEY" -H 'Content-Type: application/json' \
   -d '{"question": "How many days of leave do I get?"}' http://127.0.0.1:8000/questions/stream
+# Summarize a whole document (or "mode": "compare" with two filenames); /stream also exists.
+curl -fsS -H "$KEY" -H 'Content-Type: application/json' \
+  -d '{"mode": "summarize", "filenames": ["handbook.pdf"], "instruction": "leave rules"}' \
+  http://127.0.0.1:8000/questions/summary | jq '{answer, chunks_read, chunks_total}'
 # Passages only, no LLM:
 curl -fsS -H "$KEY" -H 'Content-Type: application/json' -d '{"query": "leave policy"}' \
   http://127.0.0.1:8000/search | jq '.results[] | {filename, page, rerank_score}'
@@ -223,6 +235,107 @@ scrape_configs:
       X-API-Key:
         secrets: ["<your API_KEY>"]
 ```
+
+## Command line and MCP
+
+The `docrag` command talks to a running DocRAG over its REST API, so the key, read-only
+key, rate limits and question slots apply as they do to the web UI. It is its own small
+package (httpx only — none of the server's models or parsers), installed from the
+repository on any machine that can reach the server:
+
+```bash
+uv tool install ./cli            # or: pipx install ./cli
+uv tool install './cli[mcp]'     # also the docrag-mcp server
+```
+
+Inside the repository, `uv run python -m cli` is the same command without installing it.
+`--url`/`DOCRAG_URL` (default `http://127.0.0.1:8000`), `--api-key`/`DOCRAG_API_KEY` and
+`--workspace`/`DOCRAG_WORKSPACE` select the server:
+
+```bash
+docrag status
+docrag ingest ./handbook ./notes.pdf     # folders recursively; waits for indexing
+docrag add-url https://example.com/policy.html
+docrag ask "How many days of leave do I get?" --file handbook.pdf
+docrag search "leave policy"
+docrag summarize handbook.pdf [other.pdf] --focus "deadlines"
+docrag export backup.zip                 # and: import backup.zip
+```
+
+`--json` gives machine-readable output; the exit code is 1 when a request (or any upload)
+failed. Uploads that meet a full indexing queue wait and retry, as the UI does. `ingest`,
+`add-url` and `import` wait for indexing for up to `--timeout` seconds (default 3600, 0 =
+no limit); anything still indexing then is reported and goes on on the server.
+
+The MCP server offers `list_documents`, `search_passages`, `ask`, `summarize` and
+`read_document` to an MCP client, all read-only (the read-only key is enough). Answers keep
+their citations, so the client can quote filename, page and section. For Claude Desktop,
+add to its MCP configuration (with `docrag-mcp` installed as above):
+
+```json
+{
+  "mcpServers": {
+    "docrag": {
+      "command": "docrag-mcp",
+      "env": {"DOCRAG_URL": "http://127.0.0.1:8000", "DOCRAG_API_KEY": "<your key>"}
+    }
+  }
+}
+```
+
+or, without installing anything, from a checkout of the repository:
+
+```json
+{
+  "mcpServers": {
+    "docrag": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/retrieval-ai-platform", "--extra", "mcp",
+               "python", "-m", "cli.mcp_server"],
+      "env": {"DOCRAG_URL": "http://127.0.0.1:8000", "DOCRAG_API_KEY": "<your key>"}
+    }
+  }
+}
+```
+
+## Multilingual documents
+
+The defaults are English-first: `BAAI/bge-small-en-v1.5` for dense retrieval and English
+stemming for BM25 (the jina reranker is multilingual already). For a corpus in other
+languages, switch both — a new vector space, so set a new `EMBEDDING_MODEL_TAG` and
+re-index (download a backup, delete every document, restore it):
+
+| Setting | Light (~50 languages) | Stronger (~100 languages, 2.2 GB) |
+|---|---|---|
+| `DENSE_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | `intfloat/multilingual-e5-large` |
+| `QDRANT_DENSE_VECTOR_SIZE` | `384` | `1024` |
+| `DENSE_QUERY_INSTRUCTION` | empty | `query: ` |
+| `DENSE_PASSAGE_PREFIX` | empty | `passage: ` |
+| `EMBEDDING_MODEL_TAG` | e.g. `fastembed:paraphrase-multilingual-MiniLM-L12-v2` | e.g. `fastembed:multilingual-e5-large` |
+
+Set `SPARSE_LANGUAGE` to the corpus's main language (`german`, `french`, `spanish`,
+`italian`, `dutch`, …) for BM25's stemmer. The collection records the dense model, the
+sparse language and the passage prefix, and refuses questions and uploads that would mix
+them with another setup. The evaluation baselines are English. To measure a multilingual
+setup, `eval/corpus_multilingual/` and `eval/datasets/multilingual_eval.jsonl` are a
+small Spanish/German/French starting point (with an archived distractor and English
+questions about the non-English documents): `python -m eval.harness ingest
+eval/corpus_multilingual`, then `python -m eval.harness retrieval
+eval/datasets/multilingual_eval.jsonl`. It has no baseline; measure on your own
+documents too before relying on it.
+
+## Watched folder
+
+With `WATCH_DIR` set, the API indexes that folder into the default workspace (or into
+`WATCH_WORKSPACE`, with workspaces on; created at startup if it doesn't exist): on start and
+then every `WATCH_INTERVAL_SECONDS` (30), new files and files modified since their document
+was indexed go through the same queue as uploads (a full queue waits for the next pass).
+Subfolders are included, dotfiles and unsupported types skipped; documents are stored by
+file name, so two files with the same name are one document (the second is skipped and
+logged). `WATCH_DELETE_MISSING=true` also deletes the document of a file removed from the
+folder — only documents the watcher saw there, never other uploads. With Compose, mount
+the folder read-only and point `WATCH_DIR` at it (see the commented line in
+`docker-compose.yml`).
 
 ## Troubleshooting
 
@@ -337,6 +450,19 @@ run uses exactly the settings you exported.
 ```bash
 uv run python -m eval.harness answer eval/datasets/retrieval_eval.sample.jsonl --output answers.json
 uv run python -m eval.ragas_runner answers.json
+```
+
+With `FEEDBACK_ENABLED`, the answer ratings people give can seed a dataset of your own
+questions. `from-feedback` reads the feedback store (or a backup zip) and writes each
+thumbs-up answer's question labeled with the documents it cited; thumbs-down questions go
+to a review file, to label by hand, since a bad rating says the answer was wrong but not
+which documents were right. Only the latest rating of a question counts, and ratings of a
+single citation are skipped. The output is validated like `validate` before it is kept:
+
+```bash
+uv run python -m eval.harness from-feedback --store data/feedback.db \
+  --output eval/datasets/from_feedback.jsonl --review review.jsonl
+# or from a backup: --export docrag-backup.zip
 ```
 
 The metric math and the harness logic (ranking per arm, passage resolution, the

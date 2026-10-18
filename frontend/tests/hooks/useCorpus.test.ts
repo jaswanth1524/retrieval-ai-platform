@@ -1,16 +1,18 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiClientError } from '../../src/api/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiClientError, setWorkspace } from '../../src/api/client';
 import type { DocumentJobStatusResponse } from '../../src/api/types';
 import { useCorpus } from '../../src/hooks/useCorpus';
 
 const api = vi.hoisted(() => ({
   listDocuments: vi.fn(),
   uploadDocument: vi.fn(),
+  uploadFromUrl: vi.fn(),
   pollDocumentJob: vi.fn(),
   cancelDocumentJob: vi.fn(),
   deleteDocument: vi.fn(),
   setDocumentTags: vi.fn(),
+  reindexDocument: vi.fn(),
 }));
 vi.mock('../../src/api/client', async () => {
   const actual = await vi.importActual<typeof import('../../src/api/client')>(
@@ -50,6 +52,29 @@ describe('useCorpus', () => {
   beforeEach(() => {
     for (const mock of Object.values(api)) mock.mockReset();
     api.listDocuments.mockResolvedValue({ filenames: [] });
+  });
+
+  it('indexes a URL like an upload, names the card after the server, and retries the URL', async () => {
+    const url = 'https://example.com/docs/policy';
+    api.uploadFromUrl
+      .mockRejectedValueOnce(new ApiClientError('The URL answered 503; nothing was fetched.', 400))
+      .mockResolvedValueOnce({ job_id: 'job-1', filename: 'policy.html', state: 'queued' });
+    api.pollDocumentJob.mockResolvedValue(
+      jobStatus({ state: 'done', filename: 'policy.html', result: { filename: 'policy.html' } as never }),
+    );
+    const { result } = setup();
+
+    await act(() => result.current.handleUploadFromUrl(url));
+    const failed = result.current.uploads[0];
+    expect(failed).toMatchObject({ filename: url, status: 'error', sourceUrl: url });
+    expect(failed.error).toContain('answered 503');
+
+    api.listDocuments.mockResolvedValue({ filenames: ['policy.html'] });
+    await act(() => result.current.handleRetryUpload(failed.id));
+    expect(api.uploadFromUrl).toHaveBeenLastCalledWith(url, expect.anything(), '');
+    // Done: its card gives way to the document's own once the listing has it.
+    expect(result.current.uploads).toEqual([]);
+    expect(result.current.indexedFilenames).toEqual(['policy.html']);
   });
 
   it('keeps one metadata record per document, in the listing order', async () => {
@@ -194,7 +219,7 @@ describe('useCorpus', () => {
 
     act(() => result.current.handleCancelUpload(result.current.uploads[0].id));
     expect(result.current.uploads[0].cancelling).toBe(true);
-    expect(api.cancelDocumentJob).toHaveBeenCalledWith('job-1');
+    expect(api.cancelDocumentJob).toHaveBeenCalledWith('job-1', undefined, '');
 
     finishPoll(jobStatus({ state: 'failed', cancelled: true, error: 'Cancelled.' }));
     await act(() => upload);
@@ -258,7 +283,7 @@ describe('useCorpus', () => {
     accept({ job_id: 'job-7', filename: 'a.txt', state: 'queued' });
     await act(() => upload);
 
-    expect(api.cancelDocumentJob).toHaveBeenCalledWith('job-7');
+    expect(api.cancelDocumentJob).toHaveBeenCalledWith('job-7', undefined, '');
     expect(result.current.uploads).toEqual([]);
   });
 
@@ -337,5 +362,121 @@ describe('useCorpus', () => {
 
     expect(api.uploadDocument).toHaveBeenCalledTimes(3);
     expect(most).toBe(2);
+  });
+});
+
+describe('useCorpus across workspaces', () => {
+  beforeEach(() => {
+    for (const mock of Object.values(api)) mock.mockReset();
+    api.listDocuments.mockResolvedValue({ filenames: [] });
+    setWorkspace('legal');
+  });
+  afterEach(() => setWorkspace(''));
+
+  const done = (filename: string) =>
+    jobStatus({ state: 'done', filename, result: { filename } as DocumentJobStatusResponse['result'] });
+
+  it('sends an upload waiting for room in the queue to the workspace it was started in', async () => {
+    api.uploadDocument
+      .mockRejectedValueOnce(new ApiClientError('The indexing queue is full.', 503, 1))
+      .mockResolvedValueOnce({ job_id: 'job-1', filename: 'a.txt', state: 'queued' });
+    api.pollDocumentJob.mockResolvedValue(done('a.txt'));
+    const { result } = setup();
+
+    let upload!: Promise<void>;
+    act(() => {
+      upload = result.current.handleUpload([file]);
+    });
+    await waitFor(() => expect(result.current.uploads[0]?.progress?.state).toBe('waiting'));
+    expect(result.current.uploads[0].workspace).toBe('legal');
+    // Switched to the default while it waits.
+    setWorkspace('');
+    act(() => result.current.resetForWorkspace());
+    await act(() => upload);
+
+    expect(api.uploadDocument.mock.calls.map((call) => call[2])).toEqual(['legal', 'legal']);
+    expect(api.pollDocumentJob).toHaveBeenCalledWith('job-1', expect.any(Function), undefined, 'legal');
+    // Indexed in legal: the default workspace's list doesn't gain it, nor is it relisted.
+    expect(result.current.indexedFilenames).toEqual([]);
+    expect(api.listDocuments).not.toHaveBeenCalled();
+    expect(result.current.uploads).toEqual([]);
+  });
+
+  it('retries a failed upload in its own workspace, whichever is in use', async () => {
+    api.uploadDocument
+      .mockRejectedValueOnce(new ApiClientError('Ingest backend down.', 500))
+      .mockResolvedValueOnce({ job_id: 'job-2', filename: 'a.txt', state: 'queued' });
+    api.pollDocumentJob.mockResolvedValue(done('a.txt'));
+    const { result } = setup();
+    await act(() => result.current.handleUpload([file]));
+    expect(result.current.uploads[0].status).toBe('error');
+
+    setWorkspace('');
+    await act(() => result.current.handleRetryUpload(result.current.uploads[0].id));
+
+    expect(api.uploadDocument).toHaveBeenLastCalledWith(file, expect.anything(), 'legal');
+  });
+
+  it('leaves the list of the workspace now in use alone when a delete or tag change ends', async () => {
+    api.listDocuments.mockResolvedValue({ filenames: ['shared.md'], tags: { 'shared.md': ['a'] } });
+    let finishDelete!: () => void;
+    api.deleteDocument.mockReturnValue(new Promise<void>((resolve) => (finishDelete = resolve)));
+    let finishTags!: (value: { filename: string; tags: string[] }) => void;
+    api.setDocumentTags.mockReturnValue(new Promise((resolve) => (finishTags = resolve)));
+    const { result, callbacks } = setup();
+    await act(() => result.current.refreshDocuments());
+
+    let deleting!: Promise<void>;
+    let tagging!: Promise<void>;
+    act(() => {
+      deleting = result.current.handleDeleteDocument('shared.md');
+      tagging = result.current.handleSetTags('shared.md', ['b']);
+    });
+    // The default workspace holds a document of the same name.
+    setWorkspace('');
+    act(() => result.current.resetForWorkspace());
+    await act(() => result.current.refreshDocuments());
+    finishDelete();
+    finishTags({ filename: 'shared.md', tags: ['b'] });
+    await act(() => Promise.all([deleting, tagging]));
+
+    expect(api.deleteDocument).toHaveBeenCalledWith('shared.md', undefined, 'legal');
+    expect(api.setDocumentTags).toHaveBeenCalledWith('shared.md', ['b'], undefined, 'legal');
+    expect(result.current.indexedFilenames).toEqual(['shared.md']);
+    expect(result.current.documents['shared.md'].tags).toEqual(['a']);
+    // Pruned from legal's conversations, not the default workspace's.
+    expect(callbacks.removeFromScopes).toHaveBeenCalledWith(['shared.md'], 'legal');
+  });
+
+  it("drops a listing of the previous workspace that lands after a switch", async () => {
+    let answer!: (value: { filenames: string[] }) => void;
+    api.listDocuments.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
+    const { result } = setup();
+
+    let listing!: Promise<void>;
+    act(() => {
+      listing = result.current.refreshDocuments();
+    });
+    setWorkspace('');
+    answer({ filenames: ['contract.txt'] });
+    await act(() => listing);
+
+    expect(result.current.indexedFilenames).toEqual([]);
+  });
+
+  it('forgets the previous workspace’s corpus on a switch, keeping unfinished cards', async () => {
+    api.listDocuments.mockResolvedValue({ filenames: ['contract.txt'], chunk_counts: { 'contract.txt': 2 } });
+    api.uploadDocument.mockRejectedValue(new ApiClientError('Ingest backend down.', 500));
+    const { result } = setup();
+    await act(() => result.current.refreshDocuments());
+    await act(() => result.current.handleUpload([file]));
+
+    act(() => result.current.resetForWorkspace());
+
+    expect(result.current.indexedFilenames).toEqual([]);
+    expect(result.current.documents).toEqual({});
+    expect(result.current.uploads).toEqual([
+      expect.objectContaining({ status: 'error', workspace: 'legal' }),
+    ]);
   });
 });

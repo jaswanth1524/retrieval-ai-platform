@@ -170,6 +170,13 @@ function SettingsModal({
                   <span className="settings__provider-status mono">configured</span>
                 </div>
               )}
+              {config.anthropic_available && (
+                <div className="settings__provider" data-testid="settings-provider-anthropic">
+                  <span className="settings__provider-name">Anthropic</span>
+                  <span className="settings__provider-model mono">{config.anthropic_model}</span>
+                  <span className="settings__provider-status mono">key configured</span>
+                </div>
+              )}
             </div>
           </section>
 

@@ -53,6 +53,89 @@ describe('CorpusPanel', () => {
     expect(items[0]).toHaveTextContent('re-indexing 50%');
   });
 
+  it('adds a document from a URL, checking the scheme first', async () => {
+    const props = setup({ onUploadFromUrl: vi.fn() });
+    const input = screen.getByLabelText('Document URL to index');
+
+    await userEvent.type(input, 'ftp://example.com/a.txt');
+    await userEvent.click(screen.getByTestId('url-ingest-submit'));
+    expect(screen.getByRole('alert')).toHaveTextContent('http:// or https://');
+    expect(props.onUploadFromUrl).not.toHaveBeenCalled();
+
+    await userEvent.clear(input);
+    await userEvent.type(input, ' https://example.com/a.txt {Enter}');
+    expect(props.onUploadFromUrl).toHaveBeenCalledWith('https://example.com/a.txt');
+    expect(input).toHaveValue('');
+  });
+
+  it('offers no URL form without the handler or for the read-only key', () => {
+    setup({ onUploadFromUrl: vi.fn(), readOnly: true });
+    expect(screen.queryByTestId('url-ingest-form')).not.toBeInTheDocument();
+  });
+
+  it('summarizes a document from its card, read-only key included', async () => {
+    const props = setup({
+      filenames: ['a.txt'],
+      documents: { 'a.txt': meta() },
+      readOnly: true,
+      onSummarize: vi.fn(),
+    });
+
+    await userEvent.click(screen.getByLabelText('Summarize a.txt'));
+
+    expect(props.onSummarize).toHaveBeenCalledWith(['a.txt']);
+  });
+
+  it('offers Compare only when exactly two documents are selected', async () => {
+    const props = setup({
+      filenames: ['a.txt', 'b.txt', 'c.txt'],
+      documents: { 'a.txt': meta(), 'b.txt': meta(), 'c.txt': meta() },
+      onSummarize: vi.fn(),
+    });
+    const boxes = screen.getAllByTestId('corpus-select');
+
+    await userEvent.click(boxes[0]);
+    expect(screen.queryByTestId('corpus-bulk-compare')).not.toBeInTheDocument();
+    await userEvent.click(boxes[1]);
+    await userEvent.click(screen.getByTestId('corpus-bulk-compare'));
+    expect(props.onSummarize).toHaveBeenCalledWith(['a.txt', 'b.txt']);
+    await userEvent.click(boxes[2]);
+    expect(screen.queryByTestId('corpus-bulk-compare')).not.toBeInTheDocument();
+  });
+
+  it('lets the read-only key compare two documents, and nothing else in bulk', async () => {
+    // The server allows summaries for the read key; selection used to be full-key only.
+    const props = setup({
+      filenames: ['a.txt', 'b.txt'],
+      documents: { 'a.txt': meta({ reindexable: true }), 'b.txt': meta({ reindexable: true }) },
+      readOnly: true,
+      onSummarize: vi.fn(),
+      onReindex: vi.fn(),
+      onReindexMany: vi.fn(),
+      onSetTags: vi.fn(),
+    });
+    for (const box of screen.getAllByTestId('corpus-select')) await userEvent.click(box);
+
+    await userEvent.click(screen.getByTestId('corpus-bulk-compare'));
+    expect(props.onSummarize).toHaveBeenCalledWith(['a.txt', 'b.txt']);
+    expect(screen.queryByTestId('corpus-bulk-delete')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('corpus-bulk-tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('corpus-bulk-reindex')).not.toBeInTheDocument();
+  });
+
+  it('keeps Summarize and Compare disabled while summaries can’t be asked', async () => {
+    const props = setup({
+      filenames: ['a.txt', 'b.txt'],
+      documents: { 'a.txt': meta(), 'b.txt': meta() },
+      onSummarize: vi.fn(),
+      summarizeDisabled: true,
+    });
+    expect(screen.getByLabelText('Summarize a.txt')).toBeDisabled();
+    for (const box of screen.getAllByTestId('corpus-select')) await userEvent.click(box);
+    expect(screen.getByTestId('corpus-bulk-compare')).toBeDisabled();
+    expect(props.onSummarize).not.toHaveBeenCalled();
+  });
+
   it('focuses Cancel on a delete confirm, and Escape backs out of it', async () => {
     setup({ filenames: ['a.txt'], documents: { 'a.txt': meta({ chunks: 3 }) } });
 

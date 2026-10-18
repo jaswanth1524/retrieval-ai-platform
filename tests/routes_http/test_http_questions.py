@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -22,12 +22,14 @@ from api.dependencies import (
     get_reranker,
     get_token_counter,
 )
+from api.generation import ChatMessage
 from api.main import create_app
 from api.qdrant_schema import (
     EMBEDDING_MODEL_TAG_KEY,
     dense_vectors_config,
     sparse_vectors_config,
 )
+from api.settings import AppSettings
 from tests.factories import wait_until
 from tests.routes_http.support import (
     ApiTestContext,
@@ -265,7 +267,7 @@ def test_question_endpoint_rejects_unknown_provider() -> None:
     completion_client = CapturingCompletionClient()
     client, _ = ingested_client(settings, completion_client)
 
-    response = client.post("/questions", json={"question": "alpha", "llm_provider": "anthropic"})
+    response = client.post("/questions", json={"question": "alpha", "llm_provider": "cohere"})
 
     # Literal["ollama","openai"] rejects unknown values at the schema boundary.
     assert response.status_code == 422
@@ -708,7 +710,11 @@ def test_a_provider_outside_the_allowlist_is_refused_before_a_slot_is_taken() ->
 
 @pytest.mark.parametrize(
     ("provider", "detail"),
-    [("openai", "OPENAI_API_KEY"), ("openai_compatible", "OPENAI_COMPATIBLE_BASE_URL")],
+    [
+        ("openai", "OPENAI_API_KEY"),
+        ("openai_compatible", "OPENAI_COMPATIBLE_BASE_URL"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+    ],
 )
 def test_an_unconfigured_provider_is_refused_before_any_retrieval(
     api_context: ApiTestContext, provider: str, detail: str
@@ -728,9 +734,125 @@ def test_an_unconfigured_provider_is_refused_before_any_retrieval(
     assert len(api_context.embeddings.seen_text_batches) == embedded_before
 
 
+def test_an_anthropic_temperature_above_one_is_refused_before_any_work(
+    api_context: ApiTestContext,
+) -> None:
+    from api.dependencies import get_app_settings
+    from api.generation import GenerationConfigError
+    from api.routes.questions import check_request_provider
+
+    keyed = make_settings(anthropic_api_key="sk-ant-test")
+    api_context.app.dependency_overrides[get_app_settings] = lambda: keyed
+    assert upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    embedded_before = len(api_context.embeddings.seen_text_batches)
+    api_context.generator.messages = []
+
+    question = {"question": "alpha", "llm_provider": "anthropic", "llm_temperature": 1.5}
+    summary = {
+        "mode": "summarize",
+        "filenames": ["guide.txt"],
+        "llm_provider": "anthropic",
+        "llm_temperature": 1.5,
+    }
+    for route, body in (
+        ("/questions", question),
+        ("/questions/stream", question),
+        ("/questions/summary", summary),
+        ("/questions/summary/stream", summary),
+    ):
+        refused = api_context.client.post(route, json=body)
+        assert refused.status_code == 400, route
+        assert "temperature of at most 1" in refused.json()["detail"]
+    assert len(api_context.embeddings.seen_text_batches) == embedded_before
+    assert api_context.generator.messages == []  # nothing generated
+
+    # 1.0 is fine, as is 1.5 for a provider that takes it; and an anthropic default
+    # provider is held to it too.
+    check_request_provider("anthropic", keyed, 1.0)
+    check_request_provider("ollama", keyed, 1.5)
+    anthropic_default = make_settings(llm_provider="anthropic", anthropic_api_key="k")
+    with pytest.raises(GenerationConfigError, match="at most 1"):
+        check_request_provider(None, anthropic_default, 1.5)
+    with pytest.raises(GenerationConfigError, match="at most 1"):
+        check_request_provider(None, anthropic_default.model_copy(update={"llm_temperature": 1.2}))
+
+
 def test_every_provider_is_allowed_per_request_by_default(api_context: ApiTestContext) -> None:
     assert api_context.client.get("/config").json()["allowed_request_providers"] == [
         "ollama",
         "openai",
         "openai_compatible",
+        "anthropic",
     ]
+
+
+class FollowupGenerator:
+    """Answers with a citation; answers the follow-up prompt with questions."""
+
+    def __init__(self, answer: str = "Alpha is documented [1].") -> None:
+        self.answer = answer
+        self.followup_prompts: list[str] = []
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        if messages[0]["content"].startswith("You suggest follow-up questions"):
+            self.followup_prompts.append(messages[-1]["content"])
+            return "What else is documented?\nHow is beta used?"
+        return self.answer
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterator[str]:
+        yield self.complete(messages, settings)
+
+
+def test_followups_come_after_the_answer_when_enabled(api_context: ApiTestContext) -> None:
+    assert upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    generator = FollowupGenerator()
+    api_context.app.dependency_overrides[get_generator] = lambda: generator
+    client = api_context.client
+
+    # Off by default: no extra call, an empty list.
+    assert client.post("/questions", json={"question": "alpha"}).json()["followups"] == []
+    assert generator.followup_prompts == []
+
+    enabled = make_settings(followups_enabled=True, answer_cache_size=0)
+    api_context.app.dependency_overrides[get_app_settings] = lambda: enabled
+    body = client.post("/questions", json={"question": "alpha"}).json()
+    assert body["followups"] == ["What else is documented?", "How is beta used?"]
+
+    streamed = parse_sse_events(client.post("/questions/stream", json={"question": "alpha"}).text)
+    kinds = [event["type"] for event in without_stage_events(streamed)]
+    assert kinds[-2:] == ["done", "followups"]
+    assert streamed[-1]["questions"] == ["What else is documented?", "How is beta used?"]
+    assert "alpha beta" in generator.followup_prompts[-1]
+
+
+def test_no_followups_for_an_answer_that_cites_nothing(api_context: ApiTestContext) -> None:
+    assert upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    generator = FollowupGenerator(answer="The documents do not contain enough information.")
+    api_context.app.dependency_overrides[get_generator] = lambda: generator
+    enabled = make_settings(followups_enabled=True)
+    api_context.app.dependency_overrides[get_app_settings] = lambda: enabled
+
+    body = api_context.client.post("/questions", json={"question": "alpha"}).json()
+
+    assert body["answer_status"] == "insufficient_context"
+    assert body["followups"] == []
+    assert generator.followup_prompts == []
+
+
+def test_cached_answers_replay_their_followups(api_context: ApiTestContext) -> None:
+    assert upload_and_wait(api_context.client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    generator = FollowupGenerator()
+    api_context.app.dependency_overrides[get_generator] = lambda: generator
+    enabled = make_settings(followups_enabled=True)
+    api_context.app.dependency_overrides[get_app_settings] = lambda: enabled
+    client = api_context.client
+
+    client.post("/questions/stream", json={"question": "alpha"})
+    replay = parse_sse_events(client.post("/questions/stream", json={"question": "alpha"}).text)
+
+    assert replay[-2]["cached"] is True
+    assert replay[-1] == {
+        "type": "followups",
+        "questions": ["What else is documented?", "How is beta used?"],
+    }
+    assert len(generator.followup_prompts) == 1

@@ -397,9 +397,7 @@ def test_completion_model_and_kwargs_rejects_unknown_provider() -> None:
     with pytest.raises(GenerationConfigError, match="Unsupported"):
         # AppSettings refuses it at startup; model_copy skips that, as a per-request
         # override does, so the generator's own guard is still exercised.
-        completion_model_and_kwargs(
-            make_settings().model_copy(update={"llm_provider": "anthropic"})
-        )
+        completion_model_and_kwargs(make_settings().model_copy(update={"llm_provider": "cohere"}))
 
 
 def test_completion_model_and_kwargs_adds_reasoning_effort_for_reasoning_model() -> None:
@@ -788,6 +786,49 @@ def test_generate_query_variants_returns_empty_on_error() -> None:
     assert generate_query_variants("q", 3, RaisingGenerator(), make_settings()) == []
 
 
+def test_generate_followups_keeps_short_new_questions_about_the_cited_sources() -> None:
+    from api.generation import generate_followups
+
+    generator = ScriptedGenerator(
+        [
+            "1. What does the guide say about upgrades?\n"
+            "- what is alpha?\n"
+            "Here are some ideas:\n"
+            "How is beta configured?\n"
+            f"{'Why ' * 60}?\n"
+            "Where is gamma stored?"
+        ]
+    )
+    sources = [make_chunk("c1", "Alpha is first. " * 80)]
+
+    followups = generate_followups(
+        "What is alpha?", "Alpha is first [1].", sources, generator, make_settings()
+    )
+
+    # Markers stripped; the echo, the non-question and the over-long one dropped; capped.
+    assert followups == [
+        "What does the guide say about upgrades?",
+        "How is beta configured?",
+        "Where is gamma stored?",
+    ]
+    prompt = generator.calls[0][-1]["content"]
+    assert "Answer:\nAlpha is first [1]." in prompt
+    assert "[1] filename=" in prompt
+    # The source is clipped: the extra call stays cheap.
+    assert prompt.count("Alpha is first.") < 80
+    assert int(generator.settings_seen[0].llm_max_tokens) == 128
+
+
+def test_generate_followups_is_best_effort() -> None:
+    from api.generation import generate_followups
+
+    sources = [make_chunk("c1", "Alpha.")]
+    assert generate_followups("q", "a [1]", sources, RaisingGenerator(), make_settings()) == []
+    generator = ScriptedGenerator(["Ask more?"])
+    assert generate_followups("q", "a", [], generator, make_settings()) == []
+    assert generator.calls == []
+
+
 def test_generate_query_variants_respects_zero_count() -> None:
     generator = ScriptedGenerator(["a\nb\nc"])
     assert generate_query_variants("q", 0, generator, make_settings()) == []
@@ -1092,6 +1133,28 @@ def test_openai_compatible_provider_requires_its_url_and_model() -> None:
 
     with pytest.raises(GenerationConfigError, match="OPENAI_COMPATIBLE_BASE_URL"):
         completion_model_and_kwargs(make_settings(llm_provider="openai_compatible"))
+
+
+def test_anthropic_provider_routes_to_claude_with_the_plain_budget() -> None:
+    from api.generation import completion_model_and_kwargs, effective_max_tokens
+
+    settings = make_settings(
+        llm_provider="anthropic", anthropic_api_key="sk-ant", anthropic_model="claude-x"
+    )
+
+    model, kwargs = completion_model_and_kwargs(settings)
+
+    assert model == "anthropic/claude-x"
+    assert kwargs == {"api_key": "sk-ant"}
+    # Extended thinking is never enabled, so no reasoning headroom and no effort knob.
+    assert effective_max_tokens(settings, model) == 512
+
+
+def test_anthropic_provider_requires_its_key() -> None:
+    from api.generation import GenerationConfigError, completion_model_and_kwargs
+
+    with pytest.raises(GenerationConfigError, match="ANTHROPIC_API_KEY"):
+        completion_model_and_kwargs(make_settings(llm_provider="anthropic"))
 
 
 def test_an_unreachable_openai_compatible_server_is_named_without_credentials() -> None:

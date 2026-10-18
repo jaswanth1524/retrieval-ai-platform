@@ -19,6 +19,7 @@ from api.embeddings import EmbeddedText, EmbeddingError
 from api.metrics import ingest_stage_seconds
 from api.qdrant_schema import check_dense_dimension
 from api.settings import AppSettings
+from api.workspaces import document_key
 
 
 class IngestionError(RuntimeError):
@@ -117,6 +118,14 @@ def filename_write_lock(filename: str) -> Iterator[None]:
                 del _filename_locks[filename]
 
 
+class ClosedForWorkError(Exception):
+    """An ingest or delete was asked for in a group (a workspace) being deleted."""
+
+    def __init__(self, group: str) -> None:
+        super().__init__(group)
+        self.group = group
+
+
 class IngestSequencer:
     """Stops an older ingest of a filename from overwriting a newer one.
 
@@ -138,9 +147,17 @@ class IngestSequencer:
         self._in_flight: dict[str, int] = {}
         # Newest applied (sequence, was_a_delete) per filename.
         self._applied: dict[str, tuple[int, bool]] = {}
+        # Groups of keys (a workspace being deleted) that admit nothing, by name.
+        self._closed: dict[str, Callable[[str], bool]] = {}
 
     def admit(self, filename: str) -> int:
+        """A sequence number for a new ingest or delete of ``filename``; raises
+        ``ClosedForWorkError`` while ``close_if_idle`` has closed its group."""
+
         with self._lock:
+            for group, belongs in self._closed.items():
+                if belongs(filename):
+                    raise ClosedForWorkError(group)
             self._next += 1
             self._in_flight[filename] = self._in_flight.get(filename, 0) + 1
             return self._next
@@ -184,6 +201,26 @@ class IngestSequencer:
 
         with self._lock:
             return list(self._in_flight)
+
+    def close_if_idle(self, group: str, belongs: Callable[[str], bool]) -> bool:
+        """Stop admitting keys ``belongs`` accepts, if none is in flight now.
+
+        The check and the closing happen under one lock, so no ingest can be admitted
+        between them: deleting a workspace's collection after a separate in-flight check
+        could still race an upload admitted in between, whose job would then fail or
+        recreate the collection. False (nothing closed) when one is in flight. Undo with
+        ``reopen``, on every path.
+        """
+
+        with self._lock:
+            if group in self._closed or any(belongs(key) for key in self._in_flight):
+                return False
+            self._closed[group] = belongs
+            return True
+
+    def reopen(self, group: str) -> None:
+        with self._lock:
+            self._closed.pop(group, None)
 
     def release(self, filename: str) -> None:
         with self._lock:
@@ -279,7 +316,7 @@ def ingest_chunks(
 
     with ExitStack() as locks:
         for filename in filenames:
-            locks.enter_context(filename_write_lock(filename))
+            locks.enter_context(filename_write_lock(document_key(settings, filename)))
         # Registered after the locks, so it runs first on exit: the time locks are held.
         write_start = time.monotonic()
         locks.callback(

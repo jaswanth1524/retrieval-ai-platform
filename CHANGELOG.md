@@ -24,6 +24,16 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Internal: `api/pipeline.py` split into `api/context_expansion.py` (neighbour expansion)
+  and `api/ingest_service.py` (`IngestService`), re-exported from `api.pipeline`; the
+  corpus panel's card, bulk bar, tag editor and types moved to `components/corpus/`, and
+  App's helpers and connection monitor to `appHelpers.ts` / `useConnectionMonitor`, its
+  boot to `useAppBoot`, its workspace handling to `useWorkspaces`, backups to
+  `useBackupActions`, the inspector's open/close rule to `useInspectorVisibility`, and the
+  traces and feedback panels share `usePanelList`. No behaviour change (the OpenAPI
+  document only gained the additions below).
+- `GET /config` always reports the app's own settings (never a workspace's), so the UI
+  boots even when the workspace it remembers was deleted.
 - **Chunker version 5.** Table rows (CSV, XLSX and Markdown tables, which PDF tables are
   rendered as) are never split across chunks, and a table chunk is labelled with the
   rows it actually holds (`Rows 4-17`, not its whole 50-row group). A chunk that runs
@@ -41,6 +51,58 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Workspaces (`WORKSPACES_ENABLED`, off by default): separate corpora, one Qdrant
+  collection (`<QDRANT_COLLECTION>__ws_<name>`) and originals folder each, chosen per
+  request with `X-Workspace`; `GET/POST /workspaces`, `DELETE /workspaces/{name}` (empty
+  only). The answer cache, the filename lock and the ingest sequencer are per workspace.
+  The UI has a workspace menu in the corpus panel, and each conversation belongs to the
+  workspace of its first question: choosing another workspace opens a fresh chat, and
+  opening a conversation switches back to its workspace (the list names it). The
+  workspace in use is held per browser tab. Answer feedback is kept per workspace too:
+  `GET /feedback`, a backup and a restore cover only the request's workspace (the
+  feedback file gains a `workspace` column in place, its rows in the default one), and
+  `eval.harness from-feedback --store` takes `--workspace`. **Re-index: none** — the
+  default workspace is the existing collection.
+- `POST /documents/from-url` (`URL_INGEST_ENABLED`, off by default): the server fetches a
+  document and indexes it like an upload; public addresses only unless
+  `URL_INGEST_ALLOW_PRIVATE`, the checked address pinned for the connection, redirects
+  re-checked, `MAX_UPLOAD_BYTES` and `URL_INGEST_TIMEOUT_SECONDS` apply. **Re-index: none.**
+- A watched folder (`WATCH_DIR`, `WATCH_INTERVAL_SECONDS`, `WATCH_DELETE_MISSING`): new and
+  changed files are indexed as they appear, into the default workspace or
+  `WATCH_WORKSPACE` (created at startup when missing; a bad name, or workspaces off,
+  stops startup naming the setting). **Re-index: none.**
+- The `docrag` command (status, documents, ingest, add-url, ask, search, summarize,
+  export, import) and an MCP server, `docrag-mcp`, both over the REST API. They are their
+  own small package (`uv tool install ./cli`, `./cli[mcp]` for the server; httpx only,
+  none of the server's dependencies); `python -m cli` / `python -m cli.mcp_server` run
+  them from the repository. CI builds the wheel and runs it. **Re-index: none.**
+- A multilingual profile: `SPARSE_LANGUAGE` (BM25 stemming) and `DENSE_PASSAGE_PREFIX`
+  (e5-style models), both recorded with the collection and checked like the dense model;
+  README "Multilingual documents" lists the supported models. A small Spanish/German/
+  French fixture (`eval/corpus_multilingual/`, `eval/datasets/multilingual_eval.jsonl`,
+  including English questions about the non-English documents) has its format and
+  labels checked in CI (the labelled files and passages exist in the corpus); no model
+  runs on it there and it has no baseline yet. **Re-index: none** for the defaults; switching to the profile is
+  a new vector space (re-index).
+- Whole-document summaries and comparisons: `POST /questions/summary` and
+  `/questions/summary/stream` read every passage of one document (or two, to compare),
+  in parts of `SUMMARY_BATCH_CHARS`, as cited notes combined into one answer; at most
+  `SUMMARY_MAX_BATCHES` parts (a longer document is read at evenly spaced passages,
+  reported as `chunks_read`/`chunks_total`), with `SUMMARY_MAX_TOKENS` for the answer.
+  Same key, slot, rate limit, citation retry and answer cache as a question. The UI has
+  ∑ on each document card, Compare for two selected documents, and a ⌘K command for a
+  scoped document; Retry and Regenerate repeat the summary. **Re-index: none.**
+- Suggested follow-up questions (`FOLLOWUPS_ENABLED`, off by default; `FOLLOWUP_COUNT`,
+  `FOLLOWUP_MAX_TOKENS`): one extra LLM call after an answer that cited its sources,
+  sent as `followups` on `/questions` and a `followups` frame after `done` on the
+  stream, and shown as one-click questions under the latest answer. **Re-index: none.**
+- Anthropic (Claude) generation: `LLM_PROVIDER=anthropic` or per question, with
+  `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` (default `claude-sonnet-5-5`). Optional like
+  OpenAI; embeddings stay local. `GET /config` reports `anthropic_available`/
+  `anthropic_model`. **Re-index: none.**
+- `eval/harness.py from-feedback`: drafts a labeled retrieval dataset from answer
+  ratings (the feedback store or a backup zip) — thumbs-up questions labeled with their
+  cited documents, thumbs-down questions written to a review file. **Re-index: none.**
 - Excel (`.xlsx`) and PowerPoint (`.pptx`) uploads (`openpyxl`, `python-pptx`). Each
   sheet is a page, its rows rendered like a CSV's and labelled with spreadsheet row
   numbers (`Costs · Rows 2-51`); each slide is a page titled by its slide title, with
@@ -152,6 +214,98 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- A question sent (Enter) while the page was still starting up was dropped without a
+  word, left in the box; it is now sent as soon as DocRAG is ready, with a "Sending as
+  soon as DocRAG is ready…" note meanwhile (not when sending waits for another
+  conversation's answer). The watched folder's "lists no files at all" / "could not be
+  read" warnings are logged once when deletions start being held back, not every
+  interval.
+- A one- or two-word search (`POST /search`, the Search panel, `docrag search`, MCP
+  `search_passages`) often found nothing although documents held the words: the
+  cross-encoder scores a bare keyword low even against a passage containing it
+  ("laptop": 0.11 for the IT equipment policy, which it still ranks first), under the
+  0.15 `RERANK_MIN_SCORE` an answer's sources must clear. When nothing clears it, a
+  search now returns the closest passages with `weak_matches: true`, and the panel, the
+  CLI and the MCP tool say they are only the closest. Answers are unchanged: they never
+  use passages under the bar. **Re-index: none.**
+- The stronger multilingual profile (`intfloat/multilingual-e5-large`) failed to load
+  from a fresh download ("External data path escapes model directory"): its weights are
+  a separate `model.onnx_data` file, huggingface_hub 1.x links each file into a shared,
+  hash-sharded blob store, and ONNX Runtime 1.27 refuses external data outside the
+  directory the model resolves into. Model files are now hard-linked into the model's
+  own directory after download (same files, no extra disk) — dense, sparse and reranker
+  models alike. Measured on `eval/datasets/multilingual_eval.jsonl` the default, light
+  and stronger profiles all ingest and retrieve (chunk hit@1 0.83, MRR 0.92, recall@3
+  1.0 each; a small set). **Re-index: none.**
+- Corpus panel: the URL field's placeholder no longer runs out of room, and the workspace
+  label sits on its own line so Delete doesn't wrap alone. A card's actions move under
+  its file name when they don't fit beside it (with ∑ added, names broke mid-word). On a
+  phone, the composer's provider menu spans the control row instead of running off the
+  right edge. `docrag status` names the model of the provider in use (it always showed
+  Ollama's).
+- Review of the roadmap features, all with regression tests:
+  - **Watched folder (security):** only regular files are read — a symbolic link (to
+    `/proc/self/environ`, `/dev/zero`), FIFO or device is skipped, and the read is bounded
+    and refuses a file swapped for a link after the listing. `WATCH_DELETE_MISSING`
+    deletes nothing in a pass that couldn't read the whole folder (an unreadable
+    subfolder, a dropped mount) or that lists nothing at all. A file is read once it has
+    been unchanged for one interval (not half-copied), documents are stamped with the
+    file's mtime and re-indexed whenever it differs (a `cp -p` replacement was missed),
+    and a name differing only by case from a stored one is refused as uploads are. Watched
+    documents indexed before this are re-indexed once.
+  - **URL ingest:** checks the indexing queue before connecting and the declared size
+    before the body (503 + Retry-After), at most 4 fetches at once (429), one deadline for
+    the whole fetch, bad or non-ASCII URLs are a 400 not a 500 (hosts IDNA-encoded), IPv4
+    is tried first with fallback to the next address, NAT64/6to4/IPv4-mapped addresses are
+    checked by the IPv4 inside, and logged URLs drop their query string. The deadline
+    now covers the DNS lookup too, and is exact: when it passes, the connection is shut
+    down under whatever read was waiting (a single slow read could run past it by up to
+    the whole timeout again). A name
+    the remote server picked (its `Content-Disposition`, or the path of a URL it
+    redirected to) that differs from the URL's own and is already indexed is a 409
+    instead of replacing that document; giving a `filename` replaces it on purpose, and
+    re-adding the same URL still replaces its own document.
+  - **Workspaces:** traces and ingest jobs belong to the workspace they ran in (404 from
+    another); deleting a workspace with work in flight is a 409 (the check and the delete
+    are now one step: an upload or delete into the workspace meanwhile is a 409, and an
+    import defers those documents, where they could slip in between), a deleted
+    workspace is never recreated by a request or job that found it just before the
+    delete (404 "No workspace named …"; only creating it makes it), the watched folder's
+    `WATCH_WORKSPACE` can't be deleted while it is configured (409), leftover temp files no
+    longer block it, and a re-created workspace stores originals again; `/health/ready`
+    ignores `X-Workspace` (it could reveal workspace names without a key); a collection
+    name containing `__ws_` is refused at startup; `FEEDBACK_MAX_ROWS` applies per
+    workspace. The UI clears the previous workspace's cards, selection and search on a
+    switch, sends each upload, delete, tag change, re-index and URL ingest to the
+    workspace it started in, refreshes the workspace list after Settings or a key change,
+    and falls back to the default workspace when the current one was deleted elsewhere.
+    Arrowing through the closed workspace menu (Windows, Linux) switches once, when the
+    keys stop, on Enter or when focus leaves, not at every workspace passed.
+  - **Answers:** a streamed answer shows as finished at `done`, with follow-ups arriving
+    afterwards (Regenerate, feedback and the next question no longer wait for them), and
+    is cached at `done`; Anthropic temperatures above 1 are a 400 before any work;
+    equivalent `SPARSE_LANGUAGE` values ("", "English") are no longer refused.
+  - **Summaries:** refused with the same 409 as questions when the index was built for
+    another embedding setup (they read stored text, but a mismatched index is rebuilt
+    before it answers anything); notes mentioning "nothing relevant" in passing are kept, a cut passage
+    leaves room for its header, comparing a document with no readable text is a 400
+    naming it, and a short document's unused parts go to the other one.
+  - **Feedback** records its `kind` (`question`, `follow_up`, `summary`); `from-feedback`
+    labels only questions, reads the store read-only, and defaults to the default
+    workspace (`--all-workspaces` for all).
+  - **CLI:** files with the same name in different folders are uploaded once and the
+    rest reported, an error after the answer finished no longer discards it, `export`
+    never truncates an existing backup, `import` exits 1 when anything failed, local
+    errors are `error:` lines (no tracebacks), global flags work after the subcommand,
+    output can't crash a cp1252 console, 429 is retried, `add-url` no longer treats the
+    page as the server address, and MCP `read_document` output is capped. CI's wheel
+    smoke test imports the installed wheel, not the source checkout. `ingest` keeps up to
+    8 files indexing at once (the server indexes them side by side) instead of one after
+    another; `ingest`, `add-url` and `import` stop waiting after `--timeout`
+    (default 3600 s, 0 = no limit) and report what is still indexing; `ingest` and
+    `add-url` honour `--json`. A cancelled MCP `ask` or `summarize` closes its stream
+    (within one keepalive, 15 s), so the answer stops on the server and frees its
+    question slot. The dependency audit (CI, `make check`) covers the `mcp` extra.
 - A client that left a streamed answer kept the pipeline running to the end of the
   answer (Starlette never closes a plain iterator): the question slot and the LLM stayed
   busy until garbage collection. The same for `/original` downloads, whose file stayed

@@ -1932,3 +1932,32 @@ def test_fetch_neighbors_finds_every_ordinal_past_leftover_copies() -> None:
     fetched = repository.fetch_neighbors(settings, "guide.md", [1, 2, 3])
 
     assert {(point.payload or {}).get("chunk_ordinal") for point in fetched} == {1, 2, 3}
+
+
+def test_a_streamed_answer_is_cached_when_the_client_leaves_at_done() -> None:
+    from api.answer_cache import AnswerCache
+
+    settings = make_settings(followups_enabled=True)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    generator = FakeGenerator("Alpha is documented [1].")
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=60),
+    )
+
+    stream = pipeline.answer_stream("alpha")
+    for event in stream:
+        if event["type"] == "done":
+            break  # the client leaves while follow-up questions would be generated
+    stream.close()
+
+    replay = [event for event in pipeline.answer_stream("alpha") if event["type"] == "done"]
+    assert replay[0].get("cached") is True
+    assert replay[0]["answer"] == "Alpha is documented [1]."

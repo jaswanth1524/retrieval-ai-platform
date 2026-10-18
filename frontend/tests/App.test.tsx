@@ -1404,6 +1404,7 @@ describe('App', () => {
       cited_filenames: ['a.txt'],
       rating: 'up',
       citation_source_number: null,
+      kind: 'question',
     });
   });
 
@@ -1431,5 +1432,270 @@ describe('App', () => {
 
     await openCorpusPanel();
     expect(screen.getByTestId('upload-dropzone')).toBeInTheDocument();
+  });
+});
+
+describe('App workspaces', () => {
+  const turn = (id: string, role: 'user' | 'assistant', content: string) => ({
+    id, role, content, sources: [], timestamp: 1_700_000_000_000, timings: null, traceId: null,
+  });
+
+  function stubServer() {
+    const listedFor: (string | undefined)[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost');
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (url.pathname === '/health') return jsonResponse({ status: 'ok' });
+      if (url.pathname === '/config') return jsonResponse(makeConfigPayload({ workspaces_enabled: true }));
+      if (url.pathname === '/access') return jsonResponse({ access: 'open' });
+      if (url.pathname === '/workspaces') return jsonResponse({ enabled: true, workspaces: ['legal'] });
+      if (url.pathname === '/documents') {
+        listedFor.push(headers['X-Workspace']);
+        const filenames = headers['X-Workspace'] === 'legal' ? ['contract.txt'] : ['guide.md'];
+        return jsonResponse({ filenames, chunk_counts: Object.fromEntries(filenames.map((f) => [f, 1])) });
+      }
+      throw new Error(`unexpected fetch: ${url.pathname}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return listedFor;
+  }
+
+  afterEach(async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('');
+  });
+
+  it('opens a fresh chat when the workspace changes, and returns to a conversation’s own workspace', async () => {
+    localStorage.setItem(
+      'docrag-chat-history',
+      JSON.stringify({
+        version: 2,
+        activeConversationId: 'default-chat',
+        conversations: [
+          { id: 'default-chat', title: 'Guide question', createdAt: 2, updatedAt: 2,
+            turns: [turn('d1', 'user', 'What is in the guide?'), turn('d2', 'assistant', 'Hybrid retrieval.')] },
+          { id: 'legal-chat', title: 'Contract question', createdAt: 1, updatedAt: 1, workspace: 'legal',
+            turns: [turn('l1', 'user', 'What does the contract say?'), turn('l2', 'assistant', 'Kappa.')] },
+        ],
+      }),
+    );
+    const listedFor = stubServer();
+    render(<App />);
+    expect(await screen.findByText('What is in the guide?')).toBeInTheDocument();
+
+    await openCorpusPanel();
+    const select = await screen.findByTestId('workspace-select');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await userEvent.selectOptions(select, 'legal');
+
+    // The guide conversation stays in the default workspace: a new chat opens here.
+    await waitFor(() => expect(screen.queryByText('What is in the guide?')).not.toBeInTheDocument());
+    await waitFor(() => expect(listedFor.at(-1)).toBe('legal'));
+
+    // Opening the guide conversation brings the default workspace back.
+    await userEvent.click(screen.getByTestId('rail-chat'));
+    const row = screen.getAllByTestId('conversation-select').find((r) => r.textContent?.includes('Guide question'))!;
+    await userEvent.click(row);
+    expect(await screen.findByText('What is in the guide?')).toBeInTheDocument();
+    await waitFor(() => expect(listedFor.at(-1)).toBeUndefined());
+
+    // The legal one is labelled, and opening it switches to legal.
+    const legalRow = screen.getAllByTestId('conversation-select').find((r) => r.textContent?.includes('Contract question'))!;
+    expect(legalRow).toHaveTextContent('legal');
+    await userEvent.click(legalRow);
+    expect(await screen.findByText('What does the contract say?')).toBeInTheDocument();
+    await waitFor(() => expect(listedFor.at(-1)).toBe('legal'));
+    await openCorpusPanel();
+    expect(screen.getByTestId('workspace-select')).toHaveValue('legal');
+  });
+
+  it('says so when a conversation’s workspace was deleted, instead of switching', async () => {
+    localStorage.setItem(
+      'docrag-chat-history',
+      JSON.stringify({
+        version: 2,
+        activeConversationId: 'gone-chat',
+        conversations: [
+          { id: 'gone-chat', title: 'Old', createdAt: 1, updatedAt: 1, workspace: 'archive',
+            turns: [turn('g1', 'user', 'Old question'), turn('g2', 'assistant', 'Old answer.')] },
+        ],
+      }),
+    );
+    const listedFor = stubServer();
+    render(<App />);
+    expect(await screen.findByText('Workspace no longer exists')).toBeInTheDocument();
+    expect(listedFor.every((header) => header === undefined)).toBe(true);
+  });
+});
+
+describe('App workspace switching', () => {
+  type Reply = Response | Promise<Response>;
+  const listing = (filenames: string[]) =>
+    jsonResponse({ filenames, chunk_counts: Object.fromEntries(filenames.map((f) => [f, 1])) });
+  const CORPUS: Record<string, string[]> = { '': ['guide.md', 'shared.md'], legal: ['contract.txt', 'shared.md'] };
+
+  function server(
+    routes: {
+      config?: () => Reply;
+      workspaces?: () => Reply;
+      documents?: (workspace: string) => Reply;
+    } = {},
+  ) {
+    const calls: { path: string; workspace?: string }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), 'http://localhost');
+        const workspace = ((init?.headers ?? {}) as Record<string, string>)['X-Workspace'];
+        calls.push({ path: url.pathname, workspace });
+        if (url.pathname === '/health') return jsonResponse({ status: 'ok' });
+        if (url.pathname === '/config') {
+          return routes.config?.() ?? jsonResponse(makeConfigPayload({ workspaces_enabled: true }));
+        }
+        if (url.pathname === '/access') return jsonResponse({ access: 'open' });
+        if (url.pathname === '/workspaces') {
+          return routes.workspaces?.() ?? jsonResponse({ enabled: true, workspaces: ['legal'] });
+        }
+        if (url.pathname === '/documents') {
+          return routes.documents?.(workspace ?? '') ?? listing(CORPUS[workspace ?? '']);
+        }
+        if (url.pathname === '/search') {
+          return jsonResponse({
+            results: [
+              { rank: 1, filename: 'guide.md', page: 1, section: 'Intro', chunk_id: 'c1', chunk_ordinal: 0,
+                text: 'Hybrid retrieval.', retrieval_score: 0.5, rerank_score: 0.9 },
+            ],
+            timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1 },
+          });
+        }
+        throw new Error(`unexpected fetch: ${url.pathname}`);
+      }),
+    );
+    return calls;
+  }
+
+  afterEach(async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('');
+  });
+
+  const card = (name: string) =>
+    screen.queryAllByTestId('corpus-panel-item').find((item) => item.dataset.corpusCard === name);
+
+  it('leaves nothing of the previous workspace’s corpus to act on while the next one loads', async () => {
+    let answerLegal!: () => void;
+    server({
+      documents: (workspace) =>
+        workspace === 'legal'
+          ? new Promise((resolve) => (answerLegal = () => resolve(listing(CORPUS.legal))))
+          : listing(CORPUS['']),
+    });
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await waitFor(() => expect(card('guide.md')).toBeDefined());
+    await userEvent.click(screen.getByLabelText('Select shared.md'));
+    expect(screen.getByTestId('corpus-bulk')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+
+    await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
+
+    // Not the default workspace's cards, nor its selection ("1 selected" over a
+    // shared.md that exists in both), and not "Upload a document to start." either.
+    expect(card('guide.md')).toBeUndefined();
+    expect(card('shared.md')).toBeUndefined();
+    expect(screen.queryByTestId('corpus-bulk')).not.toBeInTheDocument();
+    expect(screen.getByTestId('question-hint')).not.toHaveTextContent('Upload a document to start.');
+
+    await act(async () => answerLegal());
+    await waitFor(() => expect(card('contract.txt')).toBeDefined());
+    expect(card('shared.md')).toBeDefined();
+    expect(screen.queryByTestId('corpus-bulk')).not.toBeInTheDocument();
+  });
+
+  it('retries a listing that failed after a switch instead of showing an empty corpus', async () => {
+    server({
+      documents: (workspace) =>
+        workspace === 'legal'
+          ? new Response(JSON.stringify({ detail: 'Qdrant is down.' }), { status: 503 })
+          : listing(CORPUS['']),
+    });
+    render(<App />);
+    await screen.findByText('api ok');
+    await openCorpusPanel();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+
+    await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
+
+    await waitFor(() =>
+      expect(screen.getByTestId('question-hint')).toHaveTextContent('Couldn’t load the document list — retrying.'),
+    );
+  });
+
+  it('clears search results of the previous workspace', async () => {
+    server();
+    render(<App />);
+    await screen.findByText('api ok');
+    await userEvent.click(screen.getByTestId('rail-search'));
+    await userEvent.type(screen.getByTestId('search-input'), 'retrieval{Enter}');
+    expect(await screen.findByTestId('search-result')).toBeInTheDocument();
+
+    await openCorpusPanel();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
+    await userEvent.click(screen.getByTestId('rail-search'));
+
+    expect(screen.queryByTestId('search-result')).not.toBeInTheDocument();
+    expect(screen.getByTestId('search-input')).toHaveValue('');
+  });
+
+  it('asks for /config and /access without waiting on the remembered workspace’s check', async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('legal');
+    const calls = server({ workspaces: () => new Promise<Response>(() => {}) });
+    render(<App />);
+
+    expect(await screen.findByText('api ok')).toBeInTheDocument();
+    expect(calls.find((call) => call.path === '/access')?.workspace).toBeUndefined();
+    // The listing still waits: it may be read from a workspace that is gone.
+    expect(calls.some((call) => call.path === '/documents')).toBe(false);
+  });
+
+  it('falls back to the default workspace when the one in use was deleted elsewhere', async () => {
+    const { setWorkspace } = await import('../src/api/client');
+    setWorkspace('legal');
+    const calls = server({
+      documents: (workspace) =>
+        workspace === 'legal'
+          ? new Response(JSON.stringify({ detail: "No workspace named 'legal'." }), { status: 404 })
+          : listing(CORPUS['']),
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Workspace no longer exists')).toBeInTheDocument();
+    await waitFor(() => expect(calls.filter((c) => c.path === '/documents').at(-1)?.workspace).toBeUndefined());
+    await openCorpusPanel();
+    expect(screen.getByTestId('workspace-select')).toHaveValue('');
+    await waitFor(() => expect(card('guide.md')).toBeDefined());
+  });
+
+  it('reads the workspace list again after Settings are saved', async () => {
+    const calls = server();
+    render(<App />);
+    await screen.findByText('api ok');
+    await waitFor(() => expect(calls.filter((c) => c.path === '/workspaces')).toHaveLength(1));
+
+    await userEvent.click(screen.getByTestId('open-settings'));
+    await userEvent.click(await screen.findByTestId('settings-save'));
+
+    await waitFor(() => expect(calls.filter((c) => c.path === '/workspaces')).toHaveLength(2));
+  });
+
+  it('keeps Summarize disabled until the app has booted', async () => {
+    server({ config: () => new Promise<Response>(() => {}) });
+    render(<App />);
+    await openCorpusPanel();
+    await waitFor(() => expect(card('guide.md')).toBeDefined());
+    expect(screen.getByLabelText('Summarize guide.md')).toBeDisabled();
   });
 });

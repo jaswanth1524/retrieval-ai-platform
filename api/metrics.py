@@ -92,6 +92,12 @@ answers_truncated_total = Counter(
     "Answers the provider cut off at the token limit (LLM_MAX_TOKENS).",
 )
 
+summaries_total = Counter(
+    "docrag_summaries_total",
+    "Document summaries and comparisons, labeled by mode and outcome (ok, error).",
+    labelnames=("mode", "outcome"),
+)
+
 citation_retries_total = Counter(
     "docrag_citation_retries_total",
     "Answers that cited nothing and were regenerated once to add citations.",

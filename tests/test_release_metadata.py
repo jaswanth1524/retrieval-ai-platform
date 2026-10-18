@@ -68,6 +68,23 @@ def test_the_frontend_package_carries_the_same_version() -> None:
     assert lock["packages"][""]["version"] == version
 
 
+def test_the_cli_package_carries_the_same_version_and_matching_pins() -> None:
+    """``cli/pyproject.toml`` is a separate distribution (``uv tool install ./cli``); its
+    version and its httpx/mcp bounds must not drift from the app's."""
+
+    with (ROOT / "cli/pyproject.toml").open("rb") as handle:
+        cli = tomllib.load(handle)["project"]
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        app = tomllib.load(handle)["project"]
+
+    assert cli["version"] == _project_version()
+    assert cli["requires-python"] == app["requires-python"]
+    httpx_pin = next(dep for dep in app["dependencies"] if dep.startswith("httpx"))
+    assert httpx_pin in cli["dependencies"]
+    assert cli["optional-dependencies"]["mcp"] == app["optional-dependencies"]["mcp"]
+    assert set(cli["scripts"]) == {"docrag", "docrag-mcp"}
+
+
 def test_the_qdrant_image_is_pinned_to_one_version_everywhere() -> None:
     pattern = re.compile(r"qdrant/qdrant:(v\d+\.\d+\.\d+)")
     files = [".env.example", "docker-compose.yml", ".github/workflows/ci.yml"]

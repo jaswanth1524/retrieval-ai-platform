@@ -13,6 +13,7 @@ from typing import Literal
 
 from fastapi import HTTPException
 
+from api.corpus import bump_corpus_generation
 from api.documents import (
     DocumentError,
     DocumentNotFoundError,
@@ -20,7 +21,12 @@ from api.documents import (
     normalize_filename,
 )
 from api.embeddings import EmbeddingError
-from api.ingestion import IngestionError, ingest_sequencer
+from api.ingestion import (
+    ClosedForWorkError,
+    IngestionError,
+    filename_write_lock,
+    ingest_sequencer,
+)
 from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobStore
 from api.metrics import (
     NO_ERROR_TYPE,
@@ -31,9 +37,12 @@ from api.metrics import (
 from api.pipeline import IngestService
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
+from api.repository import VectorRepository
 from api.schemas import (
     DocumentJobAcceptedResponse,
 )
+from api.settings import AppSettings
+from api.workspaces import WorkspaceClosingError, document_key, filename_of, workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +183,9 @@ def run_ingest_job(
     failed, and overwrote the original of a still-indexed older version.
     """
 
+    # The sequencer's key: the filename, workspace-qualified outside the default one.
+    key = document_key(ingest_service.settings, filename)
+
     def on_progress(done: int, total: int) -> None:
         job_store.update(job_id, state="embedding", chunks_done=done, chunks_total=total)
 
@@ -185,11 +197,11 @@ def run_ingest_job(
         if precondition is not None:
             precondition()
         if sequence is not None:
-            ingest_sequencer.check(filename, sequence)
+            ingest_sequencer.check(key, sequence)
 
     def save_original() -> None:
         if sequence is not None:
-            ingest_sequencer.mark_applied(filename, sequence)
+            ingest_sequencer.mark_applied(key, sequence)
         if raw_store is None:
             return
         try:
@@ -268,6 +280,15 @@ def backlog_full_error() -> HTTPException:
     return HTTPException(status_code=503, detail=BACKLOG_FULL_ERROR, headers={"Retry-After": "15"})
 
 
+def admit_or_refuse(key: str) -> int:
+    """``ingest_sequencer.admit(key)``, or a 409 while its workspace is being deleted."""
+
+    try:
+        return ingest_sequencer.admit(key)
+    except ClosedForWorkError as exc:
+        raise WorkspaceClosingError(exc.group) from None
+
+
 def enqueue_ingest(
     *,
     job_store: JobStore,
@@ -290,14 +311,19 @@ def enqueue_ingest(
     size = len(content)
     if not backlog.try_reserve(size):
         raise backlog_full_error()
-    sequence = ingest_sequencer.admit(filename)
+    key = document_key(ingest_service.settings, filename)
+    try:
+        sequence = admit_or_refuse(key)
+    except HTTPException:
+        backlog.release(size)
+        raise
 
     def release() -> None:
         backlog.release(size)
-        ingest_sequencer.release(filename)
+        ingest_sequencer.release(key)
 
     try:
-        job = job_store.create(filename)
+        job = job_store.create(filename, workspace_of(ingest_service.settings))
     except BaseException:
         release()
         raise
@@ -417,6 +443,15 @@ def refuse_near_duplicate_name(filename: str, existing: Iterable[str]) -> None:
             )
 
 
+def known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
+    """Every indexed filename in ``settings``' workspace plus those with an upload or
+    delete in flight: what a new name is checked against by
+    ``refuse_near_duplicate_name`` (uploads, URL ingest, import and the folder watcher)."""
+
+    in_flight = (filename_of(settings, key) for key in ingest_sequencer.in_flight())
+    return [*repository.filename_metadata(settings), *(name for name in in_flight if name)]
+
+
 def require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
     """The raw store, or a 409: re-indexing reads originals only kept when it's on."""
 
@@ -468,3 +503,78 @@ def finish_ingest_future(
             job_store.update(job_id, state="failed", error=UNRECORDED_OUTCOME_ERROR)
         except Exception:
             logger.exception("Could not mark ingest job %s as failed.", job_id)
+
+
+def delete_indexed_document(
+    repository: VectorRepository,
+    settings: AppSettings,
+    raw_store: RawDocumentStore | None,
+    filename: str,
+) -> int:
+    """Delete a stored document's points and original; the number of points removed.
+
+    ``DELETE /documents/{filename}`` and the folder watcher's removals (api/watch.py).
+    404 when there is nothing to delete, 409 when a newer upload won the race.
+
+    Same lock the ingest path takes: snapshot-then-delete is a read-modify-write, so
+    without it a delete landing between a concurrent ingest's upsert and its
+    stale-cleanup would remove the points that ingest just wrote, and the ingest would
+    still report success. The raw copy (when stored) is removed under the same lock, or
+    a deleted document's original bytes would accumulate forever.
+    """
+
+    # Sequenced like an ingest, and admitted before waiting for the lock, so an
+    # upload already queued for this name is refused when it reaches the lock
+    # instead of indexing the document straight back after the delete.
+    key = document_key(settings, filename)
+    sequence = admit_or_refuse(key)
+    try:
+        with filename_write_lock(key):
+            # The lock isn't fair: an upload admitted after this delete can reach
+            # it first and be indexed. Deleting then would remove the newer
+            # document the user just uploaded, so the delete stands down.
+            superseded = ingest_sequencer.superseded_by(key, sequence)
+            if superseded == "upload":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"A newer upload of '{filename}' was indexed after this "
+                    "delete was requested; it was kept.",
+                )
+            if superseded == "delete":
+                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+            point_ids = repository.point_ids_for_filename(settings, filename)
+            if point_ids:
+                repository.delete_by_ids(settings, point_ids)
+                # Right away, not after the original below: if removing that
+                # raises, cached answers must still stop citing the deleted points.
+                bump_corpus_generation([filename])
+            # Also when no points remain: an original orphaned by an earlier failed
+            # ingest was otherwise undeletable, since the 404 came first.
+            removed_original = _delete_original(raw_store, filename, points_gone=bool(point_ids))
+            if not point_ids and not removed_original:
+                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+            ingest_sequencer.mark_applied(key, sequence, deleted=True)
+    finally:
+        ingest_sequencer.release(key)
+    return len(point_ids)
+
+
+def _delete_original(
+    raw_store: RawDocumentStore | None, filename: str, *, points_gone: bool
+) -> bool:
+    """Remove the stored original; True when one was removed.
+
+    Once the points are gone the delete has happened: a failure removing the original
+    (a read-only or permission-locked RAW_DOCUMENT_DIR) is logged rather than turned
+    into a 500, and a second DELETE removes the orphan through the no-points path.
+    """
+
+    if raw_store is None:
+        return False
+    try:
+        return raw_store.delete(filename)
+    except OSError:
+        if not points_gone:
+            raise
+        logger.exception("Could not remove the stored original of '%s'", filename)
+        return True

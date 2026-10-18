@@ -40,7 +40,7 @@ def test_chunk_overlap_must_be_below_chunk_size_at_startup() -> None:
 
 def test_llm_provider_is_checked_at_startup_case_insensitively() -> None:
     with pytest.raises(ValidationError):
-        AppSettings(_env_file=None, llm_provider="anthropic")  # type: ignore[call-arg]
+        AppSettings(_env_file=None, llm_provider="cohere")  # type: ignore[call-arg]
     settings = AppSettings(_env_file=None, llm_provider=" OpenAI ")  # type: ignore[call-arg]
     assert settings.llm_provider == "openai"
 
@@ -287,3 +287,9 @@ def test_an_unconfigured_default_provider_is_warned_about_at_startup(
     warnings = [record.getMessage() for record in caplog.records]
     assert len(warnings) == 1
     assert "OPENAI_API_KEY" in warnings[0]
+
+
+def test_a_collection_name_with_the_workspace_separator_is_refused() -> None:
+    with pytest.raises(ValidationError, match="__ws_"):
+        AppSettings(_env_file=None, qdrant_collection="docs__ws_legal")  # type: ignore[call-arg]
+    assert AppSettings(_env_file=None, qdrant_collection="docs_ws").qdrant_collection == "docs_ws"  # type: ignore[call-arg]

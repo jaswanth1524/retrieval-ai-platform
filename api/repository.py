@@ -158,10 +158,9 @@ class VectorRepository:
         except (UnexpectedResponse, grpc.RpcError, ValueError) as exc:
             if not _is_missing_collection(exc):
                 raise
-            logger.warning(
-                "Collection %r disappeared while in use; recreating it.",
-                settings.qdrant_collection,
-            )
+            # The default collection is recreated; a workspace's is not (a deleted
+            # workspace stays deleted: ensure_ready raises WorkspaceGoneError).
+            logger.warning("Collection %r disappeared while in use.", settings.qdrant_collection)
             forget_collection(self._client, settings)
             self.ensure_ready(settings)
             return getattr(self._client, method)(*args, **kwargs)
@@ -175,12 +174,14 @@ class VectorRepository:
 
         ensure_collection(self._client, settings, strict=strict)
 
-    def ensure_writable(self, settings: AppSettings) -> None:
+    def ensure_writable(self, settings: AppSettings, *, create_workspace: bool = False) -> None:
         """``ensure_ready`` for a write of new vectors: an empty collection built for
-        another embedding setup is recreated for this one; a non-empty one refuses."""
+        another embedding setup is recreated for this one; a non-empty one refuses.
+        ``create_workspace``: make a missing workspace collection (creating the
+        workspace) instead of refusing it."""
 
-        recreate_if_empty_and_mismatched(self._client, settings)
-        ensure_collection(self._client, settings)
+        recreate_if_empty_and_mismatched(self._client, settings, create_workspace=create_workspace)
+        ensure_collection(self._client, settings, create_workspace=create_workspace)
 
     def hybrid_search(
         self,

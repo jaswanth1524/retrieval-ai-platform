@@ -58,6 +58,9 @@ class IngestJob:
     # Wall clock, for oldest-first ordering that survives a restart
     # (SqliteIngestJobStore).
     created_at_wall: float = field(default_factory=time.time)
+    # The workspace the document is indexed into ("" = the default): a job is only
+    # visible (and cancellable) from its own workspace, as its filename and error are.
+    workspace: str = ""
 
 
 class IngestBacklog:
@@ -121,7 +124,7 @@ class IngestBacklog:
 class JobStore(Protocol):
     """Minimal surface ``api.ingest_jobs`` needs to track background ingest jobs."""
 
-    def create(self, filename: str) -> IngestJob: ...
+    def create(self, filename: str, workspace: str = "") -> IngestJob: ...
 
     def get(self, job_id: str) -> IngestJob | None: ...
 
@@ -139,8 +142,8 @@ class IngestJobStore:
         self._lock = Lock()
         self._jobs: OrderedDict[str, IngestJob] = OrderedDict()
 
-    def create(self, filename: str) -> IngestJob:
-        job = IngestJob(id=str(uuid.uuid4()), filename=filename)
+    def create(self, filename: str, workspace: str = "") -> IngestJob:
+        job = IngestJob(id=str(uuid.uuid4()), filename=filename, workspace=workspace)
         with self._lock:
             self._jobs[job.id] = job
             self._prune_finished_locked()
@@ -197,11 +200,23 @@ class IngestJobStore:
         ingest_jobs_evicted_total.inc(len(still_evicting))
 
 
-_JOB_COLUMNS = "id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall"
+_JOB_COLUMNS = (
+    "id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall, workspace"
+)
 
 
 def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
-    job_id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall = row
+    (
+        job_id,
+        filename,
+        state,
+        chunks_total,
+        chunks_done,
+        error,
+        result_json,
+        created_at_wall,
+        workspace,
+    ) = row
     return IngestJob(
         id=str(job_id),
         filename=str(filename),
@@ -211,6 +226,7 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         error=None if error is None else str(error),
         result=None if result_json is None else json.loads(result_json),
         created_at_wall=float(created_at_wall),
+        workspace=str(workspace),
     )
 
 
@@ -242,10 +258,15 @@ class SqliteIngestJobStore:
                     chunks_done INTEGER NOT NULL,
                     error TEXT,
                     result_json TEXT,
-                    created_at_wall REAL NOT NULL
+                    created_at_wall REAL NOT NULL,
+                    workspace TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            # A file from before workspaces: its jobs were all the default workspace's.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            if "workspace" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
             # Only this process runs jobs (one uvicorn worker), so anything still
             # non-terminal at startup belonged to a process that died mid-ingest. Left
             # as-is, a client polling it would wait forever.
@@ -258,12 +279,13 @@ class SqliteIngestJobStore:
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_transaction(self._path)
 
-    def create(self, filename: str) -> IngestJob:
-        job = IngestJob(id=str(uuid.uuid4()), filename=filename)
+    def create(self, filename: str, workspace: str = "") -> IngestJob:
+        job = IngestJob(id=str(uuid.uuid4()), filename=filename, workspace=workspace)
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, filename, state, chunks_total, chunks_done, "
-                "error, result_json, created_at_wall) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "error, result_json, created_at_wall, workspace) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job.id,
                     job.filename,
@@ -273,6 +295,7 @@ class SqliteIngestJobStore:
                     job.error,
                     None,
                     job.created_at_wall,
+                    job.workspace,
                 ),
             )
             self._prune_finished_locked(conn)

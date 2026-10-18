@@ -1,0 +1,12 @@
+{"question": "¿Con cuántos días de antelación hay que reservar los vuelos?", "relevant_filenames": ["politica_de_viajes.md"], "relevant_passages": ["con al menos diez días de antelación"]}
+{"question": "¿Cuál es la dieta diaria para comidas en el extranjero?", "relevant_filenames": ["politica_de_viajes.md"], "relevant_passages": ["La dieta diaria para comidas en el extranjero es de cincuenta y cinco euros"]}
+{"question": "¿En qué plazo se presentan los justificantes de gastos?", "relevant_filenames": ["politica_de_viajes.md"], "relevant_passages": ["en un plazo de treinta días desde el regreso"]}
+{"question": "Wie viele Urlaubstage haben Vollzeitbeschäftigte?", "relevant_filenames": ["urlaubsrichtlinie.md"], "relevant_passages": ["achtundzwanzig Urlaubstage pro Kalenderjahr"]}
+{"question": "Wie weit im Voraus muss Urlaub beantragt werden?", "relevant_filenames": ["urlaubsrichtlinie.md"], "relevant_passages": ["mindestens drei Wochen im Voraus"]}
+{"question": "Ab wann braucht man bei Krankheit eine ärztliche Bescheinigung?", "relevant_filenames": ["urlaubsrichtlinie.md"], "relevant_passages": ["ab dem dritten Krankheitstag eine ärztliche Bescheinigung"]}
+{"question": "Combien de caractères doit comporter un mot de passe ?", "relevant_filenames": ["securite_informatique.md"], "relevant_passages": ["au moins quatorze caractères"]}
+{"question": "Dans quel délai faut-il signaler un incident de sécurité ?", "relevant_filenames": ["securite_informatique.md"], "relevant_passages": ["dans un délai d'une heure"]}
+{"question": "Combien de temps les sauvegardes sont-elles conservées ?", "relevant_filenames": ["securite_informatique.md"], "relevant_passages": ["conservées pendant quatre-vingt-dix jours"]}
+{"question": "How much is the hotel limit per night when travelling?", "relevant_filenames": ["politica_de_viajes.md"], "relevant_passages": ["ciento sesenta euros por noche"]}
+{"question": "When does unused vacation expire?", "relevant_filenames": ["urlaubsrichtlinie.md"], "relevant_passages": ["verfällt am einunddreißigsten März des Folgejahres"]}
+{"question": "After how many minutes do laptops lock automatically?", "relevant_filenames": ["securite_informatique.md"], "relevant_passages": ["après cinq minutes d'inactivité"]}

@@ -4,6 +4,9 @@ import {
   api,
   apiErrorMessage,
   extractErrorDetail,
+  getWorkspace,
+  onWorkspaceMissing,
+  setWorkspace,
   uploadTimeoutMs,
 } from '../../src/api/client';
 
@@ -464,6 +467,65 @@ describe('askQuestionStream', () => {
     );
   });
 
+  it('sends a document task to the summary route with only the fields it uses', async () => {
+    const frames = [
+      `data: ${JSON.stringify({ type: 'stage', stage: 'summarizing', step: 2, steps: 5 })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'done',
+        answer: 'Summary [1]',
+        sources: [],
+        timings: null,
+        trace_id: null,
+        chunks_read: 40,
+        chunks_total: 300,
+      })}\n\n`,
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse(frames));
+    vi.stubGlobal('fetch', fetchMock);
+    const onStage = vi.fn();
+    const onDone = vi.fn();
+
+    await api.askQuestionStream(
+      'Summarize a.pdf',
+      'ollama',
+      { rerankTopK: 5, maxContextChunks: 4, llmTemperature: 0.3 },
+      ['scoped.pdf'],
+      [{ role: 'user', content: 'earlier' }],
+      { onStage, onDone },
+      undefined,
+      {
+        task: { mode: 'summarize', filenames: ['a.pdf'], instruction: 'risks' },
+        tags: ['finance'],
+        bypassCache: true,
+      },
+    );
+
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/questions\/summary\/stream$/);
+    expect(JSON.parse(sentBody(fetchMock, 0))).toEqual({
+      mode: 'summarize',
+      filenames: ['a.pdf'],
+      instruction: 'risks',
+      llm_provider: 'ollama',
+      llm_temperature: 0.3,
+      use_cache: false,
+    });
+    expect(onStage).toHaveBeenCalledWith('summarizing', { step: 2, steps: 5 });
+    expect(onDone.mock.calls[0][5]).toMatchObject({ coverage: { read: 40, total: 300 } });
+  });
+
+  it('reports follow-ups sent after done, keeping only strings', async () => {
+    const frames = [
+      `data: ${JSON.stringify({ type: 'done', answer: 'a [1]', sources: [], timings: null, trace_id: null })}\n\n`,
+      `data: ${JSON.stringify({ type: 'followups', questions: ['Next?', 7, 'More?'] })}\n\n`,
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(frames)));
+    const onFollowups = vi.fn();
+
+    await api.askQuestionStream('q', undefined, undefined, undefined, undefined, { onFollowups });
+
+    expect(onFollowups).toHaveBeenCalledWith(['Next?', 'More?']);
+  });
+
   it('reads frames the way any SSE source may send them', async () => {
     // CRLF endings (a proxy rewrote them), a comment, one event's data split over two
     // lines and split across chunks, no space after the colon, and a last frame with
@@ -885,5 +947,123 @@ describe('apiErrorMessage', () => {
     expect(apiErrorMessage(new ApiClientError('Not found.', 404), 'fallback')).toBe('Not found.');
     expect(apiErrorMessage(new TypeError('boom'), 'fallback')).toBe('fallback');
     expect(apiErrorMessage('x', 'fallback')).toBe('fallback');
+  });
+});
+
+describe('workspace header', () => {
+  afterEach(() => setWorkspace(''));
+
+  it('names the chosen workspace on every request, and nothing for the default', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(200, { filenames: [] })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.listDocuments();
+    setWorkspace('legal');
+    await api.listDocuments();
+
+    const headers = (call: number) => (fetchMock.mock.calls[call][1] as RequestInit).headers as Record<string, string>;
+    expect(headers(0)['X-Workspace']).toBeUndefined();
+    expect(headers(1)['X-Workspace']).toBe('legal');
+  });
+
+  it("is held per tab: another tab's choice only seeds the next tab", () => {
+    setWorkspace('legal');
+    // Another tab switching writes the shared storage key.
+    localStorage.setItem('docrag-workspace', 'research');
+    expect(getWorkspace()).toBe('legal');
+    expect(localStorage.getItem('docrag-workspace')).toBe('research');
+  });
+});
+
+describe('workspace an operation started in', () => {
+  afterEach(() => {
+    setWorkspace('');
+    onWorkspaceMissing(null);
+  });
+  const headers = (mock: { mock: { calls: unknown[][] } }, call: number) =>
+    (mock.mock.calls[call][1] as RequestInit).headers as Record<string, string>;
+
+  it('is sent instead of the one in use, the default (no header) included', async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      // Also a finished job, for the poll.
+      Promise.resolve(jsonResponse(200, { filename: 'a.txt', state: 'done' })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Started in the default workspace; another is in use by the time it is sent.
+    setWorkspace('legal');
+    await api.deleteDocument('a.txt', undefined, '');
+    await api.setDocumentTags('a.txt', ['x'], undefined, '');
+    setWorkspace('');
+    await api.reindexDocument('a.txt', undefined, 'legal');
+    await api.pollDocumentJob('job-1', undefined, undefined, 'legal');
+
+    expect(headers(fetchMock, 0)['X-Workspace']).toBeUndefined();
+    expect(headers(fetchMock, 1)['X-Workspace']).toBeUndefined();
+    expect(headers(fetchMock, 2)['X-Workspace']).toBe('legal');
+    expect(headers(fetchMock, 3)['X-Workspace']).toBe('legal');
+  });
+
+  it('is never sent with /config or /access, which a deleted workspace would 404', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(200, { access: 'full' })));
+    vi.stubGlobal('fetch', fetchMock);
+    setWorkspace('legal');
+
+    await api.config();
+    await api.access();
+
+    expect(headers(fetchMock, 0)['X-Workspace']).toBeUndefined();
+    expect(headers(fetchMock, 1)['X-Workspace']).toBeUndefined();
+  });
+
+  it('is reported when the server no longer has it, naming the workspace the request went to', async () => {
+    const missing = vi.fn();
+    onWorkspaceMissing(missing);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(() =>
+        Promise.resolve(jsonResponse(404, { detail: "No workspace named 'legal'." })),
+      ),
+    );
+    setWorkspace('');
+
+    await expect(api.listDocuments(undefined, 'legal')).rejects.toMatchObject({ statusCode: 404 });
+    expect(missing).toHaveBeenCalledWith('legal');
+
+    // A plain 404 (a document that isn't there) is not that.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(404, { detail: 'No such document.' }))),
+    );
+    setWorkspace('legal');
+    await expect(api.deleteDocument('a.txt')).rejects.toMatchObject({ statusCode: 404 });
+    expect(missing).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('uploadFromUrl', () => {
+  it('waits longer than the server may take to fetch the document', async () => {
+    vi.useFakeTimers();
+    let aborted = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }),
+      ),
+    );
+
+    const promise = api.uploadFromUrl('https://example.com/a.pdf');
+    promise.catch(() => {});
+    // URL_INGEST_TIMEOUT_SECONDS is 30 by default; the old 15 s budget gave up first.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(aborted).toBe(true);
+    vi.useRealTimers();
   });
 });

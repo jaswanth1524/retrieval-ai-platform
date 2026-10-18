@@ -21,7 +21,7 @@ REQUEST_TEMPERATURE_MAX = 2.0
 # MAX_QUESTION_CHARS (src/utils/limits.ts) must match; tests/test_schemas_limits.py checks.
 MAX_QUESTION_CHARS = 4000
 # Providers a question may name per request (routes/questions.py's allowlist reads these).
-RequestProvider = Literal["ollama", "openai", "openai_compatible"]
+RequestProvider = Literal["ollama", "openai", "openai_compatible", "anthropic"]
 
 # Bounds for the client-sent conversation history on QuestionRequest. The server
 # also has its own conversation_max_history_messages setting for further truncation;
@@ -110,10 +110,17 @@ class PublicConfigResponse(BaseModel):
     # OPENAI_COMPATIBLE_BASE_URL and _MODEL are set (the server itself isn't probed).
     openai_compatible_available: bool = False
     openai_compatible_model: str = ""
+    # WORKSPACES_ENABLED: requests may name a workspace (X-Workspace).
+    workspaces_enabled: bool = False
+    # URL_INGEST_ENABLED: POST /documents/from-url is available.
+    url_ingest_enabled: bool = False
+    # ANTHROPIC_API_KEY is set (the key itself is never checked here).
+    anthropic_available: bool = False
+    anthropic_model: str = ""
     # Providers a question may choose per request (ALLOWED_REQUEST_PROVIDERS, plus
     # LLM_PROVIDER). Whether each is reachable is the *_available fields above.
     allowed_request_providers: list[str] = Field(
-        default_factory=lambda: ["ollama", "openai", "openai_compatible"]
+        default_factory=lambda: ["ollama", "openai", "openai_compatible", "anthropic"]
     )
     # File suffixes an upload may have (".pdf", ".epub", ...), so the UI's file picker
     # and its pre-upload check follow the server instead of a hard-coded copy.
@@ -215,6 +222,10 @@ class FeedbackRequest(BaseModel):
     # Set only when the rating targets one specific citation (its [n] source_number
     # as shown in the answer), rather than the answer as a whole.
     citation_source_number: int | None = Field(default=None, ge=1, le=FEEDBACK_CITATION_NUMBER_MAX)
+    # What was rated: an answer to a question (the default, and all a client that
+    # predates this sends), a suggested follow-up question, or a summary/comparison.
+    # Only "question" ratings become retrieval labels (eval/feedback_dataset.py).
+    kind: Literal["question", "follow_up", "summary"] = "question"
 
 
 class FeedbackResponse(BaseModel):
@@ -237,6 +248,7 @@ class FeedbackItemResponse(BaseModel):
     rating: Literal["up", "down"]
     citation_source_number: int | None
     created_at: float
+    kind: Literal["question", "follow_up", "summary"] = "question"
 
 
 class FeedbackListResponse(BaseModel):
@@ -482,6 +494,70 @@ class QuestionResponse(BaseModel):
     top_rerank_score: float | None = None
     # The provider stopped at the token limit (LLM_MAX_TOKENS): the answer is cut off.
     truncated: bool = False
+    # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.
+    followups: list[str] = []
+
+
+class WorkspaceCreateRequest(BaseModel):
+    """Create a workspace (POST /workspaces); see api/workspaces.py for the name rule."""
+
+    name: str = Field(min_length=1, max_length=64)
+
+
+class WorkspaceResponse(BaseModel):
+    name: str
+
+
+class WorkspaceListResponse(BaseModel):
+    """The workspaces besides the default one (which has no name and is always there)."""
+
+    enabled: bool
+    workspaces: list[str]
+
+
+class UrlIngestRequest(BaseModel):
+    """Index a document fetched from a URL (POST /documents/from-url)."""
+
+    url: str = Field(min_length=1, max_length=2048)
+    # The stored name; else the server's Content-Disposition, else the URL's last path
+    # segment (with an extension from the content type when it names no supported one).
+    filename: RequestFilename | None = None
+
+
+class SummaryRequest(BaseModel):
+    """Summarize one whole document, or compare two (POST /questions/summary)."""
+
+    mode: Literal["summarize", "compare"]
+    # One document to summarize, two (different ones) to compare.
+    filenames: list[RequestFilename] = Field(min_length=1, max_length=2)
+    # What to concentrate on ("deadlines", "risks"); omitted for a general summary.
+    instruction: str | None = Field(default=None, max_length=MAX_QUESTION_CHARS)
+    llm_provider: RequestProvider | None = None
+    llm_temperature: float | None = Field(
+        default=None, ge=REQUEST_TEMPERATURE_MIN, le=REQUEST_TEMPERATURE_MAX
+    )
+    # False skips the answer cache's lookup (Regenerate); the new summary is still cached.
+    use_cache: bool = True
+
+    @model_validator(mode="after")
+    def _validate_document_count(self) -> SummaryRequest:
+        wanted = 2 if self.mode == "compare" else 1
+        if len(self.filenames) != wanted or len(set(self.filenames)) != wanted:
+            raise ValueError(
+                "compare takes two different documents"
+                if self.mode == "compare"
+                else "summarize takes one document"
+            )
+        return self
+
+
+class SummaryResponse(QuestionResponse):
+    """A summary or comparison: an answer, plus how much of the documents it read."""
+
+    # Passages read, of the passages the documents hold. Fewer when a long document was
+    # read at evenly spaced passages (SUMMARY_MAX_BATCHES parts per request).
+    chunks_read: int = 0
+    chunks_total: int = 0
 
 
 class AccessResponse(BaseModel):
@@ -531,6 +607,10 @@ class SearchTimingsResponse(BaseModel):
 class SearchResponse(BaseModel):
     results: list[SearchResultResponse]
     timings: SearchTimingsResponse
+    # No passage cleared RERANK_MIN_SCORE (the bar an answer's sources must clear); the
+    # results are the closest ones, best first. Typical of a one- or two-word search,
+    # which the cross-encoder scores low even against a passage containing the words.
+    weak_matches: bool = False
 
 
 class ImportResponse(BaseModel):

@@ -19,8 +19,11 @@ import type {
   ImportResponse,
   LlmProvider,
   PublicConfigResponse,
+  DocumentTask,
   QuestionOptions,
   QuestionOverrides,
+  SummaryCoverage,
+  WorkspaceListResponse,
   TimingsResponse,
   TraceDetailResponse,
   TraceListResponse,
@@ -65,9 +68,48 @@ export function setApiKey(key: string): void {
   writeStored(API_KEY_STORAGE_KEY, key || null);
 }
 
-function authHeaders(): Record<string, string> {
+// The workspace this browser works in (WORKSPACES_ENABLED); '' is the default one,
+// which needs no header — so a server without workspaces never sees it.
+const WORKSPACE_STORAGE_KEY = 'docrag-workspace';
+// Held per tab: storage only seeds the next tab. Read from storage on every request,
+// switching in one tab silently sent the other tab's questions to the new workspace.
+let currentWorkspace: string | null = null;
+
+export function getWorkspace(): string {
+  currentWorkspace ??= readStored(WORKSPACE_STORAGE_KEY) ?? '';
+  return currentWorkspace;
+}
+
+export function setWorkspace(name: string): void {
+  currentWorkspace = name;
+  writeStored(WORKSPACE_STORAGE_KEY, name || null);
+}
+
+// Told when a request sent with a workspace's header comes back 404 "No workspace named
+// …": that workspace was deleted elsewhere (another tab, the CLI). Given the workspace
+// the request was sent with, which needn't be the one in use by then.
+const WORKSPACE_MISSING_PREFIX = 'No workspace named';
+let workspaceMissingListener: ((workspace: string) => void) | null = null;
+
+export function onWorkspaceMissing(listener: ((workspace: string) => void) | null): void {
+  workspaceMissingListener = listener;
+}
+
+function noteWorkspaceMissing(sentWorkspace: string, status: number, detail: string): void {
+  if (status === 404 && sentWorkspace && detail.startsWith(WORKSPACE_MISSING_PREFIX)) {
+    workspaceMissingListener?.(sentWorkspace);
+  }
+}
+
+/** `workspace`: the one to send instead of the one in use — an operation started in a
+ *  workspace keeps going to it after a switch ('' = the default, no header). */
+function authHeaders(workspace?: string): Record<string, string> {
   const key = getApiKey();
-  return key ? { 'X-API-Key': key } : {};
+  workspace ??= getWorkspace();
+  return {
+    ...(key ? { 'X-API-Key': key } : {}),
+    ...(workspace ? { 'X-Workspace': workspace } : {}),
+  };
 }
 
 // Without a timeout, a hung backend (a stalled Ollama call, a network blip) leaves
@@ -79,10 +121,18 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 interface RequestOptions extends Omit<RequestInit, 'headers'> {
   timeoutMs?: number;
   headers?: Record<string, string>;
+  /** Sent instead of the workspace in use (see authHeaders). */
+  workspace?: string;
 }
 
 async function request<T>(path: string, options?: RequestOptions): Promise<T> {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, headers, ...init } = options ?? {};
+  const {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    signal: callerSignal,
+    headers,
+    workspace = getWorkspace(),
+    ...init
+  } = options ?? {};
   const timeoutController = new AbortController();
   const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
   // Let the caller's own signal (e.g. aborted on component unmount) cancel the
@@ -100,7 +150,7 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
     try {
       response = await fetch(`${BASE_URL}${path}`, {
         ...init,
-        headers: { ...authHeaders(), ...headers },
+        headers: { ...authHeaders(workspace), ...headers },
         signal: timeoutController.signal,
       });
     } catch (err) {
@@ -110,11 +160,9 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
       throw new ApiClientError(`API request failed: ${(err as Error).message}`);
     }
     if (!response.ok) {
-      throw new ApiClientError(
-        await extractErrorDetail(response),
-        response.status,
-        retryAfterSeconds(response),
-      );
+      const detail = await extractErrorDetail(response);
+      noteWorkspaceMissing(workspace, response.status, detail);
+      throw new ApiClientError(detail, response.status, retryAfterSeconds(response));
     }
     try {
       return (await response.json()) as T;
@@ -182,6 +230,7 @@ async function downloadBlob(
   path: string,
   signal?: AbortSignal,
 ): Promise<{ response: Response; blob: Blob }> {
+  const workspace = getWorkspace();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   const abortFromCaller = () => controller.abort();
@@ -191,7 +240,7 @@ async function downloadBlob(
     let response: Response;
     try {
       response = await fetch(`${BASE_URL}${path}`, {
-        headers: authHeaders(),
+        headers: authHeaders(workspace),
         signal: controller.signal,
       });
     } catch (err) {
@@ -199,7 +248,9 @@ async function downloadBlob(
       throw new ApiClientError(`API request failed: ${(err as Error).message}`);
     }
     if (!response.ok) {
-      throw new ApiClientError(await extractErrorDetail(response), response.status);
+      const detail = await extractErrorDetail(response);
+      noteWorkspaceMissing(workspace, response.status, detail);
+      throw new ApiClientError(detail, response.status);
     }
     try {
       return { response, blob: await response.blob() };
@@ -261,6 +312,21 @@ function questionRequestBody(
   return body;
 }
 
+function summaryRequestBody(
+  task: DocumentTask,
+  llmProvider?: LlmProvider,
+  overrides?: QuestionOverrides,
+  options?: QuestionOptions,
+): Record<string, unknown> {
+  // Only what a summary uses: retrieval overrides, scope and history don't apply to it.
+  const body: Record<string, unknown> = { mode: task.mode, filenames: task.filenames };
+  if (task.instruction) body.instruction = task.instruction;
+  if (llmProvider) body.llm_provider = llmProvider;
+  if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
+  if (options?.bypassCache) body.use_cache = false;
+  return body;
+}
+
 /** A page of GET /documents/{filename}/content. */
 export interface ContentPage {
   around?: string;
@@ -273,9 +339,12 @@ export interface QuestionStreamHandlers {
   // Which pipeline stage the server just started, before any token exists. Retrieval
   // can run for tens of seconds on a whole-corpus question, so this is the difference
   // between a progress indicator and a frozen one.
-  onStage?: (stage: string) => void;
+  // `progress`: step of steps through a multi-step stage (a summary's parts).
+  onStage?: (stage: string, progress?: { step: number; steps: number }) => void;
   onSources?: (sources: CitationResponse[], traceId: string | null) => void;
   onDelta?: (text: string) => void;
+  // Suggested next questions, after `done` (FOLLOWUPS_ENABLED on the server).
+  onFollowups?: (questions: string[]) => void;
   onDone?: (
     answer: string,
     sources: CitationResponse[],
@@ -286,12 +355,14 @@ export interface QuestionStreamHandlers {
       answerStatus?: AnswerStatus;
       topRerankScore?: number | null;
       truncated?: boolean;
+      /** Summaries only: passages read, of the passages the documents hold. */
+      coverage?: SummaryCoverage;
     },
   ) => void;
 }
 
 type QuestionStreamEvent =
-  | { type: 'stage'; stage: string }
+  | { type: 'stage'; stage: string; step?: number; steps?: number }
   | { type: 'sources'; sources: CitationResponse[]; trace_id: string | null }
   | { type: 'delta'; text: string }
   | {
@@ -304,7 +375,10 @@ type QuestionStreamEvent =
       answer_status?: AnswerStatus;
       top_rerank_score?: number | null;
       truncated?: boolean;
+      chunks_read?: number;
+      chunks_total?: number;
     }
+  | { type: 'followups'; questions: string[] }
   | { type: 'error'; detail: string };
 
 async function readSseStream(
@@ -368,17 +442,21 @@ async function readSseStream(
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/health', { signal }),
 
-  config: (signal?: AbortSignal) => request<PublicConfigResponse>('/config', { signal }),
+  // Neither depends on a workspace, so neither names one: a remembered workspace deleted
+  // since would 404 /access (it resolves the request's workspace), which read as an
+  // older server and granted full access.
+  config: (signal?: AbortSignal) =>
+    request<PublicConfigResponse>('/config', { signal, workspace: '' }),
 
   // Which key this browser holds: "read" hides what the server would refuse (403).
-  access: (signal?: AbortSignal) => request<AccessResponse>('/access', { signal }),
+  access: (signal?: AbortSignal) => request<AccessResponse>('/access', { signal, workspace: '' }),
 
   // Recorded answer ratings, newest first (full key; 404 when feedback is off).
   listFeedback: (limit = 200, signal?: AbortSignal) =>
     request<FeedbackListResponse>(`/feedback?limit=${limit}`, { signal }),
 
   // Restores a backup zip from exportCorpus: each document is re-indexed as a job.
-  importBackup: (file: File, signal?: AbortSignal) => {
+  importBackup: (file: File, signal?: AbortSignal, workspace?: string) => {
     const form = new FormData();
     form.append('file', file);
     return request<ImportResponse>('/import', {
@@ -388,6 +466,7 @@ export const api = {
       // document, and a fixed two minutes failed big restores on a slow link.
       timeoutMs: uploadTimeoutMs(file.size),
       signal,
+      workspace,
     });
   },
 
@@ -396,10 +475,12 @@ export const api = {
   getDocumentOriginal: async (filename: string, signal?: AbortSignal): Promise<Blob> =>
     (await downloadBlob(`/documents/${encodeURIComponent(filename)}/original`, signal)).blob,
 
-  listDocuments: (signal?: AbortSignal) =>
-    request<DocumentListResponse>('/documents', { signal }),
+  // `workspace` on the corpus calls below: the workspace the operation was started in
+  // (see authHeaders); the one in use when absent.
+  listDocuments: (signal?: AbortSignal, workspace?: string) =>
+    request<DocumentListResponse>('/documents', { signal, workspace }),
 
-  uploadDocument: (file: File, signal?: AbortSignal) => {
+  uploadDocument: (file: File, signal?: AbortSignal, workspace?: string) => {
     const form = new FormData();
     // Do NOT set Content-Type manually — the browser sets the multipart boundary.
     form.append('file', file);
@@ -408,37 +489,70 @@ export const api = {
       body: form,
       timeoutMs: uploadTimeoutMs(file.size),
       signal,
+      workspace,
     });
   },
 
+  // Workspaces besides the default (GET answers {enabled: false} when they are off).
+  listWorkspaces: (signal?: AbortSignal) =>
+    request<WorkspaceListResponse>('/workspaces', { signal }),
+
+  createWorkspace: (name: string) =>
+    request<{ name: string }>('/workspaces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }),
+
+  // Only an empty one (409 while it holds documents).
+  deleteWorkspace: (name: string) =>
+    request<{ name: string }>(`/workspaces/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // The server fetches the URL's document and indexes it like an upload (URL_INGEST_ENABLED);
+  // poll the job the same way. 400 names why a URL can't be fetched.
+  // The server answers once it has fetched the document (up to URL_INGEST_TIMEOUT_SECONDS,
+  // 30 s by default): the 15 s default reported a fetch still running as failed.
+  uploadFromUrl: (url: string, signal?: AbortSignal, workspace?: string) =>
+    request<DocumentJobAcceptedResponse>('/documents/from-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+      workspace,
+    }),
+
   // Re-chunks and re-embeds a document from its stored original; poll the job like an
   // upload's. 409 when the server keeps no originals, 404 when this one has none.
-  reindexDocument: (filename: string, signal?: AbortSignal) =>
+  reindexDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobAcceptedResponse>(`/documents/${encodeURIComponent(filename)}/reindex`, {
       method: 'POST',
       signal,
+      workspace,
     }),
 
   // Stops an ingest job that is still queued or hasn't written to the index yet (409 once
   // it has: point ids are deterministic, so a half-written document can't be rolled
   // back). The job then ends `failed` with `cancelled: true`; keep polling to see it.
-  cancelDocumentJob: (jobId: string, signal?: AbortSignal) =>
+  cancelDocumentJob: (jobId: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobStatusResponse>(`/documents/jobs/${encodeURIComponent(jobId)}`, {
       method: 'DELETE',
       signal,
+      workspace,
     }),
 
   // Re-indexes every document chunked by an older chunker that has a stored original.
-  reindexStaleDocuments: (signal?: AbortSignal) =>
-    request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal }),
+  reindexStaleDocuments: (signal?: AbortSignal, workspace?: string) =>
+    request<DocumentReindexAllResponse>('/documents/reindex', { method: 'POST', signal, workspace }),
 
   // Replaces a document's tags (an empty list clears them). Payload-only on the server.
-  setDocumentTags: (filename: string, tags: string[], signal?: AbortSignal) =>
+  setDocumentTags: (filename: string, tags: string[], signal?: AbortSignal, workspace?: string) =>
     request<DocumentTagsResponse>(`/documents/${encodeURIComponent(filename)}/tags`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags }),
       signal,
+      workspace,
     }),
 
   // The whole-corpus backup zip (manifest, stored originals, feedback). Needs the full
@@ -450,10 +564,11 @@ export const api = {
     return { blob, filename };
   },
 
-  deleteDocument: (filename: string, signal?: AbortSignal) =>
+  deleteDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
       method: 'DELETE',
       signal,
+      workspace,
     }),
 
   // Reconstructs a document from its stored chunks (ordinal order) for the source
@@ -509,6 +624,7 @@ export const api = {
     jobId: string,
     onProgress?: (status: DocumentJobStatusResponse) => void,
     signal?: AbortSignal,
+    workspace?: string,
   ): Promise<DocumentJobStatusResponse> => {
     let intervalMs = JOB_POLL_INITIAL_MS;
     let lastProgress = '';
@@ -518,6 +634,7 @@ export const api = {
       try {
         status = await request<DocumentJobStatusResponse>(`/documents/jobs/${encodeURIComponent(jobId)}`, {
           signal,
+          workspace,
         });
         transientFailures = 0;
       } catch (err) {
@@ -582,15 +699,19 @@ export const api = {
     // An already-aborted signal never fires 'abort', so the question was sent anyway.
     if (signal?.aborted) timeoutController.abort();
     let sawDone = false;
+    const workspace = getWorkspace();
 
     try {
       let response: Response;
       try {
-        response = await fetch(`${BASE_URL}/questions/stream`, {
+        const task = options?.task;
+        response = await fetch(`${BASE_URL}${task ? '/questions/summary/stream' : '/questions/stream'}`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          headers: { 'Content-Type': 'application/json', ...authHeaders(workspace) },
           body: JSON.stringify(
-            questionRequestBody(question, llmProvider, overrides, filenames, history, options),
+            task
+              ? summaryRequestBody(task, llmProvider, overrides, options)
+              : questionRequestBody(question, llmProvider, overrides, filenames, history, options),
           ),
           signal: timeoutController.signal,
         });
@@ -602,11 +723,9 @@ export const api = {
       }
 
       if (!response.ok) {
-        throw new ApiClientError(
-      await extractErrorDetail(response),
-      response.status,
-      retryAfterSeconds(response),
-    );
+        const detail = await extractErrorDetail(response);
+        noteWorkspaceMissing(workspace, response.status, detail);
+        throw new ApiClientError(detail, response.status, retryAfterSeconds(response));
       }
 
       // Body reading needs the same error translation the fetch above already has.
@@ -617,8 +736,14 @@ export const api = {
         await readSseStream(
           response,
           (event) => {
-            if (event.type === 'stage') handlers.onStage?.(event.stage);
-            else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
+            if (event.type === 'stage') {
+              handlers.onStage?.(
+                event.stage,
+                typeof event.step === 'number' && typeof event.steps === 'number'
+                  ? { step: event.step, steps: event.steps }
+                  : undefined,
+              );
+            } else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
             else if (event.type === 'delta') handlers.onDelta?.(event.text);
             else if (event.type === 'done') {
               sawDone = true;
@@ -632,8 +757,15 @@ export const api = {
                   answerStatus: event.answer_status,
                   topRerankScore: event.top_rerank_score,
                   truncated: event.truncated,
+                  ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'
+                    ? { coverage: { read: event.chunks_read, total: event.chunks_total } }
+                    : {}),
                 },
               );
+            } else if (event.type === 'followups') {
+              if (Array.isArray(event.questions)) {
+                handlers.onFollowups?.(event.questions.filter((item) => typeof item === 'string'));
+              }
             } else if (event.type === 'error') throw new ApiClientError(event.detail);
           },
           resetIdleTimeout,

@@ -28,7 +28,15 @@ from api.settings import AppSettings
 # Every route under these prefixes (and the exact paths) is key-guarded; see CLAUDE.md.
 # /health, /health/ready, /config and the static frontend stay open. The API docs are
 # guarded too: open, they listed every route and schema of a key-protected instance.
-GUARDED_PREFIXES = ("/documents", "/questions", "/traces", "/feedback", "/docs", "/redoc")
+GUARDED_PREFIXES = (
+    "/documents",
+    "/questions",
+    "/traces",
+    "/feedback",
+    "/workspaces",
+    "/docs",
+    "/redoc",
+)
 GUARDED_EXACT = frozenset({"/metrics", "/export", "/access", "/search", "/import", "/openapi.json"})
 # Room for the multipart boundary and part headers around an upload's own bytes.
 UPLOAD_OVERHEAD_BYTES = 64 * 1024
@@ -78,9 +86,11 @@ def needs_full_key(method: str, path: str) -> bool:
         return True
     if method == "POST" and path == "/import":
         return True
+    if method in ("POST", "DELETE") and (path == "/workspaces" or path.startswith("/workspaces/")):
+        return True
     if method == "DELETE" and path.startswith("/documents/"):
         return True
-    if method == "POST" and path in ("/documents", "/documents/reindex"):
+    if method == "POST" and path in ("/documents", "/documents/reindex", "/documents/from-url"):
         return True
     return method in ("POST", "PATCH") and _REINDEX_OR_TAGS.match(path) is not None
 

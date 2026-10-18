@@ -57,4 +57,5 @@ def register(app: FastAPI) -> None:
             timings=SearchTimingsResponse(
                 embed_ms=phase.embed_ms, search_ms=phase.search_ms, rerank_ms=phase.rerank_ms
             ),
+            weak_matches=phase.below_min_score,
         )

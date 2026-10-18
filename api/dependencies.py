@@ -34,7 +34,16 @@ from api.repository import (
 )
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
+from api.summarize import DocumentSummarizer
 from api.tracing import TraceStore
+from api.workspaces import (
+    WORKSPACE_HEADER,
+    WorkspaceError,
+    settings_for,
+    validate_name,
+    workspace_exists,
+    workspace_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +223,31 @@ def get_vector_repository(
     return VectorRepository(client)
 
 
+def get_request_settings(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+    client: Annotated[QdrantClient, Depends(get_qdrant_client)],
+    x_workspace: Annotated[str | None, Header(alias=WORKSPACE_HEADER)] = None,
+) -> AppSettings:
+    """The settings this request runs with: the app's, pointed at the workspace its
+    ``X-Workspace`` header names (api/workspaces.py). No header (or an empty one) is the
+    default workspace, so a client that has never heard of workspaces is unaffected.
+    """
+
+    if not x_workspace or not x_workspace.strip():
+        return settings
+    if not settings.workspaces_enabled:
+        raise HTTPException(status_code=400, detail="Workspaces are not enabled on this server.")
+    try:
+        name = validate_name(x_workspace)
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Never created implicitly: the repository recreates a missing collection on use,
+    # so a typo in the header would otherwise become a new, empty workspace.
+    if not workspace_exists(client, settings.qdrant_collection, name):
+        raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
+    return settings_for(settings, name)
+
+
 @lru_cache
 def get_trace_store() -> TraceStore:
     """Return the process-wide per-query debug trace store.
@@ -232,7 +266,7 @@ def get_rag_pipeline(
     embedding_provider: Annotated[LocalEmbeddingProvider, Depends(get_embedding_provider)],
     reranker: Annotated[LocalCrossEncoderReranker, Depends(get_reranker)],
     generator: Annotated[LiteLLMGenerator, Depends(get_generator)],
-    settings: Annotated[AppSettings, Depends(get_app_settings)],
+    settings: Annotated[AppSettings, Depends(get_request_settings)],
     trace_store: Annotated[TraceStore, Depends(get_trace_store)],
     answer_cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
 ) -> RagPipeline:
@@ -246,6 +280,24 @@ def get_rag_pipeline(
         settings=settings,
         # The gate reads the *injected* settings (not a direct get_app_settings()
         # call) so a test overriding get_app_settings controls trace_enabled too.
+        trace_store=trace_store if settings.trace_enabled else None,
+        answer_cache=answer_cache,
+    )
+
+
+def get_document_summarizer(
+    repository: Annotated[VectorRepository, Depends(get_vector_repository)],
+    generator: Annotated[LiteLLMGenerator, Depends(get_generator)],
+    settings: Annotated[AppSettings, Depends(get_request_settings)],
+    trace_store: Annotated[TraceStore, Depends(get_trace_store)],
+    answer_cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+) -> DocumentSummarizer:
+    """Return the whole-document summary seam (POST /questions/summary)."""
+
+    return DocumentSummarizer(
+        repository=repository,
+        generator=generator,
+        settings=settings,
         trace_store=trace_store if settings.trace_enabled else None,
         answer_cache=answer_cache,
     )
@@ -298,7 +350,7 @@ def get_token_counter() -> TokenCounter:
 def get_ingest_service(
     repository: Annotated[VectorRepository, Depends(get_vector_repository)],
     embedding_provider: Annotated[LocalEmbeddingProvider, Depends(get_embedding_provider)],
-    settings: Annotated[AppSettings, Depends(get_app_settings)],
+    settings: Annotated[AppSettings, Depends(get_request_settings)],
     token_counter: Annotated[TokenCounter, Depends(get_token_counter)],
 ) -> IngestService:
     """Return the ingest orchestration seam: parse -> chunk -> embed -> index."""
@@ -340,6 +392,30 @@ def get_raw_document_store() -> RawDocumentStore | None:
 
     directory = get_app_settings().raw_document_dir
     return RawDocumentStore(directory) if directory else None
+
+
+@lru_cache
+def _workspace_raw_store(directory: str) -> RawDocumentStore:
+    return RawDocumentStore(directory)
+
+
+def clear_workspace_raw_stores() -> None:
+    """Forget the per-workspace originals stores (a workspace was deleted)."""
+
+    _workspace_raw_store.cache_clear()
+
+
+def get_request_raw_store(
+    base: Annotated[RawDocumentStore | None, Depends(get_raw_document_store)],
+    settings: Annotated[AppSettings, Depends(get_request_settings)],
+) -> RawDocumentStore | None:
+    """The originals store for this request's workspace: the app's own for the default
+    workspace (so overriding ``get_raw_document_store`` still cascades), a directory of
+    its own under ``RAW_DOCUMENT_DIR/workspaces/`` for any other."""
+
+    if base is None or not workspace_of(settings):
+        return base
+    return _workspace_raw_store(settings.raw_document_dir)
 
 
 @lru_cache
@@ -408,6 +484,7 @@ def clear_dependency_caches() -> None:
     get_token_counter.cache_clear()
     get_ingest_job_store.cache_clear()
     get_raw_document_store.cache_clear()
+    _workspace_raw_store.cache_clear()
     get_feedback_store.cache_clear()
     get_ingest_executor.cache_clear()
     get_ingest_backlog.cache_clear()

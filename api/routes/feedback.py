@@ -11,7 +11,7 @@ from api.dependencies import (
     require_full_key,
 )
 from api.metrics import feedback_total
-from api.routes.deps import FeedbackStoreDep
+from api.routes.deps import FeedbackStoreDep, SettingsDep
 from api.schemas import (
     FEEDBACK_LIST_MAX_LIMIT,
     FeedbackItemResponse,
@@ -19,6 +19,7 @@ from api.schemas import (
     FeedbackRequest,
     FeedbackResponse,
 )
+from api.workspaces import workspace_of
 
 
 def register(app: FastAPI) -> None:
@@ -34,7 +35,7 @@ def register(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def submit_feedback(
-        request: FeedbackRequest, feedback_store: FeedbackStoreDep
+        request: FeedbackRequest, feedback_store: FeedbackStoreDep, settings: SettingsDep
     ) -> FeedbackResponse:
         if feedback_store is None:
             raise HTTPException(status_code=404, detail="Feedback capture is not enabled.")
@@ -45,6 +46,10 @@ def register(app: FastAPI) -> None:
             cited_filenames=request.cited_filenames,
             rating=request.rating,
             citation_source_number=request.citation_source_number,
+            # The workspace the rated answer came from (X-Workspace), so its list and
+            # its backups carry only its own ratings.
+            workspace=workspace_of(settings),
+            kind=request.kind,
         )
         feedback_total.labels(rating=request.rating).inc()
         return FeedbackResponse(id=feedback.id)
@@ -59,6 +64,7 @@ def register(app: FastAPI) -> None:
     )
     def list_feedback(
         feedback_store: FeedbackStoreDep,
+        settings: SettingsDep,
         limit: Annotated[int, Query(ge=1, le=FEEDBACK_LIST_MAX_LIMIT)] = 100,
     ) -> FeedbackListResponse:
         if feedback_store is None:
@@ -74,7 +80,8 @@ def register(app: FastAPI) -> None:
                     rating=item.rating,
                     citation_source_number=item.citation_source_number,
                     created_at=item.created_at,
+                    kind=item.kind,
                 )
-                for item in feedback_store.list_recent(limit)
+                for item in feedback_store.list_recent(limit, workspace_of(settings))
             ]
         )

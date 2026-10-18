@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from api.dependencies import (
+    get_app_settings,
     key_access,
     require_api_key,
     require_full_key,
@@ -63,6 +64,10 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
             settings.openai_compatible_base_url and settings.openai_compatible_model
         ),
         openai_compatible_model=settings.openai_compatible_model,
+        anthropic_available=bool(settings.anthropic_api_key),
+        url_ingest_enabled=settings.url_ingest_enabled,
+        workspaces_enabled=settings.workspaces_enabled,
+        anthropic_model=settings.anthropic_model,
         allowed_request_providers=allowed_request_providers(settings),
         supported_extensions=sorted(SUPPORTED_EXTENSIONS),
     )
@@ -77,9 +82,12 @@ def register(app: FastAPI) -> None:
     async def health() -> HealthResponse:
         return HealthResponse(status="ok", version=app_version())
 
+    # The app's settings, never an X-Workspace one, as /config: a probe or a browser
+    # holding a since-deleted workspace must not get a 404 (or 400 with workspaces off)
+    # from a readiness check, and the index checked is the app's own collection.
     @app.get("/health/ready")
     def health_ready(
-        settings: SettingsDep,
+        settings: Annotated[AppSettings, Depends(get_app_settings)],
         check_qdrant: QdrantCheckDep,
         qdrant_client: QdrantClientDep,
         check_ollama: OllamaCheckDep,
@@ -96,6 +104,8 @@ def register(app: FastAPI) -> None:
             provider_ok = bool(
                 settings.openai_compatible_base_url and settings.openai_compatible_model
             )
+        elif provider == "anthropic":
+            provider_ok = bool(settings.anthropic_api_key)
         else:
             provider_ok = bool(settings.openai_api_key)
         index_detail = index_compatibility(qdrant_client, settings) if qdrant_ok else None
@@ -119,8 +129,13 @@ def register(app: FastAPI) -> None:
     def metrics() -> Response:
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+    # The app's settings, not a workspace's: the UI boots from /config, and a workspace
+    # remembered in the browser but since deleted must not stop it booting (404).
     @app.get("/config", response_model=PublicConfigResponse)
-    def config(settings: SettingsDep, check_ollama: OllamaCheckDep) -> PublicConfigResponse:
+    def config(
+        settings: Annotated[AppSettings, Depends(get_app_settings)],
+        check_ollama: OllamaCheckDep,
+    ) -> PublicConfigResponse:
         return public_config(settings, ollama_available=check_ollama(settings))
 
     # Guarded (any valid key): /config is open, so it can't say which key the caller

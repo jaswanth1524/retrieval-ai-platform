@@ -25,6 +25,14 @@ describe('isProviderUsable', () => {
       ),
     ).toBe(false);
     expect(isProviderUsable('anthropic', config())).toBe(false);
+    expect(isProviderUsable('anthropic', config({ anthropic_available: true }))).toBe(true);
+    expect(
+      isProviderUsable(
+        'anthropic',
+        config({ anthropic_available: true, allowed_request_providers: ['ollama'] }),
+      ),
+    ).toBe(false);
+    expect(isProviderUsable('cohere', config())).toBe(false);
     expect(isProviderUsable(null, config())).toBe(false);
   });
 });

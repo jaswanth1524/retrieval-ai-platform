@@ -309,3 +309,33 @@ def test_backlog_has_room_peeks_without_reserving() -> None:
     assert backlog.pending_bytes == 6  # peeking reserved nothing
     assert backlog.try_reserve(4)
     assert not backlog.has_room(0)  # the job cap is reached too
+
+
+def test_jobs_keep_their_workspace_and_an_old_file_is_migrated(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = str(tmp_path / "jobs.db")
+    connection = sqlite3.connect(path)
+    with connection:
+        # The table as it was before workspaces.
+        connection.execute(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, filename TEXT NOT NULL, state TEXT NOT "
+            "NULL, chunks_total INTEGER NOT NULL, chunks_done INTEGER NOT NULL, error TEXT, "
+            "result_json TEXT, created_at_wall REAL NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO jobs VALUES ('old', 'a.txt', 'done', 1, 1, NULL, NULL, 1.0)"
+        )
+    connection.close()
+
+    store = SqliteIngestJobStore(path, max_retained=10)
+    old = store.get("old")
+    assert old is not None and old.workspace == "" and old.state == "done"
+    legal = store.create("b.txt", "legal")
+    store.update(legal.id, state="done")
+    reopened = SqliteIngestJobStore(path, max_retained=10).get(legal.id)
+    assert reopened is not None and reopened.workspace == "legal"
+
+    memory = IngestJobStore(max_retained=10)
+    assert memory.create("c.txt", "legal").workspace == "legal"
+    assert memory.create("d.txt").workspace == ""

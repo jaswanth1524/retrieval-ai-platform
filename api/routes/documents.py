@@ -32,17 +32,18 @@ from api.ingest_jobs import (
     FilenameConflictError,
     backlog_full_error,
     cancel_ingest_job,
+    delete_indexed_document,
     enqueue_ingest,
+    known_filenames,
     original_still_stored,
     refuse_near_duplicate_name,
     require_raw_store,
     stored_filename,
 )
-from api.ingestion import filename_write_lock, ingest_sequencer
+from api.ingestion import filename_write_lock
 from api.jobs import JobNotFoundError, JobStore
 from api.metrics import corpus_documents
-from api.raw_documents import RawDocumentStore
-from api.repository import DocumentMetadata, VectorRepository
+from api.repository import DocumentMetadata
 from api.restore import BackupImportError, restore_backup
 from api.routes.deps import (
     FeedbackStoreDep,
@@ -67,10 +68,13 @@ from api.schemas import (
     DocumentTagsRequest,
     DocumentTagsResponse,
     ImportResponse,
+    UrlIngestRequest,
 )
 from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
 from api.upload import read_upload_within_limit
+from api.url_fetch import BacklogFullError, fetch_document, loggable_url
+from api.workspaces import document_key, workspace_of
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +87,16 @@ CONTENT_MAX_RADIUS = 100
 CONTENT_MAX_ORDINAL = 1_000_000
 # /content with no paging parameters returns at most this many chunks.
 CONTENT_UNPAGED_MAX_CHUNKS = 2000
+# POST /documents/from-url downloads at most this many documents at once.
+URL_FETCH_MAX_CONCURRENT = 4
+_url_fetch_slots = threading.BoundedSemaphore(URL_FETCH_MAX_CONCURRENT)
 
 
-def _job_status(job_store: JobStore, job_id: str) -> DocumentJobStatusResponse:
+def _job_status(job_store: JobStore, job_id: str, workspace: str) -> DocumentJobStatusResponse:
     job = job_store.get(job_id)
-    if job is None:
+    # Another workspace's job is "not found" here, the same as an unknown id: its
+    # status carries the filename and error text.
+    if job is None or job.workspace != workspace:
         raise JobNotFoundError(f"No ingestion job found with id '{job_id}'.")
     result = DocumentIngestResponse.model_validate(job.result) if job.result is not None else None
     return DocumentJobStatusResponse(
@@ -169,7 +178,7 @@ def register(app: FastAPI) -> None:
         # only fail on a collection built for another embedding setup.
         await run_in_threadpool(repository.ensure_writable, settings)
         if raw_store is not None:
-            known = await run_in_threadpool(_known_filenames, repository, settings)
+            known = await run_in_threadpool(known_filenames, repository, settings)
             try:
                 refuse_near_duplicate_name(filename, known)
             except FilenameConflictError as exc:
@@ -190,6 +199,96 @@ def register(app: FastAPI) -> None:
             ingest_service=ingest_service,
             filename=filename,
             content=content,
+            raw_store=raw_store,
+        )
+
+    # The server downloads the document (URL_INGEST_ENABLED, off by default) and it
+    # takes the upload's path from there: same name checks, backlog, job and polling.
+    # api/url_fetch.py guards against fetching private addresses (SSRF).
+    @app.post(
+        "/documents/from-url",
+        response_model=DocumentJobAcceptedResponse,
+        status_code=202,
+        dependencies=[Depends(require_full_key)],
+        responses={
+            404: {"description": "URL ingest is off (URL_INGEST_ENABLED)."},
+            409: {
+                "description": "The remote server named the document after one already "
+                "indexed (pass `filename` to replace it); or, with stored originals, the "
+                "name differs from an existing document's only by letter case or accents."
+            },
+        },
+    )
+    async def upload_document_from_url(
+        request: UrlIngestRequest,
+        ingest_service: IngestServiceDep,
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+    ) -> DocumentJobAcceptedResponse:
+        if not settings.url_ingest_enabled:
+            raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+        await run_in_threadpool(repository.ensure_writable, settings)
+        # A full backlog refuses before the download, as an upload is refused before
+        # its body is read; fetch_document asks again with the size the server
+        # declares, before reading the body. enqueue_ingest makes the real reservation.
+        if not backlog.has_room(1):
+            raise backlog_full_error()
+        # Each fetch holds a request thread for up to URL_INGEST_TIMEOUT_SECONDS and
+        # up to MAX_UPLOAD_BYTES of memory: a few at a time, the rest told to retry.
+        if not _url_fetch_slots.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many URL fetches are running. Try again in a moment.",
+                headers={"Retry-After": "5"},
+            )
+        try:
+            fetched = await run_in_threadpool(
+                fetch_document,
+                request.url,
+                settings,
+                filename=request.filename,
+                has_room=backlog.has_room,
+            )
+        except BacklogFullError:
+            raise backlog_full_error() from None
+        finally:
+            _url_fetch_slots.release()
+        if raw_store is not None or fetched.remote_named:
+            known = await run_in_threadpool(known_filenames, repository, settings)
+            # A name the remote server picked (Content-Disposition, a redirect) must not
+            # replace a document already here: re-adding the same URL keeps its own
+            # name and replaces it as an upload would; a page calling itself
+            # "handbook.pdf" doesn't.
+            if fetched.remote_named and fetched.filename in known:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"The server at that URL names the document "
+                    f"'{fetched.filename}', and a document with that name is already "
+                    "indexed; it was not replaced. Delete or rename that document first, "
+                    "or give this one a name (`filename` in the API, --name on the CLI).",
+                )
+            if raw_store is not None:
+                try:
+                    refuse_near_duplicate_name(fetched.filename, known)
+                except FilenameConflictError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info(
+            "Fetched %s (%d bytes) for indexing.",
+            loggable_url(fetched.final_url),
+            len(fetched.content),
+        )
+        return await run_in_threadpool(
+            enqueue_ingest,
+            job_store=job_store,
+            executor=executor,
+            backlog=backlog,
+            ingest_service=ingest_service,
+            filename=fetched.filename,
+            content=fetched.content,
             raw_store=raw_store,
         )
 
@@ -324,41 +423,8 @@ def register(app: FastAPI) -> None:
         # would still report success. The raw copy (when stored) is removed under the
         # same lock, or a deleted document's original bytes would accumulate forever.
         filename = stored_filename(filename)
-        # Sequenced like an ingest, and admitted before waiting for the lock, so an
-        # upload already queued for this name is refused when it reaches the lock
-        # instead of indexing the document straight back after the delete.
-        sequence = ingest_sequencer.admit(filename)
-        try:
-            with filename_write_lock(filename):
-                # The lock isn't fair: an upload admitted after this delete can reach
-                # it first and be indexed. Deleting then would remove the newer
-                # document the user just uploaded, so the delete stands down.
-                superseded = ingest_sequencer.superseded_by(filename, sequence)
-                if superseded == "upload":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"A newer upload of '{filename}' was indexed after this "
-                        "delete was requested; it was kept.",
-                    )
-                if superseded == "delete":
-                    raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-                point_ids = repository.point_ids_for_filename(settings, filename)
-                if point_ids:
-                    repository.delete_by_ids(settings, point_ids)
-                    # Right away, not after the original below: if removing that
-                    # raises, cached answers must still stop citing the deleted points.
-                    bump_corpus_generation([filename])
-                # Also when no points remain: an original orphaned by an earlier failed
-                # ingest was otherwise undeletable, since the 404 came first.
-                removed_original = _delete_original(
-                    raw_store, filename, points_gone=bool(point_ids)
-                )
-                if not point_ids and not removed_original:
-                    raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-                ingest_sequencer.mark_applied(filename, sequence, deleted=True)
-        finally:
-            ingest_sequencer.release(filename)
-        return DocumentDeleteResponse(filename=filename, points_deleted=len(point_ids))
+        deleted = delete_indexed_document(repository, settings, raw_store, filename)
+        return DocumentDeleteResponse(filename=filename, points_deleted=deleted)
 
     # Payload-only: no re-embedding, so it is instant even for a large document.
     @app.patch(
@@ -377,7 +443,7 @@ def register(app: FastAPI) -> None:
         # Under the filename lock ingest also reads tags under (ingest_chunks'
         # carry_tags), so a re-upload in flight either sees this change or runs after
         # it and carries it over — it never writes the tags from before it.
-        with filename_write_lock(filename):
+        with filename_write_lock(document_key(settings, filename)):
             # A count, not a scroll of every point id just to see whether there is one.
             if repository.chunk_count_for_filename(settings, filename) == 0:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
@@ -394,8 +460,10 @@ def register(app: FastAPI) -> None:
         response_model=DocumentJobStatusResponse,
         dependencies=[Depends(require_api_key)],
     )
-    def get_document_job(job_id: str, job_store: IngestJobStoreDep) -> DocumentJobStatusResponse:
-        return _job_status(job_store, job_id)
+    def get_document_job(
+        job_id: str, job_store: IngestJobStoreDep, settings: SettingsDep
+    ) -> DocumentJobStatusResponse:
+        return _job_status(job_store, job_id, workspace_of(settings))
 
     # Stops a queued job outright, or a running one at its next checkpoint — but only
     # before it writes anything: point ids are deterministic, so once a batch is
@@ -407,11 +475,16 @@ def register(app: FastAPI) -> None:
         status_code=202,
         dependencies=[Depends(require_full_key)],
     )
-    def cancel_document_job(job_id: str, job_store: IngestJobStoreDep) -> DocumentJobStatusResponse:
+    def cancel_document_job(
+        job_id: str, job_store: IngestJobStoreDep, settings: SettingsDep
+    ) -> DocumentJobStatusResponse:
+        workspace = workspace_of(settings)
+        # Checked before cancelling: another workspace's job is a 404, left running.
+        _job_status(job_store, job_id, workspace)
         outcome = cancel_ingest_job(job_id)
         if outcome == "not_running":
-            # Unknown is a 404 (raised by _job_status); a finished job can't be stopped.
-            status = _job_status(job_store, job_id)
+            # A finished job can't be stopped.
+            status = _job_status(job_store, job_id, workspace)
             raise HTTPException(
                 status_code=409, detail=f"Job '{job_id}' has already {status.state}."
             )
@@ -423,7 +496,7 @@ def register(app: FastAPI) -> None:
                     "cleanly. Delete the document once it finishes instead."
                 ),
             )
-        return _job_status(job_store, job_id)
+        return _job_status(job_store, job_id, workspace)
 
     # Guarded alongside GET /documents: this returns every chunk's raw text, so leaving
     # it open would let an unauthenticated caller list the corpus and then dump it in
@@ -609,7 +682,7 @@ def register(app: FastAPI) -> None:
             nonlocal known
             if raw_store is not None:
                 if known is None:
-                    known = set(_known_filenames(repository, settings))
+                    known = set(known_filenames(repository, settings))
                 # A DocumentError: listed under `rejected`, the rest still restored.
                 refuse_near_duplicate_name(filename, known)
                 known.add(filename)
@@ -636,6 +709,7 @@ def register(app: FastAPI) -> None:
                 has_room=backlog.has_room,
                 enqueue=enqueue,
                 feedback_store=feedback_store,
+                workspace=workspace_of(settings),
             )
         except BackupImportError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -658,30 +732,3 @@ def _staleness(
     fingerprint = chunking_fingerprint(settings)
     counter_mode = str(getattr(token_counter, "mode", "unknown"))
     return lambda meta: meta.is_stale(fingerprint, counter_mode)
-
-
-def _known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
-    """Every indexed filename plus those with an upload or delete in flight."""
-
-    return [*repository.filename_metadata(settings), *ingest_sequencer.in_flight()]
-
-
-def _delete_original(
-    raw_store: RawDocumentStore | None, filename: str, *, points_gone: bool
-) -> bool:
-    """Remove the stored original; True when one was removed.
-
-    Once the points are gone the delete has happened: a failure removing the original
-    (a read-only or permission-locked RAW_DOCUMENT_DIR) is logged rather than turned
-    into a 500, and a second DELETE removes the orphan through the no-points path.
-    """
-
-    if raw_store is None:
-        return False
-    try:
-        return raw_store.delete(filename)
-    except OSError:
-        if not points_gone:
-            raise
-        logger.exception("Could not remove the stored original of '%s'", filename)
-        return True

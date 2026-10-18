@@ -133,10 +133,14 @@
   gap: 7px;
 }
 
+/* Wraps: with five actions (read, summarize, original, re-index, delete) the name was
+   left 24-36px and broke mid-word ("roa / dm / ap. / ppt / x"). The name keeps room
+   for a whole short filename, and the actions move under it when they don't fit. */
 .corpus-panel__card-top {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
-  gap: 8px;
+  gap: 6px 8px;
 }
 
 .corpus-panel__ext {
@@ -152,11 +156,12 @@
 }
 
 .corpus-panel__name {
-  flex: 1;
+  flex: 1 1 9rem;
   min-width: 0;
   font-size: 12.5px;
   line-height: 1.35;
-  word-break: break-word;
+  /* Only a name longer than the whole row breaks, and then between any characters. */
+  overflow-wrap: anywhere;
   color: var(--rail-text);
 }
 
@@ -219,6 +224,7 @@
 /* ConfirmInline supplies the buttons; the card's top row only needs it not to shrink. */
 .corpus-panel__confirm {
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 .corpus-panel__failed-actions {
@@ -266,6 +272,8 @@
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
+  /* Right-aligned, on the name's row or (wrapped) on a row of their own. */
+  margin-left: auto;
 }
 
 .corpus-panel__reindex {
@@ -405,9 +413,14 @@
   line-height: 1;
 }
 
-.corpus-panel__read:hover,
+.corpus-panel__read:hover:not(:disabled),
 .corpus-panel__read:focus-visible {
   color: var(--accent);
+}
+
+.corpus-panel__read:disabled {
+  cursor: default;
+  opacity: 0.4;
 }
 
 .corpus-panel__controls {
@@ -491,4 +504,77 @@
 .corpus-panel__bulk-delete:hover:not(:disabled) {
   color: var(--bad);
   border-color: var(--bad);
+}
+
+/* "From URL": a single row under the dropzone. */
+.corpus-panel__url {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+/* Looks like the filter field (.corpus-panel__search). */
+.corpus-panel__url-input {
+  flex: 1 1 160px;
+  min-width: 0;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--fm);
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.corpus-panel__url-input:focus {
+  outline: 2px solid transparent;
+  border-color: var(--accent);
+}
+
+.corpus-panel__url .corpus-panel__reject {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* Workspace picker above the corpus (WORKSPACES_ENABLED). */
+.corpus-panel__workspace {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+/* On its own line: beside the select it left too little room, and Delete wrapped
+   alone onto a second row at the panel's usual width. */
+.corpus-panel__workspace-label {
+  flex-basis: 100%;
+  color: var(--rail-dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.corpus-panel__workspace-select {
+  flex: 1 1 120px;
+  min-width: 0;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--fm);
+  font-size: 12px;
+  padding: 4px 6px;
+}
+
+.corpus-panel__workspace-form {
+  display: flex;
+  flex: 1 1 100%;
+  gap: 6px;
+}
+
+.corpus-panel__workspace .corpus-panel__reject {
+  flex-basis: 100%;
+  margin: 0;
 }

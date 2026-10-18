@@ -25,6 +25,7 @@ const SNIPPET_CHARS = 220;
 function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResultResponse[] | null>(null);
+  const [weak, setWeak] = useState(false);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
@@ -35,6 +36,7 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
     controllerRef.current?.abort();
     setQuery('');
     setResults(null);
+    setWeak(false);
     setError(null);
     setSearching(false);
   }, [resetKey]);
@@ -60,6 +62,7 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
       );
       if (controller.signal.aborted) return;
       setResults(response.results);
+      setWeak(response.weak_matches === true && response.results.length > 0);
     } catch (err) {
       if (controller.signal.aborted) return;
       setResults(null);
@@ -114,7 +117,9 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
             ? ''
             : results.length === 0
               ? 'No passages found.'
-              : `${results.length} passage${results.length === 1 ? '' : 's'} found.`}
+              : weak
+                ? `No strong matches; ${results.length} closest passage${results.length === 1 ? '' : 's'} shown.`
+                : `${results.length} passage${results.length === 1 ? '' : 's'} found.`}
       </span>
       {error && (
         <p className="search-panel__message" role="alert" data-testid="search-error">
@@ -123,6 +128,12 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
       )}
       {results !== null && results.length === 0 && (
         <p className="search-panel__message">No passages matched.</p>
+      )}
+      {weak && results !== null && results.length > 0 && (
+        <p className="search-panel__message" data-testid="search-weak">
+          No strong matches. These are the closest passages — a fuller question usually finds
+          better ones.
+        </p>
       )}
       {results?.map((result) => (
         <button

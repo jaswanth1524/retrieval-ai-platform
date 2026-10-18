@@ -115,6 +115,9 @@ services:
       # recreate — including each `docker compose up --build` — downloads them again.
       - model_cache:/home/app/.cache
       - docrag_data:/app/data
+      # Keep the index in step with a host folder: mount it read-only and set
+      # WATCH_DIR=/app/watched in .env (README "Watched folder").
+      # - ./my-documents:/app/watched:ro
     extra_hosts:
       # Lets OLLAMA_BASE_URL=http://host.docker.internal:... resolve on native Linux
       # Docker (Docker Desktop on macOS/Windows already resolves this automatically).

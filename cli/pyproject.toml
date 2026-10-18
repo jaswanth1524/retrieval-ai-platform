@@ -1,0 +1,40 @@
+# The command line and MCP server as their own small package: they only talk to the
+# REST API (httpx, plus mcp for the server), so installing them never pulls in the
+# server's models and parsers. The repository's own pyproject.toml stays an
+# uninstalled app (`package = false`), which keeps the Docker dependency layer
+# independent of the source.
+#
+#   uv tool install ./cli            # docrag
+#   uv tool install './cli[mcp]'     # docrag and docrag-mcp
+#
+# Inside the repository, `python -m cli` and `python -m cli.mcp_server` work as before.
+[project]
+name = "docrag-cli"
+version = "0.1.0"
+description = "Command line and MCP server for a DocRAG server."
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+mcp = [
+  "mcp>=2.2,<3",
+]
+
+[project.scripts]
+docrag = "cli.__main__:main"
+docrag-mcp = "cli.mcp_server:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+# This directory is the `cli` package itself: ship its modules under that name.
+[tool.hatch.build.targets.wheel]
+only-include = ["__init__.py", "__main__.py", "client.py", "mcp_server.py"]
+sources = { "" = "cli" }
+
+[tool.hatch.build.targets.sdist]
+only-include = ["__init__.py", "__main__.py", "client.py", "mcp_server.py", "pyproject.toml"]

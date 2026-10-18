@@ -19,6 +19,7 @@ from fastembed.common.model_description import ModelSource
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 
 from api.documents import contextual_text
+from api.model_files import colocate
 from api.retrieval import RetrievalError, RetrievedChunk
 from api.settings import AppSettings
 
@@ -121,12 +122,15 @@ class LocalCrossEncoderReranker:
     ) -> None:
         self.settings = settings
         model_name, cache_dir = _resolve_model(settings.reranker_model, settings.reranker_onnx_file)
-        self.model = model or TextCrossEncoder(
-            model_name=model_name,
-            cache_dir=cache_dir,
-            lazy_load=True,
-            threads=settings.reranker_threads or None,
-        )
+        if model is None:
+            model = TextCrossEncoder(
+                model_name=model_name,
+                cache_dir=cache_dir,
+                lazy_load=True,
+                threads=settings.reranker_threads or None,
+            )
+            colocate(model)  # see api/model_files.py
+        self.model = model
         # One forward pass at a time. Two concurrent questions each allocating their
         # own activations is how the container got OOM-killed before; serialized, the
         # peak stays at one batch's worth and each pass gets every core.

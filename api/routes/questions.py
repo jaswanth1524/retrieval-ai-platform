@@ -17,6 +17,7 @@ from api.dependencies import (
 )
 from api.errors import public_error_message, question_error_type
 from api.generation import GenerationConfigError
+from api.ingest_jobs import stored_filename
 from api.llm import completion_model_and_kwargs
 from api.metrics import (
     NO_ERROR_TYPE,
@@ -25,15 +26,23 @@ from api.metrics import (
     answers_truncated_total,
     observe_question_timings,
     questions_total,
+    summaries_total,
 )
 from api.pipeline import AnswerOverrides, timings_dict
-from api.routes.deps import QuestionSlotsDep, RagPipelineDep, SettingsDep
+from api.routes.deps import (
+    DocumentSummarizerDep,
+    QuestionSlotsDep,
+    RagPipelineDep,
+    SettingsDep,
+)
 from api.routes.responses import history_messages, log_question, timings_response
 from api.schemas import (
     CitationResponse,
     QuestionRequest,
     QuestionResponse,
     RequestProvider,
+    SummaryRequest,
+    SummaryResponse,
 )
 from api.settings import AppSettings
 from api.sse import (
@@ -45,6 +54,7 @@ from api.sse import (
     with_keepalive,
 )
 from api.streaming import ClosingStreamingResponse
+from api.summarize import SummaryRequest as PipelineSummaryRequest
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +99,26 @@ def allowed_request_providers(settings: AppSettings) -> list[str]:
     return [name for name in REQUEST_PROVIDERS if name in allowed or name == default]
 
 
-def check_request_provider(provider: str | None, settings: AppSettings) -> None:
-    """400 for a per-request provider the operator hasn't allowed or hasn't configured
-    (``openai`` with no OPENAI_API_KEY) — before a question slot is taken, so a refused
-    request costs nothing. Unchecked, it ran embedding, search and the rerank first and
-    failed only at generation, after the stream had already sent its sources."""
+# Anthropic's API refuses a temperature above this (OpenAI's go to 2).
+ANTHROPIC_TEMPERATURE_MAX = 1.0
 
+
+def check_request_provider(
+    provider: str | None, settings: AppSettings, temperature: float | None = None
+) -> None:
+    """400 for a per-request provider the operator hasn't allowed or hasn't configured
+    (``openai`` with no OPENAI_API_KEY), or a temperature the effective provider refuses
+    — before a question slot is taken, so a refused request costs nothing. Unchecked, it
+    ran embedding, search and the rerank first and failed only at generation, after the
+    stream had already sent its sources."""
+
+    effective = (provider or settings.llm_provider).lower().strip()
+    effective_temperature = temperature if temperature is not None else settings.llm_temperature
+    if effective == "anthropic" and float(effective_temperature) > ANTHROPIC_TEMPERATURE_MAX:
+        raise GenerationConfigError(
+            f"Anthropic models take a temperature of at most {ANTHROPIC_TEMPERATURE_MAX:g}; "
+            f"got {float(effective_temperature):g}."
+        )
     if provider is None:
         return
     if provider not in allowed_request_providers(settings):
@@ -102,6 +126,18 @@ def check_request_provider(provider: str | None, settings: AppSettings) -> None:
             f"LLM provider '{provider}' is not allowed on this server (ALLOWED_REQUEST_PROVIDERS)."
         )
     completion_model_and_kwargs(settings.model_copy(update={"llm_provider": provider}))
+
+
+def summary_request(request: SummaryRequest) -> PipelineSummaryRequest:
+    """The pipeline's request: names checked like any document path parameter."""
+
+    return PipelineSummaryRequest(
+        mode=request.mode,
+        filenames=tuple(stored_filename(name) for name in request.filenames),
+        instruction=(request.instruction or "").strip() or None,
+        llm_provider=request.llm_provider,
+        llm_temperature=request.llm_temperature,
+    )
 
 
 def register(app: FastAPI) -> None:
@@ -116,7 +152,7 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> QuestionResponse:
-        check_request_provider(request.llm_provider, settings)
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
         release = question_slot(slots)
         try:
             grounded = pipeline.answer(
@@ -158,6 +194,7 @@ def register(app: FastAPI) -> None:
             answer_status=grounded.answer_status,
             top_rerank_score=grounded.top_rerank_score,
             truncated=grounded.truncated,
+            followups=grounded.followups,
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
@@ -167,7 +204,7 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> ClosingStreamingResponse:
-        check_request_provider(request.llm_provider, settings)
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
         # Taken here, before the 200 is committed, so a full server can still say 429.
         lease = StreamLease(question_slot(slots))
         stop = threading.Event()
@@ -237,5 +274,95 @@ def register(app: FastAPI) -> None:
             headers=SSE_HEADERS,
             # Also after a disconnect before the first frame, which never runs the
             # generator (and so never its finally). The release is idempotent.
+            background=BackgroundTask(lease.release_if_not_handed_off),
+        )
+
+    # Whole-document tasks: the same admission, provider check, key guard, rate limit
+    # and answer frames as a question, over every passage of the named documents
+    # instead of the retrieved few (api/summarize.py).
+    @app.post(
+        "/questions/summary",
+        response_model=SummaryResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    def summarize_documents(
+        request: SummaryRequest,
+        summarizer: DocumentSummarizerDep,
+        slots: QuestionSlotsDep,
+        settings: SettingsDep,
+    ) -> SummaryResponse:
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
+        task = summary_request(request)
+        summarizer.check_documents(task.filenames)
+        release = question_slot(slots, count_metric=False)
+        try:
+            result = summarizer.summarize(task, use_cache=request.use_cache)
+        except Exception:
+            summaries_total.labels(mode=request.mode, outcome="error").inc()
+            raise
+        finally:
+            release()
+        summaries_total.labels(mode=request.mode, outcome="ok").inc()
+        count_answer(result.grounded.answer_status, result.grounded.truncated)
+        grounded = result.grounded
+        return SummaryResponse(
+            answer=grounded.answer,
+            sources=[CitationResponse(**asdict(source)) for source in grounded.sources],
+            timings=timings_response(grounded.timings),
+            trace_id=grounded.trace_id,
+            cached=grounded.cached,
+            answer_status=grounded.answer_status,
+            truncated=grounded.truncated,
+            chunks_read=result.chunks_read,
+            chunks_total=result.chunks_total,
+        )
+
+    @app.post("/questions/summary/stream", dependencies=[Depends(require_api_key)])
+    def summarize_documents_stream(
+        request: SummaryRequest,
+        summarizer: DocumentSummarizerDep,
+        slots: QuestionSlotsDep,
+        settings: SettingsDep,
+    ) -> ClosingStreamingResponse:
+        check_request_provider(request.llm_provider, settings, request.llm_temperature)
+        task = summary_request(request)
+        # Before the 200: an unknown or oversized document is a plain 404 / 400.
+        summarizer.check_documents(task.filenames)
+        lease = StreamLease(question_slot(slots, count_metric=False))
+        stop = threading.Event()
+
+        def event_source() -> Iterator[str]:
+            events = with_keepalive(
+                summarizer.summarize_stream(
+                    task, use_cache=request.use_cache, should_stop=stop.is_set
+                ),
+                SSE_KEEPALIVE_SECONDS,
+                stop=stop,
+                on_start=lease.hand_off,
+                on_finish=lease.release,
+            )
+            try:
+                for event in events:
+                    if event is None:
+                        yield SSE_KEEPALIVE_FRAME
+                        continue
+                    if event["type"] == "done":
+                        summaries_total.labels(mode=request.mode, outcome="ok").inc()
+                        count_answer(
+                            event.get("answer_status", "answered"), event.get("truncated", False)
+                        )
+                    yield sse_event(dict(event))
+            except Exception as exc:
+                summaries_total.labels(mode=request.mode, outcome="error").inc()
+                logger.warning("Streamed summary failed: %s", exc, exc_info=True)
+                yield sse_event({"type": "error", "detail": public_error_message(exc)})
+            finally:
+                events.close()
+                lease.release_if_not_handed_off()
+
+        return ClosingStreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
             background=BackgroundTask(lease.release_if_not_handed_off),
         )

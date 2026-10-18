@@ -5,9 +5,10 @@
  * versioned payloads, sanitizing what is read back, compacting what is written, and
  * merging two copies of the same history.
  */
-import type { CitationResponse } from '../api/types';
+import type { CitationResponse, DocumentTask } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
+import { WORKSPACE_NAME_PATTERN } from '../utils/limits';
 
 /** Which documents a conversation's questions search. Empty lists mean "everything". */
 export interface ConversationScope {
@@ -32,6 +33,10 @@ export interface Conversation {
   editedAt?: number;
   // Kept past MAX_CONVERSATIONS and listed first. A pin is an edit (editedAt).
   pinned?: boolean;
+  // The workspace its questions went to (WORKSPACES_ENABLED), set by the first question;
+  // absent = the default one, which is also what every conversation from before
+  // workspaces was asked in. See conversationWorkspace.
+  workspace?: string;
 }
 
 /** A conversation deleted in some tab, so another tab's copy doesn't bring it back. */
@@ -49,6 +54,14 @@ export interface ConversationSummary {
   updatedAt: number;
   turnCount: number;
   pinned?: boolean;
+  // Only when not the default workspace.
+  workspace?: string;
+}
+
+/** The workspace a conversation belongs to ('' = the default), or null for one with no
+ *  questions yet, which belongs to whichever workspace asks first. */
+export function conversationWorkspace(conversation: Conversation): string | null {
+  return conversation.turns.length > 0 ? (conversation.workspace ?? '') : null;
 }
 
 /** Where a search matched inside a conversation's turns. */
@@ -152,6 +165,46 @@ function withValidSpans(source: CitationResponse): CitationResponse {
  *
  * Only the top-level shape used to be checked, so an imported file with `model: {}` or
  * a `null` source was saved — and crashed the page on every load once it rendered. */
+// The server sends at most 5 follow-ups of at most 200 characters (api/prompting.py).
+const MAX_FOLLOWUPS = 5;
+const FOLLOWUP_MAX_CHARS = 200;
+
+/** Suggested follow-ups as the thread can render them: strings with text, each once —
+ *  they are the buttons' React keys, so a repeated one (a model can suggest the same
+ *  question twice) broke rendering. From the stream and from disk alike. */
+export function cleanFollowups(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const followups = (value as unknown[]).filter(
+    (item): item is string =>
+      typeof item === 'string' && item.trim().length > 0 && item.length <= FOLLOWUP_MAX_CHARS,
+  );
+  return [...new Set(followups)].slice(0, MAX_FOLLOWUPS);
+}
+
+/** ``value`` as a document task when it is one the server would accept, else null. */
+export function sanitizeTask(value: unknown): DocumentTask | null {
+  if (!value || typeof value !== 'object') return null;
+  const task = value as Record<string, unknown>;
+  const mode = task.mode;
+  if (mode !== 'summarize' && mode !== 'compare') return null;
+  const names = task.filenames;
+  if (!Array.isArray(names) || !names.every((name) => typeof name === 'string' && name !== '')) {
+    return null;
+  }
+  if (names.length !== (mode === 'compare' ? 2 : 1) || new Set(names).size !== names.length) {
+    return null;
+  }
+  const sanitized: DocumentTask = { mode, filenames: [...(names as string[])] };
+  if (typeof task.instruction === 'string' && task.instruction.trim()) {
+    sanitized.instruction = task.instruction;
+  }
+  return sanitized;
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
 export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (!isChatTurn(value)) return null;
   const turn = value as ChatTurn & Record<string, unknown>;
@@ -171,8 +224,18 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (typeof turn.question === 'string') sanitized.question = turn.question;
   if (turn.feedback === 'up' || turn.feedback === 'down') sanitized.feedback = turn.feedback;
   if (typeof turn.model === 'string') sanitized.model = turn.model;
-  for (const flag of ['stopped', 'incomplete', 'cached', 'notFound', 'uncited', 'truncated'] as const) {
+  const flags = ['stopped', 'incomplete', 'cached', 'notFound', 'uncited', 'truncated', 'followUp'] as const;
+  for (const flag of flags) {
     if (turn[flag] === true) sanitized[flag] = true;
+  }
+  const task = sanitizeTask(turn.task);
+  if (task) sanitized.task = task;
+  const followups = cleanFollowups(turn.followups);
+  if (followups.length > 0) sanitized.followups = followups;
+  const coverage = turn.coverage as unknown;
+  if (coverage && typeof coverage === 'object') {
+    const { read, total } = coverage as Record<string, unknown>;
+    if (isCount(read) && isCount(total) && read < total) sanitized.coverage = { read, total };
   }
   return sanitized;
 }
@@ -536,6 +599,9 @@ export function sanitizeConversation(value: unknown): Conversation | null {
   };
   if (validTime(raw.editedAt, NaN) === raw.editedAt) conversation.editedAt = raw.editedAt;
   if (raw.pinned === true) conversation.pinned = true;
+  if (typeof raw.workspace === 'string' && WORKSPACE_NAME_PATTERN.test(raw.workspace)) {
+    conversation.workspace = raw.workspace;
+  }
   return conversation;
 }
 

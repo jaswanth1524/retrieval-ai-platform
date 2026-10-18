@@ -12,7 +12,7 @@ from qdrant_client import QdrantClient
 from api.admission import QuestionSlots
 from api.chunking import TokenCounter
 from api.dependencies import (
-    get_app_settings,
+    get_document_summarizer,
     get_feedback_store,
     get_ingest_backlog,
     get_ingest_executor,
@@ -23,7 +23,8 @@ from api.dependencies import (
     get_qdrant_reachability_checker,
     get_question_slots,
     get_rag_pipeline,
-    get_raw_document_store,
+    get_request_raw_store,
+    get_request_settings,
     get_token_counter,
     get_trace_store,
     get_vector_repository,
@@ -34,15 +35,21 @@ from api.pipeline import IngestService, RagPipeline
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from api.summarize import DocumentSummarizer
 from api.tracing import TraceStore
 
-SettingsDep = Annotated[AppSettings, Depends(get_app_settings)]
+# The request's settings: the app's, pointed at the X-Workspace workspace when one is
+# named (api/workspaces.py). Routes read the collection and directories from these.
+SettingsDep = Annotated[AppSettings, Depends(get_request_settings)]
 
 
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 
 
 RagPipelineDep = Annotated[RagPipeline, Depends(get_rag_pipeline)]
+
+
+DocumentSummarizerDep = Annotated[DocumentSummarizer, Depends(get_document_summarizer)]
 
 
 OllamaCheckDep = Annotated[Callable[[AppSettings], bool], Depends(get_ollama_reachability_checker)]
@@ -60,7 +67,7 @@ VectorRepositoryDep = Annotated[VectorRepository, Depends(get_vector_repository)
 IngestJobStoreDep = Annotated[JobStore, Depends(get_ingest_job_store)]
 
 
-RawDocumentStoreDep = Annotated[RawDocumentStore | None, Depends(get_raw_document_store)]
+RawDocumentStoreDep = Annotated[RawDocumentStore | None, Depends(get_request_raw_store)]
 
 
 FeedbackStoreDep = Annotated[FeedbackStore | None, Depends(get_feedback_store)]

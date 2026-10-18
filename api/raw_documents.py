@@ -26,6 +26,12 @@ _STALE_TEMP_FILE_SECONDS = 3600.0
 _TEMP_FILE_NAME = re.compile(r"\.upload-[a-z0-9_]{8}")
 
 
+def is_temp_file_name(name: str) -> bool:
+    """Whether ``name`` is one of ``save``'s own temp files, never a stored original."""
+
+    return _TEMP_FILE_NAME.fullmatch(name) is not None
+
+
 class RawDocumentStore:
     """Filesystem-backed store for original uploaded document bytes.
 
@@ -64,6 +70,10 @@ class RawDocumentStore:
         """Write atomically: a crash mid-write leaves the previous original intact."""
 
         target = self._path_for(filename)
+        # Made again if it went: deleting a workspace removes its directory, and a store
+        # built for it before (cached, or the folder watcher's) must still work if a
+        # workspace of that name is created again.
+        self._directory.mkdir(parents=True, exist_ok=True)
         fd, temp_path = tempfile.mkstemp(dir=self._directory, prefix=".upload-")
         try:
             with os.fdopen(fd, "wb") as handle:

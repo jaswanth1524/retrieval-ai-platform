@@ -538,6 +538,16 @@
       "title": "Id",
       "type": "string"
      },
+     "kind": {
+      "default": "question",
+      "enum": [
+       "question",
+       "follow_up",
+       "summary"
+      ],
+      "title": "Kind",
+      "type": "string"
+     },
      "question": {
       "title": "Question",
       "type": "string"
@@ -622,6 +632,16 @@
       "maxItems": 50,
       "title": "Cited Filenames",
       "type": "array"
+     },
+     "kind": {
+      "default": "question",
+      "enum": [
+       "question",
+       "follow_up",
+       "summary"
+      ],
+      "title": "Kind",
+      "type": "string"
      },
      "question": {
       "maxLength": 4000,
@@ -822,6 +842,16 @@
       "title": "Allowed Request Providers",
       "type": "array"
      },
+     "anthropic_available": {
+      "default": false,
+      "title": "Anthropic Available",
+      "type": "boolean"
+     },
+     "anthropic_model": {
+      "default": "",
+      "title": "Anthropic Model",
+      "type": "string"
+     },
      "dense_embedding_model": {
       "title": "Dense Embedding Model",
       "type": "string"
@@ -935,6 +965,16 @@
       },
       "title": "Supported Extensions",
       "type": "array"
+     },
+     "url_ingest_enabled": {
+      "default": false,
+      "title": "Url Ingest Enabled",
+      "type": "boolean"
+     },
+     "workspaces_enabled": {
+      "default": false,
+      "title": "Workspaces Enabled",
+      "type": "boolean"
      }
     },
     "required": [
@@ -1006,7 +1046,8 @@
         "enum": [
          "ollama",
          "openai",
-         "openai_compatible"
+         "openai_compatible",
+         "anthropic"
         ],
         "type": "string"
        },
@@ -1112,6 +1153,14 @@
       "default": false,
       "title": "Cached",
       "type": "boolean"
+     },
+     "followups": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Followups",
+      "type": "array"
      },
      "sources": {
       "items": {
@@ -1239,6 +1288,11 @@
      },
      "timings": {
       "$ref": "#/components/schemas/SearchTimingsResponse"
+     },
+     "weak_matches": {
+      "default": false,
+      "title": "Weak Matches",
+      "type": "boolean"
      }
     },
     "required": [
@@ -1341,6 +1395,175 @@
      "rerank_ms"
     ],
     "title": "SearchTimingsResponse",
+    "type": "object"
+   },
+   "SummaryRequest": {
+    "description": "Summarize one whole document, or compare two (POST /questions/summary).",
+    "properties": {
+     "filenames": {
+      "items": {
+       "maxLength": 1024,
+       "type": "string"
+      },
+      "maxItems": 2,
+      "minItems": 1,
+      "title": "Filenames",
+      "type": "array"
+     },
+     "instruction": {
+      "anyOf": [
+       {
+        "maxLength": 4000,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Instruction"
+     },
+     "llm_provider": {
+      "anyOf": [
+       {
+        "enum": [
+         "ollama",
+         "openai",
+         "openai_compatible",
+         "anthropic"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Llm Provider"
+     },
+     "llm_temperature": {
+      "anyOf": [
+       {
+        "maximum": 2.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Llm Temperature"
+     },
+     "mode": {
+      "enum": [
+       "summarize",
+       "compare"
+      ],
+      "title": "Mode",
+      "type": "string"
+     },
+     "use_cache": {
+      "default": true,
+      "title": "Use Cache",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "mode",
+     "filenames"
+    ],
+    "title": "SummaryRequest",
+    "type": "object"
+   },
+   "SummaryResponse": {
+    "description": "A summary or comparison: an answer, plus how much of the documents it read.",
+    "properties": {
+     "answer": {
+      "title": "Answer",
+      "type": "string"
+     },
+     "answer_status": {
+      "default": "answered",
+      "title": "Answer Status",
+      "type": "string",
+      "x-extensible-enum": [
+       "answered",
+       "insufficient_context",
+       "no_context",
+       "uncited"
+      ]
+     },
+     "cached": {
+      "default": false,
+      "title": "Cached",
+      "type": "boolean"
+     },
+     "chunks_read": {
+      "default": 0,
+      "title": "Chunks Read",
+      "type": "integer"
+     },
+     "chunks_total": {
+      "default": 0,
+      "title": "Chunks Total",
+      "type": "integer"
+     },
+     "followups": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Followups",
+      "type": "array"
+     },
+     "sources": {
+      "items": {
+       "$ref": "#/components/schemas/CitationResponse"
+      },
+      "title": "Sources",
+      "type": "array"
+     },
+     "timings": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/TimingsResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "top_rerank_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Rerank Score"
+     },
+     "trace_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Trace Id"
+     },
+     "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "answer",
+     "sources"
+    ],
+    "title": "SummaryResponse",
     "type": "object"
    },
    "TimingsResponse": {
@@ -1814,6 +2037,34 @@
     "title": "TraceSummaryResponse",
     "type": "object"
    },
+   "UrlIngestRequest": {
+    "description": "Index a document fetched from a URL (POST /documents/from-url).",
+    "properties": {
+     "filename": {
+      "anyOf": [
+       {
+        "maxLength": 1024,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Filename"
+     },
+     "url": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Url",
+      "type": "string"
+     }
+    },
+    "required": [
+     "url"
+    ],
+    "title": "UrlIngestRequest",
+    "type": "object"
+   },
    "ValidationError": {
     "properties": {
      "ctx": {
@@ -1853,6 +2104,57 @@
     ],
     "title": "ValidationError",
     "type": "object"
+   },
+   "WorkspaceCreateRequest": {
+    "description": "Create a workspace (POST /workspaces); see api/workspaces.py for the name rule.",
+    "properties": {
+     "name": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "title": "WorkspaceCreateRequest",
+    "type": "object"
+   },
+   "WorkspaceListResponse": {
+    "description": "The workspaces besides the default one (which has no name and is always there).",
+    "properties": {
+     "enabled": {
+      "title": "Enabled",
+      "type": "boolean"
+     },
+     "workspaces": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Workspaces",
+      "type": "array"
+     }
+    },
+    "required": [
+     "enabled",
+     "workspaces"
+    ],
+    "title": "WorkspaceListResponse",
+    "type": "object"
+   },
+   "WorkspaceResponse": {
+    "properties": {
+     "name": {
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "title": "WorkspaceResponse",
+    "type": "object"
    }
   }
  },
@@ -1880,6 +2182,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -1945,6 +2263,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -1989,6 +2323,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "requestBody": {
@@ -2029,6 +2379,84 @@
     "summary": "Upload Document"
    }
   },
+  "/documents/from-url": {
+   "post": {
+    "operationId": "upload_document_from_url_documents_from_url_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/UrlIngestRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "URL ingest is off (URL_INGEST_ENABLED)."
+     },
+     "409": {
+      "description": "The remote server named the document after one already indexed (pass `filename` to replace it); or, with stored originals, the name differs from an existing document's only by letter case or accents."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Upload Document From Url"
+   }
+  },
   "/documents/jobs/{job_id}": {
    "delete": {
     "operationId": "cancel_document_job_documents_jobs__job_id__delete",
@@ -2056,6 +2484,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2110,6 +2554,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -2155,6 +2615,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2210,6 +2686,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2334,6 +2826,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -2389,6 +2897,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -2441,6 +2965,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2496,6 +3036,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2553,6 +3109,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -2609,6 +3181,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -2652,6 +3240,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2742,6 +3346,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -2843,6 +3463,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "requestBody": {
@@ -2899,6 +3535,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "requestBody": {
@@ -2934,6 +3586,148 @@
     "summary": "Answer Question Stream"
    }
   },
+  "/questions/summary": {
+   "post": {
+    "operationId": "summarize_documents_questions_summary_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SummaryRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SummaryResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Summarize Documents"
+   }
+  },
+  "/questions/summary/stream": {
+   "post": {
+    "operationId": "summarize_documents_stream_questions_summary_stream_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SummaryRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Summarize Documents Stream"
+   }
+  },
   "/search": {
    "post": {
     "operationId": "search_search_post",
@@ -2952,6 +3746,22 @@
         }
        ],
        "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
       }
      }
     ],
@@ -3009,6 +3819,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -3064,6 +3890,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "responses": {
@@ -3089,6 +3931,164 @@
      }
     },
     "summary": "Get Trace"
+   }
+  },
+  "/workspaces": {
+   "get": {
+    "operationId": "workspaces_workspaces_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WorkspaceListResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Workspaces"
+   },
+   "post": {
+    "operationId": "create_workspace_workspaces_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/WorkspaceCreateRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "201": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WorkspaceResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Create Workspace"
+   }
+  },
+  "/workspaces/{name}": {
+   "delete": {
+    "operationId": "delete_workspace_workspaces__name__delete",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WorkspaceResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "409": {
+      "description": "The workspace still holds documents or originals."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Delete Workspace"
    }
   }
  }

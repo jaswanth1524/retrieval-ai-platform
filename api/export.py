@@ -32,6 +32,7 @@ from api.raw_documents import RawDocumentStore
 from api.repository import DocumentMetadata, VectorRepository
 from api.settings import AppSettings
 from api.version import app_version
+from api.workspaces import workspace_of
 
 _CHUNK_BYTES = 64 * 1024
 # Blocks between the zip writer and the response: the writer waits for a slow client
@@ -100,8 +101,10 @@ def build_export(
     """
 
     metadata = repository.filename_metadata(settings)
+    # A backup holds one workspace: its own ratings only.
+    workspace = workspace_of(settings)
     first_feedback = (
-        feedback_store.rows_oldest_first(None, _FEEDBACK_PAGE)
+        feedback_store.rows_oldest_first(None, _FEEDBACK_PAGE, workspace)
         if feedback_store is not None
         else None
     )
@@ -163,12 +166,21 @@ def _write_archive(
     with archive.open("feedback.jsonl", "w") as member:
         page, cursor = first_feedback
         while page:
-            member.write(
-                "".join(json.dumps(asdict(row), sort_keys=True) + "\n" for row in page).encode()
-            )
+            member.write("".join(_feedback_line(row) for row in page).encode())
             if cursor is None or len(page) < _FEEDBACK_PAGE:
                 break
-            page, cursor = feedback_store.rows_oldest_first(cursor, _FEEDBACK_PAGE)
+            page, cursor = feedback_store.rows_oldest_first(
+                cursor, _FEEDBACK_PAGE, workspace_of(settings)
+            )
+
+
+def _feedback_line(row: Feedback) -> str:
+    """One feedback.jsonl row: the fields a restore reads, without the workspace (the
+    rows join the workspace the backup is restored into)."""
+
+    fields = asdict(row)
+    del fields["workspace"]
+    return json.dumps(fields, sort_keys=True) + "\n"
 
 
 class ExportStream:

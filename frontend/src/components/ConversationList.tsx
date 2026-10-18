@@ -220,6 +220,12 @@ function ConversationList({
                   <span className="conversation-list__meta mono">
                     {conversation.turnCount} {conversation.turnCount === 1 ? 'turn' : 'turns'} &middot;{' '}
                     {formatRelativeTimeAgo(conversation.updatedAt)}
+                    {conversation.workspace && (
+                      <span data-testid="conversation-workspace">
+                        {' '}
+                        &middot; {conversation.workspace}
+                      </span>
+                    )}
                   </span>
                 </button>
                 <span className="conversation-list__row-actions">

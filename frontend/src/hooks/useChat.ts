@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, apiErrorMessage } from '../api/client';
+import { api, apiErrorMessage, getWorkspace } from '../api/client';
 import type {
   FeedbackRating,
   HistoryMessage,
@@ -19,6 +19,8 @@ import {
   applyDeleteHeldDuringStream,
   byRecentUse,
   capConversations,
+  cleanFollowups,
+  conversationWorkspace,
   deriveTitle,
   emptyConversation,
   isOnlyEmpty,
@@ -140,10 +142,16 @@ const STAGE_LABELS: Record<string, string> = {
   condensing: 'reading the conversation…',
   searching: 'searching documents…',
   verifying_citations: 'checking citations…',
+  reading_documents: 'reading the document…',
+  summarizing: 'taking notes…',
+  combining: 'combining notes…',
 };
 const DEFAULT_STAGE_LABEL = 'retrieving…';
 
-export function stageLabel(stage: string): string {
+export function stageLabel(stage: string, progress?: { step: number; steps: number }): string {
+  if (stage === 'summarizing' && progress && progress.steps > 1) {
+    return `taking notes, part ${progress.step} of ${progress.steps}…`;
+  }
   return STAGE_LABELS[stage] ?? DEFAULT_STAGE_LABEL;
 }
 
@@ -167,6 +175,9 @@ export interface UseChatResult {
   activeConversationId: string | null;
   // The active conversation's search scope.
   scope: ConversationScope;
+  /** The workspace the active conversation's questions went to ('' = default), or null
+   *  while it has none and so belongs to whichever workspace asks first. */
+  conversationWorkspace: string | null;
   /** A scope, or an updater of the current one — updaters compose, so two setters
    *  called in the same tick (clear files, then clear tags) don't undo each other. */
   setScope: (scope: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => void;
@@ -174,8 +185,9 @@ export interface UseChatResult {
    *  (when ``indexedTags`` is given), from every conversation's scope. */
   pruneScopes: (indexedFilenames: string[], indexedTags?: string[]) => void;
   /** Drop just these filenames from every conversation's scope. Unlike pruneScopes it
-   *  needs no snapshot of the whole corpus, which can be stale by the time it runs. */
-  removeFromScopes: (filenames: string[]) => void;
+   *  needs no snapshot of the whole corpus, which can be stale by the time it runs.
+   *  `workspace`: the one they were deleted from (the one in use when absent). */
+  removeFromScopes: (filenames: string[], workspace?: string) => void;
   ask: (
     question: string,
     provider?: LlmProvider,
@@ -223,6 +235,11 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
 }
 
 const NO_TURNS: ChatTurn[] = [];
+
+interface TrailingStream {
+  conversationId: string | null;
+  controller: AbortController;
+}
 
 // How long IndexedDB writes are held back so a burst of changes is written once.
 const CHAT_STORE_SAVE_DELAY_MS = 300;
@@ -467,10 +484,14 @@ export function useChat(): UseChatResult {
   // Tracks the in-flight question's controller: doubles as a reentrancy guard and lets
   // unmount cancel a hung request.
   const inflightRef = useRef<AbortController | null>(null);
+  // Answered streams still open for their suggested follow-ups (see runAsk's finish).
+  const trailingRef = useRef(new Set<TrailingStream>());
 
   useEffect(() => {
+    const trailing = trailingRef.current;
     return () => {
       inflightRef.current?.abort();
+      trailing.forEach((stream) => stream.controller.abort());
     };
   }, []);
 
@@ -529,8 +550,21 @@ export function useChat(): UseChatResult {
     const startedAt = Date.now();
     const updateTurns = (update: (turns: ChatTurn[]) => ChatTurn[], touch = true) =>
       setConversationTurns(conversationId, update, touch);
+    let trailing: TrailingStream | null = null;
 
-    updateTurns((prev) => [...prev, makeTurn('user', question)]);
+    const task = options?.task;
+    // The first question binds the conversation to the workspace it was asked in
+    // (api/client sends that one's header); the default is recorded as no field.
+    const workspace = getWorkspace();
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) => {
+        if (conversation.id !== conversationId || conversation.turns.length > 0) return conversation;
+        const { workspace: _previous, ...rest } = conversation;
+        return workspace ? { ...rest, workspace } : rest;
+      }),
+    }));
+    updateTurns((prev) => [...prev, { ...makeTurn('user', question), ...(task ? { task } : {}) }]);
     setPending(true);
     // Seeded before the first server frame arrives so there is never a gap with a
     // pending request and no label at all.
@@ -546,6 +580,9 @@ export function useChat(): UseChatResult {
         if (!existing) {
           const created: ChatTurn = { ...makeTurn('assistant', ''), id: assistantTurnId };
           if (options?.modelLabel) created.model = options.modelLabel;
+          // Asked with the conversation as history: rated as a follow-up (feedback kind).
+          // A summary sends none.
+          if (!task && history.length > 0) created.followUp = true;
           return [...prev, update(created)];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
@@ -568,6 +605,32 @@ export function useChat(): UseChatResult {
       updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false);
     };
 
+    // The answer is finished at `done`, though the stream stays open for the suggested
+    // follow-ups the server works out after it: until then the answer read as still
+    // streaming (no Regenerate or rating, Stop on screen, no "Answer ready") and the next
+    // question waited for suggestions nobody had asked for yet. Run once — at `done`, or
+    // when the stream ends without one — so a question asked in between keeps its state.
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      flushDelta();
+      streamingTurnIdRef.current = null;
+      streamingConversationIdRef.current = null;
+      setStreamingConversationId(null);
+      if (inflightRef.current === controller) inflightRef.current = null;
+      if (conversationId) {
+        setStorage((prev) => applyDeleteHeldDuringStream(prev, conversationId, startedAt));
+      }
+      setPending(false);
+      setStage(null);
+    };
+    // A newer question in this conversation makes these suggestions moot (only the last
+    // answer shows its own): stop waiting for them, freeing the server's question slot.
+    trailingRef.current.forEach((trailing) => {
+      if (trailing.conversationId === conversationId) trailing.controller.abort();
+    });
+
     try {
       await api.askQuestionStream(
         question,
@@ -576,18 +639,32 @@ export function useChat(): UseChatResult {
         filenames,
         history,
         {
-          onStage: (serverStage) => {
-            setStage(stageLabel(serverStage));
+          onStage: (serverStage, progress) => {
+            setStage(stageLabel(serverStage, progress));
           },
           onSources: (sources, traceId) => {
             // Sources land the moment retrieval finishes, which is exactly when
             // generation starts — no separate server frame needed for it.
-            setStage('generating answer…');
+            setStage(task ? 'writing the summary…' : 'generating answer…');
             updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
           },
           onDelta: (text) => {
             bufferedDeltaRef.current += text;
             if (frameId === null) frameId = requestAnimationFrame(flushDelta);
+          },
+          onFollowups: (questions) => {
+            const followups = cleanFollowups(questions);
+            if (followups.length === 0) return;
+            // Onto this answer by id, and never creating it: by now it may have been
+            // cleared or deleted, and other questions may have been asked since.
+            setConversationTurns(
+              conversationId,
+              (prev) =>
+                prev.some((turn) => turn.id === assistantTurnId)
+                  ? prev.map((turn) => (turn.id === assistantTurnId ? { ...turn, followups } : turn))
+                  : prev,
+              false,
+            );
           },
           onDone: (answer, sources, timings, traceId, cached, grounding) => {
             flushDelta();
@@ -604,7 +681,14 @@ export function useChat(): UseChatResult {
                 : {}),
               ...(status === 'uncited' ? { uncited: true } : {}),
               ...(grounding?.truncated ? { truncated: true } : {}),
+              ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
+                ? { coverage: grounding.coverage }
+                : {}),
             }));
+            finish();
+            // Still open for follow-ups; aborted on unmount or by a newer question here.
+            trailing = { conversationId, controller };
+            trailingRef.current.add(trailing);
           },
         },
         controller.signal,
@@ -636,20 +720,12 @@ export function useChat(): UseChatResult {
           ...prev.map((turn) =>
             turn.id === assistantTurnId && turn.content !== '' ? { ...turn, incomplete: true } : turn,
           ),
-          { ...makeTurn('error', message), question },
+          { ...makeTurn('error', message), question, ...(task ? { task } : {}) },
         ]);
       }
     } finally {
-      flushDelta();
-      streamingTurnIdRef.current = null;
-      streamingConversationIdRef.current = null;
-      setStreamingConversationId(null);
-      inflightRef.current = null;
-      if (conversationId) {
-        setStorage((prev) => applyDeleteHeldDuringStream(prev, conversationId, startedAt));
-      }
-      setPending(false);
-      setStage(null);
+      if (trailing) trailingRef.current.delete(trailing);
+      finish();
     }
     // Only refs and stable setters are closed over — see activeConversationRef above.
   }, [setConversationTurns]);
@@ -698,6 +774,7 @@ export function useChat(): UseChatResult {
         updatedAt: now,
         turns: prior,
         scope: source.scope,
+        ...(source.workspace ? { workspace: source.workspace } : {}),
       };
       setStorage((prev) => ({
         ...prev,
@@ -729,6 +806,9 @@ export function useChat(): UseChatResult {
       updatedAt: now,
       turns,
     };
+    // An export carries only turns: it joins the workspace it is imported into.
+    const workspace = getWorkspace();
+    if (workspace) conversation.workspace = workspace;
     setStorage((prev) => ({
       ...prev,
       activeConversationId: conversation.id,
@@ -758,10 +838,17 @@ export function useChat(): UseChatResult {
   const keepInScopes = useCallback((
     keep: (filename: string) => boolean,
     keepTag: (tag: string) => boolean = () => true,
+    current = getWorkspace(),
   ) => {
+    // Only the conversations of the workspace the change was seen in: another
+    // workspace's documents are simply not in its listing.
     setStorage((prev) => {
       let changed = false;
       const conversations = prev.conversations.map((conversation) => {
+        const bound = conversationWorkspace(conversation);
+        // One with no questions yet belongs to the workspace in use, so a delete that
+        // ends after a switch away from its workspace leaves it alone.
+        if (bound === null ? current !== getWorkspace() : bound !== current) return conversation;
         const filenames = conversation.scope?.filenames ?? [];
         const tags = conversation.scope?.tags ?? [];
         const kept = filenames.filter(keep);
@@ -794,9 +881,9 @@ export function useChat(): UseChatResult {
   );
 
   const removeFromScopes = useCallback(
-    (filenames: string[]) => {
+    (filenames: string[], workspace?: string) => {
       const removed = new Set(filenames);
-      keepInScopes((name) => !removed.has(name));
+      keepInScopes((name) => !removed.has(name), undefined, workspace);
     },
     [keepInScopes],
   );
@@ -913,6 +1000,9 @@ export function useChat(): UseChatResult {
       updatedAt: conversation.updatedAt,
       turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
       ...(conversation.pinned ? { pinned: true } : {}),
+      ...(conversation.workspace && conversation.turns.length > 0
+        ? { workspace: conversation.workspace }
+        : {}),
     }));
     const prev = summariesRef.current;
     const same =
@@ -923,7 +1013,8 @@ export function useChat(): UseChatResult {
           summary.title === next[index].title &&
           summary.updatedAt === next[index].updatedAt &&
           summary.turnCount === next[index].turnCount &&
-          summary.pinned === next[index].pinned,
+          summary.pinned === next[index].pinned &&
+          summary.workspace === next[index].workspace,
       );
     if (same) return prev;
     summariesRef.current = next;
@@ -936,6 +1027,7 @@ export function useChat(): UseChatResult {
     streamingConversationId,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
+    conversationWorkspace: activeConversation ? conversationWorkspace(activeConversation) : null,
     setScope,
     pruneScopes,
     removeFromScopes,

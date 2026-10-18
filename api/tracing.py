@@ -100,6 +100,9 @@ class QueryTrace:
     citation_retry_used: bool = False
     # The HTTP request it came from (X-Request-ID), to find its log lines.
     request_id: str | None = None
+    # The workspace it was asked in ("" = the default): GET /traces shows a workspace
+    # only its own, as the prompt and candidates quote its documents.
+    workspace: str = ""
 
 
 class TraceSink(Protocol):
@@ -136,11 +139,15 @@ class TraceStore:
             trace = self._traces.get(trace_id)
             return replace(trace) if trace is not None else None
 
-    def list_traces(self) -> list[QueryTrace]:
-        """Return all retained traces, newest first."""
+    def list_traces(self, workspace: str | None = None) -> list[QueryTrace]:
+        """Return the retained traces, newest first; only ``workspace``'s when given."""
 
         with self._lock:
-            return [replace(trace) for trace in reversed(self._traces.values())]
+            return [
+                replace(trace)
+                for trace in reversed(self._traces.values())
+                if workspace is None or trace.workspace == workspace
+            ]
 
 
 def build_trace_candidates(

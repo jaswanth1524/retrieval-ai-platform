@@ -36,6 +36,13 @@ export interface PublicConfigResponse {
   /** An OpenAI-compatible server (vLLM, llama.cpp, LM Studio) is configured. */
   openai_compatible_available?: boolean;
   openai_compatible_model?: string;
+  /** WORKSPACES_ENABLED: separate corpora chosen per request; absent on older servers. */
+  workspaces_enabled?: boolean;
+  /** URL_INGEST_ENABLED: documents can be added from a URL; absent on older servers. */
+  url_ingest_enabled?: boolean;
+  /** ANTHROPIC_API_KEY is set; absent on older servers. */
+  anthropic_available?: boolean;
+  anthropic_model?: string;
   /** Providers a question may pick per request (ALLOWED_REQUEST_PROVIDERS). */
   allowed_request_providers?: string[];
   // Upload suffixes the server accepts (".pdf", ".epub", ...); absent on older servers.
@@ -86,6 +93,9 @@ export interface SearchResultResponse {
 export interface SearchResponse {
   results: SearchResultResponse[];
   timings: { embed_ms: number; search_ms: number; rerank_ms: number };
+  /** Nothing cleared the relevance bar an answer's sources must clear; these are the
+   *  closest passages (typical of a one- or two-word search). Absent from older servers. */
+  weak_matches?: boolean;
 }
 
 export interface FeedbackItemResponse {
@@ -97,6 +107,8 @@ export interface FeedbackItemResponse {
   rating: FeedbackRating;
   citation_source_number: number | null;
   created_at: number;
+  /** Absent from rows recorded before the kind was (read as "question"). */
+  kind?: FeedbackKind;
 }
 
 export interface FeedbackListResponse {
@@ -170,6 +182,10 @@ export interface DocumentDeleteResponse {
 
 export type FeedbackRating = 'up' | 'down';
 
+/** What was rated: a standalone question, one asked with the conversation as history,
+ *  or a summary/comparison. The server defaults to "question". */
+export type FeedbackKind = 'question' | 'follow_up' | 'summary';
+
 export interface FeedbackRequest {
   trace_id: string | null;
   question: string;
@@ -177,6 +193,7 @@ export interface FeedbackRequest {
   cited_filenames: string[];
   rating: FeedbackRating;
   citation_source_number: number | null;
+  kind?: FeedbackKind;
 }
 
 export interface FeedbackResponse {
@@ -258,10 +275,33 @@ export interface HistoryMessage {
   content: string;
 }
 
-export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible';
+export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible' | 'anthropic';
 
 /** Per-question options beyond the retrieval overrides. */
+/** A whole-document task (POST /questions/summary): summarize one document, or
+ *  compare two. Kept on the turn that asked it, so Retry and Regenerate repeat it. */
+export interface DocumentTask {
+  mode: 'summarize' | 'compare';
+  filenames: string[];
+  /** What to concentrate on; a general summary when absent. */
+  instruction?: string;
+}
+
+/** GET /workspaces: the workspaces besides the default one. */
+export interface WorkspaceListResponse {
+  enabled: boolean;
+  workspaces: string[];
+}
+
+/** How much of the documents a summary read (fewer than all when sampled). */
+export interface SummaryCoverage {
+  read: number;
+  total: number;
+}
+
 export interface QuestionOptions {
+  /** Ask this whole-document task instead of a retrieval question. */
+  task?: DocumentTask;
   /** Only documents carrying one of these tags. */
   tags?: string[];
   /** Skip the server's answer cache (Regenerate). */

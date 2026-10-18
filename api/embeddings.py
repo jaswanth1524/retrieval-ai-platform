@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from fastembed import SparseTextEmbedding, TextEmbedding
 from qdrant_client import models
 
+from api.model_files import colocate
 from api.request_id import submit_in_context
 from api.settings import AppSettings
 
@@ -65,6 +66,23 @@ class EmbeddedText:
     sparse: models.SparseVector
 
 
+def sparse_model_options(settings: AppSettings) -> dict[str, Any]:
+    """Extra options for the sparse model: BM25's stemmer language (SPARSE_LANGUAGE).
+
+    Only for BM25 — the other sparse models fastembed has take no language — and only
+    when it isn't English, so the default setup builds exactly the model it always did.
+    """
+
+    if settings.sparse_embedding_model.lower() != "qdrant/bm25":
+        return {}
+    language = settings.sparse_language.strip().lower()
+    return {} if language in ("", "english") else {"language": language}
+
+
+def passage_texts(texts: Sequence[str], prefix: str) -> list[str]:
+    return [f"{prefix}{text}" for text in texts] if prefix else list(texts)
+
+
 class LocalEmbeddingProvider:
     """Generate local dense and sparse embeddings with FastEmbed."""
 
@@ -75,15 +93,24 @@ class LocalEmbeddingProvider:
         sparse_model: SparseEmbeddingModel | None = None,
     ) -> None:
         self.settings = settings
-        self.dense_model = dense_model or TextEmbedding(
-            model_name=settings.dense_embedding_model,
-            lazy_load=True,
-            threads=settings.embedding_threads or None,
-        )
-        self.sparse_model = sparse_model or SparseTextEmbedding(
-            model_name=settings.sparse_embedding_model,
-            lazy_load=True,
-        )
+        if dense_model is None:
+            dense_model = TextEmbedding(
+                model_name=settings.dense_embedding_model,
+                lazy_load=True,
+                threads=settings.embedding_threads or None,
+            )
+            # Downloaded by the constructor, loaded on first use: in between, keep a
+            # large model's external weights where ONNX Runtime accepts them.
+            colocate(dense_model)
+        self.dense_model = dense_model
+        if sparse_model is None:
+            sparse_model = SparseTextEmbedding(
+                model_name=settings.sparse_embedding_model,
+                lazy_load=True,
+                **sparse_model_options(settings),
+            )
+            colocate(sparse_model)
+        self.sparse_model = sparse_model
         # One long-lived pair of workers instead of a fresh pool per call. Every query
         # embeds, so spawning and joining two OS threads was pure per-request overhead
         # on the hot path. The provider is a process-wide singleton (see
@@ -124,6 +151,10 @@ class LocalEmbeddingProvider:
         sequentially (roughly halving embedding wall-clock for a batch).
         """
 
+        # The corpus side only (e5-style models expect "passage: "); queries take
+        # DENSE_QUERY_INSTRUCTION instead, and BM25 never sees either.
+        prefix = self.settings.dense_passage_prefix
+
         if not texts:
             return []
 
@@ -133,7 +164,9 @@ class LocalEmbeddingProvider:
         try:
             dense_future = submit_in_context(
                 self._executor,
-                lambda: self._run_model("dense", lambda: list(self.dense_model.embed(texts))),
+                lambda: self._run_model(
+                    "dense", lambda: list(self.dense_model.embed(passage_texts(texts, prefix)))
+                ),
             )
             sparse_future = submit_in_context(
                 self._executor,

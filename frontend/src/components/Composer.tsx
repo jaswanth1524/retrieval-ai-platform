@@ -19,6 +19,9 @@ interface ComposerProps {
   disabled: boolean;
   /** The question can be typed but not sent yet (the app is still connecting). */
   sendHeld?: boolean;
+  /** The hold is the app starting up: a send asked for meanwhile goes out when it ends
+   *  (Enter pressed right after the page loaded was dropped without a word). */
+  sendQueueable?: boolean;
   hint?: string;
   pending: boolean;
   onCancel: () => void;
@@ -51,6 +54,7 @@ function Composer({
   onSubmit,
   disabled,
   sendHeld = false,
+  sendQueueable = false,
   hint,
   pending,
   onCancel,
@@ -157,13 +161,28 @@ function Composer({
 
   // The textarea stays editable while an answer streams (it can take a minute or two);
   // only sending is held until it finishes.
+  const [sendQueued, setSendQueued] = useState(false);
   const submit = () => {
     const trimmed = value.trim();
-    if (!trimmed || disabled || sendHeld || pending) return;
+    if (!trimmed || disabled || pending) return;
+    if (sendHeld) {
+      if (sendQueueable) setSendQueued(true);
+      return;
+    }
+    setSendQueued(false);
     onSubmit(trimmed);
     setValue('');
     if (draftKey) writeDraft(draftKey, '');
   };
+  // The queued send, once startup is over — or dropped, when it ended unable to send
+  // (an API key needed, no documents yet), the question kept in the box.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  useEffect(() => {
+    if (!sendQueued || sendHeld) return;
+    if (disabled || !value.trim()) setSendQueued(false);
+    else submitRef.current();
+  }, [sendQueued, sendHeld, disabled, value]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter while an IME is composing (Japanese, Chinese, Korean) confirms the candidate;
@@ -208,6 +227,7 @@ function Composer({
   const openaiEnabled = config !== null && isProviderUsable('openai', config);
   const ollamaEnabled = config !== null && isProviderUsable('ollama', config);
   const compatibleAllowed = allowed('openai_compatible');
+  const anthropicEnabled = config !== null && isProviderUsable('anthropic', config);
 
   // A search hiding an already-selected filename would make it permanently
   // unselectable (the checkbox list is the only way to remove it from scope), so a
@@ -230,6 +250,14 @@ function Composer({
       {hint && (
         <p className="composer__hint" data-testid="question-hint">
           {hint}
+        </p>
+      )}
+      <p className="visually-hidden" role="status">
+        {sendQueued ? 'Your question will be sent as soon as DocRAG is ready.' : ''}
+      </p>
+      {sendQueued && (
+        <p className="composer__hint" data-testid="question-queued" aria-hidden="true">
+          Sending as soon as DocRAG is ready…
         </p>
       )}
       <p className="visually-hidden" role="status" data-testid="question-length-status">
@@ -416,6 +444,22 @@ function Composer({
                     <span>Self-hosted &middot; {config.openai_compatible_model}</span>
                   </label>
                 )}
+                {config.anthropic_available && (
+                  <label className="composer__popover-item">
+                    <input
+                      type="radio"
+                      name="composer-provider"
+                      checked={provider === 'anthropic'}
+                      disabled={!anthropicEnabled}
+                      onChange={() => onProviderChange('anthropic')}
+                      data-testid="provider-anthropic"
+                    />
+                    <span>Anthropic &middot; {config.anthropic_model}</span>
+                  </label>
+                )}
+                {config.anthropic_available && !anthropicEnabled && (
+                  <p className="composer__popover-note">Not allowed on this server.</p>
+                )}
               </div>
             )}
           </div>
@@ -425,7 +469,9 @@ function Composer({
             type="button"
             className="composer__send"
             onClick={pending ? onCancel : submit}
-            disabled={pending ? false : disabled || sendHeld || !value.trim()}
+            disabled={
+              pending ? false : disabled || (sendHeld && !sendQueueable) || sendQueued || !value.trim()
+            }
             data-testid="question-submit"
           >
             {pending ? 'Stop' : 'Ask'}

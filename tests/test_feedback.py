@@ -173,3 +173,124 @@ def test_rows_restored_from_a_backup_are_ordered_and_pruned_by_their_age(
 
     # Four rows against a cap of three: the oldest restored one goes.
     assert [row.question for row in store.list_recent()] == ["live1", "live0", "old1"]
+
+
+def _rate(store: FeedbackStore, question: str, workspace: str = "") -> None:
+    store.add(
+        trace_id=None,
+        question=question,
+        answer_excerpt="a",
+        cited_filenames=[],
+        rating="up",
+        citation_source_number=None,
+        workspace=workspace,
+    )
+
+
+def test_feedback_is_kept_per_workspace(tmp_path: Path) -> None:
+    store = FeedbackStore(str(tmp_path / "feedback.db"))
+    _rate(store, "default q")
+    _rate(store, "legal q", workspace="legal")
+
+    assert [row.question for row in store.list_recent(10, workspace="")] == ["default q"]
+    assert [row.question for row in store.list_recent(10, workspace="legal")] == ["legal q"]
+    assert {row.question for row in store.list_recent(10)} == {"default q", "legal q"}
+    page, _ = store.rows_oldest_first(None, 10, workspace="legal")
+    assert [(row.question, row.workspace) for row in page] == [("legal q", "legal")]
+    assert len(store.rows_oldest_first(None, 10)[0]) == 2
+
+
+def test_restored_rows_join_the_workspace_they_are_restored_into(tmp_path: Path) -> None:
+    source = FeedbackStore(str(tmp_path / "a.db"))
+    _rate(source, "q")
+    rows, _ = source.rows_oldest_first(None, 10)
+    target = FeedbackStore(str(tmp_path / "b.db"))
+
+    assert target.import_rows(rows, workspace="legal") == 1
+    assert [row.workspace for row in target.list_recent(10)] == ["legal"]
+
+
+def test_a_file_from_before_workspaces_gets_the_column_in_place(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "feedback.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE feedback (id TEXT PRIMARY KEY, trace_id TEXT, "
+            "question TEXT NOT NULL, answer_excerpt TEXT NOT NULL, "
+            "cited_filenames_json TEXT NOT NULL, rating TEXT NOT NULL, "
+            "citation_source_number INTEGER, created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO feedback VALUES ('old', NULL, 'old q', 'a', '[]', 'down', NULL, 1.0)"
+        )
+    conn.close()
+
+    store = FeedbackStore(str(path))
+    _rate(store, "new q", workspace="legal")
+
+    assert [row.question for row in store.list_recent(10, workspace="")] == ["old q"]
+    assert [row.question for row in store.list_recent(10, workspace="legal")] == ["new q"]
+    FeedbackStore(str(path))  # opening it again doesn't try to add the column twice
+
+
+def test_the_same_rating_can_be_restored_into_two_workspaces_but_only_once_into_each(
+    tmp_path: Path,
+) -> None:
+    store = FeedbackStore(str(tmp_path / "feedback.db"))
+    _rate(store, "q", workspace="legal")
+    rows, _ = store.rows_oldest_first(None, 10)
+
+    assert store.import_rows(rows, workspace="archive") == 1
+    assert store.import_rows(rows, workspace="archive") == 0
+    assert store.import_rows(rows, workspace="legal") == 0
+    assert len(store.list_recent(10)) == 2
+
+
+def test_the_row_cap_applies_to_each_workspace_on_its_own(tmp_path: Path) -> None:
+    store = FeedbackStore(str(tmp_path / "feedback.db"), max_rows=2)
+    _rate(store, "quiet default q")  # the oldest row in the file
+    for index in range(3):
+        _rate(store, f"legal q{index}", workspace="legal")
+
+    # Across workspaces, the busy one's ratings pushed out the quiet one's.
+    assert [row.question for row in store.list_recent(10, workspace="")] == ["quiet default q"]
+    assert [row.question for row in store.list_recent(10, workspace="legal")] == [
+        "legal q2",
+        "legal q1",
+    ]
+
+
+def test_kind_is_stored_and_a_file_without_the_column_gets_it_in_place(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "feedback.db"
+    with sqlite3.connect(path) as conn:
+        # The table as it was with workspaces, before kinds.
+        conn.execute(
+            "CREATE TABLE feedback (id TEXT NOT NULL, trace_id TEXT, question TEXT NOT NULL, "
+            "answer_excerpt TEXT NOT NULL, cited_filenames_json TEXT NOT NULL, rating TEXT "
+            "NOT NULL, citation_source_number INTEGER, created_at REAL NOT NULL, workspace "
+            "TEXT NOT NULL DEFAULT '', PRIMARY KEY (workspace, id))"
+        )
+        conn.execute(
+            "INSERT INTO feedback VALUES ('old', NULL, 'old q', 'a', '[]', 'up', NULL, 1.0, '')"
+        )
+    conn.close()
+
+    store = FeedbackStore(str(path))
+    store.add(
+        trace_id=None,
+        question="Summarize a.txt",
+        answer_excerpt="a",
+        cited_filenames=[],
+        rating="up",
+        citation_source_number=None,
+        kind="summary",
+    )
+    assert [(row.question, row.kind) for row in store.list_recent(10)] == [
+        ("Summarize a.txt", "summary"),
+        ("old q", "question"),
+    ]
+    page, _ = FeedbackStore(str(path)).rows_oldest_first(None, 10)  # reopened: no re-add
+    assert [row.kind for row in page] == ["question", "summary"]
