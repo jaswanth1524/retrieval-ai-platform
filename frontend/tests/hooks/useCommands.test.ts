@@ -165,3 +165,49 @@ describe('isShortcutModifier', () => {
     expect(isShortcutModifier(meta, false)).toBe(false);
   });
 });
+
+describe('pass 7 commands and keys', () => {
+  it('lists documents to read or summarize, up to a cap', () => {
+    const run = { ...actions(), readDocument: vi.fn(), summarize: vi.fn() };
+    const palette = { otherDialogOpen: false, togglePalette: vi.fn(), closePalette: vi.fn() };
+    const { result } = renderHook(() =>
+      useCommands(state({ documents: ['a.md', 'b.pdf'] }), run, palette),
+    );
+    const read = result.current.find((command) => command.label === 'Read: b.pdf');
+    read?.run();
+    expect(run.readDocument).toHaveBeenCalledWith('b.pdf');
+    result.current.find((command) => command.label === 'Summarize: a.md')?.run();
+    expect(run.summarize).toHaveBeenCalledWith(['a.md']);
+
+    const many = Array.from({ length: 301 }, (_, index) => `d${index}.md`);
+    const { result: crowded } = renderHook(() =>
+      useCommands(state({ documents: many }), run, palette),
+    );
+    expect(crowded.current.some((command) => command.label.startsWith('Read: '))).toBe(false);
+  });
+
+  it('binds the inspector and search, and plain keys only outside text fields', () => {
+    const run = { ...actions(), showShortcuts: vi.fn(), cycleConversation: vi.fn() };
+    const palette = { otherDialogOpen: false, togglePalette: vi.fn(), closePalette: vi.fn() };
+    renderHook(() => useCommands(state(), run, palette));
+
+    press('\\');
+    press('F', { shiftKey: true });
+    expect(run.toggleInspector).toHaveBeenCalledTimes(1);
+    expect(run.searchPassages).toHaveBeenCalledTimes(1);
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: ']' }));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: '[' }));
+    expect(run.showShortcuts).toHaveBeenCalledTimes(1);
+    expect(run.cycleConversation).toHaveBeenNthCalledWith(1, 1);
+    expect(run.cycleConversation).toHaveBeenNthCalledWith(2, -1);
+
+    // Typed into a text field, they are text.
+    const input = document.createElement('textarea');
+    document.body.appendChild(input);
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true }));
+    input.remove();
+    expect(run.showShortcuts).toHaveBeenCalledTimes(1);
+  });
+});

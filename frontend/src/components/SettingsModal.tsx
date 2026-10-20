@@ -16,6 +16,8 @@ interface SettingsModalProps {
   /** Show a system notification when an answer finishes in a background tab. */
   notifyOnAnswer?: boolean;
   onNotifyOnAnswerChange?: (value: boolean) => void;
+  /** The server's DocRAG version (/health); null when it doesn't say. */
+  serverVersion?: string | null;
 }
 
 const SYSTEM_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
@@ -82,6 +84,7 @@ function SettingsModal({
   disabled,
   notifyOnAnswer = false,
   onNotifyOnAnswerChange,
+  serverVersion = null,
 }: SettingsModalProps) {
   const dialogRef = useDialog(true, onClose);
   const [apiKeyDraft, setApiKeyDraft] = useState(getApiKey);
@@ -307,6 +310,14 @@ function SettingsModal({
             <summary className="mono">System info</summary>
             <table className="settings__table">
               <tbody>
+                {serverVersion && (
+                  <tr>
+                    <td>DocRAG version</td>
+                    <td className="mono" data-testid="settings-server-version">
+                      {serverVersion}
+                    </td>
+                  </tr>
+                )}
                 {SYSTEM_FIELDS.map(([label, key]) => (
                   <tr key={key}>
                     <td>{label}</td>

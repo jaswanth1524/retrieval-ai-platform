@@ -38,6 +38,7 @@ from api.parsers.html import parse_html_document
 from api.parsers.pdf import parse_pdf_document
 from api.parsers.pptx import parse_pptx_document
 from api.parsers.text import (
+    declared_html_charset,
     decode_text_document,
     looks_like_markdown,
     parse_markdown_document,
@@ -104,7 +105,9 @@ def _parse_markdown(
 def _parse_html(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
-    return parse_html_document(filename, decode_text_document(filename, content))
+    return parse_html_document(
+        filename, decode_text_document(filename, content, declared_html_charset(content))
+    )
 
 
 def _parse_csv(
@@ -170,9 +173,14 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 # labelled with the rows it holds; a chunk crossing pages records its last page
 # (``page_end``); tiny sections are only merged within a page; chunk ids come from the
 # content, not the position, so they survive an edit elsewhere in the document.
+# v6: HTML keeps its main content only (<main>, a lone <article>, or the page without
+# its nav/header/footer/aside), its tables as one self-describing line per row, and
+# paragraph and list-item boundaries; an HTML file's <meta charset> is honoured. PDF
+# lines repeated at the top or bottom of most pages (running headers, footers, page
+# numbers) are dropped.
 # Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
 # carry an older version is listed as stale, and re-indexing it applies this one.
-CHUNKER_VERSION = 5
+CHUNKER_VERSION = 6
 
 # The smallest share of CHUNK_SIZE_TOKENS a window keeps for text, whatever the
 # filename › section prefix costs. Without a floor a long name left one token per
@@ -213,6 +221,15 @@ class DocumentNotFoundError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DocumentSource:
+    """Where a URL-ingested document came from (stamped on its chunks)."""
+
+    url: str
+    etag: str | None = None
+    last_modified: str | None = None
+
+
+@dataclass(frozen=True)
 class DocumentChunk:
     """A chunk ready for embedding and storage with citation metadata.
 
@@ -250,6 +267,17 @@ class DocumentChunk:
     # chunks ("hf" or "heuristic", see api/chunking.py). Absent on older points.
     chunking_fingerprint: str | None = None
     token_counter: str | None = None
+    # SHA-256 of the uploaded bytes (every chunk of one ingest), so an upload of the
+    # same bytes can be recognized and left alone, and how many chunks that ingest
+    # wrote: a failed ingest leaves fewer points than it says, and is not "complete".
+    # Absent on older points.
+    content_sha256: str | None = None
+    document_chunks: int | None = None
+    # Where a document fetched by URL (POST /documents/from-url) came from, with the
+    # validators the server sent, for a refresh. Absent on uploads.
+    source_url: str | None = None
+    source_etag: str | None = None
+    source_last_modified: str | None = None
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
@@ -260,6 +288,11 @@ class DocumentChunk:
     PAYLOAD_TAGS_KEY: ClassVar[str] = "tags"
     PAYLOAD_FINGERPRINT_KEY: ClassVar[str] = "chunking_fingerprint"
     PAYLOAD_TOKEN_COUNTER_KEY: ClassVar[str] = "token_counter"
+    PAYLOAD_SHA256_KEY: ClassVar[str] = "content_sha256"
+    PAYLOAD_DOCUMENT_CHUNKS_KEY: ClassVar[str] = "document_chunks"
+    PAYLOAD_SOURCE_URL_KEY: ClassVar[str] = "source_url"
+    PAYLOAD_SOURCE_ETAG_KEY: ClassVar[str] = "source_etag"
+    PAYLOAD_SOURCE_LAST_MODIFIED_KEY: ClassVar[str] = "source_last_modified"
 
     def to_payload(self) -> dict[str, str | int | float | list[str]]:
         """Return the Qdrant payload shape needed for grounded citations."""
@@ -286,6 +319,16 @@ class DocumentChunk:
             payload[self.PAYLOAD_FINGERPRINT_KEY] = self.chunking_fingerprint
         if self.token_counter is not None:
             payload[self.PAYLOAD_TOKEN_COUNTER_KEY] = self.token_counter
+        if self.document_chunks is not None:
+            payload[self.PAYLOAD_DOCUMENT_CHUNKS_KEY] = self.document_chunks
+        for key, value in (
+            (self.PAYLOAD_SHA256_KEY, self.content_sha256),
+            (self.PAYLOAD_SOURCE_URL_KEY, self.source_url),
+            (self.PAYLOAD_SOURCE_ETAG_KEY, self.source_etag),
+            (self.PAYLOAD_SOURCE_LAST_MODIFIED_KEY, self.source_last_modified),
+        ):
+            if value is not None:
+                payload[key] = value
         return payload
 
 

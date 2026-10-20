@@ -29,6 +29,7 @@ function documentsFrom(response: DocumentListResponse): Record<string, DocumentM
       stale: stale.has(filename),
       reindexable: reindexable.has(filename),
       tags: response.tags?.[filename] ?? [],
+      ...(response.source_urls?.[filename] ? { sourceUrl: response.source_urls[filename] } : {}),
     };
   }
   return documents;
@@ -354,6 +355,33 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest(workspace);
     };
 
+    // A document fetched by URL, fetched again. The server asks conditionally: a source
+    // that hasn't changed (304) starts no job.
+    const handleRefreshFromUrl = async (filename: string, workspace = getWorkspace()) => {
+      let result;
+      try {
+        result = await api.refreshDocument(filename, undefined, workspace);
+      } catch (err) {
+        if (!deps.current.onAuthFailure(err)) {
+          deps.current.pushToast({
+            tone: 'bad',
+            title: `Couldn't refresh ${filename}`,
+            body: apiErrorMessage(err, 'Try again in a moment.'),
+          });
+        }
+        return;
+      }
+      if (!('job_id' in result)) {
+        deps.current.pushToast({ tone: 'good', title: `${filename} is unchanged at its source` });
+        return;
+      }
+      const accepted = result;
+      const id = newId();
+      setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true, workspace }]);
+      await runIngestJob(id, filename, workspace, async () => accepted);
+      await refreshAfterIngest(workspace);
+    };
+
     // Several documents chosen at once: started together and followed together, with
     // one listing refresh at the end — handleReindex per document refreshed the whole
     // listing once per document.
@@ -524,6 +552,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleCancelUpload,
       handleUploadFromUrl,
       handleReindex,
+      handleRefreshFromUrl,
       handleReindexMany,
       handleReindexAllStale,
       handleDeleteDocument,

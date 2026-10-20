@@ -30,12 +30,17 @@ import ToastRow from './components/ToastRow';
 import SearchPanel from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import FeedbackPanel from './components/FeedbackPanel';
-import { MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
+import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
 import { useChat } from './hooks/useChat';
 import { useStableHandler } from './hooks/useStableHandler';
 import { prefetchCitationContent } from './utils/contentPrefetch';
 import { useCommands } from './hooks/useCommands';
-import { useConnectionMonitor } from './hooks/useConnectionMonitor';
+import { useServerHealth } from './hooks/useServerHealth';
+import ServerNotices from './components/ServerNotices';
+import SummaryDialog from './components/SummaryDialog';
+import ShortcutsDialog from './components/ShortcutsDialog';
+import ServerActivity from './components/corpus/ServerActivity';
+import { useCorpusAutoRefresh } from './hooks/useCorpusAutoRefresh';
 import { usePanelList } from './hooks/usePanelList';
 import { useAppBoot } from './hooks/useAppBoot';
 import { useWorkspaces } from './hooks/useWorkspaces';
@@ -64,6 +69,7 @@ import {
   clampOverrides,
   loadPersistedMode,
   CITATION_PREFETCH_DWELL_MS,
+  WEAK_SUPPORT_MARGIN,
   canPreviewOriginal,
   NO_HIDDEN_PANELS,
   HIDDEN_FEEDBACK_PANEL,
@@ -149,6 +155,7 @@ function App() {
     persistError,
     persistPartial,
     setTurnFeedback,
+    setSourceIrrelevant,
     scope,
     conversationWorkspace,
     setScope,
@@ -157,6 +164,7 @@ function App() {
     editAndResend,
     importConversation,
     historyReady,
+    allConversationsJson,
   } = useChat();
   // A deleted conversation's unsent draft goes with it, whichever tab deleted it. After
   // the composer has saved it on the switch away, hence an effect on the list. Not
@@ -166,6 +174,19 @@ function App() {
     if (!historyReady) return;
     pruneDrafts(new Set(conversations.map((conversation) => conversation.id)));
   }, [conversations, historyReady]);
+  // At the cap, starting another conversation drops the least recently used unpinned
+  // one. Said once a session, when the history first fills, rather than not at all.
+  const capNoticeShownRef = useRef(false);
+  useEffect(() => {
+    if (!historyReady || capNoticeShownRef.current) return;
+    if (conversations.length < MAX_CONVERSATIONS) return;
+    capNoticeShownRef.current = true;
+    pushToast({
+      tone: 'warn',
+      title: `History is full (${MAX_CONVERSATIONS} conversations)`,
+      body: 'Each new conversation now replaces the least recently used one that isn’t pinned. Pin or export the ones to keep.',
+    });
+  }, [conversations.length, historyReady, pushToast]);
   // An answer can stream into one conversation while another is open. The open one shows
   // its progress (and offers Stop) only when it is the one being answered.
   const streamingHere = pending && streamingConversationId === activeConversationId;
@@ -181,6 +202,7 @@ function App() {
     handleDismissUpload,
     handleCancelUpload,
     handleReindex,
+    handleRefreshFromUrl,
     handleUploadFromUrl,
     handleReindexMany,
     handleReindexAllStale,
@@ -268,6 +290,10 @@ function App() {
     (filename: string, tags: string[]) => handleSetTags(filename, tags, workspace),
     [handleSetTags, workspace],
   );
+  const refreshHere = useCallback(
+    (filename: string) => void handleRefreshFromUrl(filename, workspace),
+    [handleRefreshFromUrl, workspace],
+  );
   const reindexHere = useCallback(
     (filename: string) => void handleReindex(filename, workspace),
     [handleReindex, workspace],
@@ -282,9 +308,22 @@ function App() {
     () => uploads.filter((item) => (item.workspace ?? '') === workspace),
     [uploads, workspace],
   );
+  // This tab's own uploads in flight: the activity list shows only the rest.
+  const followedKey = workspaceUploads
+    .filter((item) => item.status === 'uploading')
+    .map((item) => item.filename)
+    .join('\n');
+  const followedUploads = useMemo(
+    () => new Set(followedKey ? followedKey.split('\n') : []),
+    [followedKey],
+  );
+  const relistAfterOtherJobs = useStableHandler(() => {
+    void refreshDocuments().catch(noteAuthFailure);
+  });
   const { exportingBackup, restoring, downloadBackup, restoreBackup, downloadOriginal } =
     useBackupActions({
       pushToast,
+      dismissToast,
       noteAuthFailure,
       onRestoreQueued: async (jobs, restoredTo) => {
         setRail('corpus');
@@ -423,7 +462,8 @@ function App() {
     load: loadFeedback,
   } = usePanelList<FeedbackItemResponse>(
     rail === 'feedback',
-    async (signal) => (await api.listFeedback(200, signal)).feedback,
+    // The server's cap (FEEDBACK_LIST_MAX_LIMIT): the panel filters what it holds.
+    async (signal) => (await api.listFeedback(500, signal)).feedback,
     noteAuthFailure,
     'Could not load feedback.',
   );
@@ -496,8 +536,15 @@ function App() {
     }
   });
   const booted = apiStatus === 'ok' || apiStatus === 'unauthorized';
-  const connectionLost = useConnectionMonitor(booted);
+  const { connectionLost, version: serverVersion, updatedTo, indexProblem } =
+    useServerHealth(booted);
+  useCorpusAutoRefresh(
+    corpusChecked && apiStatus === 'ok',
+    connectionLost,
+    useStableHandler(() => refreshDocuments().catch(noteAuthFailure)),
+  );
 
+  const reloadPage = useStableHandler(() => window.location.reload());
   const noDocs = corpusChecked && !listingFailed && indexedFilenames.length === 0;
   const booting = apiStatus === 'checking' || !corpusChecked;
   // Auth takes precedence over noDocs: when the corpus list 401s, "no documents" is a
@@ -597,24 +644,48 @@ function App() {
       }),
     [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
-  // Like the composer's Send: not before the app has booted, nor with a refused key.
-  const summarizeDisabled = booting || apiStatus === 'unauthorized';
+  // Like the composer's Send: not before the app has booted, nor with a refused key —
+  // and not while any answer streams (one question at a time; it would be ignored).
+  const summarizeDisabled = booting || apiStatus === 'unauthorized' || pending;
   // One document summarized, or two compared, as a turn in the open conversation.
   // Stable: every memoized document card receives it, and it used to change with the
   // scope and the provider (askQuestion's), re-rendering all of them.
+  // Opens the focus dialog first ("deadlines", "what changed"); it runs on Enter.
+  const [summaryFilenames, setSummaryFilenames] = useState<string[] | null>(null);
   const summarizeDocuments = useStableHandler((filenames: string[]) => {
+    if (summarizeDisabled || filenames.length === 0) return;
+    setSummaryFilenames([...new Set(filenames)]);
+  });
+  const runSummary = useStableHandler((filenames: string[], instruction?: string) => {
+    setSummaryFilenames(null);
     if (summarizeDisabled) return;
-    const task: DocumentTask =
-      filenames.length === 2
-        ? { mode: 'compare', filenames: filenames.slice(0, 2) }
-        : { mode: 'summarize', filenames: filenames.slice(0, 1) };
+    const mode: DocumentTask['mode'] =
+      filenames.length === 1 ? 'summarize' : filenames.length === 2 ? 'compare' : 'brief';
+    const task: DocumentTask = { mode, filenames, ...(instruction ? { instruction } : {}) };
     const label =
-      task.mode === 'compare'
-        ? `Compare ${task.filenames[0]} and ${task.filenames[1]}`
-        : `Summarize ${task.filenames[0]}`;
+      mode === 'compare'
+        ? `Compare ${filenames[0]} and ${filenames[1]}`
+        : mode === 'brief'
+          ? `Brief on ${filenames.length} documents: ${filenames.join(', ')}`
+          : `Summarize ${filenames[0]}`;
+    const shown = instruction ? `${label} — focus: ${instruction}` : label;
     // On a narrow screen the corpus panel is a drawer over the conversation.
     setPanelDrawerOpen(false);
-    void askQuestion(label, task);
+    void askQuestion(shown, task);
+  });
+  // "Ask about these": the open conversation's scope becomes those documents, and the
+  // question box takes focus. Before, the composer's scope popover was the only way.
+  const askAbout = useStableHandler((filenames: string[]) => {
+    setScope({ filenames: [...new Set(filenames)], tags: [] });
+    setPanelDrawerOpen(false);
+    pushToast({
+      tone: 'good',
+      title:
+        filenames.length === 1
+          ? `Asking about ${filenames[0]}`
+          : `Asking about ${filenames.length} documents`,
+    });
+    window.requestAnimationFrame(() => document.getElementById(QUESTION_INPUT_ID)?.focus());
   });
   const editQuestion = useCallback(
     (turnId: string, question: string) => {
@@ -670,7 +741,13 @@ function App() {
   // Shown at once (ChatMessage's feedbackGiven); taken back if it couldn't be sent, so
   // the buttons don't claim a rating the server never recorded and it can be retried.
   const handleFeedback = useCallback((payload: FeedbackPayload) => {
-    setTurnFeedback(payload.turnId, payload.rating);
+    const citation = payload.citationSourceNumber;
+    // One source rated, or the whole answer: each kept on the turn so it isn't sent twice.
+    const mark = (on: boolean) =>
+      citation !== undefined
+        ? setSourceIrrelevant(payload.turnId, citation, on)
+        : setTurnFeedback(payload.turnId, on ? payload.rating : undefined);
+    mark(true);
     void api
       .submitFeedback({
         trace_id: payload.traceId,
@@ -678,11 +755,11 @@ function App() {
         answer_excerpt: sliceWhole(payload.answerExcerpt, 2000),
         cited_filenames: payload.citedFilenames,
         rating: payload.rating,
-        citation_source_number: null,
+        citation_source_number: citation ?? null,
         kind: payload.kind,
       })
       .catch((err) => {
-        setTurnFeedback(payload.turnId, undefined);
+        mark(false);
         if (noteAuthFailure(err)) return;
         pushToast({
           tone: 'warn',
@@ -692,7 +769,7 @@ function App() {
       });
     // noteAuthFailure only calls state setters; pushToast is stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setTurnFeedback, pushToast]);
+  }, [setTurnFeedback, setSourceIrrelevant, pushToast]);
 
   // Persistence problems arrive as state flags, not events, so they are surfaced with
   // stable ids — a re-render must refresh the same notice rather than stack duplicates.
@@ -735,6 +812,35 @@ function App() {
     );
   }, []);
 
+  const exportAllConversations = useCallback(() => {
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadFile(`docrag-conversations-${stamp}.json`, 'application/json', allConversationsJson());
+  }, [allConversationsJson]);
+  const copyLastAnswer = useStableHandler(() => {
+    const answer = [...turns].reverse().find((turn) => turn.role === 'assistant' && turn.content);
+    if (!answer) return;
+    const done = (ok: boolean) =>
+      pushToast(
+        ok
+          ? { tone: 'good', title: 'Answer copied' }
+          : { tone: 'warn', title: "Couldn't copy", body: 'Use the copy button on the answer.' },
+      );
+    if (!navigator.clipboard) {
+      done(false);
+      return;
+    }
+    navigator.clipboard.writeText(answer.content).then(
+      () => done(true),
+      () => done(false),
+    );
+  });
+  const cycleConversation = useStableHandler((step: 1 | -1) => {
+    if (conversations.length < 2) return;
+    const index = conversations.findIndex((c) => c.id === activeConversationId);
+    const next = conversations[(index + step + conversations.length) % conversations.length];
+    if (next) switchConversation(next.id);
+  });
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const exportJson = useCallback(() => {
     if (turnsRef.current.length === 0) return;
     downloadFile(
@@ -797,6 +903,8 @@ function App() {
       scopedFilenames: selectedFilenames,
       answerInFlight: pending,
       summarizeDisabled,
+      documents: indexedFilenames,
+      hasAnswer: turns.some((turn) => turn.role === 'assistant' && turn.content !== ''),
     },
     {
       newConversation: () => {
@@ -825,9 +933,18 @@ function App() {
       clear,
       switchConversation,
       summarize: summarizeDocuments,
+      readDocument: handleReadDocument,
+      copyLastAnswer,
+      exportAllConversations,
+      cycleConversation,
+      showShortcuts: () => {
+        setPaletteOpen(false);
+        setShortcutsOpen(true);
+      },
     },
     {
-      otherDialogOpen: settingsOpen || sourceView !== null,
+      otherDialogOpen:
+        settingsOpen || sourceView !== null || shortcutsOpen || summaryFilenames !== null,
       togglePalette: () => setPaletteOpen((prev) => !prev),
       closePalette: () => setPaletteOpen(false),
     },
@@ -840,10 +957,31 @@ function App() {
     } catch {
       parsed = null;
     }
-    const imported = parsed !== null && importConversation(parsed);
+    // "Export all conversations" wrote several; a single conversation's export is turns.
+    const many =
+      parsed && typeof parsed === 'object' && 'docrag_conversations' in parsed
+        ? (parsed as { docrag_conversations: unknown }).docrag_conversations
+        : null;
+    let count = 0;
+    if (Array.isArray(many)) {
+      for (const item of [...many].reverse()) {
+        const title =
+          item && typeof item === 'object' && typeof (item as { title?: unknown }).title === 'string'
+            ? (item as { title: string }).title
+            : undefined;
+        if (importConversation(item, title)) count += 1;
+      }
+    } else if (parsed !== null && importConversation(parsed)) {
+      count = 1;
+    }
+    const imported = count > 0;
     pushToast(
       imported
-        ? { tone: 'good', title: 'Conversation imported', body: file.name }
+        ? {
+            tone: 'good',
+            title: count === 1 ? 'Conversation imported' : `${count} conversations imported`,
+            body: file.name,
+          }
         : {
             tone: 'bad',
             title: "Couldn't import that file",
@@ -953,6 +1091,16 @@ function App() {
             onDelete={deleteWorkspace}
           />
         )}
+        {rail === 'corpus' && apiStatus === 'ok' && (
+          <ServerActivity
+            key={`activity-${workspace}`}
+            workspace={workspace}
+            followed={followedUploads}
+            watchEnabled={Boolean(config?.watch_enabled)}
+            canScan={!readOnly}
+            onJobsFinished={relistAfterOtherJobs}
+          />
+        )}
         {rail === 'corpus' && (
           <CorpusPanel
             // A fresh panel per workspace: a selection, a pending confirm or a bulk
@@ -965,7 +1113,9 @@ function App() {
             onDelete={deleteDocumentHere}
             maxUploadBytes={config?.max_upload_bytes}
             supportedExtensions={config?.supported_extensions}
-            disabled={pending}
+            // Only while this conversation's answer streams: an answer in another
+            // conversation locked tagging, deleting and uploading for its minute or two.
+            disabled={streamingHere}
             browseInputRef={corpusBrowseInputRef}
             onRetryUpload={handleRetryUpload}
             onDismissUpload={handleDismissUpload}
@@ -981,6 +1131,9 @@ function App() {
             onRead={handleReadDocument}
             onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
             onSummarize={summarizeDocuments}
+            onAskAbout={askAbout}
+            summaryMaxDocuments={config?.summary_max_documents}
+            onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? refreshHere : undefined}
             summarizeDisabled={summarizeDisabled}
           />
         )}
@@ -1021,6 +1174,12 @@ function App() {
           </div>
         ) : (
           <>
+            <ServerNotices
+              indexProblem={indexProblem}
+              updatedTo={updatedTo}
+              workspacesEnabled={workspacesEnabled}
+              onReload={reloadPage}
+            />
             <ChatHeader
               key={activeConversationId ?? 'none'}
               title={activeConversation?.title ?? 'New chat'}
@@ -1050,6 +1209,9 @@ function App() {
               onRetry={askQuestion}
               onRegenerate={regenerateQuestion}
               onAskFollowup={askQuestion}
+              weakSupportBelow={
+                config ? config.rerank_min_score + WEAK_SUPPORT_MARGIN : undefined
+              }
               onEditQuestion={editQuestion}
               feedbackEnabled={config?.feedback_enabled}
               onFeedback={handleFeedback}
@@ -1128,9 +1290,20 @@ function App() {
           {paletteOpen && (
             <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />
           )}
+          {shortcutsOpen && (
+            <ShortcutsDialog commands={commands} onClose={() => setShortcutsOpen(false)} />
+          )}
+          {summaryFilenames && (
+            <SummaryDialog
+              filenames={summaryFilenames}
+              onRun={(instruction) => runSummary(summaryFilenames, instruction)}
+              onClose={() => setSummaryFilenames(null)}
+            />
+          )}
           {settingsOpen && config && (
             <SettingsModal
               config={config}
+              serverVersion={serverVersion}
               overrides={advancedOptions}
               onOverridesChange={updateAdvancedOptions}
               onClose={() => setSettingsOpen(false)}

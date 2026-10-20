@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from typing import Any, cast
 
 import pytest
 
+import api.llm as llm_module
 from api.answer_cache import AnswerCache
 from api.documents import DocumentNotFoundError
 from api.llm import ChatMessage
@@ -430,3 +432,165 @@ def test_a_summary_trace_records_its_workspace() -> None:
     ).summarize(SummaryRequest(mode="summarize", filenames=("a.txt",)))
 
     assert [trace.workspace for trace in traces.traces] == ["legal"]
+
+
+def test_a_summary_stream_left_as_done_arrives_is_still_cached() -> None:
+    repository = FakeRepository({"a.txt": [_payload("a.txt", 1, "Alpha.")]})
+    generator = ScriptedGenerator()
+    summarizer = _summarizer(
+        repository, generator, answer_cache=AnswerCache(max_entries=8, ttl_seconds=60)
+    )
+    request = SummaryRequest(mode="summarize", filenames=("a.txt",))
+
+    stream = summarizer.summarize_stream(request)
+    for event in stream:
+        if event["type"] == "done":
+            break
+    # The client went away with the `done` frame in hand: the generator is closed at
+    # that yield, and the cache entry was written before it went out.
+    stream.close()
+
+    replay = list(summarizer.summarize_stream(request))
+    assert len(generator.calls) == 1
+    assert replay[-1]["type"] == "done" and replay[-1].get("cached") is True
+
+
+def test_cjk_passages_are_packed_by_tokens_not_characters() -> None:
+    from api.reranking import RerankedChunk
+    from api.summarize import _pack
+
+    def chunk(n: int, text: str) -> RerankedChunk:
+        return RerankedChunk(
+            point_id=f"p{n}",
+            filename="a.txt",
+            page=1,
+            section="S",
+            chunk_id=f"c{n}",
+            text=text,
+            retrieval_score=0.0,
+            rerank_score=0.0,
+        )
+
+    latin = [chunk(n, "x" * 300) for n in range(4)]
+    cjk = [chunk(n, "休" * 300) for n in range(4)]
+    # 300 CJK characters weigh three times 300 Latin ones: more, smaller parts.
+    assert len(_pack(cjk, 1000)) > len(_pack(latin, 1000))
+    # A single CJK passage over the budget is cut to fit it.
+    (only,) = _pack([chunk(9, "休" * 2000)], 1000)
+    assert len(only[0].text) < 1000 // 3 + 1
+
+
+def test_a_brief_covers_several_documents_by_theme() -> None:
+    repository = FakeRepository(
+        {name: [_payload(name, 1, f"{name} text.")] for name in ("a.txt", "b.txt", "c.txt")}
+    )
+    generator = ScriptedGenerator()
+    request = SummaryRequest(mode="brief", filenames=("a.txt", "b.txt", "c.txt"))
+
+    result = _summarizer(repository, generator).summarize(request)
+
+    prompt = generator.calls[-1][-1]["content"]
+    assert 'covering the documents "a.txt", "b.txt" and "c.txt"' in prompt
+    assert "by theme" in prompt
+    assert all(f"{name} text." in prompt for name in ("a.txt", "b.txt", "c.txt"))
+    assert result.chunks_read == 3
+
+
+def test_a_brief_past_the_document_limit_is_refused() -> None:
+    names = tuple(f"d{n}.txt" for n in range(6))
+    repository = FakeRepository({name: [_payload(name, 1, "t")] for name in names})
+    summarizer = _summarizer(repository, ScriptedGenerator(), _settings(summary_max_documents=5))
+    with pytest.raises(SummaryTooLargeError, match="at most 5"):
+        summarizer.check_documents(names)
+
+
+class SlowNotes(ScriptedGenerator):
+    """Notes that finish out of order, each reporting token usage like LiteLLM does."""
+
+    def __init__(self) -> None:
+        super().__init__(answer="All of it [1].")
+        self.lock = threading.Lock()
+        self.active = 0
+        self.peak = 0
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        content = messages[-1]["content"]
+        if "Excerpts from" not in content:
+            return super().complete(messages, settings)
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        part = int(content.split("(part ")[1].split(" of")[0])
+        time.sleep(0.02 * max(0, 8 - part))  # earlier parts finish later
+        llm_module._count_usage({"usage": {"prompt_tokens": 10, "completion_tokens": 1}}, settings)
+        with self.lock:
+            self.active -= 1
+        return f"Notes on part {part} [{part}]."
+
+
+def _long_document(parts: int) -> FakeRepository:
+    return FakeRepository(
+        {"long.txt": [_payload("long.txt", n, "w" * 1200) for n in range(1, parts * 3 + 1)]}
+    )
+
+
+def test_hosted_parts_run_side_by_side_and_keep_their_order_and_usage() -> None:
+    generator = SlowNotes()
+    settings = _settings(
+        llm_provider="openai",
+        openai_api_key="k",
+        summary_batch_chars=3000,
+        summary_parallel_parts=4,
+    )
+    request = SummaryRequest(mode="summarize", filenames=("long.txt",))
+
+    events = list(_summarizer(_long_document(4), generator, settings).summarize_stream(request))
+
+    assert generator.peak > 1
+    combine = generator.calls[-1][-1]["content"]
+    positions = [combine.index(f"Notes on part {n}") for n in range(1, 4)]
+    assert positions == sorted(positions)  # in document order, whatever finished first
+    steps = [e["step"] for e in events if e["type"] == "stage" and e["stage"] == "summarizing"]
+    assert steps == list(range(1, len(steps) + 1)) and len(steps) >= 3
+    done = next(e for e in events if e["type"] == "done")
+    assert done["usage"]["prompt_tokens"] >= 40  # every part's tokens counted
+
+
+def test_ollama_parts_run_one_at_a_time() -> None:
+    generator = SlowNotes()
+    settings = _settings(llm_provider="ollama", summary_batch_chars=3000, summary_parallel_parts=4)
+    request = SummaryRequest(mode="summarize", filenames=("long.txt",))
+    list(_summarizer(_long_document(3), generator, settings).summarize_stream(request))
+    assert generator.peak == 1
+
+
+class NotesRecorder(SlowNotes):
+    def __init__(self) -> None:
+        super().__init__()
+        self.notes_prompts: list[str] = []
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        if "Excerpts from" in messages[-1]["content"]:
+            self.notes_prompts.append(messages[-1]["content"])
+        return super().complete(messages, settings)
+
+
+def test_notes_for_several_documents_say_the_others_are_read_separately() -> None:
+    # A part shows one document while a compare/brief task names all of them; told
+    # nothing more, gpt-4o-mini answered NOTHING RELEVANT for every part.
+    marker = "the others are read separately"
+    settings = _settings(llm_provider="ollama", summary_batch_chars=3000)
+    repository = FakeRepository(
+        {name: [_payload(name, n, "w" * 1200) for n in range(1, 7)] for name in ("a.txt", "b.txt")}
+    )
+    generator = NotesRecorder()
+    request = SummaryRequest(mode="compare", filenames=("a.txt", "b.txt"))
+    list(_summarizer(repository, generator, settings).summarize_stream(request))
+    assert len(generator.notes_prompts) >= 2
+    assert all(marker in prompt for prompt in generator.notes_prompts)
+
+    generator = NotesRecorder()
+    request = SummaryRequest(mode="summarize", filenames=("long.txt",))
+    list(_summarizer(_long_document(3), generator, settings).summarize_stream(request))
+    assert generator.notes_prompts
+    assert not any(marker in prompt for prompt in generator.notes_prompts)

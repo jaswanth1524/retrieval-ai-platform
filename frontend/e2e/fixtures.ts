@@ -136,6 +136,14 @@ export class MockApi {
   readonly imports: string[] = [];
   /** DELETE /documents/jobs/{id} answers 409 "already writing" instead of cancelling. */
   cancelTooLate = false;
+  /** The server's version on GET /health; change it mid-test to simulate an update. */
+  version = '0.1.0';
+  /** GET /health/ready beyond "all up" (an index built for another embedding setup). */
+  readiness: Record<string, unknown> = {};
+  /** GET /documents/jobs: jobs indexing that the page didn't start. */
+  activeJobs: object[] = [];
+  /** GET /watch (needs config.watch_enabled); null answers 404. */
+  watchStatus: object | null = null;
   /** In-flight ingest jobs by id: the file each one indexes, how often it was polled and
    *  whether it was cancelled. Every job walks `jobSteps` on its own, so a bulk re-index
    *  runs several at once. */
@@ -148,7 +156,7 @@ export class MockApi {
   async install(page: Page): Promise<void> {
     await page.route(
       (url) =>
-        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search)(\/|$)/.test(
+        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch)(\/|$)/.test(
           url.pathname,
         ),
       (route) => this.handle(route),
@@ -170,7 +178,19 @@ export class MockApi {
     const path = new URL(request.url()).pathname;
     const method = request.method();
 
-    if (path === '/health') return this.json(route, 200, { status: 'ok' });
+    if (path === '/health') return this.json(route, 200, { status: 'ok', version: this.version });
+    if (path === '/health/ready') {
+      return this.json(route, 200, {
+        status: 'ok',
+        qdrant: true,
+        generation_provider: true,
+        llm_provider: 'ollama',
+        index_compatible: true,
+        index_detail: null,
+        originals_kept: false,
+        ...this.readiness,
+      });
+    }
     if (path === '/config') return this.json(route, 200, { ...CONFIG, ...this.config });
     if (this.apiKey !== null && request.headers()['x-api-key'] !== this.apiKey) {
       return this.configured(route, 401, { detail: 'Missing or invalid API key.' });
@@ -232,6 +252,13 @@ export class MockApi {
       return this.json(route, 202, this.startJob(filename));
     }
 
+    if (path === '/documents/jobs' && method === 'GET') {
+      return this.json(route, 200, { jobs: this.activeJobs });
+    }
+    if (path === '/watch' || path === '/watch/scan') {
+      if (this.watchStatus === null) return this.configured(route, 404, { detail: 'No folder is watched.' });
+      return this.json(route, path === '/watch' ? 200 : 202, this.watchStatus);
+    }
     if (path.startsWith('/documents/jobs/')) {
       const jobId = path.slice('/documents/jobs/'.length);
       const job = this.jobs.get(jobId);

@@ -11,7 +11,7 @@ from qdrant_client import QdrantClient
 from api.chunking import HeuristicTokenCounter
 from api.dependencies import clear_dependency_caches
 from api.repository import VectorRepository
-from api.watch import FolderWatcher, scan_folder
+from api.watch import FolderWatcher, UnreadableFileError, WatchedJob, scan_folder
 from tests.factories import wait_until
 from tests.routes_http.support import FakeEmbeddingProvider, make_settings
 
@@ -118,7 +118,8 @@ def test_removed_files_are_deleted_only_when_asked_and_only_if_seen(tmp_path: Pa
 
 def test_a_missing_folder_is_reported_not_fatal(tmp_path: Path) -> None:
     folder = watcher(tmp_path / "nope", Recorder())
-    assert folder.scan_once() == {"indexed": [], "deleted": [], "deferred": []}
+    assert not any(folder.scan_once().values())
+    assert "not a directory" in folder.status().problems[0]
 
 
 def test_the_app_watcher_indexes_reindexes_and_deletes(
@@ -388,3 +389,173 @@ def test_a_stand_down_is_logged_once_not_every_pass(
     folder.scan_once()
     folder.scan_once()
     assert caplog.text.count("lists no files at all") == 2
+
+
+class JobRecorder(Recorder):
+    """Each enqueue makes a job the test settles by hand, as the ingest pool would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.jobs: dict[str, WatchedJob] = {}
+        self.refuse: Exception | None = None
+
+    def enqueue(self, name: str, content: bytes, mtime: float) -> str:  # type: ignore[override]
+        if self.refuse is not None:
+            raise self.refuse
+        self.enqueued.append((name, content))
+        job_id = f"job-{len(self.enqueued)}"
+        self.jobs[job_id] = WatchedJob("queued")
+        return job_id
+
+    def finish(self, job_id: str, state: str, error: str | None = None, **kw: bool) -> None:
+        self.jobs[job_id] = WatchedJob(state, error, **kw)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def retrying_watcher(
+    tmp_path: Path, recorder: JobRecorder, clock: Clock, **overrides: object
+) -> FolderWatcher:
+    settings = make_settings(
+        watch_dir=str(tmp_path), watch_interval_seconds=10, watch_max_retries=2, **overrides
+    )
+    return FolderWatcher(
+        settings,
+        lambda: dict(recorder.indexed),
+        recorder.enqueue,
+        recorder.delete,
+        recorder.jobs.get,
+        clock=clock,
+    )
+
+
+def test_a_failed_job_is_retried_with_backoff_then_given_up(tmp_path: Path) -> None:
+    """A file whose job failed (Qdrant down, an embedding error) used to stay "sent"
+    until it changed or the process restarted."""
+
+    write(tmp_path / "a.txt", "A")
+    recorder, clock = JobRecorder(), Clock()
+    folder = retrying_watcher(tmp_path, recorder, clock)
+
+    folder.scan_once()
+    assert folder.scan_once()["indexed"] == ["a.txt"]
+    recorder.finish("job-1", "failed", "Qdrant is unavailable")
+
+    assert folder.scan_once()["retrying"] == ["a.txt"]  # failed: waits 10s
+    status = folder.status()
+    assert [(r.filename, r.attempts, r.error) for r in status.retrying] == [
+        ("a.txt", 1, "Qdrant is unavailable")
+    ]
+    clock.now += 10
+    assert folder.scan_once()["indexed"] == ["a.txt"]  # second attempt
+    recorder.finish("job-2", "failed", "still down")
+    folder.scan_once()
+    clock.now += 19
+    assert folder.scan_once()["retrying"] == ["a.txt"]  # 20s now, not 10
+    clock.now += 1
+    assert folder.scan_once()["indexed"] == ["a.txt"]
+    recorder.finish("job-3", "failed", "still down")
+
+    assert folder.scan_once()["gave_up"] == ["a.txt"]  # past WATCH_MAX_RETRIES=2
+    clock.now += 10_000
+    assert not any(folder.scan_once().values())
+    assert folder.status().gave_up == ["a.txt"] and folder.status().retrying == []
+
+    # Changing the file starts over.
+    write(tmp_path / "a.txt", "A, edited", mtime=time.time() + 5)
+    folder.scan_once()
+    assert folder.scan_once()["indexed"] == ["a.txt"]
+    assert folder.status().gave_up == []
+
+
+def test_a_finished_or_cancelled_job_is_not_retried(tmp_path: Path) -> None:
+    write(tmp_path / "done.txt", "D")
+    write(tmp_path / "cancelled.txt", "C")
+    recorder, clock = JobRecorder(), Clock()
+    folder = retrying_watcher(tmp_path, recorder, clock)
+
+    folder.scan_once()
+    assert sorted(folder.scan_once()["indexed"]) == ["cancelled.txt", "done.txt"]
+    for job_id, (name, _) in zip(recorder.jobs, recorder.enqueued, strict=True):
+        if name == "done.txt":
+            recorder.finish(job_id, "done")
+        else:
+            recorder.finish(job_id, "failed", "Cancelled", cancelled=True)
+
+    clock.now += 10_000
+    assert not any(folder.scan_once().values())
+    assert len(recorder.enqueued) == 2
+
+
+def test_a_job_the_store_forgot_falls_back_to_the_index(tmp_path: Path) -> None:
+    write(tmp_path / "a.txt", "A")
+    recorder, clock = JobRecorder(), Clock()
+    folder = retrying_watcher(tmp_path, recorder, clock)
+    folder.scan_once()
+    folder.scan_once()
+    recorder.jobs.clear()  # evicted, and the document never made it into the index
+
+    assert folder.scan_once()["indexed"] == ["a.txt"]
+
+
+def test_a_refused_file_waits_for_a_change_and_an_unreadable_one_is_retried(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path / "a.txt", "A")
+    recorder, clock = JobRecorder(), Clock()
+    folder = retrying_watcher(tmp_path, recorder, clock)
+    folder.scan_once()
+
+    recorder.refuse = HTTPException(status_code=409, detail="conflict")
+    done = folder.scan_once()
+    assert done["gave_up"] == ["a.txt"] and done["indexed"] == []  # not counted as sent
+    recorder.refuse = None
+    clock.now += 10_000
+    assert not any(folder.scan_once().values())
+
+    recorder.refuse = UnreadableFileError("gone mid-read")
+    write(tmp_path / "a.txt", "A2", mtime=time.time() + 5)
+    folder.scan_once()
+    assert folder.scan_once()["retrying"] == ["a.txt"]
+    recorder.refuse = None
+    clock.now += 10
+    assert folder.scan_once()["indexed"] == ["a.txt"]
+
+
+def test_scan_now_runs_the_next_pass_without_waiting_for_the_interval(tmp_path: Path) -> None:
+    recorder = Recorder()
+    settings = make_settings(watch_dir=str(tmp_path), watch_interval_seconds=3600)
+    folder = FolderWatcher(
+        settings, lambda: dict(recorder.indexed), recorder.enqueue, recorder.delete
+    )
+    folder.start()
+    try:
+        wait_until(lambda: folder.status().last_scan_at is not None)
+        first = folder.status().last_scan_at
+        folder.scan_now()
+        wait_until(lambda: folder.status().last_scan_at != first)
+    finally:
+        folder.stop()
+
+
+def test_a_file_that_cannot_be_parsed_is_not_retried(tmp_path: Path) -> None:
+    """Retrying a corrupt PDF only parsed it again to the same error, WATCH_MAX_RETRIES
+    times; it now waits for the file to change."""
+
+    write(tmp_path / "a.txt", "A")
+    recorder, clock = JobRecorder(), Clock()
+    folder = retrying_watcher(tmp_path, recorder, clock)
+    folder.scan_once()
+    folder.scan_once()
+    recorder.finish("job-1", "failed", "Could not parse 'a.txt'.", permanent=True)
+
+    assert folder.scan_once()["gave_up"] == ["a.txt"]
+    clock.now += 10_000
+    assert not any(folder.scan_once().values())
+    assert len(recorder.enqueued) == 1

@@ -3,6 +3,7 @@ follow-ups, and query expansion."""
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -10,6 +11,7 @@ from dataclasses import dataclass, replace
 from api.llm import (
     ChatGenerator,
     ChatMessage,
+    GenerationConfigError,
     GenerationError,
     completion_model_and_kwargs,
     effective_max_tokens,
@@ -27,7 +29,7 @@ CONDENSE_SYSTEM_PROMPT = (
     "You rewrite a follow-up question into one standalone search query for document "
     "retrieval. Use the conversation to resolve pronouns and references. Output only "
     "the rewritten question — no preamble, quotes, or explanation. If the question is "
-    "already self-contained, return it unchanged."
+    "already self-contained, return it unchanged. Keep the question's language."
 )
 
 
@@ -46,6 +48,27 @@ EXPANSION_SYSTEM_PROMPT = (
     "Output one variant per line — no numbering, bullets, quotes, or preamble. Vary "
     "the wording and emphasis while keeping the original meaning."
 )
+
+
+def answer_language_instruction(settings: AppSettings) -> str:
+    """The system-prompt sentence for ANSWER_LANGUAGE ("" when unset)."""
+
+    language = settings.answer_language
+    if not language:
+        return ""
+    if language == "match":
+        return "Write the answer in the language of the question."
+    return f"Write the answer in {language}."
+
+
+def with_answer_language(messages: list[ChatMessage], settings: AppSettings) -> list[ChatMessage]:
+    """``messages`` with ANSWER_LANGUAGE's sentence added to the system message."""
+
+    instruction = answer_language_instruction(settings)
+    if not instruction or not messages or messages[0]["role"] != "system":
+        return messages
+    first = {"role": "system", "content": f"{messages[0]['content']} {instruction}"}
+    return [first, *messages[1:]]  # type: ignore[list-item]
 
 
 def build_grounded_messages(
@@ -111,18 +134,93 @@ _CONTEXT_WINDOW_MARGIN_TOKENS = 64
 
 
 def context_window_tokens(settings: AppSettings) -> int:
-    """The generation model's context window, or 0 when unknown (no fitting)."""
+    """The generation model's context window, or 0 when unknown (no fitting).
+
+    LLM_CONTEXT_WINDOW when set; for Ollama, OLLAMA_NUM_CTX when set; for a hosted model
+    (OpenAI, Anthropic), what LiteLLM's bundled model table says. Ollama is never asked
+    (its /api/show is a network call per lookup, which once cost 75 s when Ollama was
+    unreachable), and an OpenAI-compatible server's model is unknown to the table.
+    """
 
     if settings.llm_context_window > 0:
         return int(settings.llm_context_window)
-    if settings.llm_provider.lower().strip() == "ollama" and settings.ollama_num_ctx > 0:
-        return int(settings.ollama_num_ctx)
+    provider = settings.llm_provider.lower().strip()
+    if provider == "ollama":
+        return int(settings.ollama_num_ctx) if settings.ollama_num_ctx > 0 else 0
+    if provider in ("openai", "anthropic"):
+        try:
+            model, _ = completion_model_and_kwargs(settings)
+        except GenerationConfigError:
+            return 0  # not configured: generation reports that itself
+        return _known_context_window(model)
     return 0
+
+
+@functools.lru_cache(maxsize=64)
+def _known_context_window(model: str) -> int:
+    """The model's input window from LiteLLM's bundled model table (read as data: its
+    lookup function prints a banner for every unlisted model), or 0 when unlisted."""
+
+    import litellm
+
+    table = getattr(litellm, "model_cost", {}) or {}
+    entry = table.get(model) or table.get(model.split("/", 1)[-1])
+    if not isinstance(entry, dict):
+        return 0
+    window = entry.get("max_input_tokens") or entry.get("max_tokens")
+    return int(window) if isinstance(window, int) and window > 0 else 0
+
+
+def prompt_token_budget(settings: AppSettings) -> int | None:
+    """Tokens a prompt may take and still leave room for the answer, or None when the
+    window is unknown (nothing is fitted then)."""
+
+    window = context_window_tokens(settings)
+    if window <= 0:
+        return None
+    model, _ = completion_model_and_kwargs(settings)
+    return window - effective_max_tokens(settings, model) - _CONTEXT_WINDOW_MARGIN_TOKENS
+
+
+# Chinese, Japanese and Korean characters: about one token each under the common
+# tokenizers, where chars/3 counted three of them as one and let a CJK prompt run well
+# past the window it was fitted to.
+_CJK_RE = re.compile(
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9f]"
+)
+
+
+def estimate_text_tokens(text: str) -> int:
+    """A deliberately high token estimate: a CJK character is one token, the rest
+    CHARS_PER_TOKEN_ESTIMATE characters per token."""
+
+    cjk = len(_CJK_RE.findall(text))
+    return cjk + -(-(len(text) - cjk) // CHARS_PER_TOKEN_ESTIMATE)
+
+
+def weighted_length(text: str) -> int:
+    """``text``'s length in "estimate characters": a CJK character counts as a whole
+    token's worth (CHARS_PER_TOKEN_ESTIMATE), so character budgets hold for CJK too."""
+
+    return len(text) + (CHARS_PER_TOKEN_ESTIMATE - 1) * len(_CJK_RE.findall(text))
+
+
+def clip_to_weight(text: str, limit: int) -> str:
+    """The longest prefix of ``text`` whose ``weighted_length`` is at most ``limit``."""
+
+    if weighted_length(text) <= limit:
+        return text
+    used = 0
+    for index, char in enumerate(text):
+        used += CHARS_PER_TOKEN_ESTIMATE if _CJK_RE.match(char) else 1
+        if used > limit:
+            return text[:index]
+    return text
 
 
 def estimate_prompt_tokens(messages: Sequence[ChatMessage]) -> int:
     return sum(
-        -(-len(message["content"]) // CHARS_PER_TOKEN_ESTIMATE) + _PER_MESSAGE_TOKEN_OVERHEAD
+        estimate_text_tokens(message["content"]) + _PER_MESSAGE_TOKEN_OVERHEAD
         for message in messages
     )
 
@@ -153,10 +251,9 @@ def fit_prompt_to_context_window(
     chunks = list(context_chunks)
     kept_history = list(history or [])
     window = context_window_tokens(settings)
-    if window <= 0:
+    budget = prompt_token_budget(settings)
+    if budget is None:
         return FittedPrompt(chunks, kept_history)
-    model, _ = completion_model_and_kwargs(settings)
-    budget = window - effective_max_tokens(settings, model) - _CONTEXT_WINDOW_MARGIN_TOKENS
     dropped: list[str] = []
     dropped_history = 0
 
@@ -194,7 +291,7 @@ CONDENSE_HISTORY_MESSAGES = 4
 CONDENSE_ASSISTANT_CHARS = 600
 
 
-def _clip(text: str, limit: int) -> str:
+def clip_text(text: str, limit: int) -> str:
     """``text`` cut to about ``limit`` characters, on a word boundary."""
 
     if len(text) <= limit:
@@ -219,7 +316,7 @@ def build_condense_messages(
     transcript = "\n".join(
         f"User: {message['content']}"
         if message["role"] == "user"
-        else f"Assistant: {_clip(message['content'], CONDENSE_ASSISTANT_CHARS)}"
+        else f"Assistant: {clip_text(message['content'], CONDENSE_ASSISTANT_CHARS)}"
         for message in history[-CONDENSE_HISTORY_MESSAGES:]
     )
     return [
@@ -425,7 +522,72 @@ _LOW_SIGNAL_WORDS = frozenset(
 )
 
 
-_WORD_RE = re.compile(r"[a-z][a-z']*")
+# The same two judgements for the languages the multilingual profile is measured on
+# (Spanish, German, French, Portuguese, Italian). Without them a follow-up such as "Und
+# wie lange dauert das?" was never condensed: no English anaphora, five "content" words.
+# Kept to words that are not English words, so an English question is judged exactly as
+# before (German "die" and "er" are left out for that reason; a short German follow-up
+# still condenses through the content-word rule). Words that also mean something
+# everyday in another of the languages
+# are left out of the anaphora list, or every question in that language would match:
+# the articles "le", "la", "lo", "il", German "es" (Spanish "is"), Spanish "su"
+# (Italian "on").
+_ANAPHORA_WORDS_OTHER = frozenset(
+    {
+        # Spanish
+        "eso", "esto", "esa", "ese", "esas", "esos", "estas", "estos", "ello", "él",
+        "ella", "ellos", "ellas", "sus", "mismo", "misma", "anterior", "otro",
+        "otra", "entonces", "allí", "ahí",
+        # German
+        "das", "diese", "dieser", "dieses", "diesem", "diesen", "sie", "ihm",
+        "ihn", "ihr", "ihre", "ihren", "ihrem", "dafür", "dazu", "davon", "darüber",
+        "damit", "dabei", "dort", "dann", "dasselbe", "derselbe", "vorherige", "andere",
+        # French
+        "elle", "ils", "elles", "lui", "leur", "leurs", "sa", "ses", "ce", "cela",
+        "ça", "ceci", "celui", "celle", "ceux", "celles", "là", "alors", "même",
+        "précédent", "autre",
+        # Portuguese
+        "isso", "isto", "aquilo", "ele", "ela", "eles", "elas", "dele", "dela", "deles",
+        "delas", "seu", "sua", "seus", "suas", "então", "lá", "ali", "outra",
+        # Italian
+        "esso", "essa", "questo", "questa", "questi", "queste", "quello", "quella",
+        "quelli", "ciò", "lei", "loro", "suo", "suoi", "sue", "stesso",
+        "precedente", "altro", "altra", "allora", "lì",
+    }
+)  # fmt: skip
+
+
+_LOW_SIGNAL_WORDS_OTHER = frozenset(
+    {
+        # Spanish
+        "de", "la", "le", "lo", "il", "di", "al", "su", "es", "o", "e",
+        "el", "los", "las", "una", "unos", "unas", "y", "pero", "del", "en", "por",
+        "para", "sobre", "qué", "cuál", "cuáles", "quién", "cuándo", "dónde", "cómo",
+        "cuánto", "cuántos", "cuánta", "cuántas", "está", "están", "hay", "se",
+        "mi", "nos", "sí", "también", "muy", "más",
+        # German
+        "der", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "und",
+        "oder", "aber", "von", "zu", "für", "mit", "auf", "im", "bei", "über", "wer",
+        "wie", "wann", "wo", "warum", "welche", "welcher", "welches", "viele", "viel",
+        "ist", "sind", "gibt", "haben", "kann", "muss", "ich", "wir", "mir", "uns",
+        "nicht", "kein", "auch", "noch", "bitte",
+        # French
+        "les", "une", "du", "et", "ou", "mais", "à", "au", "aux", "dans", "pour", "avec",
+        "quel", "quelle", "quels", "quelles", "qui", "quand", "où", "comment", "combien",
+        "pourquoi", "est", "sont", "faut", "je", "nous", "ne", "oui", "aussi",
+        # Portuguese
+        "os", "um", "uma", "da", "dos", "das", "em", "na", "nas", "qual", "quais", "quem",
+        "quando", "onde", "como", "quanto", "quantos", "quantas", "é", "são", "há", "eu",
+        "meu", "minha", "não", "também",
+        # Italian
+        "gli", "uno", "della", "nel", "che", "quale", "quali", "chi", "perché", "è",
+        "sono", "ci", "io", "mio", "anche",
+    }
+)  # fmt: skip
+
+
+# Words in any script (letters only, an inner apostrophe kept: "it's", "d'une").
+_WORD_RE = re.compile(r"[^\W\d_][^\W\d_']*")
 
 
 # Below this many substantive words, a question is too thin to retrieve on by itself
@@ -449,9 +611,13 @@ def needs_condense(question: str) -> bool:
     """
 
     words = _WORD_RE.findall(question.lower())
-    if any(word in _ANAPHORA_WORDS for word in words):
+    if any(word in _ANAPHORA_WORDS or word in _ANAPHORA_WORDS_OTHER for word in words):
         return True
-    content = [word for word in words if word not in _LOW_SIGNAL_WORDS]
+    content = [
+        word
+        for word in words
+        if word not in _LOW_SIGNAL_WORDS and word not in _LOW_SIGNAL_WORDS_OTHER
+    ]
     return len(content) < _MIN_STANDALONE_CONTENT_WORDS
 
 
@@ -536,7 +702,7 @@ def build_followup_messages(
     context = "\n\n".join(
         format_context_chunk(
             index,
-            replace(chunk, text=_clip(chunk.text, _FOLLOWUP_SOURCE_CHARS), expanded_text=None),
+            replace(chunk, text=clip_text(chunk.text, _FOLLOWUP_SOURCE_CHARS), expanded_text=None),
         )
         for index, chunk in enumerate(sources, start=1)
     )

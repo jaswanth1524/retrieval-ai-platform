@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from api.citations import ANSWER_STATUSES
 from api.documents import MAX_TAGS_PER_DOCUMENT
+from api.settings import SUMMARY_DOCUMENTS_LIMIT
 from api.tracing import TRACE_DROP_REASONS
 
 # Bounds for per-question retrieval/generation overrides accepted by QuestionRequest.
@@ -33,6 +34,9 @@ REQUEST_HISTORY_MESSAGE_MAX_CHARS = 4000
 # self-hosted corpus — this exists to stop an unbounded client-supplied list, not to
 # constrain legitimate scoping.
 REQUEST_FILENAMES_MAX = 500
+# A section filter on POST /search; stored labels are capped well below it
+# (parsers.common.MAX_SECTION_CHARS).
+SEARCH_SECTION_MAX_CHARS = 200
 
 # Per-item caps on client-sent lists, which were capped only in count: one feedback row
 # could carry ~1 MB of filenames, and question scopes are copied into every trace and
@@ -74,6 +78,9 @@ class ReadinessResponse(BaseModel):
     # of `status` — the app is up, and the UI is how the operator recovers.
     index_compatible: bool = True
     index_detail: str | None = None
+    # Whether uploaded originals are kept (RAW_DOCUMENT_DIR): only then can a backup
+    # rebuild the index, so the UI offers that way out of a mismatch only then.
+    originals_kept: bool = False
 
 
 class PublicConfigResponse(BaseModel):
@@ -125,6 +132,12 @@ class PublicConfigResponse(BaseModel):
     # File suffixes an upload may have (".pdf", ".epub", ...), so the UI's file picker
     # and its pre-upload check follow the server instead of a hard-coded copy.
     supported_extensions: list[str] = Field(default_factory=list)
+    # WATCH_DIR is set: GET /watch and POST /watch/scan are available.
+    watch_enabled: bool = False
+    # ANSWER_LANGUAGE ("" = the model's choice, "match" = the question's language).
+    answer_language: str = ""
+    # SUMMARY_MAX_DOCUMENTS: the most documents one brief may cover.
+    summary_max_documents: int = 5
 
 
 class DocumentIngestResponse(BaseModel):
@@ -134,6 +147,9 @@ class DocumentIngestResponse(BaseModel):
     sections_parsed: int
     chunks_ingested: int
     collection_name: str
+    # The document was already indexed from these exact bytes, with current chunking
+    # settings: nothing was parsed, embedded or written.
+    unchanged: bool = False
 
 
 class DocumentJobAcceptedResponse(BaseModel):
@@ -156,6 +172,18 @@ class DocumentJobStatusResponse(BaseModel):
     result: DocumentIngestResponse | None = None
     # True for a job stopped by DELETE /documents/jobs/{job_id} (state "failed").
     cancelled: bool = False
+    # When the job was accepted (Unix time).
+    created_at: float | None = None
+    # True for a job that found the document already indexed from identical bytes and
+    # left it as it was (state "done", nothing re-embedded).
+    unchanged: bool = False
+
+
+class DocumentJobListResponse(BaseModel):
+    """A workspace's queued and running ingest jobs, oldest first: uploads from any
+    client, the watched folder, a bulk re-index or a restore."""
+
+    jobs: list[DocumentJobStatusResponse]
 
 
 class DocumentListResponse(BaseModel):
@@ -176,6 +204,30 @@ class DocumentListResponse(BaseModel):
     reindexable_filenames: list[str] = []
     # Tagged documents only (PATCH /documents/{f}/tags); an untagged one is absent.
     tags: dict[str, list[str]] = {}
+    # Documents fetched by URL (POST /documents/from-url): where from, without its query
+    # string (POST /documents/{f}/refresh uses the full one). Uploads are absent.
+    source_urls: dict[str, str] = {}
+
+
+class DocumentVersionResponse(BaseModel):
+    version: str
+    # When it was replaced (Unix time).
+    saved_at: float
+    size: int
+
+
+class DocumentVersionsResponse(BaseModel):
+    """Earlier versions of a document's original (RAW_DOCUMENT_VERSIONS), newest first."""
+
+    filename: str
+    versions: list[DocumentVersionResponse]
+
+
+class DocumentRefreshResponse(BaseModel):
+    """POST /documents/{f}/refresh when the source said nothing changed (304)."""
+
+    filename: str
+    unchanged: bool = True
 
 
 class DocumentTagsRequest(BaseModel):
@@ -368,6 +420,32 @@ class TraceListResponse(BaseModel):
     traces: list[TraceSummaryResponse]
 
 
+class QueryLogEntryResponse(BaseModel):
+    """One logged question or summary (QUERY_LOG_ENABLED)."""
+
+    created_at: float
+    question: str
+    # The trace's status: ok, insufficient_context (not answered from the documents),
+    # error. Extensible.
+    status: str
+    # Best passage score (0-1) the question found; None for a summary.
+    top_score: float | None = None
+    mode: str
+    trace_id: str | None = None
+
+
+class QueryLogResponse(BaseModel):
+    queries: list[QueryLogEntryResponse]
+
+
+class UsageResponse(BaseModel):
+    """Tokens the provider reported for an answer's LLM calls (the citation retry and a
+    summary's notes included; condensing, query expansion and follow-ups not)."""
+
+    prompt_tokens: int
+    completion_tokens: int
+
+
 class TraceDetailResponse(BaseModel):
     """Full per-query debug trace: candidates, the exact prompt, and timings."""
 
@@ -393,6 +471,7 @@ class TraceDetailResponse(BaseModel):
     citation_retry_used: bool = False
     # The X-Request-ID of the request that asked it, to find its log lines.
     request_id: str | None = None
+    usage: UsageResponse | None = None
 
 
 class HistoryMessageRequest(BaseModel):
@@ -496,6 +575,8 @@ class QuestionResponse(BaseModel):
     truncated: bool = False
     # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.
     followups: list[str] = []
+    # None when the provider reported no usage, and on a cache hit.
+    usage: UsageResponse | None = None
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -525,11 +606,13 @@ class UrlIngestRequest(BaseModel):
 
 
 class SummaryRequest(BaseModel):
-    """Summarize one whole document, or compare two (POST /questions/summary)."""
+    """Summarize one whole document, compare two, or write one brief across several
+    (POST /questions/summary)."""
 
-    mode: Literal["summarize", "compare"]
-    # One document to summarize, two (different ones) to compare.
-    filenames: list[RequestFilename] = Field(min_length=1, max_length=2)
+    mode: Literal["summarize", "compare", "brief"]
+    # One document to summarize, two (different ones) to compare, two up to
+    # SUMMARY_MAX_DOCUMENTS (different ones) for a brief.
+    filenames: list[RequestFilename] = Field(min_length=1, max_length=SUMMARY_DOCUMENTS_LIMIT)
     # What to concentrate on ("deadlines", "risks"); omitted for a general summary.
     instruction: str | None = Field(default=None, max_length=MAX_QUESTION_CHARS)
     llm_provider: RequestProvider | None = None
@@ -541,13 +624,15 @@ class SummaryRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_document_count(self) -> SummaryRequest:
-        wanted = 2 if self.mode == "compare" else 1
-        if len(self.filenames) != wanted or len(set(self.filenames)) != wanted:
-            raise ValueError(
-                "compare takes two different documents"
-                if self.mode == "compare"
-                else "summarize takes one document"
-            )
+        distinct = len(set(self.filenames))
+        if distinct != len(self.filenames):
+            raise ValueError("each document may be named once")
+        if self.mode == "compare" and distinct != 2:
+            raise ValueError("compare takes two different documents")
+        if self.mode == "summarize" and distinct != 1:
+            raise ValueError("summarize takes one document")
+        if self.mode == "brief" and distinct < 2:
+            raise ValueError("a brief takes two documents or more")
         return self
 
 
@@ -579,6 +664,22 @@ class SearchRequest(BaseModel):
     )
     # How many reranked passages to return; capped by the server's fused_top_n (400).
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
+    # Passages starting on a page in this range (either end optional).
+    page_min: int | None = Field(default=None, ge=1)
+    page_max: int | None = Field(default=None, ge=1)
+    # Passages under exactly this section label (as citations show it).
+    section: str | None = Field(default=None, min_length=1, max_length=SEARCH_SECTION_MAX_CHARS)
+    # Documents to leave out.
+    exclude_filenames: list[RequestFilename] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
+    )
+
+    @model_validator(mode="after")
+    def _page_range_in_order(self) -> SearchRequest:
+        if self.page_min is not None and self.page_max is not None:
+            if self.page_min > self.page_max:
+                raise ValueError("page_min must not be greater than page_max.")
+        return self
 
 
 class SearchResultResponse(BaseModel):
@@ -628,3 +729,26 @@ class ImportResponse(BaseModel):
     rejected: list[str]
     feedback_imported: int
     feedback_skipped: int
+
+
+class WatchRetry(BaseModel):
+    """A watched file waiting to be tried again after a failure."""
+
+    filename: str
+    attempts: int
+    next_attempt_at: float
+    error: str
+
+
+class WatchStatusResponse(BaseModel):
+    """The watched folder (WATCH_DIR) as of the watcher's last pass."""
+
+    folder: str
+    # Unix time of the last pass; None before the first.
+    last_scan_at: float | None = None
+    files: int = 0
+    problems: list[str] = []
+    deferred: list[str] = []
+    retrying: list[WatchRetry] = []
+    # Refused for good, or out of retries: tried again when the file changes.
+    gave_up: list[str] = []

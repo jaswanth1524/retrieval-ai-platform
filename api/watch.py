@@ -27,6 +27,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ from api.documents import (
     DocumentNotFoundError,
     validate_upload_filename,
 )
+from api.ingest_jobs import FilenameConflictError
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -54,11 +56,57 @@ class FileState:
 
 # What the watcher needs from the app, as plain callables, so it is testable without one.
 ListIndexed = Callable[[], dict[str, float | None]]  # filename -> uploaded_at
-# (name, content, mtime): the document is stamped with the file's mtime as its
-# uploaded_at, which is how the next pass knows it is current. Raises HTTPException(503)
-# when the backlog is full.
-Enqueue = Callable[[str, bytes, float], None]
+# (name, content, mtime) -> the job id: the document is stamped with the file's mtime
+# as its uploaded_at, which is how the next pass knows it is current. Raises
+# HTTPException(503) when the backlog is full, another HTTPException or a DocumentError
+# when the file is refused.
+Enqueue = Callable[[str, bytes, float], "str | None"]
 Delete = Callable[[str], None]
+
+
+class WatchedJob(NamedTuple):
+    """What the watcher needs to know about one of its jobs."""
+
+    state: str
+    error: str | None = None
+    cancelled: bool = False
+    # Failed because of the file itself (it can't be parsed, is empty or unsupported):
+    # sending the same bytes again would fail the same way.
+    permanent: bool = False
+
+
+# job id -> its job, or None once the job store has let it go.
+JobLookup = Callable[[str], "WatchedJob | None"]
+
+
+@dataclass
+class _Retry:
+    signature: tuple[int, float]
+    attempts: int
+    next_at: float
+    error: str
+
+
+@dataclass(frozen=True)
+class WatchRetryStatus:
+    filename: str
+    attempts: int
+    # Wall clock (time.time()), for the status response.
+    next_attempt_at: float
+    error: str
+
+
+@dataclass(frozen=True)
+class WatchStatus:
+    """The watcher as of its last pass (GET /watch)."""
+
+    folder: str
+    last_scan_at: float | None
+    files: int
+    problems: list[str]
+    deferred: list[str]
+    retrying: list[WatchRetryStatus]
+    gave_up: list[str]
 
 
 class UnreadableFileError(DocumentError):
@@ -160,17 +208,30 @@ class FolderWatcher:
         list_indexed: ListIndexed,
         enqueue: Enqueue,
         delete: Delete,
+        job_lookup: JobLookup | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._root = Path(settings.watch_dir)
         self._interval = float(settings.watch_interval_seconds)
         self._delete_missing = bool(settings.watch_delete_missing)
         self._max_bytes = int(settings.max_upload_bytes)
+        self._max_retries = int(settings.watch_max_retries)
+        self._retry_max_seconds = float(settings.watch_retry_max_seconds)
         self._list_indexed = list_indexed
         self._enqueue = enqueue
         self._delete = delete
+        self._job_lookup = job_lookup
+        self._clock = clock
         # What was last sent for each name (size, mtime): changed files are re-sent once,
         # not on every pass while their job runs.
         self._sent: dict[str, tuple[int, float]] = {}
+        # The job each sent file is indexing in, until it finishes: a job that fails
+        # puts the file back up for a retry instead of leaving it sent.
+        self._pending: dict[str, tuple[tuple[int, float], str]] = {}
+        # Files waiting to be tried again after a failure, with backoff.
+        self._retry: dict[str, _Retry] = {}
+        # Files refused for good (or out of retries), until they change: name -> signature.
+        self._gave_up: dict[str, tuple[int, float]] = {}
         # Each file's (size, mtime) in the previous pass: a file is read only once it
         # is the same in two passes in a row, one interval apart.
         self._previous: dict[str, tuple[int, float]] = {}
@@ -180,7 +241,11 @@ class FolderWatcher:
         # Why the last pass held deletions back, if it did: said once when it starts,
         # not every interval for as long as a mount stays dropped.
         self._standing_down: str | None = None
+        self._status_lock = threading.Lock()
+        self._status = WatchStatus(str(self._root), None, 0, [], [], [], [])
         self._stop = threading.Event()
+        # Set by scan_now (POST /watch/scan) to run the next pass at once.
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _is_current(self, indexed: dict[str, float | None], name: str, mtime: float) -> bool:
@@ -203,10 +268,18 @@ class FolderWatcher:
     def scan_once(self) -> dict[str, list[str]]:
         """One pass; what it did, by kind (for the log and the tests)."""
 
-        done: dict[str, list[str]] = {"indexed": [], "deleted": [], "deferred": []}
+        done: dict[str, list[str]] = {
+            "indexed": [],
+            "deleted": [],
+            "deferred": [],
+            "retrying": [],
+            "gave_up": [],
+        }
         if not self._root.is_dir():
             logger.warning("WATCH_DIR %s is not a directory; nothing to watch.", self._root)
+            self._record_status(0, [f"{self._root}: not a directory"], done)
             return done
+        self._check_jobs(done)
         scan = scan_folder(self._root, self._max_bytes)
         files = scan.files
         for problem in scan.problems:
@@ -215,38 +288,153 @@ class FolderWatcher:
                 logger.warning("Watched folder: skipping %s", problem)
         indexed = self._list_indexed()
         previous, self._previous = self._previous, {}
+        now = self._clock()
         for name, state in files.items():
             self._seen.add(name)
             signature = (state.size, state.mtime)
             self._previous[name] = signature
             if self._is_current(indexed, name, state.mtime) or self._sent.get(name) == signature:
                 continue
+            if self._gave_up.get(name) == signature:
+                continue
+            retry = self._retry.get(name)
+            if retry is not None and retry.signature != signature:
+                retry = None  # changed since it failed: a fresh start
+                del self._retry[name]
+            self._gave_up.pop(name, None)
             if previous.get(name) != signature:
                 # New, or changed since the last pass: it may still be being written.
                 # Read it next pass if it has stayed the same.
                 continue
+            if retry is not None and now < retry.next_at:
+                done["retrying"].append(name)
+                continue
             try:
                 content = read_regular_file(state.path, self._max_bytes)
-                self._enqueue(name, content, state.mtime)
+                job_id = self._enqueue(name, content, state.mtime)
             except HTTPException as exc:
                 if exc.status_code == 503:  # the backlog is full: next pass
                     done["deferred"].append(name)
                     continue
+                # Refused as it is (a bad name, a conflict): sending it again would be
+                # refused again. It is looked at once more when the file changes.
                 logger.warning("Watched folder: %s was refused: %s", state.path, exc.detail)
+                self._give_up(name, signature, done)
+                continue
+            except FilenameConflictError as exc:
+                logger.warning("Watched folder: %s was refused: %s", state.path, exc)
+                self._give_up(name, signature, done)
+                continue
             except (OSError, DocumentError) as exc:
-                logger.warning("Watched folder: could not index %s: %s", state.path, exc)
+                logger.warning("Watched folder: could not read %s: %s", state.path, exc)
+                self._schedule_retry(name, signature, str(exc), done)
+                if name in self._retry:
+                    done["retrying"].append(name)
+                continue
             self._sent[name] = signature
+            if job_id is not None and self._job_lookup is not None:
+                self._pending[name] = (signature, job_id)
             done["indexed"].append(name)
         if self._delete_missing:
             self._delete_removed(files, indexed, scan.incomplete, done)
-        if any(done.values()):
+        if any(done[kind] for kind in ("indexed", "deleted", "deferred", "gave_up")):
             logger.info(
-                "Watched folder: %d sent for indexing, %d deleted, %d waiting for room.",
+                "Watched folder: %d sent for indexing, %d deleted, %d waiting for room, "
+                "%d waiting to be retried.",
                 len(done["indexed"]),
                 len(done["deleted"]),
                 len(done["deferred"]),
+                len(self._retry),
             )
+        self._record_status(len(files), scan.problems, done)
         return done
+
+    def _check_jobs(self, done: dict[str, list[str]]) -> None:
+        """Settle the jobs sent in earlier passes: a finished one is done with; a failed
+        one (not cancelled — someone asked for that) puts its file up for a retry."""
+
+        if self._job_lookup is None:
+            return
+        for name, (signature, job_id) in list(self._pending.items()):
+            job = self._job_lookup(job_id)
+            if job is None:
+                # The job store let it go: whether the document is current decides.
+                del self._pending[name]
+                if self._sent.get(name) == signature:
+                    del self._sent[name]
+                continue
+            if job.state == "done":
+                del self._pending[name]
+                self._retry.pop(name, None)
+            elif job.state == "failed":
+                del self._pending[name]
+                if job.cancelled:
+                    continue  # stays sent: not tried again until the file changes
+                self._sent.pop(name, None)
+                logger.warning("Watched folder: indexing %s failed: %s", name, job.error)
+                if job.permanent:
+                    # Not retried: only a change to the file can make it index.
+                    self._give_up(name, signature, done)
+                    continue
+                self._schedule_retry(name, signature, job.error or "indexing failed", done)
+
+    def _schedule_retry(
+        self,
+        name: str,
+        signature: tuple[int, float],
+        error: str,
+        done: dict[str, list[str]],
+    ) -> None:
+        previous = self._retry.get(name)
+        attempts = previous.attempts + 1 if previous and previous.signature == signature else 1
+        if attempts > self._max_retries:
+            self._retry.pop(name, None)
+            logger.warning(
+                "Watched folder: giving up on %s after %d attempt(s); it is tried again "
+                "when it changes.",
+                name,
+                attempts,
+            )
+            self._give_up(name, signature, done)
+            return
+        delay = min(self._interval * 2 ** (attempts - 1), self._retry_max_seconds)
+        self._retry[name] = _Retry(signature, attempts, self._clock() + delay, error)
+
+    def _give_up(self, name: str, signature: tuple[int, float], done: dict[str, list[str]]) -> None:
+        self._gave_up[name] = signature
+        self._retry.pop(name, None)
+        done["gave_up"].append(name)
+
+    def _record_status(self, files: int, problems: list[str], done: dict[str, list[str]]) -> None:
+        now, wall = self._clock(), time.time()
+        retrying = [
+            WatchRetryStatus(
+                name, retry.attempts, wall + max(0.0, retry.next_at - now), retry.error
+            )
+            for name, retry in sorted(self._retry.items())
+        ]
+        status = WatchStatus(
+            folder=str(self._root),
+            last_scan_at=wall,
+            files=files,
+            problems=list(problems),
+            deferred=list(done["deferred"]),
+            retrying=retrying,
+            gave_up=sorted(self._gave_up),
+        )
+        with self._status_lock:
+            self._status = status
+
+    def status(self) -> WatchStatus:
+        """The watcher as of its last pass."""
+
+        with self._status_lock:
+            return self._status
+
+    def scan_now(self) -> None:
+        """Run the next pass now rather than at the end of the interval."""
+
+        self._wake.set()
 
     def _delete_removed(
         self,
@@ -294,6 +482,9 @@ class FolderWatcher:
                     logger.warning("Watched folder: could not delete %s: %s", name, exc)
             self._seen.discard(name)
             self._sent.pop(name, None)
+            self._pending.pop(name, None)
+            self._retry.pop(name, None)
+            self._gave_up.pop(name, None)
 
     def _stand_down(self, reason: str, message: str, *args: object) -> None:
         if self._standing_down != reason:
@@ -306,7 +497,8 @@ class FolderWatcher:
                 self.scan_once()
             except Exception:  # noqa: BLE001 - the watcher must outlive one bad pass
                 logger.exception("Watched folder: a scan failed; trying again next interval.")
-            self._stop.wait(self._interval)
+            self._wake.wait(self._interval)
+            self._wake.clear()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="docrag-watch", daemon=True)
@@ -315,5 +507,6 @@ class FolderWatcher:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=10)

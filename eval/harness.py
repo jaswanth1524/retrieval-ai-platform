@@ -29,10 +29,11 @@ import json
 import platform
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from api.citations import answer_status
 from api.documents import CHUNKER_VERSION, SUPPORTED_EXTENSIONS
 from api.generation import (
     ChatGenerator,
@@ -84,6 +85,23 @@ class RetrievalExample:
     # against the indexed corpus at run time, so labels survive chunking changes that
     # would change every chunk id.
     relevant_passages: frozenset[str] = frozenset()
+    # A question the corpus does not answer: scored on whether retrieval keeps nothing
+    # (nothing clears RERANK_MIN_SCORE, so the answer is "not in your documents")
+    # rather than on a ranking. Carries no relevance labels.
+    expect_no_context: bool = False
+    # Earlier turns of a conversation: the question is a follow-up ("and how long does
+    # that take?"), rewritten into a standalone query before retrieval as the API does,
+    # so the labels measure the rewriting too.
+    history: tuple[dict[str, str], ...] = ()
+
+    @property
+    def labeled(self) -> bool:
+        return bool(
+            self.relevant_filenames
+            or self.relevant_chunk_ids
+            or self.relevant_passages
+            or self.expect_no_context
+        )
 
 
 @dataclass(frozen=True)
@@ -96,18 +114,23 @@ class RankedResult:
 
 @dataclass(frozen=True)
 class AnswerRow:
-    """A generated answer row, in ``eval.ragas_runner`` input shape."""
+    """A generated answer row, in ``eval.ragas_runner`` input shape, plus what the
+    answer cited and how it was grounded (for ``answer_metrics``)."""
 
     question: str
     answer: str
     contexts: list[str]
     reference: str | None
+    cited_filenames: list[str] = field(default_factory=list)
+    answer_status: str = "answered"
 
     def to_dict(self) -> dict[str, Any]:
         row: dict[str, Any] = {
             "question": self.question,
             "answer": self.answer,
             "contexts": self.contexts,
+            "cited_filenames": self.cited_filenames,
+            "answer_status": self.answer_status,
         }
         if self.reference is not None:
             row["reference"] = self.reference
@@ -159,8 +182,20 @@ def rank_for_question(
     filenames: Sequence[str] | None = None,
     arm: str = "reranked",
     generator: ChatGenerator | None = None,
+    history: Sequence[dict[str, str]] = (),
 ) -> RankedResult:
-    """The ranking one question gets from ``arm`` (default: what the API serves)."""
+    """The ranking one question gets from ``arm`` (default: what the API serves).
+
+    With ``history`` the question is a follow-up: rewritten into a standalone query by
+    the pipeline's own condense step first (needs ``generator``)."""
+
+    if history:
+        pipeline = _pipeline(repository, embedding_provider, reranker, settings, generator)
+        turns: list[ChatMessage] = [
+            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+            for m in history
+        ]
+        question = pipeline.retrieval_query(question, turns)
 
     if arm in ("dense", "sparse"):
         embedding = embed_query(question, embedding_provider)
@@ -213,7 +248,45 @@ def answer_for_question(
         answer=grounded.answer,
         contexts=contexts or [""],  # RAGAS requires a non-empty contexts list
         reference=example.reference,
+        cited_filenames=sorted({source.filename for source in grounded.sources}),
+        answer_status=answer_status(
+            grounded.answer, len(grounded.sources), len(fitted.context_chunks)
+        ),
     )
+
+
+def answer_metrics(
+    examples: Sequence[RetrievalExample], rows: Sequence[AnswerRow]
+) -> dict[str, float]:
+    """How well the answers were grounded, over the examples that can say:
+
+    - ``cited_relevant_rate``: of the questions labeled with relevant files, the share
+      whose answer cites at least one of them;
+    - ``answered_rate``: of those, the share answered (not "not in your documents");
+    - ``refused_unanswerable_rate``: of the ``expect_no_context`` questions, the share
+      answered with "the documents don't cover this" rather than an answer;
+    - ``uncited_rate``: the share of all answers that cite nothing while answering.
+
+    A metric with no examples to measure it is left out.
+    """
+
+    labeled = [(e, r) for e, r in zip(examples, rows, strict=True) if e.relevant_filenames]
+    unanswerable = [(e, r) for e, r in zip(examples, rows, strict=True) if e.expect_no_context]
+    metrics: dict[str, float] = {}
+    if labeled:
+        metrics["cited_relevant_rate"] = sum(
+            bool(set(r.cited_filenames) & e.relevant_filenames) for e, r in labeled
+        ) / len(labeled)
+        metrics["answered_rate"] = sum(r.answer_status == "answered" for _, r in labeled) / len(
+            labeled
+        )
+    if unanswerable:
+        metrics["refused_unanswerable_rate"] = sum(
+            r.answer_status in ("no_context", "insufficient_context") for _, r in unanswerable
+        ) / len(unanswerable)
+    if rows:
+        metrics["uncited_rate"] = sum(r.answer_status == "uncited" for r in rows) / len(rows)
+    return metrics
 
 
 def load_retrieval_dataset(path: Path) -> list[RetrievalExample]:
@@ -263,13 +336,44 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
     reference = data.get("reference")
     if reference is not None and not isinstance(reference, str):
         raise HarnessDataError(f"Example {index}: 'reference' must be a string when present.")
-    return RetrievalExample(
+    expect_no_context = data.get("expect_no_context", False)
+    if not isinstance(expect_no_context, bool):
+        raise HarnessDataError(f"Example {index}: 'expect_no_context' must be true or false.")
+    example = RetrievalExample(
         question=question.strip(),
         reference=reference.strip() if isinstance(reference, str) and reference.strip() else None,
         relevant_filenames=_string_set(data.get("relevant_filenames"), index, "relevant_filenames"),
         relevant_chunk_ids=_string_set(data.get("relevant_chunk_ids"), index, "relevant_chunk_ids"),
         relevant_passages=_string_set(data.get("relevant_passages"), index, "relevant_passages"),
+        expect_no_context=expect_no_context,
+        history=_history(data.get("history"), index),
     )
+    if expect_no_context and (
+        example.relevant_filenames or example.relevant_chunk_ids or example.relevant_passages
+    ):
+        raise HarnessDataError(
+            f"Example {index}: an 'expect_no_context' question can't also name relevant "
+            "files, chunks or passages."
+        )
+    return example
+
+
+def _history(value: Any, index: int) -> tuple[dict[str, str], ...]:
+    """A follow-up's earlier turns: [{"role": "user"|"assistant", "content": "..."}]."""
+
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(
+        isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str)
+        and m["content"].strip()
+        for m in value
+    ):
+        raise HarnessDataError(
+            f"Example {index}: 'history' must be a list of {{role: user|assistant, content}}."
+        )
+    return tuple({"role": m["role"], "content": m["content"]} for m in value)
 
 
 def _string_set(value: Any, index: int, field: str) -> frozenset[str]:
@@ -303,17 +407,25 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "rerank_min_score": float(settings.rerank_min_score),
         "fused_top_n": int(settings.fused_top_n),
         "context_neighbor_radius": int(settings.context_neighbor_radius),
+        # With a cap, adjacent passages are no longer dropped as duplicates of a kept one.
+        "context_neighbor_max_chars": int(settings.context_neighbor_max_chars),
         "context_diversity_enabled": bool(settings.context_diversity_enabled),
         "context_diversity_max_similarity": float(settings.context_diversity_max_similarity),
         "dense_query_instruction": settings.dense_query_instruction,
         # Which candidates reach the reranker, and how they are fused.
         "rrf_k": int(settings.rrf_k),
+        # int8 search re-scored against the originals: close to, not the same as, float32.
+        "qdrant_quantization": settings.qdrant_quantization,
         "dense_retrieval_limit": int(settings.dense_retrieval_limit),
         "sparse_retrieval_limit": int(settings.sparse_retrieval_limit),
         "query_expansion_count": int(settings.query_expansion_count),
         # The int8 reranker quantizes activations per batch, so the batch size can move
         # borderline scores.
         "reranker_batch_size": int(settings.reranker_batch_size),
+        # The multilingual profile's knobs: BM25's stemmer and the dense passage prefix
+        # change every stored vector, and so every score.
+        "sparse_language": settings.sparse_language,
+        "dense_passage_prefix": settings.dense_passage_prefix,
         # Recorded, not enforced (metrics.baseline_shape_problems): amd64 and arm64 score
         # a borderline question differently, which explains a small drift.
         "platform_machine": platform.machine(),
@@ -331,10 +443,12 @@ def run_retrieval_eval(
     per_question: list[dict[str, Any]] = []
     filename_rows: list[dict[str, float]] = []
     chunk_rows: list[dict[str, float]] = []
+    no_context_rows: list[dict[str, float]] = []
     passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
     for index, example in enumerate(examples):
         ranked = rank_for_question(
             example.question,
+            history=example.history,
             repository=collaborators.repository,
             embedding_provider=collaborators.embedding_provider,
             reranker=collaborators.reranker,
@@ -343,6 +457,11 @@ def run_retrieval_eval(
             generator=getattr(collaborators, "generator", None),
         )
         entry: dict[str, Any] = {"question": example.question}
+        if example.expect_no_context:
+            # Only the reranked arm applies RERANK_MIN_SCORE; the others always rank.
+            kept_nothing = not ranked.chunk_ids
+            entry["no_context"] = kept_nothing
+            no_context_rows.append({"no_context_rate": 1.0 if kept_nothing else 0.0})
         if example.relevant_filenames:
             file_scores = score_ranking(ranked.filenames, example.relevant_filenames, ks)
             entry["filename"] = file_scores
@@ -354,14 +473,16 @@ def run_retrieval_eval(
             chunk_rows.append(chunk_scores)
         per_question.append(entry)
 
+    levels = {"filename": aggregate(filename_rows), "chunk": aggregate(chunk_rows)}
+    if no_context_rows:
+        # Only with such questions, so a baseline from a dataset without them keeps its
+        # shape.
+        levels["unanswerable"] = aggregate(no_context_rows)
     return {
         "fingerprint": settings_fingerprint(collaborators.settings, arm),
         "k_values": list(ks),
         "question_count": len(examples),
-        "aggregate": {
-            "filename": aggregate(filename_rows),
-            "chunk": aggregate(chunk_rows),
-        },
+        "aggregate": levels,
         "per_question": per_question,
     }
 
@@ -563,11 +684,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     if args.command == "validate":
-        labeled = sum(
-            1
-            for e in examples
-            if e.relevant_filenames or e.relevant_chunk_ids or e.relevant_passages
-        )
+        labeled = sum(1 for e in examples if e.labeled)
         print(f"{len(examples)} examples, {labeled} labeled: OK")
         return 0 if labeled else 2
 
@@ -587,7 +704,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # answer mode
     collaborators = Collaborators(settings)
-    rows = [
+    answers = [
         answer_for_question(
             example,
             repository=collaborators.repository,
@@ -595,11 +712,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             reranker=collaborators.reranker,
             generator=collaborators.generator,
             settings=settings,
-        ).to_dict()
+        )
         for example in examples
     ]
+    rows = [answer.to_dict() for answer in answers]
     args.output.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(rows)} answer rows to {args.output}")
+    for name, value in answer_metrics(examples, answers).items():
+        print(f"{name}: {value:.3f}")
     return 0
 
 

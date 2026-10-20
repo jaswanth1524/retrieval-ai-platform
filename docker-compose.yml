@@ -45,8 +45,8 @@ services:
 
   api:
     # The released image (ghcr.io, see .github/workflows/release.yml) when pulled, the one
-    # built here otherwise: DOCRAG_PULL_POLICY=always with DOCRAG_VERSION=0.1.0 runs a
-    # release without building. The default builds from source, as before. A fork
+    # built here otherwise: DOCRAG_PULL_POLICY=always with DOCRAG_VERSION=<a tagged
+    # release> runs it without building. The default builds from source, as before. A fork
     # publishing its own images sets DOCRAG_IMAGE (ghcr.io/<owner>/<repo>).
     image: ${DOCRAG_IMAGE:-ghcr.io/jaswanth1524/retrieval-ai-platform}:${DOCRAG_VERSION:-local}
     pull_policy: ${DOCRAG_PULL_POLICY:-build}

@@ -103,7 +103,7 @@ function Inspector({
       );
     }
     return activeTab === 'retrieval' ? (
-      <RetrievalTab trace={state.trace} />
+      <RetrievalTab trace={state.trace} onOpenSource={onOpenSource} />
     ) : (
       <TraceTab trace={state.trace} />
     );

@@ -30,6 +30,7 @@ from api.dependencies import (
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.ingest_jobs import (
+    JOB_CANCELLED_ERROR,
     delete_indexed_document,
     enqueue_ingest,
     known_filenames,
@@ -50,13 +51,14 @@ from api.routes import ops as ops_routes
 from api.routes import questions as questions_routes
 from api.routes import search as search_routes
 from api.routes import traces as traces_routes
+from api.routes import watch as watch_routes
 from api.routes import workspaces as workspaces_routes
 from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
 from api.storage import check_writable_storage
 from api.version import app_version
-from api.watch import FolderWatcher
+from api.watch import FolderWatcher, WatchedJob
 from api.workspaces import (
     WorkspaceError,
     settings_for,
@@ -252,7 +254,7 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
             logger.info("Creating workspace %r for WATCH_DIR.", name)
         repository.ensure_writable(target, create_workspace=True)
         if raw_store is not None and target.raw_document_dir:
-            raw_store = RawDocumentStore(target.raw_document_dir)
+            raw_store = RawDocumentStore(target.raw_document_dir, int(target.raw_document_versions))
     settings = target
     service = IngestService(repository, get_embedding_provider(), settings, get_token_counter())
 
@@ -260,13 +262,13 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
         metadata = repository.filename_metadata(settings)
         return {name: meta.uploaded_at for name, meta in metadata.items()}
 
-    def enqueue(filename: str, content: bytes, mtime: float) -> None:
+    def enqueue(filename: str, content: bytes, mtime: float) -> str:
         if raw_store is not None:
             # As an upload is: with originals stored, Report.pdf and report.pdf would
             # overwrite each other's original on a case-insensitive disk. The
             # FilenameConflictError is logged by the watcher and the file skipped.
             refuse_near_duplicate_name(filename, known_filenames(repository, settings))
-        enqueue_ingest(
+        accepted = enqueue_ingest(
             job_store=get_ingest_job_store(),
             executor=get_ingest_executor(),
             backlog=get_ingest_backlog(),
@@ -277,12 +279,28 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
             # The file's mtime, not the time the job runs: it is how the watcher tells
             # an indexed document is this exact version of the file (api/watch.py).
             uploaded_at=mtime,
+            # A file only touched (or copied over with the same bytes) isn't re-embedded:
+            # its document just takes the new mtime.
+            dedupe=True,
+        )
+        return accepted.job_id
+
+    def job_lookup(job_id: str) -> WatchedJob | None:
+        job = get_ingest_job_store().get(job_id)
+        if job is None:
+            return None
+        return WatchedJob(
+            job.state,
+            job.error,
+            job.error == JOB_CANCELLED_ERROR,
+            # The file itself is the problem: retrying the same bytes can't help.
+            permanent=job.error_type == "document",
         )
 
     def delete(filename: str) -> None:
         delete_indexed_document(repository, settings, raw_store, filename)
 
-    watcher = FolderWatcher(settings, list_indexed, enqueue, delete)
+    watcher = FolderWatcher(settings, list_indexed, enqueue, delete, job_lookup)
     watcher.start()
     return watcher
 
@@ -302,6 +320,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings,
         )
     watcher = start_folder_watcher(settings) if settings.watch_dir else None
+    # For GET /watch and POST /watch/scan.
+    app.state.watcher = watcher
     try:
         yield
     finally:
@@ -368,6 +388,7 @@ def register_routes(app: FastAPI) -> None:
     questions_routes.register(app)
     search_routes.register(app)
     workspaces_routes.register(app)
+    watch_routes.register(app)
 
 
 app = create_app()

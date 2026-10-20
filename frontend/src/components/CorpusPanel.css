@@ -578,3 +578,60 @@
   flex-basis: 100%;
   margin: 0;
 }
+
+.corpus-panel__status:has(.corpus-panel__source) {
+  flex-wrap: wrap;
+}
+
+/* Its own line under the detail, lined up with it (past the status dot). */
+.corpus-panel__source {
+  flex-basis: 100%;
+  min-width: 0;
+  padding-left: 13px;
+  overflow-wrap: anywhere;
+}
+
+.corpus-panel__source a {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.corpus-panel__source-refresh {
+  margin-left: 6px;
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  color: var(--dim);
+  font: inherit;
+  font-size: 11px;
+  padding: 0 5px;
+  cursor: pointer;
+}
+
+.corpus-panel__activity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 0;
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.corpus-panel__watch {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  overflow-wrap: anywhere;
+}
+
+.corpus-panel__watch-note {
+  margin: 0;
+  width: 100%;
+}
+
+.corpus-panel__jobs {
+  margin: 0;
+  padding-left: 16px;
+}

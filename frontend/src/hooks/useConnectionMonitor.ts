@@ -6,7 +6,13 @@ const HEALTH_POLL_MS = 30_000;
 const HEALTH_RETRY_MS = 5_000;
 
 /** True while the API has stopped answering since boot (polled only once `booted`). */
-export function useConnectionMonitor(booted: boolean): boolean {
+export function useConnectionMonitor(
+  booted: boolean,
+  /** Each successful poll's reported version (undefined from an older server). */
+  onVersion?: (version: string | undefined) => void,
+): boolean {
+  const onVersionRef = useRef(onVersion);
+  onVersionRef.current = onVersion;
   // The server can go away after boot (a restart, a laptop's network dropping). The
   // footer said "api ok" for the rest of the session, and the first sign was a failed
   // question. /health is polled while the page is visible — every 30 s, every 5 s once
@@ -33,8 +39,11 @@ export function useConnectionMonitor(booted: boolean): boolean {
     const check = async () => {
       if (document.visibilityState !== 'hidden') {
         try {
-          await api.health();
-          if (!cancelled) markLost(false);
+          const health = await api.health();
+          if (!cancelled) {
+            markLost(false);
+            onVersionRef.current?.(health.version);
+          }
         } catch {
           if (!cancelled) markLost(true);
         }

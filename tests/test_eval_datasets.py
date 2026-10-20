@@ -18,6 +18,8 @@ PAIRS = [
     ("retrieval_eval.sample.jsonl", "corpus"),
     ("handbook_eval.jsonl", "corpus_handbook"),
     ("multilingual_eval.jsonl", "corpus_multilingual"),
+    ("unanswerable_eval.jsonl", "corpus_handbook"),
+    ("followup_eval.jsonl", "corpus_handbook"),
 ]
 
 

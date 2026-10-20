@@ -2,6 +2,8 @@ import type { TimingsResponse, TraceCandidateResponse, TraceDetailResponse } fro
 
 interface RetrievalTabProps {
   trace: TraceDetailResponse;
+  /** Open a candidate in the viewer — dropped ones too, to see why they lost. */
+  onOpenSource?: (filename: string, chunkId: string) => void;
 }
 
 // Reasons whose raw name reads poorly; any other (including one a newer server adds)
@@ -79,7 +81,7 @@ function latencyRows(timings: TimingsResponse): Array<[string, number, 'io' | 'm
   ];
 }
 
-function RetrievalTab({ trace }: RetrievalTabProps) {
+function RetrievalTab({ trace, onOpenSource }: RetrievalTabProps) {
   const { candidates, timings } = trace;
   const deltas = rankDeltas(candidates);
   const keptCount = candidates.filter((c) => c.kept).length;
@@ -143,9 +145,21 @@ function RetrievalTab({ trace }: RetrievalTabProps) {
           >
             <div className="retrieval-tab__candidate-head">
               <DeltaMarker delta={deltas.get(candidate.point_id) ?? null} />
-              <span className="retrieval-tab__candidate-doc">
-                {candidate.filename} &middot; {candidate.section}
-              </span>
+              {onOpenSource ? (
+                <button
+                  type="button"
+                  className="retrieval-tab__candidate-doc retrieval-tab__candidate-open"
+                  onClick={() => onOpenSource(candidate.filename, candidate.chunk_id)}
+                  title="Open this passage"
+                  data-testid="retrieval-candidate-open"
+                >
+                  {candidate.filename} &middot; {candidate.section}
+                </button>
+              ) : (
+                <span className="retrieval-tab__candidate-doc">
+                  {candidate.filename} &middot; {candidate.section}
+                </span>
+              )}
               <span className="retrieval-tab__candidate-scores mono">
                 <span className="retrieval-tab__vec">{candidate.retrieval_score.toFixed(3)}</span>
                 {' → '}

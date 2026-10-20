@@ -1,9 +1,14 @@
 """Application settings loaded from environment variables."""
 
+import logging
+import re
 from typing import Literal
 
 from pydantic import Field, PositiveInt, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The schema's cap on documents per summary request (api/schemas.py imports it).
+SUMMARY_DOCUMENTS_LIMIT = 10
 
 _VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 # OpenAI reasoning models (gpt-5 family, o-series) accept a reasoning_effort knob;
@@ -52,6 +57,13 @@ class AppSettings(BaseSettings):
     reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
     embedding_model_tag: str = "fastembed:BAAI/bge-small-en-v1.5"
 
+    # Dense vectors kept as int8 in RAM beside the float32 originals ("scalar"), about a
+    # quarter of the memory for a large corpus; the top candidates are re-scored against
+    # the originals (oversampled by QDRANT_QUANTIZATION_OVERSAMPLING), so ranking stays
+    # close. "none" (default): float32 only. Applied to an existing collection in place
+    # (no re-embedding); switching back removes it.
+    qdrant_quantization: Literal["none", "scalar"] = "none"
+    qdrant_quantization_oversampling: float = Field(default=2.0, ge=1.0, le=8.0)
     rrf_k: PositiveInt = 60
     dense_retrieval_limit: PositiveInt = 50
     sparse_retrieval_limit: PositiveInt = 50
@@ -136,7 +148,8 @@ class AppSettings(BaseSettings):
     # front of the prompt (the grounding rules), so leave headroom for history.
     ollama_num_ctx: int = Field(default=0, ge=0)
     # The model's context window in tokens, for fitting the prompt into it. 0 (default)
-    # uses OLLAMA_NUM_CTX when the provider is Ollama and that is set, else no fitting.
+    # uses OLLAMA_NUM_CTX when the provider is Ollama and that is set; for OpenAI and
+    # Anthropic models, the window LiteLLM's bundled model table gives; else no fitting.
     # When known, the prompt drops the lowest-ranked context and then the oldest
     # history until it fits with LLM_MAX_TOKENS to spare — an over-long prompt had its
     # *front* (the grounding rules) silently cut by the model server.
@@ -144,6 +157,15 @@ class AppSettings(BaseSettings):
     # Questions answered at once; past it a question gets 429 + Retry-After at once
     # instead of holding a request thread for a minute (api/admission.py). 0 = no cap.
     max_concurrent_questions: int = Field(default=4, ge=0)
+    # Of those, how many may be summaries (POST /questions/summary*), which run for
+    # minutes: without it four summaries held every slot and each question got 429.
+    # 0 = no separate cap.
+    max_concurrent_summaries: int = Field(default=2, ge=0)
+    # The language answers are written in. Empty: the model's choice (usually the
+    # question's, often English with English instructions); "match": the question's
+    # language; or a language name ("German"). One fixed sentence in the system prompt,
+    # so prompt prefix caching still applies.
+    answer_language: str = Field(default="", max_length=40)
     # Requests per minute each client may make that change something (POST, PATCH,
     # DELETE on the API: questions, searches, uploads, feedback...) or that present a
     # wrong API key; past it, 429 + Retry-After (api/rate_limit.py). Reads and job polls
@@ -272,8 +294,18 @@ class AppSettings(BaseSettings):
     # whether the operator has also opted the job store into sqlite persistence.
     feedback_enabled: bool = False
     feedback_store_path: str = "./data/feedback.db"
+    # With RAW_DOCUMENT_DIR: how many earlier versions of each original a re-upload keeps
+    # (GET /documents/{f}/versions, POST .../versions/{v}/restore). 0 = none (default).
+    raw_document_versions: int = Field(default=0, ge=0, le=50)
     # Oldest ratings are dropped past this many rows (~6 KB each at most).
     feedback_max_rows: PositiveInt = 50_000
+    # A persistent log of every question and summary asked (text, workspace, how it went,
+    # best passage score), for "what do people ask that the documents don't cover?"
+    # (GET /query-log, full key). Off by default: it keeps what users typed. Its own
+    # sqlite file; never in a backup. Oldest rows go past QUERY_LOG_MAX_ROWS.
+    query_log_enabled: bool = False
+    query_log_path: str = "./data/query_log.db"
+    query_log_max_rows: PositiveInt = 20_000
 
     # After rerank, each selected chunk's context is expanded with up to this many
     # neighboring chunks (by chunk_ordinal) on each side from the same document —
@@ -386,6 +418,11 @@ class AppSettings(BaseSettings):
     watch_interval_seconds: float = Field(default=30.0, ge=2.0, le=86_400.0)
     watch_delete_missing: bool = False
     watch_workspace: str = ""
+    # A watched file whose read fails, or whose indexing job fails, is tried again after
+    # WATCH_INTERVAL_SECONDS x 2^n (at most WATCH_RETRY_MAX_SECONDS), up to
+    # WATCH_MAX_RETRIES times; then it waits until the file changes. 0 = never retried.
+    watch_max_retries: int = Field(default=3, ge=0, le=100)
+    watch_retry_max_seconds: float = Field(default=3600.0, ge=2.0, le=604_800.0)
 
     url_ingest_enabled: bool = False
     url_ingest_allow_private: bool = False
@@ -394,6 +431,12 @@ class AppSettings(BaseSettings):
     summary_batch_chars: int = Field(default=9000, ge=1000, le=200_000)
     summary_max_batches: int = Field(default=8, ge=1, le=64)
     summary_max_tokens: PositiveInt = 1024
+    # Parts of a long document turned into notes at once, with a hosted provider (OpenAI,
+    # Anthropic, an OpenAI-compatible server). Ollama always takes them one at a time:
+    # it runs one generation at a time anyway, and parallel requests only queue there.
+    summary_parallel_parts: int = Field(default=4, ge=1, le=16)
+    # Most documents one brief (POST /questions/summary, "mode": "brief") may cover.
+    summary_max_documents: int = Field(default=5, ge=2, le=SUMMARY_DOCUMENTS_LIMIT)
 
     # Optional single shared API key. Empty (the default) keeps every route fully open,
     # preserving the zero-config self-host story. When set, every route except
@@ -425,6 +468,27 @@ class AppSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _brief_fits_the_part_cap(self) -> "AppSettings":
+        # Every document in a summary gets at least one part, so a brief over more
+        # documents than SUMMARY_MAX_BATCHES would make more LLM calls than that cap
+        # allows. Lowered rather than refused: compose loads .env.example, so
+        # SUMMARY_MAX_DOCUMENTS always counts as set there, and a refusal would stop
+        # every install that lowered SUMMARY_MAX_BATCHES. Never below 2 (a comparison
+        # reads two documents, one part each, whatever the cap).
+        limit = max(2, self.summary_max_batches)
+        if self.summary_max_documents > limit:
+            if "summary_max_documents" in self.model_fields_set:
+                logging.getLogger(__name__).warning(
+                    "SUMMARY_MAX_DOCUMENTS=%d is above SUMMARY_MAX_BATCHES=%d; briefs "
+                    "cover at most %d documents.",
+                    self.summary_max_documents,
+                    self.summary_max_batches,
+                    limit,
+                )
+            self.summary_max_documents = limit
+        return self
+
+    @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":
         # With only a read key, the "admin" routes would have no key at all: anyone
         # could change the corpus that readers need a key to look at.
@@ -438,6 +502,18 @@ class AppSettings(BaseSettings):
     @classmethod
     def _normalize_llm_provider(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("answer_language", mode="after")
+    @classmethod
+    def _check_answer_language(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if value.lower() == "match":
+            return "match"
+        if value and not re.fullmatch(r"[^\W\d_]+(?: [^\W\d_]+)*", value):
+            raise ValueError(
+                'ANSWER_LANGUAGE must be empty, "match", or a language name ("German").'
+            )
+        return value
 
     @field_validator("sparse_language", mode="before")
     @classmethod

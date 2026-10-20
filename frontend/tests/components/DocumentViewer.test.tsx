@@ -471,3 +471,20 @@ describe('DocumentViewer cited passages', () => {
   });
 });
 
+
+describe('DocumentViewer focus', () => {
+  it('moves focus to the first passage loaded when its Load button goes away', async () => {
+    const chunks = Array.from({ length: 50 }, (_, i) => makeChunk(i));
+    getContentMock.mockImplementation(servePaged(chunks));
+    render(<DocumentViewer filename="doc.md" chunkId="c5" onClose={vi.fn()} />);
+    const later = await screen.findByTestId('viewer-load-later', {}, SLOW_RENDER);
+
+    await userEvent.click(later);
+
+    await waitFor(() => expect(screen.queryByTestId('viewer-load-later')).toBeNull());
+    const focused = document.activeElement as HTMLElement;
+    expect(focused.dataset.testid).toBe('viewer-chunk');
+    // The first of the passages that just arrived, not the top of the document.
+    expect(Number(focused.dataset.chunkId?.slice(1))).toBeGreaterThan(5);
+  });
+});

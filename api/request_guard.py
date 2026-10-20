@@ -34,6 +34,8 @@ GUARDED_PREFIXES = (
     "/traces",
     "/feedback",
     "/workspaces",
+    "/watch",
+    "/query-log",
     "/docs",
     "/redoc",
 )
@@ -75,16 +77,16 @@ def is_guarded_path(path: str) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in GUARDED_PREFIXES)
 
 
-_REINDEX_OR_TAGS = re.compile(r"^/documents/[^/]+/(reindex|tags)$")
+_REINDEX_OR_TAGS = re.compile(r"^/documents/[^/]+/(?:reindex|tags|refresh|versions/[^/]+/restore)$")
 
 
 def needs_full_key(method: str, path: str) -> bool:
     """Routes the read-only key (API_READ_KEY) may not use: changes to the corpus, and
     operator data (feedback, metrics, the full export)."""
 
-    if path in ("/metrics", "/export") or (path == "/feedback" and method == "GET"):
+    if path in ("/metrics", "/export", "/query-log") or (path == "/feedback" and method == "GET"):
         return True
-    if method == "POST" and path == "/import":
+    if method == "POST" and path in ("/import", "/watch/scan"):
         return True
     if method in ("POST", "DELETE") and (path == "/workspaces" or path.startswith("/workspaces/")):
         return True

@@ -24,3 +24,10 @@ export function shortcutLabel(shortcut: string): string {
 export function isShortcutModifier(event: KeyboardEvent, apple = APPLE): boolean {
   return apple ? event.metaKey : event.ctrlKey;
 }
+
+/** A touch screen's keyboard, where Enter is the only way to start a new line (no
+ *  Shift+Enter): there Enter inserts a newline and the Ask button sends. */
+export function enterAddsNewline(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  return window.matchMedia('(pointer: coarse)').matches;
+}

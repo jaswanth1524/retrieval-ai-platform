@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { TraceDetailResponse } from '../../api/types';
 
 interface TraceTabProps {
@@ -76,16 +77,52 @@ function buildSpans(trace: TraceDetailResponse): Span[] {
   return spans;
 }
 
+/** The trace and request ids in full, to find this question in the server's logs. */
+function TraceIds({ trace }: TraceTabProps) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    void navigator.clipboard?.writeText(trace.trace_id).then(
+      () => setCopied(true),
+      () => setCopied(false),
+    );
+  };
+  return (
+    <div className="trace-tab__ids mono" data-testid="trace-ids">
+      <span>
+        trace <span className="trace-tab__id">{trace.trace_id}</span>
+      </span>
+      {navigator.clipboard && (
+        <button type="button" className="trace-tab__copy" onClick={copy} data-testid="trace-copy-id">
+          {copied ? 'copied' : 'copy'}
+        </button>
+      )}
+      {trace.request_id && (
+        <span>
+          request <span className="trace-tab__id">{trace.request_id}</span>
+        </span>
+      )}
+      {trace.usage && (
+        <span data-testid="trace-usage">
+          tokens {trace.usage.prompt_tokens} in · {trace.usage.completion_tokens} out
+        </span>
+      )}
+    </div>
+  );
+}
+
 function TraceTab({ trace }: TraceTabProps) {
   const spans = buildSpans(trace);
   const total = trace.timings?.total_ms ?? 0;
 
   if (!trace.timings) {
     return (
-      <p className="inspector__empty" data-testid="trace-tab-empty">
-        This trace has no timings — the request failed before the pipeline finished.
-        {trace.error ? ` (${trace.error})` : ''}
-      </p>
+      <div>
+        <p className="inspector__empty" data-testid="trace-tab-empty">
+          This trace has no timings — the request failed before the pipeline finished.
+          {trace.error ? ` (${trace.error})` : ''}
+        </p>
+        <TraceIds trace={trace} />
+      </div>
     );
   }
 
@@ -98,6 +135,13 @@ function TraceTab({ trace }: TraceTabProps) {
           <> &middot; first token {(trace.timings.first_token_ms / 1000).toFixed(2)}s</>
         ) : null}
       </p>
+      <TraceIds trace={trace} />
+      {trace.error && (
+        // A stream that failed late has timings too: the error used to be hidden then.
+        <p className="trace-tab__error" role="note" data-testid="trace-error">
+          {trace.error}
+        </p>
+      )}
 
       <div className="trace-tab__span trace-tab__span--root">
         <div className="trace-tab__span-head mono">
@@ -131,6 +175,19 @@ function TraceTab({ trace }: TraceTabProps) {
           <p className="trace-tab__attr mono">{span.attribute}</p>
         </div>
       ))}
+
+      {trace.query_variants && trace.query_variants.length > 0 && (
+        <div className="trace-tab__note" data-testid="trace-variants">
+          <p className="trace-tab__note-label mono">query variants</p>
+          <ul className="trace-tab__variants">
+            {trace.query_variants.map((variant) => (
+              <li key={variant} className="mono">
+                {variant}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {trace.condensed_question && (
         <div className="trace-tab__note">

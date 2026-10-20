@@ -196,6 +196,22 @@ function DocumentViewer({
       ? { chunkId: visible.dataset.chunkId ?? '', top: visible.getBoundingClientRect().top - frameTop }
       : null;
   };
+  // The chunk to focus once a load lands, when the button that asked for it is gone
+  // (the last page loaded): focus fell to <body> inside a modal dialog otherwise.
+  const focusChunkRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const wanted = focusChunkRef.current;
+    focusChunkRef.current = null;
+    const body = bodyRef.current;
+    if (!wanted || !body) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && body.closest('[role="dialog"]')?.contains(active)) {
+      return; // the button is still there, keeping focus
+    }
+    [...body.querySelectorAll<HTMLElement>('[data-chunk-id]')]
+      .find((element) => element.dataset.chunkId === wanted)
+      ?.focus({ preventScroll: true });
+  }, [loaded]);
   useLayoutEffect(() => {
     const anchor = anchorRef.current;
     const body = bodyRef.current;
@@ -221,6 +237,10 @@ function DocumentViewer({
           : {};
     void fetchPage(options, (content) => {
       if (direction !== 'later') captureAnchor();
+      focusChunkRef.current =
+        direction === 'all'
+          ? (chunkId ?? content.chunks[0]?.chunk_id ?? null)
+          : (content.chunks[0]?.chunk_id ?? null);
       setLoaded((prev) => {
         if (!prev) return prev;
         const merged =
@@ -394,6 +414,8 @@ function DocumentViewer({
                   isTarget ? ' document-viewer__chunk--target' : ''
                 }`}
                 data-chunk-id={chunk.chunk_id}
+                // Focusable from script only: where focus goes when a load button goes.
+                tabIndex={-1}
                 data-testid="viewer-chunk"
               >
                 <div className="document-viewer__chunk-meta mono">

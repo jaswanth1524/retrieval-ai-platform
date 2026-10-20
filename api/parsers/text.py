@@ -70,7 +70,33 @@ _TEXT_BOMS: tuple[tuple[bytes, str], ...] = (
 )
 
 
-def decode_text_document(filename: str, content: bytes) -> str:
+# <meta charset="shift_jis"> / <meta http-equiv="Content-Type" content="...; charset=...">
+# in the first bytes of an HTML file (where the HTML spec has a browser look for it).
+_META_CHARSET_RE = re.compile(
+    rb"<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9_.:-]+)", re.IGNORECASE
+)
+_META_SNIFF_BYTES = 1024
+
+
+def declared_html_charset(content: bytes) -> str | None:
+    """The encoding an HTML file declares in a <meta> tag, if it is one Python knows.
+
+    A byte-order mark outranks it (as in browsers), so a file starting with one is
+    decoded by that; and UTF-16/32 can't be declared this way."""
+
+    if content.startswith((codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return None
+    match = _META_CHARSET_RE.search(content[:_META_SNIFF_BYTES])
+    if match is None:
+        return None
+    try:
+        name = codecs.lookup(match.group(1).decode("ascii")).name
+    except (LookupError, UnicodeDecodeError):
+        return None
+    return None if name.startswith(("utf-16", "utf-32")) else name
+
+
+def decode_text_document(filename: str, content: bytes, declared: str | None = None) -> str:
     """Decode a text-like document, falling back across common encodings.
 
     ``utf-8-sig`` only tolerates a BOM, not a different encoding — a `.txt`/`.md`
@@ -93,6 +119,13 @@ def decode_text_document(filename: str, content: bytes) -> str:
                     f"Could not decode text document '{filename}' as {encoding}."
                 ) from exc
             break
+    if text is None and declared:
+        # What the document says it is (an HTML <meta charset>): Shift_JIS, GBK or
+        # windows-1251 pages otherwise fell through to cp1252 and indexed as mojibake.
+        try:
+            text = content.decode(declared)
+        except (UnicodeDecodeError, LookupError):
+            text = None
     for encoding in _TEXT_DECODE_FALLBACKS if text is None else ():
         try:
             text = content.decode(encoding)

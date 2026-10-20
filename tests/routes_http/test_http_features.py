@@ -657,3 +657,26 @@ def test_import_needs_the_full_key_and_is_size_capped(tmp_path: Path) -> None:
     with keyed_client("full-key", api_read_key="read-key", max_import_bytes=1000) as client:
         assert _import(client, b"x", headers=READ).status_code == 403
         assert _import(client, b"x" * 200_000).status_code == 413
+
+
+def test_search_narrows_by_page_section_and_left_out_documents(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    doc = b"# Setup\nalpha install steps\n\n# Billing\nalpha invoice terms\n"
+    assert upload_and_wait(client, "a.md", doc)["state"] == "done"
+    assert upload_and_wait(client, "b.md", b"# Other\nalpha elsewhere\n")["state"] == "done"
+
+    def found(**narrow: object) -> list[tuple[str, str]]:
+        response = client.post("/search", json={"query": "alpha", **narrow})
+        assert response.status_code == 200, response.text
+        return sorted({(r["filename"], r["section"]) for r in response.json()["results"]})
+
+    everything = found()
+    assert {name for name, _ in everything} == {"a.md", "b.md"}
+    assert found(section="Billing") == [("a.md", "Billing")]
+    assert {name for name, _ in found(exclude_filenames=["b.md"])} == {"a.md"}
+    assert found(page_min=1, page_max=1) == everything
+    assert found(page_min=2) == []
+    reversed_range = client.post("/search", json={"query": "alpha", "page_min": 3, "page_max": 2})
+    assert reversed_range.status_code == 422

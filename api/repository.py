@@ -111,6 +111,14 @@ class DocumentMetadata:
     # whether any point was sized by the heuristic token counter.
     chunking_fingerprints: frozenset[str] = frozenset()
     heuristic_chunked: bool = False
+    # The uploaded bytes' SHA-256 when every point carries the same one, else None, and
+    # the chunk count the ingest that wrote them meant to write (when they agree).
+    content_sha256: str | None = None
+    document_chunks: int | None = None
+    # Where a URL-ingested document came from (any point's; they are all the same).
+    source_url: str | None = None
+    source_etag: str | None = None
+    source_last_modified: str | None = None
 
     def is_stale(self, fingerprint: str, counter_mode: str) -> bool:
         """Chunked differently from how it would be today, so re-indexing changes it.
@@ -131,6 +139,30 @@ class DocumentMetadata:
 _SCROLL_PAGE_SIZE = 256
 # Points fetched per requested ordinal by fetch_neighbors (see there).
 _NEIGHBOR_COPIES_ALLOWED = 4
+
+
+def _dense_search_params(settings: AppSettings) -> models.SearchParams | None:
+    """With quantization on: search the int8 copy, then re-score the best
+    ``oversampling`` times the limit against the full vectors."""
+
+    if settings.qdrant_quantization != "scalar":
+        return None
+    return models.SearchParams(
+        quantization=models.QuantizationSearchParams(
+            rescore=True, oversampling=float(settings.qdrant_quantization_oversampling)
+        )
+    )
+
+
+def _single_hash(hashes: set[str | None]) -> str | None:
+    """The one hash every point agrees on; None when any lacks it or they differ (a
+    partial re-ingest)."""
+
+    return next(iter(hashes)) if len(hashes) == 1 else None
+
+
+def _single_value(values: set[int | None]) -> int | None:
+    return next(iter(values)) if len(values) == 1 else None
 
 
 def _single_filename_filter(filename: str) -> models.Filter:
@@ -189,16 +221,18 @@ class VectorRepository:
         query_embedding: EmbeddedText,
         filenames: Sequence[str] | None = None,
         tags: Sequence[str] | None = None,
+        narrow: PassageFilter | None = None,
     ) -> list[models.ScoredPoint]:
         """Fused dense+sparse candidates: server-side RRF, falling back to manual fusion.
 
         ``filenames`` and ``tags``, when given, restrict both the dense and sparse legs
         before fusion (payload filters on the indexed ``filename`` / ``tags`` fields):
         a document must match one of the filenames *and* carry one of the tags.
+        ``narrow`` restricts them further (``PassageFilter``).
         """
 
         self.ensure_ready(settings)
-        query_filter = _scope_filter(filenames, tags)
+        query_filter = _scope_filter(filenames, tags, narrow)
         try:
             if self._client in _server_side_hybrid_unsupported:
                 return self._manual_hybrid_query(settings, query_embedding, query_filter)
@@ -371,7 +405,7 @@ class VectorRepository:
 
         collection = settings.qdrant_collection
         ttl = float(settings.document_listing_ttl_seconds)
-        cached = self._cached_metadata(collection, corpus_generation(), ttl)
+        cached = self._cached_metadata(collection, corpus_generation(collection), ttl)
         if cached is not None:
             return dict(cached)
         with _metadata_lock:
@@ -380,7 +414,7 @@ class VectorRepository:
             )
         with scan_lock:
             # Whoever held the lock may have just stored a fresh listing.
-            generation = corpus_generation()
+            generation = corpus_generation(collection)
             cached = self._cached_metadata(collection, generation, ttl)
             if cached is not None:
                 return dict(cached)
@@ -414,7 +448,7 @@ class VectorRepository:
         cached_generation, stored_at, metadata = cached
         if time.monotonic() - stored_at >= float(settings.document_listing_ttl_seconds):
             return None
-        changed = changed_since(cached_generation)
+        changed = changed_since(cached_generation, collection)
         if changed is None or len(changed) > _METADATA_PATCH_MAX_FILENAMES:
             return None
         patched = {name: meta for name, meta in metadata.items() if name not in changed}
@@ -468,6 +502,10 @@ class VectorRepository:
         tags: dict[str, dict[str, None]] = {}
         fingerprints: dict[str, set[str]] = {}
         heuristic: set[str] = set()
+        # Each filename's hashes; None stands for a point without one.
+        hashes: dict[str, set[str | None]] = {}
+        totals: dict[str, set[int | None]] = {}
+        sources: dict[str, tuple[str, str | None, str | None]] = {}
         for point in self._scroll_all(
             settings,
             scroll_filter=(
@@ -490,6 +528,11 @@ class VectorRepository:
                 "tags",
                 "chunking_fingerprint",
                 "token_counter",
+                "content_sha256",
+                "document_chunks",
+                "source_url",
+                "source_etag",
+                "source_last_modified",
             ],
         ):
             if not point.payload:
@@ -521,6 +564,21 @@ class VectorRepository:
                 fingerprints.setdefault(filename, set()).add(fingerprint)
             if point.payload.get("token_counter") == "heuristic":
                 heuristic.add(filename)
+            digest = point.payload.get("content_sha256")
+            hashes.setdefault(filename, set()).add(digest if isinstance(digest, str) else None)
+            total = point.payload.get("document_chunks")
+            totals.setdefault(filename, set()).add(
+                total if isinstance(total, int) and not isinstance(total, bool) else None
+            )
+            url = point.payload.get("source_url")
+            if isinstance(url, str) and filename not in sources:
+                etag = point.payload.get("source_etag")
+                modified = point.payload.get("source_last_modified")
+                sources[filename] = (
+                    url,
+                    etag if isinstance(etag, str) else None,
+                    modified if isinstance(modified, str) else None,
+                )
         return {
             filename: DocumentMetadata(
                 chunk_count=count,
@@ -531,9 +589,34 @@ class VectorRepository:
                 tags=tuple(tags.get(filename, {})),
                 chunking_fingerprints=frozenset(fingerprints.get(filename, ())),
                 heuristic_chunked=filename in heuristic,
+                content_sha256=_single_hash(hashes.get(filename, set())),
+                document_chunks=_single_value(totals.get(filename, set())),
+                source_url=sources[filename][0] if filename in sources else None,
+                source_etag=sources[filename][1] if filename in sources else None,
+                source_last_modified=sources[filename][2] if filename in sources else None,
             )
             for filename, count in chunk_counts.items()
         }
+
+    def document_metadata(self, settings: AppSettings, filename: str) -> DocumentMetadata | None:
+        """One document's metadata, read now (not from the cached listing), or None
+        when it isn't indexed. For decisions made under its filename lock."""
+
+        return self._scan_filename_metadata(settings, only=frozenset({filename})).get(filename)
+
+    def set_uploaded_at(self, settings: AppSettings, filename: str, uploaded_at: float) -> None:
+        """Restamp every point of ``filename`` with ``uploaded_at``. Caller holds its
+        filename lock."""
+
+        self.ensure_ready(settings)
+        self._call(
+            settings,
+            "set_payload",
+            collection_name=settings.qdrant_collection,
+            payload={"uploaded_at": uploaded_at},
+            points=_single_filename_filter(filename),
+            wait=True,
+        )
 
     def uploaded_at_for_filename(self, settings: AppSettings, filename: str) -> float | None:
         """The stored upload time of an indexed document (one point read), or None."""
@@ -564,7 +647,7 @@ class VectorRepository:
 
         cached = self._cached_metadata(
             settings.qdrant_collection,
-            corpus_generation(),
+            corpus_generation(settings.qdrant_collection),
             float(settings.document_listing_ttl_seconds),
         )
         if cached is not None:
@@ -649,6 +732,7 @@ class VectorRepository:
                     using=settings.qdrant_dense_vector_name,
                     limit=int(settings.dense_retrieval_limit),
                     filter=query_filter,
+                    params=_dense_search_params(settings),
                 ),
                 models.Prefetch(
                     query=query_embedding.sparse,
@@ -682,6 +766,7 @@ class VectorRepository:
             using=request.using,
             limit=request.limit,
             query_filter=request.filter,
+            search_params=request.params,
             with_payload=request.with_payload,
             with_vectors=False,
         )
@@ -758,19 +843,53 @@ def _is_missing_collection(exc: BaseException) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class PassageFilter:
+    """Narrows a search to passages by where they are (POST /search): a page range,
+    one section (its exact label), and documents left out. Pages and sections are
+    keyword/integer-indexed payload fields, so these are plain Qdrant filters."""
+
+    page_min: int | None = None
+    page_max: int | None = None
+    section: str | None = None
+    exclude_filenames: tuple[str, ...] = ()
+
+
 def _scope_filter(
-    filenames: Sequence[str] | None, tags: Sequence[str] | None = None
+    filenames: Sequence[str] | None,
+    tags: Sequence[str] | None = None,
+    narrow: PassageFilter | None = None,
 ) -> models.Filter | None:
     """Build a payload filter restricting search to filenames and/or tags, or None."""
 
     must: list[models.Condition] = []
+    must_not: list[models.Condition] = []
     if filenames:
         must.append(
             models.FieldCondition(key="filename", match=models.MatchAny(any=list(filenames)))
         )
     if tags:
         must.append(models.FieldCondition(key="tags", match=models.MatchAny(any=list(tags))))
-    return models.Filter(must=must) if must else None
+    if narrow is not None:
+        if narrow.page_min is not None or narrow.page_max is not None:
+            must.append(
+                models.FieldCondition(
+                    key="page", range=models.Range(gte=narrow.page_min, lte=narrow.page_max)
+                )
+            )
+        if narrow.section:
+            must.append(
+                models.FieldCondition(key="section", match=models.MatchValue(value=narrow.section))
+            )
+        if narrow.exclude_filenames:
+            must_not.append(
+                models.FieldCondition(
+                    key="filename", match=models.MatchAny(any=list(narrow.exclude_filenames))
+                )
+            )
+    if not must and not must_not:
+        return None
+    return models.Filter(must=must or None, must_not=must_not or None)
 
 
 def _chunk_ordinal_sort_key(payload: dict[str, object]) -> tuple[int, int]:
@@ -831,6 +950,7 @@ def _leg_request(
             using=settings.qdrant_dense_vector_name,
             limit=int(settings.dense_retrieval_limit),
             filter=query_filter,
+            params=_dense_search_params(settings),
             with_payload=SEARCH_PAYLOAD_FIELDS,
             with_vector=False,
         )

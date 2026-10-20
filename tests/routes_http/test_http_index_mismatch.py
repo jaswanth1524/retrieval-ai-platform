@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import json
+import zipfile
 from collections.abc import Generator
 from pathlib import Path
 
@@ -61,6 +64,9 @@ def test_listing_export_tags_and_readiness_keep_working(
     assert ready["qdrant"] is True
     assert ready["index_compatible"] is False
     assert RECOVERY in ready["index_detail"]
+    # Originals are kept here, so the backup route is the way out it names.
+    assert ready["originals_kept"] is True
+    assert "restore the backup" in ready["index_detail"]
 
 
 def test_questions_search_and_writes_are_refused_with_the_way_out(
@@ -120,3 +126,40 @@ def test_delete_all_then_upload_rebuilds_the_index(
 
     assert _stored_tag(qdrant, settings) == "other-model:v2"
     assert client.get("/documents").json()["filenames"] == ["guide.txt"]
+
+
+def test_without_kept_originals_the_hint_never_offers_a_backup_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Export, delete every document, import" with no originals kept deleted the corpus
+    and restored nothing: the hint names only what works, and the backup says what it
+    is missing."""
+
+    clear_dependency_caches()
+    settings = make_settings()
+    qdrant = QdrantClient(":memory:")
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+    try:
+        with TestClient(hermetic_app(settings, qdrant)) as client:
+            assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+            settings.__dict__["embedding_model_tag"] = "other-model:v2"
+
+            ready = client.get("/health/ready").json()
+            assert ready["originals_kept"] is False
+            assert "restore the backup" not in ready["index_detail"]
+            assert "RAW_DOCUMENT_DIR" in ready["index_detail"]
+            refused = client.post("/questions", json={"question": "alpha"})
+            assert refused.status_code == 409
+            assert "upload them again" in refused.json()["detail"]
+
+            export = client.get("/export")
+            assert export.status_code == 200
+            assert export.headers["x-docrag-originals-missing"] == "1"
+            with zipfile.ZipFile(io.BytesIO(export.content)) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+            assert manifest["originals_missing"] == ["guide.txt"]
+            assert manifest["complete"] is False
+    finally:
+        monkeypatch.undo()
+        clear_dependency_caches()

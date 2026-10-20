@@ -101,6 +101,10 @@ def build_export(
     """
 
     metadata = repository.filename_metadata(settings)
+    stored = raw_store.stored_names() if raw_store is not None else set()
+    # Known before the response starts, for its header; the manifest records what was
+    # actually written (a document can be deleted meanwhile).
+    missing_up_front = sum(1 for filename in metadata if filename not in stored)
     # A backup holds one workspace: its own ratings only.
     workspace = workspace_of(settings)
     first_feedback = (
@@ -114,7 +118,9 @@ def build_export(
             _write_archive(archive, settings, metadata, raw_store, feedback_store, first_feedback)
         writer.flush()
 
-    return _stream(write_archive)
+    stream = _stream(write_archive)
+    stream.originals_missing = missing_up_front
+    return stream
 
 
 def _write_archive(
@@ -158,6 +164,11 @@ def _write_archive(
         "chunker_version": CHUNKER_VERSION,
         "chunking_fingerprint": chunking_fingerprint(settings),
         "documents": documents,
+        # Documents this backup can't restore (no original kept: RAW_DOCUMENT_DIR is
+        # unset, or the original was never stored). `complete` is false when there are
+        # any: such a backup is not a way to rebuild the index.
+        "originals_missing": [doc["filename"] for doc in documents if doc["original"] is None],
+        "complete": all(doc["original"] is not None for doc in documents),
     }
     archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
     if feedback_store is None or first_feedback is None:
@@ -194,6 +205,9 @@ class ExportStream:
     A failure in the writer is raised from ``__next__``, so the response aborts rather
     than ending as if the zip were complete.
     """
+
+    # Documents with no original to put in the zip, counted before it is written.
+    originals_missing = 0
 
     def __init__(self, write: Callable[[_QueueWriter], None]) -> None:
         self._blocks: queue.Queue[object] = queue.Queue(maxsize=_QUEUE_BLOCKS)

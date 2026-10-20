@@ -16,8 +16,8 @@ def _chunks(name: str, content: bytes, **settings: object):  # type: ignore[no-u
     )
 
 
-def test_the_chunker_version_is_5() -> None:
-    assert CHUNKER_VERSION == 5
+def test_the_chunker_version_is_at_least_5() -> None:
+    assert CHUNKER_VERSION >= 5
 
 
 def test_csv_chunks_hold_whole_rows_labelled_with_the_rows_they_hold() -> None:

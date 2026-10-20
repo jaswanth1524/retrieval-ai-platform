@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import {
   CHAT_STORAGE_MAX_TURNS,
+  FULL_TEXT_CONVERSATIONS,
+  LOCAL_STORAGE_MAX_CONVERSATIONS,
   MAX_CONVERSATIONS,
   MAX_PINNED_CONVERSATIONS,
   type ChatStorageV2,
@@ -9,6 +11,8 @@ import {
   TOMBSTONE_MAX_AGE_MS,
   capConversations,
   compactForStorage,
+  conversationsForLocalStorage,
+  forChatStore,
   keepPassageText,
   mergeConversations,
   parseConversations,
@@ -215,14 +219,15 @@ describe('pinned conversations', () => {
     );
 
   it('drops the least recently used unpinned conversations past the cap', () => {
-    const kept = capConversations(many(MAX_CONVERSATIONS + 3, ['c21', 'c22']));
+    const n = MAX_CONVERSATIONS;
+    const kept = capConversations(many(n + 3, [`c${n + 1}`, `c${n + 2}`]));
 
     expect(kept).toHaveLength(MAX_CONVERSATIONS);
     const ids = kept.map((c) => c.id);
-    expect(ids).toContain('c21'); // pinned, though among the oldest
-    expect(ids).toContain('c22');
-    expect(ids).not.toContain('c20');
-    expect(ids).not.toContain('c19');
+    expect(ids).toContain(`c${n + 1}`); // pinned, though among the oldest
+    expect(ids).toContain(`c${n + 2}`);
+    expect(ids).not.toContain(`c${n}`);
+    expect(ids).not.toContain(`c${n - 1}`);
     // Still most recently used first.
     expect(ids[0]).toBe('c0');
   });
@@ -362,5 +367,101 @@ describe('document tasks (summaries)', () => {
     expect(
       sanitizeTurn({ ...answered, followups: ['Next?', '', '   ', 'Next?', 'More?'] })?.followups,
     ).toEqual(['Next?', 'More?']);
+  });
+});
+
+describe('what each store keeps of a long history', () => {
+  const many = (count: number) =>
+    Array.from({ length: count }, (_, index) =>
+      conversation({
+        id: `c${index}`,
+        updatedAt: count - index, // c0 is the most recently used
+        turns: [
+          {
+            id: `t${index}`,
+            role: 'assistant',
+            content: 'answer [1]',
+            sources: [
+              {
+                source_number: 1,
+                filename: 'a.md',
+                page: 1,
+                section: 'S',
+                chunk_id: 'k',
+                text: 'passage text',
+              },
+            ],
+            timestamp: 1,
+          } as ChatTurn,
+        ],
+      }),
+    );
+
+  it('localStorage holds the active, pinned and most recent conversations only', () => {
+    const list = many(LOCAL_STORAGE_MAX_CONVERSATIONS + 30);
+    list[40] = { ...list[40], pinned: true };
+    const kept = conversationsForLocalStorage({
+      version: 2,
+      activeConversationId: 'c45',
+      conversations: list,
+    }).map((c) => c.id);
+
+    expect(kept).toHaveLength(LOCAL_STORAGE_MAX_CONVERSATIONS);
+    expect(kept).toContain('c45');
+    expect(kept).toContain('c40');
+    expect(kept).toContain('c0');
+    expect(kept).not.toContain('c49');
+  });
+
+  it('a conversation missing from the compact copy is not read as deleted', () => {
+    const local = storage(many(3));
+    const merged = mergeConversations(local, [local.conversations[0]], true);
+    expect(merged.conversations.map((c) => c.id).sort()).toEqual(['c0', 'c1', 'c2']);
+  });
+
+  it('IndexedDB keeps every conversation, with passage text on the recent ones only', () => {
+    const list = many(FULL_TEXT_CONVERSATIONS + 5);
+    const stored = forChatStore({ version: 2, activeConversationId: 'c24', conversations: list });
+
+    expect(stored.conversations).toHaveLength(list.length);
+    const text = (id: string) =>
+      stored.conversations.find((c) => c.id === id)?.turns[0].sources[0].text;
+    expect(text('c0')).toBe('passage text');
+    expect(text('c24')).toBe('passage text'); // the active one
+    expect(text('c23')).toBe('');
+    expect(stored.conversations.find((c) => c.id === 'c23')?.turns).toHaveLength(1);
+  });
+});
+
+describe('pass 7 turn fields', () => {
+  it('keeps valid source marks, scores and usage, and drops anything else', () => {
+    const base = {
+      id: 't',
+      role: 'assistant',
+      content: 'x',
+      sources: [],
+      timestamp: 1,
+      timings: null,
+      traceId: null,
+    };
+    const kept = sanitizeTurn({
+      ...base,
+      irrelevantSources: [2, 2, 3],
+      topRerankScore: 0.4,
+      usage: { prompt: 10, completion: 2 },
+    });
+    expect(kept?.irrelevantSources).toEqual([2, 3]);
+    expect(kept?.topRerankScore).toBe(0.4);
+    expect(kept?.usage).toEqual({ prompt: 10, completion: 2 });
+
+    const dropped = sanitizeTurn({
+      ...base,
+      irrelevantSources: ['2', -1, 1.5, 5000],
+      topRerankScore: 7,
+      usage: { prompt: -1, completion: 'x' },
+    });
+    expect(dropped?.irrelevantSources).toBeUndefined();
+    expect(dropped?.topRerankScore).toBeUndefined();
+    expect(dropped?.usage).toBeUndefined();
   });
 });

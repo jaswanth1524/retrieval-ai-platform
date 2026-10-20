@@ -82,3 +82,14 @@ button.feedback-panel__row:hover {
   color: var(--rail-dim);
   margin: 0;
 }
+
+.feedback-panel__kind {
+  margin: 6px 0 2px;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+}

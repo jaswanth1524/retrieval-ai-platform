@@ -293,3 +293,26 @@ def test_a_collection_name_with_the_workspace_separator_is_refused() -> None:
     with pytest.raises(ValidationError, match="__ws_"):
         AppSettings(_env_file=None, qdrant_collection="docs__ws_legal")  # type: ignore[call-arg]
     assert AppSettings(_env_file=None, qdrant_collection="docs_ws").qdrant_collection == "docs_ws"  # type: ignore[call-arg]
+
+
+def test_briefs_never_cover_more_documents_than_the_part_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Each document takes at least one part, so a brief over more documents than
+    # SUMMARY_MAX_BATCHES would make more calls than the cap allows.
+    assert AppSettings(_env_file=None).summary_max_documents == 5  # type: ignore[call-arg]
+    settings = AppSettings(_env_file=None, summary_max_batches=3)  # type: ignore[call-arg]
+    assert settings.summary_max_documents == 3
+    assert not caplog.records  # the default lowered quietly
+    with caplog.at_level("WARNING", logger="api.settings"):
+        lowered = AppSettings(  # type: ignore[call-arg]
+            _env_file=None, summary_max_batches=1, summary_max_documents=8
+        )
+    assert lowered.summary_max_documents == 2  # a comparison still reads both
+    assert "SUMMARY_MAX_DOCUMENTS=8" in caplog.text
+    assert (
+        AppSettings(  # type: ignore[call-arg]
+            _env_file=None, summary_max_batches=20, summary_max_documents=10
+        ).summary_max_documents
+        == 10
+    )

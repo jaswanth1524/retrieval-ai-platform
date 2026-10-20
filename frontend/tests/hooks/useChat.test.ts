@@ -1,12 +1,14 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  BUSY_RETRY_ATTEMPTS,
   buildHistory,
+  busyRetrySeconds,
   historyForQuestion,
   mergeConversations,
   useChat,
 } from '../../src/hooks/useChat';
-import { sanitizeTurn } from '../../src/hooks/chatPersistence';
+import { MAX_CONVERSATIONS, sanitizeTurn } from '../../src/hooks/chatPersistence';
 import type { ChatTurn } from '../../src/components/ChatMessage';
 import { ApiClientError, api, setWorkspace } from '../../src/api/client';
 import type { QuestionStreamHandlers } from '../../src/api/client';
@@ -904,8 +906,11 @@ describe('useChat storage robustness', () => {
   });
 
   it('drops the least recently used conversation past the cap, not the oldest created', () => {
-    // 20 conversations; "daily" was created first but used most recently.
-    const conversations = Array.from({ length: 20 }, (_, i) => ({ id: `c${i}`, updatedAt: 100 + i }));
+    // A full history; "daily" was created first but used most recently.
+    const conversations = Array.from({ length: MAX_CONVERSATIONS }, (_, i) => ({
+      id: `c${i}`,
+      updatedAt: 100 + i,
+    }));
     conversations[0] = { id: 'daily', updatedAt: 10_000 };
     seed(conversations);
 
@@ -915,7 +920,7 @@ describe('useChat storage robustness', () => {
     const ids = result.current.conversations.map((c) => c.id);
     expect(ids).toContain('daily');
     expect(ids).not.toContain('c1');
-    expect(ids).toHaveLength(20);
+    expect(ids).toHaveLength(MAX_CONVERSATIONS);
   });
 
   it('keeps passage text only on the most recent turns when saving', () => {
@@ -1727,4 +1732,108 @@ describe('useChat follow-up flag (feedback kind)', () => {
     // Kept across a reload.
     expect(sanitizeTurn(answers[1])?.followUp).toBe(true);
   });
+});
+
+describe('pass 7', () => {
+  it('waits out a busy server and asks again on its own', async () => {
+    vi.useFakeTimers();
+    try {
+      askQuestionStreamMock
+        .mockRejectedValueOnce(new ApiClientError('Busy', 429, 2))
+        .mockImplementationOnce(async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+          handlers.onDone?.('Ten days [1].', [], ZERO_TIMINGS, 't1', false, {
+            topRerankScore: 0.42,
+            usage: { prompt_tokens: 100, completion_tokens: 20 },
+          });
+        });
+      const { result } = renderHook(() => useChat());
+      let asked!: Promise<void>;
+      act(() => {
+        asked = result.current.ask('Leave?');
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.stage).toMatch(/asking again in 2s/);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+        await asked;
+      });
+      expect(askQuestionStreamMock).toHaveBeenCalledTimes(2);
+      const answer = result.current.turns.find((turn) => turn.role === 'assistant');
+      expect(answer?.content).toBe('Ten days [1].');
+      expect(answer?.topRerankScore).toBe(0.42);
+      expect(answer?.usage).toEqual({ prompt: 100, completion: 20 });
+      expect(result.current.turns.some((turn) => turn.role === 'error')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives up after a few refusals, as an error turn', () => {
+    expect(busyRetrySeconds(new ApiClientError('Busy', 429, 5), 1)).toBe(5);
+    expect(busyRetrySeconds(new ApiClientError('Busy', 429), 1)).toBe(5);
+    expect(busyRetrySeconds(new ApiClientError('Busy', 429, 999), 1)).toBe(60);
+    expect(busyRetrySeconds(new ApiClientError('Busy', 429, 5), BUSY_RETRY_ATTEMPTS + 1)).toBeNull();
+    expect(busyRetrySeconds(new ApiClientError('Gone', 404), 1)).toBeNull();
+  });
+
+  it('marks a source not relevant, and exports every conversation for import', async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('Answer [1].', [], ZERO_TIMINGS, 't1', false);
+      },
+    );
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('First?');
+    });
+    const answer = result.current.turns.find((turn) => turn.role === 'assistant')!;
+    act(() => result.current.setSourceIrrelevant(answer.id, 2, true));
+    expect(result.current.turns.find((turn) => turn.id === answer.id)?.irrelevantSources).toEqual([2]);
+    act(() => result.current.setSourceIrrelevant(answer.id, 2, false));
+    expect(
+      result.current.turns.find((turn) => turn.id === answer.id)?.irrelevantSources,
+    ).toBeUndefined();
+
+    const exported = JSON.parse(result.current.allConversationsJson());
+    expect(exported.docrag_conversations).toHaveLength(1);
+    const [item] = exported.docrag_conversations;
+    act(() => {
+      result.current.importConversation(item, item.title);
+    });
+    expect(result.current.conversations.filter((c) => c.turnCount > 0)).toHaveLength(2);
+  });
+});
+
+it('asking an unanswered question again replaces it rather than repeating it', async () => {
+  askQuestionStreamMock.mockImplementationOnce(
+    (_q, _p, _o, _f, _h, _handlers, signal?: AbortSignal) =>
+      new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new ApiClientError('Cancelled.')));
+      }),
+  );
+  const { result } = renderHook(() => useChat());
+  let first!: Promise<void>;
+  act(() => {
+    first = result.current.ask('Leave?');
+  });
+  await act(async () => {
+    result.current.cancel();
+    await first;
+  });
+  expect(result.current.turns.map((turn) => turn.role)).toEqual(['user']);
+
+  askQuestionStreamMock.mockImplementationOnce(
+    async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+      handlers.onDone?.('Ten days [1].', [], ZERO_TIMINGS, 't1', false);
+    },
+  );
+  await act(async () => {
+    await result.current.ask('Leave?');
+  });
+  expect(result.current.turns.map((turn) => [turn.role, turn.content])).toEqual([
+    ['user', 'Leave?'],
+    ['assistant', 'Ten days [1].'],
+  ]);
 });

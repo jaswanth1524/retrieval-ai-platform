@@ -5,6 +5,7 @@ Split out of ``api.pipeline``, which re-exports these names.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable
@@ -12,13 +13,20 @@ from dataclasses import dataclass, replace
 
 from api.chunking import HeuristicTokenCounter, TokenCounter
 from api.corpus import bump_corpus_generation
-from api.documents import CHUNKER_VERSION, chunk_sections, chunking_fingerprint
+from api.documents import (
+    CHUNKER_VERSION,
+    DocumentSource,
+    chunk_sections,
+    chunking_fingerprint,
+    normalize_filename,
+)
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
-from api.ingestion import IngestResult, ingest_chunks
+from api.ingestion import IngestResult, filename_write_lock, ingest_chunks
 from api.metrics import ingest_stage_seconds
 from api.parse_isolation import parse_with_limit
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from api.workspaces import document_key
 
 # The name ingestion has always logged under ("Chunked x into n chunks ..."), kept so
 # log filters and dashboards built on it still match.
@@ -33,6 +41,8 @@ class DocumentIngestOutcome:
     sections_parsed: int
     chunks_ingested: int
     collection_name: str
+    # Already indexed from these exact bytes: nothing was parsed, embedded or written.
+    unchanged: bool = False
 
 
 class IngestService:
@@ -69,6 +79,8 @@ class IngestService:
         *,
         before_first_write: Callable[[], None] | None = None,
         tags: tuple[str, ...] | None = None,
+        source: DocumentSource | None = None,
+        dedupe: bool = False,
     ) -> DocumentIngestOutcome:
         """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
 
@@ -78,11 +90,21 @@ class IngestService:
         ``precondition`` is checked under that lock before anything is written, and
         ``before_first_write`` right before the first batch lands (see ``ingest_chunks``).
         ``tags`` sets the document's tags (a restore) instead of carrying its current ones.
+        ``source`` records where a URL-ingested document came from (a plain upload
+        has none, and drops a previous one). With ``dedupe``, bytes identical to the
+        indexed version leave it as it is (see ``_leave_unchanged``).
         """
 
         # Before parsing: an index built for another embedding setup refuses the
         # upload here unless it is empty, in which case it is rebuilt for this one.
         self._repository.ensure_writable(self._settings)
+        digest = hashlib.sha256(content).hexdigest()
+        if dedupe:
+            unchanged = self._leave_unchanged(
+                filename, digest, uploaded_at, precondition, on_indexed, tags, source
+            )
+            if unchanged is not None:
+                return unchanged
         parse_start = time.monotonic()
         sections = parse_with_limit(filename, content, self._settings)
         chunk_start = time.monotonic()
@@ -97,6 +119,7 @@ class IngestService:
         fingerprint = chunking_fingerprint(self._settings)
         # Read after chunking: the tokenizer loads (or fails to) on first use.
         counter_mode = getattr(self._token_counter, "mode", None)
+        chunk_total = len(chunks)
         chunks = [
             replace(
                 chunk,
@@ -105,6 +128,11 @@ class IngestService:
                 chunker_version=CHUNKER_VERSION,
                 chunking_fingerprint=fingerprint,
                 token_counter=counter_mode if counter_mode in ("hf", "heuristic") else None,
+                content_sha256=digest,
+                document_chunks=chunk_total,
+                source_url=source.url if source else None,
+                source_etag=source.etag if source else None,
+                source_last_modified=source.last_modified if source else None,
             )
             for chunk in chunks
         ]
@@ -143,10 +171,73 @@ class IngestService:
             # before its first write (cancelled, refused, an embedding error) changed
             # nothing, and used to empty the answer cache all the same.
             if writing:
-                bump_corpus_generation({chunk.filename for chunk in chunks})
+                bump_corpus_generation(
+                    {chunk.filename for chunk in chunks},
+                    collection=self._settings.qdrant_collection,
+                )
         return DocumentIngestOutcome(
             filename=sections[0].filename,
             sections_parsed=len(sections),
             chunks_ingested=result.points_count,
             collection_name=result.collection_name,
+        )
+
+    def _leave_unchanged(
+        self,
+        filename: str,
+        digest: str,
+        uploaded_at: float | None,
+        precondition: Callable[[], None] | None,
+        on_indexed: Callable[[], None] | None,
+        tags: tuple[str, ...] | None,
+        source: DocumentSource | None,
+    ) -> DocumentIngestOutcome | None:
+        """The outcome of leaving an identical document alone, or None to index it.
+
+        Skipped only when re-indexing could change nothing: the indexed points are one
+        complete ingest of these exact bytes (as many as it wrote, all agreeing), under
+        today's chunking (not stale), with no tags to set and the same source. Decided
+        under the filename lock, after the same sequencing check a write makes, so an
+        older upload still queued can't be left "unchanged" over a newer one.
+        ``on_indexed`` still runs (it records the upload as applied and stores the
+        original, which may have been missing). A watched file that was only touched
+        gets its new modification time, which is how the watcher knows the document is
+        current.
+        """
+
+        name = normalize_filename(filename)
+        settings = self._settings
+        with filename_write_lock(document_key(settings, name)):
+            if precondition is not None:
+                precondition()
+            meta = self._repository.document_metadata(settings, name)
+            if meta is None or meta.content_sha256 != digest or tags is not None:
+                return None
+            # Every point of one complete ingest: a failed one leaves fewer than it meant
+            # to write (all with this hash), and a retry of the same bytes must finish it.
+            if meta.document_chunks != meta.chunk_count:
+                return None
+            # A tokenizer not loaded yet may well load: judged as if it had.
+            mode = getattr(self._token_counter, "mode", None)
+            counter_mode = mode if mode == "heuristic" else "hf"
+            if meta.is_stale(chunking_fingerprint(settings), counter_mode):
+                return None
+            stored_source = (meta.source_url, meta.source_etag, meta.source_last_modified)
+            wanted_source = (
+                (source.url, source.etag, source.last_modified) if source else (None, None, None)
+            )
+            if stored_source != wanted_source:
+                return None
+            if uploaded_at is not None and meta.uploaded_at != uploaded_at:
+                self._repository.set_uploaded_at(settings, name, uploaded_at)
+                bump_corpus_generation([name], collection=settings.qdrant_collection)
+            if on_indexed is not None:
+                on_indexed()
+        logger.info("%s is unchanged (identical bytes); not re-indexed.", name)
+        return DocumentIngestOutcome(
+            filename=name,
+            sections_parsed=0,
+            chunks_ingested=meta.chunk_count,
+            collection_name=settings.qdrant_collection,
+            unchanged=True,
         )

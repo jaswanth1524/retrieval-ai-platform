@@ -6,6 +6,9 @@ DocRAG's citations, so the client can quote filename, page and section. Runs ove
     uv sync --extra mcp
     DOCRAG_URL=http://127.0.0.1:8000 DOCRAG_API_KEY=... uv run python -m cli.mcp_server
 
+``DOCRAG_WORKSPACE`` points it at a workspace (WORKSPACES_ENABLED) instead of the
+default one; ``list_workspaces`` shows which exist.
+
 Every tool goes through the REST API (``cli.client``), so the server's key, read-only
 key, rate limit and question slots apply; the read-only key is enough, since no tool
 changes the corpus.
@@ -60,6 +63,11 @@ def format_answer(result: StreamResult) -> str:
                 f"[{source.get('source_number')}] {source.get('filename')} {_pages(source)}, "
                 f"section: {source.get('section') or '-'} (chunk {source.get('chunk_id')})"
             )
+            # The exact sentences the answer drew on, for quoting verbatim.
+            for span in source.get("spans") or []:
+                quote = " ".join(str(span.get("quote", "")).split())
+                if quote:
+                    lines.append(f'    "{quote}"')
     status = done.get("answer_status")
     if status and status != "answered":
         lines.append(f"\nAnswer status: {status} (the documents may not cover this).")
@@ -153,14 +161,18 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
 
     @server.tool(annotations=_READ_ONLY)
     async def search_passages(
-        query: str, filenames: list[str] | None = None, top_k: int | None = None
+        query: str,
+        filenames: list[str] | None = None,
+        top_k: int | None = None,
+        tags: list[str] | None = None,
     ) -> str:
         """Find the passages that best match a query (hybrid search + rerank, no LLM).
 
-        filenames limits the search to those documents; top_k caps the results."""
+        filenames limits the search to those documents, tags to documents with one of
+        those tags; top_k caps the results."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
-            response = client.search_response(query, filenames, top_k)
+            response = client.search_response(query, filenames, top_k, tags)
             return format_passages(
                 response.get("results", []), weak=bool(response.get("weak_matches"))
             )
@@ -168,25 +180,30 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         return await call(work)
 
     @server.tool(annotations=_READ_ONLY)
-    async def ask(question: str, filenames: list[str] | None = None) -> str:
-        """Answer a question from the indexed documents, with numbered citations.
+    async def ask(
+        question: str, filenames: list[str] | None = None, tags: list[str] | None = None
+    ) -> str:
+        """Answer a question from the indexed documents, with numbered citations and the
+        exact quotes they rest on.
 
-        filenames limits the answer to those documents."""
+        filenames limits the answer to those documents, tags to documents with one of
+        those tags."""
 
         return await call(
             lambda client, should_stop: format_answer(
-                client.ask(question, filenames, should_stop=should_stop)
+                client.ask(question, filenames, should_stop=should_stop, tags=tags)
             )
         )
 
     @server.tool(annotations=_READ_ONLY)
     async def summarize(filenames: list[str], focus: str | None = None) -> str:
-        """Summarize one whole document, or compare two (pass both names).
+        """Summarize one whole document, compare two (pass both names), or write one
+        brief across several (pass them all; the server caps how many).
 
         focus narrows it ("deadlines", "risks"). Long documents take minutes."""
 
-        if not 1 <= len(filenames) <= 2:
-            return "summarize takes one document, or two to compare."
+        if not filenames:
+            return "summarize takes at least one document."
         return await call(
             lambda client, should_stop: format_answer(
                 client.summarize(filenames, focus, should_stop=should_stop)
@@ -194,14 +211,27 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         )
 
     @server.tool(annotations=_READ_ONLY)
-    async def read_document(filename: str, start: int = 1, count: int = 20) -> str:
-        """Read a document's indexed text, passage by passage, from passage `start`.
+    async def read_document(
+        filename: str, start: int = 1, count: int = 20, around_chunk_id: str | None = None
+    ) -> str:
+        """Read a document's indexed text, passage by passage, from passage `start` — or,
+        with around_chunk_id (a chunk id from a citation), the passages around that one.
 
         A long read stops early and ends with a note giving the `start` to go on from."""
 
         def work(client: DocragClient, should_stop: Callable[[], bool]) -> str:
             first = max(1, start)
-            page = client.content(filename, start=first, end=first + max(1, min(count, 100)) - 1)
+            if around_chunk_id:
+                radius = max(1, min(count, 100)) // 2
+                page = client.content(filename, around=around_chunk_id, radius=radius)
+                if not page.get("target_found", True):
+                    return f"{filename} has no passage {around_chunk_id}."
+                ordinals = [c.get("chunk_ordinal") for c in page.get("chunks", [])]
+                first = next((o for o in ordinals if isinstance(o, int)), 1)
+            else:
+                page = client.content(
+                    filename, start=first, end=first + max(1, min(count, 100)) - 1
+                )
             chunks = page.get("chunks", [])
             total = page.get("total_chunks")
             if not chunks:
@@ -231,6 +261,21 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
                     f"\n\n[Showing passages up to {last} of {total}; more with start={last + 1}.]"
                 )
             return result
+
+        return await call(work)
+
+    @server.tool(annotations=_READ_ONLY)
+    async def list_workspaces() -> str:
+        """List the workspaces (separate document collections) on this server; this
+        server's tools use the one DOCRAG_WORKSPACE names, or the default."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            listing = client.workspaces()
+            if not listing.get("enabled"):
+                return "Workspaces are not enabled on this server; there is one corpus."
+            names = ["(default)", *listing.get("workspaces", [])]
+            current = client.workspace or "(default)"
+            return "\n".join(f"{name}{' (in use)' if name == current else ''}" for name in names)
 
         return await call(work)
 

@@ -182,3 +182,45 @@ def test_comparing_with_a_document_that_has_no_readable_text_names_it(
     events = parse_sse_events(api_context.client.post("/questions/summary/stream", json=body).text)
     assert events[-1]["type"] == "error"
     assert "'empty.txt' has no readable text" in events[-1]["detail"]
+
+
+def test_summaries_have_their_own_cap_and_questions_keep_the_rest(
+    api_context: ApiTestContext,
+) -> None:
+    _ingest(api_context.client)
+    slots = QuestionSlots(4, summary_limit=1)
+    held = slots.try_acquire("summary")
+    assert held is not None
+    api_context.app.dependency_overrides[get_question_slots] = lambda: slots
+    try:
+        for path in ("/questions/summary", "/questions/summary/stream"):
+            busy = api_context.client.post(
+                path, json={"mode": "summarize", "filenames": ["guide.txt"]}
+            )
+            assert busy.status_code == 429, path
+            assert "MAX_CONCURRENT_SUMMARIES" in busy.json()["detail"]
+            assert busy.headers["retry-after"] == "5"
+        assert api_context.client.post("/questions", json={"question": "alpha"}).status_code == 200
+    finally:
+        held()
+
+
+def test_a_brief_takes_several_documents_and_the_modes_check_their_counts(
+    api_context: ApiTestContext,
+) -> None:
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _ingest(api_context.client, name, GUIDE)
+    client = api_context.client
+    brief = client.post(
+        "/questions/summary", json={"mode": "brief", "filenames": ["a.txt", "b.txt", "c.txt"]}
+    )
+    assert brief.status_code == 200, brief.text
+    assert "covering the documents" in api_context.generator.messages[-1]["content"]
+    for body in (
+        {"mode": "brief", "filenames": ["a.txt"]},
+        {"mode": "summarize", "filenames": ["a.txt", "b.txt"]},
+        {"mode": "compare", "filenames": ["a.txt", "b.txt", "c.txt"]},
+        {"mode": "brief", "filenames": ["a.txt", "a.txt"]},
+    ):
+        assert client.post("/questions/summary", json=body).status_code == 422, body
+    assert client.get("/config").json()["summary_max_documents"] == 5

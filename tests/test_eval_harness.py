@@ -370,3 +370,125 @@ def test_the_fingerprint_records_every_setting_that_moves_the_ranking() -> None:
         "platform_machine",
     ):
         assert key in fingerprint
+
+
+def test_unanswerable_questions_are_scored_on_keeping_nothing(tmp_path: Path) -> None:
+    from eval.harness import Collaborators, RetrievalExample, settings_fingerprint
+
+    points = [_point("c1", "a.md")]
+
+    class FakeCollaborators(Collaborators):
+        def __init__(self, min_score: float) -> None:
+            self.settings = make_settings(rerank_min_score=min_score)
+            self.repository = FakeRepository(points)
+            self.embedding_provider = FakeEmbeddingProvider()
+            # c1 scores 0 raw (0.5 once normalized): below a 0.9 floor.
+            self.reranker = FakeReranker(["other"])
+            self.generator = None  # type: ignore[assignment]
+
+    examples = [
+        RetrievalExample(
+            question="off topic",
+            reference=None,
+            relevant_filenames=frozenset(),
+            relevant_chunk_ids=frozenset(),
+            expect_no_context=True,
+        )
+    ]
+    kept_nothing = run_retrieval_eval(examples, FakeCollaborators(0.9), ks=(1,))
+    assert kept_nothing["aggregate"]["unanswerable"] == {"no_context_rate": 1.0}
+    assert kept_nothing["per_question"][0]["no_context"] is True
+    kept_something = run_retrieval_eval(examples, FakeCollaborators(0.0), ks=(1,))
+    assert kept_something["aggregate"]["unanswerable"] == {"no_context_rate": 0.0}
+    # The multilingual knobs are part of what a baseline was measured with.
+    fingerprint = settings_fingerprint(make_settings(), "reranked")
+    assert fingerprint["sparse_language"] == "english"
+    assert fingerprint["dense_passage_prefix"] == ""
+
+    path = tmp_path / "d.jsonl"
+    path.write_text('{"question": "q", "expect_no_context": true}\n', encoding="utf-8")
+    assert load_retrieval_dataset(path)[0].labeled
+    path.write_text(
+        '{"question": "q", "expect_no_context": true, "relevant_filenames": ["a.md"]}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(HarnessDataError, match="expect_no_context"):
+        load_retrieval_dataset(path)
+    path.write_text('{"question": "q", "expect_no_context": "yes"}\n', encoding="utf-8")
+    with pytest.raises(HarnessDataError, match="true or false"):
+        load_retrieval_dataset(path)
+
+
+def test_a_follow_up_is_retrieved_with_its_rewritten_query() -> None:
+    from eval.harness import RetrievalExample
+
+    points = [_point("c1", "a.md"), _point("c2", "b.md")]
+    seen: list[str] = []
+
+    class Rewriter:
+        def complete(self, messages: Any, settings: Any) -> str:
+            return "standalone question about c2"
+
+        def stream(self, messages: Any, settings: Any) -> Any:
+            yield ""
+
+    class RecordingReranker(FakeReranker):
+        def score(self, query: str, documents: Sequence[str]) -> list[float]:
+            seen.append(query)
+            return super().score(query, documents)
+
+    rank_for_question(
+        "And that one?",
+        repository=FakeRepository(points),
+        embedding_provider=FakeEmbeddingProvider(),
+        reranker=RecordingReranker(["c2", "c1"]),
+        settings=make_settings(),
+        generator=Rewriter(),
+        history=({"role": "user", "content": "Tell me about c2"},),
+    )
+    assert seen == ["standalone question about c2"]
+    example = RetrievalExample(
+        question="q", reference=None, relevant_filenames=frozenset(), relevant_chunk_ids=frozenset()
+    )
+    assert example.history == ()
+
+
+def test_history_in_a_dataset_is_validated(tmp_path: Path) -> None:
+    path = tmp_path / "d.jsonl"
+    path.write_text(
+        '{"question": "q", "history": [{"role": "user", "content": "earlier"}], '
+        '"relevant_filenames": ["a.md"]}\n',
+        encoding="utf-8",
+    )
+    assert load_retrieval_dataset(path)[0].history == ({"role": "user", "content": "earlier"},)
+    path.write_text('{"question": "q", "history": [{"role": "bot"}]}\n', encoding="utf-8")
+    with pytest.raises(HarnessDataError, match="history"):
+        load_retrieval_dataset(path)
+
+
+def test_answer_metrics_measure_grounding() -> None:
+    from eval.harness import AnswerRow, RetrievalExample, answer_metrics
+
+    def example(files: set[str], no_context: bool = False) -> RetrievalExample:
+        return RetrievalExample(
+            question="q",
+            reference=None,
+            relevant_filenames=frozenset(files),
+            relevant_chunk_ids=frozenset(),
+            expect_no_context=no_context,
+        )
+
+    def row(cited: list[str], status: str) -> AnswerRow:
+        return AnswerRow("q", "a", ["c"], None, cited_filenames=cited, answer_status=status)
+
+    metrics = answer_metrics(
+        [example({"a.md"}), example({"b.md"}), example(set(), no_context=True)],
+        [row(["a.md"], "answered"), row(["c.md"], "uncited"), row([], "no_context")],
+    )
+    assert metrics == {
+        "cited_relevant_rate": 0.5,
+        "answered_rate": 0.5,
+        "refused_unanswerable_rate": 1.0,
+        "uncited_rate": 1 / 3,
+    }
+    assert row(["a.md"], "answered").to_dict()["cited_filenames"] == ["a.md"]

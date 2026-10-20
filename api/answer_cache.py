@@ -65,7 +65,7 @@ def answer_cache_key(
         int(settings.rerank_top_k),
         int(settings.max_context_chunks),
         float(settings.llm_temperature),
-        corpus_generation(),
+        corpus_generation(settings.qdrant_collection),
     )
 
 

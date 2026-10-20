@@ -10,24 +10,38 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from threading import BoundedSemaphore, Lock
+from typing import Literal
 
 from api.metrics import question_slots_in_use
 
 Release = Callable[[], None]
 
 
+SlotKind = Literal["question", "summary"]
+
+
 class QuestionSlots:
-    """A non-blocking counting semaphore handing out idempotent release callbacks."""
+    """A non-blocking counting semaphore handing out idempotent release callbacks.
 
-    def __init__(self, limit: int) -> None:
-        # 0 (MAX_CONCURRENT_QUESTIONS=0) means no cap.
+    Summaries also take one of ``summary_limit`` slots of their own first, so they can
+    never hold every slot: questions keep the rest.
+    """
+
+    def __init__(self, limit: int, summary_limit: int = 0) -> None:
+        # 0 (MAX_CONCURRENT_QUESTIONS=0 / MAX_CONCURRENT_SUMMARIES=0) means no cap.
         self._semaphore = BoundedSemaphore(limit) if limit > 0 else None
+        self._summaries = BoundedSemaphore(summary_limit) if summary_limit > 0 else None
 
-    def try_acquire(self) -> Release | None:
+    def try_acquire(self, kind: SlotKind = "question") -> Release | None:
         """A release callback when a slot was free, else None. Never blocks."""
 
+        summaries = self._summaries if kind == "summary" else None
+        if summaries is not None and not summaries.acquire(blocking=False):
+            return None
         semaphore = self._semaphore
         if semaphore is not None and not semaphore.acquire(blocking=False):
+            if summaries is not None:
+                summaries.release()
             return None
         question_slots_in_use.inc()
         released = False
@@ -45,5 +59,7 @@ class QuestionSlots:
             question_slots_in_use.dec()
             if semaphore is not None:
                 semaphore.release()
+            if summaries is not None:
+                summaries.release()
 
         return release

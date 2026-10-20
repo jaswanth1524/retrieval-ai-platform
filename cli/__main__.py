@@ -9,6 +9,10 @@ repository the module runs it directly:
     uv run python -m cli ask "How many days of leave do I get?" --file handbook.pdf
     uv run python -m cli search "leave policy"
     uv run python -m cli summarize handbook.pdf [other.pdf] [--focus "deadlines"]
+    uv run python -m cli read handbook.pdf [--around CHUNK_ID]
+    uv run python -m cli tags add handbook.pdf hr / delete handbook.pdf
+    uv run python -m cli reindex --stale / refresh policy.html / jobs [--cancel ID]
+    uv run python -m cli workspaces list|create NAME|delete NAME / watch [--scan]
     uv run python -m cli export backup.zip / import backup.zip
 
 ``--url`` / ``DOCRAG_URL`` (default http://127.0.0.1:8000) and ``--api-key`` /
@@ -252,6 +256,7 @@ def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     result = client.ask(
         args.question,
         filenames=args.file or None,
+        tags=args.tag or None,
         provider=args.provider,
         on_delta=None if args.json else write,
         on_stage=None if args.json or args.quiet else _stage_printer(sys.stderr),
@@ -269,9 +274,6 @@ def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
 
 
 def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    if len(args.files) > 2:
-        print("error: summarize takes one document, or two to compare", file=sys.stderr)
-        return 2
     result = client.summarize(
         args.files,
         instruction=args.focus,
@@ -287,7 +289,9 @@ def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -
 
 
 def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    response = client.search_response(args.query, filenames=args.file or None, top_k=args.top_k)
+    response = client.search_response(
+        args.query, filenames=args.file or None, top_k=args.top_k, tags=args.tag or None
+    )
     results: list[dict[str, Any]] = response.get("results", [])
     if args.json:
         print(json.dumps(results), file=out)
@@ -301,6 +305,205 @@ def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             f"({item.get('rerank_score', 0):.2f})\n   {text[:240]}",
             file=out,
         )
+    return 0
+
+
+def cmd_read(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """A document's indexed passages: around a cited chunk, or from passage --start."""
+
+    if args.around:
+        page = client.content(args.file, around=args.around, radius=args.radius)
+    else:
+        start = max(1, args.start)
+        page = client.content(args.file, start=start, end=start + max(1, args.count) - 1)
+    if args.json:
+        print(json.dumps(page), file=out)
+        return 0
+    if args.around and not page.get("target_found", True):
+        print(f"(no passage {args.around} in {args.file}; showing its start)", file=sys.stderr)
+    for chunk in page.get("chunks", []):
+        page_no, end = chunk.get("page"), chunk.get("page_end")
+        pages = f"p.{page_no}-{end}" if end else f"p.{page_no}"
+        print(
+            f"[{chunk.get('chunk_ordinal')}] {pages} · {chunk.get('section') or '-'} "
+            f"({chunk.get('chunk_id')})\n{chunk.get('text', '')}\n",
+            file=out,
+        )
+    print(f"({page.get('total_chunks')} passages in all)", file=out)
+    return 0
+
+
+def cmd_delete(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    for name in args.files:
+        client.delete(name)
+        if not args.json:
+            print(f"deleted {name}", file=out)
+    if args.json:
+        print(json.dumps({"deleted": args.files}), file=out)
+    return 0
+
+
+def cmd_tags(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """``set`` replaces a document's tags; ``add``/``remove`` change the current ones."""
+
+    if args.action == "set":
+        wanted = list(args.tags)
+    else:
+        current = list(client.documents().get("tags", {}).get(args.file, []))
+        if args.action == "add":
+            wanted = current + [tag for tag in args.tags if tag not in current]
+        else:
+            drop = {tag.casefold() for tag in args.tags}
+            wanted = [tag for tag in current if tag.casefold() not in drop]
+    stored = client.set_tags(args.file, wanted)
+    if args.json:
+        print(json.dumps({"filename": args.file, "tags": stored}), file=out)
+    else:
+        print(f"{args.file}: {', '.join(stored) or '(no tags)'}", file=out)
+    return 0
+
+
+def _follow(
+    client: DocragClient, jobs: list[dict[str, Any]], args: argparse.Namespace, out: TextIO
+) -> int:
+    """Wait for ``jobs`` and print each outcome; 1 when any failed or wasn't followed."""
+
+    if not jobs:
+        return 0
+    names = {job["job_id"]: job.get("filename") for job in jobs}
+    statuses = client.wait_for_jobs(list(names), timeout=_wait_limit(args))
+    failed = 0
+    for job_id, status in statuses.items():
+        ok = status.get("state") == "done"
+        failed += not ok
+        if not args.json:
+            note = " (unchanged)" if status.get("unchanged") else ""
+            detail = "" if ok else f": {_job_error(status)}"
+            label = "ok   " if ok else "fail "
+            print(f"{label} {status.get('filename') or names[job_id]}{note}{detail}", file=out)
+    if args.json:
+        print(json.dumps(list(statuses.values())), file=out)
+    return 1 if failed else 0
+
+
+def cmd_reindex(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if bool(args.stale) == bool(args.file):
+        print("error: name a document, or pass --stale (not both)", file=sys.stderr)
+        return 2
+    if args.stale:
+        report = client.reindex_stale()
+        jobs, deferred = report.get("jobs", []), report.get("deferred", [])
+        if not args.json:
+            print(f"{len(jobs)} queued, {len(deferred)} deferred (queue full)", file=out)
+        return _follow(client, jobs, args, out) or (1 if deferred else 0)
+    return _follow(client, [client.reindex(args.file)], args, out)
+
+
+def cmd_refresh(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    result = client.refresh(args.file)
+    if result.get("unchanged") and "job_id" not in result:
+        if args.json:
+            print(json.dumps(result), file=out)
+        else:
+            print(f"{args.file}: unchanged at its source", file=out)
+        return 0
+    return _follow(client, [result], args, out)
+
+
+def cmd_versions(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.restore:
+        return _follow(client, [client.restore_version(args.file, args.restore)], args, out)
+    versions = client.versions(args.file)
+    if args.json:
+        print(json.dumps(versions), file=out)
+    elif not versions:
+        print(f"no earlier versions of {args.file} (RAW_DOCUMENT_VERSIONS)", file=out)
+    for version in versions if not args.json else []:
+        print(f"{version['version']}  {version['size']} bytes", file=out)
+    return 0
+
+
+def cmd_queries(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    rows = client.query_log(limit=args.limit, uncovered=args.uncovered)
+    if args.json:
+        print(json.dumps(rows), file=out)
+        return 0
+    for row in rows:
+        score = row.get("top_score")
+        shown = f"{score:.2f}" if isinstance(score, int | float) else "-"
+        print(f"{row.get('status'):22} {shown:>5}  {row.get('question')}", file=out)
+    return 0
+
+
+def cmd_jobs(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.cancel:
+        status = client.cancel_job(args.cancel)
+        if args.json:
+            print(json.dumps(status), file=out)
+        else:
+            print(f"cancel requested: {status.get('filename')} ({status.get('state')})", file=out)
+        return 0
+    jobs = client.active_jobs()
+    if args.json:
+        print(json.dumps(jobs), file=out)
+        return 0
+    if not jobs:
+        print("no indexing jobs running", file=out)
+    for job in jobs:
+        progress = (
+            f" {job.get('chunks_done')}/{job.get('chunks_total')}"
+            if job.get("chunks_total")
+            else ""
+        )
+        print(f"{job.get('job_id')}  {job.get('state')}{progress}  {job.get('filename')}", file=out)
+    return 0
+
+
+def cmd_workspaces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.action == "list":
+        listing = client.workspaces()
+        if args.json:
+            print(json.dumps(listing), file=out)
+        elif not listing.get("enabled"):
+            print("workspaces are not enabled on this server (WORKSPACES_ENABLED)", file=out)
+        else:
+            for name in ["(default)", *listing.get("workspaces", [])]:
+                print(name, file=out)
+        return 0
+    if not args.name:
+        print(f"error: workspaces {args.action} needs a name", file=sys.stderr)
+        return 2
+    if args.action == "create":
+        client.create_workspace(args.name)
+    else:
+        client.delete_workspace(args.name)
+    if args.json:
+        print(json.dumps({args.action: args.name}), file=out)
+    else:
+        print(f"{args.action}d workspace {args.name}", file=out)
+    return 0
+
+
+def cmd_watch(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.scan:
+        client.watch_scan()
+    status = client.watch_status()
+    if args.json:
+        print(json.dumps(status), file=out)
+        return 0
+    print(f"watching {status.get('folder')}: {status.get('files', 0)} files", file=out)
+    if args.scan:
+        print("(a pass was started; run again to see its result)", file=out)
+    for retry in status.get("retrying", []):
+        print(
+            f"retry   {retry.get('filename')} (attempt {retry.get('attempts')}): "
+            f"{retry.get('error')}",
+            file=out,
+        )
+    for name in status.get("gave_up", []):
+        print(f"gave up {name} (tried again when it changes)", file=out)
+    for problem in status.get("problems", []):
+        print(f"skip    {problem}", file=out)
     return 0
 
 
@@ -408,10 +611,13 @@ def build_parser() -> argparse.ArgumentParser:
     ask = command("ask", "Ask a question (streamed).")
     ask.add_argument("question")
     ask.add_argument("--file", action="append", help="Limit to this document (repeatable).")
+    ask.add_argument("--tag", action="append", help="Limit to documents with this tag.")
     ask.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
     ask.add_argument("--quiet", action="store_true", help="No progress lines on stderr.")
 
-    summarize = command("summarize", "Summarize a document, or compare two.")
+    summarize = command(
+        "summarize", "Summarize a document, compare two, or write one brief across several."
+    )
     summarize.add_argument("files", nargs="+")
     summarize.add_argument("--focus", help="What to concentrate on.")
     summarize.add_argument("--provider")
@@ -420,7 +626,51 @@ def build_parser() -> argparse.ArgumentParser:
     search = command("search", "Ranked passages, no LLM.")
     search.add_argument("query")
     search.add_argument("--file", action="append")
+    search.add_argument("--tag", action="append")
     search.add_argument("--top-k", type=int)
+
+    read = command("read", "Print a document's indexed passages.")
+    read.add_argument("file")
+    read.add_argument("--around", metavar="CHUNK_ID", help="Centre on this passage.")
+    read.add_argument("--radius", type=int, default=3, help="Passages either side of it.")
+    read.add_argument("--start", type=int, default=1, help="First passage (1-based).")
+    read.add_argument("--count", type=int, default=20)
+
+    delete = command("delete", "Delete documents from the index (full key).")
+    delete.add_argument("files", nargs="+")
+
+    tags = command("tags", "Set, add or remove a document's tags (full key).")
+    tags.add_argument("action", choices=("set", "add", "remove"))
+    tags.add_argument("file")
+    tags.add_argument("tags", nargs="*")
+
+    reindex = command("reindex", "Re-index from stored originals (RAW_DOCUMENT_DIR).")
+    reindex.add_argument("file", nargs="?")
+    reindex.add_argument("--stale", action="store_true", help="Every out-of-date document.")
+    wait_flag(reindex)
+
+    refresh = command("refresh", "Fetch a URL-ingested document again.")
+    refresh.add_argument("file")
+    wait_flag(refresh)
+
+    versions = command("versions", "A document's earlier originals (RAW_DOCUMENT_VERSIONS).")
+    versions.add_argument("file")
+    versions.add_argument("--restore", metavar="VERSION", help="Index this version again.")
+    wait_flag(versions)
+
+    queries = command("queries", "What was asked (QUERY_LOG_ENABLED, full key).")
+    queries.add_argument("--uncovered", action="store_true", help="Only unanswered ones.")
+    queries.add_argument("--limit", type=int, default=50)
+
+    jobs = command("jobs", "Indexing jobs running now.")
+    jobs.add_argument("--cancel", metavar="JOB_ID", help="Cancel this job.")
+
+    workspaces = command("workspaces", "List, create or delete workspaces.")
+    workspaces.add_argument("action", choices=("list", "create", "delete"))
+    workspaces.add_argument("name", nargs="?")
+
+    watch = command("watch", "The watched folder's status (WATCH_DIR).")
+    watch.add_argument("--scan", action="store_true", help="Start a pass now (full key).")
 
     export = command("export", "Download a backup zip (full key).")
     export.add_argument("output")
@@ -438,6 +688,16 @@ COMMANDS = {
     "ask": cmd_ask,
     "summarize": cmd_summarize,
     "search": cmd_search,
+    "read": cmd_read,
+    "delete": cmd_delete,
+    "tags": cmd_tags,
+    "reindex": cmd_reindex,
+    "refresh": cmd_refresh,
+    "versions": cmd_versions,
+    "queries": cmd_queries,
+    "jobs": cmd_jobs,
+    "workspaces": cmd_workspaces,
+    "watch": cmd_watch,
     "export": cmd_export,
     "import": cmd_import,
 }

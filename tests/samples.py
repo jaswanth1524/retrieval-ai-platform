@@ -6,7 +6,7 @@ import io
 
 
 def pdf_bytes(pages: list[str]) -> bytes:
-    """A minimal valid PDF with one line of Helvetica text per page."""
+    """A minimal valid PDF of Helvetica text, one entry per page ("\n" between lines)."""
 
     objects: list[bytes] = []
     kids = " ".join(f"{3 + 2 * index} 0 R" for index in range(len(pages)))
@@ -20,7 +20,9 @@ def pdf_bytes(pages: list[str]) -> bytes:
             f"/Resources << /Font << /F1 {font_id} 0 R >> >> "
             f"/Contents {content_id} 0 R >>".encode()
         )
-        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+        # One line of text per "\n", each 14 points below the last.
+        shown = " 0 -14 Td ".join(f"({line}) Tj" for line in text.split("\n"))
+        stream = f"BT /F1 12 Tf 72 720 Td {shown} ET".encode()
         objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
     objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 

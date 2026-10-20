@@ -66,3 +66,19 @@
 .chat-thread__upload:hover {
   border-color: var(--accent);
 }
+
+.chat-thread__jump {
+  position: sticky;
+  bottom: 12px;
+  left: 100%;
+  display: block;
+  margin: 0 16px 0 auto;
+  background: var(--card);
+  border: 1px solid var(--rule-hi);
+  border-radius: 999px;
+  color: var(--ink);
+  font-size: 12px;
+  padding: 5px 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}

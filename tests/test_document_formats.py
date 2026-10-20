@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 from io import BytesIO
 from typing import Any
 
@@ -8,14 +9,17 @@ import pytest
 import api.documents as documents
 import api.parsers.docx as docx_parser
 import api.parsers.pdf as pdf_parser
+from api.chunking import HeuristicTokenCounter
 from api.documents import (
     DocumentSection,
     EmptyDocumentError,
+    chunk_sections,
     parse_document_bytes,
 )
 from api.parsers.pdf import _table_to_markdown
 from api.settings import AppSettings
 from tests.factories import make_test_settings
+from tests.samples import pdf_bytes
 
 
 def make_settings(**overrides: Any) -> AppSettings:
@@ -618,8 +622,8 @@ def test_parse_epub_reads_chapters_in_spine_order_with_the_chapter_as_page() -> 
     sections = parse_document_bytes("novel.epub", content)
 
     assert [(s.page, s.section, s.text) for s in sections] == [
-        (1, "Departure", "Departure They left by night."),
-        (2, "Arrival", "Arrival The ship docked at dawn."),
+        (1, "Departure", "Departure\n\nThey left by night."),
+        (2, "Arrival", "Arrival\n\nThe ship docked at dawn."),
     ]
 
 
@@ -627,7 +631,7 @@ def test_parse_epub_skips_empty_chapters_and_fails_when_nothing_is_left() -> Non
     from tests.samples import epub_bytes
 
     sections = parse_document_bytes("book.epub", epub_bytes([("", ""), ("Two", "Body text.")]))
-    assert [(s.page, s.text) for s in sections] == [(2, "Two Body text.")]
+    assert [(s.page, s.text) for s in sections] == [(2, "Two\n\nBody text.")]
 
     with pytest.raises(documents.EmptyDocumentError):
         parse_document_bytes("blank.epub", epub_bytes([("", "")]))
@@ -695,7 +699,7 @@ def test_parse_eml_falls_back_to_the_html_body() -> None:
     sections = parse_document_bytes("news.eml", bytes(message))
 
     assert sections[-1].section == "October"
-    assert sections[-1].text == "October Release notes inside."
+    assert sections[-1].text == "October\n\nRelease notes inside."
 
 
 def test_an_html_email_labels_its_text_with_the_subject_not_the_html_title() -> None:
@@ -712,3 +716,96 @@ def test_an_html_email_labels_its_text_with_the_subject_not_the_html_title() -> 
 
     assert [section.section for section in sections] == ["Invoice 42", "Invoice 42"]
     assert sections[-1].text == "Pay by Friday."
+
+
+# --- CHUNKER_VERSION 6: HTML main content, tables, blocks, charset; PDF running lines ---
+
+
+def test_html_keeps_the_main_content_and_drops_the_page_chrome() -> None:
+    page = (
+        b"<html><head><title>Policies</title></head><body>"
+        b"<nav><a href='/'>Home</a> <a href='/jobs'>Careers</a></nav>"
+        b"<header><p>ACME Corporation</p></header>"
+        b"<main><h1>Leave</h1><p>Employees get 28 days.</p><ul><li>Plan ahead</li>"
+        b"<li>Ask your manager</li></ul></main>"
+        b"<aside>Related: holidays</aside><footer>Copyright ACME</footer></body></html>"
+    )
+    sections = parse_document_bytes("p.html", page)
+    text = " ".join(section.text for section in sections)
+    assert "Employees get 28 days." in text
+    assert "Plan ahead\n\nAsk your manager" in text
+    for chrome in ("Careers", "ACME Corporation", "Related", "Copyright"):
+        assert chrome not in text
+
+
+def test_html_without_main_drops_chrome_but_keeps_an_articles_own_header() -> None:
+    page = (
+        b"<body><nav>Menu</nav><article><header><h1>Title</h1></header><p>Body.</p>"
+        b"</article><article><p>Second.</p></article><footer>Foot</footer></body>"
+    )
+    text = " ".join(section.text for section in parse_document_bytes("p.html", page))
+    assert "Title" in text and "Body." in text and "Second." in text
+    assert "Menu" not in text and "Foot" not in text
+
+
+def test_html_whose_text_is_all_chrome_still_indexes_it() -> None:
+    sections = parse_document_bytes("p.html", b"<body><header><p>Only here</p></header></body>")
+    assert [section.text for section in sections] == ["Only here"]
+
+
+def test_html_tables_become_one_self_describing_line_per_row() -> None:
+    page = (
+        b"<main><h2>Grades</h2><table><tr><th>Grade</th><th>Days</th></tr>"
+        b"<tr><td>A</td><td>28</td></tr><tr><td>B</td><td>30</td></tr></table></main>"
+    )
+    (section,) = parse_document_bytes("t.html", page)
+    assert "| Grade: A; Days: 28\n| Grade: B; Days: 30" in section.text
+    chunks = chunk_sections([section], make_test_settings(), HeuristicTokenCounter())
+    assert any("Grade: B; Days: 30" in chunk.text for chunk in chunks)
+
+
+def test_html_meta_charset_is_honoured_and_a_bom_outranks_it() -> None:
+    page = '<html><head><meta charset="shift_jis"></head><p>休暇は二十八日です。</p>'
+    (section,) = parse_document_bytes("j.html", page.encode("shift_jis"))
+    assert section.text == "休暇は二十八日です。"
+    legacy = (
+        '<meta http-equiv="Content-Type" content="text/html; charset=windows-1251">'
+        "<p>Отпуск 28 дней.</p>"
+    )
+    (section,) = parse_document_bytes("r.html", legacy.encode("cp1251"))
+    assert section.text == "Отпуск 28 дней."
+    # A UTF-8 BOM (what URL ingest writes for a charset the server declared) wins.
+    wrong_meta = '<meta charset="shift_jis"><p>Grüße</p>'
+    (section,) = parse_document_bytes("u.html", codecs.BOM_UTF8 + wrong_meta.encode("utf-8"))
+    assert section.text == "Grüße"
+
+
+def test_running_headers_footers_and_page_numbers_are_dropped_from_pdf_pages() -> None:
+    from api.parsers.pdf import strip_running_lines
+
+    pages = [
+        f"ACME Handbook 2024\nChapter {n}\nThe text of page {n} goes here.\nPage {n} of 5"
+        for n in range(1, 6)
+    ]
+    assert strip_running_lines(pages) == [
+        f"Chapter {n}\nThe text of page {n} goes here." for n in range(1, 6)
+    ]
+    # Two pages are not enough to call anything "running".
+    assert strip_running_lines(pages[:2]) == pages[:2]
+    # A line that repeats inside the text, not at an edge, stays.
+    inner = [f"Top {n}\nNext {n}\nSee section 2.\nmore {n}\nend {n}" for n in range(4)]
+    assert all("See section 2." in page for page in strip_running_lines(inner))
+    # Under 60% of the pages: not a running line.
+    mixed = ["Draft\nA.", "Draft\nB.", "C.", "D.", "E."]
+    assert strip_running_lines(mixed) == mixed
+
+
+def test_a_pdf_is_indexed_without_its_running_lines() -> None:
+    pages = [
+        f"ACME Handbook 2024\nSection {n} says something useful.\nPage {n}" for n in range(1, 5)
+    ]
+    sections = parse_document_bytes("h.pdf", pdf_bytes(pages))
+    assert [section.page for section in sections] == [1, 2, 3, 4]
+    assert all("ACME Handbook" not in section.text for section in sections)
+    assert all("useful" in section.text for section in sections)
+    assert all(section.section != "ACME Handbook 2024" for section in sections)

@@ -29,6 +29,7 @@ quietly replace another document by naming itself ``handbook.pdf``.
 
 from __future__ import annotations
 
+import codecs
 import ipaddress
 import re
 import socket
@@ -94,6 +95,11 @@ class FetchedDocument:
     # The name came from the remote server (Content-Disposition, or a redirect target's
     # path), not from the request's filename or the URL it asked for.
     remote_named: bool = False
+    # The server's validators, kept for a later conditional refresh.
+    etag: str | None = None
+    last_modified: str | None = None
+    # A conditional fetch the server answered 304: nothing changed, ``content`` is empty.
+    not_modified: bool = False
 
 
 class BacklogFullError(Exception):
@@ -282,6 +288,7 @@ def _pinned_request(
     port: int,
     timeout: float,
     trace: Callable[[str, dict[str, object]], None] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> httpx.Request:
     """A GET to ``address`` that still presents ``host`` (Host header, TLS SNI)."""
 
@@ -296,10 +303,54 @@ def _pinned_request(
     return client.build_request(
         "GET",
         target,
-        headers={"Host": host_header, "User-Agent": _USER_AGENT, "Accept": "*/*"},
+        headers={
+            **(extra_headers or {}),
+            "Host": host_header,
+            "User-Agent": _USER_AGENT,
+            "Accept": "*/*",
+        },
         extensions={"sni_hostname": host, **({"trace": trace} if trace else {})},
         timeout=httpx.Timeout(timeout),
     )
+
+
+# Validators longer than this aren't kept (they are stored on every chunk).
+_MAX_VALIDATOR_CHARS = 200
+
+
+def _header_value(value: str | None) -> str | None:
+    if not value or len(value) > _MAX_VALIDATOR_CHARS:
+        return None
+    return value
+
+
+def _conditional_headers(etag: str | None, last_modified: str | None) -> dict[str, str] | None:
+    headers = {}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    return headers or None
+
+
+def _with_declared_charset(body: bytes, content_type: str) -> bytes:
+    """A text document re-encoded as UTF-8 (with a byte-order mark) when the server's
+    Content-Type names its charset: that outranks a <meta charset> inside the page, as
+    in a browser, and the parser trusts a BOM above both. Undeclared, or a charset
+    Python doesn't know, or bytes that don't decode under it: left as they are."""
+
+    media, _, params = content_type.partition(";")
+    media = media.strip().lower()
+    if not (media.startswith("text/") or media in ("application/xhtml+xml", "application/xml")):
+        return body
+    match = re.search(r"charset\s*=\s*\"?([A-Za-z0-9_.:-]+)", params, re.IGNORECASE)
+    if match is None or body.startswith(codecs.BOM_UTF8):
+        return body
+    try:
+        text = body.decode(match.group(1))
+    except (LookupError, UnicodeDecodeError):
+        return body
+    return codecs.BOM_UTF8 + text.encode("utf-8")
 
 
 def loggable_url(url: str) -> str:
@@ -360,6 +411,8 @@ def fetch_document(
     transport: httpx.BaseTransport | None = None,
     has_room: Callable[[int], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    etag: str | None = None,
+    last_modified: str | None = None,
 ) -> FetchedDocument:
     """Download ``url`` within the guards above; blocking (run it off the event loop).
 
@@ -367,6 +420,9 @@ def fetch_document(
     declared length (``MAX_UPLOAD_BYTES`` when it declares none), before any of the
     body is read: a full ingest backlog raises ``BacklogFullError`` then, rather than
     after downloading a document it can only refuse.
+
+    ``etag``/``last_modified`` (from an earlier fetch) make it conditional: a 304
+    returns a ``not_modified`` document with no content.
     """
 
     limit = int(settings.max_upload_bytes)
@@ -396,6 +452,7 @@ def fetch_document(
             has_room,
             remaining,
             watchdog,
+            _conditional_headers(etag, last_modified),
         )
     except (UrlFetchError, httpx.HTTPError) as exc:
         if not watchdog.fired:
@@ -417,15 +474,36 @@ def _fetch(
     has_room: Callable[[int], bool] | None,
     remaining: Callable[[str], float],
     watchdog: _Watchdog,
+    conditional: dict[str, str] | None = None,
 ) -> FetchedDocument:
     with httpx.Client(follow_redirects=False, transport=transport) as client:
         for _ in range(MAX_REDIRECTS + 1):
             _, host, port = _validated(current)
             response = _connect(
-                client, current, host, port, allow_private, resolve, remaining, watchdog.trace
+                client,
+                current,
+                host,
+                port,
+                allow_private,
+                resolve,
+                remaining,
+                watchdog.trace,
+                conditional,
             )
             try:
-                if response.is_redirect:
+                if response.status_code == 304 and conditional:
+                    # Before the redirect check: httpx counts every 3xx as a redirect, 304
+                    # included, and a 304 has no Location.
+                    return FetchedDocument(
+                        filename or "",
+                        b"",
+                        current,
+                        etag=response.headers.get("etag") or conditional.get("If-None-Match"),
+                        last_modified=response.headers.get("last-modified")
+                        or conditional.get("If-Modified-Since"),
+                        not_modified=True,
+                    )
+                if response.is_redirect and response.status_code != 304:
                     location = response.headers.get("location")
                     if not location:
                         raise UrlFetchError("The URL redirected nowhere.")
@@ -434,7 +512,7 @@ def _fetch(
                     except ValueError as exc:
                         raise UrlFetchError("The URL redirected to an invalid URL.") from exc
                     continue
-                if response.status_code >= 400:
+                if response.status_code == 304 or response.status_code >= 400:
                     raise UrlFetchError(
                         f"The URL answered {response.status_code}; nothing was fetched."
                     )
@@ -444,7 +522,10 @@ def _fetch(
                     raise UrlFetchError(f"The document is larger than {limit} bytes.")
                 if has_room is not None and not has_room(size if size is not None else limit):
                     raise BacklogFullError
-                body = _read_body(response, limit, host, remaining)
+                body = _with_declared_charset(
+                    _read_body(response, limit, host, remaining),
+                    response.headers.get("content-type", ""),
+                )
                 disposition = response.headers.get("content-disposition")
                 name = choose_filename(
                     current, response.headers.get("content-type", ""), disposition, filename
@@ -452,7 +533,14 @@ def _fetch(
                 remote_named = not (filename or "").strip() and name != _requested_name(
                     url, response.headers.get("content-type", "")
                 )
-                return FetchedDocument(name, body, current, remote_named=remote_named)
+                return FetchedDocument(
+                    name,
+                    body,
+                    current,
+                    remote_named=remote_named,
+                    etag=_header_value(response.headers.get("etag")),
+                    last_modified=_header_value(response.headers.get("last-modified")),
+                )
             finally:
                 response.close()
     raise UrlFetchError(f"The URL redirected more than {MAX_REDIRECTS} times.")
@@ -467,12 +555,15 @@ def _connect(
     resolve: Resolver,
     remaining: Callable[[str], float],
     trace: Callable[[str, dict[str, object]], None] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     """The response from the first checked address that accepts the connection."""
 
     addresses = _checked_addresses(host, port, allow_private, resolve, remaining(host))
     for index, address in enumerate(addresses):
-        request = _pinned_request(client, url, address, host, port, remaining(host), trace)
+        request = _pinned_request(
+            client, url, address, host, port, remaining(host), trace, extra_headers
+        )
         try:
             return client.send(request, stream=True)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

@@ -16,6 +16,7 @@ from api.schemas import (
     TraceConfigResponse,
     TraceDetailResponse,
     TraceSummaryResponse,
+    UsageResponse,
 )
 from api.tracing import QueryTrace
 
@@ -66,6 +67,12 @@ def trace_summary_response(trace: QueryTrace) -> TraceSummaryResponse:
         candidate_count=len(trace.candidates),
         kept_count=sum(1 for candidate in trace.candidates if candidate.kept),
     )
+
+
+def usage_response(usage: tuple[int, int] | None) -> UsageResponse | None:
+    if usage is None:
+        return None
+    return UsageResponse(prompt_tokens=usage[0], completion_tokens=usage[1])
 
 
 def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
@@ -124,6 +131,7 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         query_variants=trace.query_variants,
         citation_retry_used=trace.citation_retry_used,
         request_id=trace.request_id,
+        usage=usage_response(trace.usage),
     )
 
 

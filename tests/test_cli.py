@@ -92,8 +92,9 @@ def test_summarize_and_compare(client: DocragClient, tmp_path: Path) -> None:
     assert code == 0 and "Alpha is documented [1]." in out
     code, out = run(client, "--json", "summarize", "guide.txt", "notes.md", "--focus", "letters")
     assert code == 0 and json.loads(out)["chunks_read"] == 2
+    # Three documents: one brief across them; unknown names are the server's 404.
     code, _ = run(client, "summarize", "a", "b", "c")
-    assert code == 2
+    assert code == 1
 
 
 def test_search_lists_ranked_passages(client: DocragClient, tmp_path: Path) -> None:
@@ -709,3 +710,47 @@ def test_search_says_when_the_passages_are_only_the_closest() -> None:
     # --json keeps its shape: the list of passages.
     code, out = run(mock_client(handler), "search", "laptop", "--json")
     assert json.loads(out) == [passage]
+
+
+def test_tags_read_delete_jobs_and_workspaces(client: DocragClient, tmp_path: Path) -> None:
+    run(client, "ingest", str(corpus(tmp_path)))
+
+    assert run(client, "tags", "set", "guide.txt", "hr", "policy") == (0, "guide.txt: hr, policy\n")
+    assert run(client, "tags", "add", "guide.txt", "legal", "hr")[1] == (
+        "guide.txt: hr, policy, legal\n"
+    )
+    assert run(client, "tags", "remove", "guide.txt", "HR")[1] == "guide.txt: policy, legal\n"
+    code, out = run(client, "search", "alpha", "--tag", "legal")
+    assert code == 0 and out.startswith("1. guide.txt")
+    code, out = run(client, "search", "beta", "--tag", "legal")
+    assert "notes.md" not in out
+
+    code, out = run(client, "read", "guide.txt")
+    assert code == 0 and "Alpha is the first letter." in out and "(1 passages in all)" in out
+    chunk_id = json.loads(run(client, "--json", "read", "guide.txt")[1])["chunks"][0]["chunk_id"]
+    code, out = run(client, "read", "guide.txt", "--around", chunk_id)
+    assert code == 0 and chunk_id in out
+
+    assert run(client, "jobs") == (0, "no indexing jobs running\n")
+    code, out = run(client, "workspaces", "list")
+    assert code == 0 and "not enabled" in out
+    assert run(client, "workspaces", "create")[0] == 2
+
+    assert run(client, "delete", "notes.md") == (0, "deleted notes.md\n")
+    assert json.loads(run(client, "--json", "documents")[1])["filenames"] == ["guide.txt"]
+    code, _ = run(client, "delete", "notes.md")
+    assert code == 1  # already gone: the server's 404
+
+
+def test_reindex_refresh_and_watch_report_the_servers_answer(client: DocragClient) -> None:
+    # No stored originals, no URL ingest, no watched folder on this server: each says so.
+    assert run(client, "reindex")[0] == 2
+    assert run(client, "reindex", "guide.txt")[0] == 1
+    assert run(client, "refresh", "guide.txt")[0] == 1
+    assert run(client, "watch")[0] == 1
+
+
+def test_versions_and_queries_say_what_the_server_says(client: DocragClient) -> None:
+    # No stored originals and no query log on this server: the server's refusals.
+    assert run(client, "versions", "guide.txt")[0] == 1
+    assert run(client, "queries")[0] == 1

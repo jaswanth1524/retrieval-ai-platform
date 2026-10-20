@@ -70,6 +70,9 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         anthropic_model=settings.anthropic_model,
         allowed_request_providers=allowed_request_providers(settings),
         supported_extensions=sorted(SUPPORTED_EXTENSIONS),
+        watch_enabled=bool(settings.watch_dir),
+        answer_language=settings.answer_language,
+        summary_max_documents=settings.summary_max_documents,
     )
 
 
@@ -116,6 +119,7 @@ def register(app: FastAPI) -> None:
             llm_provider=settings.llm_provider,
             index_compatible=index_detail is None,
             index_detail=index_detail,
+            originals_kept=bool(settings.raw_document_dir),
         )
         status_code = 200 if qdrant_ok and provider_ok else 503
         return JSONResponse(status_code=status_code, content=body.model_dump())

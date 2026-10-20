@@ -1,0 +1,16 @@
+.shortcuts-dialog__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.shortcuts-dialog__table td {
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.shortcuts-dialog__table td:first-child {
+  width: 30%;
+  color: var(--dim);
+  white-space: nowrap;
+}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, apiErrorMessage, getWorkspace } from '../api/client';
+import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/client';
 import type {
   FeedbackRating,
   HistoryMessage,
@@ -29,6 +29,8 @@ import {
   parseConversations,
   parseDeleted,
   persistStorage,
+  forChatStore,
+  LOCAL_STORAGE_MAX_CONVERSATIONS,
   sanitizeTurn,
   searchConversations as searchStoredConversations,
   withoutConversation,
@@ -220,6 +222,11 @@ export interface UseChatResult {
   searchConversations: (query: string) => Map<string, ConversationMatch>;
   /** `undefined` takes a rating back (it could not be sent). */
   setTurnFeedback: (turnId: string, rating: FeedbackRating | undefined) => void;
+  /** Every conversation with turns, as one JSON document (Export all conversations);
+   *  importConversations reads it back. */
+  allConversationsJson: () => string;
+  /** Mark (or, after a failed send, unmark) one cited source of a turn not relevant. */
+  setSourceIrrelevant: (turnId: string, sourceNumber: number, marked: boolean) => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
@@ -235,6 +242,42 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
 }
 
 const NO_TURNS: ChatTurn[] = [];
+
+/** Times a question refused with 429 is asked again on its own. */
+export const BUSY_RETRY_ATTEMPTS = 3;
+const BUSY_RETRY_MAX_SECONDS = 60;
+
+/** How long to wait before asking again after ``err`` on ``attempt``, or null when it
+ *  isn't a busy refusal (or the attempts are used up). */
+export function busyRetrySeconds(err: unknown, attempt: number): number | null {
+  if (!(err instanceof ApiClientError) || err.statusCode !== 429) return null;
+  if (attempt > BUSY_RETRY_ATTEMPTS) return null;
+  return Math.min(Math.max(1, Math.ceil(err.retryAfterSeconds ?? 5)), BUSY_RETRY_MAX_SECONDS);
+}
+
+/** Waits ``seconds``, calling ``onTick`` with the seconds left each second; ends early
+ *  (resolving) when ``signal`` aborts. */
+function countDown(
+  seconds: number,
+  signal: AbortSignal,
+  onTick: (left: number) => void,
+): Promise<void> {
+  return new Promise((resolve) => {
+    let left = seconds;
+    onTick(left);
+    const timer = setInterval(() => {
+      left -= 1;
+      if (left <= 0) done();
+      else onTick(left);
+    }, 1000);
+    const done = () => {
+      clearInterval(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    signal.addEventListener('abort', done);
+  });
+}
 
 interface TrailingStream {
   conversationId: string | null;
@@ -301,7 +344,9 @@ export function useChat(): UseChatResult {
     if (pendingStorage === null) return;
     // Mirrors persistStorage: a lone empty conversation clears the store rather than
     // being saved, so it can't come back next to a new one after a reload.
-    void (isOnlyEmpty(pendingStorage) ? clearChatStore() : saveChatStore(pendingStorage)).then(
+    void (
+      isOnlyEmpty(pendingStorage) ? clearChatStore() : saveChatStore(forChatStore(pendingStorage))
+    ).then(
       (saved) => {
         if (!mountedRef.current) return;
         // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
@@ -382,7 +427,7 @@ export function useChat(): UseChatResult {
     // This snapshot supersedes any write still waiting on its timer.
     window.clearTimeout(chatStoreTimerRef.current);
     pendingChatStoreRef.current = null;
-    if (chatStoreAvailable()) void saveChatStore(snapshot);
+    if (chatStoreAvailable()) void saveChatStore(forChatStore(snapshot));
   };
 
   // While an answer streams: the other conversations and the selection as last seen,
@@ -421,7 +466,14 @@ export function useChat(): UseChatResult {
     outsideStreamRef.current = null;
     const outcome = persistStorage(storage);
     setPersistError(outcome === 'failed');
-    setPersistPartial(outcome === 'partial');
+    // Without IndexedDB, localStorage's copy is all there is, and it holds only the
+    // most recent conversations.
+    setPersistPartial(
+      outcome === 'partial' ||
+        (outcome === 'saved' &&
+          !chatStoreAvailable() &&
+          storage.conversations.length > LOCAL_STORAGE_MAX_CONVERSATIONS),
+    );
     if (!chatStoreReady || !chatStoreAvailable()) return;
     // Coalesced: every scope click, rename or rating used to rewrite the whole history
     // in IndexedDB at once; a burst of changes now costs one write. The timer is not
@@ -564,7 +616,19 @@ export function useChat(): UseChatResult {
         return workspace ? { ...rest, workspace } : rest;
       }),
     }));
-    updateTurns((prev) => [...prev, { ...makeTurn('user', question), ...(task ? { task } : {}) }]);
+    updateTurns((prev) => {
+      // Asked again after it got no answer (stopped before the first frame, a reload
+      // mid-retrieval): it takes the unanswered question's place, not a second copy.
+      const last = prev[prev.length - 1];
+      const unanswered =
+        last?.role === 'user' &&
+        last.content === question &&
+        JSON.stringify(last.task ?? null) === JSON.stringify(task ?? null);
+      return [
+        ...(unanswered ? prev.slice(0, -1) : prev),
+        { ...makeTurn('user', question), ...(task ? { task } : {}) },
+      ];
+    });
     setPending(true);
     // Seeded before the first server frame arrives so there is never a gap with a
     // pending request and no label at all.
@@ -632,68 +696,96 @@ export function useChat(): UseChatResult {
     });
 
     try {
-      await api.askQuestionStream(
-        question,
-        provider,
-        overrides,
-        filenames,
-        history,
-        {
-          onStage: (serverStage, progress) => {
-            setStage(stageLabel(serverStage, progress));
-          },
-          onSources: (sources, traceId) => {
-            // Sources land the moment retrieval finishes, which is exactly when
-            // generation starts — no separate server frame needed for it.
-            setStage(task ? 'writing the summary…' : 'generating answer…');
-            updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
-          },
-          onDelta: (text) => {
-            bufferedDeltaRef.current += text;
-            if (frameId === null) frameId = requestAnimationFrame(flushDelta);
-          },
-          onFollowups: (questions) => {
-            const followups = cleanFollowups(questions);
-            if (followups.length === 0) return;
-            // Onto this answer by id, and never creating it: by now it may have been
-            // cleared or deleted, and other questions may have been asked since.
-            setConversationTurns(
-              conversationId,
-              (prev) =>
-                prev.some((turn) => turn.id === assistantTurnId)
-                  ? prev.map((turn) => (turn.id === assistantTurnId ? { ...turn, followups } : turn))
-                  : prev,
-              false,
-            );
-          },
-          onDone: (answer, sources, timings, traceId, cached, grounding) => {
-            flushDelta();
-            const status = grounding?.answerStatus;
-            updateAssistantTurn((turn) => ({
-              ...turn,
-              content: answer,
-              sources,
-              timings,
-              traceId,
-              ...(cached ? { cached: true } : {}),
-              ...(status === 'insufficient_context' || status === 'no_context'
-                ? { notFound: true }
-                : {}),
-              ...(status === 'uncited' ? { uncited: true } : {}),
-              ...(grounding?.truncated ? { truncated: true } : {}),
-              ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
-                ? { coverage: grounding.coverage }
-                : {}),
-            }));
-            finish();
-            // Still open for follow-ups; aborted on unmount or by a newer question here.
-            trailing = { conversationId, controller };
-            trailingRef.current.add(trailing);
-          },
-        },
-        controller.signal,
-        options,
-      );
+      // A 429 (every question slot busy, or the rate limit) arrives before any frame:
+      // waited out with a countdown and asked again, up to BUSY_RETRY_ATTEMPTS times,
+      // instead of an error turn telling the user to do exactly that by hand. Stop
+      // cancels the wait.
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          await api.askQuestionStream(
+            question,
+            provider,
+            overrides,
+            filenames,
+            history,
+            {
+              onStage: (serverStage, progress) => {
+                setStage(stageLabel(serverStage, progress));
+              },
+              onSources: (sources, traceId) => {
+                // Sources land the moment retrieval finishes, which is exactly when
+                // generation starts — no separate server frame needed for it.
+                setStage(task ? 'writing the summary…' : 'generating answer…');
+                updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
+              },
+              onDelta: (text) => {
+                bufferedDeltaRef.current += text;
+                if (frameId === null) frameId = requestAnimationFrame(flushDelta);
+              },
+              onFollowups: (questions) => {
+                const followups = cleanFollowups(questions);
+                if (followups.length === 0) return;
+                // Onto this answer by id, and never creating it: by now it may have been
+                // cleared or deleted, and other questions may have been asked since.
+                setConversationTurns(
+                  conversationId,
+                  (prev) =>
+                    prev.some((turn) => turn.id === assistantTurnId)
+                      ? prev.map((turn) => (turn.id === assistantTurnId ? { ...turn, followups } : turn))
+                      : prev,
+                  false,
+                );
+              },
+              onDone: (answer, sources, timings, traceId, cached, grounding) => {
+                flushDelta();
+                const status = grounding?.answerStatus;
+                updateAssistantTurn((turn) => ({
+                  ...turn,
+                  content: answer,
+                  sources,
+                  timings,
+                  traceId,
+                  ...(cached ? { cached: true } : {}),
+                  ...(status === 'insufficient_context' || status === 'no_context'
+                    ? { notFound: true }
+                    : {}),
+                  ...(status === 'uncited' ? { uncited: true } : {}),
+                  ...(grounding?.truncated ? { truncated: true } : {}),
+                  ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
+                    ? { coverage: grounding.coverage }
+                    : {}),
+                  ...(typeof grounding?.topRerankScore === 'number'
+                    ? { topRerankScore: grounding.topRerankScore }
+                    : {}),
+                  ...(grounding?.usage
+                    ? {
+                        usage: {
+                          prompt: grounding.usage.prompt_tokens,
+                          completion: grounding.usage.completion_tokens,
+                        },
+                      }
+                    : {}),
+                }));
+                finish();
+                // Still open for follow-ups; aborted on unmount or by a newer question here.
+                trailing = { conversationId, controller };
+                trailingRef.current.add(trailing);
+              },
+            },
+            controller.signal,
+            options,
+          );
+          break;
+        } catch (err) {
+          const waitSeconds = busyRetrySeconds(err, attempt);
+          if (waitSeconds === null || controller.signal.aborted) throw err;
+          await countDown(waitSeconds, controller.signal, (left) =>
+            setStage(`server busy — asking again in ${left}s…`),
+          );
+          if (controller.signal.aborted) throw err;
+          setStage(DEFAULT_STAGE_LABEL);
+        }
+      }
     } catch (err) {
       flushDelta();
       // A user-initiated Stop aborts `controller`; a timeout aborts askQuestionStream's
@@ -971,6 +1063,45 @@ export function useChat(): UseChatResult {
     [],
   );
 
+  const allConversationsJson = useCallback(
+    () =>
+      JSON.stringify(
+        {
+          docrag_conversations: storageRef.current.conversations
+            .filter((conversation) => conversation.turns.length > 0)
+            .sort(byRecentUse)
+            .map((conversation) => ({ title: conversation.title, turns: conversation.turns })),
+        },
+        null,
+        2,
+      ),
+    [],
+  );
+
+  const setSourceIrrelevant = useCallback(
+    (turnId: string, sourceNumber: number, marked: boolean) => {
+      setStorage((prev) => ({
+        ...prev,
+        conversations: prev.conversations.map((conversation) =>
+          conversation.turns.some((turn) => turn.id === turnId)
+            ? {
+                ...conversation,
+                turns: conversation.turns.map((turn) => {
+                  if (turn.id !== turnId) return turn;
+                  const others = (turn.irrelevantSources ?? []).filter((n) => n !== sourceNumber);
+                  const next = marked ? [...others, sourceNumber] : others;
+                  const { irrelevantSources: _previous, ...rest } = turn;
+                  return next.length > 0 ? { ...rest, irrelevantSources: next } : rest;
+                }),
+                editedAt: Date.now(),
+              }
+            : conversation,
+        ),
+      }));
+    },
+    [],
+  );
+
   const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
     // Stored on the turn, so a rating survives a reload or a conversation switch and
     // the buttons can't send a duplicate row for the same answer.
@@ -1049,5 +1180,7 @@ export function useChat(): UseChatResult {
     setPinned,
     searchConversations,
     setTurnFeedback,
+    setSourceIrrelevant,
+    allConversationsJson,
   };
 }

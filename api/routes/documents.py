@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import mimetypes
 import os
 import threading
 import time
 from collections.abc import Callable, Iterator
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -22,6 +23,7 @@ from api.dependencies import (
 )
 from api.documents import (
     DocumentNotFoundError,
+    DocumentSource,
     chunking_fingerprint,
     normalize_tags,
     validate_upload_filename,
@@ -41,7 +43,7 @@ from api.ingest_jobs import (
     stored_filename,
 )
 from api.ingestion import filename_write_lock
-from api.jobs import JobNotFoundError, JobStore
+from api.jobs import IngestJob, JobNotFoundError, JobStore
 from api.metrics import corpus_documents
 from api.repository import DocumentMetadata
 from api.restore import BackupImportError, restore_backup
@@ -62,11 +64,15 @@ from api.schemas import (
     DocumentDeleteResponse,
     DocumentIngestResponse,
     DocumentJobAcceptedResponse,
+    DocumentJobListResponse,
     DocumentJobStatusResponse,
     DocumentListResponse,
+    DocumentRefreshResponse,
     DocumentReindexAllResponse,
     DocumentTagsRequest,
     DocumentTagsResponse,
+    DocumentVersionResponse,
+    DocumentVersionsResponse,
     ImportResponse,
     UrlIngestRequest,
 )
@@ -98,6 +104,16 @@ def _job_status(job_store: JobStore, job_id: str, workspace: str) -> DocumentJob
     # status carries the filename and error text.
     if job is None or job.workspace != workspace:
         raise JobNotFoundError(f"No ingestion job found with id '{job_id}'.")
+    return _job_response(job)
+
+
+def _source_of(meta: DocumentMetadata) -> DocumentSource | None:
+    if not meta.source_url:
+        return None
+    return DocumentSource(meta.source_url, meta.source_etag, meta.source_last_modified)
+
+
+def _job_response(job: IngestJob) -> DocumentJobStatusResponse:
     result = DocumentIngestResponse.model_validate(job.result) if job.result is not None else None
     return DocumentJobStatusResponse(
         job_id=job.id,
@@ -108,6 +124,8 @@ def _job_status(job_store: JobStore, job_id: str, workspace: str) -> DocumentJob
         error=job.error,
         result=result,
         cancelled=job.error == JOB_CANCELLED_ERROR,
+        created_at=job.created_at_wall,
+        unchanged=bool(result is not None and result.unchanged),
     )
 
 
@@ -146,6 +164,13 @@ def register(app: FastAPI) -> None:
             stale_filenames=sorted(name for name, meta in metadata.items() if is_stale(meta)),
             reindexable_filenames=sorted(set(metadata) & stored_originals),
             tags={name: list(meta.tags) for name, meta in metadata.items() if meta.tags},
+            # Without the query string or fragment, which can carry a signed token: the
+            # listing is readable with the read key. Refresh uses the stored full URL.
+            source_urls={
+                name: loggable_url(meta.source_url)
+                for name, meta in metadata.items()
+                if meta.source_url
+            },
         )
 
     @app.post(
@@ -200,6 +225,8 @@ def register(app: FastAPI) -> None:
             filename=filename,
             content=content,
             raw_store=raw_store,
+            # The same bytes again (a re-upload, a file sent twice): left as indexed.
+            dedupe=True,
         )
 
     # The server downloads the document (URL_INGEST_ENABLED, off by default) and it
@@ -290,6 +317,147 @@ def register(app: FastAPI) -> None:
             filename=fetched.filename,
             content=fetched.content,
             raw_store=raw_store,
+            # The URL asked for (not where a redirect went): what a refresh fetches again.
+            source=DocumentSource(request.url.strip(), fetched.etag, fetched.last_modified),
+            dedupe=True,
+        )
+
+    # Earlier versions of a document's original, kept by re-uploads when
+    # RAW_DOCUMENT_VERSIONS is set; 409 without stored originals, like /reindex.
+    @app.get(
+        "/documents/{filename}/versions",
+        response_model=DocumentVersionsResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    def list_document_versions(
+        filename: str, raw_store: RawDocumentStoreDep
+    ) -> DocumentVersionsResponse:
+        store = require_raw_store(raw_store)
+        name = stored_filename(filename)
+        return DocumentVersionsResponse(
+            filename=name,
+            versions=[
+                DocumentVersionResponse(version=v.version, saved_at=v.saved_at, size=v.size)
+                for v in store.versions(name)
+            ],
+        )
+
+    # Puts an earlier version back: it is indexed as an upload of those bytes would be,
+    # and the version replaced is kept in its turn.
+    @app.post(
+        "/documents/{filename}/versions/{version}/restore",
+        response_model=DocumentJobAcceptedResponse,
+        status_code=202,
+        dependencies=[Depends(require_full_key)],
+    )
+    def restore_document_version(
+        filename: str,
+        version: str,
+        repository: VectorRepositoryDep,
+        ingest_service: IngestServiceDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+    ) -> DocumentJobAcceptedResponse:
+        store = require_raw_store(raw_store)
+        name = stored_filename(filename)
+        repository.ensure_writable(settings)
+        content = store.read_version(name, version)
+        if content is None:
+            raise DocumentNotFoundError(f"No version '{version}' of '{name}'.")
+        return enqueue_ingest(
+            job_store=job_store,
+            executor=executor,
+            backlog=backlog,
+            ingest_service=ingest_service,
+            filename=name,
+            content=content,
+            raw_store=store,
+        )
+
+    # Fetches a URL-ingested document again from where it came from, conditionally: a
+    # server that says nothing changed (304) costs no download and no job.
+    @app.post(
+        "/documents/{filename}/refresh",
+        response_model=DocumentJobAcceptedResponse | DocumentRefreshResponse,
+        status_code=202,
+        dependencies=[Depends(require_full_key)],
+        responses={
+            200: {
+                "model": DocumentRefreshResponse,
+                "description": "Unchanged at the source (304); nothing was fetched.",
+            },
+            404: {
+                "description": "No such document, it wasn't fetched by URL, or URL ingest is off."
+            },
+        },
+    )
+    async def refresh_document_from_url(
+        filename: str,
+        ingest_service: IngestServiceDep,
+        repository: VectorRepositoryDep,
+        settings: SettingsDep,
+        job_store: IngestJobStoreDep,
+        executor: IngestExecutorDep,
+        backlog: IngestBacklogDep,
+        raw_store: RawDocumentStoreDep,
+    ) -> DocumentJobAcceptedResponse | Response:
+        if not settings.url_ingest_enabled:
+            raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+        name = stored_filename(filename)
+        meta = await run_in_threadpool(repository.document_metadata, settings, name)
+        if meta is None:
+            raise DocumentNotFoundError(f"No indexed document named '{name}'.")
+        if not meta.source_url:
+            raise HTTPException(
+                status_code=404, detail=f"'{name}' was uploaded, not fetched from a URL."
+            )
+        await run_in_threadpool(repository.ensure_writable, settings)
+        if not backlog.has_room(1):
+            raise backlog_full_error()
+        if not _url_fetch_slots.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many URL fetches are running. Try again in a moment.",
+                headers={"Retry-After": "5"},
+            )
+        try:
+            fetched = await run_in_threadpool(
+                functools.partial(
+                    fetch_document,
+                    meta.source_url,
+                    settings,
+                    # Its own name, whatever the server calls it now.
+                    filename=name,
+                    has_room=backlog.has_room,
+                    etag=meta.source_etag,
+                    last_modified=meta.source_last_modified,
+                )
+            )
+        except BacklogFullError:
+            raise backlog_full_error() from None
+        finally:
+            _url_fetch_slots.release()
+        if fetched.not_modified:
+            return Response(
+                content=DocumentRefreshResponse(filename=name).model_dump_json(),
+                status_code=200,
+                media_type="application/json",
+            )
+        return await run_in_threadpool(
+            enqueue_ingest,
+            job_store=job_store,
+            executor=executor,
+            backlog=backlog,
+            ingest_service=ingest_service,
+            filename=name,
+            content=fetched.content,
+            raw_store=raw_store,
+            source=DocumentSource(meta.source_url, fetched.etag, fetched.last_modified),
+            # Its tags carry over (as on any re-upload); unchanged bytes are left alone.
+            dedupe=True,
         )
 
     # Re-chunks and re-embeds a document from its stored original (RAW_DOCUMENT_DIR),
@@ -344,6 +512,7 @@ def register(app: FastAPI) -> None:
                         raw_store=None,
                         uploaded_at=meta.uploaded_at,
                         precondition=original_still_stored(store, name),
+                        source=_source_of(meta),
                     )
                 )
             except HTTPException as exc:
@@ -381,6 +550,7 @@ def register(app: FastAPI) -> None:
         content = store.read(name)
         if content is None:
             raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
+        meta = repository.document_metadata(settings, name)
         return enqueue_ingest(
             job_store=job_store,
             executor=executor,
@@ -391,8 +561,10 @@ def register(app: FastAPI) -> None:
             # The original is already stored, byte-identical. Passing the store would
             # re-save it, and a failed save deletes it — losing the only copy.
             raw_store=None,
-            uploaded_at=repository.uploaded_at_for_filename(settings, name),
+            uploaded_at=meta.uploaded_at if meta is not None else None,
             precondition=original_still_stored(store, name),
+            # A re-index is the same document: where it came from carries over.
+            source=_source_of(meta) if meta is not None else None,
         )
 
     @app.delete(
@@ -448,13 +620,28 @@ def register(app: FastAPI) -> None:
             if repository.chunk_count_for_filename(settings, filename) == 0:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
             repository.set_tags(settings, filename, tags)
-        bump_corpus_generation([filename])
+        bump_corpus_generation([filename], collection=settings.qdrant_collection)
         return DocumentTagsResponse(filename=filename, tags=list(tags))
 
     # Guarded like its sibling document routes: the response carries the filename (and
     # on failure the error text), and the frontend polls this URL once a second during
     # every upload, so the job id lands in browser history and any intermediate proxy
     # log — places a party who never held the key can read it from.
+    @app.get(
+        "/documents/jobs",
+        response_model=DocumentJobListResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    def list_document_jobs(
+        job_store: IngestJobStoreDep,
+        settings: SettingsDep,
+        state: Annotated[Literal["active"], Query()] = "active",
+    ) -> DocumentJobListResponse:
+        # Only "active" for now: finished jobs are what each client polled itself.
+        return DocumentJobListResponse(
+            jobs=[_job_response(job) for job in job_store.list_active(workspace_of(settings))]
+        )
+
     @app.get(
         "/documents/jobs/{job_id}",
         response_model=DocumentJobStatusResponse,
@@ -647,6 +834,8 @@ def register(app: FastAPI) -> None:
             headers={
                 "Content-Disposition": f'attachment; filename="docrag-export-{stamp}.zip"',
                 "X-Content-Type-Options": "nosniff",
+                # Documents the backup holds no original for, and so can't restore.
+                "X-DocRAG-Originals-Missing": str(archive.originals_missing),
             },
         )
 

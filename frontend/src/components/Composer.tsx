@@ -1,8 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
 import './Composer.css';
 import { isImeComposing } from '../utils/keyboard';
+import { enterAddsNewline } from '../utils/platform';
 import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
@@ -12,6 +13,8 @@ import { isProviderAllowed, isProviderUsable } from '../utils/providers';
 // MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
 // question and every passage search, with nothing saying why.
 const MAX_SCOPE_TAGS = 20;
+// The most of the window the question box grows to before it scrolls.
+const COMPOSER_MAX_HEIGHT_SHARE = 0.4;
 const MAX_SCOPE_FILENAMES = 500;
 
 interface ComposerProps {
@@ -106,6 +109,16 @@ function Composer({
   const [scopeQuery, setScopeQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Grows with what is typed (up to a share of the window, then scrolls): two fixed
+  // rows hid all but the end of a long, multi-line question.
+  useLayoutEffect(() => {
+    const element = textareaRef.current;
+    if (!element) return;
+    element.style.height = 'auto';
+    const limit = Math.round(window.innerHeight * COMPOSER_MAX_HEIGHT_SHARE);
+    element.style.height = `${Math.min(element.scrollHeight, limit)}px`;
+    element.style.overflowY = element.scrollHeight > limit ? 'auto' : 'hidden';
+  }, [value]);
   // Hand focus back when an answer settles (a click on Stop moved it to the button), so
   // the next question can be typed straight away. Not on touch screens: focusing there
   // opens the on-screen keyboard over the answer that just arrived.
@@ -151,11 +164,23 @@ function Composer({
       setOpenPopover(null);
       opener.current?.focus();
     };
+    // Tabbing out of the popover (and its button) closes it: it stayed open over the
+    // thread while focus went on elsewhere. Focus moving, not blur: a click on a
+    // checkbox in Safari focuses nothing, and must not close the list.
+    const handleFocus = (event: FocusEvent) => {
+      const opener = (openPopover === 'scope' ? scopeButtonRef : providerButtonRef).current;
+      const anchor = opener?.closest('.composer__popover-anchor');
+      if (anchor && event.target instanceof Node && !anchor.contains(event.target)) {
+        setOpenPopover(null);
+      }
+    };
     document.addEventListener('mousedown', handleClick);
     document.addEventListener('keydown', handleKey);
+    document.addEventListener('focusin', handleFocus);
     return () => {
       document.removeEventListener('mousedown', handleClick);
       document.removeEventListener('keydown', handleKey);
+      document.removeEventListener('focusin', handleFocus);
     };
   }, [openPopover]);
 
@@ -194,7 +219,7 @@ function Composer({
       onCancel();
       return;
     }
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === 'Enter' && !event.shiftKey && !enterAddsNewline()) {
       event.preventDefault();
       submit();
     }
@@ -464,7 +489,9 @@ function Composer({
             )}
           </div>
           <span className="composer__spacer" />
-          <span className="composer__key-hint">⏎ send &middot; ⇧⏎ newline</span>
+          {!enterAddsNewline() && (
+            <span className="composer__key-hint">⏎ send &middot; ⇧⏎ newline</span>
+          )}
           <button
             type="button"
             className="composer__send"

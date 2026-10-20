@@ -57,6 +57,7 @@ from api.prompting import (
     generate_followups,
     generate_query_variants,
     needs_condense,
+    with_answer_language,
 )
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
@@ -164,6 +165,9 @@ class GroundedAnswer:
     # The provider stopped at the token limit (finish_reason "length"): the answer is
     # cut off mid-way. Only as reliable as the provider's finish_reason.
     truncated: bool = False
+    # (prompt, completion) tokens the provider reported for the answer's calls (the
+    # citation retry included); None when it reported none, and on a cache hit.
+    usage: tuple[int, int] | None = None
     # The best cross-encoder score (0-1) among the candidates, kept or not. None when
     # retrieval found nothing to score.
     top_rerank_score: float | None = None
@@ -201,7 +205,9 @@ def generate_grounded_answer(
     if not selected_chunks:
         return GroundedAnswer(answer=INSUFFICIENT_CONTEXT_ANSWER, sources=[])
 
-    messages = build_grounded_messages(normalized_query, selected_chunks, history)
+    messages = with_answer_language(
+        build_grounded_messages(normalized_query, selected_chunks, history), settings
+    )
     answer = generator.complete(messages, settings).strip()
     if not answer:
         raise GenerationError("Generation provider returned an empty answer.")

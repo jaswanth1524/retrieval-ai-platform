@@ -166,6 +166,13 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+      # A scan reads the files; it doesn't run them. A missing arm64 wheel or native
+      # library shows only when Python imports the app, so do that, under QEMU.
+      - name: Start the arm64 image
+        run: |
+          docker run --rm --platform linux/arm64 --entrypoint /app/.venv/bin/python docrag:scan-arm64 \
+            -c 'import api.main, onnxruntime, numpy; print("arm64 imports ok")'
+
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -226,3 +233,28 @@ jobs:
             echo "Image: \`${IMAGE}:${version}\` (\`${{ steps.build.outputs.digest }}\`), signed with cosign."
           } >> notes.md
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+
+  cli:
+    # The docrag command and docrag-mcp server, as a wheel and sdist attached to the
+    # GitHub release (pip install from its URL) and, when the repository variable
+    # PUBLISH_CLI is "true", published to PyPI as docrag-cli by trusted publishing —
+    # which the owner sets up on PyPI first (project docrag-cli, this workflow); there
+    # is no token in the repository.
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # attach the files to the release
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - name: Build the CLI
+        run: uv build ./cli --out-dir dist-cli
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" dist-cli/*
+      - name: Publish to PyPI
+        if: vars.PUBLISH_CLI == 'true'
+        run: uv publish --trusted-publishing always dist-cli/*

@@ -11,7 +11,7 @@ from typing import get_args
 from fastapi import Depends, FastAPI, HTTPException
 from starlette.background import BackgroundTask
 
-from api.admission import QuestionSlots, Release
+from api.admission import QuestionSlots, Release, SlotKind
 from api.dependencies import (
     require_api_key,
 )
@@ -35,7 +35,12 @@ from api.routes.deps import (
     RagPipelineDep,
     SettingsDep,
 )
-from api.routes.responses import history_messages, log_question, timings_response
+from api.routes.responses import (
+    history_messages,
+    log_question,
+    timings_response,
+    usage_response,
+)
 from api.schemas import (
     CitationResponse,
     QuestionRequest,
@@ -64,17 +69,25 @@ QUESTIONS_BUSY_ERROR = (
 )
 
 
-def question_slot(slots: QuestionSlots, *, count_metric: bool = True) -> Release:
-    """A question slot, or 429. ``count_metric=False`` for a search, which isn't a
-    question and stays out of ``questions_total``."""
+SUMMARIES_BUSY_ERROR = (
+    "The server is running as many summaries as it allows at once "
+    "(MAX_CONCURRENT_SUMMARIES, within MAX_CONCURRENT_QUESTIONS). Try again in a moment."
+)
 
-    release = slots.try_acquire()
+
+def question_slot(
+    slots: QuestionSlots, *, count_metric: bool = True, kind: SlotKind = "question"
+) -> Release:
+    """A question slot, or 429. ``count_metric=False`` for a search, which isn't a
+    question and stays out of ``questions_total``. ``kind="summary"`` also takes one of
+    the summaries' own slots."""
+
+    release = slots.try_acquire(kind)
     if release is None:
         if count_metric:
             questions_total.labels(outcome="error", error_type="busy").inc()
-        raise HTTPException(
-            status_code=429, detail=QUESTIONS_BUSY_ERROR, headers={"Retry-After": "5"}
-        )
+        detail = SUMMARIES_BUSY_ERROR if kind == "summary" else QUESTIONS_BUSY_ERROR
+        raise HTTPException(status_code=429, detail=detail, headers={"Retry-After": "5"})
     return release
 
 
@@ -195,6 +208,7 @@ def register(app: FastAPI) -> None:
             top_rerank_score=grounded.top_rerank_score,
             truncated=grounded.truncated,
             followups=grounded.followups,
+            usage=usage_response(grounded.usage),
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
@@ -294,7 +308,7 @@ def register(app: FastAPI) -> None:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
         task = summary_request(request)
         summarizer.check_documents(task.filenames)
-        release = question_slot(slots, count_metric=False)
+        release = question_slot(slots, count_metric=False, kind="summary")
         try:
             result = summarizer.summarize(task, use_cache=request.use_cache)
         except Exception:
@@ -313,6 +327,7 @@ def register(app: FastAPI) -> None:
             cached=grounded.cached,
             answer_status=grounded.answer_status,
             truncated=grounded.truncated,
+            usage=usage_response(grounded.usage),
             chunks_read=result.chunks_read,
             chunks_total=result.chunks_total,
         )
@@ -328,7 +343,7 @@ def register(app: FastAPI) -> None:
         task = summary_request(request)
         # Before the 200: an unknown or oversized document is a plain 404 / 400.
         summarizer.check_documents(task.filenames)
-        lease = StreamLease(question_slot(slots, count_metric=False))
+        lease = StreamLease(question_slot(slots, count_metric=False, kind="summary"))
         stop = threading.Event()
 
         def event_source() -> Iterator[str]:

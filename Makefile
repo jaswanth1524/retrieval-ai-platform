@@ -18,12 +18,17 @@ backend:
 		&& test -x "$$out/venv/bin/docrag-mcp" \
 		&& "$$out/venv/bin/python" -I -c 'import sys, cli; from importlib.metadata import entry_points; [entry_points(group="console_scripts")[name].load() for name in ("docrag", "docrag-mcp")]; assert cli.__file__.startswith(sys.prefix), cli.__file__'; \
 		status=$$?; rm -rf "$$out"; exit $$status
+	# As CI: ragas has broken on import alone, which --validate-only never touches.
+	uv run python -c "import ragas"
 	uv run python -m eval.ragas_runner eval/datasets/sample_eval.jsonl --validate-only
 	uv run python -m eval.harness validate eval/datasets/retrieval_eval.sample.jsonl
 	uv run python -m eval.harness validate eval/datasets/handbook_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/multilingual_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/unanswerable_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/followup_eval.jsonl
 	req=$$(mktemp) && uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$$req" \
-		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req"; \
+		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req" \
+			$$(awk '!/^#/ && NF {printf "--ignore-vuln %s ", $$1}' .github/ci/pip-audit-ignore.txt); \
 		status=$$?; rm -f "$$req"; exit $$status
 
 frontend:

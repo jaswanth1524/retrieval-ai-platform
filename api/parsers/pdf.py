@@ -63,11 +63,10 @@ def parse_pdf_document(
 
     tables_by_page = _extract_pdf_tables(content, _pages_that_draw_lines(reader))
 
-    sections: list[DocumentSection] = []
-    empty_pages: list[int] = []
+    page_texts: list[str] = []
     for page_number, page in enumerate(reader.pages, start=1):
         try:
-            text = normalize_text(page.extract_text() or "")
+            page_texts.append(normalize_text(page.extract_text() or ""))
         except Exception:
             # One malformed content stream shouldn't fail the whole document; the page
             # goes to OCR like a page with no text layer.
@@ -77,7 +76,14 @@ def parse_pdf_document(
                 page_number,
                 exc_info=True,
             )
-            text = ""
+            page_texts.append("")
+    cleaned = strip_running_lines(page_texts)
+
+    sections: list[DocumentSection] = []
+    empty_pages: list[int] = []
+    for page_number, (raw, text) in enumerate(zip(page_texts, cleaned, strict=True), start=1):
+        if raw and not text and not tables_by_page.get(page_number):
+            continue  # nothing but the running header/footer: a blank page, not a scan
         table_blocks = tables_by_page.get(page_number, [])
         if table_blocks:
             table_text = "\n\n".join(f"[Table]\n{block}" for block in table_blocks)
@@ -137,6 +143,67 @@ def parse_pdf_document(
     if not sections:
         raise EmptyDocumentError(f"PDF '{filename}' has no extractable text.")
     return sections
+
+
+# A line repeated at the top or bottom of most pages is a running header or footer
+# ("ACME Handbook 2024", "Page 3 of 40", "Confidential"): it went into every chunk and
+# became most pages' section label. Looked for in the first and last
+# _RUNNING_EDGE_LINES lines of each page, on documents of at least
+# _RUNNING_MIN_PAGES pages, and counted as running when it is on at least
+# _RUNNING_MIN_SHARE of them (digits ignored, so page numbers match).
+_RUNNING_EDGE_LINES = 2
+_RUNNING_MIN_PAGES = 3
+_RUNNING_MIN_SHARE = 0.6
+
+
+def _line_keys(line: str, outermost: bool) -> set[str]:
+    """What a line is matched across pages by: its text (whitespace and case aside),
+    and — on a page's very first or last line, where page numbers sit — also its text
+    with the digits ignored ("Page 3 of 40")."""
+
+    exact = " ".join(line.split()).casefold()
+    if not exact:
+        return set()
+    keys = {exact}
+    if outermost and re.search(r"\d", exact):
+        keys.add("#digits:" + re.sub(r"\d+", "#", exact))
+    return keys
+
+
+def strip_running_lines(page_texts: Sequence[str]) -> list[str]:
+    """``page_texts`` with running headers and footers removed from each page's edges.
+
+    Only the edge lines are touched: a sentence that happens to repeat inside the text
+    stays. A document shorter than _RUNNING_MIN_PAGES pages is returned unchanged.
+    """
+
+    pages = [text.split("\n") for text in page_texts]
+    with_text = [lines for lines in pages if any(line.strip() for line in lines)]
+    if len(with_text) < _RUNNING_MIN_PAGES:
+        return list(page_texts)
+
+    def edges(lines: list[str]) -> dict[int, set[str]]:
+        indexed = [index for index, line in enumerate(lines) if line.strip()]
+        if not indexed:
+            return {}
+        picked = indexed[:_RUNNING_EDGE_LINES] + indexed[-_RUNNING_EDGE_LINES:]
+        outer = {indexed[0], indexed[-1]}
+        return {index: _line_keys(lines[index], index in outer) for index in picked}
+
+    counts: dict[str, int] = {}
+    for lines in with_text:
+        for key in set().union(*edges(lines).values()):
+            counts[key] = counts.get(key, 0) + 1
+    needed = max(_RUNNING_MIN_PAGES, int(len(with_text) * _RUNNING_MIN_SHARE + 0.999))
+    running = {key for key, count in counts.items() if count >= needed}
+    if not running:
+        return list(page_texts)
+    cleaned: list[str] = []
+    for lines in pages:
+        drop = {index for index, keys in edges(lines).items() if keys & running}
+        kept = [line for index, line in enumerate(lines) if index not in drop]
+        cleaned.append(normalize_text("\n".join(kept)))
+    return cleaned
 
 
 # Content-stream operators that draw a rectangle or a line, plus XObject paints (a

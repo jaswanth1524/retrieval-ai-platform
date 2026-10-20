@@ -1,5 +1,5 @@
 import { memo, useState } from 'react';
-import type { FeedbackItemResponse, FeedbackRating } from '../api/types';
+import type { FeedbackItemResponse, FeedbackKind, FeedbackRating } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import './FeedbackPanel.css';
 
@@ -19,10 +19,27 @@ const FILTERS: { key: Filter; label: string; glyph?: string }[] = [
   { key: 'up', label: 'Up', glyph: '👍' },
 ];
 
+type KindFilter = 'all' | FeedbackKind | 'citation';
+
+const KIND_FILTERS: { key: KindFilter; label: string }[] = [
+  { key: 'all', label: 'Every kind' },
+  { key: 'question', label: 'Questions' },
+  { key: 'follow_up', label: 'Follow-ups' },
+  { key: 'summary', label: 'Summaries' },
+  { key: 'citation', label: 'Single sources' },
+];
+
+function matchesKind(item: FeedbackItemResponse, kind: KindFilter): boolean {
+  if (kind === 'all') return true;
+  if (kind === 'citation') return item.citation_source_number !== null;
+  return item.citation_source_number === null && (item.kind ?? 'question') === kind;
+}
+
 /** Recorded answer ratings (GET /feedback), newest first — thumbs-down rows are the
  *  questions the corpus or the prompt is failing. */
 function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
   const [filter, setFilter] = useState<Filter>('all');
+  const [kind, setKind] = useState<KindFilter>('all');
   if (error) {
     return (
       <p className="feedback-panel__message" role="alert">
@@ -32,7 +49,9 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
   }
   if (feedback === null) return <p className="feedback-panel__message">Loading…</p>;
 
-  const rows = filter === 'all' ? feedback : feedback.filter((item) => item.rating === filter);
+  const rows = feedback.filter(
+    (item) => (filter === 'all' || item.rating === filter) && matchesKind(item, kind),
+  );
   const downCount = feedback.filter((item) => item.rating === 'down').length;
   return (
     <>
@@ -50,6 +69,19 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
           </button>
         ))}
       </div>
+      <select
+        className="feedback-panel__kind"
+        value={kind}
+        onChange={(event) => setKind(event.target.value as KindFilter)}
+        aria-label="Show ratings of"
+        data-testid="feedback-kind-filter"
+      >
+        {KIND_FILTERS.map((option) => (
+          <option key={option.key} value={option.key}>
+            {option.label}
+          </option>
+        ))}
+      </select>
       <p className="feedback-panel__summary mono">
         {feedback.length} rating{feedback.length === 1 ? '' : 's'} · {downCount} down
       </p>
