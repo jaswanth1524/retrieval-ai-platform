@@ -26,7 +26,15 @@ export interface CommandState {
   answerInFlight?: boolean;
   /** Summaries can't be asked at all right now (booting, the key was refused). */
   summarizeDisabled?: boolean;
+  /** Indexed documents, offered as "Read:" and "Summarize:" entries. */
+  documents?: string[];
+  /** The open conversation has a finished answer to copy. */
+  hasAnswer?: boolean;
 }
+
+// Past this many documents the palette lists none of them: two entries each would bury
+// the commands, and the corpus panel's filter is the way through a corpus that size.
+export const PALETTE_MAX_DOCUMENTS = 300;
 
 /** What the commands do. Read when a command runs, so they needn't be stable. */
 export interface CommandActions {
@@ -47,6 +55,12 @@ export interface CommandActions {
   switchConversation: (id: string) => void;
   pinConversation: (id: string, pinned: boolean) => void;
   summarize?: (filenames: string[]) => void;
+  readDocument?: (filename: string) => void;
+  copyLastAnswer?: () => void;
+  exportAllConversations?: () => void;
+  /** The next (1) or previous (-1) conversation in the list. */
+  cycleConversation?: (step: 1 | -1) => void;
+  showShortcuts?: () => void;
 }
 
 interface PaletteControls {
@@ -84,6 +98,8 @@ export function useCommands(
     scopedFilenames,
     answerInFlight = false,
     summarizeDisabled = false,
+    documents,
+    hasAnswer = false,
   } = state;
 
   const commands = useMemo<Command[]>(() => {
@@ -122,7 +138,16 @@ export function useCommands(
         id: 'toggle-inspector',
         glyph: '◧',
         label: inspectorOpen ? 'Hide inspector' : 'Show inspector',
+        // Not ⌘⇧I or ⌘⌥I: the browsers' developer tools.
+        shortcut: '⌘\\',
         run: () => run.current.toggleInspector(),
+      },
+      {
+        id: 'shortcuts',
+        glyph: '⌨',
+        label: 'Keyboard shortcuts',
+        shortcut: '?',
+        run: () => run.current.showShortcuts?.(),
       },
       {
         id: 'toggle-mode',
@@ -151,6 +176,20 @@ export function useCommands(
         run: () => run.current.exportJson(),
         disabled: !hasTurns,
       },
+      {
+        id: 'export-all',
+        glyph: '⇩',
+        label: 'Export all conversations (JSON)',
+        run: () => run.current.exportAllConversations?.(),
+        disabled: conversations.every((conversation) => conversation.turnCount === 0),
+      },
+      {
+        id: 'copy-answer',
+        glyph: '⧉',
+        label: 'Copy the last answer',
+        run: () => run.current.copyLastAnswer?.(),
+        disabled: !hasAnswer,
+      },
       ...(scopedFilenames?.length === 1 || scopedFilenames?.length === 2
         ? [
             {
@@ -169,6 +208,7 @@ export function useCommands(
         id: 'search-passages',
         glyph: '⌕',
         label: 'Search passages',
+        shortcut: '⌘⇧F',
         run: () => run.current.searchPassages(),
       },
       {
@@ -222,6 +262,23 @@ export function useCommands(
         run: () => run.current.clear(),
         disabled: pending || !hasTurns,
       },
+      ...(documents && documents.length <= PALETTE_MAX_DOCUMENTS
+        ? documents.flatMap((filename) => [
+            {
+              id: `read-${filename}`,
+              glyph: '☰',
+              label: `Read: ${filename}`,
+              run: () => run.current.readDocument?.(filename),
+            },
+            {
+              id: `summarize-${filename}`,
+              glyph: '∑',
+              label: `Summarize: ${filename}`,
+              run: () => run.current.summarize?.([filename]),
+              disabled: answerInFlight || summarizeDisabled,
+            },
+          ])
+        : []),
       // Every saved conversation, so the palette doubles as conversation search.
       ...conversations
         .filter((conversation) => conversation.id !== activeConversationId)
@@ -247,6 +304,8 @@ export function useCommands(
     scopedFilenames,
     answerInFlight,
     summarizeDisabled,
+    documents,
+    hasAnswer,
   ]);
 
   // Read at keypress time so the listener is registered once.
@@ -255,6 +314,10 @@ export function useCommands(
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (!isShortcutModifier(event) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        plainKey(event);
+        return;
+      }
       if (!isShortcutModifier(event) || event.altKey) return;
       // A held key repeats: ⌘J flickered the theme, ⌘K opened and closed the palette.
       if (event.repeat) return;
@@ -274,9 +337,42 @@ export function useCommands(
       paletteRef.current.closePalette();
       command.run();
     };
+    // Keys with no modifier, only while nothing editable has focus (they are text there):
+    // ? the shortcut list, ] and [ the next and previous conversation.
+    const plainKey = (event: KeyboardEvent) => {
+      if (event.repeat || paletteRef.current.otherDialogOpen) return;
+      if (isEditable(event.target)) return;
+      if (document.querySelector('[aria-modal="true"]')) return;
+      const actions = actionsRef.current;
+      if (event.key === '?') {
+        event.preventDefault();
+        actions.showShortcuts?.();
+      } else if (event.key === ']' || event.key === '[') {
+        event.preventDefault();
+        actions.cycleConversation?.(event.key === ']' ? 1 : -1);
+      }
+    };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
   }, []);
 
   return commands;
 }
+
+function isEditable(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.isContentEditable ||
+    target.tagName === 'INPUT' ||
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'SELECT'
+  );
+}
+
+/** Keys that work with no modifier (outside text fields), for the shortcut list. */
+export const PLAIN_KEYS: Array<[keys: string, what: string]> = [
+  ['/', 'Type a question'],
+  ['?', 'This list'],
+  [']  [', 'Next / previous conversation'],
+  ['Esc', 'Stop the answer, or close a dialog'],
+];

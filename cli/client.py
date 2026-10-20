@@ -139,6 +139,7 @@ class DocragClient:
         space = workspace if workspace is not None else os.environ.get("DOCRAG_WORKSPACE", "")
         if space:
             self._headers["X-Workspace"] = space
+        self.workspace = space
         self._owns_http = http is None
         self._http = http or httpx.Client(
             base_url=url,
@@ -204,13 +205,23 @@ class DocragClient:
         return result
 
     def search(
-        self, query: str, filenames: list[str] | None = None, top_k: int | None = None
+        self,
+        query: str,
+        filenames: list[str] | None = None,
+        top_k: int | None = None,
+        tags: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = self.search_response(query, filenames, top_k)["results"]
+        results: list[dict[str, Any]] = self.search_response(query, filenames, top_k, tags)[
+            "results"
+        ]
         return results
 
     def search_response(
-        self, query: str, filenames: list[str] | None = None, top_k: int | None = None
+        self,
+        query: str,
+        filenames: list[str] | None = None,
+        top_k: int | None = None,
+        tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """The whole ``POST /search`` response: ``results`` and ``weak_matches`` (none
         cleared the relevance bar; these are the closest)."""
@@ -218,6 +229,8 @@ class DocragClient:
         body: dict[str, Any] = {"query": query}
         if filenames:
             body["filenames"] = filenames
+        if tags:
+            body["tags"] = tags
         if top_k:
             body["rerank_top_k"] = top_k
         response: dict[str, Any] = self._json(
@@ -235,10 +248,13 @@ class DocragClient:
         on_delta: Callable[[str], None] | None = None,
         on_stage: Callable[[dict[str, Any]], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        tags: list[str] | None = None,
     ) -> StreamResult:
         body: dict[str, Any] = {"question": question}
         if filenames:
             body["filenames"] = filenames
+        if tags:
+            body["tags"] = tags
         if provider:
             body["llm_provider"] = provider
         return self._stream("/questions/stream", body, on_delta, on_stage, should_stop)
@@ -253,7 +269,8 @@ class DocragClient:
         should_stop: Callable[[], bool] | None = None,
     ) -> StreamResult:
         body: dict[str, Any] = {
-            "mode": "compare" if len(filenames) == 2 else "summarize",
+            # One document: a summary; two: a comparison; more: one brief across them.
+            "mode": {1: "summarize", 2: "compare"}.get(len(filenames), "brief"),
             "filenames": filenames,
         }
         if instruction:
@@ -476,6 +493,80 @@ class DocragClient:
 
     def delete(self, filename: str) -> None:
         self._request("DELETE", f"/documents/{_quote(filename)}")
+
+    def set_tags(self, filename: str, tags: list[str]) -> list[str]:
+        """Replace a document's tags; the tags as stored."""
+
+        result: dict[str, Any] = self._json(
+            "PATCH", f"/documents/{_quote(filename)}/tags", json={"tags": tags}
+        )
+        return list(result.get("tags", []))
+
+    def reindex(self, filename: str) -> dict[str, Any]:
+        """Re-index one document from its stored original; the accepted job."""
+
+        result: dict[str, Any] = self._json("POST", f"/documents/{_quote(filename)}/reindex")
+        return result
+
+    def reindex_stale(self) -> dict[str, Any]:
+        """Re-index every document chunked under older settings: ``jobs`` and ``deferred``."""
+
+        result: dict[str, Any] = self._json("POST", "/documents/reindex")
+        return result
+
+    def refresh(self, filename: str) -> dict[str, Any]:
+        """Fetch a URL-ingested document again: the accepted job, or ``unchanged``."""
+
+        result: dict[str, Any] = self._json("POST", f"/documents/{_quote(filename)}/refresh")
+        return result
+
+    def versions(self, filename: str) -> list[dict[str, Any]]:
+        """Earlier versions of a document's original, newest first."""
+
+        result: dict[str, Any] = self._json("GET", f"/documents/{_quote(filename)}/versions")
+        return list(result.get("versions", []))
+
+    def restore_version(self, filename: str, version: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json(
+            "POST", f"/documents/{_quote(filename)}/versions/{_quote(version)}/restore"
+        )
+        return result
+
+    def query_log(self, limit: int = 200, uncovered: bool = False) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": limit}
+        if uncovered:
+            params["uncovered"] = "true"
+        result: dict[str, Any] = self._json("GET", "/query-log", params=params)
+        return list(result.get("queries", []))
+
+    def active_jobs(self) -> list[dict[str, Any]]:
+        """Queued and running indexing jobs, whoever started them."""
+
+        result: dict[str, Any] = self._json("GET", "/documents/jobs")
+        return list(result.get("jobs", []))
+
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("DELETE", f"/documents/jobs/{_quote(job_id)}")
+        return result
+
+    def workspaces(self) -> dict[str, Any]:
+        """``enabled`` and the ``workspaces`` besides the default one."""
+
+        result: dict[str, Any] = self._json("GET", "/workspaces")
+        return result
+
+    def create_workspace(self, name: str) -> None:
+        self._request("POST", "/workspaces", json={"name": name})
+
+    def delete_workspace(self, name: str) -> None:
+        self._request("DELETE", f"/workspaces/{_quote(name)}")
+
+    def watch_status(self) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("GET", "/watch")
+        return result
+
+    def watch_scan(self) -> None:
+        self._request("POST", "/watch/scan")
 
     def export(self, destination: Path) -> int:
         """Stream ``GET /export`` into ``destination``; returns the bytes written.

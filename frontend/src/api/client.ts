@@ -5,7 +5,9 @@ import type {
   DocumentContentResponse,
   DocumentDeleteResponse,
   DocumentJobAcceptedResponse,
+  DocumentJobListResponse,
   DocumentJobStatusResponse,
+  DocumentRefreshResponse,
   DocumentListResponse,
   DocumentReindexAllResponse,
   DocumentTagsResponse,
@@ -19,6 +21,9 @@ import type {
   ImportResponse,
   LlmProvider,
   PublicConfigResponse,
+  ReadinessResponse,
+  UsageResponse,
+  WatchStatusResponse,
   DocumentTask,
   QuestionOptions,
   QuestionOverrides,
@@ -357,6 +362,8 @@ export interface QuestionStreamHandlers {
       truncated?: boolean;
       /** Summaries only: passages read, of the passages the documents hold. */
       coverage?: SummaryCoverage;
+      /** Tokens the provider reported for this answer; absent when it reported none. */
+      usage?: UsageResponse | null;
     },
   ) => void;
 }
@@ -377,6 +384,7 @@ type QuestionStreamEvent =
       truncated?: boolean;
       chunks_read?: number;
       chunks_total?: number;
+      usage?: UsageResponse | null;
     }
   | { type: 'followups'; questions: string[] }
   | { type: 'error'; detail: string };
@@ -441,6 +449,25 @@ async function readSseStream(
 
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/health', { signal }),
+
+  // Open, and 503 with the same body when degraded: that body is the answer here (an
+  // index built for another embedding setup), so it is read whatever the status.
+  readiness: async (signal?: AbortSignal): Promise<ReadinessResponse> => {
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}/health/ready`, { signal });
+    } catch (err) {
+      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+    }
+    if (!response.ok && response.status !== 503) {
+      throw new ApiClientError(await extractErrorDetail(response), response.status);
+    }
+    try {
+      return (await response.json()) as ReadinessResponse;
+    } catch {
+      throw new ApiClientError('API response was not valid JSON.');
+    }
+  },
 
   // Neither depends on a workspace, so neither names one: a remembered workspace deleted
   // since would 404 /access (it resolves the request's workspace), which read as an
@@ -587,6 +614,26 @@ export const api = {
       { signal },
     );
   },
+
+  // Queued and running indexing jobs in this workspace, whoever started them (the
+  // watched folder, a restore, another tab).
+  listActiveJobs: (signal?: AbortSignal, workspace?: string) =>
+    request<DocumentJobListResponse>('/documents/jobs', { signal, workspace }),
+
+  // The watched folder (WATCH_DIR) as of its last pass; 404 when none is watched.
+  watchStatus: (signal?: AbortSignal) =>
+    request<WatchStatusResponse>('/watch', { signal, workspace: '' }),
+
+  // Runs the watcher's next pass now (full key).
+  watchScan: () =>
+    request<WatchStatusResponse>('/watch/scan', { method: 'POST', workspace: '' }),
+
+  // Fetches a URL-ingested document again: a job to poll, or `unchanged` (304).
+  refreshDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
+    request<DocumentJobAcceptedResponse | DocumentRefreshResponse>(
+      `/documents/${encodeURIComponent(filename)}/refresh`,
+      { method: 'POST', timeoutMs: LONG_RUNNING_TIMEOUT_MS, signal, workspace },
+    ),
 
   // Ranked passages without an answer: works with no LLM reachable. 429 when the server
   // is answering its maximum number of questions (it shares their slots).
@@ -757,6 +804,7 @@ export const api = {
                   answerStatus: event.answer_status,
                   topRerankScore: event.top_rerank_score,
                   truncated: event.truncated,
+                  ...(event.usage ? { usage: event.usage } : {}),
                   ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'
                     ? { coverage: { read: event.chunks_read, total: event.chunks_total } }
                     : {}),

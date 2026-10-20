@@ -72,19 +72,41 @@ RECOVERY_HINT = (
     "backup (GET /export), delete every document, then restore the backup (POST /import) "
     "— or delete every document and upload them again."
 )
+# The same without the backup route: a backup holds the documents themselves only when
+# RAW_DOCUMENT_DIR keeps them, and without it "export, delete everything, import"
+# deleted the corpus and restored nothing.
+RECOVERY_HINT_WITHOUT_ORIGINALS = (
+    "Questions and uploads are refused until the index matches the configuration. "
+    "Either restore the previous embedding settings, or delete every document and upload "
+    "them again. A backup (GET /export) can't rebuild this index: it holds the documents "
+    "themselves only when RAW_DOCUMENT_DIR keeps them, and that is not set."
+)
+
+
+def recovery_hint(settings: AppSettings) -> str:
+    """The way out of a mismatched index that works with this configuration."""
+
+    return RECOVERY_HINT if settings.raw_document_dir else RECOVERY_HINT_WITHOUT_ORIGINALS
 
 
 class EmbeddingModelMismatchError(CollectionSchemaError):
     """Raised when the configured embedding model tag differs from collection metadata."""
 
-    def __init__(self, *, collection_name: str, expected: str, actual: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        collection_name: str,
+        expected: str,
+        actual: str | None,
+        hint: str = RECOVERY_HINT,
+    ) -> None:
         self.collection_name = collection_name
         self.expected = expected
         self.actual = actual
         actual_label = actual if actual is not None else "<missing>"
         super().__init__(
             f"Collection '{collection_name}' uses embedding model tag '{actual_label}', "
-            f"but the configured tag is '{expected}'. {RECOVERY_HINT}"
+            f"but the configured tag is '{expected}'. {hint}"
         )
 
 
@@ -133,6 +155,41 @@ def sparse_vectors_config(settings: AppSettings) -> dict[str, models.SparseVecto
     return {
         settings.qdrant_sparse_vector_name: models.SparseVectorParams(modifier=models.Modifier.IDF)
     }
+
+
+def quantization_config(settings: AppSettings) -> models.ScalarQuantization | None:
+    """QDRANT_QUANTIZATION as Qdrant's collection setting (None: full vectors only)."""
+
+    if settings.qdrant_quantization != "scalar":
+        return None
+    return models.ScalarQuantization(
+        scalar=models.ScalarQuantizationConfig(
+            type=models.ScalarType.INT8, quantile=0.99, always_ram=True
+        )
+    )
+
+
+def ensure_quantization(
+    client: QdrantClient,
+    settings: AppSettings,
+    collection_info: models.CollectionInfo,
+) -> None:
+    """Bring an existing collection's quantization in line with QDRANT_QUANTIZATION, in
+    place: Qdrant builds (or drops) the int8 copy from the stored vectors."""
+
+    current = collection_info.config.quantization_config
+    wanted = quantization_config(settings)
+    if (current is None) == (wanted is None):
+        return
+    client.update_collection(
+        collection_name=settings.qdrant_collection,
+        quantization_config=wanted if wanted is not None else models.Disabled.DISABLED,
+    )
+    logger.info(
+        "%s scalar quantization on collection %r.",
+        "Enabled" if wanted is not None else "Disabled",
+        settings.qdrant_collection,
+    )
 
 
 def ensure_sparse_idf(
@@ -393,6 +450,7 @@ def _ensure_collection_against_qdrant(
                 vectors_config=dense_vectors_config(settings),
                 sparse_vectors_config=sparse_vectors_config(settings),
                 metadata=collection_metadata(settings),
+                quantization_config=quantization_config(settings),
             )
             create_payload_indexes(client, collection_name)
             return CollectionReady(
@@ -412,6 +470,7 @@ def _ensure_collection_against_qdrant(
     validate_collection_schema(collection_info, settings)
     ensure_payload_indexes(client, collection_name, collection_info)
     ensure_sparse_idf(client, settings, collection_info)
+    ensure_quantization(client, settings, collection_info)
     return CollectionReady(
         collection_name=collection_name,
         created=False,
@@ -425,6 +484,8 @@ def validate_collection_schema(
 ) -> None:
     """Validate vector names, dense dimensions, sparse config, and embedding tag."""
 
+    hint = recovery_hint(settings)
+
     metadata = read_collection_metadata(collection_info)
     actual_tag = metadata.get(EMBEDDING_MODEL_TAG_KEY)
     if actual_tag != settings.embedding_model_tag:
@@ -432,6 +493,7 @@ def validate_collection_schema(
             collection_name=settings.qdrant_collection,
             expected=settings.embedding_model_tag,
             actual=actual_tag,
+            hint=hint,
         )
 
     # The tag is set by hand, so a changed dense model with the tag left alone would
@@ -442,7 +504,7 @@ def validate_collection_schema(
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' uses dense embedding model "
             f"'{actual_dense}', but the configured model is "
-            f"'{settings.dense_embedding_model}'. {RECOVERY_HINT}"
+            f"'{settings.dense_embedding_model}'. {hint}"
         )
 
     # The dense-only tag does not capture the sparse model, but changing it also
@@ -452,7 +514,7 @@ def validate_collection_schema(
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' uses sparse embedding model "
             f"'{actual_sparse if actual_sparse is not None else '<missing>'}', but the "
-            f"configured model is '{settings.sparse_embedding_model}'. {RECOVERY_HINT}"
+            f"configured model is '{settings.sparse_embedding_model}'. {hint}"
         )
 
     # Recorded since the multilingual profile; a collection without them was built with
@@ -470,7 +532,7 @@ def validate_collection_schema(
         if actual != expected:
             raise CollectionSchemaError(
                 f"Collection '{settings.qdrant_collection}' was indexed with {label} of "
-                f"{actual!r}, but the configured one is {expected!r}. {RECOVERY_HINT}"
+                f"{actual!r}, but the configured one is {expected!r}. {hint}"
             )
 
     params = collection_info.config.params
@@ -478,7 +540,7 @@ def validate_collection_schema(
     if not isinstance(vectors, dict) or settings.qdrant_dense_vector_name not in vectors:
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' is missing dense vector "
-            f"'{settings.qdrant_dense_vector_name}'. {RECOVERY_HINT}"
+            f"'{settings.qdrant_dense_vector_name}'. {hint}"
         )
 
     dense_config = vectors[settings.qdrant_dense_vector_name]
@@ -486,19 +548,19 @@ def validate_collection_schema(
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' dense vector size is "
             f"{dense_config.size}, expected {settings.qdrant_dense_vector_size}. "
-            f"{RECOVERY_HINT}"
+            f"{hint}"
         )
     if dense_config.distance != models.Distance.COSINE:
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' dense vector distance is "
-            f"{dense_config.distance}, expected {models.Distance.COSINE}. {RECOVERY_HINT}"
+            f"{dense_config.distance}, expected {models.Distance.COSINE}. {hint}"
         )
 
     sparse_vectors = params.sparse_vectors or {}
     if settings.qdrant_sparse_vector_name not in sparse_vectors:
         raise CollectionSchemaError(
             f"Collection '{settings.qdrant_collection}' is missing sparse vector "
-            f"'{settings.qdrant_sparse_vector_name}'. {RECOVERY_HINT}"
+            f"'{settings.qdrant_sparse_vector_name}'. {hint}"
         )
 
 

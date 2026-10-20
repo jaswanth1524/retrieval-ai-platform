@@ -290,3 +290,25 @@ def test_the_manual_fusion_fallback_sends_both_legs_in_one_batch(
         for point in points
     )
     assert {"filename", "page", "section", "chunk_id", "text"} <= set(points[0].payload or {})
+
+
+def test_scalar_quantization_is_applied_in_place_and_searches_rescore(
+    server: tuple[QdrantClient, AppSettings],
+) -> None:
+    client, settings = server
+    repository = seed(client, settings)
+    assert client.get_collection(settings.qdrant_collection).config.quantization_config is None
+
+    quantized = settings.model_copy(update={"qdrant_quantization": "scalar"})
+    clear_readiness_cache()
+    repository.ensure_ready(quantized)
+    config = client.get_collection(settings.qdrant_collection).config.quantization_config
+    assert config is not None
+    points = repository.hybrid_search(quantized, embedding([1.0, 0.0, 0.0], [10], [1.0]))
+    assert [point.payload["chunk_id"] for point in points if point.payload][:2] == ["c1", "c3"]
+    dense = repository.search_leg(quantized, embedding([1.0, 0.0, 0.0], [10], [1.0]), "dense")
+    assert dense and dense[0].payload and dense[0].payload["chunk_id"] == "c1"
+
+    clear_readiness_cache()
+    repository.ensure_ready(settings)  # back to "none": removed in place
+    assert client.get_collection(settings.qdrant_collection).config.quantization_config is None

@@ -18,6 +18,7 @@ import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatMessage.css';
 import { isImeComposing } from '../utils/keyboard';
+import { enterAddsNewline } from '../utils/platform';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
 
 // Answers quote retrieved documents, and a poisoned document can steer the model into
@@ -93,6 +94,8 @@ export interface FeedbackPayload {
   citedFilenames: string[];
   traceId: string | null;
   kind: FeedbackKind;
+  /** A rating of one cited source (its number) rather than of the whole answer. */
+  citationSourceNumber?: number;
 }
 
 export interface ChatTurn {
@@ -134,6 +137,12 @@ export interface ChatTurn {
   // An answer to a question asked with the conversation as history (rated as a
   // "follow_up"; see FeedbackKind).
   followUp?: boolean;
+  // Sources marked "not relevant" (their numbers), so each is rated once.
+  irrelevantSources?: number[];
+  // Best cross-encoder score among the candidates (0-1), for the weak-support badge.
+  topRerankScore?: number;
+  // Tokens the provider reported for this answer.
+  usage?: { prompt: number; completion: number };
 }
 
 interface ChatMessageProps {
@@ -169,6 +178,12 @@ interface ChatMessageProps {
   busy?: boolean;
   // Ask one of the turn's suggested follow-ups; set only on the latest answer.
   onAskFollowup?: (question: string) => void;
+  // The last turn is this question with no answer after it (stopped before the first
+  // frame, or a reload during retrieval): offer to ask it again.
+  unanswered?: boolean;
+  // An answer whose best passage scored under this reads as weakly supported (the
+  // server's RERANK_MIN_SCORE plus a margin); undefined: no badge.
+  weakSupportBelow?: number;
 }
 
 /** Ask again, naming the task only when there is one (a plain question keeps its call). */
@@ -206,6 +221,8 @@ function ChatMessage({
   onCitationLeave,
   busy = false,
   onAskFollowup,
+  unanswered = false,
+  weakSupportBelow,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -230,6 +247,20 @@ function ChatMessage({
       traceId: turn.traceId,
       // A summary's question is a label for the task; it was asked without history.
       kind: regenerateTask ? 'summary' : turn.followUp ? 'follow_up' : 'question',
+    });
+  };
+
+  const markNotRelevant = (source: CitationResponse) => {
+    if (!regenerateQuestion || !onFeedback) return;
+    onFeedback({
+      turnId: turn.id,
+      rating: 'down',
+      question: regenerateQuestion,
+      answerExcerpt: turn.content,
+      citedFilenames: [source.filename],
+      traceId: turn.traceId,
+      kind: regenerateTask ? 'summary' : turn.followUp ? 'follow_up' : 'question',
+      citationSourceNumber: source.source_number,
     });
   };
 
@@ -369,7 +400,7 @@ function ChatMessage({
                   if (event.key === 'Escape') {
                     event.stopPropagation();
                     cancelEdit();
-                  } else if (event.key === 'Enter' && !event.shiftKey) {
+                  } else if (event.key === 'Enter' && !event.shiftKey && !enterAddsNewline()) {
                     event.preventDefault();
                     submitEdit();
                   }
@@ -413,6 +444,20 @@ function ChatMessage({
               )}
             </>
           )}
+        </div>
+      )}
+      {turn.role === 'user' && unanswered && onRetry && !editing && (
+        <div className="chat-message__unanswered" data-testid="chat-message-unanswered">
+          <span>No answer to this question.</span>
+          <button
+            type="button"
+            className="chat-message__action"
+            onClick={() => askAgain(onRetry, turn.content, turn.task)}
+            disabled={busy}
+            data-testid="chat-message-ask-again"
+          >
+            Ask again
+          </button>
         </div>
       )}
 
@@ -472,6 +517,19 @@ function ChatMessage({
                   not in your documents
                 </span>
               )}
+              {weakSupportBelow !== undefined &&
+                typeof turn.topRerankScore === 'number' &&
+                turn.topRerankScore < weakSupportBelow &&
+                !turn.notFound &&
+                turn.sources.length > 0 && (
+                  <span
+                    className="chat-message__flag chat-message__flag--warn"
+                    title={`The best passage found scored ${turn.topRerankScore.toFixed(2)}, just over the bar for being used at all — the documents may only touch on this`}
+                    data-testid="chat-message-weak-support"
+                  >
+                    weakly supported
+                  </span>
+                )}
               {turn.uncited && (
                 <span
                   className="chat-message__flag chat-message__flag--warn"
@@ -577,6 +635,12 @@ function ChatMessage({
                     }
                     onHoverStart={onCitationHover ? () => onCitationHover(source) : undefined}
                     onHoverEnd={onCitationLeave}
+                    onNotRelevant={
+                      feedbackEnabled && onFeedback && regenerateQuestion && !streamStage
+                        ? () => markNotRelevant(source)
+                        : undefined
+                    }
+                    markedNotRelevant={turn.irrelevantSources?.includes(source.source_number)}
                   />
                 ))}
               </div>

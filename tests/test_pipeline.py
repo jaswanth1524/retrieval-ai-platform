@@ -968,7 +968,48 @@ def test_rag_pipeline_answer_with_history_condenses_before_retrieval() -> None:
     final_call_messages = generator.calls[-1][0]
     assert any("What about the second one?" in m["content"] for m in final_call_messages)
     assert _HISTORY[0] in final_call_messages
-    assert _HISTORY[1] in final_call_messages
+    # The earlier answer goes back without its [n] markers: they numbered that turn's
+    # sources, and this prompt numbers its own from 1 again.
+    assert {
+        "role": "assistant",
+        "content": "Doc A covers setup. Doc B covers billing.",
+    } in final_call_messages
+    condense_messages = generator.calls[0][0]
+    assert not any("[1]" in m["content"] or "[2]" in m["content"] for m in condense_messages)
+
+
+def test_history_answers_lose_their_citation_markers_in_both_answer_modes() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "Tell me about alpha."},
+        {"role": "assistant", "content": "Alpha is first [1, 2] and also [1-3][4]."},
+        {"role": "user", "content": "And beta?"},
+        {"role": "assistant", "content": "[2]"},
+    ]
+
+    for mode in ("sync", "stream"):
+        generator = SequencedGenerator(["alpha beta standalone question", "Alpha beta [1]."])
+        pipeline = RagPipeline(
+            repository=repository,
+            embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+            reranker=FakeReranker(),
+            generator=generator,
+            settings=settings,
+        )
+        if mode == "sync":
+            pipeline.answer("And what about it?", history=history)
+        else:
+            list(pipeline.answer_stream("And what about it?", history=history))
+        sent = [m for call in generator.calls for m in call[0] if m["role"] == "assistant"]
+        assert {"role": "assistant", "content": "Alpha is first and also."} in sent, mode
+        # A bare marker keeps its turn, so user and assistant still alternate.
+        assert {"role": "assistant", "content": "(answer omitted)"} in sent, mode
+        assert history[1]["content"] == "Alpha is first [1, 2] and also [1-3][4]."
 
 
 def test_rag_pipeline_answer_without_history_makes_a_single_generation_call() -> None:
@@ -1961,3 +2002,36 @@ def test_a_streamed_answer_is_cached_when_the_client_leaves_at_done() -> None:
     replay = [event for event in pipeline.answer_stream("alpha") if event["type"] == "done"]
     assert replay[0].get("cached") is True
     assert replay[0]["answer"] == "Alpha is documented [1]."
+
+
+def test_a_capped_neighbour_expansion_keeps_adjacent_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The filter drops a chunk next to a kept one because expansion brings its text
+    back; capped by CONTEXT_NEIGHBOR_MAX_CHARS, it brings back only a slice of it."""
+
+    import api.pipeline as pipeline_module
+
+    seen: list[bool] = []
+    real = pipeline_module.select_diverse
+
+    def spy(outcome, settings, drop_neighbours=True):  # type: ignore[no-untyped-def]
+        seen.append(drop_neighbours)
+        return real(outcome, settings, drop_neighbours=drop_neighbours)
+
+    monkeypatch.setattr(pipeline_module, "select_diverse", spy)
+    for cap, expected in ((0, True), (300, False)):
+        settings = make_settings(context_neighbor_max_chars=cap)
+        client = QdrantClient(":memory:")
+        repository = VectorRepository(client)
+        IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+            "guide.txt", b"Intro\nalpha beta"
+        )
+        RagPipeline(
+            repository=repository,
+            embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+            reranker=FakeReranker(),
+            generator=SequencedGenerator(["unused"]),
+            settings=settings,
+        ).retrieve("alpha")
+        assert seen[-1] is expected, cap

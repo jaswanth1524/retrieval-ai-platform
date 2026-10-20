@@ -25,6 +25,8 @@ interface ChatThreadProps {
   onEditQuestion?: (turnId: string, question: string) => void;
   // Ask one of the latest answer's suggested follow-ups.
   onAskFollowup?: (question: string) => void;
+  /** See ChatMessage's weakSupportBelow. */
+  weakSupportBelow?: number;
   feedbackEnabled?: boolean;
   onFeedback?: (payload: FeedbackPayload) => void;
   onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
@@ -101,6 +103,7 @@ function ChatThread({
   onRetry,
   onRegenerate,
   onAskFollowup,
+  weakSupportBelow,
   onEditQuestion,
   feedbackEnabled,
   onFeedback,
@@ -128,6 +131,9 @@ function ChatThread({
   // Position, not a timer: deltas can arrive several times per animation frame, so a
   // frame-based guard would swallow genuine user scrolls during a fast stream.
   const autoScrollTopRef = useRef(-1);
+  // Scrolled up away from the bottom: offer the way back (state only flips on change,
+  // so scrolling costs no render).
+  const [showJump, setShowJump] = useState(false);
   // Set when a question this thread watched finishes, so "Answer ready." is said once
   // for a new answer — never for history shown on a reload or conversation switch.
   const [justFinished, setJustFinished] = useState(false);
@@ -148,6 +154,13 @@ function ChatThread({
     if (Math.abs(element.scrollTop - autoScrollTopRef.current) <= 1) return;
     pinnedRef.current =
       element.scrollHeight - element.scrollTop - element.clientHeight <= PIN_THRESHOLD_PX;
+    setShowJump(!pinnedRef.current);
+  };
+
+  const jumpToLatest = () => {
+    pinnedRef.current = true;
+    setShowJump(false);
+    scrollToBottom();
   };
 
   const scrollToBottom = () => {
@@ -174,7 +187,10 @@ function ChatThread({
     turnCountRef.current = turns.length;
     // Asking something new always pulls the view back down; mid-answer growth only
     // does so while the user is still at the bottom following along.
-    if (isNewTurn) pinnedRef.current = true;
+    if (isNewTurn) {
+      pinnedRef.current = true;
+      setShowJump(false);
+    }
     if (pinnedRef.current) scrollToBottom();
   }, [turns, pending]);
 
@@ -298,6 +314,10 @@ function ChatThread({
             regenerateTask={turn.role === 'assistant' ? questions[index]?.task : undefined}
             busy={busy}
             onAskFollowup={turn.id === lastTurn?.id ? onAskFollowup : undefined}
+            weakSupportBelow={weakSupportBelow}
+            unanswered={
+              turn.id === lastTurn?.id && turn.role === 'user' && !pending && !awaitingFirstEvent
+            }
             feedbackEnabled={feedbackEnabled}
             onFeedback={onFeedback}
             onOpenSource={onOpenSource}
@@ -318,6 +338,16 @@ function ChatThread({
           </div>
         )}
       </div>
+      {showJump && (
+        <button
+          type="button"
+          className="chat-thread__jump"
+          onClick={jumpToLatest}
+          data-testid="chat-jump-latest"
+        >
+          {pending ? '↓ Follow the answer' : '↓ Latest'}
+        </button>
+      )}
     </div>
   );
 }

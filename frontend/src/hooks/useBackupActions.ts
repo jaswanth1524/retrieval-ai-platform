@@ -6,7 +6,8 @@ import { useStableHandler } from './useStableHandler';
 import type { ToastInput } from './useToasts';
 
 interface BackupOptions {
-  pushToast: (toast: ToastInput) => unknown;
+  pushToast: (toast: ToastInput) => string;
+  dismissToast: (id: string) => void;
   noteAuthFailure: (err: unknown) => boolean;
   /** The restore queued these documents (follow them like uploads), in `workspace`. */
   onRestoreQueued: (jobs: DocumentJobAcceptedResponse[], workspace: string) => Promise<void> | void;
@@ -14,7 +15,12 @@ interface BackupOptions {
 
 /** Corpus backups (GET /export, POST /import) and stored-original downloads, each
  *  reporting through toasts. */
-export function useBackupActions({ pushToast, noteAuthFailure, onRestoreQueued }: BackupOptions) {
+export function useBackupActions({
+  pushToast,
+  dismissToast,
+  noteAuthFailure,
+  onRestoreQueued,
+}: BackupOptions) {
   const [exportingBackup, setExportingBackup] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const exportingRef = useRef(false);
@@ -31,7 +37,14 @@ export function useBackupActions({ pushToast, noteAuthFailure, onRestoreQueued }
     setExportingBackup(true);
     const controller = new AbortController();
     exportControllerRef.current = controller;
-    pushToast({ tone: 'info', title: 'Preparing backup…', body: 'The download starts when it is ready.' });
+    // Up while the server builds the zip (a big one outlasted the usual toast), and gone
+    // the moment the download starts or fails, instead of claiming it hadn't.
+    const preparing = pushToast({
+      tone: 'info',
+      title: 'Preparing backup…',
+      body: 'The download starts when it is ready.',
+      sticky: true,
+    });
     api
       .exportCorpus(controller.signal)
       .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
@@ -48,6 +61,7 @@ export function useBackupActions({ pushToast, noteAuthFailure, onRestoreQueued }
         });
       })
       .finally(() => {
+        dismissToast(preparing);
         exportingRef.current = false;
         exportControllerRef.current = null;
         setExportingBackup(false);

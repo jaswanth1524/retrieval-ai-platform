@@ -57,6 +57,7 @@ def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
         "llm_provider": "ollama",
         "index_compatible": True,
         "index_detail": None,
+        "originals_kept": False,
     }
 
 

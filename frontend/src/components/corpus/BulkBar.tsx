@@ -10,6 +10,11 @@ interface BulkBarProps {
   onAddTag?: (tag: string) => Promise<void>;
   /** Compare the selection, offered when exactly two documents are selected. */
   onCompare?: (filenames: string[]) => void;
+  /** Scope the open conversation to the selection. */
+  onAskAbout?: (filenames: string[]) => void;
+  /** Three documents up to this many get "Brief" (one summary across them, via
+   *  onCompare); absent on a server that doesn't offer briefs. */
+  maxBrief?: number;
   /** Can't compare right now (booting, the key was refused) — like the composer. */
   compareDisabled?: boolean;
   /** Absent for the read-only key, which can only compare. */
@@ -25,6 +30,8 @@ export default function BulkBar({
   onReindex,
   onAddTag,
   onCompare,
+  onAskAbout,
+  maxBrief,
   compareDisabled,
   onDelete,
   onClear,
@@ -97,6 +104,17 @@ export default function BulkBar({
               </button>
             </form>
           )}
+          {onAskAbout && (
+            <button
+              type="button"
+              className="corpus-panel__bulk-button"
+              onClick={() => onAskAbout(selected)}
+              disabled={disabled}
+              data-testid="corpus-bulk-ask"
+            >
+              Ask about these
+            </button>
+          )}
           {onCompare && count === 2 && (
             <button
               type="button"
@@ -107,6 +125,18 @@ export default function BulkBar({
               data-testid="corpus-bulk-compare"
             >
               Compare
+            </button>
+          )}
+          {onCompare && maxBrief !== undefined && count >= 3 && count <= maxBrief && (
+            <button
+              type="button"
+              className="corpus-panel__bulk-button"
+              onClick={() => onCompare(selected)}
+              disabled={disabled || busy || compareDisabled}
+              title="One summary across the selected documents"
+              data-testid="corpus-bulk-brief"
+            >
+              Brief
             </button>
           )}
           {onReindex && reindexable.length > 0 && (

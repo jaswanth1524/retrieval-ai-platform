@@ -17,6 +17,8 @@ interface DocumentCardProps {
   onCancelDelete: () => void;
   onConfirmDelete: (filename: string) => void;
   onRead?: (filename: string) => void;
+  /** Scope the open conversation to this document, ready to ask about it. */
+  onAskAbout?: (filenames: string[]) => void;
   onSummarize?: (filenames: string[]) => void;
   /** Summarize can't run right now (booting, the key was refused) — like the composer. */
   summarizeDisabled?: boolean;
@@ -26,6 +28,17 @@ interface DocumentCardProps {
   onRetryUpload?: (uploadId: string) => void;
   onDismissUpload?: (uploadId: string) => void;
   onSetTags?: (filename: string, tags: string[]) => Promise<void>;
+  /** Fetch a URL-ingested document again (URL ingest on, full key). */
+  onRefreshFromUrl?: (filename: string) => void;
+}
+
+/** The source's host, for a short link label ("example.com"). */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
 }
 
 /** One document (or upload) card. Memoized with stable card objects and callbacks, so
@@ -43,6 +56,7 @@ const DocumentCard = memo(function DocumentCard({
   onCancelDelete,
   onConfirmDelete,
   onRead,
+  onAskAbout,
   onSummarize,
   summarizeDisabled,
   onOpenOriginal,
@@ -51,6 +65,7 @@ const DocumentCard = memo(function DocumentCard({
   onRetryUpload,
   onDismissUpload,
   onSetTags,
+  onRefreshFromUrl,
 }: DocumentCardProps) {
   return (
     <article
@@ -93,6 +108,18 @@ const DocumentCard = memo(function DocumentCard({
                 data-testid="corpus-read"
               >
                 ☰
+              </button>
+            )}
+            {onAskAbout && (
+              <button
+                type="button"
+                className="corpus-panel__read"
+                onClick={() => onAskAbout([card.filename])}
+                aria-label={`Ask about ${card.filename}`}
+                title="Ask about this document only"
+                data-testid="corpus-ask-about"
+              >
+                ?
               </button>
             )}
             {onSummarize && (
@@ -198,6 +225,33 @@ const DocumentCard = memo(function DocumentCard({
           <span role="status">{`failed — ${card.detail}`}</span>
         ) : (
           <span>{card.detail}</span>
+        )}
+        {card.status === 'indexed' && card.sourceUrl && (
+          <span className="corpus-panel__source">
+            {'from '}
+            <a
+              href={card.sourceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={card.sourceUrl}
+              data-testid="corpus-source-link"
+            >
+              {hostOf(card.sourceUrl)}
+            </a>
+            {onRefreshFromUrl && (
+              <button
+                type="button"
+                className="corpus-panel__source-refresh"
+                onClick={() => onRefreshFromUrl(card.filename)}
+                disabled={disabled}
+                aria-label={`Fetch ${card.filename} again from its source`}
+                title="Fetch again from the URL (skipped when unchanged)"
+                data-testid="corpus-refresh-url"
+              >
+                refresh
+              </button>
+            )}
+          </span>
         )}
       </div>
       {card.status === 'indexing' && (

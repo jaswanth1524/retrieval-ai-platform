@@ -468,3 +468,31 @@ def test_an_equivalent_stored_sparse_language_is_accepted(stored: str) -> None:
     )
 
     ensure_collection(client, settings)  # the same English index: no re-ingest asked for
+
+
+def test_quantization_is_only_changed_when_the_setting_differs() -> None:
+    from unittest.mock import MagicMock
+
+    from qdrant_client import models
+
+    from api.qdrant_schema import ensure_quantization, quantization_config
+
+    assert quantization_config(make_test_settings()) is None
+    scalar = make_test_settings(qdrant_quantization="scalar")
+    assert isinstance(quantization_config(scalar), models.ScalarQuantization)
+
+    def info(quantized: bool) -> MagicMock:
+        collection = MagicMock()
+        collection.config.quantization_config = quantization_config(scalar) if quantized else None
+        return collection
+
+    client = MagicMock()
+    ensure_quantization(client, scalar, info(quantized=True))
+    ensure_quantization(client, make_test_settings(), info(quantized=False))
+    client.update_collection.assert_not_called()
+    ensure_quantization(client, scalar, info(quantized=False))
+    assert client.update_collection.call_args.kwargs["quantization_config"] is not None
+    ensure_quantization(client, make_test_settings(), info(quantized=True))
+    assert client.update_collection.call_args.kwargs["quantization_config"] == (
+        models.Disabled.DISABLED
+    )

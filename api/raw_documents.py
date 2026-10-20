@@ -11,8 +11,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -24,6 +26,22 @@ _STALE_TEMP_FILE_SECONDS = 3600.0
 # What tempfile.mkstemp(prefix=".upload-") produces: 8 characters from
 # [a-z0-9_] and no suffix — which no accepted upload name can have.
 _TEMP_FILE_NAME = re.compile(r"\.upload-[a-z0-9_]{8}")
+
+
+# Earlier versions of each original (RAW_DOCUMENT_VERSIONS), in a subdirectory per
+# document: ``.versions/<name>/<nanoseconds>``. A directory, so the listing of stored
+# originals (files only) never shows it, and a name no upload can have (no extension).
+VERSIONS_DIR = ".versions"
+_VERSION_ID = re.compile(r"\d{1,20}")
+
+
+@dataclass(frozen=True)
+class StoredVersion:
+    """One earlier version of a document's original."""
+
+    version: str
+    saved_at: float
+    size: int
 
 
 def is_temp_file_name(name: str) -> bool:
@@ -41,8 +59,10 @@ class RawDocumentStore:
     path component.
     """
 
-    def __init__(self, directory: str) -> None:
+    def __init__(self, directory: str, keep_versions: int = 0) -> None:
         self._directory = Path(directory)
+        # How many earlier versions of each original a save keeps (0: none).
+        self._keep_versions = keep_versions
         self._directory.mkdir(parents=True, exist_ok=True)
         self._sweep_stale_temp_files()
 
@@ -78,10 +98,70 @@ class RawDocumentStore:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
+            if self._keep_versions > 0 and _is_file(target):
+                self._keep_as_version(target, content)
             os.replace(temp_path, target)
         except BaseException:
             Path(temp_path).unlink(missing_ok=True)
             raise
+
+    def _versions_dir(self, filename: str) -> Path:
+        return self._directory / VERSIONS_DIR / normalize_filename(filename)
+
+    def _keep_as_version(self, current: Path, incoming: bytes) -> None:
+        """Move the current original into its versions (unless it is the same bytes),
+        then drop all but the newest ``keep_versions``. A failure here is logged: the
+        new original is saved either way."""
+
+        try:
+            if current.stat().st_size == len(incoming) and current.read_bytes() == incoming:
+                return
+            directory = self._versions_dir(current.name)
+            directory.mkdir(parents=True, exist_ok=True)
+            kept = directory / str(time.time_ns())
+            try:
+                os.link(current, kept)  # the same bytes, no copy
+            except OSError:
+                shutil.copy2(current, kept)
+            for old in self._version_paths(current.name)[self._keep_versions :]:
+                old.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not keep the previous version of %s", current.name, exc_info=True)
+
+    def _version_paths(self, filename: str) -> list[Path]:
+        """A document's version files, newest first."""
+
+        directory = self._versions_dir(filename)
+        try:
+            paths = [
+                p for p in directory.iterdir() if _VERSION_ID.fullmatch(p.name) and p.is_file()
+            ]
+        except OSError:
+            return []
+        return sorted(paths, key=lambda path: int(path.name), reverse=True)
+
+    def versions(self, filename: str) -> list[StoredVersion]:
+        """The earlier versions kept for ``filename``, newest first."""
+
+        result: list[StoredVersion] = []
+        for path in self._version_paths(filename):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            result.append(StoredVersion(path.name, int(path.name) / 1e9, size))
+        return result
+
+    def read_version(self, filename: str, version: str) -> bytes | None:
+        """One earlier version's bytes, or None when there is no such version."""
+
+        if not _VERSION_ID.fullmatch(version):
+            return None
+        path = self._versions_dir(filename) / version
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except OSError:
+            return None
 
     def read(self, filename: str) -> bytes | None:
         path = self.path(filename)
@@ -148,6 +228,8 @@ class RawDocumentStore:
         """Remove the stored original; True when there was one to remove."""
 
         path = self._path_for(filename)
+        # Its earlier versions go with it: they are versions of a document that's gone.
+        shutil.rmtree(self._versions_dir(filename), ignore_errors=True)
         if not _is_file(path):
             return False
         path.unlink(missing_ok=True)

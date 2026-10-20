@@ -20,7 +20,7 @@ from api.answer_cache import (
     CacheKey,
     answer_cache_key,
 )
-from api.citations import answer_status
+from api.citations import answer_status, strip_citation_markers
 
 # Neighbour expansion and ingestion live in their own modules now; their names are
 # re-exported here (``x as x``) so every existing ``from api.pipeline import`` works.
@@ -56,9 +56,10 @@ from api.generation import (
 )
 from api.ingest_service import DocumentIngestOutcome as DocumentIngestOutcome
 from api.ingest_service import IngestService as IngestService
-from api.llm import reset_finish_reason, stopped_at_token_limit
+from api.llm import begin_usage, reset_finish_reason, stopped_at_token_limit, usage_totals
+from api.prompting import with_answer_language
 from api.qdrant_schema import check_dense_dimension
-from api.repository import VectorRepository, reciprocal_rank_fusion
+from api.repository import PassageFilter, VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
 from api.reranking import (
     RerankedChunk,
@@ -197,6 +198,7 @@ class DoneEvent(TypedDict):
     top_rerank_score: NotRequired[float | None]
     # The provider cut the answer off at the token limit.
     truncated: NotRequired[bool]
+    usage: NotRequired[dict[str, int] | None]
     # Summaries only: passages read, of the passages the documents hold. Fewer than
     # the total when a long document was read at evenly spaced passages.
     chunks_read: NotRequired[int]
@@ -239,6 +241,25 @@ def _cached_timings(started: float) -> StageTimings:
 def _citation_dict(source: SourceCitation) -> dict[str, Any]:
     # Every field, spans included (as lists of dicts), as CitationResponse has them.
     return dataclasses.asdict(source)
+
+
+def usage_dict(usage: tuple[int, int] | None) -> dict[str, int] | None:
+    """Token usage as the ``done`` frame and responses carry it."""
+
+    if usage is None:
+        return None
+    return {"prompt_tokens": usage[0], "completion_tokens": usage[1]}
+
+
+def usage_tuple(usage: object) -> tuple[int, int] | None:
+    """``usage_dict``'s inverse (a ``done`` frame's usage back to the pair)."""
+
+    if not isinstance(usage, dict):
+        return None
+    prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if isinstance(prompt, int) and isinstance(completion, int):
+        return prompt, completion
+    return None
 
 
 def timings_dict(timings: StageTimings) -> dict[str, float]:
@@ -400,6 +421,7 @@ class RagPipeline:
         condensed_question: str | None,
         history_message_count: int,
         citation_retry_used: bool = False,
+        usage: tuple[int, int] | None = None,
     ) -> QueryTrace:
         """The trace of a question that ran to an answer (or to "insufficient context")."""
 
@@ -430,17 +452,33 @@ class RagPipeline:
             citation_retry_used=citation_retry_used,
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
+            usage=usage,
         )
 
     def _truncate_history(
         self, history: Sequence[ChatMessage] | None, effective_settings: AppSettings
     ) -> list[ChatMessage]:
-        """Keep only the most recent history messages, per server-side config."""
+        """Keep only the most recent history messages, per server-side config.
+
+        Earlier answers lose their ``[n]`` markers: those numbered the previous turn's
+        sources, and this turn's prompt numbers its own from 1 again, so a model
+        continuing the conversation could copy a stale ``[2]`` onto an unrelated source.
+        """
 
         if not history:
             return []
         cap = int(effective_settings.conversation_max_history_messages)
-        return list(history)[-cap:] if cap > 0 else []
+        kept = list(history)[-cap:] if cap > 0 else []
+        return [
+            {
+                "role": "assistant",
+                # A bare "[1]" answer still holds its place, so the turns keep alternating.
+                "content": strip_citation_markers(message["content"]) or "(answer omitted)",
+            }
+            if message["role"] == "assistant"
+            else message
+            for message in kept
+        ]
 
     def _will_condense(
         self,
@@ -493,6 +531,15 @@ class RagPipeline:
             return question, condense_ms, None
         return condensed, condense_ms, condensed
 
+    def retrieval_query(self, question: str, history: Sequence[ChatMessage] | None = None) -> str:
+        """The query a question is retrieved with: a follow-up rewritten into a
+        standalone one, as ``answer`` does (the eval harness scores this)."""
+
+        settings = self._effective_settings(AnswerOverrides())
+        truncated = self._truncate_history(history, settings)
+        query, _, _ = self._condense_query(question.strip(), truncated, settings)
+        return query
+
     def _stored_tag_variants(self, tags: Sequence[str], settings: AppSettings) -> list[str]:
         """The stored spellings of ``tags``, matched the way tags are de-duplicated.
 
@@ -515,6 +562,7 @@ class RagPipeline:
         should_stop: Callable[[], bool] | None = None,
         *,
         for_generation: bool = True,
+        narrow: PassageFilter | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
 
@@ -568,9 +616,11 @@ class RagPipeline:
             tags = tag_variants.result()
 
         search_start = time.monotonic()
+        # Passed only when set, so a repository double without the parameter still works.
+        narrowing = {"narrow": narrow} if narrow is not None else {}
         result_lists = _map_concurrently(
             lambda embedding: self._repository.hybrid_search(
-                effective_settings, embedding, filenames, tags
+                effective_settings, embedding, filenames, tags, **narrowing
             ),
             query_embeddings,
         )
@@ -595,8 +645,14 @@ class RagPipeline:
             reranker=self._reranker,
             settings=effective_settings,
         )
+        # A chunk next to a kept one is dropped on the promise that neighbour expansion
+        # puts its text back — true only when expansion brings the whole neighbour.
+        # With CONTEXT_NEIGHBOR_MAX_CHARS capping it, a well-scored passage was lost.
         diverse_outcome, diversity_dropped = select_diverse(
-            outcome, effective_settings, drop_neighbours=for_generation
+            outcome,
+            effective_settings,
+            drop_neighbours=for_generation
+            and int(effective_settings.context_neighbor_max_chars) == 0,
         )
         # A search (no answer) where nothing clears rerank_min_score shows the closest
         # passages anyway, flagged. The bar is set for grounding an answer; the
@@ -661,6 +717,7 @@ class RagPipeline:
         tags: Sequence[str] | None = None,
         *,
         for_generation: bool = True,
+        narrow: PassageFilter | None = None,
     ) -> RetrievalPhase:
         """Retrieval exactly as ``answer`` runs it — query expansion, hybrid search,
         rerank, diversity filter, neighbour expansion — without generating. The eval
@@ -671,7 +728,12 @@ class RagPipeline:
 
         effective_settings = self._effective_settings(overrides or AnswerOverrides())
         return self._retrieve_and_rerank(
-            question, effective_settings, filenames, tags, for_generation=for_generation
+            question,
+            effective_settings,
+            filenames,
+            tags,
+            for_generation=for_generation,
+            narrow=narrow,
         )
 
     def _cache_key(
@@ -867,6 +929,7 @@ class RagPipeline:
 
             generate_start = time.monotonic()
             reset_finish_reason()
+            begin_usage()
             grounded = generate_grounded_answer(
                 query=question,
                 context_chunks=selected,
@@ -880,6 +943,7 @@ class RagPipeline:
             generate_ms = (time.monotonic() - generate_start) * 1000 - grounded.citation_retry_ms
             # The last call made the answer: the citation retry's when it fired.
             truncated = stopped_at_token_limit()
+            usage = usage_totals()
             timings = self._phase_timings(
                 phase,
                 total_start=total_start,
@@ -931,6 +995,7 @@ class RagPipeline:
                     condensed_question=condensed_question,
                     history_message_count=len(truncated_history),
                     citation_retry_used=grounded.citation_retry_used,
+                    usage=usage,
                 )
             )
         status = answer_status(grounded.answer, len(grounded.sources), len(selected))
@@ -953,6 +1018,7 @@ class RagPipeline:
             top_rerank_score=_top_rerank_score(phase),
             truncated=truncated,
             followups=followups,
+            usage=usage,
         )
 
     def _answer_stream_uncached(
@@ -1070,12 +1136,16 @@ class RagPipeline:
                 "trace_id": trace_id,
             }
 
-            messages = build_grounded_messages(question.strip(), selected, fitted.history or None)
+            messages = with_answer_language(
+                build_grounded_messages(question.strip(), selected, fitted.history or None),
+                effective_settings,
+            )
             if should_stop is not None and should_stop():
                 return  # the finally below records the trace as closed early
             generate_start = time.monotonic()
             first_token_ms = 0.0
             reset_finish_reason()
+            begin_usage()
             for delta in self._generator.stream(messages, effective_settings):
                 if not parts:
                     first_token_ms = (time.monotonic() - total_start) * 1000
@@ -1104,6 +1174,7 @@ class RagPipeline:
             answer = outcome.answer
             # The last call made the answer: the citation retry's when it fired.
             truncated = stopped_at_token_limit()
+            usage = usage_totals()
             # Spans only now: the sources frame went out before there was an answer.
             cited = attach_spans(answer, outcome.cited, selected)
             citation_retry_used = outcome.retry_used
@@ -1140,6 +1211,7 @@ class RagPipeline:
                         condensed_question=condensed_question,
                         history_message_count=len(truncated_history),
                         citation_retry_used=citation_retry_used,
+                        usage=usage,
                     )
                 )
             finalized = True
@@ -1153,6 +1225,7 @@ class RagPipeline:
                 "answer_status": status,
                 "top_rerank_score": _top_rerank_score(phase),
                 "truncated": truncated,
+                "usage": usage_dict(usage),
             }
             if (
                 effective_settings.followups_enabled

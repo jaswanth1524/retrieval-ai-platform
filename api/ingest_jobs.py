@@ -17,6 +17,7 @@ from api.corpus import bump_corpus_generation
 from api.documents import (
     DocumentError,
     DocumentNotFoundError,
+    DocumentSource,
     UnsupportedDocumentError,
     normalize_filename,
 )
@@ -172,6 +173,8 @@ def run_ingest_job(
     sequence: int | None = None,
     handle: JobHandle | None = None,
     tags: tuple[str, ...] | None = None,
+    source: DocumentSource | None = None,
+    dedupe: bool = False,
 ) -> None:
     """Background-executor entry point: parse/chunk/embed/index and update job status.
 
@@ -237,24 +240,32 @@ def run_ingest_job(
             precondition=check_sequence,
             before_first_write=handle.begin_write if handle is not None else None,
             tags=tags,
+            source=source,
+            dedupe=dedupe,
         )
     except IngestCancelledError as exc:
         # Asked for, not a fault: one line, no traceback.
         logger.info("Ingest job %s for %r cancelled.", job_id, filename)
         ingest_job_seconds.labels(outcome="failed").observe(time.monotonic() - started)
         ingest_jobs_total.labels(outcome="failed", error_type="cancelled").inc()
-        job_store.update(job_id, state="failed", error=job_error_message(exc))
+        job_store.update(
+            job_id, state="failed", error=job_error_message(exc), error_type="cancelled"
+        )
         return
     except Exception as exc:
         logger.warning("Ingest job %s for %r failed: %s", job_id, filename, exc, exc_info=True)
         ingest_job_seconds.labels(outcome="failed").observe(time.monotonic() - started)
-        ingest_jobs_total.labels(outcome="failed", error_type=ingest_error_type(exc)).inc()
-        job_store.update(job_id, state="failed", error=job_error_message(exc))
+        error_type = ingest_error_type(exc)
+        ingest_jobs_total.labels(outcome="failed", error_type=error_type).inc()
+        job_store.update(
+            job_id, state="failed", error=job_error_message(exc), error_type=error_type
+        )
         return
 
     ingest_job_seconds.labels(outcome="done").observe(time.monotonic() - started)
     ingest_jobs_total.labels(outcome="done", error_type=NO_ERROR_TYPE).inc()
-    ingest_chunks_total.inc(outcome.chunks_ingested)
+    if not outcome.unchanged:  # nothing was indexed
+        ingest_chunks_total.inc(outcome.chunks_ingested)
     job_store.update(
         job_id,
         state="done",
@@ -265,6 +276,7 @@ def run_ingest_job(
             "sections_parsed": outcome.sections_parsed,
             "chunks_ingested": outcome.chunks_ingested,
             "collection_name": outcome.collection_name,
+            "unchanged": outcome.unchanged,
         },
     )
 
@@ -301,6 +313,8 @@ def enqueue_ingest(
     uploaded_at: float | None = None,
     precondition: Callable[[], None] | None = None,
     tags: tuple[str, ...] | None = None,
+    source: DocumentSource | None = None,
+    dedupe: bool = False,
 ) -> DocumentJobAcceptedResponse:
     """Admit ``content`` against the backlog, create its job, and start it. Blocking.
 
@@ -354,6 +368,8 @@ def enqueue_ingest(
             sequence,
             handle,
             tags,
+            source,
+            dedupe,
         )
     except RuntimeError as exc:
         # The executor is shut down (the process is stopping). The job already exists,
@@ -547,7 +563,7 @@ def delete_indexed_document(
                 repository.delete_by_ids(settings, point_ids)
                 # Right away, not after the original below: if removing that
                 # raises, cached answers must still stop citing the deleted points.
-                bump_corpus_generation([filename])
+                bump_corpus_generation([filename], collection=settings.qdrant_collection)
             # Also when no points remain: an original orphaned by an earlier failed
             # ingest was otherwise undeletable, since the 404 came first.
             removed_original = _delete_original(raw_store, filename, points_gone=bool(point_ids))

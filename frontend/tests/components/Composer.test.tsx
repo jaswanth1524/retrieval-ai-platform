@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import Composer from '../../src/components/Composer';
@@ -491,5 +491,44 @@ describe('Composer length limit', () => {
 
     await userEvent.clear(textarea);
     expect(screen.queryByTestId('question-length-note')).not.toBeInTheDocument();
+  });
+});
+
+describe('popover focus', () => {
+  it('closes the scope popover when focus moves out of it, not on a click inside', async () => {
+    render(<Composer {...baseProps({ indexedFilenames: ['a.md', 'b.md'] })} />);
+    await userEvent.click(screen.getByTestId('composer-scope-button'));
+    const popover = screen.getByTestId('composer-scope-popover');
+    // Inside: stays open.
+    fireEvent.focusIn(popover.querySelector('input') as HTMLElement);
+    expect(screen.getByTestId('composer-scope-popover')).toBeInTheDocument();
+    // Out to the question box: closes.
+    act(() => screen.getByTestId('question-textarea').focus());
+    expect(screen.queryByTestId('composer-scope-popover')).toBeNull();
+  });
+});
+
+describe('touch keyboards', () => {
+  it('Enter starts a new line on a coarse pointer, and the button sends', async () => {
+    const matchMedia = vi.fn((query: string) => ({
+      matches: query === '(pointer: coarse)',
+      media: query,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+    vi.stubGlobal('matchMedia', matchMedia);
+    try {
+      const onSubmit = vi.fn();
+      render(<Composer {...baseProps({ onSubmit })} />);
+      const box = screen.getByTestId('question-textarea');
+      await userEvent.type(box, 'first line{Enter}second line');
+      expect(onSubmit).not.toHaveBeenCalled();
+      expect(box).toHaveValue('first line\nsecond line');
+      expect(screen.queryByText(/⇧⏎ newline/)).toBeNull();
+      await userEvent.click(screen.getByTestId('question-submit'));
+      expect(onSubmit).toHaveBeenCalledWith('first line\nsecond line');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

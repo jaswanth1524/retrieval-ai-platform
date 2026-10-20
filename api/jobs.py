@@ -61,6 +61,10 @@ class IngestJob:
     # The workspace the document is indexed into ("" = the default): a job is only
     # visible (and cancellable) from its own workspace, as its filename and error are.
     workspace: str = ""
+    # Why a failed job failed, coarsely (api.ingest_jobs.ingest_error_type): "document"
+    # is the file itself (unparseable, unsupported, empty), which sending it again won't
+    # change; the rest are the server's state at the time.
+    error_type: str | None = None
 
 
 class IngestBacklog:
@@ -130,6 +134,8 @@ class JobStore(Protocol):
 
     def update(self, job_id: str, **fields: object) -> None: ...
 
+    def list_active(self, workspace: str) -> list[IngestJob]: ...
+
 
 class IngestJobStore:
     """Thread-safe in-memory store for background ingest job status."""
@@ -168,6 +174,16 @@ class IngestJobStore:
             for key, value in fields.items():
                 setattr(job, key, value)
 
+    def list_active(self, workspace: str) -> list[IngestJob]:
+        """``workspace``'s queued and running jobs, oldest first (copies)."""
+
+        with self._lock:
+            return [
+                replace(job)
+                for job in self._jobs.values()
+                if job.workspace == workspace and job.state not in TERMINAL_STATES
+            ]
+
     def _prune_finished_locked(self) -> None:
         """Evict oldest-first to stay within the cap, finished jobs first.
 
@@ -201,7 +217,8 @@ class IngestJobStore:
 
 
 _JOB_COLUMNS = (
-    "id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall, workspace"
+    "id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall, "
+    "workspace, error_type"
 )
 
 
@@ -216,6 +233,7 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         result_json,
         created_at_wall,
         workspace,
+        error_type,
     ) = row
     return IngestJob(
         id=str(job_id),
@@ -227,6 +245,7 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         result=None if result_json is None else json.loads(result_json),
         created_at_wall=float(created_at_wall),
         workspace=str(workspace),
+        error_type=None if error_type is None else str(error_type),
     )
 
 
@@ -259,7 +278,8 @@ class SqliteIngestJobStore:
                     error TEXT,
                     result_json TEXT,
                     created_at_wall REAL NOT NULL,
-                    workspace TEXT NOT NULL DEFAULT ''
+                    workspace TEXT NOT NULL DEFAULT '',
+                    error_type TEXT
                 )
                 """
             )
@@ -267,6 +287,8 @@ class SqliteIngestJobStore:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
             if "workspace" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
+            if "error_type" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN error_type TEXT")
             # Only this process runs jobs (one uvicorn worker), so anything still
             # non-terminal at startup belonged to a process that died mid-ingest. Left
             # as-is, a client polling it would wait forever.
@@ -308,6 +330,16 @@ class SqliteIngestJobStore:
             ).fetchone()
         return None if row is None else _row_to_job(row)
 
+    def list_active(self, workspace: str) -> list[IngestJob]:
+        terminal = ", ".join("?" for _ in TERMINAL_STATES)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE workspace = ? "
+                f"AND state NOT IN ({terminal}) ORDER BY created_at_wall, rowid",
+                (workspace, *TERMINAL_STATES),
+            ).fetchall()
+        return [_row_to_job(row) for row in rows]
+
     def update(self, job_id: str, **fields: object) -> None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -320,7 +352,7 @@ class SqliteIngestJobStore:
                 setattr(job, key, value)
             conn.execute(
                 "UPDATE jobs SET filename=?, state=?, chunks_total=?, chunks_done=?, "
-                "error=?, result_json=? WHERE id=?",
+                "error=?, result_json=?, error_type=? WHERE id=?",
                 (
                     job.filename,
                     job.state,
@@ -328,6 +360,7 @@ class SqliteIngestJobStore:
                     job.chunks_done,
                     job.error,
                     None if job.result is None else json.dumps(job.result),
+                    job.error_type,
                     job_id,
                 ),
             )

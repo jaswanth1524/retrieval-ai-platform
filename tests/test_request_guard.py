@@ -123,7 +123,14 @@ def test_an_undeclared_body_is_cut_off_once_it_passes_the_limit() -> None:
 def test_open_routes_are_never_guarded() -> None:
     for path in ("/health", "/health/ready", "/config", "/", "/assets/app.js", "/documentsx"):
         assert not is_guarded_path(path)
-    for path in ("/documents", "/documents/a.pdf/original", "/questions/stream", "/metrics"):
+    for path in (
+        "/documents",
+        "/documents/a.pdf/original",
+        "/questions/stream",
+        "/metrics",
+        "/watch",
+        "/watch/scan",
+    ):
         assert is_guarded_path(path)
 
     downstream, sent, _ = _run(_settings(api_key="secret"), path="/config", method="GET")
@@ -163,12 +170,19 @@ def test_full_key_routes() -> None:
         ("GET", "/metrics"),
         ("GET", "/feedback"),
         ("GET", "/export"),
+        ("POST", "/watch/scan"),
+        ("POST", "/documents/a.pdf/refresh"),
+        ("POST", "/documents/a.pdf/versions/123/restore"),
+        ("GET", "/query-log"),
     ]:
         assert needs_full_key(method, path), (method, path)
     for method, path in [
         ("GET", "/documents"),
         ("GET", "/documents/a.pdf/content"),
         ("GET", "/documents/jobs/x"),
+        ("GET", "/documents/jobs"),
+        ("GET", "/watch"),
+        ("GET", "/documents/a.pdf/versions"),
         ("POST", "/questions/stream"),
         ("POST", "/feedback"),
         ("GET", "/traces"),

@@ -1,5 +1,27 @@
 export interface HealthResponse {
   status: string;
+  /** The server's DocRAG version; absent on older servers. */
+  version?: string;
+}
+
+/** GET /health/ready (open; 503 with the same body when degraded). The index check is
+ *  of the default workspace's collection. */
+export interface ReadinessResponse {
+  status: 'ok' | 'degraded';
+  qdrant: boolean;
+  generation_provider: boolean;
+  llm_provider: string;
+  /** False when the index was built for another embedding setup (questions get 409). */
+  index_compatible?: boolean;
+  index_detail?: string | null;
+  /** Uploaded originals are kept (RAW_DOCUMENT_DIR): a backup can rebuild the index. */
+  originals_kept?: boolean;
+}
+
+/** Tokens the provider reported for an answer's LLM calls. */
+export interface UsageResponse {
+  prompt_tokens: number;
+  completion_tokens: number;
 }
 
 // 'unauthorized' is distinct from 'error' on purpose: the server is reachable and
@@ -47,6 +69,31 @@ export interface PublicConfigResponse {
   allowed_request_providers?: string[];
   // Upload suffixes the server accepts (".pdf", ".epub", ...); absent on older servers.
   supported_extensions?: string[];
+  /** WATCH_DIR is set: GET /watch and POST /watch/scan exist. */
+  watch_enabled?: boolean;
+  /** ANSWER_LANGUAGE: "" = the model's choice, "match" = the question's language. */
+  answer_language?: string;
+  /** SUMMARY_MAX_DOCUMENTS: the most documents one brief covers; absent on older servers. */
+  summary_max_documents?: number;
+}
+
+/** A watched file waiting to be tried again after a failure. */
+export interface WatchRetry {
+  filename: string;
+  attempts: number;
+  next_attempt_at: number;
+  error: string;
+}
+
+/** GET /watch: the watched folder as of the watcher's last pass. */
+export interface WatchStatusResponse {
+  folder: string;
+  last_scan_at: number | null;
+  files: number;
+  problems: string[];
+  deferred: string[];
+  retrying: WatchRetry[];
+  gave_up: string[];
 }
 
 /** What the caller's API key unlocks (GET /access). */
@@ -126,6 +173,8 @@ export interface DocumentIngestResponse {
   sections_parsed: number;
   chunks_ingested: number;
   collection_name: string;
+  /** Already indexed from identical bytes: left as it was. */
+  unchanged?: boolean;
 }
 
 export type IngestJobState = 'queued' | 'parsing' | 'embedding' | 'done' | 'failed';
@@ -152,6 +201,21 @@ export interface DocumentJobStatusResponse {
   result: DocumentIngestResponse | null;
   /** Stopped by DELETE /documents/jobs/{id} (state "failed"). */
   cancelled?: boolean;
+  /** Unix time the job was accepted. */
+  created_at?: number | null;
+  /** Found the document already indexed from identical bytes; nothing re-embedded. */
+  unchanged?: boolean;
+}
+
+/** GET /documents/jobs: queued and running jobs, whoever started them. */
+export interface DocumentJobListResponse {
+  jobs: DocumentJobStatusResponse[];
+}
+
+/** POST /documents/{f}/refresh when the source said nothing changed. */
+export interface DocumentRefreshResponse {
+  filename: string;
+  unchanged: boolean;
 }
 
 export interface DocumentListResponse {
@@ -168,6 +232,8 @@ export interface DocumentListResponse {
   reindexable_filenames?: string[];
   /** Tagged documents only; an untagged one is absent. */
   tags?: Record<string, string[]>;
+  /** Documents fetched by URL: where from (POST /documents/{f}/refresh fetches again). */
+  source_urls?: Record<string, string>;
 }
 
 export interface DocumentTagsResponse {
@@ -281,7 +347,8 @@ export type LlmProvider = 'ollama' | 'openai' | 'openai_compatible' | 'anthropic
 /** A whole-document task (POST /questions/summary): summarize one document, or
  *  compare two. Kept on the turn that asked it, so Retry and Regenerate repeat it. */
 export interface DocumentTask {
-  mode: 'summarize' | 'compare';
+  /** One document summarized, two compared, or several in one brief. */
+  mode: 'summarize' | 'compare' | 'brief';
   filenames: string[];
   /** What to concentrate on; a general summary when absent. */
   instruction?: string;
@@ -389,4 +456,5 @@ export interface TraceDetailResponse {
   citation_retry_used?: boolean;
   /** The X-Request-ID of the request that produced it, for finding its log lines. */
   request_id?: string | null;
+  usage?: UsageResponse | null;
 }

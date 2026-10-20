@@ -14,10 +14,12 @@ citation still carries filename, page, section and chunk_id.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
@@ -38,21 +40,34 @@ from api.llm import (
     ChatGenerator,
     ChatMessage,
     GenerationError,
+    add_usage,
+    begin_usage,
     completion_model_and_kwargs,
     effective_max_tokens,
     reset_finish_reason,
     stopped_at_token_limit,
+    usage_totals,
 )
-from api.pipeline import DoneEvent, QuestionAbandoned, StreamEvent, timings_dict
+from api.pipeline import (
+    DoneEvent,
+    QuestionAbandoned,
+    StreamEvent,
+    timings_dict,
+    usage_dict,
+    usage_tuple,
+)
 from api.prompting import (
     CHARS_PER_TOKEN_ESTIMATE,
     INSUFFICIENT_CONTEXT_ANSWER,
+    clip_to_weight,
     context_window_tokens,
     format_context_chunk,
     one_line,
+    weighted_length,
+    with_answer_language,
 )
 from api.repository import VectorRepository
-from api.request_id import current_request_id
+from api.request_id import current_request_id, submit_in_context
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
 from api.settings import AppSettings
@@ -61,7 +76,7 @@ from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
 
-SummaryMode = Literal["summarize", "compare"]
+SummaryMode = Literal["summarize", "compare", "brief"]
 
 # What a part's notes say when nothing in it bears on the task; such notes are left out
 # of the combining step.
@@ -116,9 +131,14 @@ class SummaryResult:
 def task_description(request: SummaryRequest) -> str:
     """The task as the model (and the trace list) sees it."""
 
-    names = " and ".join(f'"{one_line(name)}"' for name in request.filenames)
+    quoted = [f'"{one_line(name)}"' for name in request.filenames]
+    names = (
+        " and ".join(quoted) if len(quoted) <= 2 else ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
+    )
     if request.mode == "compare":
         task = f"Compare the documents {names}."
+    elif request.mode == "brief":
+        task = f"Write one brief covering the documents {names}."
     else:
         task = f"Summarize the document {names}."
     if request.instruction and request.instruction.strip():
@@ -158,7 +178,9 @@ def _header_size(chunk: RerankedChunk) -> int:
 
 
 def _packed_size(chunk: RerankedChunk) -> int:
-    return len(chunk.text) + _header_size(chunk)
+    # Weighted: the budget is in characters at CHARS_PER_TOKEN_ESTIMATE per token, and a
+    # CJK character is a whole token.
+    return weighted_length(chunk.text) + _header_size(chunk)
 
 
 def _pack(chunks: Sequence[RerankedChunk], budget: int) -> list[list[RerankedChunk]]:
@@ -174,7 +196,8 @@ def _pack(chunks: Sequence[RerankedChunk], budget: int) -> list[list[RerankedChu
             # header let a long filename and section push the part past the budget. A
             # header can't outgrow it (names ≤ 255, sections ≤ MAX_SECTION_CHARS, a
             # budget ≥ _MIN_BATCH_CHARS), but a passage always keeps some text.
-            chunk = replace(chunk, text=chunk.text[: max(budget - _header_size(chunk), 1)])
+            kept = clip_to_weight(chunk.text, max(budget - _header_size(chunk), 1))
+            chunk = replace(chunk, text=kept or chunk.text[:1])
         size = _packed_size(chunk)
         if current and used + size > budget:
             parts.append(current)
@@ -259,8 +282,15 @@ def build_notes_messages(
     part_index: int,
     part_count: int,
     part: Sequence[tuple[int, RerankedChunk]],
+    *,
+    several_documents: bool = False,
 ) -> list[ChatMessage]:
-    """The prompt that turns one part of a document into cited notes."""
+    """The prompt that turns one part of a document into cited notes.
+
+    ``several_documents`` (compare, brief): a part shows one document while the task
+    names all of them, and without saying so the model answered NOTHING RELEVANT for a
+    part that plainly covered its own document's side.
+    """
 
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -272,7 +302,14 @@ def build_notes_messages(
                 f"{_numbered_context(part)}\n\n"
                 "Instructions:\n"
                 "- Write concise notes on what these excerpts say that bears on the task.\n"
-                "- Use only the excerpts. Cite every note with its source numbers, such as [3].\n"
+                + (
+                    "- They come from one of the documents; the others are read separately. "
+                    "Note what these say that the task will need, even if they cover only "
+                    "one side of it.\n"
+                    if several_documents
+                    else ""
+                )
+                + "- Use only the excerpts. Cite every note with its source numbers, such as [3].\n"
                 f"- If nothing in them bears on the task, reply exactly: {NOTHING_RELEVANT}"
             ),
         },
@@ -291,6 +328,12 @@ def _final_instructions(mode: SummaryMode) -> str:
             0,
             "- Organize the answer as: what both documents say, where they differ, and "
             "what only one of them covers.",
+        )
+    elif mode == "brief":
+        lines.insert(
+            0,
+            "- Organize the answer by theme, not document by document; say which document "
+            "a point comes from when only some of them make it, and where they disagree.",
         )
     return "Instructions:\n" + "\n".join(lines)
 
@@ -358,7 +401,7 @@ def summary_cache_key(request: SummaryRequest, settings: AppSettings) -> CacheKe
         int(settings.summary_max_tokens),
         int(settings.summary_batch_chars),
         int(settings.summary_max_batches),
-        corpus_generation(),
+        corpus_generation(settings.qdrant_collection),
     )
 
 
@@ -398,6 +441,12 @@ class DocumentSummarizer:
         """
 
         self._repository.ensure_ready(self._settings)
+        limit = int(self._settings.summary_max_documents)
+        if len(filenames) > limit:
+            raise SummaryTooLargeError(
+                f"A brief covers at most {limit} documents (SUMMARY_MAX_DOCUMENTS); "
+                f"{len(filenames)} were named."
+            )
         for filename in filenames:
             self._checked_count(self._settings, filename)
 
@@ -411,6 +460,74 @@ class DocumentSummarizer:
                 f"({SUMMARY_MAX_DOCUMENT_CHUNKS}). Ask questions about it instead."
             )
         return count
+
+    def _part_notes(
+        self,
+        task: str,
+        jobs: Sequence[tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]],
+        settings: AppSettings,
+        should_stop: Callable[[], bool] | None,
+        steps: int,
+    ) -> Generator[StreamEvent, None, list[str]]:
+        """Each part's notes, in part order, yielding a ``summarizing`` stage frame as
+        each starts (one at a time) or finishes (several at once).
+
+        Several at once (SUMMARY_PARALLEL_PARTS) with a hosted provider, where requests
+        run side by side; one at a time with Ollama, which generates one at a time and
+        only queues the rest. Parts run on pool threads in this request's context; their
+        token usage is added to this thread's count, which is what the answer reports.
+        """
+
+        def stop_requested() -> bool:
+            return should_stop is not None and should_stop()
+
+        several_documents = len({job[0] for job in jobs}) > 1
+
+        def note(job: tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]) -> str:
+            filename, index, count, excerpts = job
+            messages = build_notes_messages(
+                task, filename, index, count, excerpts, several_documents=several_documents
+            )
+            return self._generator.complete(messages, settings).strip()
+
+        width = int(settings.summary_parallel_parts)
+        if settings.llm_provider.lower().strip() == "ollama" or width <= 1 or len(jobs) <= 1:
+            texts: list[str] = []
+            for step, job in enumerate(jobs, start=1):
+                if stop_requested():
+                    raise QuestionAbandoned
+                yield {"type": "stage", "stage": "summarizing", "step": step, "steps": steps}
+                texts.append(note(job))
+            return texts
+
+        def counted(job: tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]):  # type: ignore[no-untyped-def]
+            begin_usage()
+            return note(job), usage_totals()
+
+        results: dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=min(width, len(jobs))) as pool:
+            futures = {
+                submit_in_context(pool, functools.partial(counted, job)): position
+                for position, job in enumerate(jobs)
+            }
+            try:
+                for done_count, future in enumerate(as_completed(futures), start=1):
+                    text, usage = future.result()
+                    add_usage(usage)
+                    results[futures[future]] = text
+                    if stop_requested():
+                        raise QuestionAbandoned
+                    yield {
+                        "type": "stage",
+                        "stage": "summarizing",
+                        "step": done_count,
+                        "steps": steps,
+                    }
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+        return [results[position] for position in range(len(jobs))]
 
     def _document_chunks(self, settings: AppSettings, filename: str) -> list[RerankedChunk]:
         self._checked_count(settings, filename)
@@ -434,6 +551,7 @@ class DocumentSummarizer:
             cached=done.get("cached", False),
             answer_status=done.get("answer_status", "answered"),
             truncated=done.get("truncated", False),
+            usage=usage_tuple(done.get("usage")),
         )
         return SummaryResult(grounded, done.get("chunks_read", 0), done.get("chunks_total", 0))
 
@@ -474,28 +592,28 @@ class DocumentSummarizer:
                     "chunks_total": total,
                 }
                 return
-        done: DoneEvent | None = None
         events = self._run(request, settings, should_stop, mode, stream=mode == "stream")
         try:
             for event in events:
-                if event["type"] == "done":
-                    done = event
+                # Cached before the `done` frame goes out, as answers are: a client that
+                # leaves as it arrives closes this generator at the yield, and a store
+                # after the loop never ran.
+                if event["type"] == "done" and key is not None and self._answer_cache is not None:
+                    self._answer_cache.put(
+                        key,
+                        CachedAnswer(
+                            event["answer"],
+                            tuple(citation_from_dict(source) for source in event["sources"]),
+                            event["trace_id"],
+                            event.get("answer_status", "answered"),
+                            None,
+                            event.get("truncated", False),
+                            coverage=(event.get("chunks_read", 0), event.get("chunks_total", 0)),
+                        ),
+                    )
                 yield event
         finally:
             events.close()
-        if key is not None and done is not None and self._answer_cache is not None:
-            self._answer_cache.put(
-                key,
-                CachedAnswer(
-                    done["answer"],
-                    tuple(citation_from_dict(source) for source in done["sources"]),
-                    done["trace_id"],
-                    done.get("answer_status", "answered"),
-                    None,
-                    done.get("truncated", False),
-                    coverage=(done.get("chunks_read", 0), done.get("chunks_total", 0)),
-                ),
-            )
 
     def _run(
         self,
@@ -520,6 +638,7 @@ class DocumentSummarizer:
             cited: Sequence[int] = (),
             timings: StageTimings | None = None,
             error: str | None = None,
+            usage: tuple[int, int] | None = None,
         ) -> None:
             if self._trace_store is None or trace_id is None:
                 return
@@ -547,6 +666,7 @@ class DocumentSummarizer:
                     error=error,
                     request_id=current_request_id(),
                     workspace=workspace_of(self._settings),
+                    usage=usage,
                 )
             )
 
@@ -558,11 +678,13 @@ class DocumentSummarizer:
             chunks_total = 0
             for filename in request.filenames:
                 chunks = self._document_chunks(settings, filename)
-                if not chunks and request.mode == "compare":
+                if not chunks and request.mode != "summarize":
                     # Compared with nothing, the other document would be "compared"
                     # alone and the answer would read as if both had been.
                     raise NothingToCompareError(
-                        f"'{filename}' has no readable text to compare (its passages are empty)."
+                        f"'{filename}' has no readable text to "
+                        f"{'compare' if request.mode == 'compare' else 'cover'} "
+                        "(its passages are empty)."
                     )
                 chunks_total += len(chunks)
                 readable.append((filename, chunks))
@@ -611,6 +733,8 @@ class DocumentSummarizer:
                 return
 
             generate_start = time.monotonic()
+            # Every call from here on (notes, the answer, a citation retry) is counted.
+            begin_usage()
             part_total = sum(len(doc_parts) for _, doc_parts in numbered)
             # Everything read fits one part (one document's, or two short ones to
             # compare): answer in one call rather than notes per document plus a combine.
@@ -618,35 +742,33 @@ class DocumentSummarizer:
                 everything = [
                     pair for _, doc_parts in numbered for part in doc_parts for pair in part
                 ]
-                final_messages = build_direct_messages(task, request.mode, everything)
+                final_messages = with_answer_language(
+                    build_direct_messages(task, request.mode, everything), settings
+                )
             else:
+                jobs = [
+                    (filename, index, len(doc_parts), excerpts)
+                    for filename, doc_parts in numbered
+                    for index, excerpts in enumerate(doc_parts, start=1)
+                ]
                 notes: list[tuple[str, int, int, str]] = []
-                step = 0
-                for filename, doc_parts in numbered:
-                    for index, excerpts in enumerate(doc_parts, start=1):
-                        step += 1
-                        if should_stop is not None and should_stop():
-                            raise QuestionAbandoned
-                        yield {
-                            "type": "stage",
-                            "stage": "summarizing",
-                            "step": step,
-                            "steps": part_total,
-                        }
-                        text = self._generator.complete(
-                            build_notes_messages(task, filename, index, len(doc_parts), excerpts),
-                            settings,
-                        ).strip()
-                        # Only a reply that is the marker: notes that merely mention
-                        # it ("... not NOTHING RELEVANT here [2]") still carry findings.
-                        if text and text.strip(" .").upper() != NOTHING_RELEVANT:
-                            notes.append((filename, index, len(doc_parts), text))
+                for (filename, index, count, _), text in zip(
+                    jobs,
+                    (yield from self._part_notes(task, jobs, settings, should_stop, part_total)),
+                    strict=True,
+                ):
+                    # Only a reply that is the marker: notes that merely mention it
+                    # ("... not NOTHING RELEVANT here [2]") still carry findings.
+                    if text and text.strip(" .").upper() != NOTHING_RELEVANT:
+                        notes.append((filename, index, count, text))
                 if not notes:
                     notes.append(("the documents", 1, 1, NOTHING_RELEVANT))
                 if should_stop is not None and should_stop():
                     raise QuestionAbandoned
                 yield {"type": "stage", "stage": "combining"}
-                final_messages = build_combine_messages(task, request.mode, notes, budget)
+                final_messages = with_answer_language(
+                    build_combine_messages(task, request.mode, notes, budget), settings
+                )
 
             final_settings = settings.model_copy(
                 update={"llm_max_tokens": int(settings.summary_max_tokens)}
@@ -679,6 +801,7 @@ class DocumentSummarizer:
             answer = outcome.answer
             final_messages = list(outcome.prompt_messages)
             truncated = stopped_at_token_limit()
+            usage = usage_totals()
             cited = attach_spans(answer, outcome.cited, selected)
             timings = _elapsed_timings(
                 started,
@@ -692,6 +815,7 @@ class DocumentSummarizer:
                 answer=answer,
                 cited=[source.source_number for source in cited],
                 timings=timings,
+                usage=usage,
             )
             finalized = True
             yield {
@@ -704,6 +828,7 @@ class DocumentSummarizer:
                 "truncated": truncated,
                 "chunks_read": chunks_read,
                 "chunks_total": chunks_total,
+                "usage": usage_dict(usage),
             }
         except QuestionAbandoned:
             return

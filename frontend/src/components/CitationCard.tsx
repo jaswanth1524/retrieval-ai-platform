@@ -11,6 +11,9 @@ interface CitationCardProps {
   onOpen?: () => void;
   onHoverStart?: () => void;
   onHoverEnd?: () => void;
+  /** Rate this source as not relevant to the answer (feedback on); once per source. */
+  onNotRelevant?: () => void;
+  markedNotRelevant?: boolean;
 }
 
 function CitationCard({
@@ -22,9 +25,11 @@ function CitationCard({
   onOpen,
   onHoverStart,
   onHoverEnd,
+  onNotRelevant,
+  markedNotRelevant = false,
 }: CitationCardProps) {
   const trigger = usePreviewTrigger({ onOpen, onHoverStart, onHoverEnd });
-  return (
+  const card = (
     <button
       type="button"
       className="citation-card"
@@ -38,6 +43,28 @@ function CitationCard({
         {pageLabel(page, pageEnd)} &middot; {section}
       </span>
     </button>
+  );
+  if (!onNotRelevant && !markedNotRelevant) return card;
+  return (
+    <span className="citation-card-wrap">
+      {card}
+      <button
+        type="button"
+        className="citation-card__irrelevant"
+        onClick={onNotRelevant}
+        disabled={markedNotRelevant || !onNotRelevant}
+        aria-pressed={markedNotRelevant}
+        aria-label={
+          markedNotRelevant
+            ? `Source ${sourceNumber} marked not relevant`
+            : `Mark source ${sourceNumber} not relevant`
+        }
+        title={markedNotRelevant ? 'Marked not relevant' : 'Not relevant to this answer'}
+        data-testid="citation-not-relevant"
+      >
+        {markedNotRelevant ? '✓ not relevant' : '✕'}
+      </button>
+    </span>
   );
 }
 

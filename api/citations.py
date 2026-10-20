@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -17,8 +19,17 @@ from api.llm import (
     reset_finish_reason,
 )
 from api.metrics import citation_retries_total
+from api.prompting import (
+    CHARS_PER_TOKEN_ESTIMATE,
+    clip_text,
+    clip_to_weight,
+    estimate_prompt_tokens,
+    prompt_token_budget,
+)
 from api.reranking import RerankedChunk
 from api.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 # One bracketed citation marker: [3], and the list/range forms models also write —
 # [1, 2], [1-3], [1–3], [1, 3-4]. Matching only [3] counted "[1, 2]" as uncited, which
@@ -31,6 +42,20 @@ _CITATION_RE = re.compile(
 
 
 _CITATION_RANGE_SEP = re.compile(r"\s*[-–]\s*")
+
+
+# A marker with the space before it ("... days [1]."), so stripping leaves "... days.".
+_MARKER_WITH_SPACE_RE = re.compile(r"[ \t]*" + _CITATION_RE.pattern)
+
+
+def strip_citation_markers(text: str) -> str:
+    """``text`` without its ``[n]`` citation markers (lists, ranges and runs too).
+
+    For earlier answers sent back as conversation history: their numbers named the
+    sources of the turn they answered, not this one's.
+    """
+
+    return _MARKER_WITH_SPACE_RE.sub("", text).strip()
 
 
 CITATION_EXCERPT_MAX_CHARS = 200
@@ -54,7 +79,42 @@ _INSUFFICIENCY_HINTS = (
     "do not contain",
     "does not contain",
     "cannot answer",
+    # The same for the multilingual profile's languages (es, de, fr, pt, it), written
+    # without accents: both sides are compared accent-stripped (_fold), so "información"
+    # and "informacion" both match.
+    "suficiente informacion",
+    "informacion suficiente",
+    "no contienen",
+    "no contiene",
+    "no puedo responder",
+    "nicht genugend informationen",
+    "nicht genug informationen",
+    "keine ausreichenden informationen",
+    "enthalten nicht",
+    "enthalt nicht",
+    "nicht beantworten",
+    "pas suffisamment d'informations",
+    "pas assez d'informations",
+    "informations insuffisantes",
+    "ne contiennent pas",
+    "ne contient pas",
+    "ne peux pas repondre",
+    "informacoes suficientes",
+    "informacao suficiente",
+    "nao contem",
+    "nao posso responder",
+    "informazioni sufficienti",
+    "non contengono",
+    "non contiene",
+    "non posso rispondere",
 )
+
+
+def _fold(text: str) -> str:
+    """Lower-cased and accent-stripped ("Información" -> "informacion")."""
+
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
 def _normalize_negation(text: str) -> str:
@@ -387,8 +447,57 @@ def answer_status(answer: str, cited_count: int, source_count: int) -> str:
 
 
 def _states_insufficiency(answer: str) -> bool:
-    lowered = _normalize_negation(answer.lower())
+    lowered = _normalize_negation(_fold(answer))
     return any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
+
+
+# Below this much of the first answer, a retry has too little to rewrite: skipped.
+_MIN_RETRY_ANSWER_TOKENS = 64
+
+
+def retry_messages(
+    prompt_messages: Sequence[ChatMessage], first_answer: str, settings: AppSettings
+) -> list[ChatMessage] | None:
+    """The retry's continuation of the grounded prompt, fitted to the context window.
+
+    The prompt was fitted with room for one answer; the retry adds that answer and a
+    reminder on top, which could run past the window, and a local model then silently
+    drops the *front* of the prompt — the grounding rules. Over budget, the history
+    goes first (``[system, *history, user]``: the sources are in the last message, so
+    their numbering is untouched), then the first answer is clipped; when even that
+    leaves too little of it, None (no retry). An unknown window changes nothing.
+    """
+
+    def build(head: Sequence[ChatMessage], answer: str) -> list[ChatMessage]:
+        return [
+            *head,
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": CITATION_RETRY_REMINDER},
+        ]
+
+    messages = build(prompt_messages, first_answer)
+    budget = prompt_token_budget(settings)
+    if budget is None or estimate_prompt_tokens(messages) <= budget:
+        return messages
+    head = (
+        [*prompt_messages[:1], *prompt_messages[-1:]]
+        if len(prompt_messages) > 2
+        else list(prompt_messages)
+    )
+    messages = build(head, first_answer)
+    if estimate_prompt_tokens(messages) <= budget:
+        return messages
+    spare = budget - estimate_prompt_tokens(build(head, ""))
+    if spare < _MIN_RETRY_ANSWER_TOKENS:
+        return None
+    # clip_text may add one character ("…"); clipped by weight, so a CJK answer fits too.
+    clipped = clip_text(
+        clip_to_weight(first_answer, spare * CHARS_PER_TOKEN_ESTIMATE - 1),
+        spare * CHARS_PER_TOKEN_ESTIMATE - 1,
+    )
+    if clipped != first_answer and not clipped.endswith("…"):
+        clipped = f"{clipped}…"
+    return build(head, clipped)
 
 
 def retry_uncited_answer(
@@ -409,11 +518,13 @@ def retry_uncited_answer(
     derivation that could silently drift from the one generation actually used.
     """
 
-    messages: list[ChatMessage] = [
-        *prompt_messages,
-        {"role": "assistant", "content": first_answer},
-        {"role": "user", "content": CITATION_RETRY_REMINDER},
-    ]
+    messages = retry_messages(prompt_messages, first_answer, settings)
+    if messages is None:
+        logger.info(
+            "Skipped the citation retry: the continuation would not fit the context window."
+        )
+        return None
+    citation_retries_total.inc()
     try:
         retried = generator.complete(messages, settings).strip()
     except GenerationError:
@@ -493,7 +604,6 @@ def finalize_citations(
         # attributing it to generate_ms is what made this stage invisible before.
         retry_start = time.monotonic()
         first_finish = last_finish_reason()
-        citation_retries_total.inc()
         retried = retry_uncited_answer(prompt_messages, answer, generator, settings)
         retry_ms = (time.monotonic() - retry_start) * 1000
         if retried is not None:

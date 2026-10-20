@@ -21,6 +21,7 @@ from api.dependencies import (
     get_ollama_reachability_checker,
     get_qdrant_client,
     get_qdrant_reachability_checker,
+    get_query_log_store,
     get_question_slots,
     get_rag_pipeline,
     get_request_raw_store,
@@ -32,6 +33,7 @@ from api.dependencies import (
 from api.feedback import FeedbackStore
 from api.jobs import IngestBacklog, JobStore
 from api.pipeline import IngestService, RagPipeline
+from api.query_log import QueryLogStore
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.settings import AppSettings
@@ -83,6 +85,7 @@ QuestionSlotsDep = Annotated[QuestionSlots, Depends(get_question_slots)]
 
 
 TraceStoreDep = Annotated[TraceStore, Depends(get_trace_store)]
+QueryLogDep = Annotated[QueryLogStore | None, Depends(get_query_log_store)]
 
 
 TokenCounterDep = Annotated[TokenCounter, Depends(get_token_counter)]

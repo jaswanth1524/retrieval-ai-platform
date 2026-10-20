@@ -64,6 +64,9 @@ def test_an_original_deleted_mid_export_is_skipped_not_a_failure(tmp_path: Path)
 
     assert manifest["manifest_version"] == MANIFEST_VERSION == 1
     assert originals == {"gone.txt": None, "kept.txt": "originals/kept.txt"}
+    # What the zip actually holds, not what the listing promised.
+    assert manifest["originals_missing"] == ["gone.txt"]
+    assert manifest["complete"] is False
     assert archive.read("originals/kept.txt") == b"kept bytes"
     assert "originals/gone.txt" not in archive.namelist()
 

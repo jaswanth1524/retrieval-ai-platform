@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import type { TraceSummaryResponse } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import './TracesPanel.css';
@@ -21,7 +21,11 @@ function formatLatency(totalMs: number | null): string {
   return `${(totalMs / 1000).toFixed(2)}s`;
 }
 
+type StatusFilter = 'all' | 'problems';
+
 function TracesPanel({ traces, error, onSelect }: TracesPanelProps) {
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState<StatusFilter>('all');
   if (error) {
     return (
       <p className="traces-panel__message" role="alert">
@@ -36,9 +40,39 @@ function TracesPanel({ traces, error, onSelect }: TracesPanelProps) {
     return <p className="traces-panel__message">No traces yet.</p>;
   }
 
+  // Client-side: the server lists its recent traces (a ring buffer) unfiltered.
+  const needle = query.trim().toLowerCase();
+  const shown = traces.filter(
+    (trace) =>
+      (status === 'all' || trace.status !== 'ok') &&
+      (!needle || trace.question.toLowerCase().includes(needle)),
+  );
   return (
     <>
-      {traces.map((trace) => (
+      <div className="traces-panel__filters">
+        <input
+          type="search"
+          className="traces-panel__search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Filter by question…"
+          aria-label="Filter traces by question"
+          data-testid="traces-filter"
+        />
+        <label className="traces-panel__problems mono">
+          <input
+            type="checkbox"
+            checked={status === 'problems'}
+            onChange={(event) => setStatus(event.target.checked ? 'problems' : 'all')}
+            data-testid="traces-problems-only"
+          />
+          errors &amp; no context only
+        </label>
+      </div>
+      {shown.length === 0 && (
+        <p className="traces-panel__message">No traces match.</p>
+      )}
+      {shown.map((trace) => (
         <button
           key={trace.trace_id}
           type="button"

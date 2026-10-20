@@ -36,3 +36,30 @@
   font-size: 10px;
   color: var(--dim);
 }
+
+.citation-card-wrap {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 2px;
+  max-width: 100%;
+}
+
+.citation-card__irrelevant {
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  color: var(--dim);
+  font-size: 11px;
+  padding: 0 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.citation-card__irrelevant:hover:not(:disabled) {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.citation-card__irrelevant:disabled {
+  cursor: default;
+}

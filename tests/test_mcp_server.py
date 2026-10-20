@@ -41,7 +41,14 @@ def text_of(result: Any) -> str:
 async def test_every_tool_is_listed_as_read_only(server: MCPServer) -> None:
     tools = {tool.name: tool for tool in await server.list_tools()}
 
-    assert set(tools) == {"list_documents", "search_passages", "ask", "summarize", "read_document"}
+    assert set(tools) == {
+        "list_documents",
+        "search_passages",
+        "ask",
+        "summarize",
+        "read_document",
+        "list_workspaces",
+    }
     assert all(tool.annotations and tool.annotations.read_only_hint for tool in tools.values())
 
 
@@ -70,8 +77,10 @@ async def test_tools_answer_from_the_indexed_documents_with_citations(server: MC
 async def test_server_refusals_come_back_as_readable_text(server: MCPServer) -> None:
     missing = text_of(await server.call_tool("summarize", {"filenames": ["missing.txt"]}))
     assert missing == "DocRAG error (404): No indexed document named 'missing.txt'."
-    too_many = text_of(await server.call_tool("summarize", {"filenames": ["a", "b", "c"]}))
-    assert "one document, or two" in too_many
+    none = text_of(await server.call_tool("summarize", {"filenames": []}))
+    assert "at least one document" in none
+    brief = text_of(await server.call_tool("summarize", {"filenames": ["a", "b", "c"]}))
+    assert brief.startswith("DocRAG error (404)")
     past_end = text_of(
         await server.call_tool("read_document", {"filename": "guide.txt", "start": 50})
     )
@@ -218,3 +227,45 @@ async def test_a_cancelled_tool_call_closes_the_answer_stream() -> None:
     with pytest.raises(asyncio.CancelledError):
         await call
     assert await asyncio.to_thread(closed.wait, 5)
+
+
+@pytest.mark.asyncio
+async def test_parity_tools_read_around_a_citation_and_list_workspaces(server: MCPServer) -> None:
+    passages = text_of(await server.call_tool("search_passages", {"query": "alpha"}))
+    chunk_id = passages.split("(chunk ")[1].split(",")[0]
+    around = text_of(
+        await server.call_tool(
+            "read_document", {"filename": "guide.txt", "around_chunk_id": chunk_id}
+        )
+    )
+    assert "Alpha is the first letter" in around
+    unknown = text_of(
+        await server.call_tool(
+            "read_document", {"filename": "guide.txt", "around_chunk_id": "nope"}
+        )
+    )
+    assert unknown == "guide.txt has no passage nope."
+    # A tag nothing carries: scoped search finds nothing.
+    tagged = text_of(await server.call_tool("search_passages", {"query": "alpha", "tags": ["x"]}))
+    assert "guide.txt" not in tagged
+    workspaces = text_of(await server.call_tool("list_workspaces", {}))
+    assert "not enabled" in workspaces
+
+
+def test_answers_list_the_exact_quotes_their_citations_rest_on() -> None:
+    result = StreamResult(
+        {
+            "answer": "Alpha is first [1].",
+            "sources": [
+                {
+                    "source_number": 1,
+                    "filename": "a.txt",
+                    "page": 1,
+                    "chunk_id": "c1",
+                    "spans": [{"start": 0, "end": 10, "quote": "Alpha is\nthe first letter."}],
+                }
+            ],
+        },
+        [],
+    )
+    assert '    "Alpha is the first letter."' in format_answer(result)

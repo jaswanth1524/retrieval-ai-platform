@@ -49,6 +49,16 @@ Please report it privately through the repository's **Security** tab
   `display:none`) is not indexed at all. This reduces, but cannot
   remove, the chance that a model follows instructions planted in a document. Treat
   answers about untrusted documents with the same care as the documents.
+- **Fetching URLs** (`URL_INGEST_ENABLED`, off by default) is guarded against
+  server-side request forgery: every address a host resolves to must be public
+  (`ipaddress.is_global`, with NAT64, 6to4 and IPv4-mapped forms unwrapped), the
+  connection is pinned to the address that was checked, redirects are followed by hand
+  and checked again, a URL carrying credentials is refused, and the download is capped
+  in size and time. `URL_INGEST_ALLOW_PRIVATE=true` lifts the address check: only for a
+  server whose network holds nothing a URL should reach. A fetched document's URL is
+  stored with it (for refresh) and listed to anyone holding the read key without its
+  query string (`source_urls`), which may hold a signed token; the full URL stays only in
+  the index.
 - **Containers.** The compose file runs the API read-only, as a non-root user, with no
   Linux capabilities and `no-new-privileges`; Qdrant and the API listen on 127.0.0.1
   unless `API_BIND` says otherwise. Qdrant's anonymous telemetry is turned off.
@@ -60,9 +70,25 @@ Please report it privately through the repository's **Security** tab
   in a header).
 - **Exposure.** Without `API_KEY`, anyone who can reach the port can read, change and
   delete every document. Keep it on localhost or a trusted network, or set a key.
-- **Hosted LLMs.** With `LLM_PROVIDER=openai` (or an OpenAI-compatible server), the
-  question and the retrieved passages are sent to that provider. Ingestion and
-  embeddings stay local either way.
+- **Hosted LLMs.** With `LLM_PROVIDER=openai`, `anthropic` or `openai_compatible`, the
+  question, the conversation history sent with it and the retrieved passages go to that
+  provider (a summary sends the documents' text). Ingestion and embeddings stay local
+  either way.
+- **Workspaces are not access control.** Any key that can use the API can name any
+  workspace (`X-Workspace`); they separate corpora, not users.
+- **The watched folder** (`WATCH_DIR`) indexes whatever appears in it, and with
+  `WATCH_DELETE_MISSING` deletes the documents of files removed from it. Only people
+  allowed to change the index should be able to write to that folder.
+- **The MCP server** (`docrag-mcp`) holds the API key in the MCP client's configuration
+  (`DOCRAG_API_KEY`). Give it the read-only key (`API_READ_KEY`): its tools only read.
+- **What is kept on disk.** Stored originals (`RAW_DOCUMENT_DIR`) and their earlier
+  versions (`RAW_DOCUMENT_VERSIONS`) are the uploaded files as sent; deleting a document
+  removes both, and a backup holds only the current original. The query log
+  (`QUERY_LOG_ENABLED`, off by default) keeps the text of every question and summary
+  request, with its workspace and outcome, in `QUERY_LOG_PATH` (up to
+  `QUERY_LOG_MAX_ROWS`); it is read only with the full key (`GET /query-log`) and never
+  goes into a backup. Turn it on only where keeping what people asked is acceptable, and
+  protect that file like the documents.
 - **Secrets.** `.env` holds keys; keep it out of version control and backups you share.
 - **Updates.** Dependencies, base images and actions are pinned and bumped by hand. CI
   audits the runtime dependencies and scans the image on every push and weekly, and

@@ -26,6 +26,7 @@ from api.provider_health import (
     clear_ollama_reachability_cache,
 )
 from api.qdrant_schema import clear_readiness_cache, make_qdrant_client
+from api.query_log import CompositeTraceSink, QueryLogSink, QueryLogStore
 from api.raw_documents import RawDocumentStore
 from api.repository import (
     VectorRepository,
@@ -35,7 +36,7 @@ from api.repository import (
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
 from api.summarize import DocumentSummarizer
-from api.tracing import TraceStore
+from api.tracing import TraceSink, TraceStore
 from api.workspaces import (
     WORKSPACE_HEADER,
     WorkspaceError,
@@ -269,6 +270,7 @@ def get_rag_pipeline(
     settings: Annotated[AppSettings, Depends(get_request_settings)],
     trace_store: Annotated[TraceStore, Depends(get_trace_store)],
     answer_cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+    query_log: Annotated[QueryLogStore | None, Depends(get_query_log_store)],
 ) -> RagPipeline:
     """Return the query orchestration seam: retrieve -> rerank -> generate."""
 
@@ -280,7 +282,7 @@ def get_rag_pipeline(
         settings=settings,
         # The gate reads the *injected* settings (not a direct get_app_settings()
         # call) so a test overriding get_app_settings controls trace_enabled too.
-        trace_store=trace_store if settings.trace_enabled else None,
+        trace_store=_trace_sink(settings, trace_store, query_log),
         answer_cache=answer_cache,
     )
 
@@ -291,6 +293,7 @@ def get_document_summarizer(
     settings: Annotated[AppSettings, Depends(get_request_settings)],
     trace_store: Annotated[TraceStore, Depends(get_trace_store)],
     answer_cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+    query_log: Annotated[QueryLogStore | None, Depends(get_query_log_store)],
 ) -> DocumentSummarizer:
     """Return the whole-document summary seam (POST /questions/summary)."""
 
@@ -298,14 +301,14 @@ def get_document_summarizer(
         repository=repository,
         generator=generator,
         settings=settings,
-        trace_store=trace_store if settings.trace_enabled else None,
+        trace_store=_trace_sink(settings, trace_store, query_log),
         answer_cache=answer_cache,
     )
 
 
 @lru_cache
-def _question_slots_for(limit: int) -> QuestionSlots:
-    return QuestionSlots(limit)
+def _question_slots_for(limit: int, summary_limit: int) -> QuestionSlots:
+    return QuestionSlots(limit, summary_limit)
 
 
 def get_question_slots(
@@ -313,7 +316,9 @@ def get_question_slots(
 ) -> QuestionSlots:
     """The process-wide question concurrency cap (MAX_CONCURRENT_QUESTIONS)."""
 
-    return _question_slots_for(int(settings.max_concurrent_questions))
+    return _question_slots_for(
+        int(settings.max_concurrent_questions), int(settings.max_concurrent_summaries)
+    )
 
 
 @lru_cache
@@ -390,13 +395,14 @@ def get_raw_document_store() -> RawDocumentStore | None:
     (the ``.env.example`` default's literal value) means off, same as unset.
     """
 
-    directory = get_app_settings().raw_document_dir
-    return RawDocumentStore(directory) if directory else None
+    settings = get_app_settings()
+    directory = settings.raw_document_dir
+    return RawDocumentStore(directory, int(settings.raw_document_versions)) if directory else None
 
 
 @lru_cache
 def _workspace_raw_store(directory: str) -> RawDocumentStore:
-    return RawDocumentStore(directory)
+    return RawDocumentStore(directory, int(get_app_settings().raw_document_versions))
 
 
 def clear_workspace_raw_stores() -> None:
@@ -429,6 +435,32 @@ def get_feedback_store() -> FeedbackStore | None:
     if not settings.feedback_enabled:
         return None
     return FeedbackStore(settings.feedback_store_path, max_rows=int(settings.feedback_max_rows))
+
+
+@lru_cache
+def get_query_log_store() -> QueryLogStore | None:
+    """The optional query log (QUERY_LOG_ENABLED), or None when it is off."""
+
+    settings = get_app_settings()
+    if not settings.query_log_enabled:
+        return None
+    return QueryLogStore(settings.query_log_path, int(settings.query_log_max_rows))
+
+
+def _trace_sink(
+    settings: AppSettings, trace_store: TraceStore, query_log: QueryLogStore | None
+) -> TraceSink | None:
+    """Where a pipeline records its traces: the trace buffer (TRACE_ENABLED) and the
+    query log (QUERY_LOG_ENABLED), either, both or neither."""
+
+    sinks: list[TraceSink] = []
+    if settings.trace_enabled:
+        sinks.append(trace_store)
+    if query_log is not None:
+        sinks.append(QueryLogSink(query_log))
+    if not sinks:
+        return None
+    return sinks[0] if len(sinks) == 1 else CompositeTraceSink(sinks)
 
 
 @lru_cache
@@ -486,6 +518,7 @@ def clear_dependency_caches() -> None:
     get_raw_document_store.cache_clear()
     _workspace_raw_store.cache_clear()
     get_feedback_store.cache_clear()
+    get_query_log_store.cache_clear()
     get_ingest_executor.cache_clear()
     get_ingest_backlog.cache_clear()
     get_trace_store.cache_clear()

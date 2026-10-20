@@ -262,6 +262,11 @@
      "sections_parsed": {
       "title": "Sections Parsed",
       "type": "integer"
+     },
+     "unchanged": {
+      "default": false,
+      "title": "Unchanged",
+      "type": "boolean"
      }
     },
     "required": [
@@ -298,6 +303,23 @@
     "title": "DocumentJobAcceptedResponse",
     "type": "object"
    },
+   "DocumentJobListResponse": {
+    "description": "A workspace's queued and running ingest jobs, oldest first: uploads from any\nclient, the watched folder, a bulk re-index or a restore.",
+    "properties": {
+     "jobs": {
+      "items": {
+       "$ref": "#/components/schemas/DocumentJobStatusResponse"
+      },
+      "title": "Jobs",
+      "type": "array"
+     }
+    },
+    "required": [
+     "jobs"
+    ],
+    "title": "DocumentJobListResponse",
+    "type": "object"
+   },
    "DocumentJobStatusResponse": {
     "description": "Current status of a background ingestion job.",
     "properties": {
@@ -313,6 +335,17 @@
      "chunks_total": {
       "title": "Chunks Total",
       "type": "integer"
+     },
+     "created_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Created At"
      },
      "error": {
       "anyOf": [
@@ -353,6 +386,11 @@
       ],
       "title": "State",
       "type": "string"
+     },
+     "unchanged": {
+      "default": false,
+      "title": "Unchanged",
+      "type": "boolean"
      }
     },
     "required": [
@@ -407,6 +445,14 @@
       "title": "Reindexable Filenames",
       "type": "array"
      },
+     "source_urls": {
+      "additionalProperties": {
+       "type": "string"
+      },
+      "default": {},
+      "title": "Source Urls",
+      "type": "object"
+     },
      "stale_filenames": {
       "default": [],
       "items": {
@@ -439,6 +485,25 @@
      "filenames"
     ],
     "title": "DocumentListResponse",
+    "type": "object"
+   },
+   "DocumentRefreshResponse": {
+    "description": "POST /documents/{f}/refresh when the source said nothing changed (304).",
+    "properties": {
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "unchanged": {
+      "default": true,
+      "title": "Unchanged",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "filename"
+    ],
+    "title": "DocumentRefreshResponse",
     "type": "object"
    },
    "DocumentReindexAllResponse": {
@@ -503,6 +568,51 @@
      "tags"
     ],
     "title": "DocumentTagsResponse",
+    "type": "object"
+   },
+   "DocumentVersionResponse": {
+    "properties": {
+     "saved_at": {
+      "title": "Saved At",
+      "type": "number"
+     },
+     "size": {
+      "title": "Size",
+      "type": "integer"
+     },
+     "version": {
+      "title": "Version",
+      "type": "string"
+     }
+    },
+    "required": [
+     "version",
+     "saved_at",
+     "size"
+    ],
+    "title": "DocumentVersionResponse",
+    "type": "object"
+   },
+   "DocumentVersionsResponse": {
+    "description": "Earlier versions of a document's original (RAW_DOCUMENT_VERSIONS), newest first.",
+    "properties": {
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "versions": {
+      "items": {
+       "$ref": "#/components/schemas/DocumentVersionResponse"
+      },
+      "title": "Versions",
+      "type": "array"
+     }
+    },
+    "required": [
+     "filename",
+     "versions"
+    ],
+    "title": "DocumentVersionsResponse",
     "type": "object"
    },
    "FeedbackItemResponse": {
@@ -842,6 +952,11 @@
       "title": "Allowed Request Providers",
       "type": "array"
      },
+     "answer_language": {
+      "default": "",
+      "title": "Answer Language",
+      "type": "string"
+     },
      "anthropic_available": {
       "default": false,
       "title": "Anthropic Available",
@@ -959,6 +1074,11 @@
       "title": "Sparse Retrieval Limit",
       "type": "integer"
      },
+     "summary_max_documents": {
+      "default": 5,
+      "title": "Summary Max Documents",
+      "type": "integer"
+     },
      "supported_extensions": {
       "items": {
        "type": "string"
@@ -969,6 +1089,11 @@
      "url_ingest_enabled": {
       "default": false,
       "title": "Url Ingest Enabled",
+      "type": "boolean"
+     },
+     "watch_enabled": {
+      "default": false,
+      "title": "Watch Enabled",
       "type": "boolean"
      },
      "workspaces_enabled": {
@@ -1003,6 +1128,73 @@
      "feedback_enabled"
     ],
     "title": "PublicConfigResponse",
+    "type": "object"
+   },
+   "QueryLogEntryResponse": {
+    "description": "One logged question or summary (QUERY_LOG_ENABLED).",
+    "properties": {
+     "created_at": {
+      "title": "Created At",
+      "type": "number"
+     },
+     "mode": {
+      "title": "Mode",
+      "type": "string"
+     },
+     "question": {
+      "title": "Question",
+      "type": "string"
+     },
+     "status": {
+      "title": "Status",
+      "type": "string"
+     },
+     "top_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Score"
+     },
+     "trace_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Trace Id"
+     }
+    },
+    "required": [
+     "created_at",
+     "question",
+     "status",
+     "mode"
+    ],
+    "title": "QueryLogEntryResponse",
+    "type": "object"
+   },
+   "QueryLogResponse": {
+    "properties": {
+     "queries": {
+      "items": {
+       "$ref": "#/components/schemas/QueryLogEntryResponse"
+      },
+      "title": "Queries",
+      "type": "array"
+     }
+    },
+    "required": [
+     "queries"
+    ],
+    "title": "QueryLogResponse",
     "type": "object"
    },
    "QuestionRequest": {
@@ -1205,6 +1397,16 @@
       "default": false,
       "title": "Truncated",
       "type": "boolean"
+     },
+     "usage": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/UsageResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
      }
     },
     "required": [
@@ -1217,6 +1419,23 @@
    "SearchRequest": {
     "description": "Retrieval without an answer: the passages a question would be answered from.",
     "properties": {
+     "exclude_filenames": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        "maxItems": 500,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Exclude Filenames"
+     },
      "filenames": {
       "anyOf": [
        {
@@ -1233,6 +1452,30 @@
        }
       ],
       "title": "Filenames"
+     },
+     "page_max": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Max"
+     },
+     "page_min": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Min"
      },
      "query": {
       "maxLength": 4000,
@@ -1252,6 +1495,19 @@
        }
       ],
       "title": "Rerank Top K"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Section"
      },
      "tags": {
       "anyOf": [
@@ -1398,14 +1654,14 @@
     "type": "object"
    },
    "SummaryRequest": {
-    "description": "Summarize one whole document, or compare two (POST /questions/summary).",
+    "description": "Summarize one whole document, compare two, or write one brief across several\n(POST /questions/summary).",
     "properties": {
      "filenames": {
       "items": {
        "maxLength": 1024,
        "type": "string"
       },
-      "maxItems": 2,
+      "maxItems": 10,
       "minItems": 1,
       "title": "Filenames",
       "type": "array"
@@ -1455,7 +1711,8 @@
      "mode": {
       "enum": [
        "summarize",
-       "compare"
+       "compare",
+       "brief"
       ],
       "title": "Mode",
       "type": "string"
@@ -1557,6 +1814,16 @@
       "default": false,
       "title": "Truncated",
       "type": "boolean"
+     },
+     "usage": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/UsageResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
      }
     },
     "required": [
@@ -1924,6 +2191,16 @@
      "trace_id": {
       "title": "Trace Id",
       "type": "string"
+     },
+     "usage": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/UsageResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
      }
     },
     "required": [
@@ -2065,6 +2342,25 @@
     "title": "UrlIngestRequest",
     "type": "object"
    },
+   "UsageResponse": {
+    "description": "Tokens the provider reported for an answer's LLM calls (the citation retry and a\nsummary's notes included; condensing, query expansion and follow-ups not).",
+    "properties": {
+     "completion_tokens": {
+      "title": "Completion Tokens",
+      "type": "integer"
+     },
+     "prompt_tokens": {
+      "title": "Prompt Tokens",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "prompt_tokens",
+     "completion_tokens"
+    ],
+    "title": "UsageResponse",
+    "type": "object"
+   },
    "ValidationError": {
     "properties": {
      "ctx": {
@@ -2103,6 +2399,97 @@
      "type"
     ],
     "title": "ValidationError",
+    "type": "object"
+   },
+   "WatchRetry": {
+    "description": "A watched file waiting to be tried again after a failure.",
+    "properties": {
+     "attempts": {
+      "title": "Attempts",
+      "type": "integer"
+     },
+     "error": {
+      "title": "Error",
+      "type": "string"
+     },
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "next_attempt_at": {
+      "title": "Next Attempt At",
+      "type": "number"
+     }
+    },
+    "required": [
+     "filename",
+     "attempts",
+     "next_attempt_at",
+     "error"
+    ],
+    "title": "WatchRetry",
+    "type": "object"
+   },
+   "WatchStatusResponse": {
+    "description": "The watched folder (WATCH_DIR) as of the watcher's last pass.",
+    "properties": {
+     "deferred": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Deferred",
+      "type": "array"
+     },
+     "files": {
+      "default": 0,
+      "title": "Files",
+      "type": "integer"
+     },
+     "folder": {
+      "title": "Folder",
+      "type": "string"
+     },
+     "gave_up": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Gave Up",
+      "type": "array"
+     },
+     "last_scan_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Last Scan At"
+     },
+     "problems": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     },
+     "retrying": {
+      "default": [],
+      "items": {
+       "$ref": "#/components/schemas/WatchRetry"
+      },
+      "title": "Retrying",
+      "type": "array"
+     }
+    },
+    "required": [
+     "folder"
+    ],
+    "title": "WatchStatusResponse",
     "type": "object"
    },
    "WorkspaceCreateRequest": {
@@ -2455,6 +2842,79 @@
      }
     },
     "summary": "Upload Document From Url"
+   }
+  },
+  "/documents/jobs": {
+   "get": {
+    "operationId": "list_document_jobs_documents_jobs_get",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "state",
+      "required": false,
+      "schema": {
+       "const": "active",
+       "default": "active",
+       "title": "State",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentJobListResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Document Jobs"
    }
   },
   "/documents/jobs/{job_id}": {
@@ -2938,6 +3398,98 @@
     "summary": "Document Original"
    }
   },
+  "/documents/{filename}/refresh": {
+   "post": {
+    "operationId": "refresh_document_from_url_documents__filename__refresh_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "filename",
+      "required": true,
+      "schema": {
+       "title": "Filename",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentRefreshResponse"
+        }
+       }
+      },
+      "description": "Unchanged at the source (304); nothing was fetched."
+     },
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "anyOf": [
+          {
+           "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
+          },
+          {
+           "$ref": "#/components/schemas/DocumentRefreshResponse"
+          }
+         ],
+         "title": "Response Refresh Document From Url Documents  Filename  Refresh Post"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such document, it wasn't fetched by URL, or URL ingest is off."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Refresh Document From Url"
+   }
+  },
   "/documents/{filename}/reindex": {
    "post": {
     "operationId": "reindex_document_documents__filename__reindex_post",
@@ -3088,6 +3640,157 @@
      }
     },
     "summary": "Set Document Tags"
+   }
+  },
+  "/documents/{filename}/versions": {
+   "get": {
+    "operationId": "list_document_versions_documents__filename__versions_get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "filename",
+      "required": true,
+      "schema": {
+       "title": "Filename",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentVersionsResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Document Versions"
+   }
+  },
+  "/documents/{filename}/versions/{version}/restore": {
+   "post": {
+    "operationId": "restore_document_version_documents__filename__versions__version__restore_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "filename",
+      "required": true,
+      "schema": {
+       "title": "Filename",
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "version",
+      "required": true,
+      "schema": {
+       "title": "Version",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Restore Document Version"
    }
   },
   "/export": {
@@ -3442,6 +4145,93 @@
      }
     },
     "summary": "Metrics"
+   }
+  },
+  "/query-log": {
+   "get": {
+    "operationId": "list_query_log_query_log_get",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 200,
+       "maximum": 1000,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     },
+     {
+      "in": "query",
+      "name": "uncovered",
+      "required": false,
+      "schema": {
+       "default": false,
+       "title": "Uncovered",
+       "type": "boolean"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/QueryLogResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "The query log is off (QUERY_LOG_ENABLED)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Query Log"
    }
   },
   "/questions": {
@@ -3931,6 +4721,98 @@
      }
     },
     "summary": "Get Trace"
+   }
+  },
+  "/watch": {
+   "get": {
+    "operationId": "watch_status_watch_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WatchStatusResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Watch Status"
+   }
+  },
+  "/watch/scan": {
+   "post": {
+    "operationId": "watch_scan_now_watch_scan_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WatchStatusResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Watch Scan Now"
    }
   },
   "/workspaces": {

@@ -18,6 +18,7 @@
   z-index: 1;
   width: min(720px, 92vw);
   max-height: 85vh;
+  max-height: 85dvh;
   display: flex;
   flex-direction: column;
   background: var(--card);
@@ -172,6 +173,7 @@
 .document-viewer__panel:has(.document-viewer__pdf) {
   width: min(960px, 96vw);
   height: 85vh;
+  height: 85dvh;
 }
 
 .document-viewer__pdf {
@@ -202,4 +204,16 @@
   border-radius: 2px;
   text-decoration: underline 1px var(--accent);
   text-underline-offset: 3px;
+}
+
+/* A phone: the viewer takes the whole screen rather than a card with margins to spare. */
+@media (max-width: 600px) {
+  .document-viewer__panel,
+  .document-viewer__panel:has(.document-viewer__pdf) {
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    max-height: none;
+    border-radius: 0;
+  }
 }

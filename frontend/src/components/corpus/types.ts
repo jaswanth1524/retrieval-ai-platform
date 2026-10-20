@@ -45,6 +45,8 @@ export interface DocumentMeta {
   /** Has a stored original the server can re-index from (and serve back). */
   reindexable: boolean;
   tags: string[];
+  /** Where a document fetched by URL came from (absent for uploads). */
+  sourceUrl?: string;
 }
 
 
@@ -66,4 +68,5 @@ export interface DocCard {
   tags: string[];
   bytes?: number;
   uploadedAt?: number;
+  sourceUrl?: string;
 }

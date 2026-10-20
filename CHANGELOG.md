@@ -11,12 +11,13 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 ## Unreleased
 
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
-features). **Re-index: recommended** — chunker version 5 (see Changed). Every document
+features). **Re-index: recommended** — chunker version 6 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
 before. No embedding change: the index stays compatible, and nothing is refused. The
 re-index also picks up the parser fixes below (a mis-detected CSV delimiter, hidden HTML
-text no longer indexed, an HTML-only email labelled by its subject).
+text no longer indexed, an HTML-only email labelled by its subject, a web page's
+navigation and a PDF's running headers left out).
 
 **Upgrading with Compose:** the API's `/app/data` volume is now mounted by default, as
 `docrag_data`. If you had uncommented the old `docrag_job_store` line, copy that volume
@@ -24,6 +25,36 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- **Chunker version 6** (pass 7). HTML: only the page's content is indexed — `<main>`,
+  or its single `<article>`, else the body without `<nav>`, `<header>`, `<footer>` and
+  `<aside>` (kept inside an article; a page whose content area is empty is read whole);
+  block elements end a line, so headings and list items no longer run together; a table
+  is rows of `column: value` pairs (`| Grade: A; Budget: 500`); a charset declared only
+  in a `<meta>` tag or the server's `Content-Type` (URL ingest) is honoured (a BOM still
+  wins). PDF: lines repeated at the top or bottom of most pages (three pages or more) —
+  running headers, footers, "Page 3 of 40" — are dropped; a page left empty by that is
+  skipped, not sent to OCR. Both retrieval baselines score the same as with version 5.
+- Pass 7: a summary too long for one call reads its parts side by side with a hosted
+  provider (`SUMMARY_PARALLEL_PARTS`, 4; Ollama still one at a time), in document order
+  and with every part's tokens counted. **None.**
+- Pass 7: with `LLM_CONTEXT_WINDOW` unset, an OpenAI or Anthropic model's context window
+  comes from LiteLLM's model table, so the prompt fitter and the citation retry's budget
+  apply to them too (Ollama still uses `OLLAMA_NUM_CTX`; unknown models stay unfitted).
+  Chinese, Japanese and Korean text is estimated at a token per character (it was a
+  third of that), for prompts and summary parts. **None.**
+- Pass 7: with `CONTEXT_NEIGHBOR_MAX_CHARS` set, the diversity filter keeps adjacent
+  chunks (expansion no longer brings them back whole); the setting is in the eval
+  fingerprint. Unchanged at the default (0). **None.**
+- Pass 7: the chat keeps 100 conversations (was 20; history lives in IndexedDB now),
+  with localStorage keeping a compact copy of the 20 most recent, and passage text kept
+  in IndexedDB for the 20 most recently used — older conversations keep their citations.
+  A notice says when the history fills. **None.**
+- Pass 7: ∑, Compare and the palette's summary ask for an optional focus first. The
+  corpus panel stays usable while an answer streams in another conversation. **None.**
+- Pass 7: the cached answers and document listing are invalidated per workspace: an
+  upload to one workspace no longer empties every workspace's answer cache. **None.**
+- Pass 7: `MAX_CONCURRENT_SUMMARIES` (2) — summaries take one of their own slots as well
+  as a question slot, so long summaries can't hold every slot. **None.**
 - Internal: `api/pipeline.py` split into `api/context_expansion.py` (neighbour expansion)
   and `api/ingest_service.py` (`IngestService`), re-exported from `api.pipeline`; the
   corpus panel's card, bulk bar, tag editor and types moved to `components/corpus/`, and
@@ -51,6 +82,70 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 7: identical re-sends are left alone. A document uploaded (or watched, or fetched)
+  again with the same bytes, under current chunking, finishes `done` with `unchanged:
+  true` and nothing re-embedded; a watched file that was only touched takes its new time.
+  Chunks carry `content_sha256`. **Recommended** (documents indexed before have no hash,
+  so their next identical upload still re-indexes once).
+- Pass 7: URL-ingested documents keep their source (`source_url`, with the server's
+  ETag/Last-Modified): `source_urls` on `GET /documents`, a link on the card, and
+  `POST /documents/{filename}/refresh` (and `docrag refresh`) to fetch again —
+  conditionally, so an unchanged page costs a 304 and no job. Re-index keeps the source.
+- Pass 7: `GET /documents/jobs` lists the jobs queued or running in a workspace, whoever
+  started them; the corpus panel shows the ones this tab didn't start.
+- Pass 7: the watched folder retries a file whose read or indexing job failed, with
+  backoff (`WATCH_MAX_RETRIES`, `WATCH_RETRY_MAX_SECONDS`), and stops retrying a refused
+  one until it changes. `GET /watch` reports its last pass and `POST /watch/scan` runs
+  one now; the corpus panel shows both (`watch_enabled` on `/config`).
+- Pass 7: `POST /search` narrows by `page_min`/`page_max`, `section` and
+  `exclude_filenames`.
+- Pass 7: `ANSWER_LANGUAGE` (`match`, or a language name) for answers and summaries.
+- Pass 7: token usage the provider reported, per answer: `usage` on `QuestionResponse`,
+  `SummaryResponse`, the `done` frame and the trace (generation and the citation retry;
+  not condensing, query expansion or follow-ups).
+- Pass 7: `/health/ready` reports `originals_kept`; the UI shows a banner when the index
+  doesn't match the embedding setup (with the way out that works on this server), shows
+  the server version in Settings, and offers a reload when the server is updated.
+- Pass 7 UI: "Ask again" on a question left without an answer; a 429 is waited out with
+  a countdown and asked again (up to three times); "weakly supported" on answers whose
+  best passage only just cleared `RERANK_MIN_SCORE`; "not relevant" feedback on a single
+  cited source (`citation_source_number`); "Ask about these" on documents; a jump to the
+  latest turn; a question box that grows with the text; palette entries to read or
+  summarize each document, copy the last answer and export every conversation (importing
+  that file restores them all); ⌘⇧F search, ⌘\\ inspector, `]`/`[` between
+  conversations and `?` for the list; clickable retrieval candidates; the trace's full
+  id, request id, query variants, token usage and error; Traces and Feedback filters.
+- Pass 7 CLI/MCP: `docrag read`, `delete`, `tags`, `reindex`, `refresh`, `jobs`,
+  `workspaces`, `watch`, and `--tag` on `ask`/`search`; MCP `list_workspaces`, `tags`
+  on `ask`/`search_passages`, `read_document(around_chunk_id=)`, and answers that list
+  the exact sentences each citation rests on.
+- Pass 7: briefs — one cited overview of 3 to `SUMMARY_MAX_DOCUMENTS` (5; at most 10,
+  and never more than `SUMMARY_MAX_BATCHES`, since each document takes a part)
+  documents, organised by theme: `mode: "brief"` on `/questions/summary*`, "Brief" for
+  three or more selected documents in the corpus panel, `docrag summarize` with three
+  or more files, and MCP `summarize`. **None.**
+- Pass 7: a query log (`QUERY_LOG_ENABLED`, off by default; `QUERY_LOG_PATH`,
+  `QUERY_LOG_MAX_ROWS` 20 000): one row per question or summary — text, workspace,
+  outcome, best passage score — kept in its own sqlite file beyond the trace buffer.
+  `GET /query-log` (full key; `?uncovered=true` for what the documents didn't answer)
+  and `docrag queries`. **None.**
+- Pass 7: document versions (`RAW_DOCUMENT_VERSIONS`, 0 = off; needs
+  `RAW_DOCUMENT_DIR`): a re-upload keeps the previous original (up to that many);
+  `GET /documents/{filename}/versions`, `POST /documents/{filename}/versions/{version}/restore`
+  (full key; a job indexing those bytes like an upload, which keeps the version it
+  replaces) and `docrag versions FILE [--restore VERSION]`. Deleting the
+  document deletes its versions; backups hold only the current original. **None.**
+- Pass 7: `QDRANT_QUANTIZATION=scalar` stores int8 copies of the dense vectors in RAM
+  (about a quarter of the memory) and rescores the best `QDRANT_QUANTIZATION_OVERSAMPLING`
+  (2.0) × limit candidates with the original vectors. Applied to an existing collection
+  in place at startup, and removed again with `none`; in the eval fingerprint.
+  **Re-index: none.**
+- Pass 7 eval: answer-mode runs report `cited_relevant_rate`, `answered_rate`,
+  `uncited_rate` and, on unanswerable rows, `refused_unanswerable_rate`; rows can carry
+  a `history` and are scored on the rewritten follow-up, as the API retrieves it
+  (`eval/datasets/followup_eval.jsonl`, handbook corpus).
+- Pass 7 eval: datasets can hold unanswerable questions (`expect_no_context`), scored as
+  `no_context_rate`; `eval/datasets/unanswerable_eval.jsonl` against the handbook corpus.
 - Workspaces (`WORKSPACES_ENABLED`, off by default): separate corpora, one Qdrant
   collection (`<QDRANT_COLLECTION>__ws_<name>`) and originals folder each, chosen per
   request with `X-Workspace`; `GET/POST /workspaces`, `DELETE /workspaces/{name}` (empty
@@ -214,6 +309,37 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 7: earlier answers went back to the model as history with their `[n]` markers,
+  which numbered the previous turn's sources: the model could copy a stale number onto
+  an unrelated source. They are stripped from history now.
+- Pass 7: a German, Spanish, French, Portuguese or Italian follow-up ("Und wie lange
+  dauert das?") was never rewritten into a standalone query (the check knew English words
+  only), and a "not enough information" answer in those languages cost a citation retry
+  and read as uncited.
+- Pass 7: the citation retry could push the prompt past the context window (it adds the
+  first answer and a reminder to a prompt already fitted): it drops the history, then
+  clips the first answer, then skips the retry.
+- Pass 7: a summary stream left as `done` arrived was not cached.
+- Pass 7: with `RAW_DOCUMENT_DIR` unset, the index-mismatch message still advised
+  "export, delete every document, import" — which restores nothing without originals.
+  It names only what works, and a backup says what it lacks (`originals_missing`,
+  `complete` in the manifest, `X-DocRAG-Originals-Missing`).
+- Pass 7: the watched folder marked a refused or failed file as sent and never tried it
+  again until it changed or the process restarted.
+- Pass 7: a conditional URL fetch answered 304 was handled as a redirect.
+- Pass 7: a comparison (or brief) too long for one call answered that the documents
+  don't contain enough information: each part shows one document while the task names
+  all of them, and the model replied "NOTHING RELEVANT" for every part. The notes prompt
+  now says the other documents are read separately.
+- Pass 7 UI: "Preparing backup… the download starts when it is ready" stayed up for
+  seconds after the download had started, and a backup slower than 4 s lost the note
+  while it was still being built. It now stays until the backup is ready and goes the
+  moment the download starts, fails or is cancelled.
+- Pass 7: the watched folder gives up at once on a file that can't be parsed (it is
+  retried when it changes), instead of re-reading it `WATCH_MAX_RETRIES` times.
+- Pass 7 UI: the document list was read at startup only — documents added by the watched
+  folder, the CLI or another tab appeared after a reload. It is re-read when the tab
+  comes back into view (at most every 30 s) and when the connection returns.
 - A question sent (Enter) while the page was still starting up was dropped without a
   word, left in the box; it is now sent as soon as DocRAG is ready, with a "Sending as
   soon as DocRAG is ready…" note meanwhile (not when sending waits for another
@@ -369,6 +495,16 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 7: aiohttp 3.14.5 (through LiteLLM) and certifi 2026.10.19, for advisories
+  published since the last bump. Eight Pillow 12.3.0 advisories are fixed only in Pillow
+  13, which no fastembed release accepts yet: the dependency audit skips them, listed
+  with that reason in `.github/ci/pip-audit-ignore.txt`, and a test fails once the
+  lockfile moves past Pillow 12 so the skips are removed then.
+- Pass 7: the query log keeps what users typed — off by default, read only with the full
+  key, capped, and never in a backup; kept versions are earlier originals on disk, removed
+  with the document. SECURITY.md says both.
+- Pass 7: SECURITY.md covers URL ingest, the watched folder, workspaces (not access
+  control), the MCP server's key and every hosted provider's data flow.
 - Behind `uvicorn --root-path`, the request guard compared the prefixed path and let
   every guarded route through unchecked (no early 401, no body cap, no rate limit, open
   API docs). It now matches the path the routes see.
@@ -408,6 +544,11 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   starts.
 
 ### Accessibility
+- Pass 7: "Load earlier/later" in the viewer moves focus to the first passage it loaded
+  once the button goes; the composer's scope menu closes when focus leaves it; on touch
+  screens Enter adds a line (send with the button) and the keyboard hint is hidden; the
+  viewer fills the screen on phones, and dialogs fit between mobile browser bars
+  (`dvh`, with a `vh` fallback).
 - The citation preview closes with Escape, and the inline `[n]` markers behave like the
   citation cards (no reopening when focus returns from the viewer, no stuck preview on
   touch). Answer headings start at `<h3>`, below the page's own; wide tables scroll
@@ -423,6 +564,18 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   many it found.
 
 ### Development
+- Pass 7: `tests/test_frontend_contract.py` checks that every field the frontend's API
+  types read exists in the OpenAPI schema. CI loads the embedding and reranker models
+  inside the hardened compose container (read-only filesystem, dropped capabilities)
+  and embeds and reranks one query; the release starts the arm64 image (imports the
+  app) before pushing it, and builds the `docrag-cli` wheel and sdist, attaching them
+  to the release and publishing to PyPI only when the `PUBLISH_CLI` repository variable
+  is `true` (trusted publishing, which needs setting up on PyPI first).
+- Pass 7: the eval baselines record `rrf_k`, the retrieval limits, the query-expansion
+  count, the reranker batch size, `sparse_language` and `dense_passage_prefix`, so a
+  change to any of them is a refused comparison rather than a silent pass (both
+  baselines re-measured: identical aggregates). `make check` imports ragas, as CI does. Tests for the
+  restore guards and URL-fetch edge cases; two wall-clock assertions made robust.
 - `make check` runs what CI runs, coverage floor, dataset validation and dependency
   audits included. CI can be started by hand; lint and typecheck run once (on 3.12);
   dependency review skips with a notice while the repository's Dependency graph is

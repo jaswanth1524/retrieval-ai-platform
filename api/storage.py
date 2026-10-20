@@ -22,6 +22,8 @@ def enabled_store_directories(settings: AppSettings) -> list[tuple[str, Path]]:
         directories.append(("JOB_STORE_PATH", Path(settings.job_store_path).parent))
     if settings.feedback_enabled:
         directories.append(("FEEDBACK_STORE_PATH", Path(settings.feedback_store_path).parent))
+    if settings.query_log_enabled:
+        directories.append(("QUERY_LOG_PATH", Path(settings.query_log_path).parent))
     return directories
 
 

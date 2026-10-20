@@ -188,6 +188,33 @@ def last_finish_reason() -> str | None:
     return reason if isinstance(reason, str) else None
 
 
+def begin_usage() -> None:
+    """Start adding up this thread's reported token usage (see ``usage_totals``)."""
+
+    _last_call.usage = [0, 0]
+
+
+def add_usage(usage: tuple[int, int] | None) -> None:
+    """Add usage counted on another thread (a summary's parallel parts) to this thread's
+    totals since ``begin_usage``."""
+
+    totals = getattr(_last_call, "usage", None)
+    if usage is None or not isinstance(totals, list):
+        return
+    totals[0] += usage[0]
+    totals[1] += usage[1]
+
+
+def usage_totals() -> tuple[int, int] | None:
+    """Prompt and completion tokens reported since ``begin_usage`` on this thread, or
+    None when the provider reported none (or nothing was begun)."""
+
+    totals = getattr(_last_call, "usage", None)
+    if not isinstance(totals, list) or not any(totals):
+        return None
+    return int(totals[0]), int(totals[1])
+
+
 def stopped_at_token_limit() -> bool:
     """True when this thread's latest call was cut off at ``max_tokens``."""
 
@@ -214,10 +241,15 @@ def _count_usage(response: object, settings: AppSettings) -> None:
     if usage is None:
         return
     provider = settings.llm_provider.lower().strip()
-    for kind, key in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
+    totals = getattr(_last_call, "usage", None)
+    for index, (kind, key) in enumerate(
+        (("prompt", "prompt_tokens"), ("completion", "completion_tokens"))
+    ):
         value = read_value(usage, key)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             llm_tokens_total.labels(provider=provider, kind=kind).inc(value)
+            if isinstance(totals, list):
+                totals[index] += value
 
 
 class LiteLLMGenerator:

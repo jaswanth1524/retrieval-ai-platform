@@ -58,6 +58,9 @@ const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 
 // How long a pointer or focus rests on a citation before its viewer page is fetched.
 export const CITATION_PREFETCH_DWELL_MS = 150;
+// An answer whose best passage scored under RERANK_MIN_SCORE plus this is flagged
+// "weakly supported": it cleared the bar, but only just.
+export const WEAK_SUPPORT_MARGIN = 0.1;
 // A failed document listing is retried from this delay, doubling up to BOOT_RETRY_MAX_MS.
 export const LISTING_RETRY_BASE_MS = 5000;
 // Backoff between boot attempts while the API is unreachable: 2s, 4s, 8s ... 30s.

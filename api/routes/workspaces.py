@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import functools
 import os
+import shutil
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from qdrant_client import QdrantClient
 
+from api.corpus import bump_corpus_generation
 from api.dependencies import (
     clear_workspace_raw_stores,
     get_app_settings,
@@ -18,7 +20,7 @@ from api.dependencies import (
 )
 from api.ingestion import ingest_sequencer
 from api.qdrant_schema import forget_collection
-from api.raw_documents import is_temp_file_name
+from api.raw_documents import VERSIONS_DIR, is_temp_file_name
 from api.repository import clear_metadata_cache
 from api.routes.deps import QdrantClientDep, VectorRepositoryDep
 from api.schemas import WorkspaceCreateRequest, WorkspaceListResponse, WorkspaceResponse
@@ -57,6 +59,9 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
     points = client.count(collection_name=target.qdrant_collection, exact=True).count
     originals = target.raw_document_dir
     entries = os.listdir(originals) if originals and os.path.isdir(originals) else []
+    # Earlier versions belong to documents: with none left, they are history of
+    # deleted ones, and an empty workspace stayed undeletable over them.
+    entries = [entry for entry in entries if entry != VERSIONS_DIR]
     # A save a crash interrupted leaves an `.upload-*` temp file behind; it is not a
     # document, and must not keep an empty workspace undeletable.
     temp_files = [entry for entry in entries if is_temp_file_name(entry)]
@@ -72,6 +77,7 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
         try:
             for entry in temp_files:
                 os.unlink(os.path.join(originals, entry))
+            shutil.rmtree(os.path.join(originals, VERSIONS_DIR), ignore_errors=True)
             os.rmdir(originals)
         except OSError as exc:
             raise HTTPException(
@@ -82,6 +88,9 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
     client.delete_collection(target.qdrant_collection)
     forget_collection(client, target)
     clear_metadata_cache()
+    # Answers cached for it are for a corpus that is gone (a workspace created again
+    # under this name starts at a generation it never had).
+    bump_corpus_generation(collection=target.qdrant_collection)
     # The cached store for its directory: dropped, so a workspace created again
     # under this name starts from a fresh one (save also remakes the directory).
     clear_workspace_raw_stores()

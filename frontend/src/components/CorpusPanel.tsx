@@ -55,6 +55,12 @@ interface CorpusPanelProps {
   onRead?: (filename: string) => void;
   /** Summarize one document, or compare two, as a turn in the conversation. */
   onSummarize?: (filenames: string[]) => void;
+  /** Scope the open conversation to these documents. */
+  onAskAbout?: (filenames: string[]) => void;
+  /** The most documents one brief covers (the server's SUMMARY_MAX_DOCUMENTS). */
+  summaryMaxDocuments?: number;
+  /** Fetch a URL-ingested document again; absent when URL ingest is off. */
+  onRefreshFromUrl?: (filename: string) => void;
   /** Summaries can't be asked right now (booting, the key was refused): the buttons
    *  stay, disabled, like the composer's Send. */
   summarizeDisabled?: boolean;
@@ -117,6 +123,9 @@ function CorpusPanel({
   onOpenOriginal,
   onRead,
   onSummarize,
+  onAskAbout,
+  summaryMaxDocuments,
+  onRefreshFromUrl,
   summarizeDisabled = false,
   onUploadFromUrl,
 }: CorpusPanelProps) {
@@ -250,6 +259,7 @@ function CorpusPanel({
           tags: meta?.tags.length ? meta.tags : NO_TAGS,
           bytes: meta?.bytes,
           uploadedAt: meta?.uploadedAt,
+          sourceUrl: meta?.sourceUrl,
         };
       });
   }, [filenames, documents, inFlightKey, onReindex]);
@@ -332,7 +342,9 @@ function CorpusPanel({
   }, [visibleIndexed]);
   // The read-only key selects too, but only to compare (the server allows it summaries);
   // the bar offers it nothing else.
-  const canBulk = indexedCards.length > 1 && (!readOnly || onSummarize !== undefined);
+  const canBulk =
+    indexedCards.length > 1 &&
+    (!readOnly || onSummarize !== undefined || onAskAbout !== undefined);
   const visibleNames = visibleIndexed.map((card) => card.filename);
   const allVisibleSelected =
     visibleNames.length > 0 && visibleNames.every((filename) => selected.has(filename));
@@ -564,6 +576,8 @@ function CorpusPanel({
           }
           onAddTag={onSetTags && !readOnly ? bulkAddTag : undefined}
           onCompare={onSummarize}
+          onAskAbout={onAskAbout}
+          maxBrief={summaryMaxDocuments}
           compareDisabled={summarizeDisabled}
           onDelete={readOnly ? undefined : bulkDelete}
           onClear={() => setSelected(new Set())}
@@ -594,6 +608,7 @@ function CorpusPanel({
             onCancelDelete={cancelDelete}
             onConfirmDelete={handleDelete}
             onRead={onRead}
+            onAskAbout={onAskAbout}
             onSummarize={onSummarize}
             summarizeDisabled={summarizeDisabled}
             onOpenOriginal={onOpenOriginal}
@@ -602,6 +617,7 @@ function CorpusPanel({
             onRetryUpload={onRetryUpload}
             onDismissUpload={onDismissUpload}
             onSetTags={onSetTags}
+            onRefreshFromUrl={onRefreshFromUrl}
           />
         ))}
       </div>

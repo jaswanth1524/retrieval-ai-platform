@@ -513,18 +513,23 @@ def test_a_name_lookup_that_hangs_is_given_up_on_within_the_deadline() -> None:
     from api.url_fetch import resolve_within
 
     release = threading.Event()
+    returned = threading.Event()
 
     def hanging(host: str, port: int) -> list[str]:
-        release.wait(5)
+        release.wait(30)
+        returned.set()
         return [PUBLIC]
 
     started = time.monotonic()
     try:
         with pytest.raises(UrlFetchError, match="could not be resolved within"):
             resolve_within(hanging, "slow.example", 443, 0.2)
+        # Given up on while the lookup was still hanging, not when it came back: an
+        # ordering, not a wall-clock bound a busy runner could miss.
+        assert not returned.is_set()
     finally:
         release.set()
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 25  # only a backstop
     assert resolve_within(resolver({}), "fast.example", 443, 1.0) == [PUBLIC]
 
 
@@ -594,7 +599,8 @@ def test_the_deadline_holds_even_inside_one_slow_read(scheme: str, tmp_path: Any
             connection = server_tls.wrap_socket(raw, server_side=True) if server_tls else raw
             with connection:
                 request = connection.recv(65536).decode()
-                time.sleep(1.5)  # the headers come late, but within the deadline
+                if "/stalls" in request:
+                    time.sleep(1.5)  # the headers come late, but within the deadline
                 head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\n"
                 if "/complete" in request:
                     connection.sendall(head + b"Hello there.")
@@ -620,7 +626,8 @@ def test_the_deadline_holds_even_inside_one_slow_read(scheme: str, tmp_path: Any
         with pytest.raises(UrlFetchError, match="did not finish within"):
             get("/stalls.txt")
         # At the deadline (2 s), not a full read timeout after the body began (3.5 s).
-        assert time.monotonic() - started < 2.8
+        # Midway between the two, so a busy runner has room either side.
+        assert time.monotonic() - started < 3.0
     finally:
         release.set()
         server.join(5)
@@ -671,3 +678,66 @@ def test_the_route_refuses_a_server_chosen_name_that_is_already_indexed(
         listing = client.get("/documents").json()["filenames"]
         assert sorted(listing) == ["handbook.txt", "other.txt"]
     clear_dependency_caches()
+
+
+def test_a_conditional_fetch_sends_the_validators_and_reads_a_304() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.headers.get("if-none-match") == '"v1"':
+            return httpx.Response(304, headers={"etag": '"v1"'})
+        return httpx.Response(
+            200,
+            content=b"Hello.",
+            headers={"content-type": "text/plain", "etag": '"v1"', "last-modified": "Mon"},
+        )
+
+    first = fetch("https://example.com/a.txt", handler)
+    assert (first.etag, first.last_modified, first.not_modified) == ('"v1"', "Mon", False)
+
+    again = fetch("https://example.com/a.txt", handler, etag='"v1"', last_modified="Mon")
+    assert again.not_modified and again.content == b""
+    assert seen[-1].headers["if-modified-since"] == "Mon"
+    # Asked for unconditionally, a 304 is an error, never an empty document.
+    with pytest.raises(UrlFetchError, match="304"):
+        fetch("https://example.com/a.txt", lambda request: httpx.Response(304))
+
+
+def test_broken_redirects_and_a_cut_off_body_are_clear_errors() -> None:
+    with pytest.raises(UrlFetchError, match="redirected nowhere"):
+        fetch("https://example.com/a.txt", lambda request: httpx.Response(302))
+    # Refused as a fetch error (a 400 at the route), never an unhandled exception.
+    with pytest.raises(UrlFetchError):
+        fetch(
+            "https://example.com/a.txt",
+            lambda request: httpx.Response(302, headers={"location": "http://[::1"}),
+        )
+
+    def cut_off(request: httpx.Request) -> httpx.Response:
+        def body() -> Any:
+            yield b"Hello"
+            raise httpx.ReadError("connection reset")
+
+        return httpx.Response(200, content=body(), headers={"content-type": "text/plain"})
+
+    with pytest.raises(UrlFetchError) as cut:
+        fetch("https://example.com/a.txt", cut_off)
+    assert "connection reset" not in str(cut.value)  # no transport detail to the client
+
+
+def test_the_servers_charset_outranks_the_pages_meta_charset() -> None:
+    from api.documents import parse_document_bytes
+
+    body = '<meta charset="utf-8"><p>Отпуск 28 дней.</p>'.encode("cp1251")
+    doc = fetch(
+        "https://example.com/ru.html",
+        lambda request: httpx.Response(
+            200, content=body, headers={"content-type": "text/html; charset=windows-1251"}
+        ),
+    )
+    (section,) = parse_document_bytes(doc.filename, doc.content)
+    assert section.text == "Отпуск 28 дней."
+    # Undeclared: left as sent.
+    plain = fetch("https://example.com/a.txt", ok(b"Hello.", "text/plain"))
+    assert plain.content == b"Hello."

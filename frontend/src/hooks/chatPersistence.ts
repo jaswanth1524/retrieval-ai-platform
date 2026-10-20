@@ -78,7 +78,16 @@ export const CHAT_STORAGE_VERSION = 2;
 export const CHAT_STORAGE_MAX_TURNS = 100;
 // The tail kept when even that doesn't fit the localStorage quota.
 export const CHAT_STORAGE_FALLBACK_TURNS = 20;
-export const MAX_CONVERSATIONS = 20;
+// IndexedDB holds the history now (chatStore.ts); 20 dated from when localStorage's
+// ~5 MB quota held all of it, and the 21st conversation silently dropped the oldest.
+export const MAX_CONVERSATIONS = 100;
+// localStorage keeps only a copy for first paint and the other tabs' storage events:
+// the active conversation, the pinned ones, and the most recently used, up to this.
+export const LOCAL_STORAGE_MAX_CONVERSATIONS = 20;
+// IndexedDB keeps passage text on this many most recently used conversations; older
+// ones keep their citations (file, page, section, chunk id), which open the viewer.
+// The whole history is one record, rewritten on every save.
+export const FULL_TEXT_CONVERSATIONS = 20;
 // Pinned conversations are never the ones dropped past MAX_CONVERSATIONS; at most this
 // many, so there is always room left for the conversations in use.
 export const MAX_PINNED_CONVERSATIONS = 10;
@@ -186,12 +195,14 @@ export function sanitizeTask(value: unknown): DocumentTask | null {
   if (!value || typeof value !== 'object') return null;
   const task = value as Record<string, unknown>;
   const mode = task.mode;
-  if (mode !== 'summarize' && mode !== 'compare') return null;
+  if (mode !== 'summarize' && mode !== 'compare' && mode !== 'brief') return null;
   const names = task.filenames;
   if (!Array.isArray(names) || !names.every((name) => typeof name === 'string' && name !== '')) {
     return null;
   }
-  if (names.length !== (mode === 'compare' ? 2 : 1) || new Set(names).size !== names.length) {
+  const countOk =
+    mode === 'brief' ? names.length >= 2 && names.length <= 50 : names.length === (mode === 'compare' ? 2 : 1);
+  if (!countOk || new Set(names).size !== names.length) {
     return null;
   }
   const sanitized: DocumentTask = { mode, filenames: [...(names as string[])] };
@@ -232,6 +243,20 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (task) sanitized.task = task;
   const followups = cleanFollowups(turn.followups);
   if (followups.length > 0) sanitized.followups = followups;
+  if (Array.isArray(turn.irrelevantSources)) {
+    const numbers = turn.irrelevantSources.filter(
+      (value): value is number => Number.isInteger(value) && value >= 1 && value <= 1000,
+    );
+    if (numbers.length > 0) sanitized.irrelevantSources = [...new Set(numbers)].slice(0, 50);
+  }
+  if (typeof turn.topRerankScore === 'number' && turn.topRerankScore >= 0 && turn.topRerankScore <= 1) {
+    sanitized.topRerankScore = turn.topRerankScore;
+  }
+  const usage = turn.usage as unknown;
+  if (usage && typeof usage === 'object') {
+    const { prompt, completion } = usage as Record<string, unknown>;
+    if (isCount(prompt) && isCount(completion)) sanitized.usage = { prompt, completion };
+  }
   const coverage = turn.coverage as unknown;
   if (coverage && typeof coverage === 'object') {
     const { read, total } = coverage as Record<string, unknown>;
@@ -311,9 +336,13 @@ export function searchConversations(
 
 /** A conversation as written to disk: the last `maxTurns` turns, with source text kept
  * only on the most recent few (see PERSISTED_SOURCE_TEXT_TURNS). */
-export function compactForStorage(conversation: Conversation, maxTurns: number): Conversation {
+export function compactForStorage(
+  conversation: Conversation,
+  maxTurns: number,
+  textTurns = PERSISTED_SOURCE_TEXT_TURNS,
+): Conversation {
   const turns = conversation.turns.slice(-maxTurns);
-  const keepTextFrom = turns.length - PERSISTED_SOURCE_TEXT_TURNS;
+  const keepTextFrom = turns.length - textTurns;
   return {
     ...conversation,
     turns: turns.map((turn, index) =>
@@ -329,6 +358,48 @@ export function compactForStorage(conversation: Conversation, maxTurns: number):
 }
 
 export type PersistOutcome = 'saved' | 'partial' | 'failed';
+
+/** The conversations localStorage's copy holds: the active one, the pinned ones and
+ *  the most recently used, LOCAL_STORAGE_MAX_CONVERSATIONS in all. A conversation left
+ *  out is never read as deleted (only a tombstone deletes; see mergeConversations). */
+export function conversationsForLocalStorage(storage: ChatStorageV2): Conversation[] {
+  const { conversations, activeConversationId } = storage;
+  if (conversations.length <= LOCAL_STORAGE_MAX_CONVERSATIONS) return conversations;
+  const kept = new Set<string>();
+  const sorted = [...conversations].sort(byRecentUse);
+  for (const conversation of sorted) {
+    if (conversation.id === activeConversationId) kept.add(conversation.id);
+  }
+  for (const conversation of sorted) {
+    if (conversation.pinned && kept.size < LOCAL_STORAGE_MAX_CONVERSATIONS) kept.add(conversation.id);
+  }
+  for (const conversation of sorted) {
+    if (kept.size >= LOCAL_STORAGE_MAX_CONVERSATIONS) break;
+    kept.add(conversation.id);
+  }
+  return conversations.filter((conversation) => kept.has(conversation.id));
+}
+
+/** The history as IndexedDB stores it: every conversation and turn, with passage text
+ *  only on the FULL_TEXT_CONVERSATIONS most recently used (and the active one). */
+export function forChatStore(storage: ChatStorageV2): ChatStorageV2 {
+  if (storage.conversations.length <= FULL_TEXT_CONVERSATIONS) return storage;
+  const full = new Set(
+    [...storage.conversations]
+      .sort(byRecentUse)
+      .slice(0, FULL_TEXT_CONVERSATIONS)
+      .map((conversation) => conversation.id),
+  );
+  if (storage.activeConversationId) full.add(storage.activeConversationId);
+  return {
+    ...storage,
+    conversations: storage.conversations.map((conversation) =>
+      full.has(conversation.id)
+        ? conversation
+        : compactForStorage(conversation, Number.MAX_SAFE_INTEGER, 0),
+    ),
+  };
+}
 
 /** Write the store to localStorage, falling back to the active conversation alone. */
 export function isOnlyEmpty(storage: ChatStorageV2): boolean {
@@ -354,6 +425,7 @@ export function persistStorage(storage: ChatStorageV2): PersistOutcome {
     }
     return 'saved';
   }
+  const local = conversationsForLocalStorage(storage);
   const payloadFor = (convos: Conversation[], maxTurns: number) =>
     JSON.stringify({
       version: CHAT_STORAGE_VERSION,
@@ -362,7 +434,7 @@ export function persistStorage(storage: ChatStorageV2): PersistOutcome {
       deleted: storage.deleted,
     });
   try {
-    localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(conversations, CHAT_STORAGE_MAX_TURNS));
+    localStorage.setItem(CHAT_STORAGE_KEY, payloadFor(local, CHAT_STORAGE_MAX_TURNS));
     return 'saved';
   } catch {
     // Quota most likely exceeded. Retry once with only the active conversation and a

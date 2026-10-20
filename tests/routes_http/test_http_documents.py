@@ -42,6 +42,7 @@ def test_document_upload_ingests_chunks(api_context: ApiTestContext) -> None:
         "sections_parsed": 1,
         "chunks_ingested": 1,
         "collection_name": "api_documents",
+        "unchanged": False,
     }
     records, _ = api_context.qdrant.scroll(
         collection_name="api_documents",

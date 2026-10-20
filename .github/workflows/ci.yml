@@ -108,6 +108,8 @@ jobs:
           uv run python -m eval.harness validate eval/datasets/retrieval_eval.sample.jsonl
           uv run python -m eval.harness validate eval/datasets/handbook_eval.jsonl
           uv run python -m eval.harness validate eval/datasets/multilingual_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/unanswerable_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/followup_eval.jsonl
 
       - name: Audit runtime dependencies
         # Once: the lockfile is the same on every Python version.
@@ -118,7 +120,9 @@ jobs:
         # ships, and ragas carries advisories with no fixed release to move to.
         run: |
           uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
-          uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
+          # Skipped advisories, each with its reason: .github/ci/pip-audit-ignore.txt.
+          mapfile -t ignores < <(awk '!/^#/ && NF {print "--ignore-vuln"; print $1}' .github/ci/pip-audit-ignore.txt)
+          uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt" "${ignores[@]}"
 
   qdrant:
     # The unit suite runs Qdrant in-process (":memory:"), which never exercises the
@@ -314,7 +318,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -356,6 +360,16 @@ jobs:
           expected=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)
           reported=$(curl -fsS http://127.0.0.1:8000/openapi.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])')
           test "$reported" = "$expected" || { echo "image reports $reported, pyproject says $expected"; exit 1; }
+
+      # The boot above skips the models. Load them for real inside the running container
+      # — read-only root filesystem, no capabilities, the model_cache volume — so the
+      # download, the int8 reranker export and api/model_files.py's link replacement run
+      # where users run them, and one query is embedded and reranked.
+      - name: Load the models in the hardened container
+        timeout-minutes: 15
+        run: |
+          docker compose -f docker-compose.yml -f .github/ci/compose.ci.yml exec -T api \
+            /app/.venv/bin/python -c 'from api.dependencies import get_embedding_provider, get_reranker; vectors = get_embedding_provider().embed_texts(["leave policy"]); scores = get_reranker().score("leave policy", ["Employees get 28 days of leave."]); assert len(vectors[0].dense) == 384 and len(scores) == 1, (vectors, scores); print("models ok", scores)'
 
       - name: Show logs on failure
         if: failure()

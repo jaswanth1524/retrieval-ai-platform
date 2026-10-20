@@ -7,7 +7,7 @@ from api.answer_cache import (
     CachedAnswer,
     answer_cache_key,
 )
-from api.corpus import bump_corpus_generation
+from api.corpus import bump_corpus_generation, changed_since, corpus_generation
 from api.settings import AppSettings
 from tests.factories import make_test_settings
 
@@ -45,6 +45,39 @@ def test_a_corpus_change_invalidates_every_key() -> None:
     bump_corpus_generation()
 
     assert answer_cache_key("q", settings, None) != before
+
+
+def test_a_change_in_one_workspace_keeps_the_others_answers() -> None:
+    """Every ingest anywhere used to move one process-wide counter, so an upload to one
+    workspace emptied every workspace's cached answers."""
+
+    default = _settings()
+    other = default.model_copy(update={"qdrant_collection": "docrag_chunks__ws_legal"})
+    default_key, other_key = (
+        answer_cache_key("q", default, None),
+        answer_cache_key("q", other, None),
+    )
+
+    bump_corpus_generation(["a.md"], collection=other.qdrant_collection)
+
+    assert answer_cache_key("q", default, None) == default_key
+    assert answer_cache_key("q", other, None) != other_key
+
+
+def test_changed_since_is_per_collection() -> None:
+    start_a, start_b = corpus_generation("a"), corpus_generation("b")
+
+    bump_corpus_generation(["x.md"], collection="a")
+    bump_corpus_generation(["y.md"], collection="b")
+
+    assert changed_since(start_a, "a") == frozenset({"x.md"})
+    assert changed_since(start_b, "b") == frozenset({"y.md"})
+    assert changed_since(corpus_generation("a"), "a") == frozenset()
+    # A bump naming no collection reaches them all, and names nothing.
+    bump_corpus_generation()
+    assert changed_since(start_b, "b") is None
+    # A collection deleted and made again never reuses a generation it had.
+    assert corpus_generation("new") > start_a
 
 
 def test_least_recently_used_entries_are_evicted_past_the_cap() -> None:
