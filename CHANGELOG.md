@@ -11,7 +11,8 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 ## Unreleased
 
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
-features). **Re-index: recommended** — chunker version 6 (see Changed). Every document
+features), then a follow-up retrieval and chunking pass (pass 8). **Re-index:
+recommended** — chunker version 7 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
 before. No embedding change: the index stays compatible, and nothing is refused. The
@@ -25,6 +26,24 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- **Chunker version 7** (pass 8). Short Markdown/HTML sections are no longer folded into
+  their neighbours: a run of them becomes a chunk of its own, labelled by its first
+  heading and cut once it reaches `MIN_SECTION_WORDS` (a policy's short "Receipts" and
+  "Reimbursement" sections had been one chunk with its boilerplate introduction, cited as
+  "About this policy", and the reranker scored the mileage rule 0.35 there and 0.64 on
+  its own; a page of short FAQ answers had been one chunk under the last question). Only
+  a scrap (a bare heading) still folds into the next section. PDF: a page's first or
+  last line is matched across pages with its digits ignored only when it reads as a page
+  number — "Article 3", "Notice period is 3 days" and "Total 180" were dropped from every
+  page as if they were; a line repeated one in from the edge (a table's header row under
+  the running header) keeps its first copy, where it had gone from every page, and isn't
+  taken for that page's section label. HTML: a `<main>` or lone `<article>` is the page's content only
+  when it holds at least half its text (a sidebar teaser `<article>` or a `<main>` with a
+  welcome line had the real text in a `<div>` dropped), and `<header>`/`<aside>` inside
+  `<main>`, `<article>` or `<section>` are kept. The token estimate used when the dense
+  model's tokenizer can't be fetched counts CJK characters, digits and punctuation, so a
+  chunk of unspaced Japanese or of figures no longer runs past the 512 tokens the model
+  reads. Both retrieval baselines score the same as with version 6. **Recommended.**
 - **Chunker version 6** (pass 7). HTML: only the page's content is indexed — `<main>`,
   or its single `<article>`, else the body without `<nav>`, `<header>`, `<footer>` and
   `<aside>` (kept inside an article; a page whose content area is empty is read whole);
@@ -82,6 +101,12 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 8: traces carry `condense_note` (why a follow-up wasn't rewritten, or its rewrite
+  was cleaned or rejected; shown in the Trace tab) and the reranker model in `config`. The
+  server warns at startup when `RERANKER_MODEL` is changed and `RERANK_MIN_SCORE` is not:
+  the floor is on the default model's score scale. `eval/datasets/paraphrase_eval.jsonl`
+  (questions worded unlike their passage) and six elliptical rows in
+  `followup_eval.jsonl`. **None.**
 - Pass 7: identical re-sends are left alone. A document uploaded (or watched, or fetched)
   again with the same bytes, under current chunking, finishes `done` with `unchanged:
   true` and nothing re-embedded; a watched file that was only touched takes its new time.
@@ -309,6 +334,59 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 8: a question the documents answer was refused ("I do not have enough
+  information…") whenever the reranker scored every passage under `RERANK_MIN_SCORE`.
+  The floor is on one model's score scale: "what are foundational models" against a
+  passage starting "Foundation models: You have trained your own model…" scored 0.006
+  with `Xenova/ms-marco-MiniLM-L-6-v2` and 0.154 with the default jina reranker, so the
+  answer depended on which side of 0.15 a score fell. Now the `RERANK_FALLBACK_COUNT`
+  (3) best-ranked passages go to the model anyway, and the prompt tells it they match
+  only weakly: answer only if they state the answer, else say the documents don't cover
+  it. Such an answer carries `weak_matches: true` (`QuestionResponse`, the `done`
+  frame, the answer cache) and is marked "weak match" in the UI; a refusal is still
+  `insufficient_context`. `RERANK_FALLBACK_COUNT=0` restores the instant refusal. A
+  question nothing clears the bar for now costs one LLM call. Measured on 42
+  answerable and 12 unanswerable questions: gpt-5-mini answered 41/42 (jina) and 40/42
+  (MiniLM), up from 37 and 35; qwen2.5 37/42 with either, up from 37 and 35; every
+  configuration still refused 12/12. Refusals that cite the sources they looked at are
+  recognised in more of the ways gpt-5-mini and qwen2.5 phrase them (a refusal after
+  ", but", sentences that only say what the sources are about, a trailing run of bare
+  markers). **None.**
+- Pass 8: traces carry `weak_matches` (shown in the Trace tab), and `docrag ask` and the
+  MCP `ask` tool say when an answer rests on weak matches. **None.**
+- Pass 8: a line copying a source's header ("[1] filename=…; page=…; section=…"), which
+  qwen2.5 appended to answers despite the prompt, is removed from the answer. **None.**
+- Pass 8: a second question in a conversation was often answered "not enough
+  information" although the documents held the answer. Follow-ups such as "Explain in
+  more detail", "Give me more details", "List all the steps", "Elaborate on the second
+  point" or "How about driving a private car?" were judged standalone and searched as
+  typed; with no topic, nothing cleared `RERANK_MIN_SCORE`. Such follow-ups (words like
+  more, details, explain, second, steps; openings like "and …", "what about …") are now
+  rewritten from the conversation first, and the raw follow-up is searched next to the
+  rewrite (fused with the same RRF `k=60`), so a rewrite that lost what was asked no
+  longer loses its matches. The rewrite is cleaned (an echoed "Standalone question:"
+  label, a preamble, quotes, a second line) and not used when it ran into
+  `CONDENSE_MAX_TOKENS`, is far longer than a question, or answers instead of asking.
+  The answering prompt shows the question as asked plus how it was read. Measured on
+  `followup_eval.jsonl`: hit@3 0.5 → 1.0. **None.**
+- Pass 8: an exchange answered "not enough information" (no citation) is left out of the
+  history sent with the next question, by the server and by the UI: the rewrite folded
+  the refusal into the next search ("What if they miss it?" became "… miss the key
+  points?") and the model refused again. **None.**
+- Pass 8: an answer that cites sources only to say they don't answer the question ("The
+  provided documents do not contain enough information to determine how many sick days
+  contractors get [1][2].") read as `answered`: no "not in your documents" badge, and it
+  went back as history. Its `answer_status` is `insufficient_context` now, so it is
+  flagged and left out of history like an uncited refusal. An answer that gives
+  something after what is missing ("…, but days carry over [1]", or a later cited
+  sentence) is still `answered`. **None.**
+- Pass 8: a summary or comparison answer went back as history at up to 4000 characters
+  (half the history budget); it is clipped to 1500. New chat on an empty conversation
+  kept the document scope set on it ("Ask about these"), so the first question of the
+  new chat was searched in those documents only; it starts unscoped now. **None.**
+- Pass 8: a trace whose answer said the documents don't cover the question was recorded
+  `ok`; it is `insufficient_context` now (and counted as uncovered by the query log).
+  **None.**
 - Pass 7: earlier answers went back to the model as history with their `[n]` markers,
   which numbered the previous turn's sources: the model could copy a stale number onto
   an unrelated source. They are stripped from history now.
