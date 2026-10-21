@@ -152,12 +152,21 @@ export function historyForQuestion(turns: ChatTurn[], question: string): History
 const STAGE_LABELS: Record<string, string> = {
   condensing: 'reading the conversation…',
   searching: 'searching documents…',
+  waiting_for_model: 'waiting for the model — another question is using it…',
+  reading: 'reading the passages…',
   verifying_citations: 'checking citations…',
   reading_documents: 'reading the document…',
   summarizing: 'taking notes…',
   combining: 'combining notes…',
 };
 const DEFAULT_STAGE_LABEL = 'retrieving…';
+/** When the question in flight was asked and its current stage began (epoch ms), and how
+ *  long the local model should take to read the prompt (the server's estimate). */
+export interface StageTiming {
+  askedAt: number;
+  stageStartedAt: number;
+  etaMs: number | null;
+}
 
 export function stageLabel(stage: string, progress?: { step: number; steps: number }): string {
   if (stage === 'summarizing' && progress && progress.steps > 1) {
@@ -180,6 +189,8 @@ export interface UseChatResult {
   // nothing is in flight. Driven by real server `stage` events rather than a hardcoded
   // string, so a 30s retrieval no longer looks identical to a frozen UI.
   stage: string | null;
+  /** Timing of the question in flight (null when none is): drives the elapsed time. */
+  stageTiming: StageTiming | null;
   persistError: boolean;
   persistPartial: boolean;
   conversations: ConversationSummary[];
@@ -300,6 +311,7 @@ export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
   const [pending, setPending] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
+  const [stageTiming, setStageTiming] = useState<StageTiming | null>(null);
   // Which conversation the answer in flight is written to (null when none is), and the
   // one asked in last: other conversations can be opened while an answer streams.
   const [streamingConversationId, setStreamingConversationId] = useState<string | null>(null);
@@ -642,6 +654,15 @@ export function useChat(): UseChatResult {
     // Seeded before the first server frame arrives so there is never a gap with a
     // pending request and no label at all.
     setStage(DEFAULT_STAGE_LABEL);
+    const askedAt = Date.now();
+    setStageTiming({ askedAt, stageStartedAt: askedAt, etaMs: null });
+    const enterStage = (label: string, etaMs: number | null = null) => {
+      setStage(label);
+      setStageTiming({ askedAt, stageStartedAt: Date.now(), etaMs });
+    };
+    // Searched within some documents or tags: a "not found" is about those, not all.
+    const scoped = (filenames?.length ?? 0) > 0 || (options?.tags?.length ?? 0) > 0;
+    let streamedText = false;
 
     // The assistant turn is created lazily on the first `sources`/`delta` event so a
     // mid-stream failure before any event arrives renders as a clean error turn.
@@ -656,6 +677,7 @@ export function useChat(): UseChatResult {
           // Asked with the conversation as history: rated as a follow-up (feedback kind).
           // A summary sends none.
           if (!task && history.length > 0) created.followUp = true;
+          if (scoped && !task) created.scoped = true;
           return [...prev, update(created)];
         }
         return prev.map((turn) => (turn.id === assistantTurnId ? update(turn) : turn));
@@ -697,6 +719,7 @@ export function useChat(): UseChatResult {
       }
       setPending(false);
       setStage(null);
+      setStageTiming(null);
     };
     // A newer question in this conversation makes these suggestions moot (only the last
     // answer shows its own): stop waiting for them, freeing the server's question slot.
@@ -718,16 +741,21 @@ export function useChat(): UseChatResult {
             filenames,
             history,
             {
-              onStage: (serverStage, progress) => {
-                setStage(stageLabel(serverStage, progress));
+              onStage: (serverStage, progress, reading) => {
+                enterStage(stageLabel(serverStage, progress), reading?.etaMs ?? null);
               },
               onSources: (sources, traceId) => {
-                // Sources land the moment retrieval finishes, which is exactly when
-                // generation starts — no separate server frame needed for it.
-                setStage(task ? 'writing the summary…' : 'generating answer…');
+                // Sources land the moment retrieval finishes, which is when generation
+                // starts; a newer server follows with "reading" (or "waiting").
+                enterStage(task ? 'writing the summary…' : 'generating answer…');
                 updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
               },
               onDelta: (text) => {
+                if (!streamedText) {
+                  // The model is writing: "reading the passages…" is over.
+                  streamedText = true;
+                  enterStage(task ? 'writing the summary…' : 'generating answer…');
+                }
                 bufferedDeltaRef.current += text;
                 if (frameId === null) frameId = requestAnimationFrame(flushDelta);
               },
@@ -748,16 +776,27 @@ export function useChat(): UseChatResult {
               onDone: (answer, sources, timings, traceId, cached, grounding) => {
                 flushDelta();
                 const status = grounding?.answerStatus;
+                const notFound = status === 'insufficient_context' || status === 'no_context';
                 updateAssistantTurn((turn) => ({
                   ...turn,
                   content: answer,
                   sources,
+                  // The passages it was given, kept when it found nothing in them, so
+                  // the reader can see what was looked at (text dropped: CitationCard
+                  // opens the passage by chunk id).
+                  ...(notFound && turn.sources.length > 0 && sources.length === 0
+                    ? {
+                        contextSources: turn.sources.map(({ spans: _spans, ...source }) => ({
+                          ...source,
+                          text: '',
+                        })),
+                      }
+                    : {}),
+                  ...(grounding?.autoCited ? { autoCited: true } : {}),
                   timings,
                   traceId,
                   ...(cached ? { cached: true } : {}),
-                  ...(status === 'insufficient_context' || status === 'no_context'
-                    ? { notFound: true }
-                    : {}),
+                  ...(notFound ? { notFound: true } : {}),
                   ...(status === 'uncited' ? { uncited: true } : {}),
                   ...(grounding?.weakMatches ? { weakMatch: true } : {}),
                   ...(grounding?.truncated ? { truncated: true } : {}),
@@ -1186,6 +1225,7 @@ export function useChat(): UseChatResult {
     importConversation,
     pending,
     stage,
+    stageTiming,
     persistError,
     persistPartial,
     conversations: summaries,

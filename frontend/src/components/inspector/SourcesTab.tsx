@@ -6,6 +6,8 @@ interface SourcesTabProps {
   /** Trace candidates, when loaded — supplies each source's rerank score for the track. */
   candidates?: TraceCandidateResponse[];
   onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
+  /** What to say when the turn has no sources: why a finished answer cited none. */
+  emptyMessage?: string;
 }
 
 /** Score for a source, matched to its trace candidate by chunk id.
@@ -22,11 +24,11 @@ function scoreFor(
   return match?.rerank_score ?? null;
 }
 
-function SourcesTab({ sources, candidates, onOpenSource }: SourcesTabProps) {
+function SourcesTab({ sources, candidates, onOpenSource, emptyMessage }: SourcesTabProps) {
   if (sources.length === 0) {
     return (
       <p className="inspector__empty" data-testid="sources-empty">
-        No sources for this turn yet. Ask a question to see what it retrieved.
+        {emptyMessage ?? 'No sources for this turn yet. Ask a question to see what it retrieved.'}
       </p>
     );
   }

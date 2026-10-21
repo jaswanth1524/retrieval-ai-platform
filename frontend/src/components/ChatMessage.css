@@ -419,3 +419,53 @@
   opacity: 0.5;
   cursor: default;
 }
+
+/* A stage after the answer text started (checking citations). */
+.chat-message__stage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-family: var(--fm);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.chat-message__stage-spinner {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--accent);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: dr-spin 0.7s linear infinite;
+}
+
+/* How the answer was grounded, in words, with the next steps for a "not found". */
+.chat-message__notes {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.chat-message__notes p {
+  margin: 0;
+}
+
+.chat-message__note-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.chat-message__closest {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.chat-message__closest > summary {
+  cursor: pointer;
+  color: var(--dim);
+}

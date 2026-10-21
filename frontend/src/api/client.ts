@@ -345,7 +345,13 @@ export interface QuestionStreamHandlers {
   // can run for tens of seconds on a whole-corpus question, so this is the difference
   // between a progress indicator and a frozen one.
   // `progress`: step of steps through a multi-step stage (a summary's parts).
-  onStage?: (stage: string, progress?: { step: number; steps: number }) => void;
+  // `reading`: the prompt the model is about to read — its size, and how long the
+  // local model should take to read it (etaMs, once the server has measured it).
+  onStage?: (
+    stage: string,
+    progress?: { step: number; steps: number },
+    reading?: { promptTokens?: number; etaMs?: number },
+  ) => void;
   onSources?: (sources: CitationResponse[], traceId: string | null) => void;
   onDelta?: (text: string) => void;
   // Suggested next questions, after `done` (FOLLOWUPS_ENABLED on the server).
@@ -362,6 +368,8 @@ export interface QuestionStreamHandlers {
       /** No passage cleared the server's bar: answered from the closest ones. */
       weakMatches?: boolean;
       truncated?: boolean;
+      /** The model cited nothing; the citations were matched to its sentences. */
+      autoCited?: boolean;
       /** Summaries only: passages read, of the passages the documents hold. */
       coverage?: SummaryCoverage;
       /** Tokens the provider reported for this answer; absent when it reported none. */
@@ -371,7 +379,14 @@ export interface QuestionStreamHandlers {
 }
 
 type QuestionStreamEvent =
-  | { type: 'stage'; stage: string; step?: number; steps?: number }
+  | {
+      type: 'stage';
+      stage: string;
+      step?: number;
+      steps?: number;
+      prompt_tokens?: number;
+      eta_ms?: number;
+    }
   | { type: 'sources'; sources: CitationResponse[]; trace_id: string | null }
   | { type: 'delta'; text: string }
   | {
@@ -385,6 +400,7 @@ type QuestionStreamEvent =
       top_rerank_score?: number | null;
       weak_matches?: boolean;
       truncated?: boolean;
+      citation_backfilled?: boolean;
       chunks_read?: number;
       chunks_total?: number;
       usage?: UsageResponse | null;
@@ -787,12 +803,19 @@ export const api = {
           response,
           (event) => {
             if (event.type === 'stage') {
-              handlers.onStage?.(
-                event.stage,
+              const reading =
+                typeof event.prompt_tokens === 'number' || typeof event.eta_ms === 'number'
+                  ? {
+                      ...(typeof event.prompt_tokens === 'number' ? { promptTokens: event.prompt_tokens } : {}),
+                      ...(typeof event.eta_ms === 'number' ? { etaMs: event.eta_ms } : {}),
+                    }
+                  : undefined;
+              const progress =
                 typeof event.step === 'number' && typeof event.steps === 'number'
                   ? { step: event.step, steps: event.steps }
-                  : undefined,
-              );
+                  : undefined;
+              if (reading) handlers.onStage?.(event.stage, progress, reading);
+              else handlers.onStage?.(event.stage, progress);
             } else if (event.type === 'sources') handlers.onSources?.(event.sources, event.trace_id);
             else if (event.type === 'delta') handlers.onDelta?.(event.text);
             else if (event.type === 'done') {
@@ -807,6 +830,7 @@ export const api = {
                   answerStatus: event.answer_status,
                   topRerankScore: event.top_rerank_score,
                   ...(event.weak_matches === true ? { weakMatches: true } : {}),
+                  ...(event.citation_backfilled === true ? { autoCited: true } : {}),
                   truncated: event.truncated,
                   ...(event.usage ? { usage: event.usage } : {}),
                   ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'

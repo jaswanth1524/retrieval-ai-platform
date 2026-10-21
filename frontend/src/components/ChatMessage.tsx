@@ -16,6 +16,7 @@ import { pageLabel } from '../utils/pages';
 import CitationCard from './CitationCard';
 import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
+import { STREAMING_STAGE_LABELS } from '../utils/stages';
 import './ChatMessage.css';
 import { isImeComposing } from '../utils/keyboard';
 import { enterAddsNewline } from '../utils/platform';
@@ -146,6 +147,14 @@ export interface ChatTurn {
   weakMatch?: boolean;
   // Tokens the provider reported for this answer.
   usage?: { prompt: number; completion: number };
+  // A "not found" answer's passages: what the model read and found no answer in (text
+  // left out; opened by chunk id).
+  contextSources?: CitationResponse[];
+  // The model cited nothing; its citations were added by matching its sentences to the
+  // sources (the server's CITATION_RETRY_MODE).
+  autoCited?: boolean;
+  // Asked within some documents or tags, not the whole corpus.
+  scoped?: boolean;
 }
 
 interface ChatMessageProps {
@@ -153,6 +162,10 @@ interface ChatMessageProps {
   engineerMode: boolean;
   // Set only on the single turn actively streaming; undefined means "not this one".
   streamStage?: string;
+  // The streaming turn's question was asked at this time (epoch ms): the wait shown.
+  streamStartedAt?: number;
+  // How long the local model should take to read the prompt, from the server.
+  streamEtaMs?: number | null;
   currentModelLabel?: string;
   // `task`: the whole-document task the question was (a summary), repeated as one.
   onRetry?: (question: string, task?: DocumentTask) => void;
@@ -187,6 +200,35 @@ interface ChatMessageProps {
   // An answer whose best passage scored under this reads as weakly supported (the
   // server's RERANK_MIN_SCORE plus a margin); undefined: no badge.
   weakSupportBelow?: number;
+  // A "not found" answer's next steps: ask the question again over every document
+  // (offered when it was asked within some), or look at the closest passages.
+  onAskEverywhere?: (question: string) => void;
+  onSearchPassages?: (question: string) => void;
+}
+
+/** What the reader should know about how an answer was grounded, in words: the flags
+ *  above say it in one or two, as a tooltip a touch or keyboard user never sees. */
+function groundingNotes(turn: ChatTurn): string[] {
+  const notes: string[] = [];
+  if (turn.notFound) {
+    notes.push(
+      turn.scoped
+        ? 'Nothing in the selected documents answers this.'
+        : 'Nothing in your documents answers this.',
+    );
+  } else if (turn.weakMatch) {
+    notes.push(
+      'No passage matched this question closely; the answer comes from the nearest ones — check it against its sources.',
+    );
+  }
+  if (turn.uncited) notes.push('This answer cites none of its sources — check it against your documents.');
+  if (turn.autoCited) {
+    notes.push(
+      "The model didn't cite its sources; the citations were added by matching its sentences to the passages.",
+    );
+  }
+  if (turn.truncated) notes.push('The model reached its output limit and stopped mid-answer.');
+  return notes;
 }
 
 /** Ask again, naming the task only when there is one (a plain question keeps its call). */
@@ -226,6 +268,10 @@ function ChatMessage({
   onAskFollowup,
   unanswered = false,
   weakSupportBelow,
+  streamStartedAt,
+  streamEtaMs,
+  onAskEverywhere,
+  onSearchPassages,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -471,7 +517,7 @@ function ChatMessage({
           </span>
           <div className="chat-message__answer">
             {showSkeleton ? (
-              <StreamingSkeleton stage={streamStage} />
+              <StreamingSkeleton stage={streamStage} startedAt={streamStartedAt} etaMs={streamEtaMs} />
             ) : (
               <div className="chat-message__markdown">
                 {Markdown ? (
@@ -485,6 +531,14 @@ function ChatMessage({
                   // "[1](#docrag-cite-1)" until the renderer arrives.
                   <p className="chat-message__plain">{turn.content}</p>
                 )}
+              </div>
+            )}
+            {/* A stage after the text has started (checking citations): a whole extra
+                generation on a local model, with the answer otherwise sitting still. */}
+            {streamStage !== undefined && !showSkeleton && !STREAMING_STAGE_LABELS.has(streamStage) && (
+              <div className="chat-message__stage" data-testid="chat-message-stage">
+                <span className="chat-message__stage-spinner" aria-hidden="true" />
+                {streamStage}
               </div>
             )}
             <div className="chat-message__meta-row">
@@ -512,12 +566,13 @@ function ChatMessage({
                 </span>
               )}
               {turn.notFound && (
-                <span
-                  className="chat-message__flag"
-                  title="The server found nothing in your documents that answers this"
-                  data-testid="chat-message-not-found"
-                >
-                  not in your documents
+                <span className="chat-message__flag" data-testid="chat-message-not-found">
+                  {turn.scoped ? 'not in the selected documents' : 'not in your documents'}
+                </span>
+              )}
+              {turn.autoCited && (
+                <span className="chat-message__flag chat-message__flag--warn" data-testid="chat-message-auto-cited">
+                  auto-cited
                 </span>
               )}
               {turn.weakMatch && !turn.notFound && (
@@ -631,6 +686,56 @@ function ChatMessage({
                 </div>
               )}
             </div>
+            {!streamStage && groundingNotes(turn).length > 0 && (
+              <div className="chat-message__notes" data-testid="chat-message-notes">
+                <p>{groundingNotes(turn).join(' ')}</p>
+                {turn.notFound && regenerateQuestion && !regenerateTask && (
+                  <div className="chat-message__note-actions">
+                    {turn.scoped && onAskEverywhere && (
+                      <button
+                        type="button"
+                        className="chat-message__action"
+                        disabled={busy}
+                        onClick={() => onAskEverywhere(regenerateQuestion)}
+                        data-testid="chat-message-ask-everywhere"
+                      >
+                        Ask across all documents
+                      </button>
+                    )}
+                    {onSearchPassages && (
+                      <button
+                        type="button"
+                        className="chat-message__action"
+                        onClick={() => onSearchPassages(regenerateQuestion)}
+                        data-testid="chat-message-search-passages"
+                      >
+                        Search the passages
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+            {turn.contextSources && turn.contextSources.length > 0 && (
+              <details className="chat-message__closest" data-testid="chat-message-closest">
+                <summary>
+                  Passages it read ({turn.contextSources.length}) — none answered the question
+                </summary>
+                <div className="chat-message__citations">
+                  {turn.contextSources.map((source) => (
+                    <CitationCard
+                      key={`${turn.id}-context-${source.source_number}`}
+                      sourceNumber={source.source_number}
+                      filename={source.filename}
+                      page={source.page}
+                      pageEnd={source.page_end}
+                      section={source.section}
+                      onOpen={onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined}
+                    />
+                  ))}
+                </div>
+              </details>
+            )}
             {turn.sources.length > 0 && (
               <div className="chat-message__citations" data-testid="chat-message-sources">
                 {turn.sources.map((source) => (

@@ -31,6 +31,8 @@ interface InspectorProps {
   onOpenSource?: (filename: string, chunkId: string, highlights?: string[]) => void;
   /** Too narrow for a fourth column: show as a drawer over the chat instead. */
   overlay?: boolean;
+  /** Why the inspected answer has no sources, when it is finished and has none. */
+  sourcesEmptyMessage?: string;
 }
 
 function Inspector({
@@ -43,6 +45,7 @@ function Inspector({
   traceReady = true,
   onOpenSource,
   overlay = false,
+  sourcesEmptyMessage,
 }: InspectorProps) {
   const tabs = engineerMode ? ENGINEER_TABS : READER_TABS;
   const state = useTrace(traceId, traceReady);
@@ -66,6 +69,7 @@ function Inspector({
           sources={sources}
           candidates={state.status === 'ready' ? state.trace.candidates : undefined}
           onOpenSource={onOpenSource}
+          emptyMessage={sourcesEmptyMessage}
         />
       );
     }
