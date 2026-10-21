@@ -20,6 +20,7 @@ PAIRS = [
     ("multilingual_eval.jsonl", "corpus_multilingual"),
     ("unanswerable_eval.jsonl", "corpus_handbook"),
     ("followup_eval.jsonl", "corpus_handbook"),
+    ("paraphrase_eval.jsonl", "corpus_handbook"),
 ]
 
 

@@ -113,6 +113,23 @@ describe('ChatThread', () => {
     );
   });
 
+  it('an answer from below-the-bar passages says weak match, not weakly supported', () => {
+    const turns = [
+      turn({ id: 'q1' }),
+      turn({
+        id: 'a1',
+        role: 'assistant',
+        content: 'Foundation models are trained in house [1].',
+        sources: [SOURCE],
+        topRerankScore: 0.006,
+        weakMatch: true,
+      }),
+    ];
+    render(<ChatThread turns={turns} pending={false} engineerMode={false} weakSupportBelow={0.25} />);
+    expect(screen.getByTestId('chat-message-weak-match')).toHaveTextContent('weak match');
+    expect(screen.queryByTestId('chat-message-weak-support')).toBeNull();
+  });
+
   it('a marked source stays marked and well-supported answers carry no badge', () => {
     const turns = [
       turn({ id: 'q1' }),
@@ -344,6 +361,17 @@ describe('inspector', () => {
     expect(screen.getByTestId('trace-error')).toHaveTextContent('The model timed out.');
     expect(screen.getByTestId('trace-variants')).toHaveTextContent('annual leave');
     expect(screen.getByTestId('trace-usage')).toHaveTextContent('120 in');
+  });
+
+  it('says why a follow-up was not condensed', () => {
+    render(<TraceTab trace={{ ...detail, condense_note: 'standalone' }} />);
+    expect(screen.getByTestId('trace-condense-note')).toHaveTextContent('standalone');
+    expect(screen.queryByTestId('trace-weak-matches')).toBeNull();
+  });
+
+  it('says when the answer came from weak matches', () => {
+    render(<TraceTab trace={{ ...detail, weak_matches: true }} />);
+    expect(screen.getByTestId('trace-weak-matches')).toHaveTextContent('closest ones');
   });
 
   it('opens a dropped candidate in the viewer', async () => {

@@ -178,9 +178,14 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 # paragraph and list-item boundaries; an HTML file's <meta charset> is honoured. PDF
 # lines repeated at the top or bottom of most pages (running headers, footers, page
 # numbers) are dropped.
+# v7: a run of short sections becomes a section of its own (labelled by its first)
+# instead of being folded into its neighbours; a PDF edge line is matched with its digits
+# ignored only when it reads as a page number ("Article 3" stays); HTML keeps text outside
+# a <main>/<article> that holds less than half the page, and chrome tags inside content;
+# the fallback token counter counts CJK, digits and punctuation.
 # Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
 # carry an older version is listed as stale, and re-indexing it applies this one.
-CHUNKER_VERSION = 6
+CHUNKER_VERSION = 7
 
 # The smallest share of CHUNK_SIZE_TOKENS a window keeps for text, whatever the
 # filename › section prefix costs. Without a floor a long name left one token per

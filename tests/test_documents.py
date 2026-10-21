@@ -404,6 +404,49 @@ def test_merge_tiny_semantic_sections_folds_backward_when_trailing() -> None:
     assert "see above" in merged[0].text
 
 
+def _semantic(section: str, words: int) -> DocumentSection:
+    text = f"## {section}\n" + " ".join(f"{section.lower()}{i}" for i in range(words))
+    return DocumentSection(
+        filename="policy.md", page=1, section=section, text=text, boundary="semantic"
+    )
+
+
+def test_a_trailing_run_of_short_sections_becomes_its_own_section() -> None:
+    # "Receipts" and "Reimbursement" were folded back into the policy's introduction and
+    # cited as "About this policy"; the reranker scored the mileage rule far lower there.
+    about = _semantic("About this policy", 45)
+    receipts = _semantic("Receipts", 16)
+    reimbursement = _semantic("Reimbursement", 18)
+
+    merged = merge_tiny_semantic_sections([about, receipts, reimbursement], min_words=40)
+
+    assert [section.section for section in merged] == ["About this policy", "Receipts"]
+    assert merged[0].text == about.text
+    assert merged[1].text == receipts.text + "\n\n" + reimbursement.text
+
+
+def test_short_sections_are_gathered_until_they_reach_the_minimum() -> None:
+    # A page of short FAQ answers was one chunk labelled with the last question.
+    questions = [_semantic(f"Question {n}", 18) for n in range(1, 7)]
+
+    merged = merge_tiny_semantic_sections(questions, min_words=40)
+
+    assert [section.section for section in merged] == ["Question 1", "Question 3", "Question 5"]
+    assert all(len(section.text.split()) >= 40 for section in merged)
+
+
+def test_a_bare_heading_still_folds_into_the_section_after_it() -> None:
+    title = DocumentSection(
+        filename="policy.md", page=1, section="Policy", text="# Policy", boundary="semantic"
+    )
+    body = _semantic("About this policy", 45)
+
+    merged = merge_tiny_semantic_sections([title, body], min_words=40)
+
+    assert [section.section for section in merged] == ["About this policy"]
+    assert merged[0].text.startswith("# Policy\n\n## About this policy")
+
+
 def test_merge_tiny_semantic_sections_leaves_physical_sections_untouched() -> None:
     physical = DocumentSection(filename="notes.txt", page=1, section="P", text="a")
 
@@ -627,3 +670,14 @@ def test_csv_section_labels_use_spreadsheet_row_numbers_despite_blank_rows() -> 
     # Row 1 is the header, rows 2, 5 and 6 are blank.
     assert [section.section for section in sections] == ["Rows 3-4", "Rows 7-7"]
     assert sections[1].text == "name: ui; port: 5173"
+
+
+def test_a_section_with_no_words_is_never_a_chunk_of_its_own() -> None:
+    # With MIN_SECTION_WORDS at 1 or 2 the scrap size was 0, so an empty section was not
+    # a scrap and was gathered into a section of its own.
+    empty = DocumentSection(filename="g.md", page=1, section="Empty", text="", boundary="semantic")
+    body = _semantic("Body", 5)
+
+    for min_words in (1, 2):
+        merged = merge_tiny_semantic_sections([empty, body], min_words=min_words)
+        assert [section.section for section in merged] == ["Body"]

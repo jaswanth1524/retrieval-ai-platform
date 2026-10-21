@@ -67,20 +67,24 @@ const HISTORY_MESSAGE_MAX_CHARS = 4000;
 // something the speaker never said; backing up to the last space avoids that. Bounded
 // because text with no whitespace in its tail (a base64 blob, unspaced CJK) would
 // otherwise back off arbitrarily far — past this, a clean cut beats a short message.
-const HISTORY_TRUNCATION_BACKOFF_CHARS = Math.floor(HISTORY_MESSAGE_MAX_CHARS * 0.12);
+// A summary or comparison answer sent back as history: its gist is what a follow-up
+// ("what does it say about deadlines?") needs, and at the full 4000 characters one
+// summary took half of HISTORY_CHAR_BUDGET from the exchanges before it.
+const SUMMARY_HISTORY_MAX_CHARS = 1500;
 
 /** Truncate to HISTORY_MESSAGE_MAX_CHARS, preferring a nearby whitespace boundary.
  *
  * The result is always <= HISTORY_MESSAGE_MAX_CHARS: the ellipsis has to fit inside the
  * server's per-message limit too, so the budget it occupies is reserved up front rather
  * than appended after a full-width cut (which would land one char over and 422). */
-function truncateForHistory(content: string): string {
-  if (content.length <= HISTORY_MESSAGE_MAX_CHARS) return content;
+function truncateForHistory(content: string, maxChars = HISTORY_MESSAGE_MAX_CHARS): string {
+  if (content.length <= maxChars) return content;
   const ELLIPSIS = '…';
-  const budget = HISTORY_MESSAGE_MAX_CHARS - ELLIPSIS.length;
+  const budget = maxChars - ELLIPSIS.length;
   const hardCut = sliceWhole(content, budget);
   const lastBreak = hardCut.lastIndexOf(' ');
-  const cut = lastBreak >= budget - HISTORY_TRUNCATION_BACKOFF_CHARS ? hardCut.slice(0, lastBreak) : hardCut;
+  const backoff = Math.floor(maxChars * 0.12);
+  const cut = lastBreak >= budget - backoff ? hardCut.slice(0, lastBreak) : hardCut;
   // The marker is for the model's benefit: without it a truncated answer looks complete,
   // so it may treat a severed sentence as the speaker's final word.
   return `${cut.trimEnd()}${ELLIPSIS}`;
@@ -93,7 +97,10 @@ function isCompleteAnswer(turn: ChatTurn | undefined): boolean {
     // A stopped answer is a fragment; sent back as history it reads to the model as
     // what it actually concluded. Same for one cut short by a failed connection.
     !turn.stopped &&
-    !turn.incomplete
+    !turn.incomplete &&
+    // "Not enough information" answered nothing: sent back, the server's rewrite of the
+    // next question folded the refusal into the search and the model refused again.
+    !turn.notFound
   );
 }
 
@@ -115,7 +122,9 @@ export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
   const withinBudget: HistoryMessage[] = [];
   let charsUsed = 0;
   for (let i = candidates.length - 1; i >= 0; i -= 1) {
-    const content = truncateForHistory(candidates[i].content);
+    const turn = candidates[i];
+    const isSummary = turn.role === 'assistant' && Boolean(candidates[i - 1]?.task);
+    const content = truncateForHistory(turn.content, isSummary ? SUMMARY_HISTORY_MAX_CHARS : undefined);
     charsUsed += content.length;
     if (charsUsed > HISTORY_CHAR_BUDGET && withinBudget.length > 0) break;
     withinBudget.unshift({ role: candidates[i].role, content });
@@ -750,6 +759,7 @@ export function useChat(): UseChatResult {
                     ? { notFound: true }
                     : {}),
                   ...(status === 'uncited' ? { uncited: true } : {}),
+                  ...(grounding?.weakMatches ? { weakMatch: true } : {}),
                   ...(grounding?.truncated ? { truncated: true } : {}),
                   ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
                     ? { coverage: grounding.coverage }
@@ -1007,9 +1017,19 @@ export function useChat(): UseChatResult {
 
   const newConversation = useCallback(() => {
     setStorage((prev) => {
-      // Reuse an already-empty active conversation instead of stacking blanks.
+      // Reuse an already-empty active conversation instead of stacking blanks — but as a
+      // new chat: a document scope set on it ("Ask about these") went on to scope the
+      // first question of what the user had just asked to be a fresh conversation.
       const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
-      if (active && active.turns.length === 0) return prev;
+      if (active && active.turns.length === 0) {
+        if (!active.scope?.filenames.length && !active.scope?.tags.length) return prev;
+        return {
+          ...prev,
+          conversations: prev.conversations.map((c) =>
+            c.id === active.id ? { ...c, scope: EMPTY_SCOPE, editedAt: Date.now() } : c,
+          ),
+        };
+      }
       const conversation = emptyConversation();
       // Past the cap, the least recently *used* unpinned conversation goes — not the
       // oldest created, which dropped a conversation still in daily use.

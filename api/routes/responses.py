@@ -94,6 +94,7 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
                 fused_top_n=trace.config.fused_top_n,
                 filenames=trace.config.filenames,
                 tags=trace.config.tags,
+                reranker_model=trace.config.reranker_model,
             )
             if trace.config is not None
             else None
@@ -127,6 +128,8 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         timings=TimingsResponse(**trace.timings) if trace.timings is not None else None,
         error=trace.error,
         condensed_question=trace.condensed_question,
+        condense_note=trace.condense_note,
+        weak_matches=trace.weak_matches,
         history_message_count=trace.history_message_count,
         query_variants=trace.query_variants,
         citation_retry_used=trace.citation_retry_used,

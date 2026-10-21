@@ -1,51 +1,51 @@
 {
  "corpus__docrag_citations.md": [
   {
-   "chunk_id": "b4c186fd368a164c0bc9",
+   "chunk_id": "51e28dfdc424a9019c73",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Grounded answers",
    "text_sha1": "60729daa88d95b5f"
   },
   {
-   "chunk_id": "0f23c6b9c9d4119a4aa1",
+   "chunk_id": "31b45eb5b439f6ea8cdb",
    "page": 1,
-   "section": "Citation retry",
-   "text_sha1": "6a8329de6bd1a11e"
+   "section": "Grounded answers",
+   "text_sha1": "a37aa87988fbd0e8"
   },
   {
-   "chunk_id": "b08928ace9fbb55f3e80",
+   "chunk_id": "ee62ead69c9e6f5ece0d",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Citation fields",
    "text_sha1": "b5e97094ff6f91d0"
   },
   {
-   "chunk_id": "bce91af26b690349c8ad",
+   "chunk_id": "5164dedf38c2ffb2a246",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Citation fields",
    "text_sha1": "85de367b102d0cbc"
   },
   {
-   "chunk_id": "6b4be549fd0501551a88",
+   "chunk_id": "972ff12d0c1a1906f15b",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Citation fields",
    "text_sha1": "d44e0088c3c4970b"
   },
   {
-   "chunk_id": "8b855c277c0598cebe1b",
+   "chunk_id": "cb9fbaef97a33adca536",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Citation fields",
    "text_sha1": "6bd2a58a5c318ef8"
   },
   {
-   "chunk_id": "25316bcdc030427cbcff",
+   "chunk_id": "5e7d467cee04d2296a9b",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Citation fields",
    "text_sha1": "6e5853812f3e5f65"
   },
   {
-   "chunk_id": "d3a060342ab2ee621a19",
+   "chunk_id": "79adc073e68bded4596a",
    "page": 1,
-   "section": "Citation retry",
+   "section": "Citation fields",
    "text_sha1": "0b709f817f713388"
   }
  ],
@@ -63,24 +63,24 @@
    "text_sha1": "c8e103c6ac3c89ef"
   },
   {
-   "chunk_id": "e5c59ec0e134dcb7dbb0",
+   "chunk_id": "7a5b78d1ff854cab3aad",
    "page": 1,
-   "section": "Follow-up questions",
+   "section": "History limits",
    "text_sha1": "5aa163c39cea86de"
   },
   {
-   "chunk_id": "275821d6231e0bc62d95",
+   "chunk_id": "4306de4552b50781d6c8",
    "page": 1,
-   "section": "Follow-up questions",
+   "section": "History limits",
    "text_sha1": "f5fee26b9f8fdc81"
   }
  ],
  "corpus__docrag_overview.md": [
   {
-   "chunk_id": "7f5dc904d1ebaff91886",
+   "chunk_id": "174b677ce8953bc44f54",
    "page": 1,
-   "section": "Retrieval strategy",
-   "text_sha1": "8c68672c24cf3248"
+   "section": "DocRAG overview",
+   "text_sha1": "319542e57b5ca152"
   },
   {
    "chunk_id": "3b99f07aa5f56c200855",
@@ -101,16 +101,16 @@
    "text_sha1": "f126de13b1e163f3"
   },
   {
-   "chunk_id": "3901fc25dac5099d1f81",
+   "chunk_id": "ce6328199e8fa6f7b0c1",
    "page": 1,
-   "section": "Embedding model tag",
+   "section": "Embedding models",
    "text_sha1": "c0bb6370e4fbb3e6"
   },
   {
-   "chunk_id": "409a070af02c5c9d30ab",
+   "chunk_id": "aee5a9d22d9d40d62e88",
    "page": 1,
-   "section": "Embedding model tag",
-   "text_sha1": "bb5ceddac75406c5"
+   "section": "Embedding models",
+   "text_sha1": "dc89b9fa35fa321c"
   },
   {
    "chunk_id": "6b95f9cc5ab1e982e417",
@@ -133,22 +133,22 @@
  ],
  "corpus__docrag_providers.md": [
   {
-   "chunk_id": "b237af9f4bcb7b1171c9",
+   "chunk_id": "0bb1d6db34fd30bf72d6",
    "page": 1,
-   "section": "Self-hosted OpenAI-compatible servers",
+   "section": "Default provider",
    "text_sha1": "b79541808596e939"
   },
   {
-   "chunk_id": "3095dab375b0848fef3c",
+   "chunk_id": "211cb5f0884d878cbe19",
    "page": 1,
-   "section": "Self-hosted OpenAI-compatible servers",
+   "section": "Default provider",
    "text_sha1": "a60ccbbb9dbd53d0"
   },
   {
-   "chunk_id": "5c386813ed5fa62aee9b",
+   "chunk_id": "ccf365ef737642081cca",
    "page": 1,
-   "section": "Self-hosted OpenAI-compatible servers",
-   "text_sha1": "c23c41ab7f2ca572"
+   "section": "Default provider",
+   "text_sha1": "a480f7a29f18a457"
   },
   {
    "chunk_id": "d02016c88a020c917822",
@@ -171,22 +171,16 @@
    "text_sha1": "4260cc095ac1e99a"
   },
   {
-   "chunk_id": "d91fbee1881209466785",
+   "chunk_id": "1f95673ad71473105d84",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "3251d0291e142aa5"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "588c67ad6572476401bf",
+   "chunk_id": "26a4e25ed074461ef2b4",
    "page": 1,
-   "section": "About this policy",
-   "text_sha1": "ec080bed7dd9d8fb"
-  },
-  {
-   "chunk_id": "948d39c6c2838b5ad51e",
-   "page": 1,
-   "section": "About this policy",
-   "text_sha1": "dea3a6efaa916efb"
+   "section": "Gifts",
+   "text_sha1": "347bc8ee14dd3d86"
   }
  ],
  "corpus_handbook__company_calendar.md": [
@@ -209,42 +203,36 @@
    "text_sha1": "f3ac19781c901e61"
   },
   {
-   "chunk_id": "daab999daf5f89065051",
+   "chunk_id": "026be7fec19228ca56e1",
    "page": 1,
-   "section": "Working days",
-   "text_sha1": "20a7751994a03833"
-  },
-  {
-   "chunk_id": "6806a559a39a3cdf3919",
-   "page": 1,
-   "section": "Working days",
-   "text_sha1": "1fde54ddecbdf591"
+   "section": "Events",
+   "text_sha1": "9f98a7feabbf54fc"
   }
  ],
  "corpus_handbook__contractor_handbook.md": [
   {
-   "chunk_id": "3bf9dd083dc2e931b1d1",
+   "chunk_id": "14c809e7f1ab42ef639e",
    "page": 1,
-   "section": "Equipment",
+   "section": "Scope",
    "text_sha1": "f2ac56bce8b87c38"
   },
   {
-   "chunk_id": "a3d4de253913991acf69",
+   "chunk_id": "56f522213ae5a73c304e",
    "page": 1,
-   "section": "Equipment",
-   "text_sha1": "7dc91d8a1346174c"
+   "section": "Scope",
+   "text_sha1": "eecebc79fda028ca"
   },
   {
-   "chunk_id": "085d54a7ee320bce3002",
+   "chunk_id": "17ba651120e798609c54",
    "page": 1,
-   "section": "Equipment",
-   "text_sha1": "1e745eea5686cacc"
+   "section": "Working location",
+   "text_sha1": "978576b16e184d9a"
   },
   {
-   "chunk_id": "3f171f7ec569b71ef23b",
+   "chunk_id": "245d883ae820c1711aa2",
    "page": 1,
-   "section": "Equipment",
-   "text_sha1": "b609d1dcd4a60a5f"
+   "section": "Working location",
+   "text_sha1": "b4225e7e52f6549d"
   }
  ],
  "corpus_handbook__data_retention_policy.md": [
@@ -261,21 +249,21 @@
    "text_sha1": "232a45b8ac22bf3b"
   },
   {
-   "chunk_id": "c79fd2d19a0c835aa541",
+   "chunk_id": "6a91588dc8da8a2e628e",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "7c035dd4adefb1f0"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "fc77db9c33614c8df78a",
+   "chunk_id": "9b0a7ab608487e3bfab2",
    "page": 1,
-   "section": "About this policy",
+   "section": "Customer records",
    "text_sha1": "602c91cb0edf801b"
   },
   {
-   "chunk_id": "1a34e2efdf11dcf91b95",
+   "chunk_id": "dd9397b73ddee1af6d36",
    "page": 1,
-   "section": "About this policy",
+   "section": "Customer records",
    "text_sha1": "a4e16545be7b3ab3"
   }
  ],
@@ -287,22 +275,22 @@
    "text_sha1": "c02f216c66ded4c8"
   },
   {
-   "chunk_id": "5582935eecf8b27fb8b9",
+   "chunk_id": "4ce8dbc9bff6f12ca652",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "16edcaac58e6f23a"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "52102b951264939d0b1b",
+   "chunk_id": "7a4b99f22810a343b997",
    "page": 1,
-   "section": "About this policy",
-   "text_sha1": "ba6663dca50719c4"
+   "section": "Receipts",
+   "text_sha1": "d96b87f556b23816"
   },
   {
-   "chunk_id": "4ab33f3bea7645679b94",
+   "chunk_id": "92e64e6fa304b9af63fa",
    "page": 1,
-   "section": "About this policy",
-   "text_sha1": "247966576a7c1aa9"
+   "section": "Receipts",
+   "text_sha1": "0851b18c0df706f5"
   }
  ],
  "corpus_handbook__general_faq.md": [
@@ -319,15 +307,15 @@
    "text_sha1": "441d2fa97fc4da20"
   },
   {
-   "chunk_id": "ef58616617eea576c4cb",
+   "chunk_id": "44b96527ee94cccb4362",
    "page": 1,
    "section": "About the FAQ",
-   "text_sha1": "43969544a068decb"
+   "text_sha1": "b27ecb6096fd7f3c"
   },
   {
-   "chunk_id": "df0a4d8190fb24891c60",
+   "chunk_id": "843a00d797337188af59",
    "page": 1,
-   "section": "About the FAQ",
+   "section": "Costs",
    "text_sha1": "84f582cd530eb798"
   }
  ],
@@ -345,21 +333,21 @@
    "text_sha1": "232a45b8ac22bf3b"
   },
   {
-   "chunk_id": "89249093dbe7d57f4e2c",
+   "chunk_id": "0b36082f271c912d4a9e",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "42791f925bfa3058"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "113d8642754b998b5b8c",
+   "chunk_id": "bf44a08b0ed33aba2872",
    "page": 1,
-   "section": "About this policy",
+   "section": "Laptops",
    "text_sha1": "09b37d0e30dc0361"
   },
   {
-   "chunk_id": "776b5cb1406444c12635",
+   "chunk_id": "c66dda86468e56dc92c1",
    "page": 1,
-   "section": "About this policy",
+   "section": "Laptops",
    "text_sha1": "cf9b3f3f958a6ba5"
   }
  ],
@@ -371,21 +359,21 @@
    "text_sha1": "66c8d465e34efa86"
   },
   {
-   "chunk_id": "5df19f133d51c692aa3b",
+   "chunk_id": "7b737ede7cb3a4acadf5",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "f8b35060198f4d9b"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "c2cf90fa7a4d1b1961e8",
+   "chunk_id": "a8d023b6b796395eb6c1",
    "page": 1,
-   "section": "About this policy",
+   "section": "Vacation",
    "text_sha1": "39b76a93a67388c5"
   },
   {
-   "chunk_id": "807868e7ed425921ac21",
+   "chunk_id": "b26023098cf423f5f02f",
    "page": 1,
-   "section": "About this policy",
+   "section": "Vacation",
    "text_sha1": "93f523dac675a6c7"
   }
  ],
@@ -397,21 +385,21 @@
    "text_sha1": "31338e1ca8c53eb8"
   },
   {
-   "chunk_id": "439138f95c23f3cc447a",
+   "chunk_id": "8640b95f86e471091584",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "eacaba9e401a7239"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "dcd8bc52585bbe5f919b",
+   "chunk_id": "fa7cd60055471c1d582c",
    "page": 1,
-   "section": "About this policy",
+   "section": "First week",
    "text_sha1": "9462b97661b93f0e"
   },
   {
-   "chunk_id": "462c3bfb4dd6c5f2c2da",
+   "chunk_id": "8509200c8bd7981a10c1",
    "page": 1,
-   "section": "About this policy",
+   "section": "First week",
    "text_sha1": "ec2d0643feb56901"
   }
  ],
@@ -423,21 +411,21 @@
    "text_sha1": "b31f79b81d0d1d5d"
   },
   {
-   "chunk_id": "704c082d6e095740e5bf",
+   "chunk_id": "eff2542b383bb4f6fdcd",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "74d9c7a5a4c6746b"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "38748085cab4e47014f6",
+   "chunk_id": "bcecfff06431e02e4d1e",
    "page": 1,
-   "section": "About this policy",
+   "section": "Purchase orders",
    "text_sha1": "99b109e1c3d23204"
   },
   {
-   "chunk_id": "1374a31f2ecb197b0fa5",
+   "chunk_id": "315aa722bb5879ede46a",
    "page": 1,
-   "section": "About this policy",
+   "section": "Purchase orders",
    "text_sha1": "8cdfd49cb96f372b"
   }
  ],
@@ -455,41 +443,41 @@
    "text_sha1": "232a45b8ac22bf3b"
   },
   {
-   "chunk_id": "46f1fda6c0c70e83e45c",
+   "chunk_id": "281a85f4785bd9239c5b",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "da5ee831cd71ce7f"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "de6f11bcaa8d9ef03bb7",
+   "chunk_id": "ed008d790605802e2c4d",
    "page": 1,
-   "section": "About this policy",
+   "section": "Eligibility",
    "text_sha1": "ee31aab7d3c10640"
   },
   {
-   "chunk_id": "bb12c4eb29b2e90a62de",
+   "chunk_id": "73f9b0441f9097648363",
    "page": 1,
-   "section": "About this policy",
+   "section": "Eligibility",
    "text_sha1": "ee9ceaa2fdd93875"
   }
  ],
  "corpus_handbook__security_newsletter.md": [
   {
-   "chunk_id": "e250ed4fb0f50c44c7cd",
+   "chunk_id": "5bf31c21c62fcd4ca5d3",
    "page": 1,
-   "section": "Password tips",
+   "section": "Phishing season",
    "text_sha1": "38e18994081bfa76"
   },
   {
-   "chunk_id": "e4ba17481e5e962dc570",
+   "chunk_id": "5ba262ac3e5521c3bc27",
    "page": 1,
-   "section": "Password tips",
+   "section": "Phishing season",
    "text_sha1": "7f50c840a0dc5b6b"
   },
   {
-   "chunk_id": "25576cf1cb7f99cfeb7d",
+   "chunk_id": "ce98fd8a593d7c8fe6cb",
    "page": 1,
-   "section": "Password tips",
+   "section": "Phishing season",
    "text_sha1": "51d952c9069f39fd"
   }
  ],
@@ -501,21 +489,21 @@
    "text_sha1": "69b3f82cd212c713"
   },
   {
-   "chunk_id": "741cef58d3d7067fa89f",
+   "chunk_id": "89fbdbd5d50c867dc7fc",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "93ea064d16882a53"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "08d0068c278f8103f591",
+   "chunk_id": "27ba49ca9fec533f2915",
    "page": 1,
-   "section": "About this policy",
+   "section": "Passwords",
    "text_sha1": "4c2aaea071631ecf"
   },
   {
-   "chunk_id": "741a75c68ccf2975ad7a",
+   "chunk_id": "507762028997106ef910",
    "page": 1,
-   "section": "About this policy",
+   "section": "Passwords",
    "text_sha1": "b87cb88ee6517387"
   }
  ],
@@ -527,36 +515,36 @@
    "text_sha1": "3f24f4229e395a24"
   },
   {
-   "chunk_id": "dec0bc443235d5f3e213",
+   "chunk_id": "32ebebdcbc98cd867f37",
    "page": 1,
    "section": "About this policy",
-   "text_sha1": "a03c3a2fa46755d2"
+   "text_sha1": "80164910a5eae0b5"
   },
   {
-   "chunk_id": "78b907f6569d22e339d8",
+   "chunk_id": "0c74ea81906fe24fc77e",
    "page": 1,
-   "section": "About this policy",
+   "section": "Booking trips",
    "text_sha1": "2955ee69e4d63b76"
   },
   {
-   "chunk_id": "3f2867a3131b676cfee5",
+   "chunk_id": "3aa82edaae85126fd2c6",
    "page": 1,
-   "section": "About this policy",
+   "section": "Booking trips",
    "text_sha1": "3e2eaafc592802e8"
   }
  ],
  "corpus_handbook__travel_policy_2019_archived.md": [
   {
-   "chunk_id": "d1200a0a168490c44bcb",
+   "chunk_id": "b1fc31f5369c82225291",
    "page": 1,
-   "section": "Per diem",
+   "section": "Status",
    "text_sha1": "4486a6cefaf3f5ee"
   },
   {
-   "chunk_id": "26b3cc2a6fc953549254",
+   "chunk_id": "ee9ae425bd2896560c9e",
    "page": 1,
-   "section": "Per diem",
-   "text_sha1": "2f99167d70640974"
+   "section": "Status",
+   "text_sha1": "c96fee6ab6596329"
   },
   {
    "chunk_id": "0c9aa2c096e33c40fa00",
@@ -583,9 +571,9 @@
  ],
  "page.html": [
   {
-   "chunk_id": "5fa852f69530f49de6cf",
+   "chunk_id": "89c333f21dcfb59e3e4c",
    "page": 1,
-   "section": "Upgrade",
+   "section": "Guide",
    "text_sha1": "3292a5d9007ca104"
   }
  ],
@@ -633,17 +621,17 @@
  ],
  "fenced.md": [
   {
-   "chunk_id": "e745aa83d4d0f6e6cf68",
+   "chunk_id": "30c1d1b81f88e1c41de7",
    "page": 1,
-   "section": "Usage",
+   "section": "Install",
    "text_sha1": "a6ed35f447b380fe"
   }
  ],
  "policy.docx": [
   {
-   "chunk_id": "399912dcef0605b0fc2f",
+   "chunk_id": "7cef3a2037ec39480d33",
    "page": 1,
-   "section": "Approvals",
+   "section": "Leave policy",
    "text_sha1": "4baf184a7a2c96ad"
   }
  ],

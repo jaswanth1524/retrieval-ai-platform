@@ -16,6 +16,8 @@ from api.llm import (
     completion_model_and_kwargs,
     effective_max_tokens,
     logger,
+    reset_finish_reason,
+    stopped_at_token_limit,
 )
 from api.reranking import RerankedChunk
 from api.settings import AppSettings
@@ -71,10 +73,21 @@ def with_answer_language(messages: list[ChatMessage], settings: AppSettings) -> 
     return [first, *messages[1:]]  # type: ignore[list-item]
 
 
+# Added to the instructions when no source cleared RERANK_MIN_SCORE and the closest
+# ones are sent instead (RERANK_FALLBACK_COUNT).
+WEAK_MATCH_INSTRUCTION = (
+    "- No source matched the question closely; these are the nearest passages. Answer "
+    "only if they state the answer, and cite them. If they don't, say that the "
+    "provided documents do not contain enough information, without citing them."
+)
+
+
 def build_grounded_messages(
     query: str,
     context_chunks: Sequence[RerankedChunk],
     history: Sequence[ChatMessage] | None = None,
+    *,
+    weak_matches: bool = False,
 ) -> list[ChatMessage]:
     """Build the prompt that constrains the model to provided context.
 
@@ -116,6 +129,7 @@ def build_grounded_messages(
                 "- Include citations using source numbers such as [1] or [2].\n"
                 "- Cite inline only; do not end with a list of sources or references.\n"
                 "- If the context is insufficient, say so directly."
+                + (f"\n{WEAK_MATCH_INSTRUCTION}" if weak_matches else "")
             ),
         }
     )
@@ -240,6 +254,8 @@ def fit_prompt_to_context_window(
     context_chunks: Sequence[RerankedChunk],
     history: Sequence[ChatMessage] | None,
     settings: AppSettings,
+    *,
+    weak_matches: bool = False,
 ) -> FittedPrompt:
     """Trim the prompt so it fits the model's context window with the answer to spare.
 
@@ -258,7 +274,9 @@ def fit_prompt_to_context_window(
     dropped_history = 0
 
     def size() -> int:
-        return estimate_prompt_tokens(build_grounded_messages(query, chunks, kept_history or None))
+        return estimate_prompt_tokens(
+            build_grounded_messages(query, chunks, kept_history or None, weak_matches=weak_matches)
+        )
 
     while size() > budget:
         if len(chunks) > 1:
@@ -286,9 +304,11 @@ def fit_prompt_to_context_window(
     return FittedPrompt(chunks, kept_history, frozenset(dropped), dropped_history)
 
 
-# Recent messages the condense prompt sees, and how much of each assistant answer.
+# Recent messages the condense prompt sees, and how much of each assistant answer. At
+# 600 characters "the second point" of a longer answer was past the cut, and the rewrite
+# could only guess what it referred to.
 CONDENSE_HISTORY_MESSAGES = 4
-CONDENSE_ASSISTANT_CHARS = 600
+CONDENSE_ASSISTANT_CHARS = 1500
 
 
 def clip_text(text: str, limit: int) -> str:
@@ -328,6 +348,81 @@ def build_condense_messages(
     ]
 
 
+@dataclass(frozen=True)
+class CondensedQuery:
+    """A condense call's result: the rewrite to retrieve with ("" = use the raw question)
+    and, when it was not used as returned, why (for the trace)."""
+
+    text: str
+    note: str | None = None
+
+
+# A label the model echoes back from the prompt ("Standalone question: ..."), or puts in
+# front of its rewrite ("Rewritten query: ...").
+_CONDENSE_LABEL_RE = re.compile(
+    r"^(?:the\s+)?(?:standalone|rewritten|reformulated|rephrased|search|follow-up)?\s*"
+    r"(?:question|query)\s*:\s*",
+    re.IGNORECASE,
+)
+# A conversational lead-in ("Here is the rewritten question:", "Sure:").
+_CONDENSE_PREAMBLE_RE = re.compile(
+    r"^(?:here(?:'s| is)|sure|okay|ok|certainly)\b[^:\n]{0,60}:\s*", re.IGNORECASE
+)
+_CONDENSE_WRAPPING = "\"'`*“”‘’ "
+
+
+def clean_condensed_query(output: str, question: str) -> CondensedQuery:
+    """The retrieval query in a condense call's ``output``, or "" with the reason.
+
+    The model was asked for the rewritten question alone, but small models echo the
+    prompt's "Standalone question:" label, add a preamble, put the question on a second
+    line or answer it instead. Every one of those went to search verbatim. The first
+    line that holds text once labels and quotes are stripped is the rewrite; output far
+    longer than the question is an answer, not a rewrite, and is not used.
+    """
+
+    for line in output.splitlines():
+        text = line.strip().strip(_CONDENSE_WRAPPING)
+        text = _CONDENSE_PREAMBLE_RE.sub("", text, count=1)
+        text = _CONDENSE_LABEL_RE.sub("", text, count=1).strip().strip(_CONDENSE_WRAPPING)
+        if text:
+            break
+    else:
+        return CondensedQuery("", "empty")
+    if len(text) > max(4 * len(question), _CONDENSE_MAX_CHARS):
+        return CondensedQuery("", "rejected: longer than a question")
+    note = None if text == output.strip().strip("\"'") else "cleaned"
+    return CondensedQuery(text, note)
+
+
+# A rewrite longer than this (or four times the question) is an answer, not a question.
+_CONDENSE_MAX_CHARS = 400
+
+
+def condense_question_detailed(
+    question: str,
+    history: Sequence[ChatMessage],
+    generator: ChatGenerator,
+    settings: AppSettings,
+) -> CondensedQuery:
+    """``condense_question`` with the reason a rewrite was not used as returned."""
+
+    messages = build_condense_messages(question, history)
+    condense_settings = settings.model_copy(
+        update={
+            "llm_temperature": 0.0,
+            "llm_max_tokens": int(settings.condense_max_tokens),
+        }
+    )
+    reset_finish_reason()
+    output = generator.complete(messages, condense_settings)
+    # Cut off at condense_max_tokens: the model was answering, not rewriting, or the
+    # rewrite is missing its end.
+    if stopped_at_token_limit():
+        return CondensedQuery("", "rejected: hit condense_max_tokens")
+    return clean_condensed_query(output, question)
+
+
 def condense_question(
     question: str,
     history: Sequence[ChatMessage],
@@ -338,20 +433,12 @@ def condense_question(
 
     Deterministic (temperature 0) regardless of the caller's own temperature
     override — this is a mechanical rewrite, not a creative generation. Returns ""
-    (rather than raising) when the provider returns an empty response, so the
-    caller's own fallback-to-raw-question logic handles both failure modes the
-    same way.
+    (rather than raising) when the provider returns an empty response or something that
+    is not a rewrite, so the caller's own fallback-to-raw-question logic handles every
+    failure mode the same way.
     """
 
-    messages = build_condense_messages(question, history)
-    condense_settings = settings.model_copy(
-        update={
-            "llm_temperature": 0.0,
-            "llm_max_tokens": int(settings.condense_max_tokens),
-        }
-    )
-    result = generator.complete(messages, condense_settings).strip()
-    return result.strip("\"'")
+    return condense_question_detailed(question, history, generator, settings).text
 
 
 def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
@@ -586,8 +673,38 @@ _LOW_SIGNAL_WORDS_OTHER = frozenset(
 )  # fmt: skip
 
 
-# Words in any script (letters only, an inner apostrophe kept: "it's", "d'une").
-_WORD_RE = re.compile(r"[^\W\d_][^\W\d_']*")
+# Words that carry a question on from the previous answer with no pronoun at all:
+# "Explain in more detail", "Elaborate on the second point", "List all the steps",
+# "What happens after approval?". Each has enough words to pass for standalone, so it
+# went to search as is — with no topic, nothing cleared the rerank bar and a second
+# question in a conversation was answered "not enough information". A standalone
+# question that happens to use one costs a condense call that returns it unchanged.
+_FOLLOW_UP_WORDS = frozenset(
+    {
+        "more", "detail", "details", "detailed", "elaborate", "explain", "expand",
+        "continue", "further", "again", "too", "other", "others", "rest", "remaining",
+        "first", "second", "third", "fourth", "fifth", "last", "next", "prior", "below",
+        "point", "points", "step", "steps", "part", "parts", "example", "examples",
+        "summarize", "summarise", "summary", "list", "happens", "happen", "after",
+        "afterwards", "before", "otherwise",
+        # Spanish, German, French, Italian, Portuguese
+        "detalles", "explica", "explícame", "erkläre", "erklär", "genauer", "détails",
+        "explique", "dettagli", "spiega", "detalhes",
+    }
+)  # fmt: skip
+
+
+# A follow-up that opens by continuing the last turn ("And for part-time staff?", "How
+# about remote workers?"), whatever words follow.
+_FOLLOW_UP_FIRST_WORDS = frozenset({"and", "but", "so", "also", "or", "plus", "y", "und", "et"})
+_FOLLOW_UP_OPENINGS = frozenset(
+    {("what", "about"), ("how", "about"), ("what", "if"), ("why", "not"), ("what", "else")}
+)
+
+
+# Words in any script (letters only, an inner apostrophe kept: "it's", "d'une"), a
+# hyphenated compound as one word ("part-time"), so it counts once as content.
+_WORD_RE = re.compile(r"[^\W\d_][^\W\d_']*(?:-[^\W\d_][^\W\d_']*)*")
 
 
 # Below this many substantive words, a question is too thin to retrieve on by itself
@@ -611,7 +728,14 @@ def needs_condense(question: str) -> bool:
     """
 
     words = _WORD_RE.findall(question.lower())
-    if any(word in _ANAPHORA_WORDS or word in _ANAPHORA_WORDS_OTHER for word in words):
+    # A compound's parts are checked too: French "coûte-t-elle" holds "elle".
+    parts = {part for word in words for part in word.split("-")}
+    if any(
+        part in _ANAPHORA_WORDS or part in _ANAPHORA_WORDS_OTHER or part in _FOLLOW_UP_WORDS
+        for part in parts
+    ):
+        return True
+    if words and (words[0] in _FOLLOW_UP_FIRST_WORDS or tuple(words[:2]) in _FOLLOW_UP_OPENINGS):
         return True
     content = [
         word

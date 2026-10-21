@@ -196,6 +196,23 @@ function TraceTab({ trace }: TraceTabProps) {
         </div>
       )}
 
+      {trace.weak_matches && (
+        <div className="trace-tab__note" data-testid="trace-weak-matches">
+          <p className="trace-tab__note-label mono">weak matches</p>
+          <p className="trace-tab__note-body">
+            No candidate cleared the rerank bar; the closest ones were sent to the model, marked as
+            weak matches.
+          </p>
+        </div>
+      )}
+
+      {trace.condense_note && (
+        <div className="trace-tab__note" data-testid="trace-condense-note">
+          <p className="trace-tab__note-label mono">condense</p>
+          <p className="trace-tab__note-body mono">{trace.condense_note}</p>
+        </div>
+      )}
+
       {trace.prompt_messages && (
         <details className="trace-tab__prompt">
           <summary className="mono">

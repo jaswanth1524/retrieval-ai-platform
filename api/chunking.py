@@ -47,15 +47,38 @@ TokenCounterMode = Literal["hf", "heuristic", "unknown"]
 _TOKENIZER_RETRY_SECONDS = 300.0
 
 
+# What the dense model's WordPiece tokenizer makes a token of on its own, beyond the
+# letters of an ordinary word: a CJK character, a punctuation mark, about two digits.
+_HEURISTIC_CJK_RE = re.compile(
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9f]"
+)
+_HEURISTIC_PUNCTUATION_RE = re.compile(r"[^\w\s]")
+_HEURISTIC_DIGITS_PER_TOKEN = 2
+
+
 class HeuristicTokenCounter:
-    """Word-count-based token estimate; no model, always available."""
+    """Word-count-based token estimate; no model, always available.
+
+    An ordinary word counts _HEURISTIC_TOKENS_PER_WORD. A "word" of CJK text, digits or
+    punctuation counts what those come to: unspaced Japanese or Chinese read as one word,
+    and a table of figures as a word per cell, so a whole document became one 1240-token
+    chunk the 512-token dense model saw the start of. (CHUNKER_VERSION 7.)
+    """
 
     special_tokens_per_sequence = _BERT_SPECIAL_TOKENS
     mode: TokenCounterMode = "heuristic"
 
     def count(self, text: str) -> int:
-        words = len(text.split())
-        return math.ceil(words * _HEURISTIC_TOKENS_PER_WORD)
+        return math.ceil(sum(_heuristic_word_tokens(word) for word in text.split()))
+
+
+def _heuristic_word_tokens(word: str) -> float:
+    pieces = (
+        len(_HEURISTIC_CJK_RE.findall(word))
+        + len(_HEURISTIC_PUNCTUATION_RE.findall(word))
+        + sum(character.isdigit() for character in word) / _HEURISTIC_DIGITS_PER_TOKEN
+    )
+    return max(_HEURISTIC_TOKENS_PER_WORD, pieces)
 
 
 class HFTokenCounter:
@@ -408,25 +431,55 @@ def _merge_semantic_run(
     run: list[DocumentSection],
     min_words: int,
 ) -> list[DocumentSection]:
-    """Fold sections under ``min_words`` forward into the next section in the run.
+    """Group sections under ``min_words`` so none is chunked on its own as a scrap.
 
-    A trailing run of tiny sections with no bigger section after them folds
-    backward into the last merged section instead (or, if the whole run is tiny,
-    collapses into one section under the last section's label).
+    Consecutive tiny sections are gathered into a section of their own, labelled by the
+    first of them with real text, and cut as soon as the gathered text reaches
+    ``min_words``. Only a scrap (under a third of ``min_words``: a bare heading, a
+    one-line note) is folded into a neighbour — forward into the next section, or back
+    into the previous one at the end of the run.
+
+    It used to fold every tiny section into the next big one, and a trailing run back
+    into the last: a policy's two short sections ("Receipts", "Reimbursement") became
+    one chunk with its boilerplate introduction, labelled "About this policy", and a
+    page of short FAQ answers became one chunk under the last question. The reranker
+    scored the mileage rule at 0.35 inside that chunk and at 0.64 in its own section.
+    (CHUNKER_VERSION 7.)
     """
 
+    # At least 1: with MIN_SECTION_WORDS at 1 or 2, a section with no words was not a
+    # scrap and became a chunk of its own.
+    scrap = max(1, min_words // 3)
     merged: list[DocumentSection] = []
-    pending: list[str] = []
+    pending: list[DocumentSection] = []
+
+    def pending_words() -> int:
+        return sum(len(section.text.split()) for section in pending)
+
+    def gathered() -> DocumentSection:
+        label = next((s for s in pending if len(s.text.split()) >= scrap), pending[0])
+        return replace(label, text="\n\n".join(section.text for section in pending))
+
     for section in run:
-        if len(section.text.split()) < min_words:
-            pending.append(section.text)
+        if len(section.text.split()) >= min_words:
+            if pending and pending_words() >= scrap:
+                merged.append(gathered())
+            elif pending:
+                section = replace(
+                    section,
+                    text="\n\n".join([*(s.text for s in pending), section.text]),
+                )
+            pending = []
+            merged.append(section)
             continue
-        text = "\n\n".join([*pending, section.text]) if pending else section.text
-        pending = []
-        merged.append(replace(section, text=text))
+        pending.append(section)
+        if pending_words() >= min_words:
+            merged.append(gathered())
+            pending = []
     if pending:
-        if merged:
-            merged[-1] = replace(merged[-1], text=merged[-1].text + "\n\n" + "\n\n".join(pending))
+        if pending_words() >= scrap or not merged:
+            merged.append(gathered())
         else:
-            merged.append(replace(run[-1], text="\n\n".join(pending)))
+            tail = "\n\n".join(section.text for section in pending)
+            merged[-1] = replace(merged[-1], text=merged[-1].text + "\n\n" + tail)
     return merged

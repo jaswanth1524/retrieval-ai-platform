@@ -38,6 +38,28 @@ afterEach(() => {
 });
 
 describe('useChat', () => {
+  it('marks an answer given from below-the-bar passages as a weak match', async () => {
+    askQuestionStreamMock.mockImplementation(
+      async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+        handlers.onDone?.('Foundation models are trained in house [1].', [], ZERO_TIMINGS, 't', false, {
+          answerStatus: 'answered',
+          topRerankScore: 0.006,
+          weakMatches: true,
+        });
+      },
+    );
+    const { result } = renderHook(() => useChat());
+
+    await act(async () => {
+      await result.current.ask('what are foundational models');
+    });
+
+    const answer = result.current.turns[1];
+    expect(answer.weakMatch).toBe(true);
+    expect(answer.notFound).toBeUndefined();
+    expect(sanitizeTurn(answer)?.weakMatch).toBe(true);
+  });
+
   it('keeps a summary task on its turns and shows its part progress', async () => {
     const task = { mode: 'summarize' as const, filenames: ['a.pdf'] };
     let finish!: () => void;
@@ -762,6 +784,34 @@ describe('buildHistory', () => {
     return { id: role + content.length, role, content, sources: [], timestamp: 0, timings: null, traceId: null };
   }
 
+  it('clips a summary answer harder than an ordinary one', () => {
+    const summary = 'word '.repeat(1000);
+    const history = buildHistory([
+      { ...makeChatTurn('user', 'Summarize a.pdf'), task: { mode: 'summarize', filenames: ['a.pdf'] } },
+      makeChatTurn('assistant', summary),
+      makeChatTurn('user', 'Explain it'),
+      makeChatTurn('assistant', summary),
+    ]);
+
+    expect(history[1].content.length).toBeLessThanOrEqual(1500);
+    expect(history[1].content.endsWith('…')).toBe(true);
+    expect(history[3].content.length).toBeGreaterThan(3500);
+  });
+
+  it('leaves out an exchange whose answer found nothing in the documents', () => {
+    const history = buildHistory([
+      makeChatTurn('user', 'How many vacation days?'),
+      makeChatTurn('assistant', 'Twenty-eight [1].'),
+      makeChatTurn('user', 'Explain the second point'),
+      { ...makeChatTurn('assistant', 'I do not have enough information.'), notFound: true },
+    ]);
+
+    expect(history).toEqual([
+      { role: 'user', content: 'How many vacation days?' },
+      { role: 'assistant', content: 'Twenty-eight [1].' },
+    ]);
+  });
+
   it('truncates a single message within the per-message char cap', () => {
     // No whitespace anywhere, so the word-boundary backoff can't apply and this
     // exercises the hard-cut floor.
@@ -1261,6 +1311,19 @@ describe('useChat feature pack', () => {
     act(() => result.current.pruneScopes(['b.pdf']));
     act(() => result.current.switchConversation(scopedId));
     expect(result.current.scope).toEqual({ filenames: ['b.pdf'], tags: ['legal'] });
+  });
+
+  it('a new chat that reuses an empty conversation drops the scope set on it', () => {
+    // "Ask about these" scoped the empty conversation; New chat then kept it, and the
+    // first question of the "fresh" chat was searched in those documents only.
+    const { result } = renderHook(() => useChat());
+    const id = result.current.activeConversationId;
+    act(() => result.current.setScope({ filenames: ['a.pdf'], tags: ['legal'] }));
+
+    act(() => result.current.newConversation());
+
+    expect(result.current.activeConversationId).toBe(id);
+    expect(result.current.scope).toEqual({ filenames: [], tags: [] });
   });
 
   it('prunes tags no document carries any more, ignoring case', () => {

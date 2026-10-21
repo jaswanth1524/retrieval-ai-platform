@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Literal
@@ -87,20 +88,21 @@ def cap_section(label: str) -> str:
     return label[:MAX_SECTION_CHARS] or DEFAULT_SECTION
 
 
-def infer_section(text: str) -> str:
+def infer_section(text: str, skip: Collection[str] = ()) -> str:
     """Infer a stable section label when richer structure is unavailable.
 
     Skips candidate first-lines that look like page furniture — a bare page number,
     a "Page N" label, or a lone roman numeral — since PDF page text often has exactly
     one of these as its literal first line, which would otherwise become a
     meaningless citation section label. Falls back to the first non-blank line if
-    every candidate line looks like furniture.
+    every candidate line looks like furniture. Lines in ``skip`` (casefolded, spaces
+    collapsed: a PDF's running line kept on its first page) are passed over too.
     """
 
     first_candidate: str | None = None
     for line in text.splitlines():
         candidate = line.strip().strip("#").strip()
-        if not candidate:
+        if not candidate or " ".join(candidate.split()).casefold() in skip:
             continue
         if first_candidate is None:
             first_candidate = candidate

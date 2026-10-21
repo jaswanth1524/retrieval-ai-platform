@@ -77,7 +77,7 @@ def parse_pdf_document(
                 exc_info=True,
             )
             page_texts.append("")
-    cleaned = strip_running_lines(page_texts)
+    cleaned, kept_once = strip_running_lines_keeping_first(page_texts)
 
     sections: list[DocumentSection] = []
     empty_pages: list[int] = []
@@ -95,7 +95,7 @@ def parse_pdf_document(
             DocumentSection(
                 filename=filename,
                 page=page_number,
-                section=infer_section(text),
+                section=infer_section(text, skip=kept_once),
                 text=text,
             )
         )
@@ -156,17 +156,34 @@ _RUNNING_MIN_PAGES = 3
 _RUNNING_MIN_SHARE = 0.6
 
 
+# A page number, once digits are "#": the whole line ("3", "- 3 -", "Page 3 of 40",
+# "3/40"), or one at either end set off by a separator or a page word ("ACME Handbook |
+# 3", "Handbook 2024 — Page 3", "3 · ACME"). "Article 3" or "Notice period is 3 days"
+# is not one: matched with the digits ignored, such a line was dropped from every page.
+_PAGE_WORD = r"(?:page|pg\.?|p\.|seite|página|pagina)"
+_PAGE_NUMBER = rf"(?:{_PAGE_WORD}\s*)?#(?:\s*(?:of|/|von|de|di|sur)\s*#)?"
+_SEPARATOR = r"[-–—|•·:]"
+_PAGE_NUMBER_LINE_RE = re.compile(
+    rf"^(?:{_SEPARATOR}\s*)*{_PAGE_NUMBER}(?:\s*{_SEPARATOR})*$"
+    rf"|(?:{_SEPARATOR}|\s{_PAGE_WORD})\s*{_PAGE_NUMBER}(?:\s*{_SEPARATOR})*$"
+    rf"|^(?:{_SEPARATOR}\s*)*{_PAGE_NUMBER}\s*{_SEPARATOR}"
+    rf"|^{_PAGE_WORD}\s*#"
+)
+
+
 def _line_keys(line: str, outermost: bool) -> set[str]:
     """What a line is matched across pages by: its text (whitespace and case aside),
-    and — on a page's very first or last line, where page numbers sit — also its text
-    with the digits ignored ("Page 3 of 40")."""
+    and — on a page's very first or last line, where page numbers sit, and only when it
+    reads as a page number — also its text with the digits ignored ("Page 3 of 40")."""
 
     exact = " ".join(line.split()).casefold()
     if not exact:
         return set()
     keys = {exact}
     if outermost and re.search(r"\d", exact):
-        keys.add("#digits:" + re.sub(r"\d+", "#", exact))
+        digits_ignored = re.sub(r"\d+", "#", exact)
+        if _PAGE_NUMBER_LINE_RE.search(digits_ignored):
+            keys.add("#digits:" + digits_ignored)
     return keys
 
 
@@ -177,10 +194,24 @@ def strip_running_lines(page_texts: Sequence[str]) -> list[str]:
     stays. A document shorter than _RUNNING_MIN_PAGES pages is returned unchanged.
     """
 
+    return strip_running_lines_keeping_first(page_texts)[0]
+
+
+def strip_running_lines_keeping_first(
+    page_texts: Sequence[str],
+) -> tuple[list[str], set[str]]:
+    """``strip_running_lines``, plus the lines it kept once (see below), casefolded.
+
+    A page's outermost line that repeats is page furniture and goes from every page. A
+    repeat one line in (a table's header row under the running header, a heading that
+    starts each page) can be content: its first copy stays, and only the repeats go.
+    The kept copies are returned so they aren't taken for their page's section label.
+    """
+
     pages = [text.split("\n") for text in page_texts]
     with_text = [lines for lines in pages if any(line.strip() for line in lines)]
     if len(with_text) < _RUNNING_MIN_PAGES:
-        return list(page_texts)
+        return list(page_texts), set()
 
     def edges(lines: list[str]) -> dict[int, set[str]]:
         indexed = [index for index, line in enumerate(lines) if line.strip()]
@@ -190,6 +221,10 @@ def strip_running_lines(page_texts: Sequence[str]) -> list[str]:
         outer = {indexed[0], indexed[-1]}
         return {index: _line_keys(lines[index], index in outer) for index in picked}
 
+    def outermost(lines: list[str]) -> set[int]:
+        indexed = [index for index, line in enumerate(lines) if line.strip()]
+        return {indexed[0], indexed[-1]} if indexed else set()
+
     counts: dict[str, int] = {}
     for lines in with_text:
         for key in set().union(*edges(lines).values()):
@@ -197,13 +232,24 @@ def strip_running_lines(page_texts: Sequence[str]) -> list[str]:
     needed = max(_RUNNING_MIN_PAGES, int(len(with_text) * _RUNNING_MIN_SHARE + 0.999))
     running = {key for key, count in counts.items() if count >= needed}
     if not running:
-        return list(page_texts)
+        return list(page_texts), set()
     cleaned: list[str] = []
+    kept_once: set[str] = set()
     for lines in pages:
-        drop = {index for index, keys in edges(lines).items() if keys & running}
+        outer = outermost(lines)
+        drop: set[int] = set()
+        for index, keys in edges(lines).items():
+            matched = keys & running
+            if not matched:
+                continue
+            exact = " ".join(lines[index].split()).casefold()
+            if index not in outer and matched == {exact} and exact not in kept_once:
+                kept_once.add(exact)
+                continue
+            drop.add(index)
         kept = [line for index, line in enumerate(lines) if index not in drop]
         cleaned.append(normalize_text("\n".join(kept)))
-    return cleaned
+    return cleaned, kept_once
 
 
 # Content-stream operators that draw a rectangle or a line, plus XObject paints (a

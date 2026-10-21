@@ -378,6 +378,7 @@ class TraceConfigResponse(BaseModel):
     filenames: list[str] | None
     # The tag scope the question was asked under; None when it wasn't tag-scoped.
     tags: list[str] | None = None
+    reranker_model: str | None = None
 
 
 class TraceCandidateResponse(BaseModel):
@@ -464,6 +465,11 @@ class TraceDetailResponse(BaseModel):
     # None when no history was sent, condense was disabled, or the condense call
     # failed/returned empty and the pipeline fell back to the raw question.
     condensed_question: str | None = None
+    # Why condense did not run, or did not use the model's output as returned:
+    # "standalone", "disabled", "failed", "empty", "cleaned", "rejected: ...".
+    condense_note: str | None = None
+    # The kept candidates scored under RERANK_MIN_SCORE (the weak-match fallback).
+    weak_matches: bool = False
     history_message_count: int = 0
     # Alternative query phrasings used for multi-query retrieval (empty when disabled).
     query_variants: list[str] = Field(default_factory=list)
@@ -563,14 +569,18 @@ class QuestionResponse(BaseModel):
     trace_id: str | None = None
     # Served from the answer cache: no retrieval or generation ran for this request.
     cached: bool = False
-    # "no_context": nothing cleared the rerank bar; "insufficient_context": the model
-    # said the documents don't cover the question and cited nothing; "uncited": it
+    # "no_context": retrieval found nothing to use (nothing cleared the rerank bar, with
+    # RERANK_FALLBACK_COUNT=0); "insufficient_context": the model said the documents
+    # don't cover the question (citing nothing, or citing only to say so); "uncited": it
     # answered without citing a source. Extensible: show an unknown value as "answered".
     answer_status: str = Field(
         default="answered", json_schema_extra={"x-extensible-enum": list(ANSWER_STATUSES)}
     )
     # Best cross-encoder score (0-1) among the candidates, whether or not it was kept.
     top_rerank_score: float | None = None
+    # No passage cleared RERANK_MIN_SCORE: the answer comes from the closest ones
+    # (RERANK_FALLBACK_COUNT), which the model was told match the question only weakly.
+    weak_matches: bool = False
     # The provider stopped at the token limit (LLM_MAX_TOKENS): the answer is cut off.
     truncated: bool = False
     # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.

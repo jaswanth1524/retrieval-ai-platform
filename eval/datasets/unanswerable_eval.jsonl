@@ -4,3 +4,9 @@
 {"question": "What is the capital of Mongolia?", "expect_no_context": true}
 {"question": "Which programming language should our mobile app be rewritten in?", "expect_no_context": true}
 {"question": "What dividend does the company pay per share?", "expect_no_context": true}
+{"question": "What dental insurance plan do employees get?", "expect_no_context": true}
+{"question": "Are pets allowed in the office?", "expect_no_context": true}
+{"question": "What is the company's stock ticker?", "expect_no_context": true}
+{"question": "Can I expense a gym membership?", "expect_no_context": true}
+{"question": "What is the dress code on Fridays?", "expect_no_context": true}
+{"question": "How many sick days do contractors get?", "expect_no_context": true}

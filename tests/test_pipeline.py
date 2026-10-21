@@ -10,7 +10,13 @@ import pytest
 from qdrant_client import QdrantClient, models
 
 from api.embeddings import EmbeddedText
-from api.generation import CITATION_RETRY_REMINDER, ChatMessage, GenerationError
+from api.generation import (
+    CITATION_RETRY_REMINDER,
+    INSUFFICIENT_CONTEXT_ANSWER,
+    ChatMessage,
+    GenerationError,
+)
+from api.llm import reset_finish_reason
 from api.pipeline import (
     AnswerOverrides,
     IngestService,
@@ -20,6 +26,7 @@ from api.pipeline import (
     _strip_overlap,
     expand_with_neighbors,
 )
+from api.prompting import WEAK_MATCH_INSTRUCTION
 from api.repository import VectorRepository
 from api.reranking import RerankedChunk, rerank_candidates_detailed
 from api.retrieval import RetrievalConfigError, RetrievalError, points_to_chunks
@@ -31,9 +38,12 @@ class StaticEmbeddingProvider:
     def __init__(self, embeddings: list[EmbeddedText]) -> None:
         self.embeddings = embeddings
         self.seen_texts: list[str] = []
+        # Every text across calls (a follow-up embeds its rewrite and the raw question).
+        self.all_texts: list[str] = []
 
     def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
         self.seen_texts = list(texts)
+        self.all_texts.extend(texts)
         return self.embeddings
 
 
@@ -41,9 +51,12 @@ class FakeReranker:
     def __init__(self) -> None:
         self.seen_documents: list[str] = []
         self.seen_query: str | None = None
+        self.seen_queries: list[str] = []
 
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
-        self.seen_query = query
+        if self.seen_query is None:
+            self.seen_query = query
+        self.seen_queries.append(query)
         self.seen_documents = list(documents)
         return [1.0 for _ in documents]
 
@@ -961,7 +974,11 @@ def test_rag_pipeline_answer_with_history_condenses_before_retrieval() -> None:
     grounded = pipeline.answer("What about the second one?", history=_HISTORY)
 
     assert generator.call_count == 2
-    assert embeddings.seen_texts == ["What is the second document about?"]
+    # The rewrite and the raw follow-up are both searched; the rerank uses the rewrite.
+    assert sorted(embeddings.all_texts) == [
+        "What about the second one?",
+        "What is the second document about?",
+    ]
     assert reranker.seen_query == "What is the second document about?"
     assert grounded.answer == "Doc B is billing [1]."
     # Generation still sees the raw question plus the history, not the condensed one.
@@ -1195,7 +1212,11 @@ def test_rag_pipeline_answer_stream_condense_parity_with_sync() -> None:
     # The condense call (via `complete`) happens before the sources event, which
     # itself happens before any `stream` delta call.
     assert generator.call_count == 2
-    assert embeddings.seen_texts == ["What is the second document about?"]
+    # The rewrite and the raw follow-up are both searched; the rerank uses the rewrite.
+    assert sorted(embeddings.all_texts) == [
+        "What about the second one?",
+        "What is the second document about?",
+    ]
     done = events[-1]
     assert done["type"] == "done"
     assert done["timings"]["condense_ms"] > 0.0
@@ -2035,3 +2056,351 @@ def test_a_capped_neighbour_expansion_keeps_adjacent_chunks(
             settings=settings,
         ).retrieve("alpha")
         assert seen[-1] is expected, cap
+
+
+def _follow_up_pipeline(
+    answers: list[str], **settings_overrides: Any
+) -> tuple[RagPipeline, SequencedGenerator, FakeReranker, ListTraceStore]:
+    settings = make_settings(**settings_overrides)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "leave.txt", b"Vacation\nvacation days"
+    )
+    generator = SequencedGenerator(answers)
+    reranker = FakeReranker()
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=reranker,
+        generator=generator,
+        settings=settings,
+        trace_store=trace_store,
+    )
+    return pipeline, generator, reranker, trace_store
+
+
+_VACATION_HISTORY: list[ChatMessage] = [
+    {"role": "user", "content": "How many vacation days do full-time staff get?"},
+    {"role": "assistant", "content": "Twenty-eight vacation days per year [1]."},
+]
+
+
+def test_an_elliptical_follow_up_is_condensed_and_both_queries_are_searched() -> None:
+    # "Explain in more detail" names no pronoun and has three content words, so it was
+    # judged standalone: searched as is, nothing cleared the rerank bar, and the second
+    # question of a conversation was answered "not enough information".
+    pipeline, generator, reranker, traces = _follow_up_pipeline(
+        ["How are vacation days for full-time staff calculated?", "They accrue monthly [1]."]
+    )
+
+    grounded = pipeline.answer("Explain in more detail", history=_VACATION_HISTORY)
+
+    assert grounded.answer == "They accrue monthly [1]."
+    # Both readings are searched; the rerank scores against the rewrite.
+    assert reranker.seen_queries == ["How are vacation days for full-time staff calculated?"]
+    trace = traces.traces[0]
+    assert trace.condensed_question == "How are vacation days for full-time staff calculated?"
+    assert trace.condense_note is None
+    assert trace.query_variants == ["Explain in more detail"]
+    # The answering prompt shows the question as asked, plus how it was read.
+    final_user = generator.calls[-1][0][-1]["content"]
+    assert final_user.startswith(
+        "Question:\nExplain in more detail\n(Read with the conversation as: "
+        "How are vacation days for full-time staff calculated?)"
+    )
+
+
+def test_a_standalone_follow_up_is_noted_in_the_trace_and_searched_once() -> None:
+    pipeline, generator, _, traces = _follow_up_pipeline(["Twenty-eight days [1]."])
+
+    pipeline.answer("How many vacation days do full-time staff get?", history=_VACATION_HISTORY)
+
+    assert generator.call_count == 1
+    trace = traces.traces[0]
+    assert trace.condensed_question is None
+    assert trace.condense_note == "standalone"
+    assert trace.query_variants == []
+    assert trace.config.reranker_model == pipeline._settings.reranker_model
+
+
+@pytest.mark.parametrize(
+    ("condense_output", "expected_query", "note"),
+    [
+        (
+            "Standalone question: How do vacation days accrue?",
+            "How do vacation days accrue?",
+            "cleaned",
+        ),
+        (
+            "Standalone question:\nHow do vacation days accrue?",
+            "How do vacation days accrue?",
+            "cleaned",
+        ),
+        ('"How do vacation days accrue?"', "How do vacation days accrue?", None),
+        (
+            "The provided documents do not contain enough information.",
+            None,
+            "rejected: not a question",
+        ),
+        # A question that only uses the words is a rewrite.
+        (
+            "What happens if a receipt does not contain a date?",
+            "What happens if a receipt does not contain a date?",
+            None,
+        ),
+        ("   ", None, "empty"),
+    ],
+)
+def test_the_condense_output_is_cleaned_or_rejected(
+    condense_output: str, expected_query: str | None, note: str
+) -> None:
+    pipeline, _, reranker, traces = _follow_up_pipeline([condense_output, "Monthly [1]."])
+
+    pipeline.answer("Explain in more detail", history=_VACATION_HISTORY)
+
+    trace = traces.traces[0]
+    assert trace.condensed_question == expected_query
+    assert trace.condense_note == note
+    # A rejected rewrite falls back to the raw question.
+    assert reranker.seen_query == (expected_query or "Explain in more detail")
+
+
+def test_a_condense_cut_off_at_its_token_limit_is_not_searched() -> None:
+    class CutOffCondense(SequencedGenerator):
+        def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+            answer = super().complete(messages, settings)
+            reset_finish_reason("length" if self.call_count == 1 else "stop")
+            return answer
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "leave.txt", b"Vacation\nvacation days"
+    )
+    traces = ListTraceStore()
+    reranker = FakeReranker()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=reranker,
+        generator=CutOffCondense(["Full-time staff receive twenty-eight", "Monthly [1]."]),
+        settings=settings,
+        trace_store=traces,
+    )
+
+    pipeline.answer("Explain in more detail", history=_VACATION_HISTORY)
+
+    assert traces.traces[0].condense_note == "rejected: hit condense_max_tokens"
+    assert reranker.seen_query == "Explain in more detail"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_exchange_answered_not_enough_information_is_left_out_of_history(
+    stream: bool,
+) -> None:
+    # Sent back, the refusal went into the condense prompt (it rewrote "What if they miss
+    # it?" around the refusal) and primed the answering model to refuse again.
+    history: list[ChatMessage] = [
+        *_VACATION_HISTORY,
+        {"role": "user", "content": "Explain the second point"},
+        {"role": "assistant", "content": INSUFFICIENT_CONTEXT_ANSWER},
+        {"role": "user", "content": "How many sick days do contractors get?"},
+        {
+            "role": "assistant",
+            "content": "The provided documents do not contain enough information to "
+            "determine how many sick days contractors get [1][2].",
+        },
+        {"role": "user", "content": "Is anything missing?"},
+        {
+            "role": "assistant",
+            "content": "The documents do not contain the accrual rate, but days carry over [1].",
+        },
+    ]
+    pipeline, generator, _, traces = _follow_up_pipeline(
+        ["What happens to unused vacation days?", "They carry over [1]."]
+    )
+
+    if stream:
+        list(pipeline.answer_stream("What happens to the unused ones?", history=history))
+    else:
+        pipeline.answer("What happens to the unused ones?", history=history)
+
+    for messages, _ in generator.calls:
+        text = "\n".join(message["content"] for message in messages)
+        assert "Explain the second point" not in text
+        assert INSUFFICIENT_CONTEXT_ANSWER not in text
+        assert "sick days" not in text  # a refusal that cites its sources is one too
+        # A partial answer that cites a source still answered something.
+        assert "Is anything missing?" in text
+    assert traces.traces[0].history_message_count == 4
+
+
+def test_a_model_declared_insufficiency_is_traced_as_insufficient_context() -> None:
+    pipeline, _, _, traces = _follow_up_pipeline(
+        ["The provided documents do not contain enough information."]
+    )
+
+    pipeline.answer("How do I file a patent?")
+
+    assert traces.traces[0].status == "insufficient_context"
+
+
+class LowScoringReranker:
+    """Scores every passage under rerank_min_score (sigmoid(-4) = 0.018)."""
+
+    def score(self, query: str, documents: Sequence[str]) -> list[float]:
+        return [-4.0 for _ in documents]
+
+
+def _weak_match_pipeline(answer: str, **overrides: Any) -> tuple[RagPipeline, SequencedGenerator]:
+    settings = make_settings(**overrides)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "models.txt", b"Kinds\nFoundation models"
+    )
+    generator = SequencedGenerator([answer])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=generator,
+        settings=settings,
+    )
+    return pipeline, generator
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_nothing_over_the_bar_still_asks_the_model_with_the_closest_passages(
+    stream: bool,
+) -> None:
+    # "what are foundational models" was refused outright: the reranker in use scored
+    # the passage that answers it 0.006, under a floor set on another model's scale.
+    pipeline, generator = _weak_match_pipeline("Foundation models are trained in house [1].")
+
+    if stream:
+        done = [
+            e for e in pipeline.answer_stream("what are foundational models") if e["type"] == "done"
+        ][0]
+        status, weak, sources = done["answer_status"], done["weak_matches"], done["sources"]
+    else:
+        grounded = pipeline.answer("what are foundational models")
+        status, weak, sources = grounded.answer_status, grounded.weak_matches, grounded.sources
+
+    assert status == "answered"
+    assert weak is True
+    assert len(sources) == 1
+    prompt = generator.calls[-1][0][-1]["content"]
+    assert WEAK_MATCH_INSTRUCTION in prompt
+
+
+def test_a_weak_match_the_model_declines_is_insufficient_context() -> None:
+    pipeline, _ = _weak_match_pipeline(
+        "The provided documents do not contain enough information to answer that."
+    )
+
+    grounded = pipeline.answer("what is the boiling point of mercury")
+
+    assert grounded.weak_matches is True
+    assert grounded.answer_status == "insufficient_context"
+
+
+def test_a_fallback_count_of_zero_refuses_at_once_as_before() -> None:
+    pipeline, generator = _weak_match_pipeline("unused", rerank_fallback_count=0)
+
+    grounded = pipeline.answer("what are foundational models")
+
+    assert grounded.answer_status == "no_context"
+    assert grounded.weak_matches is False
+    assert generator.call_count == 0
+
+
+def test_an_answer_over_the_bar_carries_no_weak_match_instruction() -> None:
+    pipeline, generator, _, _ = _follow_up_pipeline(["Twenty-eight [1]."])
+
+    grounded = pipeline.answer("How many vacation days do full-time staff get?")
+
+    assert grounded.weak_matches is False
+    assert WEAK_MATCH_INSTRUCTION not in generator.calls[-1][0][-1]["content"]
+
+
+def test_a_weak_match_answer_keeps_its_flag_when_replayed_from_the_cache() -> None:
+    from api.answer_cache import AnswerCache
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "models.txt", b"Kinds\nFoundation models"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=FakeGenerator("Foundation models are trained in house [1]."),
+        settings=settings,
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=60),
+    )
+
+    assert pipeline.answer("foundation models").weak_matches is True
+    replay = pipeline.answer("foundation models")
+    assert replay.cached and replay.weak_matches is True
+    assert _stream_done(pipeline, "kinds of models")["weak_matches"] is True
+    replayed = _stream_done(pipeline, "kinds of models")
+    assert replayed.get("cached") and replayed["weak_matches"] is True
+
+
+def test_the_weak_match_fallback_sends_only_rerank_fallback_count_passages() -> None:
+    # select_diverse fills up to rerank_top_k from the scored list: the fallback sent 8
+    # below-the-bar passages instead of 3.
+    settings = make_settings(
+        rerank_top_k=8, max_context_chunks=8, fused_top_n=8, rerank_fallback_count=3
+    )
+    repository = VectorRepository(QdrantClient(":memory:"))
+    service = IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings)
+    for name, word in [
+        ("a", "apple"),
+        ("b", "banana"),
+        ("c", "cherry"),
+        ("d", "damson"),
+        ("e", "elder"),
+    ]:
+        service.ingest(f"{name}.txt", f"Fruit\n{word} grows here".encode())
+    generator = SequencedGenerator(["Apples grow here [1]."])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=generator,
+        settings=settings,
+    )
+
+    pipeline.answer("which fruit grows here")
+
+    prompt = generator.calls[-1][0][-1]["content"]
+    assert "[3] filename=" in prompt and "[4] filename=" not in prompt
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_weak_match_answer_is_marked_in_its_trace(stream: bool) -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "models.txt", b"Kinds\nFoundation models"
+    )
+    traces = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=SequencedGenerator(["Trained in house [1]."]),
+        settings=settings,
+        trace_store=traces,
+    )
+
+    if stream:
+        list(pipeline.answer_stream("what are foundational models"))
+    else:
+        pipeline.answer("what are foundational models")
+
+    assert traces.traces[0].weak_matches is True
+    assert traces.traces[0].config.reranker_model == settings.reranker_model

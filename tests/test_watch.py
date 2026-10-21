@@ -143,7 +143,17 @@ def test_the_app_watcher_indexes_reindexes_and_deletes(
     repository = VectorRepository(qdrant)
 
     def text(name: str) -> str:
-        return " ".join(str(p.get("text")) for p in repository.chunks_for_filename(settings, name))
+        # The watcher thread writes to the same in-process client this reads from, and
+        # qdrant-client's local mode isn't thread-safe: a read racing a write can hit
+        # an IndexError inside it (seen once in `make check`). Read again.
+        for _ in range(20):
+            try:
+                points = repository.chunks_for_filename(settings, name)
+            except IndexError:
+                time.sleep(0.05)
+                continue
+            return " ".join(str(p.get("text")) for p in points)
+        raise AssertionError("the local Qdrant read kept racing the watcher")
 
     running = main.start_folder_watcher(settings)
     try:

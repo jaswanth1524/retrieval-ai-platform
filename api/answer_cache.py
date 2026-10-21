@@ -35,6 +35,7 @@ class CachedAnswer:
     answer_status: str = "answered"
     top_rerank_score: float | None = None
     truncated: bool = False
+    weak_matches: bool = False
     # Summaries only: (passages read, passages in the documents).
     coverage: tuple[int, int] | None = None
     followups: tuple[str, ...] = ()

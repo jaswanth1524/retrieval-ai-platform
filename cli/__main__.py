@@ -85,6 +85,11 @@ def _print_sources(result: StreamResult, out: TextIO) -> None:
     status = result.done.get("answer_status")
     if status and status != "answered":
         print(f"\n(answer status: {status})", file=out)
+    elif result.done.get("weak_matches"):
+        print(
+            "\n(weak match: no passage matched the question closely; check the sources)",
+            file=out,
+        )
     if result.followups:
         print("\nYou could also ask:", file=out)
         for question in result.followups:
