@@ -28,8 +28,7 @@ backend:
 	uv run python -m eval.harness validate eval/datasets/followup_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/paraphrase_eval.jsonl
 	req=$$(mktemp) && uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$$req" \
-		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req" \
-			$$(awk '!/^#/ && NF {printf "--ignore-vuln %s ", $$1}' .github/ci/pip-audit-ignore.txt); \
+		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req"; \
 		status=$$?; rm -f "$$req"; exit $$status
 
 frontend:

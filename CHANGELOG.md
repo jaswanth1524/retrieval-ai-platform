@@ -633,6 +633,11 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 9: Pillow 13.0.0, for the two dozen advisories against 12.3.0 fixed only in 13.
+  fastembed (every release, 0.9.0 included) caps pillow<13, so the lock overrides it
+  (`[tool.uv] override-dependencies`): fastembed uses Pillow for its image models only,
+  and DocRAG loads text models. The PDF, PPTX and OCR parsers run on Pillow 13. The
+  audit's ignore list (and its test) is gone, having no entries left. **None.**
 - Pass 8: pypdf 6.21.2 (at least 6.20.1), for CVE-2026-113792 to CVE-2026-113795 in
   6.19.0. PDF text extraction is unchanged on the golden documents. **None.**
 - Pass 7: aiohttp 3.14.5 (through LiteLLM) and certifi 2026.10.19, for advisories
