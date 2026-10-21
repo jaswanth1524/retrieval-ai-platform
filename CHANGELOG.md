@@ -11,8 +11,9 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 ## Unreleased
 
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
-features), then a follow-up retrieval and chunking pass (pass 8). **Re-index:
-recommended** — chunker version 7 (see Changed). Every document
+features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
+text-extraction pass (pass 9). **Re-index: recommended** — chunker version 8 (see
+Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
 before. No embedding change: the index stays compatible, and nothing is refused. The
@@ -26,6 +27,27 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- **Chunker version 8** (pass 9). Every parsed document has ligature characters written
+  out ("ﬁnance") and soft hyphens and zero-width spaces removed — they split a word in
+  two for BM25 — and questions get the same clean-up (no NFKC: superscripts, fractions
+  and full-width forms stay). PDF: a font whose `/ToUnicode` map contradicts the ligature
+  glyphs its `/Differences` names is read by the glyphs (a published book came out as
+  "speci!c", "!rst", "\"oor" in every extractor); words broken over a line end are
+  rejoined, guided by the document's own words ("pur-chase" → "purchase", "cost-effective"
+  kept); a book's running head with its page number ("26 Chapter 1: Prerequisites",
+  "1.2 About Your App 27", alternating between left and right pages) is dropped, and a
+  head that changes with each subsection loses its page number but stays as the page's
+  section label ("1.2 About Your App"); a
+  scanned page carrying only a stamp of text is OCR'd (its stamp kept when OCR can't run);
+  a `|` inside a table cell no longer splits it. DOCX: text inside content controls,
+  tracked insertions and simple fields is read (tracked deletions are not), a merged cell
+  is read once, and a table with a header row labels its rows ("Grade: A; Days: 20").
+  A binary file renamed to `.txt` is refused instead of indexed as control characters.
+  Eval baselines re-measured: identical. **Recommended.**
+- Pass 9: an uncited answer on a local model gets its citations by
+  matching its sentences to the passages instead of a second generation
+  (`CITATION_RETRY_MODE=auto`; `llm` restores the retry, `backfill`/`off` the others);
+  hosted providers keep the LLM retry. **None.**
 - **Chunker version 7** (pass 8). Short Markdown/HTML sections are no longer folded into
   their neighbours: a run of them becomes a chunk of its own, labelled by its first
   heading and cut once it reaches `MIN_SECTION_WORDS` (a policy's short "Receipts" and
@@ -101,6 +123,21 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 9: stream `stage` frames `waiting_for_model` (another question has the local
+  model) and `reading` (`prompt_tokens`, and `eta_ms` once this server's prompt-reading
+  speed is measured); `citation_backfilled` on answers, `done`, traces and the answer
+  cache ("auto-cited" in the UI), `docrag_citation_backfills_total`. The UI shows the
+  time a question has waited and the reading estimate, keeps "checking citations…" in
+  view under text that has already streamed, explains each badge in words, and on a
+  "not found" answer lists the passages it read and offers "Ask across all documents"
+  (when it was scoped) and "Search the passages". Opt-in prompt trimming:
+  `PROMPT_TOKEN_BUDGET`, `RERANK_RELATIVE_FLOOR` (trace drop reason `relative_cut`) and
+  `GENERATION_HISTORY_ASSISTANT_CHARS`, all 0 (off). CLI: `docrag chat` (questions with
+  the conversation as history), `ask --strict` (exit 3 when the documents don't answer),
+  plain-language status notes and a progress tick every 15 s; MCP `ask` takes `history`.
+  Eval: `answer` mode goes through `RagPipeline.answer` (history included), rows can carry
+  `answer_contains` (`fact_hit_rate`, no judge model), rows are saved as they finish
+  (`--resume`, `--limit`), and `make eval-retrieval|eval-answer|eval-ragas`. **None.**
 - Pass 8: traces carry `condense_note` (why a follow-up wasn't rewritten, or its rewrite
   was cleaned or rejected; shown in the Trace tab) and the reranker model in `config`. The
   server warns at startup when `RERANKER_MODEL` is changed and `RERANK_MIN_SCORE` is not:
@@ -334,6 +371,29 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 9: long questions on a local model timed out before the first token.
+  `LLM_REQUEST_TIMEOUT_SECONDS` reached httpx as the longest silence allowed (LiteLLM
+  turns an `httpx.Timeout` back into one number for Ollama), and Ollama is silent while
+  it reads the prompt: an 8.5k-token prompt failed at 60 s on an M1. A local call's
+  timeout now adds the prompt's estimated tokens over `LLM_PREFILL_TOKENS_PER_SECOND`
+  (40, or the slower rate measured), and Ollama's non-streamed calls are streamed and
+  joined so the timeout bounds a silence, not the whole answer; the same prompt answers
+  (first token at 79 s). The timeout message names the time it allowed. **None.**
+- Pass 9: a second question asked while Ollama answered another timed out without ever
+  being read — Ollama answers one request at a time, and the queued one's timeout ran.
+  Calls wait in DocRAG for `OLLAMA_MAX_PARALLEL` (1) places, and their timeout starts
+  when they are sent; both questions answer. **None.**
+- Pass 9: Ollama streams reported no token usage (`usage` was always empty); streams now
+  ask for it. **None.**
+- Pass 9: an uncited refusal ("The documents do not mention X.") was `uncited`, and
+  went to a second generation asking for citations — on the weak-match path, against a
+  prompt that had said not to cite. It is `insufficient_context`, and a weak-match
+  refusal is never retried. An answer with a caveat ("Mileage is thirty cents per
+  kilometre, but the document does not give the currency [1]", "… — it does not specify
+  the days") is `answered`, not a refusal; "does not include" and a refusal that lists
+  the sections it had are refusals. **None.**
+- Pass 9: the eval's `answer` mode ignored a row's `history`, so a follow-up was asked
+  as a standalone question. **None.**
 - Pass 8: a question the documents answer was refused ("I do not have enough
   information…") whenever the reranker scored every passage under `RERANK_MIN_SCORE`.
   The floor is on one model's score scale: "what are foundational models" against a
