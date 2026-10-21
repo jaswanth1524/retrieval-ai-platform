@@ -20,7 +20,14 @@ from api.answer_cache import (
     CacheKey,
     answer_cache_key,
 )
-from api.citations import answer_status, strip_citation_markers
+from api.citations import (
+    answer_status,
+    cited_numbers,
+    declines_to_answer,
+    opens_with_a_refusal,
+    states_insufficiency,
+    strip_citation_markers,
+)
 
 # Neighbour expansion and ingestion live in their own modules now; their names are
 # re-exported here (``x as x``) so every existing ``from api.pipeline import`` works.
@@ -44,7 +51,6 @@ from api.generation import (
     attach_spans,
     build_grounded_messages,
     citation_from_dict,
-    condense_question,
     finalize_citations,
     fit_prompt_to_context_window,
     generate_followups,
@@ -57,7 +63,7 @@ from api.generation import (
 from api.ingest_service import DocumentIngestOutcome as DocumentIngestOutcome
 from api.ingest_service import IngestService as IngestService
 from api.llm import begin_usage, reset_finish_reason, stopped_at_token_limit, usage_totals
-from api.prompting import with_answer_language
+from api.prompting import condense_question_detailed, one_line, with_answer_language
 from api.qdrant_schema import check_dense_dimension
 from api.repository import PassageFilter, VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
@@ -196,6 +202,8 @@ class DoneEvent(TypedDict):
     # citations.answer_status, and the best cross-encoder score among the candidates.
     answer_status: NotRequired[str]
     top_rerank_score: NotRequired[float | None]
+    # Answered from below-the-bar passages (RetrievalPhase.below_min_score).
+    weak_matches: NotRequired[bool]
     # The provider cut the answer off at the token limit.
     truncated: NotRequired[bool]
     usage: NotRequired[dict[str, int] | None]
@@ -218,6 +226,67 @@ def _cited_chunks(
         for source in cited
         if 0 < source.source_number <= len(selected)
     ]
+
+
+def _without_unanswered_exchanges(history: list[ChatMessage]) -> list[ChatMessage]:
+    """``history`` minus every exchange whose answer was "not enough information".
+
+    Sent back, a refusal primed the next question twice over: the condense step folded
+    it into the search query ("What if they miss it?" became "What are the consequences
+    if they miss the key points?") and the answering model read it as the
+    conversation's own conclusion and refused again. A refusal that cites the sources
+    it looked at counts too (``declines_to_answer``); an answer that says something is
+    missing but gives something else from a source answered part of it, and stays.
+    """
+
+    kept: list[ChatMessage] = []
+    for message in history:
+        content = message["content"]
+        if message["role"] == "assistant" and (
+            (
+                states_insufficiency(content)
+                and not cited_numbers(content, _HISTORY_CITATION_CHECK_MAX)
+            )
+            or declines_to_answer(content)
+        ):
+            if kept and kept[-1]["role"] == "user":
+                kept.pop()
+            continue
+        kept.append(message)
+    return kept
+
+
+# Only whether an earlier answer cites anything matters, so ranges are clamped small.
+_HISTORY_CITATION_CHECK_MAX = 1000
+
+
+def _with_interpretation(question: str, condensed: str | None) -> str:
+    """The question as the answering prompt shows it: a follow-up that was rewritten for
+    search carries the rewrite, so a small model reading "Explain in more detail" next
+    to sources about vacation days knows what "more" is about."""
+
+    if not condensed or condensed.casefold() == question.casefold():
+        return question
+    return f"{question}\n(Read with the conversation as: {one_line(condensed)})"
+
+
+def _condense_skip_reason(question: str, settings: AppSettings) -> str | None:
+    """Why a question with history is not condensed, or None when it is. The one copy
+    of the gate: ``_will_condense`` announces the stage from it, ``_condense_query``
+    runs (or skips) the call from it."""
+
+    if not settings.conversation_condense_enabled:
+        return "disabled"
+    if not needs_condense(question):
+        return "standalone"
+    return None
+
+
+def _trace_status(status: str) -> TraceStatus:
+    """A finished answer's trace status: a model that said the sources don't answer it
+    is "insufficient_context" too, not "ok" (the query log counts those as uncovered)."""
+
+    return "insufficient_context" if status in ("no_context", "insufficient_context") else "ok"
 
 
 def _top_rerank_score(phase: RetrievalPhase) -> float | None:
@@ -336,6 +405,7 @@ class RagPipeline:
             fused_top_n=int(effective_settings.fused_top_n),
             filenames=list(filenames) if filenames else None,
             tags=list(tags) if tags else None,
+            reranker_model=effective_settings.reranker_model,
         )
 
     def _phase_timings(
@@ -377,6 +447,7 @@ class RagPipeline:
         answer: str | None,
         condensed_question: str | None,
         history_message_count: int,
+        condense_note: str | None = None,
     ) -> QueryTrace:
         """The trace of a question that failed (or was abandoned) before finishing."""
 
@@ -396,6 +467,7 @@ class RagPipeline:
             timings=None,
             error=error,
             condensed_question=condensed_question,
+            condense_note=condense_note,
             history_message_count=history_message_count,
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
@@ -422,6 +494,7 @@ class RagPipeline:
         history_message_count: int,
         citation_retry_used: bool = False,
         usage: tuple[int, int] | None = None,
+        condense_note: str | None = None,
     ) -> QueryTrace:
         """The trace of a question that ran to an answer (or to "insufficient context")."""
 
@@ -447,6 +520,8 @@ class RagPipeline:
             timings=timings_dict(timings),
             error=None,
             condensed_question=condensed_question,
+            condense_note=condense_note,
+            weak_matches=phase.below_min_score,
             history_message_count=history_message_count,
             query_variants=phase.query_variants,
             citation_retry_used=citation_retry_used,
@@ -463,12 +538,14 @@ class RagPipeline:
         Earlier answers lose their ``[n]`` markers: those numbered the previous turn's
         sources, and this turn's prompt numbers its own from 1 again, so a model
         continuing the conversation could copy a stale ``[2]`` onto an unrelated source.
+        An exchange whose answer was "not enough information" is left out (see
+        ``_without_unanswered_exchanges``).
         """
 
         if not history:
             return []
         cap = int(effective_settings.conversation_max_history_messages)
-        kept = list(history)[-cap:] if cap > 0 else []
+        kept = _without_unanswered_exchanges(list(history)[-cap:] if cap > 0 else [])
         return [
             {
                 "role": "assistant",
@@ -493,43 +570,60 @@ class RagPipeline:
         condition would drift the first time either side changed.
         """
 
-        if not truncated_history or not effective_settings.conversation_condense_enabled:
-            return False
-        return needs_condense(question)
+        return bool(truncated_history) and (
+            _condense_skip_reason(question, effective_settings) is None
+        )
 
     def _condense_query(
         self,
         question: str,
         truncated_history: Sequence[ChatMessage],
         effective_settings: AppSettings,
-    ) -> tuple[str, float, str | None]:
+    ) -> tuple[str, float, str | None, str | None]:
         """Rewrite a follow-up into a standalone retrieval query, when history exists.
 
         ``truncated_history`` is expected to already be capped (see
         ``_truncate_history``) — the same truncated list is what generation sees.
-        Returns ``(retrieval_query, condense_ms, condensed_question)`` — the third
+        Returns ``(retrieval_query, condense_ms, condensed_question, note)`` — the third
         element is the trace-visible rewrite, or None when condense was skipped
-        (no history, or disabled) or failed/returned empty (falls back to the raw
-        question). A condense failure must never fail the whole request — retrieval
-        just proceeds on the raw question, exactly as it did before this feature.
+        (no history, or disabled) or failed/returned nothing usable (falls back to the
+        raw question); ``note`` says why for the trace. A condense failure must never
+        fail the whole request — retrieval just proceeds on the raw question, exactly
+        as it did before this feature.
         """
 
-        if not self._will_condense(question, truncated_history, effective_settings):
-            return question, 0.0, None
+        if not truncated_history:
+            return question, 0.0, None, None
+        skip_reason = _condense_skip_reason(question, effective_settings)
+        if skip_reason is not None:
+            return question, 0.0, None, skip_reason
 
         condense_start = time.monotonic()
         try:
-            condensed = condense_question(
+            condensed = condense_question_detailed(
                 question, truncated_history, self._generator, effective_settings
             )
         except GenerationError as exc:
             logger.warning("Condense step failed, falling back to raw question: %s", exc)
-            return question, (time.monotonic() - condense_start) * 1000, None
+            return question, (time.monotonic() - condense_start) * 1000, None, "failed"
         condense_ms = (time.monotonic() - condense_start) * 1000
-        if not condensed:
-            logger.warning("Condense step returned an empty result, falling back to raw question.")
-            return question, condense_ms, None
-        return condensed, condense_ms, condensed
+        if (
+            condensed.text
+            and not condensed.text.rstrip().endswith("?")
+            and opens_with_a_refusal(condensed.text)
+        ):
+            # The model answered from the history ("The documents do not contain ...")
+            # instead of rewriting; searched for, it matches nothing. A question that
+            # merely uses the words ("What if a receipt does not contain a date?") is
+            # a rewrite.
+            condensed = replace(condensed, text="", note="rejected: not a question")
+        if not condensed.text:
+            logger.warning(
+                "Condense step returned nothing usable (%s), falling back to raw question.",
+                condensed.note,
+            )
+            return question, condense_ms, None, condensed.note
+        return condensed.text, condense_ms, condensed.text, condensed.note
 
     def retrieval_query(self, question: str, history: Sequence[ChatMessage] | None = None) -> str:
         """The query a question is retrieved with: a follow-up rewritten into a
@@ -537,7 +631,7 @@ class RagPipeline:
 
         settings = self._effective_settings(AnswerOverrides())
         truncated = self._truncate_history(history, settings)
-        query, _, _ = self._condense_query(question.strip(), truncated, settings)
+        query, _, _, _ = self._condense_query(question.strip(), truncated, settings)
         return query
 
     def _stored_tag_variants(self, tags: Sequence[str], settings: AppSettings) -> list[str]:
@@ -563,8 +657,13 @@ class RagPipeline:
         *,
         for_generation: bool = True,
         narrow: PassageFilter | None = None,
+        also_search: str | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
+
+        ``also_search`` is a second query searched alongside ``question`` and fused
+        with it (the raw follow-up next to its condensed rewrite); the rerank scores
+        against ``question`` alone.
 
         ``for_generation=False`` (search without an answer) skips the two stages that
         only serve the prompt: LLM query expansion and neighbour expansion.
@@ -605,6 +704,11 @@ class RagPipeline:
             )
             query_expansion_ms = (time.monotonic() - query_expansion_start) * 1000
         queries = [normalized_query, *variants]
+        # The raw follow-up searched next to its rewrite: a rewrite that lost or changed
+        # what the user asked no longer takes the raw question's matches with it.
+        extra_query = (also_search or "").strip()
+        if extra_query and extra_query.casefold() not in {q.casefold() for q in queries}:
+            queries.insert(1, extra_query)
 
         embed_start = time.monotonic()
         query_embeddings = _map_concurrently(
@@ -654,20 +758,29 @@ class RagPipeline:
             drop_neighbours=for_generation
             and int(effective_settings.context_neighbor_max_chars) == 0,
         )
-        # A search (no answer) where nothing clears rerank_min_score shows the closest
-        # passages anyway, flagged. The bar is set for grounding an answer; the
-        # cross-encoder scores a bare keyword low against a passage that has it
-        # ("laptop": 0.11 for the IT equipment policy, which it ranks first), so a
-        # one-word search came back empty while three documents held the word. An
-        # answer never uses passages below the bar.
+        # Nothing cleared rerank_min_score: the closest passages are used anyway,
+        # flagged. A search (no answer) shows up to rerank_top_k of them; the cross-
+        # encoder scores a bare keyword low against a passage that has it ("laptop":
+        # 0.11 for the IT equipment policy, which it ranks first). An answer gets
+        # rerank_fallback_count of them, and the prompt tells the model they match only
+        # weakly, so it answers from them only when they hold the answer: the floor is
+        # on one model's score scale, and a fixed one refused questions the documents
+        # answer ("what are foundational models": 0.006 with MiniLM, 0.154 with jina).
         below_min_score = False
-        if not for_generation and not diverse_outcome.kept and outcome.scored:
-            unfloored = effective_settings.model_copy(update={"rerank_min_score": 0.0})
+        fallback_count = min(
+            int(effective_settings.rerank_top_k),
+            int(effective_settings.rerank_fallback_count)
+            if for_generation
+            else int(effective_settings.rerank_top_k),
+        )
+        if fallback_count > 0 and not diverse_outcome.kept and outcome.scored:
+            # rerank_top_k too: select_diverse fills up to it from the scored list, so
+            # an answer got 8 below-the-bar passages instead of rerank_fallback_count.
+            unfloored = effective_settings.model_copy(
+                update={"rerank_min_score": 0.0, "rerank_top_k": fallback_count}
+            )
             diverse_outcome, diversity_dropped = select_diverse(
-                RerankOutcome(
-                    scored=outcome.scored,
-                    kept=outcome.scored[: int(effective_settings.rerank_top_k)],
-                ),
+                RerankOutcome(scored=outcome.scored, kept=outcome.scored[:fallback_count]),
                 unfloored,
                 drop_neighbours=False,
             )
@@ -705,7 +818,7 @@ class RagPipeline:
             query_expansion_ms=query_expansion_ms,
             context_expansion_ms=context_expansion_ms,
             diversity_dropped_ids=frozenset(diversity_dropped),
-            query_variants=variants,
+            query_variants=queries[1:],
             below_min_score=below_min_score,
         )
 
@@ -718,6 +831,7 @@ class RagPipeline:
         *,
         for_generation: bool = True,
         narrow: PassageFilter | None = None,
+        also_search: str | None = None,
     ) -> RetrievalPhase:
         """Retrieval exactly as ``answer`` runs it — query expansion, hybrid search,
         rerank, diversity filter, neighbour expansion — without generating. The eval
@@ -734,6 +848,7 @@ class RagPipeline:
             tags,
             for_generation=for_generation,
             narrow=narrow,
+            also_search=also_search,
         )
 
     def _cache_key(
@@ -785,6 +900,7 @@ class RagPipeline:
                     cached=True,
                     answer_status=hit.answer_status,
                     top_rerank_score=hit.top_rerank_score,
+                    weak_matches=hit.weak_matches,
                     truncated=hit.truncated,
                     followups=list(hit.followups),
                 )
@@ -799,6 +915,7 @@ class RagPipeline:
                     grounded.answer_status,
                     grounded.top_rerank_score,
                     grounded.truncated,
+                    weak_matches=grounded.weak_matches,
                     followups=tuple(grounded.followups),
                 ),
             )
@@ -839,6 +956,7 @@ class RagPipeline:
                     "cached": True,
                     "answer_status": hit.answer_status,
                     "top_rerank_score": hit.top_rerank_score,
+                    "weak_matches": hit.weak_matches,
                     "truncated": hit.truncated,
                 }
                 if hit.followups:
@@ -861,6 +979,7 @@ class RagPipeline:
                     done.get("answer_status", "answered"),
                     done.get("top_rerank_score"),
                     done.get("truncated", False),
+                    weak_matches=done.get("weak_matches", False),
                     followups=tuple(followups),
                 ),
             )
@@ -910,20 +1029,29 @@ class RagPipeline:
         trace_id = str(uuid.uuid4()) if trace_store is not None else None
         effective_settings: AppSettings | None = None
         condensed_question: str | None = None
+        condense_note: str | None = None
         truncated_history: list[ChatMessage] = []
 
         try:
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
             truncated_history = self._truncate_history(history, effective_settings)
-            retrieval_query, condense_ms, condensed_question = self._condense_query(
+            retrieval_query, condense_ms, condensed_question, condense_note = self._condense_query(
                 question, truncated_history, effective_settings
             )
-            phase = self._retrieve_and_rerank(retrieval_query, effective_settings, filenames, tags)
+            phase = self._retrieve_and_rerank(
+                retrieval_query,
+                effective_settings,
+                filenames,
+                tags,
+                also_search=question if condensed_question else None,
+            )
+            prompt_question = _with_interpretation(question.strip(), condensed_question)
             fitted = fit_prompt_to_context_window(
-                question.strip(),
+                prompt_question,
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
                 truncated_history,
                 effective_settings,
+                weak_matches=phase.below_min_score,
             )
             selected = fitted.context_chunks
 
@@ -931,11 +1059,12 @@ class RagPipeline:
             reset_finish_reason()
             begin_usage()
             grounded = generate_grounded_answer(
-                query=question,
+                query=prompt_question,
                 context_chunks=selected,
                 generator=self._generator,
                 settings=effective_settings,
                 history=fitted.history or None,
+                weak_matches=phase.below_min_score,
             )
             # generate_grounded_answer runs the zero-citation retry internally, so the
             # block just timed covers two LLM calls when it fired. Split it back out so
@@ -966,6 +1095,7 @@ class RagPipeline:
                         error=public_error_message(exc),
                         answer=None,
                         condensed_question=condensed_question,
+                        condense_note=condense_note,
                         history_message_count=len(truncated_history),
                     )
                 )
@@ -981,7 +1111,9 @@ class RagPipeline:
                     trace_id=trace_id,
                     question=question,
                     mode="sync",
-                    status="ok" if selected else "insufficient_context",
+                    status=_trace_status(
+                        answer_status(grounded.answer, len(grounded.sources), len(selected))
+                    ),
                     effective_settings=effective_settings,
                     filenames=filenames,
                     tags=tags,
@@ -993,6 +1125,7 @@ class RagPipeline:
                     cited_source_numbers=[source.source_number for source in grounded.sources],
                     timings=timings,
                     condensed_question=condensed_question,
+                    condense_note=condense_note,
                     history_message_count=len(truncated_history),
                     citation_retry_used=grounded.citation_retry_used,
                     usage=usage,
@@ -1016,6 +1149,7 @@ class RagPipeline:
             trace_id=trace_id,
             answer_status=status,
             top_rerank_score=_top_rerank_score(phase),
+            weak_matches=phase.below_min_score,
             truncated=truncated,
             followups=followups,
             usage=usage,
@@ -1044,6 +1178,7 @@ class RagPipeline:
         effective_settings: AppSettings | None = None
         parts: list[str] = []
         condensed_question: str | None = None
+        condense_note: str | None = None
         truncated_history: list[ChatMessage] = []
         # Set the moment a trace has been stored (success, insufficient-context, or a
         # caught error below) — the `finally` clause uses this to detect the one case
@@ -1065,6 +1200,7 @@ class RagPipeline:
                     error=error,
                     answer="".join(parts).strip() or None,
                     condensed_question=condensed_question,
+                    condense_note=condense_note,
                     history_message_count=len(truncated_history),
                 )
             )
@@ -1077,18 +1213,25 @@ class RagPipeline:
             # of questions, which is worse than no frame.
             if self._will_condense(question, truncated_history, effective_settings):
                 yield {"type": "stage", "stage": "condensing"}
-            retrieval_query, condense_ms, condensed_question = self._condense_query(
+            retrieval_query, condense_ms, condensed_question, condense_note = self._condense_query(
                 question, truncated_history, effective_settings
             )
             yield {"type": "stage", "stage": "searching"}
             phase = self._retrieve_and_rerank(
-                retrieval_query, effective_settings, filenames, tags, should_stop
+                retrieval_query,
+                effective_settings,
+                filenames,
+                tags,
+                should_stop,
+                also_search=question if condensed_question else None,
             )
+            prompt_question = _with_interpretation(question.strip(), condensed_question)
             fitted = fit_prompt_to_context_window(
-                question.strip(),
+                prompt_question,
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
                 truncated_history,
                 effective_settings,
+                weak_matches=phase.below_min_score,
             )
             selected = fitted.context_chunks
 
@@ -1114,6 +1257,7 @@ class RagPipeline:
                             cited_source_numbers=[],
                             timings=timings,
                             condensed_question=condensed_question,
+                            condense_note=condense_note,
                             history_message_count=len(truncated_history),
                         )
                     )
@@ -1137,7 +1281,12 @@ class RagPipeline:
             }
 
             messages = with_answer_language(
-                build_grounded_messages(question.strip(), selected, fitted.history or None),
+                build_grounded_messages(
+                    prompt_question,
+                    selected,
+                    fitted.history or None,
+                    weak_matches=phase.below_min_score,
+                ),
                 effective_settings,
             )
             if should_stop is not None and should_stop():
@@ -1193,7 +1342,7 @@ class RagPipeline:
                         trace_id=trace_id,
                         question=question,
                         mode="stream",
-                        status="ok",
+                        status=_trace_status(answer_status(answer, len(cited), len(selected))),
                         effective_settings=effective_settings,
                         filenames=filenames,
                         tags=tags,
@@ -1209,6 +1358,7 @@ class RagPipeline:
                         cited_source_numbers=[source.source_number for source in cited],
                         timings=timings,
                         condensed_question=condensed_question,
+                        condense_note=condense_note,
                         history_message_count=len(truncated_history),
                         citation_retry_used=citation_retry_used,
                         usage=usage,
@@ -1224,6 +1374,7 @@ class RagPipeline:
                 "trace_id": trace_id,
                 "answer_status": status,
                 "top_rerank_score": _top_rerank_score(phase),
+                "weak_matches": phase.below_min_score,
                 "truncated": truncated,
                 "usage": usage_dict(usage),
             }

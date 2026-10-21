@@ -29,7 +29,12 @@ from api.generation import (
     retry_uncited_answer,
     source_citations,
 )
-from api.prompting import estimate_prompt_tokens, with_answer_language
+from api.prompting import (
+    CONDENSE_ASSISTANT_CHARS,
+    clean_condensed_query,
+    estimate_prompt_tokens,
+    with_answer_language,
+)
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
 from api.settings import AppSettings
@@ -1298,7 +1303,7 @@ def test_build_condense_messages_sends_only_the_recent_exchange_with_answers_cli
     """Condensing resolves "it"/"that one" from the last exchange; the full transcript
     was prefill the model read before retrieval could even start."""
 
-    long_answer = "word " * 400
+    long_answer = "word " * 1000
     history: list[ChatMessage] = [
         {"role": "user", "content": "oldest question"},
         {"role": "assistant", "content": "oldest answer"},
@@ -1314,7 +1319,7 @@ def test_build_condense_messages_sends_only_the_recent_exchange_with_answers_cli
     assert "User: What is DocRAG?" in content
     assert "Assistant: PDF and DOCX." in content
     clipped = next(line for line in content.splitlines() if line.startswith("Assistant: word"))
-    assert len(clipped) < 700 and clipped.endswith("…")
+    assert len(clipped) < CONDENSE_ASSISTANT_CHARS + 100 and clipped.endswith("…")
 
 
 def _sample(name: str, labels: dict[str, str] | None = None) -> float:
@@ -1584,3 +1589,186 @@ def test_a_hosted_models_context_window_comes_from_the_model_table() -> None:
     assert context_window_tokens(make_settings(llm_provider="ollama", ollama_num_ctx=8192)) == 8192
     # An explicit window always wins.
     assert context_window_tokens(make_settings(llm_context_window=4096)) == 4096
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Measured: each was judged standalone and answered "not enough information".
+        "Explain in more detail",
+        "Give me more details",
+        "Elaborate on the second point",
+        "How about driving a private car?",
+        "What happens after approval?",
+        "List all the steps",
+        "Summarize the key points",
+        "And for part-time employees?",
+        "What if they miss the deadline?",
+        "Combien coûte-t-elle ?",
+    ],
+)
+def test_a_follow_up_that_continues_the_last_answer_is_condensed(question: str) -> None:
+    assert needs_condense(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many vacation days do full-time staff get?",
+        "How far ahead must employees book flights?",
+        "What daily meal allowance do employees get abroad under the policy?",
+    ],
+)
+def test_a_question_that_names_its_topic_still_skips_condense(question: str) -> None:
+    assert needs_condense(question) is False
+
+
+@pytest.mark.parametrize(
+    ("output", "expected", "note"),
+    [
+        ("How do vacation days accrue?", "How do vacation days accrue?", None),
+        ("Standalone question: How do they accrue?", "How do they accrue?", "cleaned"),
+        ("Rewritten query: How do they accrue?", "How do they accrue?", "cleaned"),
+        ("Here is the rewritten question: How do they accrue?", "How do they accrue?", "cleaned"),
+        (
+            "Standalone question:\n\nHow do they accrue?\nThis resolves 'it'.",
+            "How do they accrue?",
+            "cleaned",
+        ),
+        ("**How do they accrue?**", "How do they accrue?", "cleaned"),
+        ("“How do they accrue?”", "How do they accrue?", "cleaned"),
+        ("", "", "empty"),
+        ("Standalone question:", "", "empty"),
+        ("word " * 200, "", "rejected: longer than a question"),
+    ],
+)
+def test_clean_condensed_query(output: str, expected: str, note: str | None) -> None:
+    result = clean_condensed_query(output, "And how do they accrue?")
+
+    assert (result.text, result.note) == (expected, note)
+
+
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [
+        # A refusal that cites the sources it looked at was "answered": no badge, and it
+        # went back as history, priming the next question to be refused.
+        (
+            "The provided documents do not contain enough information to determine how "
+            "many sick days contractors get [1][2].",
+            "insufficient_context",
+        ),
+        (
+            "If an employee misses the deadline, the policy does not specify what happens. "
+            "Therefore, the provided documents do not contain enough information [1].",
+            "insufficient_context",
+        ),
+        # Partial answers: something is given after what is missing.
+        ("The documents do not contain the accrual rate, but days carry over [1].", "answered"),
+        (
+            "The policy does not specify an exact rate. However, mileage is paid at thirty "
+            "cents per kilometre [1].",
+            "answered",
+        ),
+        (
+            "The policy does not specify carry-over for parental leave [1]. It only states "
+            "that parents receive sixteen weeks of paid leave [1].",
+            "answered",
+        ),
+        ("Mileage is thirty cents [1]. The documents do not mention fuel cards.", "answered"),
+        # gpt-5-mini, on a question the documents don't answer.
+        (
+            "The provided document does not state how many sick days contractors receive. "
+            "The contractor handbook excerpt covers scope, invoicing, working location, and "
+            "equipment but contains no sick leave information [1].",
+            "insufficient_context",
+        ),
+        ("The policy has no exceptions for contractors [1].", "answered"),
+        # Refusal words in an answer that isn't about the sources.
+        ("None of the contractors are eligible for sick pay [1].", "answered"),
+        ("If not specified otherwise, the notice period is 30 days [1].", "answered"),
+        ("Bonuses not related to performance are taxed at 30% [1].", "answered"),
+        # qwen2.5 refusals on weak matches: a refusal clause after ", but", sources
+        # described as unrelated, a trailing run of bare markers.
+        (
+            "The provided documents do not contain enough information to answer how to bake "
+            "sourdough bread at home. The context focuses on inference engineering, but does "
+            "not provide instructions for baking sourdough bread [1][2][3].",
+            "insufficient_context",
+        ),
+        (
+            "The provided documents do not contain enough information to determine what "
+            "dividend the company pays per share. [3] discusses costs but does not mention "
+            "dividends. [1] and [2] are about the company's calendar and working days, "
+            "respectively, which are unrelated to dividends.",
+            "insufficient_context",
+        ),
+        (
+            "The provided documents do not contain enough information to determine the "
+            "company's stock ticker. [1] [3] [4] [5] [6]",
+            "insufficient_context",
+        ),
+        (
+            "The documents do not specify an exact rate; however, mileage is paid at thirty "
+            "cents per kilometre [1].",
+            "answered",
+        ),
+        (
+            "The provided documents do not contain enough information to determine what "
+            "dividend the company pays per share. [1] and [2] discuss inference engineering "
+            "for AI products, while [3] covers an expense policy for employees. None of these "
+            "documents mention dividends or financial details related to shares.",
+            "insufficient_context",
+        ),
+        ("The context focuses on travel, and meals abroad are sixty euros [1].", "answered"),
+        (
+            "The provided documents do not contain enough information to determine which "
+            "programming language to use. The context discusses inference engineering, "
+            "including consumer versus B2B applications [1][2]. However, it does not specify "
+            "programming languages.",
+            "insufficient_context",
+        ),
+        (
+            "The documents do not specify the hotel cap for Paris. [2] covers hotel stays, "
+            "capped at 180 euros per night in most cities.",
+            "answered",
+        ),
+    ],
+)
+def test_a_refusal_that_cites_its_sources_is_insufficient_context(answer: str, status: str) -> None:
+    assert answer_status(answer, 1, 3) == status
+
+
+def test_a_copied_source_header_is_taken_off_the_answer() -> None:
+    from api.citations import strip_echoed_source_headers
+
+    # qwen2.5, under an answer it had already cited inline.
+    answer = (
+        "The cons include cost that scales with usage [1].\n\n"
+        "[1] filename=I-2.pdf; page=1-2; section=You should know your:"
+    )
+    assert (
+        strip_echoed_source_headers(answer) == "The cons include cost that scales with usage [1]."
+    )
+    # A citation inside the text, and an answer that is nothing but a header, stay.
+    assert (
+        strip_echoed_source_headers("Mileage is paid [1] per km.") == "Mileage is paid [1] per km."
+    )
+    only = "[2] filename=a.md; page=1; section=Intro"
+    assert strip_echoed_source_headers(only) == only
+
+
+def test_the_weak_match_instruction_is_counted_when_fitting_the_prompt() -> None:
+    from api.prompting import fit_prompt_to_context_window
+
+    chunks = [make_chunk(f"c{i}", "word " * 120) for i in range(3)]
+    plain = fit_prompt_to_context_window("q", chunks, None, make_settings())
+    window = 1
+    for window in range(400, 4000, 10):
+        settings = make_settings(llm_context_window=window, llm_max_tokens=64)
+        if len(fit_prompt_to_context_window("q", chunks, None, settings).context_chunks) == 3:
+            break
+    # At the smallest window that fits all three, the longer weak-match prompt doesn't.
+    weak = fit_prompt_to_context_window("q", chunks, None, settings, weak_matches=True)
+    assert len(plain.context_chunks) == 3
+    assert len(weak.context_chunks) < 3

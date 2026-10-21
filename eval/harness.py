@@ -110,6 +110,9 @@ class RankedResult:
 
     filenames: list[str]
     chunk_ids: list[str]
+    # Nothing cleared RERANK_MIN_SCORE: the reranked arm returns the closest passages
+    # (RERANK_FALLBACK_COUNT), which an answer is told match only weakly.
+    below_min_score: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,8 +190,10 @@ def rank_for_question(
     """The ranking one question gets from ``arm`` (default: what the API serves).
 
     With ``history`` the question is a follow-up: rewritten into a standalone query by
-    the pipeline's own condense step first (needs ``generator``)."""
+    the pipeline's own condense step first (needs ``generator``), and the raw follow-up
+    searched next to the rewrite, as the API does."""
 
+    raw_question = question
     if history:
         pipeline = _pipeline(repository, embedding_provider, reranker, settings, generator)
         turns: list[ChatMessage] = [
@@ -207,12 +212,15 @@ def rank_for_question(
     if arm not in ("reranked", "fused"):
         raise ValueError(f"Unknown arm '{arm}'; expected one of {', '.join(ARMS)}.")
     phase = _pipeline(repository, embedding_provider, reranker, settings, generator).retrieve(
-        question, filenames=filenames
+        question,
+        filenames=filenames,
+        also_search=raw_question if question != raw_question else None,
     )
     ranked = phase.fused_candidates if arm == "fused" else phase.context_chunks
     return RankedResult(
         filenames=[chunk.filename for chunk in ranked],
         chunk_ids=[chunk.chunk_id for chunk in ranked],
+        below_min_score=arm == "reranked" and phase.below_min_score,
     )
 
 
@@ -235,12 +243,14 @@ def answer_for_question(
         phase.context_chunks[: int(settings.max_context_chunks)],
         None,
         settings,
+        weak_matches=phase.below_min_score,
     )
     grounded = generate_grounded_answer(
         query=example.question,
         context_chunks=fitted.context_chunks,
         generator=generator,
         settings=settings,
+        weak_matches=phase.below_min_score,
     )
     contexts = [chunk.expanded_text or chunk.text for chunk in fitted.context_chunks]
     return AnswerRow(
@@ -405,6 +415,7 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "reranker_onnx_file": settings.reranker_onnx_file,
         "rerank_candidates": int(settings.rerank_candidates),
         "rerank_min_score": float(settings.rerank_min_score),
+        "rerank_fallback_count": int(settings.rerank_fallback_count),
         "fused_top_n": int(settings.fused_top_n),
         "context_neighbor_radius": int(settings.context_neighbor_radius),
         # With a cap, adjacent passages are no longer dropped as duplicates of a kept one.
@@ -459,7 +470,8 @@ def run_retrieval_eval(
         entry: dict[str, Any] = {"question": example.question}
         if example.expect_no_context:
             # Only the reranked arm applies RERANK_MIN_SCORE; the others always rank.
-            kept_nothing = not ranked.chunk_ids
+            # Passages below it (the answer fallback) don't count as found.
+            kept_nothing = not ranked.chunk_ids or ranked.below_min_score
             entry["no_context"] = kept_nothing
             no_context_rows.append({"no_context_rate": 1.0 if kept_nothing else 0.0})
         if example.relevant_filenames:

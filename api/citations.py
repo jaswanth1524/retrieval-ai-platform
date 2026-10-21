@@ -420,7 +420,7 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 
     if source_count <= 0 or _CITATION_RE.search(answer):
         return False
-    return not _states_insufficiency(answer)
+    return not states_insufficiency(answer)
 
 
 # How well an answer is grounded, sent with every answer. A string, not an enum, so a
@@ -430,23 +430,133 @@ ANSWER_STATUSES = ("answered", "insufficient_context", "no_context", "uncited")
 
 def answer_status(answer: str, cited_count: int, source_count: int) -> str:
     """``no_context`` when nothing cleared the rerank bar, ``insufficient_context`` when
-    the model said the sources don't cover it and cited none of them, ``uncited`` when
-    it answered without citing any source (even after the citation retry, or citing
-    only numbers that aren't sources), else ``answered``.
+    the model said the sources don't cover it — citing none of them, or citing them
+    only for that (``declines_to_answer``) — ``uncited`` when it answered without citing
+    any source (even after the citation retry, or citing only numbers that aren't
+    sources), else ``answered``.
 
-    Both conditions, as for the citation retry: "the documents don't cover X, but Y
-    [1]" is a partial answer, and a hint word alone would have flagged it. An uncited
-    answer used to read as ``answered``, so nothing told the reader it had no sources.
+    A hint word alone doesn't decide it, as for the citation retry: "the documents
+    don't cover X, but Y [1]" is a partial answer. An uncited answer used to read as
+    ``answered``, so nothing told the reader it had no sources.
     """
 
     if source_count <= 0:
         return "no_context"
     if cited_count == 0:
-        return "insufficient_context" if _states_insufficiency(answer) else "uncited"
-    return "answered"
+        return "insufficient_context" if states_insufficiency(answer) else "uncited"
+    return "insufficient_context" if declines_to_answer(answer) else "answered"
 
 
-def _states_insufficiency(answer: str) -> bool:
+# How a model says the sources don't answer it, beyond _INSUFFICIENCY_HINTS (which
+# also decide whether an uncited answer is retried, so they stay narrow).
+_DECLINE_HINTS = (
+    *_INSUFFICIENCY_HINTS,
+    "not specified",
+    "does not specify",
+    "do not specify",
+    "not mentioned",
+    "does not mention",
+    "do not mention",
+    "does not say",
+    "do not say",
+    "does not state",
+    "do not state",
+    "does not provide",
+    "do not provide",
+    "does not address",
+    "do not address",
+    "does not discuss",
+    "do not discuss",
+    "unrelated",
+    "not related",
+    "no information",
+    "none of these",
+    "none of the",
+)
+# A sentence about what the sources are, not what they say: "[1] and [2] discuss
+# inference engineering, while [3] covers an expense policy", "The context focuses on
+# travel". After an opening refusal it explains the refusal; it answers nothing.
+_ABOUT_THE_SOURCES_RE = re.compile(
+    r"^\s*(?:\[\d[^\]]*\][\s,]*(?:(?:and|,)\s*\[\d[^\]]*\][\s,]*)*|(?:the |these |other )?"
+    r"(?:provided |given |retrieved )?(?:context|documents?|sources?|passages?|excerpts?|texts?)\b)"
+    r"[^.]*?\b(?:discuss(?:es)?|cover(?:s)?|focus(?:es)?|describe(?:s)?|is about|are about|"
+    r"pertain(?:s)?|relate(?:s)?|deal(?:s)? with|concern(?:s)?|talk(?:s)? about)\b"
+)
+# "contains no sick leave information", "gives no further details", "no mention of".
+_NO_INFORMATION_RE = re.compile(r"\bno\b(?:\s+[\w-]+){0,4}?\s+(?:information|details|mention)\b")
+# Where a sentence turns ("…, but …", "However, …"): what follows is what it ends up
+# saying — something the sources do give, or (again) that they don't.
+_CONTRAST_RE = re.compile(
+    r"(?:,|;)\s*(?:but|however|although|though|except)\b|^\s*(?:but|however|although|though|"
+    r"that said|still|nevertheless|nonetheless|instead)\b"
+)
+_LETTER_RE = re.compile(r"[^\W\d_]")
+# What an opening refusal is about: the sources. "None of the contractors are eligible
+# [1]" and "If not specified otherwise, notice is 30 days [1]" use the same words as a
+# refusal and are answers.
+_SOURCES_SUBJECT_RE = re.compile(
+    r"\b(?:documents?|context|sources?|passages?|excerpts?|texts?|information|provided|"
+    r"policy|policies|handbook|manual|guide|file|pdf)\b"
+)
+# A figure ("180 euros", "3.5"), not a digit inside a name ("B2B", "GPT4").
+_FIGURE_RE = re.compile(r"(?<![^\W\d_])\d")
+
+
+def _finds_nothing(clause: str) -> bool:
+    return any(hint in clause for hint in _DECLINE_HINTS) or bool(_NO_INFORMATION_RE.search(clause))
+
+
+def _declines(sentence: str, *, about_the_sources: bool = False) -> bool:
+    """The sentence ends by saying the sources don't have it: "The documents don't give
+    the rate" or "The context covers travel, but does not mention dividends" — not "…,
+    but days carry over until March". ``about_the_sources``: a sentence that only says
+    what the sources are about counts too (one with a figure in it gives something)."""
+
+    folded = _normalize_negation(_fold(sentence))
+    text = strip_citation_markers(folded)
+    if about_the_sources and _ABOUT_THE_SOURCES_RE.search(folded) and not _FIGURE_RE.search(text):
+        return True
+    return _finds_nothing(_CONTRAST_RE.split(text)[-1])
+
+
+def declines_to_answer(answer: str) -> bool:
+    """True for an answer that cites sources only to say they don't answer it.
+
+    "The provided documents do not contain enough information to determine how many
+    sick days contractors get [1][2]." read as ``answered``: the badge said nothing, and
+    the refusal went back as history, where it primed the next question to be refused
+    too. A refusal opens with it; an answer that gives something after it — a cited
+    sentence that doesn't decline too, or a "but"/"however" — is a partial answer.
+    """
+
+    sentences = [answer[start:end] for start, end in sentence_spans(answer)]
+    # A trailing run of bare markers ("… ticker. [1] [3] [4]") says nothing either way.
+    sentences = [s for s in sentences if _LETTER_RE.search(strip_citation_markers(s))]
+    if not sentences or not opens_with_a_refusal(sentences[0]):
+        return False
+    return all(
+        _declines(sentence, about_the_sources=True)
+        for sentence in sentences[1:]
+        if cited_numbers(sentence, _DECLINE_CITATION_CHECK_MAX)
+        or _CONTRAST_RE.search(_fold(sentence.strip()))
+    )
+
+
+def opens_with_a_refusal(sentence: str) -> bool:
+    """``sentence`` says the sources don't hold the answer: it declines, and about the
+    documents ("The provided documents do not contain enough information …", "The
+    policy does not specify …")."""
+
+    return _declines(sentence) and bool(
+        _SOURCES_SUBJECT_RE.search(_fold(strip_citation_markers(sentence)))
+    )
+
+
+# Only whether a sentence cites anything matters, so ranges are clamped small.
+_DECLINE_CITATION_CHECK_MAX = 1000
+
+
+def states_insufficiency(answer: str) -> bool:
     lowered = _normalize_negation(_fold(answer))
     return any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
 
@@ -570,6 +680,19 @@ def will_retry_citations(
     )
 
 
+# A line that copies a source's header from the prompt ("[1] filename=I-2.pdf; page=1-2;
+# section=…"). The prompt says to cite inline and not to end with a references list;
+# qwen2.5 appended one to answer after answer anyway, and it showed as a stray line.
+_ECHOED_HEADER_RE = re.compile(r"^[ \t>*-]*(?:\[\d{1,6}\][ \t]*)+filename=[^\n]*(?:\n|$)", re.M)
+
+
+def strip_echoed_source_headers(answer: str) -> str:
+    """``answer`` without lines that repeat a source header; never emptied by it."""
+
+    stripped = _ECHOED_HEADER_RE.sub("", answer).strip()
+    return stripped or answer
+
+
 def finalize_citations(
     prompt_messages: Sequence[ChatMessage],
     answer: str,
@@ -594,6 +717,7 @@ def finalize_citations(
     re-prompting a model that did cite, just badly, so it's left alone.
     """
 
+    answer = strip_echoed_source_headers(answer)
     cited = cited_sources(answer, all_sources)
     final_messages = list(prompt_messages)
     retry_used = False
@@ -608,6 +732,7 @@ def finalize_citations(
         retry_ms = (time.monotonic() - retry_start) * 1000
         if retried is not None:
             answer, final_messages = retried
+            answer = strip_echoed_source_headers(answer)
             cited = cited_sources(answer, all_sources)
             retry_used = True
         else:

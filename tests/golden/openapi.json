@@ -1407,6 +1407,11 @@
         "type": "null"
        }
       ]
+     },
+     "weak_matches": {
+      "default": false,
+      "title": "Weak Matches",
+      "type": "boolean"
      }
     },
     "required": [
@@ -1824,6 +1829,11 @@
         "type": "null"
        }
       ]
+     },
+     "weak_matches": {
+      "default": false,
+      "title": "Weak Matches",
+      "type": "boolean"
      }
     },
     "required": [
@@ -2024,6 +2034,17 @@
       "title": "Rerank Top K",
       "type": "integer"
      },
+     "reranker_model": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Reranker Model"
+     },
      "tags": {
       "anyOf": [
        {
@@ -2083,6 +2104,17 @@
       },
       "title": "Cited Source Numbers",
       "type": "array"
+     },
+     "condense_note": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Condense Note"
      },
      "condensed_question": {
       "anyOf": [
@@ -2201,6 +2233,11 @@
         "type": "null"
        }
       ]
+     },
+     "weak_matches": {
+      "default": false,
+      "title": "Weak Matches",
+      "type": "boolean"
      }
     },
     "required": [

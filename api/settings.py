@@ -121,6 +121,13 @@ class AppSettings(BaseSettings):
     # content existed. 0.15 still blocks clearly off-topic chunks (scored <0.05 in
     # the same real-world trace) while letting paraphrase-level matches through.
     rerank_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
+    # When no candidate clears rerank_min_score, this many of the best-ranked ones go
+    # to the model anyway, marked as weak matches, and it decides whether they answer
+    # the question (the answer then carries weak_matches). 0: refuse at once, as
+    # before. Each cross-encoder scores on its own scale, so a fixed floor dropped the
+    # passage that answered the question: "what are foundational models" scored 0.006
+    # with MiniLM and 0.154 with jina against "Foundation models: You have trained ...".
+    rerank_fallback_count: int = Field(default=3, ge=0, le=20)
 
     # Checked at startup (case-insensitive): a typo used to boot fine and then fail
     # every question with a 400 that blamed the client.

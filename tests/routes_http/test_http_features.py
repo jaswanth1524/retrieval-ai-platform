@@ -100,9 +100,11 @@ def test_a_search_with_nothing_over_the_bar_shows_the_closest_passages_flagged()
         assert [result["filename"] for result in body["results"]] == ["it.txt", "food.txt"]
         assert body["results"][0]["rerank_score"] < 0.15
 
-        # An answer still never rests on passages under the bar.
+        # An answer gets the closest passages too (RERANK_FALLBACK_COUNT), flagged, and
+        # the model is told they match only weakly.
         answer = client.post("/questions", json={"question": "laptop"}).json()
-        assert answer["answer_status"] == "no_context" and answer["sources"] == []
+        assert answer["weak_matches"] is True
+        assert answer["sources"][0]["filename"] == "it.txt"
 
 
 def test_search_skips_llm_query_expansion_even_when_it_is_on() -> None:

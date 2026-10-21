@@ -70,6 +70,8 @@ class TraceConfig:
     fused_top_n: int
     filenames: list[str] | None
     tags: list[str] | None = None
+    # The cross-encoder that scored the candidates: rerank_min_score was tuned for one.
+    reranker_model: str | None = None
 
 
 @dataclass
@@ -92,6 +94,12 @@ class QueryTrace:
     # failed/returned empty and the pipeline fell back to the raw question — in the
     # error path specifically, None also covers "the failure preceded condense."
     condensed_question: str | None = None
+    # Why the condense step did not produce condensed_question as the model returned it:
+    # skipped ("standalone", "disabled"), failed, or the output was cleaned or rejected.
+    condense_note: str | None = None
+    # Nothing cleared rerank_min_score: the kept candidates are the closest ones
+    # (RERANK_FALLBACK_COUNT), sent to the model as weak matches.
+    weak_matches: bool = False
     history_message_count: int = 0
     # Alternative query phrasings used for multi-query retrieval (empty when expansion
     # is disabled — the default).

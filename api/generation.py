@@ -171,6 +171,9 @@ class GroundedAnswer:
     # The best cross-encoder score (0-1) among the candidates, kept or not. None when
     # retrieval found nothing to score.
     top_rerank_score: float | None = None
+    # Nothing cleared rerank_min_score: the answer was given from the closest passages
+    # (rerank_fallback_count), which the model was told match only weakly.
+    weak_matches: bool = False
     # True when the answer initially lacked citations and a stricter retry supplied
     # them (see needs_citation_retry / retry_uncited_answer).
     citation_retry_used: bool = False
@@ -194,8 +197,11 @@ def generate_grounded_answer(
     generator: ChatGenerator,
     settings: AppSettings,
     history: Sequence[ChatMessage] | None = None,
+    *,
+    weak_matches: bool = False,
 ) -> GroundedAnswer:
-    """Generate a grounded answer from reranked context chunks."""
+    """Generate a grounded answer from reranked context chunks. ``weak_matches``: none
+    of them cleared rerank_min_score, and the prompt says so."""
 
     normalized_query = query.strip()
     if not normalized_query:
@@ -206,7 +212,10 @@ def generate_grounded_answer(
         return GroundedAnswer(answer=INSUFFICIENT_CONTEXT_ANSWER, sources=[])
 
     messages = with_answer_language(
-        build_grounded_messages(normalized_query, selected_chunks, history), settings
+        build_grounded_messages(
+            normalized_query, selected_chunks, history, weak_matches=weak_matches
+        ),
+        settings,
     )
     answer = generator.complete(messages, settings).strip()
     if not answer:

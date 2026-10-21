@@ -206,6 +206,7 @@ def register(app: FastAPI) -> None:
             cached=grounded.cached,
             answer_status=grounded.answer_status,
             top_rerank_score=grounded.top_rerank_score,
+            weak_matches=grounded.weak_matches,
             truncated=grounded.truncated,
             followups=grounded.followups,
             usage=usage_response(grounded.usage),
