@@ -17,7 +17,7 @@ dependencies = [
   "litellm>=1.89",
   "prometheus-client>=0.25.0",
   "pydantic-settings>=2.14",
-  "pypdf>=6.19",
+  "pypdf>=6.20.1",
   # Document format parsers. python-docx: the only maintained pure-Python DOCX reader,
   # needed for heading structure (citation sections). beautifulsoup4: robust HTML text
   # extraction over malformed markup (stdlib parser backend, no lxml). pdfplumber: PDF

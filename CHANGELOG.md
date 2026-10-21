@@ -573,6 +573,8 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 8: pypdf 6.21.2 (at least 6.20.1), for CVE-2026-113792 to CVE-2026-113795 in
+  6.19.0. PDF text extraction is unchanged on the golden documents. **None.**
 - Pass 7: aiohttp 3.14.5 (through LiteLLM) and certifi 2026.10.19, for advisories
   published since the last bump. Eight Pillow 12.3.0 advisories are fixed only in Pillow
   13, which no fastembed release accepts yet: the dependency audit skips them, listed
