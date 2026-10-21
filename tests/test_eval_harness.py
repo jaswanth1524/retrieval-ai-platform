@@ -491,5 +491,142 @@ def test_answer_metrics_measure_grounding() -> None:
         "answered_rate": 0.5,
         "refused_unanswerable_rate": 1.0,
         "uncited_rate": 1 / 3,
+        "error_rate": 0.0,
     }
     assert row(["a.md"], "answered").to_dict()["cited_filenames"] == ["a.md"]
+
+
+class AnsweringRepository(FakeRepository):
+    """A FakeRepository that can also list a file's chunks (the answer contexts)."""
+
+    def chunks_for_filename(self, settings: AppSettings, filename: str) -> list[dict[str, Any]]:
+        return [
+            dict(point.payload or {})
+            for point in self._points
+            if (point.payload or {}).get("filename") == filename
+        ]
+
+
+class ScriptedGenerator:
+    """Rewrites a follow-up to a fixed query and answers with a fixed, cited text."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.prompts: list[list[Any]] = []
+
+    def complete(self, messages: Sequence[Any], settings: AppSettings) -> str:
+        self.prompts.append(list(messages))
+        if "standalone" in messages[0]["content"].lower():
+            return "standalone question about c2"
+        return self.answer
+
+    def stream(self, messages: Sequence[Any], settings: AppSettings) -> Any:
+        yield self.complete(messages, settings)
+
+
+def test_answer_mode_goes_through_the_api_answer_path_with_history() -> None:
+    from eval.harness import RetrievalExample, answer_for_question
+
+    points = [_point("c1", "a.md"), _point("c2", "b.md")]
+    generator = ScriptedGenerator("It is sixty euros [1].")
+    row = answer_for_question(
+        RetrievalExample(
+            question="And what about that one?",
+            reference=None,
+            relevant_filenames=frozenset({"b.md"}),
+            relevant_chunk_ids=frozenset(),
+            history=(
+                {"role": "user", "content": "Tell me about c2"},
+                {"role": "assistant", "content": "c2 is a chunk."},
+            ),
+            answer_contains=("60 euros", "sixty euros"),
+        ),
+        repository=AnsweringRepository(points),
+        embedding_provider=FakeEmbeddingProvider(),
+        reranker=FakeReranker(["c2", "c1"]),
+        generator=generator,
+        settings=make_settings(),
+    )
+    # The follow-up was condensed (two LLM calls) and answered with the conversation.
+    assert len(generator.prompts) == 2
+    answer_prompt = generator.prompts[-1]
+    assert any(m["content"] == "Tell me about c2" for m in answer_prompt)
+    assert row.answer_status == "answered"
+    assert row.cited_filenames == ["b.md"]
+    assert row.fact_hit is True
+    # Contexts are the prompt's passages, top-ranked first, read back from the trace.
+    assert row.contexts[0] == "c2"
+
+
+def test_answer_rows_are_saved_as_they_finish_and_a_run_resumes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from eval.harness import RetrievalExample, partial_path, run_answer_eval
+
+    class Broken(ScriptedGenerator):
+        def complete(self, messages: Sequence[Any], settings: AppSettings) -> str:
+            raise RuntimeError("provider timed out")
+
+    def example(question: str) -> RetrievalExample:
+        return RetrievalExample(
+            question=question,
+            reference=None,
+            relevant_filenames=frozenset({"a.md"}),
+            relevant_chunk_ids=frozenset(),
+            answer_contains=("c1",),
+        )
+
+    class Collab:
+        def __init__(self, generator: Any) -> None:
+            self.repository = AnsweringRepository([_point("c1", "a.md")])
+            self.embedding_provider = FakeEmbeddingProvider()
+            self.reranker = FakeReranker(["c1"])
+            self.generator = generator
+            self.settings = make_settings()
+
+    examples = [example("first"), example("second")]
+    output = tmp_path / "answers.json"
+    # A failing question is kept as an error row; the run goes on.
+    assert run_answer_eval(examples, Collab(Broken("x")), output) == 0  # type: ignore[arg-type]
+    rows = json.loads(output.read_text())
+    assert [r["answer_status"] for r in rows] == ["error", "error"]
+    assert "error_rate: 1.000" in capsys.readouterr().out
+    assert not partial_path(output).exists()
+
+    # An interrupted run left one saved row: --resume answers only the other.
+    partial_path(output).write_text(
+        json.dumps({"index": 0, "row": {"question": "first", "answer": "kept c1 [1]"}}) + "\n"
+    )
+    generator = ScriptedGenerator("c1 it is [1].")
+    run_answer_eval(examples, Collab(generator), output, resume=True)  # type: ignore[arg-type]
+    rows = json.loads(output.read_text())
+    assert [r["answer"] for r in rows] == ["kept c1 [1]", "c1 it is [1]."]
+    assert len(generator.prompts) == 1
+    assert "[2/2] answered" in capsys.readouterr().out
+
+
+def test_answer_contains_is_validated_and_scored(tmp_path: Path) -> None:
+    from eval.harness import AnswerRow, RetrievalExample, answer_metrics, states_fact
+
+    assert states_fact("It is Sixty  euros [1].", ["sixty euros"]) is True
+    assert states_fact("It is seventy euros.", ["sixty euros", "60 euros"]) is False
+    assert states_fact("anything", []) is None
+    path = tmp_path / "d.jsonl"
+    path.write_text(
+        '{"question": "q", "expect_no_context": true, "answer_contains": ["x"]}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(HarnessDataError, match="answer_contains"):
+        load_retrieval_dataset(path)
+    examples = [
+        RetrievalExample("q", None, frozenset(), frozenset(), answer_contains=("x",)),
+        RetrievalExample("q", None, frozenset(), frozenset(), answer_contains=("y",)),
+    ]
+    rows = [
+        AnswerRow("q", "x", ["c"], None, fact_hit=True),
+        AnswerRow("q", "z", ["c"], None, fact_hit=False),
+    ]
+    assert answer_metrics(examples, rows)["fact_hit_rate"] == 0.5
+    assert AnswerRow.from_dict(rows[0].to_dict()) == AnswerRow("q", "x", ["c"], None, fact_hit=True)

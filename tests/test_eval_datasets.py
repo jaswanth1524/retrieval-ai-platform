@@ -42,6 +42,13 @@ def test_labels_point_at_files_and_passages_in_the_corpus(dataset: str, corpus: 
             assert any(_normalized(passage) in texts[name] for name in search), (
                 f"{example.question!r}: {passage!r} is in none of {sorted(search)}"
             )
+        if example.answer_contains:
+            # At least one way of stating the fact is the corpus's own wording.
+            assert any(
+                _normalized(fact) in texts[name]
+                for fact in example.answer_contains
+                for name in search
+            ), f"{example.question!r}: no answer_contains fact is in {sorted(search)}"
 
 
 def test_the_multilingual_set_covers_each_language_and_cross_lingual_questions() -> None:

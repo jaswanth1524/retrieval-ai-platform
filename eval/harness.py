@@ -8,9 +8,13 @@ Two modes:
   unless query expansion is on. ``--arm`` scores an earlier stage instead (``fused``,
   ``dense``, ``sparse``), so a change can be traced to the stage it helped or hurt.
   Optionally fails against a committed baseline for regression gating.
-* ``answer`` — run the full pipeline (retrieval + neighbor expansion + prompt fitting +
-  generation) and write ``{question, answer, contexts, reference}`` rows directly
-  consumable by ``eval.ragas_runner`` for offline RAGAS scoring.
+* ``answer`` — run the API's own answer path (``RagPipeline.answer``: condensing a
+  follow-up with its ``history``, retrieval, prompt fitting, generation, the citation
+  retry and ``answer_status``) and write ``{question, answer, contexts, reference}`` rows
+  directly consumable by ``eval.ragas_runner`` for offline RAGAS scoring. Rows labeled
+  with ``answer_contains`` are also scored on whether the answer states the fact — no
+  judge LLM needed. Rows are saved as they finish, so ``--resume`` picks a crashed or
+  interrupted run up where it stopped.
 * ``validate`` — check a dataset's shape only (CI runs this; no Qdrant or models).
 
 ``eval/corpus/`` holds the documents the sample dataset is labeled against; ingest it
@@ -28,23 +32,20 @@ import argparse
 import json
 import platform
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from api.citations import answer_status
+from api.citations import strip_citation_markers
 from api.documents import CHUNKER_VERSION, SUPPORTED_EXTENSIONS
-from api.generation import (
-    ChatGenerator,
-    ChatMessage,
-    fit_prompt_to_context_window,
-    generate_grounded_answer,
-)
+from api.generation import ChatGenerator, ChatMessage
 from api.pipeline import RagPipeline
 from api.reranking import Reranker
 from api.retrieval import QueryEmbeddingProvider, embed_query, points_to_chunks
 from api.settings import AppSettings, get_settings
+from api.tracing import QueryTrace
 from eval.feedback_dataset import (
     FeedbackDataError,
     build_dataset,
@@ -93,6 +94,9 @@ class RetrievalExample:
     # that take?"), rewritten into a standalone query before retrieval as the API does,
     # so the labels measure the rewriting too.
     history: tuple[dict[str, str], ...] = ()
+    # Answer mode: the answer must state one of these (case/space-insensitive), e.g.
+    # ["sixty euros", "60 euros"]. Scored as ``fact_hit_rate`` without a judge LLM.
+    answer_contains: tuple[str, ...] = ()
 
     @property
     def labeled(self) -> bool:
@@ -126,6 +130,16 @@ class AnswerRow:
     reference: str | None
     cited_filenames: list[str] = field(default_factory=list)
     answer_status: str = "answered"
+    # Whether the answer states one of the example's ``answer_contains`` facts; None
+    # when the example names none.
+    fact_hit: bool | None = None
+    seconds: float = 0.0
+    # Answered from below-the-bar passages; citations added by matching, not the model.
+    weak_matches: bool = False
+    citation_backfilled: bool = False
+    # The pipeline failed (a provider timeout, say): the row is kept, so one bad
+    # question doesn't end a long run, and counts as not answered.
+    error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -134,10 +148,35 @@ class AnswerRow:
             "contexts": self.contexts,
             "cited_filenames": self.cited_filenames,
             "answer_status": self.answer_status,
+            "seconds": round(self.seconds, 1),
+            "weak_matches": self.weak_matches,
+            "citation_backfilled": self.citation_backfilled,
         }
         if self.reference is not None:
             row["reference"] = self.reference
+        if self.fact_hit is not None:
+            row["fact_hit"] = self.fact_hit
+        if self.error is not None:
+            row["error"] = self.error
         return row
+
+    @classmethod
+    def from_dict(cls, row: dict[str, Any]) -> AnswerRow:
+        """The row ``to_dict`` wrote (``--resume`` reads saved rows back)."""
+
+        return cls(
+            question=str(row["question"]),
+            answer=str(row.get("answer", "")),
+            contexts=[str(c) for c in row.get("contexts", [""])],
+            reference=row.get("reference"),
+            cited_filenames=[str(f) for f in row.get("cited_filenames", [])],
+            answer_status=str(row.get("answer_status", "answered")),
+            fact_hit=row.get("fact_hit"),
+            seconds=float(row.get("seconds", 0.0)),
+            weak_matches=bool(row.get("weak_matches", False)),
+            citation_backfilled=bool(row.get("citation_backfilled", False)),
+            error=row.get("error"),
+        )
 
 
 class Collaborators:
@@ -224,6 +263,26 @@ def rank_for_question(
     )
 
 
+class _LastTrace:
+    """Trace sink keeping only the latest trace: what the answer was given to read."""
+
+    def __init__(self) -> None:
+        self.trace: QueryTrace | None = None
+
+    def add(self, trace: QueryTrace) -> None:
+        self.trace = trace
+
+
+def states_fact(answer: str, facts: Sequence[str]) -> bool | None:
+    """Whether ``answer`` states one of ``facts`` (case/space-insensitive, citation
+    markers ignored); None when there are no facts to check."""
+
+    if not facts:
+        return None
+    text = _normalized(strip_citation_markers(answer))
+    return any(_normalized(fact) in text for fact in facts)
+
+
 def answer_for_question(
     example: RetrievalExample,
     *,
@@ -233,36 +292,59 @@ def answer_for_question(
     generator: ChatGenerator,
     settings: AppSettings,
 ) -> AnswerRow:
-    """Run the full pipeline for one question and return a RAGAS-shaped row."""
+    """Answer one question the way the API does and return a RAGAS-shaped row.
 
-    phase = _pipeline(repository, embedding_provider, reranker, settings, generator).retrieve(
-        example.question
-    )
-    fitted = fit_prompt_to_context_window(
-        example.question,
-        phase.context_chunks[: int(settings.max_context_chunks)],
-        None,
-        settings,
-        weak_matches=phase.below_min_score,
-    )
-    grounded = generate_grounded_answer(
-        query=example.question,
-        context_chunks=fitted.context_chunks,
+    Goes through ``RagPipeline.answer`` (condense with the example's ``history``,
+    retrieval, fitting, generation, citation retry, status), so the eval can't drift
+    from what users get. The contexts are the passages that went into the prompt, read
+    back from the trace.
+    """
+
+    sink = _LastTrace()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=embedding_provider,
+        reranker=reranker,
         generator=generator,
         settings=settings,
-        weak_matches=phase.below_min_score,
+        trace_store=sink,
     )
-    contexts = [chunk.expanded_text or chunk.text for chunk in fitted.context_chunks]
+    history: list[ChatMessage] = [
+        {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+        for m in example.history
+    ]
+    started = time.monotonic()
+    grounded = pipeline.answer(example.question, history=history or None, use_cache=False)
+    contexts = _prompt_contexts(sink.trace, repository, settings)
     return AnswerRow(
         question=example.question,
         answer=grounded.answer,
         contexts=contexts or [""],  # RAGAS requires a non-empty contexts list
         reference=example.reference,
         cited_filenames=sorted({source.filename for source in grounded.sources}),
-        answer_status=answer_status(
-            grounded.answer, len(grounded.sources), len(fitted.context_chunks)
-        ),
+        answer_status=grounded.answer_status,
+        fact_hit=states_fact(grounded.answer, example.answer_contains),
+        seconds=time.monotonic() - started,
+        weak_matches=grounded.weak_matches,
+        citation_backfilled=grounded.citation_backfilled,
     )
+
+
+def _prompt_contexts(trace: QueryTrace | None, repository: Any, settings: AppSettings) -> list[str]:
+    """The text of each passage the answer's prompt held, in rank order."""
+
+    if trace is None:
+        return []
+    # Candidates are listed in fused order; the prompt holds them by rerank score.
+    selected = sorted(
+        (c for c in trace.candidates if c.selected_for_context),
+        key=lambda c: -(c.rerank_score if c.rerank_score is not None else float("-inf")),
+    )
+    texts: dict[str, str] = {}
+    for filename in sorted({c.filename for c in selected}):
+        for payload in repository.chunks_for_filename(settings, filename):
+            texts[str(payload.get("chunk_id", ""))] = str(payload.get("text", ""))
+    return [texts[c.chunk_id] for c in selected if c.chunk_id in texts]
 
 
 def answer_metrics(
@@ -275,7 +357,11 @@ def answer_metrics(
     - ``answered_rate``: of those, the share answered (not "not in your documents");
     - ``refused_unanswerable_rate``: of the ``expect_no_context`` questions, the share
       answered with "the documents don't cover this" rather than an answer;
-    - ``uncited_rate``: the share of all answers that cite nothing while answering.
+    - ``uncited_rate``: the share of all answers that cite nothing while answering;
+    - ``fact_hit_rate``: of the questions labeled with ``answer_contains``, the share
+      whose answer states one of the facts;
+    - ``error_rate``: the share of questions the pipeline failed on (a provider
+      timeout, say).
 
     A metric with no examples to measure it is left out.
     """
@@ -294,8 +380,12 @@ def answer_metrics(
         metrics["refused_unanswerable_rate"] = sum(
             r.answer_status in ("no_context", "insufficient_context") for _, r in unanswerable
         ) / len(unanswerable)
+    facts = [r for e, r in zip(examples, rows, strict=True) if e.answer_contains]
+    if facts:
+        metrics["fact_hit_rate"] = sum(bool(r.fact_hit) for r in facts) / len(facts)
     if rows:
         metrics["uncited_rate"] = sum(r.answer_status == "uncited" for r in rows) / len(rows)
+        metrics["error_rate"] = sum(r.error is not None for r in rows) / len(rows)
     return metrics
 
 
@@ -357,7 +447,15 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
         relevant_passages=_string_set(data.get("relevant_passages"), index, "relevant_passages"),
         expect_no_context=expect_no_context,
         history=_history(data.get("history"), index),
+        answer_contains=tuple(
+            sorted(_string_set(data.get("answer_contains"), index, "answer_contains"))
+        ),
     )
+    if expect_no_context and example.answer_contains:
+        raise HarnessDataError(
+            f"Example {index}: an 'expect_no_context' question has no fact to state "
+            "('answer_contains')."
+        )
     if expect_no_context and (
         example.relevant_filenames or example.relevant_chunk_ids or example.relevant_passages
     ):
@@ -601,6 +699,15 @@ def build_parser() -> argparse.ArgumentParser:
     answer = sub.add_parser("answer", help="Generate answers for RAGAS scoring.")
     answer.add_argument("dataset", type=Path, help="Path to .json or .jsonl labeled dataset.")
     answer.add_argument("--output", type=Path, required=True, help="Answers JSON output path.")
+    answer.add_argument(
+        "--limit", type=int, default=0, help="Answer only the first N questions (0 = all)."
+    )
+    answer.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep the rows a previous run of this dataset and output already saved "
+        "(OUTPUT.partial.jsonl) and answer only the rest.",
+    )
 
     feedback = sub.add_parser(
         "from-feedback",
@@ -717,22 +824,81 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     # answer mode
-    collaborators = Collaborators(settings)
-    answers = [
-        answer_for_question(
-            example,
-            repository=collaborators.repository,
-            embedding_provider=collaborators.embedding_provider,
-            reranker=collaborators.reranker,
-            generator=collaborators.generator,
-            settings=settings,
-        )
-        for example in examples
-    ]
-    rows = [answer.to_dict() for answer in answers]
-    args.output.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {len(rows)} answer rows to {args.output}")
-    for name, value in answer_metrics(examples, answers).items():
+    if args.limit > 0:
+        examples = examples[: args.limit]
+    return run_answer_eval(examples, Collaborators(settings), args.output, resume=args.resume)
+
+
+def partial_path(output: Path) -> Path:
+    """Where answer mode saves each row as it finishes."""
+
+    return output.with_name(output.name + ".partial.jsonl")
+
+
+def run_answer_eval(
+    examples: Sequence[RetrievalExample],
+    collaborators: Collaborators,
+    output: Path,
+    *,
+    resume: bool = False,
+) -> int:
+    """Answer every example, saving each row as it finishes, then write ``output``.
+
+    At ~90 s per answer on a local model a run takes half an hour; saving as it goes
+    means a crash or Ctrl-C loses one row, not the run (``--resume``).
+    """
+
+    partial = partial_path(output)
+    saved: dict[int, AnswerRow] = {}
+    if resume and partial.exists():
+        for line in partial.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            index = int(record["index"])
+            if index < len(examples) and examples[index].question == record["row"]["question"]:
+                saved[index] = AnswerRow.from_dict(record["row"])
+        print(f"resuming: {len(saved)} of {len(examples)} rows already answered")
+    else:
+        partial.unlink(missing_ok=True)
+    rows: list[AnswerRow] = []
+    with partial.open("a", encoding="utf-8") as sink:
+        for index, example in enumerate(examples):
+            if index in saved:
+                rows.append(saved[index])
+                continue
+            started = time.monotonic()
+            try:
+                row = answer_for_question(
+                    example,
+                    repository=collaborators.repository,
+                    embedding_provider=collaborators.embedding_provider,
+                    reranker=collaborators.reranker,
+                    generator=collaborators.generator,
+                    settings=collaborators.settings,
+                )
+            except Exception as exc:  # noqa: BLE001 - one failed question must not end the run
+                row = AnswerRow(
+                    question=example.question,
+                    answer="",
+                    contexts=[""],
+                    reference=example.reference,
+                    answer_status="error",
+                    fact_hit=False if example.answer_contains else None,
+                    seconds=time.monotonic() - started,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            sink.write(json.dumps({"index": index, "row": row.to_dict()}) + "\n")
+            sink.flush()
+            rows.append(row)
+            print(
+                f"[{index + 1}/{len(examples)}] {row.answer_status} {row.seconds:.1f}s",
+                flush=True,
+            )
+    output.write_text(json.dumps([r.to_dict() for r in rows], indent=2) + "\n", encoding="utf-8")
+    partial.unlink(missing_ok=True)
+    print(f"wrote {len(rows)} answer rows to {output}")
+    for name, value in answer_metrics(examples, rows).items():
         print(f"{name}: {value:.3f}")
     return 0
 
