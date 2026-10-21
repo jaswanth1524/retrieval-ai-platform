@@ -405,6 +405,8 @@ export interface TraceConfigResponse {
   fused_top_n: number;
   filenames: string[] | null;
   tags?: string[] | null;
+  /** The cross-encoder that scored the candidates. */
+  reranker_model?: string | null;
 }
 
 export interface TraceCandidateResponse {
@@ -451,6 +453,10 @@ export interface TraceDetailResponse {
   timings: TimingsResponse | null;
   error: string | null;
   condensed_question?: string | null;
+  /** Why a follow-up was not condensed, or its rewrite not used as returned. */
+  condense_note?: string | null;
+  /** The kept passages scored under the server's bar (weak-match fallback). */
+  weak_matches?: boolean;
   history_message_count?: number;
   query_variants?: string[];
   citation_retry_used?: boolean;

@@ -235,7 +235,16 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (typeof turn.question === 'string') sanitized.question = turn.question;
   if (turn.feedback === 'up' || turn.feedback === 'down') sanitized.feedback = turn.feedback;
   if (typeof turn.model === 'string') sanitized.model = turn.model;
-  const flags = ['stopped', 'incomplete', 'cached', 'notFound', 'uncited', 'truncated', 'followUp'] as const;
+  const flags = [
+    'stopped',
+    'incomplete',
+    'cached',
+    'notFound',
+    'uncited',
+    'truncated',
+    'followUp',
+    'weakMatch',
+  ] as const;
   for (const flag of flags) {
     if (turn[flag] === true) sanitized[flag] = true;
   }

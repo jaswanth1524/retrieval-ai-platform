@@ -359,6 +359,8 @@ export interface QuestionStreamHandlers {
     grounding?: {
       answerStatus?: AnswerStatus;
       topRerankScore?: number | null;
+      /** No passage cleared the server's bar: answered from the closest ones. */
+      weakMatches?: boolean;
       truncated?: boolean;
       /** Summaries only: passages read, of the passages the documents hold. */
       coverage?: SummaryCoverage;
@@ -381,6 +383,7 @@ type QuestionStreamEvent =
       cached?: boolean;
       answer_status?: AnswerStatus;
       top_rerank_score?: number | null;
+      weak_matches?: boolean;
       truncated?: boolean;
       chunks_read?: number;
       chunks_total?: number;
@@ -803,6 +806,7 @@ export const api = {
                 {
                   answerStatus: event.answer_status,
                   topRerankScore: event.top_rerank_score,
+                  ...(event.weak_matches === true ? { weakMatches: true } : {}),
                   truncated: event.truncated,
                   ...(event.usage ? { usage: event.usage } : {}),
                   ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'

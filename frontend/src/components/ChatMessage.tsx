@@ -141,6 +141,9 @@ export interface ChatTurn {
   irrelevantSources?: number[];
   // Best cross-encoder score among the candidates (0-1), for the weak-support badge.
   topRerankScore?: number;
+  // No passage cleared the server's bar: answered from the closest ones, which the
+  // model was told match only weakly.
+  weakMatch?: boolean;
   // Tokens the provider reported for this answer.
   usage?: { prompt: number; completion: number };
 }
@@ -517,7 +520,17 @@ function ChatMessage({
                   not in your documents
                 </span>
               )}
+              {turn.weakMatch && !turn.notFound && (
+                <span
+                  className="chat-message__flag chat-message__flag--warn"
+                  title="No passage matched this question closely; the answer comes from the nearest ones — check it against its sources"
+                  data-testid="chat-message-weak-match"
+                >
+                  weak match
+                </span>
+              )}
               {weakSupportBelow !== undefined &&
+                !turn.weakMatch &&
                 typeof turn.topRerankScore === 'number' &&
                 turn.topRerankScore < weakSupportBelow &&
                 !turn.notFound &&
