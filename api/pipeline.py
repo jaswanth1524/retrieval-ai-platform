@@ -62,8 +62,20 @@ from api.generation import (
 )
 from api.ingest_service import DocumentIngestOutcome as DocumentIngestOutcome
 from api.ingest_service import IngestService as IngestService
-from api.llm import begin_usage, reset_finish_reason, stopped_at_token_limit, usage_totals
-from api.prompting import condense_question_detailed, one_line, with_answer_language
+from api.llm import (
+    GenerationSlot,
+    begin_usage,
+    expected_prefill_ms,
+    reset_finish_reason,
+    stopped_at_token_limit,
+    usage_totals,
+)
+from api.prompting import (
+    condense_question_detailed,
+    estimate_prompt_tokens,
+    one_line,
+    with_answer_language,
+)
 from api.qdrant_schema import check_dense_dimension
 from api.repository import PassageFilter, VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
@@ -169,6 +181,11 @@ class StageEvent(TypedDict):
     # ``steps``, both 1-based. Absent on single-step stages.
     step: NotRequired[int]
     steps: NotRequired[int]
+    # "reading": the prompt the model is about to read, in estimated tokens, and how
+    # long the local model should take to read it at its measured rate (absent before
+    # one is measured, and for hosted providers).
+    prompt_tokens: NotRequired[int]
+    eta_ms: NotRequired[float]
 
 
 class DeltaEvent(TypedDict):
@@ -1180,6 +1197,7 @@ class RagPipeline:
         condensed_question: str | None = None
         condense_note: str | None = None
         truncated_history: list[ChatMessage] = []
+        slot: GenerationSlot | None = None
         # Set the moment a trace has been stored (success, insufficient-context, or a
         # caught error below) — the `finally` clause uses this to detect the one case
         # none of those cover: the client disconnecting (GeneratorExit, a BaseException
@@ -1291,6 +1309,24 @@ class RagPipeline:
             )
             if should_stop is not None and should_stop():
                 return  # the finally below records the trace as closed early
+            # Held until the answer, its citation retry and follow-ups are done, so
+            # another question's call can't slip in between them; released below.
+            slot = GenerationSlot(effective_settings)
+            if not slot.try_acquire():
+                # Another question has the local model. Waiting inside Ollama ran this
+                # request's timeout; waiting here doesn't, and the reader is told why.
+                yield {"type": "stage", "stage": "waiting_for_model"}
+                if not slot.acquire(should_stop):
+                    return  # the finally below records the trace as closed early
+            reading: StageEvent = {
+                "type": "stage",
+                "stage": "reading",
+                "prompt_tokens": estimate_prompt_tokens(messages),
+            }
+            eta_ms = expected_prefill_ms(messages, effective_settings)
+            if eta_ms is not None:
+                reading["eta_ms"] = round(eta_ms)
+            yield reading
             generate_start = time.monotonic()
             first_token_ms = 0.0
             reset_finish_reason()
@@ -1408,3 +1444,5 @@ class RagPipeline:
                 # return once `should_stop` reported the client gone.
                 _store_error_trace("Stream closed before completion.")
                 finalized = True
+            if slot is not None:
+                slot.release()

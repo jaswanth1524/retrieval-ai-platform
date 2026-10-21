@@ -1349,8 +1349,9 @@ def test_stream_announces_searching_before_retrieval_starts() -> None:
     stages = [
         event["stage"] for event in pipeline.answer_stream("alpha") if event["type"] == "stage"
     ]
-    # No history, so condense never runs and must not be announced.
-    assert stages == ["searching"]
+    # No history, so condense never runs and must not be announced. "reading" comes
+    # after the sources, right before the model is called.
+    assert stages == ["searching", "reading"]
 
 
 def test_stream_announces_condensing_only_when_the_condense_call_will_run() -> None:
@@ -1375,7 +1376,7 @@ def test_stream_announces_condensing_only_when_the_condense_call_will_run() -> N
             if event["type"] == "stage"
         ]
 
-    assert stages_for("What about the second one?") == ["condensing", "searching"]
+    assert stages_for("What about the second one?") == ["condensing", "searching", "reading"]
     # Standalone despite the history, so the condense call is skipped — and announcing
     # a stage that never runs is worse than announcing nothing.
     standalone = stages_for("What is the referral bonus amount?")
@@ -1403,14 +1404,17 @@ def test_stream_announces_verifying_citations_only_when_the_retry_will_run() -> 
 
     retried = events_for(["Alpha is documented.", "Alpha is documented [1]."])
     stages = [event["stage"] for event in retried if event["type"] == "stage"]
-    assert stages == ["searching", "verifying_citations"]
+    assert stages == ["searching", "reading", "verifying_citations"]
     types = [event["type"] for event in retried]
     last_delta = len(types) - 1 - types[::-1].index("delta")
     assert types.index("stage", last_delta) < types.index("done")
     assert retried[-1]["answer"] == "Alpha is documented [1]."
 
     cited = events_for(["Alpha is documented [1]."])
-    assert [event["stage"] for event in cited if event["type"] == "stage"] == ["searching"]
+    assert [event["stage"] for event in cited if event["type"] == "stage"] == [
+        "searching",
+        "reading",
+    ]
 
 
 def test_condense_is_skipped_for_a_standalone_follow_up() -> None:
@@ -2404,3 +2408,85 @@ def test_a_weak_match_answer_is_marked_in_its_trace(stream: bool) -> None:
 
     assert traces.traces[0].weak_matches is True
     assert traces.traces[0].config.reranker_model == settings.reranker_model
+
+
+def _streaming_pipeline(settings: AppSettings) -> RagPipeline:
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    return RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented [1]."),
+        settings=settings,
+    )
+
+
+def test_a_question_waits_for_the_local_model_and_says_so() -> None:
+    from api.llm import GenerationSlot
+
+    settings = make_settings(llm_provider="ollama")
+    pipeline = _streaming_pipeline(settings)
+    holder = GenerationSlot(settings)
+    assert holder.acquire()  # another question is generating
+    events: list[dict[str, Any]] = []
+    waiting = threading.Event()
+
+    def ask() -> None:
+        for event in pipeline.answer_stream("alpha"):
+            events.append(dict(event))
+            if event.get("stage") == "waiting_for_model":
+                waiting.set()
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+    assert waiting.wait(10)
+    assert events[-1]["stage"] == "waiting_for_model"
+    assert not any(event["type"] == "delta" for event in events)
+    holder.release()
+    thread.join(10)
+    stages = [event["stage"] for event in events if event["type"] == "stage"]
+    assert stages == ["searching", "waiting_for_model", "reading"]
+    reading = next(event for event in events if event.get("stage") == "reading")
+    assert reading["prompt_tokens"] > 0
+    assert "eta_ms" not in reading  # nothing measured yet
+    assert events[-1]["type"] == "done"
+    # The finished question gave its place back.
+    after = GenerationSlot(settings)
+    assert after.try_acquire()
+    after.release()
+
+
+def test_a_question_whose_reader_left_while_waiting_never_calls_the_model() -> None:
+    from api.llm import GenerationSlot
+
+    settings = make_settings(llm_provider="ollama")
+    pipeline = _streaming_pipeline(settings)
+    holder = GenerationSlot(settings)
+    assert holder.acquire()
+    gone = threading.Event()
+    events = []
+    thread = threading.Thread(
+        target=lambda: events.extend(pipeline.answer_stream("alpha", should_stop=gone.is_set))
+    )
+    thread.start()
+    time.sleep(0.5)
+    gone.set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert [event["type"] for event in events][-1] == "stage"
+    assert not any(event["type"] in ("delta", "done") for event in events)
+    holder.release()
+
+
+def test_the_reading_stage_carries_the_measured_eta() -> None:
+    from api import llm
+
+    settings = make_settings(llm_provider="ollama")
+    llm._record_prefill(settings, 5000, 50.0)  # 100 estimated tokens/s measured
+    events = list(_streaming_pipeline(settings).answer_stream("alpha"))
+    reading = next(event for event in events if event.get("stage") == "reading")
+    assert reading["eta_ms"] == round(reading["prompt_tokens"] / 100 * 1000)

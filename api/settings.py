@@ -143,6 +143,13 @@ class AppSettings(BaseSettings):
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_max_tokens: PositiveInt = 512
     llm_request_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    # Local providers (Ollama, OpenAI-compatible) send nothing while they read the
+    # prompt, and LiteLLM hands its timeout to httpx as the longest silence allowed
+    # (it turns an httpx.Timeout back into one number for Ollama), so a 6k-token prompt
+    # on an M1 timed out before the first token. Each call's timeout grows by its
+    # estimated prompt tokens divided by this rate (or by the slower rate this server
+    # has been measured at). 0 turns the scaling off; hosted providers never scale.
+    llm_prefill_tokens_per_second: float = Field(default=40.0, ge=0.0)
     llm_num_retries: int = Field(default=0, ge=0)
     ollama_base_url: str = "http://localhost:11434"
     # Ollama unloads a model from memory 5 minutes after its last use by default,
@@ -154,6 +161,12 @@ class AppSettings(BaseSettings):
     # but cut the loaded model from 8.2 GB to 5.3 GB. Too small silently truncates the
     # front of the prompt (the grounding rules), so leave headroom for history.
     ollama_num_ctx: int = Field(default=0, ge=0)
+    # How many LLM calls this process sends Ollama at once. Ollama answers one request
+    # at a time unless OLLAMA_NUM_PARALLEL says otherwise and queues the rest — where
+    # each waiting request's timeout runs, so a second question timed out without ever
+    # being read. Calls past this wait here instead (the stream says so), and their
+    # timeout starts when they are sent. 0 = no limit (match a raised OLLAMA_NUM_PARALLEL).
+    ollama_max_parallel: int = Field(default=1, ge=0)
     # The model's context window in tokens, for fitting the prompt into it. 0 (default)
     # uses OLLAMA_NUM_CTX when the provider is Ollama and that is set; for OpenAI and
     # Anthropic models, the window LiteLLM's bundled model table gives; else no fitting.

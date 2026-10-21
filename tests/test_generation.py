@@ -344,7 +344,13 @@ def test_litellm_generator_uses_ollama_configuration() -> None:
     assert completion_client.kwargs["base_url"] == "http://ollama:11434"
     assert completion_client.kwargs["temperature"] == 0
     assert completion_client.kwargs["max_tokens"] == 512
-    assert completion_client.kwargs["timeout"] == 60.0
+    # Ollama: the timeout grows with the prompt (60s + its estimated tokens / 40), and
+    # the answer is streamed so the timeout bounds silences, not the whole answer.
+    assert completion_client.kwargs["timeout"] == pytest.approx(
+        60.0 + estimate_prompt_tokens([{"role": "user", "content": "Hi"}]) / 40
+    )
+    assert completion_client.kwargs["stream"] is True
+    assert completion_client.kwargs["stream_options"] == {"include_usage": True}
     assert completion_client.kwargs["drop_params"] is True
 
 
