@@ -663,7 +663,10 @@ def test_search_narrows_by_page_section_and_left_out_documents(
     api_context: ApiTestContext,
 ) -> None:
     client = api_context.client
-    doc = b"# Setup\nalpha install steps\n\n# Billing\nalpha invoice terms\n"
+    # Sections long enough to be chunked apart (shorter ones are gathered under one label).
+    doc = (
+        "# Setup\n" + "alpha install steps " * 15 + "\n\n# Billing\n" + "alpha invoice terms " * 15
+    ).encode()
     assert upload_and_wait(client, "a.md", doc)["state"] == "done"
     assert upload_and_wait(client, "b.md", b"# Other\nalpha elsewhere\n")["state"] == "done"
 

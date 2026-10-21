@@ -21,8 +21,15 @@ _HTML_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 
 
 # Page chrome, not content: site navigation, the masthead, the footer, sidebars. Left out
-# when outside the page's main content (an article's own <header> holds its title).
+# when outside the page's content elements (an article's own <header> holds its title, a
+# section's <header> its heading, an <aside> in the main text a note on it).
 _CHROME_TAGS = ("nav", "header", "footer", "aside")
+_CONTENT_TAGS = ("main", "article", "section")
+
+# A <main> or lone <article> is taken as the page's content only when it holds at least
+# this share of the page's text: a <main> holding a welcome line, or one teaser
+# <article>, had the page's real text (in a plain <div>) dropped.
+_MAIN_CONTENT_MIN_SHARE = 0.5
 
 
 # Elements that end a block of text: their text is its own paragraph, not run together
@@ -36,20 +43,25 @@ _BLOCK_BREAK = "\n\n"
 _BREAK_RUN = re.compile(r"[ \t]*\n\n[\s]*")
 
 
-def _content_root(soup: Any) -> Any:
-    """Where the page's own content is: its <main>, or its only <article>; else the
-    body with the page chrome taken out."""
+def _text_length(element: Any) -> int:
+    return len(" ".join(element.get_text(" ").split()))
 
-    main = soup.find("main")
-    if main is not None:
-        return main
-    articles = soup.find_all("article")
-    if len(articles) == 1:
-        return articles[0]
+
+def _content_root(soup: Any) -> Any:
+    """Where the page's own content is: the body without its chrome, narrowed to its
+    <main> or only <article> when that holds most of the text."""
+
     for element in soup.find_all(list(_CHROME_TAGS)):
-        if element.find_parent("article") is None and not element.decomposed:
+        if not element.decomposed and element.find_parent(list(_CONTENT_TAGS)) is None:
             element.decompose()
-    return soup.body or soup
+    body = soup.body or soup
+    articles = soup.find_all("article")
+    candidate = soup.find("main") or (articles[0] if len(articles) == 1 else None)
+    if candidate is not None and _text_length(candidate) >= _MAIN_CONTENT_MIN_SHARE * (
+        _text_length(body)
+    ):
+        return candidate
+    return body
 
 
 def _rows_of(table: Any) -> list[list[str]]:

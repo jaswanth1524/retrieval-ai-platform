@@ -126,10 +126,12 @@ def test_chunk_ids_survive_an_insert_earlier_in_the_document() -> None:
     ids_before = {chunk.text: chunk.chunk_id for chunk in before if chunk.section != "Part 1"}
     ids_after = {chunk.text: chunk.chunk_id for chunk in after if chunk.section != "Part 1"}
     assert ids_before and ids_before == ids_after
-    # The later chunks did move (the insert added a chunk before them): only their
+    # The later chunks did move (the insert added chunks before them): only their
     # position changed, and the id no longer depends on it.
+    added = len(after) - len(before)
+    assert added > 0
     assert [c.ordinal for c in after if c.section == "Part 2"] == [
-        c.ordinal + 1 for c in before if c.section == "Part 2"
+        c.ordinal + added for c in before if c.section == "Part 2"
     ]
 
 

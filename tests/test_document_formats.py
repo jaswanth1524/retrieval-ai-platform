@@ -748,6 +748,42 @@ def test_html_without_main_drops_chrome_but_keeps_an_articles_own_header() -> No
     assert "Menu" not in text and "Foot" not in text
 
 
+@pytest.mark.parametrize(
+    ("page", "kept"),
+    [
+        # A teaser <article> in a sidebar was taken as the page's only article.
+        (
+            b"<body><div id='content'><h1>Refunds</h1><p>Refunds are issued within 30 "
+            b"days of the return being received.</p></div><aside><article>Related post"
+            b"</article></aside></body>",
+            "Refunds are issued within 30 days",
+        ),
+        # A <main> holding a welcome line won over the real text in a <div>.
+        (
+            b"<body><main><p>Welcome</p></main><div id='content'><h2>Install</h2><p>Run "
+            b"the installer and accept the licence to finish setting up.</p></div></body>",
+            "Run the installer",
+        ),
+        # A section's own <header> holds its heading.
+        (
+            b"<body><section><header><h2>Pricing</h2></header><p>The Pro plan costs $20 "
+            b"per month.</p></section></body>",
+            "Pricing",
+        ),
+        # An <aside> inside the main text is a note on it, not a sidebar.
+        (
+            b"<body><main><p>The Pro plan costs $20 per month.</p><aside>Note: Enterprise "
+            b"customers get a 20% discount.</aside></main></body>",
+            "Enterprise customers get a 20% discount",
+        ),
+    ],
+)
+def test_html_content_outside_the_presumed_main_element_is_kept(page: bytes, kept: str) -> None:
+    text = " ".join(section.text for section in parse_document_bytes("p.html", page))
+    assert kept in text
+    assert "Related post" not in text
+
+
 def test_html_whose_text_is_all_chrome_still_indexes_it() -> None:
     sections = parse_document_bytes("p.html", b"<body><header><p>Only here</p></header></body>")
     assert [section.text for section in sections] == ["Only here"]
@@ -798,6 +834,43 @@ def test_running_headers_footers_and_page_numbers_are_dropped_from_pdf_pages() -
     # Under 60% of the pages: not a running line.
     mixed = ["Draft\nA.", "Draft\nB.", "C.", "D.", "E."]
     assert strip_running_lines(mixed) == mixed
+
+
+def test_pdf_edge_lines_that_differ_only_by_a_number_are_content() -> None:
+    # Matched with the digits ignored, a numbered heading and a closing sentence were
+    # taken for page numbers and dropped from every page. (CHUNKER_VERSION 7.)
+    from api.parsers.pdf import strip_running_lines
+
+    pages = [
+        f"Article {n}\nThe rule of article {n} applies.\nNotice period is {n} days.\n- {n} -"
+        for n in range(1, 6)
+    ]
+    assert strip_running_lines(pages) == [
+        f"Article {n}\nThe rule of article {n} applies.\nNotice period is {n} days."
+        for n in range(1, 6)
+    ]
+    footers = [f"Total {n * 60}\nBody {n}.\nACME Handbook | {n}" for n in range(1, 5)]
+    assert strip_running_lines(footers) == [f"Total {n * 60}\nBody {n}." for n in range(1, 5)]
+
+
+def test_a_repeat_one_line_in_from_the_edge_keeps_its_first_copy() -> None:
+    # A table's header row under the running header was dropped from every page,
+    # first one included; the rows lost what their columns are.
+    from api.parsers.pdf import strip_running_lines
+
+    pages = [f"ACME Handbook\nName Plan Cost\nrow{n} Basic {n}\n- {n} -" for n in range(1, 5)]
+    assert strip_running_lines(pages) == [
+        "Name Plan Cost\nrow1 Basic 1",
+        *(f"row{n} Basic {n}" for n in range(2, 5)),
+    ]
+
+
+def test_a_kept_header_row_is_not_its_pages_section_label() -> None:
+    pages = [f"ACME Handbook\nName Plan Cost\nAlice{n} Basic {n}\nPage {n}" for n in range(1, 5)]
+    sections = parse_document_bytes("t.pdf", pdf_bytes(pages))
+    assert "Name Plan Cost" in sections[0].text
+    assert sections[0].section == "Alice1 Basic 1"
+    assert all("Name Plan Cost" not in section.text for section in sections[1:])
 
 
 def test_a_pdf_is_indexed_without_its_running_lines() -> None:
