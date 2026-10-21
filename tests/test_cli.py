@@ -754,3 +754,14 @@ def test_versions_and_queries_say_what_the_server_says(client: DocragClient) -> 
     # No stored originals and no query log on this server: the server's refusals.
     assert run(client, "versions", "guide.txt")[0] == 1
     assert run(client, "queries")[0] == 1
+
+
+def test_an_answer_from_weak_matches_is_flagged_in_the_cli() -> None:
+    import io
+
+    from cli.__main__ import _print_sources
+    from cli.client import StreamResult
+
+    out = io.StringIO()
+    _print_sources(StreamResult({"answer": "x [1]", "sources": [], "weak_matches": True}, []), out)
+    assert "weak match: no passage matched the question closely" in out.getvalue()

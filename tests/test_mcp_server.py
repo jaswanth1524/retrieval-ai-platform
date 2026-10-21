@@ -100,6 +100,10 @@ def test_formatting_notes_partial_reads_and_status() -> None:
     )
     text = format_answer(result)
     assert "Answer status: uncited" in text and "Read 4 of 9 passages" in text
+    weak_answer = format_answer(
+        StreamResult({"answer": "x [1]", "sources": [], "weak_matches": True}, [])
+    )
+    assert "Weak match: no passage matched the question closely" in weak_answer
     assert text.endswith("Suggested follow-ups: What else?")
     assert format_passages([]) == "No passages matched."
     weak = format_passages([{"rank": 1, "filename": "a.txt", "text": "x"}], weak=True)
