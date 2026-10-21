@@ -106,6 +106,8 @@ class QueryTrace:
     query_variants: list[str] = field(default_factory=list)
     # True when the answer initially lacked citations and a stricter retry supplied them.
     citation_retry_used: bool = False
+    # The answer's citations were added by matching it to the sources, not by the model.
+    citation_backfilled: bool = False
     # (prompt, completion) tokens reported for the answer's LLM calls, when reported.
     usage: tuple[int, int] | None = None
     # The HTTP request it came from (X-Request-ID), to find its log lines.

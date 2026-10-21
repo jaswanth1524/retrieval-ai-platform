@@ -401,6 +401,14 @@ class AppSettings(BaseSettings):
     # reminder to cite. Never loops; falls back to the original answer if the retry
     # still lacks citations. See api/generation.py.
     citation_retry_enabled: bool = True
+    # How an uncited answer gets its citations. "llm": the retry above (a second full
+    # generation — about a minute on a local model). "backfill": each answer sentence
+    # a source plainly states (most of its content words, in one or two adjacent
+    # sentences of the source) gets that source's [n]; no LLM call. "auto" (default):
+    # backfill first for local providers (Ollama, OpenAI-compatible), the LLM retry only
+    # when nothing matched; the LLM retry for hosted providers. "off": neither (as
+    # CITATION_RETRY_ENABLED=false).
+    citation_retry_mode: Literal["auto", "llm", "backfill", "off"] = "auto"
 
     # Suggested follow-up questions (default OFF: one more LLM call per answer, which on
     # a local model is seconds). When on, an answer that cited its sources gets up to

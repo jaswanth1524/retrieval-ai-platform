@@ -24,6 +24,7 @@ from api.citations import (
     needs_citation_retry,
     retry_uncited_answer,
     source_citations,
+    will_call_llm_for_citations,
     will_retry_citations,
 )
 from api.llm import (
@@ -108,6 +109,7 @@ __all__ = [
     "retry_uncited_answer",
     "source_citations",
     "supports_reasoning",
+    "will_call_llm_for_citations",
     "will_retry_citations",
 ]
 
@@ -177,6 +179,9 @@ class GroundedAnswer:
     # True when the answer initially lacked citations and a stricter retry supplied
     # them (see needs_citation_retry / retry_uncited_answer).
     citation_retry_used: bool = False
+    # The answer cited nothing and citations were added by matching its sentences to
+    # the sources (citations.backfill_citations), not by the model.
+    citation_backfilled: bool = False
     # Wall-clock of that retry's LLM call, 0.0 when it didn't fire. Carried out so the
     # pipeline can subtract it from the block it measures as generate_ms — the retry
     # happens inside generate_grounded_answer, but it is not generation.
@@ -222,12 +227,21 @@ def generate_grounded_answer(
         raise GenerationError("Generation provider returned an empty answer.")
 
     all_sources = source_citations(selected_chunks)
-    outcome = finalize_citations(messages, answer, all_sources, generator, settings)
+    outcome = finalize_citations(
+        messages,
+        answer,
+        all_sources,
+        generator,
+        settings,
+        weak_matches=weak_matches,
+        context_chunks=selected_chunks,
+    )
 
     return GroundedAnswer(
         answer=outcome.answer,
         sources=attach_spans(outcome.answer, outcome.cited, selected_chunks),
         citation_retry_used=outcome.retry_used,
+        citation_backfilled=outcome.backfilled,
         citation_retry_ms=outcome.retry_ms,
         prompt_messages=outcome.prompt_messages,
     )

@@ -208,6 +208,7 @@ def register(app: FastAPI) -> None:
             top_rerank_score=grounded.top_rerank_score,
             weak_matches=grounded.weak_matches,
             truncated=grounded.truncated,
+            citation_backfilled=grounded.citation_backfilled,
             followups=grounded.followups,
             usage=usage_response(grounded.usage),
         )

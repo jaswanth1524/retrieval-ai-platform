@@ -58,7 +58,7 @@ from api.generation import (
     generate_query_variants,
     needs_condense,
     source_citations,
-    will_retry_citations,
+    will_call_llm_for_citations,
 )
 from api.ingest_service import DocumentIngestOutcome as DocumentIngestOutcome
 from api.ingest_service import IngestService as IngestService
@@ -223,6 +223,8 @@ class DoneEvent(TypedDict):
     weak_matches: NotRequired[bool]
     # The provider cut the answer off at the token limit.
     truncated: NotRequired[bool]
+    # The answer's citations were added by matching it to the sources (backfill).
+    citation_backfilled: NotRequired[bool]
     usage: NotRequired[dict[str, int] | None]
     # Summaries only: passages read, of the passages the documents hold. Fewer than
     # the total when a long document was read at evenly spaced passages.
@@ -512,6 +514,7 @@ class RagPipeline:
         citation_retry_used: bool = False,
         usage: tuple[int, int] | None = None,
         condense_note: str | None = None,
+        citation_backfilled: bool = False,
     ) -> QueryTrace:
         """The trace of a question that ran to an answer (or to "insufficient context")."""
 
@@ -542,6 +545,7 @@ class RagPipeline:
             history_message_count=history_message_count,
             query_variants=phase.query_variants,
             citation_retry_used=citation_retry_used,
+            citation_backfilled=citation_backfilled,
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
             usage=usage,
@@ -919,6 +923,7 @@ class RagPipeline:
                     top_rerank_score=hit.top_rerank_score,
                     weak_matches=hit.weak_matches,
                     truncated=hit.truncated,
+                    citation_backfilled=hit.citation_backfilled,
                     followups=list(hit.followups),
                 )
         grounded = self._answer_uncached(question, overrides, filenames, history, tags)
@@ -933,6 +938,7 @@ class RagPipeline:
                     grounded.top_rerank_score,
                     grounded.truncated,
                     weak_matches=grounded.weak_matches,
+                    citation_backfilled=grounded.citation_backfilled,
                     followups=tuple(grounded.followups),
                 ),
             )
@@ -975,6 +981,7 @@ class RagPipeline:
                     "top_rerank_score": hit.top_rerank_score,
                     "weak_matches": hit.weak_matches,
                     "truncated": hit.truncated,
+                    "citation_backfilled": hit.citation_backfilled,
                 }
                 if hit.followups:
                     yield {"type": "followups", "questions": list(hit.followups)}
@@ -997,6 +1004,7 @@ class RagPipeline:
                     done.get("top_rerank_score"),
                     done.get("truncated", False),
                     weak_matches=done.get("weak_matches", False),
+                    citation_backfilled=done.get("citation_backfilled", False),
                     followups=tuple(followups),
                 ),
             )
@@ -1145,6 +1153,7 @@ class RagPipeline:
                     condense_note=condense_note,
                     history_message_count=len(truncated_history),
                     citation_retry_used=grounded.citation_retry_used,
+                    citation_backfilled=grounded.citation_backfilled,
                     usage=usage,
                 )
             )
@@ -1351,10 +1360,22 @@ class RagPipeline:
             # uses, so the retry-trigger condition can't drift between response modes.
             # The retry is a whole unstreamed generation after the last delta; without
             # this frame the UI sits on its streaming label with nothing moving.
-            if will_retry_citations(answer, all_sources, effective_settings):
+            if will_call_llm_for_citations(
+                answer,
+                all_sources,
+                effective_settings,
+                weak_matches=phase.below_min_score,
+                context_chunks=selected,
+            ):
                 yield {"type": "stage", "stage": "verifying_citations"}
             outcome = finalize_citations(
-                messages, answer, all_sources, self._generator, effective_settings
+                messages,
+                answer,
+                all_sources,
+                self._generator,
+                effective_settings,
+                weak_matches=phase.below_min_score,
+                context_chunks=selected,
             )
             answer = outcome.answer
             # The last call made the answer: the citation retry's when it fired.
@@ -1397,6 +1418,7 @@ class RagPipeline:
                         condense_note=condense_note,
                         history_message_count=len(truncated_history),
                         citation_retry_used=citation_retry_used,
+                        citation_backfilled=outcome.backfilled,
                         usage=usage,
                     )
                 )
@@ -1412,6 +1434,7 @@ class RagPipeline:
                 "top_rerank_score": _top_rerank_score(phase),
                 "weak_matches": phase.below_min_score,
                 "truncated": truncated,
+                "citation_backfilled": outcome.backfilled,
                 "usage": usage_dict(usage),
             }
             if (

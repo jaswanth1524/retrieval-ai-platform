@@ -103,6 +103,12 @@ citation_retries_total = Counter(
     "Answers that cited nothing and were regenerated once to add citations.",
 )
 
+citation_backfills_total = Counter(
+    "docrag_citation_backfills_total",
+    "Answers that cited nothing and had citations added by matching their sentences "
+    "to the sources (CITATION_RETRY_MODE backfill/auto), without an LLM call.",
+)
+
 feedback_total = Counter(
     "docrag_feedback_total",
     "Answer ratings recorded through POST /feedback, labeled by rating.",
