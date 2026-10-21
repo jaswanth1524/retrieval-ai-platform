@@ -128,6 +128,12 @@ class AppSettings(BaseSettings):
     # passage that answered the question: "what are foundational models" scored 0.006
     # with MiniLM and 0.154 with jina against "Foundation models: You have trained ...".
     rerank_fallback_count: int = Field(default=3, ge=0, le=20)
+    # Opt-in (0 = off): of the passages that cleared the floor, keep only those scoring
+    # within this share of the way from the median candidate's score to the best one
+    # ((score - median) / (top - median) >= this), and always the best two. Works on
+    # any reranker's scale, and only ever trims the prompt — never turns an answer into
+    # a refusal. A low-scoring sixth passage is ~1k tokens of prompt to read.
+    rerank_relative_floor: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Checked at startup (case-insensitive): a typo used to boot fine and then fail
     # every question with a 400 that blamed the client.
@@ -174,6 +180,11 @@ class AppSettings(BaseSettings):
     # history until it fits with LLM_MAX_TOKENS to spare — an over-long prompt had its
     # *front* (the grounding rules) silently cut by the model server.
     llm_context_window: int = Field(default=0, ge=0)
+    # Opt-in (0 = off): the most estimated tokens a question's prompt may take, whatever
+    # the window. Over it, neighbour text goes first (lowest-ranked passage first), then
+    # whole lowest-ranked passages, then the oldest history. A local model reads a
+    # prompt at ~70 tokens/s on an M1, so prompt size is most of the wait.
+    prompt_token_budget: int = Field(default=0, ge=0)
     # Questions answered at once; past it a question gets 429 + Retry-After at once
     # instead of holding a request thread for a minute (api/admission.py). 0 = no cap.
     max_concurrent_questions: int = Field(default=4, ge=0)
@@ -384,6 +395,10 @@ class AppSettings(BaseSettings):
     # Server-side truncation cap (most recent messages kept) — independent of the
     # request schema's own cap, so an operator can tighten it without a schema change.
     conversation_max_history_messages: int = Field(default=12, ge=0)
+    # Opt-in (0 = off): earlier answers sent to the answering model are cut to this many
+    # characters each (the condense step keeps its own 1500). The question already
+    # carries its resolved meaning ("Read with the conversation as: ...").
+    generation_history_assistant_chars: int = Field(default=0, ge=0)
     # The condense call only needs to produce one rewritten sentence — capped well
     # below llm_max_tokens so a runaway rewrite can't burn the generation token budget.
     condense_max_tokens: PositiveInt = 128

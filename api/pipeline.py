@@ -71,6 +71,7 @@ from api.llm import (
     usage_totals,
 )
 from api.prompting import (
+    clip_text,
     condense_question_detailed,
     estimate_prompt_tokens,
     one_line,
@@ -83,6 +84,7 @@ from api.reranking import (
     RerankedChunk,
     Reranker,
     RerankOutcome,
+    relative_cut,
     rerank_candidates_detailed,
 )
 from api.retrieval import (
@@ -144,6 +146,8 @@ class RetrievalPhase:
     # Part of rerank_ms spent waiting for the reranker (another question was scoring).
     rerank_wait_ms: float = 0.0
     diversity_dropped_ids: frozenset[str] = frozenset()
+    # Cleared the floor, cut for scoring far below the best (RERANK_RELATIVE_FLOOR).
+    relative_cut_ids: frozenset[str] = frozenset()
     query_variants: list[str] = field(default_factory=list)
     # Search only: nothing cleared rerank_min_score, so context_chunks are the closest
     # passages instead (see _retrieve_and_rerank).
@@ -277,6 +281,21 @@ def _without_unanswered_exchanges(history: list[ChatMessage]) -> list[ChatMessag
 
 # Only whether an earlier answer cites anything matters, so ranges are clamped small.
 _HISTORY_CITATION_CHECK_MAX = 1000
+
+
+def _clip_earlier_answers(history: list[ChatMessage], settings: AppSettings) -> list[ChatMessage]:
+    """``history`` with each earlier answer cut to GENERATION_HISTORY_ASSISTANT_CHARS
+    (0: unchanged). The answering model reads all of it before the first token."""
+
+    limit = int(settings.generation_history_assistant_chars)
+    if limit <= 0:
+        return history
+    return [
+        {"role": "assistant", "content": clip_text(message["content"], limit)}
+        if message["role"] == "assistant"
+        else message
+        for message in history
+    ]
 
 
 def _with_interpretation(question: str, condensed: str | None) -> str:
@@ -532,6 +551,7 @@ class RagPipeline:
                 selected,
                 min_score=float(effective_settings.rerank_min_score),
                 diversity_dropped_ids=phase.diversity_dropped_ids,
+                relative_cut_ids=phase.relative_cut_ids,
                 context_budget_dropped_ids=context_budget_dropped_ids,
             ),
             prompt_messages=prompt_messages,
@@ -806,6 +826,14 @@ class RagPipeline:
                 drop_neighbours=False,
             )
             below_min_score = bool(diverse_outcome.kept)
+        relative_cut_ids: set[str] = set()
+        if for_generation and not below_min_score:
+            trimmed, relative_cut_ids = relative_cut(
+                diverse_outcome.kept,
+                outcome.scored,
+                float(effective_settings.rerank_relative_floor),
+            )
+            diverse_outcome = RerankOutcome(scored=diverse_outcome.scored, kept=trimmed)
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
@@ -839,6 +867,7 @@ class RagPipeline:
             query_expansion_ms=query_expansion_ms,
             context_expansion_ms=context_expansion_ms,
             diversity_dropped_ids=frozenset(diversity_dropped),
+            relative_cut_ids=frozenset(relative_cut_ids),
             query_variants=queries[1:],
             below_min_score=below_min_score,
         )
@@ -1074,7 +1103,7 @@ class RagPipeline:
             fitted = fit_prompt_to_context_window(
                 prompt_question,
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
-                truncated_history,
+                _clip_earlier_answers(truncated_history, effective_settings),
                 effective_settings,
                 weak_matches=phase.below_min_score,
             )
@@ -1256,7 +1285,7 @@ class RagPipeline:
             fitted = fit_prompt_to_context_window(
                 prompt_question,
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
-                truncated_history,
+                _clip_earlier_answers(truncated_history, effective_settings),
                 effective_settings,
                 weak_matches=phase.below_min_score,
             )

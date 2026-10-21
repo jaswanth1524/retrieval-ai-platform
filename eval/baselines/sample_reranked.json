@@ -37,6 +37,7 @@
     "query_expansion_enabled": false,
     "rerank_candidates": 50,
     "rerank_fallback_count": 3,
+    "rerank_relative_floor": 0.0,
     "rerank_min_score": 0.15,
     "rerank_top_k": 8,
     "reranker_batch_size": 8,

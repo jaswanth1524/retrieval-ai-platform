@@ -368,6 +368,7 @@ def test_the_fingerprint_records_every_setting_that_moves_the_ranking() -> None:
         "query_expansion_count",
         "reranker_batch_size",
         "platform_machine",
+        "rerank_relative_floor",
     ):
         assert key in fingerprint
 

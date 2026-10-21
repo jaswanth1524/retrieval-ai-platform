@@ -416,6 +416,8 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "rerank_candidates": int(settings.rerank_candidates),
         "rerank_min_score": float(settings.rerank_min_score),
         "rerank_fallback_count": int(settings.rerank_fallback_count),
+        # Trims the kept passages relative to the best one (0 = off).
+        "rerank_relative_floor": float(settings.rerank_relative_floor),
         "fused_top_n": int(settings.fused_top_n),
         "context_neighbor_radius": int(settings.context_neighbor_radius),
         # With a cap, adjacent passages are no longer dropped as duplicates of a kept one.
