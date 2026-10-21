@@ -249,8 +249,14 @@ class DocragClient:
         on_stage: Callable[[dict[str, Any]], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         tags: list[str] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> StreamResult:
+        """``history``: the conversation so far ({role: user|assistant, content}),
+        oldest first, so a follow-up ("and for contractors?") is read with it."""
+
         body: dict[str, Any] = {"question": question}
+        if history:
+            body["history"] = history
         if filenames:
             body["filenames"] = filenames
         if tags:
@@ -627,3 +633,35 @@ def _until(lines: Iterator[str], should_stop: Callable[[], bool]) -> Iterator[st
 
 def _quote(segment: str) -> str:
     return quote(segment, safe="")
+
+
+# What an answer's grounding means, for a person (CLI) or an agent (MCP). The server's
+# answer_status is a code; "uncited" in particular is not "the documents lack it".
+STATUS_MESSAGES = {
+    "insufficient_context": (
+        "the documents don't answer this — try `docrag search` for the closest "
+        "passages, or ask without --file/--tag"
+    ),
+    "no_context": "nothing in the searched documents matched this question",
+    "uncited": "answered without citing its sources — check it against the documents",
+}
+REFUSED_STATUSES = frozenset({"insufficient_context", "no_context"})
+
+
+def grounding_notes(done: dict[str, Any]) -> list[str]:
+    """What to know about how an answer (a ``done`` frame) was grounded, as sentences."""
+
+    notes: list[str] = []
+    status = done.get("answer_status")
+    if isinstance(status, str) and status in STATUS_MESSAGES:
+        notes.append(STATUS_MESSAGES[status])
+    elif done.get("weak_matches"):
+        notes.append("weak match: no passage matched the question closely; check the sources")
+    if done.get("citation_backfilled"):
+        notes.append(
+            "the model cited nothing; the citations were added by matching its sentences "
+            "to the passages"
+        )
+    if done.get("truncated"):
+        notes.append("the answer was cut off at the model's output limit")
+    return notes

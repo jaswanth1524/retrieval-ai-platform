@@ -24,7 +24,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from cli.client import Cancelled, DocragClient, DocragError, StreamResult
+from cli.client import Cancelled, DocragClient, DocragError, StreamResult, grounding_notes
 
 # A passage shown to the model is cut here: a search returns up to a dozen of them.
 _PASSAGE_CHARS = 1200
@@ -68,16 +68,14 @@ def format_answer(result: StreamResult) -> str:
                 quote = " ".join(str(span.get("quote", "")).split())
                 if quote:
                     lines.append(f'    "{quote}"')
+    # How it was grounded, so an agent quoting it can check rather than present a
+    # refusal, an uncited answer or a weak match as well supported.
     status = done.get("answer_status")
+    notes = grounding_notes(done)
     if status and status != "answered":
-        lines.append(f"\nAnswer status: {status} (the documents may not cover this).")
-    elif done.get("weak_matches"):
-        # Answered from passages under the relevance bar: say so, so an agent quoting
-        # it can check the sources rather than present it as well supported.
-        lines.append(
-            "\nWeak match: no passage matched the question closely; the answer rests on "
-            "the closest ones — check the sources."
-        )
+        lines.append(f"\nAnswer status: {status}" + (f" — {'; '.join(notes)}." if notes else "."))
+    else:
+        lines.extend(f"\n{note[:1].upper()}{note[1:]}." for note in notes)
     read, total = done.get("chunks_read"), done.get("chunks_total")
     if isinstance(read, int) and isinstance(total, int) and read < total:
         lines.append(f"\nRead {read} of {total} passages (evenly spaced).")
@@ -188,17 +186,32 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
 
     @server.tool(annotations=_READ_ONLY)
     async def ask(
-        question: str, filenames: list[str] | None = None, tags: list[str] | None = None
+        question: str,
+        filenames: list[str] | None = None,
+        tags: list[str] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> str:
         """Answer a question from the indexed documents, with numbered citations and the
         exact quotes they rest on.
 
         filenames limits the answer to those documents, tags to documents with one of
-        those tags."""
+        those tags. history is the conversation so far, oldest first, as
+        [{"role": "user" | "assistant", "content": "..."}], so a follow-up ("and for
+        contractors?") is read with it; leave out answers that said the documents don't
+        cover the question."""
 
+        turns = [
+            {"role": str(turn.get("role")), "content": str(turn.get("content", ""))}
+            for turn in history or []
+            if isinstance(turn, dict)
+            and turn.get("role") in ("user", "assistant")
+            and str(turn.get("content", "")).strip()
+        ]
         return await call(
             lambda client, should_stop: format_answer(
-                client.ask(question, filenames, should_stop=should_stop, tags=tags)
+                client.ask(
+                    question, filenames, should_stop=should_stop, tags=tags, history=turns or None
+                )
             )
         )
 

@@ -765,3 +765,85 @@ def test_an_answer_from_weak_matches_is_flagged_in_the_cli() -> None:
     out = io.StringIO()
     _print_sources(StreamResult({"answer": "x [1]", "sources": [], "weak_matches": True}, []), out)
     assert "weak match: no passage matched the question closely" in out.getvalue()
+
+
+def test_ask_strict_exits_3_when_the_documents_do_not_answer(
+    client: DocragClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cli.client import StreamResult
+
+    run(client, "ingest", str(corpus(tmp_path)))
+    refused = StreamResult(
+        {"answer": "The documents do not cover it.", "sources": [], "answer_status": "no_context"},
+        [],
+    )
+    monkeypatch.setattr(client, "ask", lambda *a, **k: refused)
+    code, out = run(client, "ask", "gym?", "--quiet", "--strict")
+    assert code == 3
+    assert "nothing in the searched documents matched this question" in out
+    # Without --strict a refusal is still a successful run.
+    assert run(client, "ask", "gym?", "--quiet")[0] == 0
+
+
+def test_cli_notes_explain_uncited_and_auto_cited_answers() -> None:
+    from cli.client import grounding_notes
+
+    assert grounding_notes({"answer_status": "uncited"}) == [
+        "answered without citing its sources — check it against the documents"
+    ]
+    assert "added by matching" in grounding_notes({"citation_backfilled": True})[0]
+    assert grounding_notes({"answer_status": "answered"}) == []
+
+
+def test_chat_sends_the_conversation_and_leaves_refusals_out(
+    client: DocragClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli.client import StreamResult
+
+    seen: list[list[dict[str, str]] | None] = []
+    answers = iter(
+        [
+            {"answer": "Fourteen days [1].", "sources": [], "answer_status": "answered"},
+            {"answer": "Not covered.", "sources": [], "answer_status": "insufficient_context"},
+            {"answer": "Sixty euros [1].", "sources": [], "answer_status": "answered"},
+            {"answer": "Fresh [1].", "sources": [], "answer_status": "answered"},
+        ]
+    )
+
+    def fake_ask(
+        question: str, *args: object, history: object = None, **kwargs: object
+    ) -> StreamResult:
+        seen.append(history)  # type: ignore[arg-type]
+        return StreamResult(next(answers), [])
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO("Flights?\nGym?\nAnd meals?\n/new\nHello?\n/quit\nnever\n")
+    )
+    code, out = run(client, "chat", "--quiet")
+    assert code == 0
+    assert seen[0] is None
+    flights = [
+        {"role": "user", "content": "Flights?"},
+        {"role": "assistant", "content": "Fourteen days [1]."},
+    ]
+    # The refusal to "Gym?" isn't sent back with the next question.
+    assert seen[1] == flights and seen[2] == flights
+    assert seen[3] is None  # /new
+    assert "(new conversation)" in out
+    assert len(seen) == 4
+
+
+def test_the_stage_reporter_ticks_while_nothing_arrives() -> None:
+    from cli.__main__ import StageReporter
+
+    err = io.StringIO()
+    with StageReporter(err, tick=0.05) as reporter:
+        reporter.stage({"stage": "reading", "eta_ms": 42000})
+        import time
+
+        time.sleep(0.2)
+        reporter.delta()
+    lines = err.getvalue().splitlines()
+    assert lines[0] == "[reading the passages, about 42s]"
+    assert any(line.startswith("[reading the passages… ") for line in lines[1:])
