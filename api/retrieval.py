@@ -10,6 +10,7 @@ from typing import Protocol
 from qdrant_client import models
 
 from api.embeddings import EmbeddedText, EmbeddingError
+from api.parsers.common import clean_text
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ def embed_query(query: str, embedding_provider: QueryEmbeddingProvider) -> Embed
     ``embed_texts`` for providers/test fakes that only implement the batch path.
     """
 
+    # Cleaned like the indexed text, so "ﬁnance" in a pasted question finds "finance".
+    query = clean_text(query)
     query_embed = getattr(embedding_provider, "embed_query", None)
     if callable(query_embed):
         result = query_embed(query)

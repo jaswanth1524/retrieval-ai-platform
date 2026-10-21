@@ -76,6 +76,35 @@ class DocumentSection:
     row_label_prefix: str = ""
 
 
+# Ligature characters, written out ("ﬁnance" never matched a search for "finance"), and
+# invisible characters that split a word in two for BM25 ("infor\u00admation" was
+# "infor" + "mation"): soft hyphen, zero-width space, word joiner, a BOM mid-text. The
+# zero-width joiner and non-joiner stay — Persian, Indic scripts and emoji need them —
+# and so does everything NFKC would also rewrite (², ½, ™, full-width forms).
+_TEXT_CLEANUP = str.maketrans(
+    {
+        "\ufb00": "ff",
+        "\ufb01": "fi",
+        "\ufb02": "fl",
+        "\ufb03": "ffi",
+        "\ufb04": "ffl",
+        "\ufb05": "st",
+        "\ufb06": "st",
+        "\u00ad": None,
+        "\u200b": None,
+        "\u2060": None,
+        "\ufeff": None,
+    }
+)
+
+
+def clean_text(text: str) -> str:
+    """``text`` with ligature characters written out and word-splitting invisible
+    characters removed. Applied to every parsed section and to questions alike."""
+
+    return text.translate(_TEXT_CLEANUP)
+
+
 def normalize_text(text: str) -> str:
     """Normalize line endings and trim surrounding whitespace."""
 

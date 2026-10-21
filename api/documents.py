@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import PurePosixPath
 from typing import ClassVar
@@ -27,6 +27,7 @@ from api.parsers.common import (
     EmptyDocumentError,
     UnsupportedDocumentError,
     cap_section,
+    clean_text,
     infer_section,
     normalize_text,
 )
@@ -183,9 +184,17 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 # ignored only when it reads as a page number ("Article 3" stays); HTML keeps text outside
 # a <main>/<article> that holds less than half the page, and chrome tags inside content;
 # the fallback token counter counts CJK, digits and punctuation.
+# v8: every parsed text has ligature characters written out and soft hyphens / zero-width
+# characters removed; a PDF font whose /ToUnicode map contradicts the ligature glyphs its
+# /Differences names is read by the glyphs; words broken over a PDF line end are rejoined;
+# a book's running head with its page number is dropped (one that changes by subsection
+# keeps its title, without the number); a scanned page with only a stamp
+# of text is OCR'd; DOCX reads content controls, tracked insertions and simple fields,
+# reads a merged cell once and labels table rows by their header; "|" in a PDF table cell
+# is escaped.
 # Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
 # carry an older version is listed as stale, and re-indexing it applies this one.
-CHUNKER_VERSION = 7
+CHUNKER_VERSION = 8
 
 # The smallest share of CHUNK_SIZE_TOKENS a window keeps for text, whatever the
 # filename › section prefix costs. Without a floor a long name left one token per
@@ -348,7 +357,14 @@ def parse_document_bytes(
 
     safe_filename = validate_upload_filename(filename)
     suffix = PurePosixPath(safe_filename).suffix.lower()
-    return PARSERS[suffix](safe_filename, content, settings)
+    sections = [
+        replace(section, text=clean_text(section.text), section=clean_text(section.section))
+        for section in PARSERS[suffix](safe_filename, content, settings)
+    ]
+    kept = [section for section in sections if section.text.strip()]
+    if not kept:
+        raise EmptyDocumentError(f"'{safe_filename}' has no extractable text.")
+    return kept
 
 
 def chunk_sections(

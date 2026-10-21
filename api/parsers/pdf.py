@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Sequence
 from io import BytesIO
@@ -10,6 +11,7 @@ from threading import Lock
 from typing import Any
 
 from pypdf import PdfReader
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject, StreamObject
 
 from api.parsers.common import (
     DocumentParseError,
@@ -62,6 +64,9 @@ def parse_pdf_document(
         )
 
     tables_by_page = _extract_pdf_tables(content, _pages_that_draw_lines(reader))
+    repaired = repair_ligature_maps(reader)
+    if repaired:
+        logger.info("PDF %s: repaired the ligature mapping of %d font(s).", filename, repaired)
 
     page_texts: list[str] = []
     for page_number, page in enumerate(reader.pages, start=1):
@@ -78,12 +83,20 @@ def parse_pdf_document(
             )
             page_texts.append("")
     cleaned, kept_once = strip_running_lines_keeping_first(page_texts)
+    cleaned = rejoin_hyphenated(cleaned)
 
     sections: list[DocumentSection] = []
     empty_pages: list[int] = []
+    # Scanned pages carrying a few characters of real text (a scanner's stamp, a Bates
+    # number): OCR'd like empty ones, keeping the stamp's text if OCR gives nothing.
+    stamped: dict[int, DocumentSection] = {}
     for page_number, (raw, text) in enumerate(zip(page_texts, cleaned, strict=True), start=1):
         if raw and not text and not tables_by_page.get(page_number):
-            continue  # nothing but the running header/footer: a blank page, not a scan
+            # Nothing but the running header/footer: a blank page — or a scan whose
+            # stamp repeats on every page.
+            if _draws_a_large_image(reader.pages[page_number - 1]):
+                empty_pages.append(page_number)
+            continue
         table_blocks = tables_by_page.get(page_number, [])
         if table_blocks:
             table_text = "\n\n".join(f"[Table]\n{block}" for block in table_blocks)
@@ -91,14 +104,17 @@ def parse_pdf_document(
         if not text:
             empty_pages.append(page_number)
             continue
-        sections.append(
-            DocumentSection(
-                filename=filename,
-                page=page_number,
-                section=infer_section(text, skip=kept_once),
-                text=text,
-            )
+        section = DocumentSection(
+            filename=filename,
+            page=page_number,
+            section=infer_section(text, skip=kept_once),
+            text=text,
         )
+        if len(text) < _STAMP_MAX_CHARS and _draws_a_large_image(reader.pages[page_number - 1]):
+            stamped[page_number] = section
+            empty_pages.append(page_number)
+            continue
+        sections.append(section)
 
     if len(empty_pages) > max_ocr_pages:
         logger.warning(
@@ -116,7 +132,7 @@ def parse_pdf_document(
         try:
             ocr_sections = _ocr_pdf_pages(filename, content, empty_pages)
         except EmptyDocumentError:
-            if not sections:
+            if not sections and not stamped:
                 raise
             logger.warning(
                 "PDF %s: pages %s have no text layer and OCR is not installed "
@@ -129,7 +145,7 @@ def parse_pdf_document(
             # OCR itself broke (engine load, unreadable PDF for the rasterizer). A fully
             # scanned PDF has nothing else to offer, so that still fails; a mixed one
             # keeps its text pages, as it did before its empty pages were OCR'd.
-            if not sections:
+            if not sections and not stamped:
                 raise
             logger.warning(
                 "PDF %s: OCR failed for pages %s; indexing the remaining pages only.",
@@ -138,11 +154,203 @@ def parse_pdf_document(
                 exc_info=True,
             )
             ocr_sections = []
-        sections = sorted([*sections, *ocr_sections], key=lambda section: section.page)
+        ocr_texts = rejoin_hyphenated([section.text for section in ocr_sections])
+        ocr_sections = [
+            DocumentSection(
+                filename=section.filename,
+                page=section.page,
+                section=section.section,
+                text=text,
+                boundary=section.boundary,
+            )
+            for section, text in zip(ocr_sections, ocr_texts, strict=True)
+        ]
+        read = {section.page for section in ocr_sections}
+        sections = sorted(
+            [
+                *sections,
+                *ocr_sections,
+                *(section for page, section in stamped.items() if page not in read),
+            ],
+            key=lambda section: section.page,
+        )
 
     if not sections:
         raise EmptyDocumentError(f"PDF '{filename}' has no extractable text.")
     return sections
+
+
+# A page with less text than this that draws a large image is a scan with a stamp on it.
+_STAMP_MAX_CHARS = 20
+# Width x height, in image pixels: about a third of a page scanned at 150 dpi.
+_LARGE_IMAGE_PIXELS = 500_000
+
+
+def _draws_a_large_image(page: Any) -> bool:
+    """Whether the page's resources hold an image big enough to be a page scan."""
+
+    try:
+        resources = page.get("/Resources")
+        resources = resources.get_object() if resources is not None else None
+        xobjects = resources.get("/XObject") if isinstance(resources, DictionaryObject) else None
+        xobjects = xobjects.get_object() if xobjects is not None else None
+        if not isinstance(xobjects, DictionaryObject):
+            return False
+        for reference in xobjects.values():
+            image = reference.get_object()
+            if not isinstance(image, DictionaryObject) or image.get("/Subtype") != "/Image":
+                continue
+            pixels = int(image.get("/Width", 0)) * int(image.get("/Height", 0))
+            if pixels >= _LARGE_IMAGE_PIXELS:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+# Ligature glyphs by their font-encoding names (the Adobe names, and the f_i form), as
+# text. A font's /Differences can name the "fi" glyph at a code its /ToUnicode map says
+# is "!" (seen in a published book: "speci!c", "!rst", "\"oor") — every extractor
+# trusts the map, so the words came out broken.
+_LIGATURE_GLYPHS = {
+    "/fi": "fi",
+    "/fl": "fl",
+    "/ff": "ff",
+    "/ffi": "ffi",
+    "/ffl": "ffl",
+    "/f_i": "fi",
+    "/f_l": "fl",
+    "/f_f": "ff",
+    "/f_f_i": "ffi",
+    "/f_f_l": "ffl",
+    "/uniFB00": "ff",
+    "/uniFB01": "fi",
+    "/uniFB02": "fl",
+    "/uniFB03": "ffi",
+    "/uniFB04": "ffl",
+}
+# Form XObjects nest resources; deeper than this is not worth following.
+_MAX_RESOURCE_DEPTH = 4
+
+
+def _ligature_codes(font: DictionaryObject) -> dict[int, str]:
+    """The single-byte codes a simple font's /Differences assigns ligature glyphs to."""
+
+    encoding = font.get("/Encoding")
+    encoding = encoding.get_object() if encoding is not None else None
+    if not isinstance(encoding, DictionaryObject):
+        return {}
+    differences = encoding.get("/Differences")
+    differences = differences.get_object() if differences is not None else None
+    if not isinstance(differences, list):
+        return {}
+    codes: dict[int, str] = {}
+    code: int | None = None
+    for item in differences:
+        if isinstance(item, int):
+            code = item
+            continue
+        if code is None:
+            continue
+        text = _LIGATURE_GLYPHS.get(str(item))
+        if text is not None and 0 <= code < 256:
+            codes[code] = text
+        code += 1
+    return codes
+
+
+def repair_ligature_maps(reader: PdfReader) -> int:
+    """Correct, in memory, fonts whose /ToUnicode map contradicts the ligature glyphs
+    their /Differences name; returns how many fonts were changed.
+
+    Each ligature code gets a /ToUnicode entry for its glyph appended (pypdf reads the
+    map in order, so the last entry for a code wins): a map that already agreed is
+    unchanged in effect, a wrong one is corrected. Simple fonts only (a /Differences
+    array means one-byte codes); best-effort — a font it can't read is left alone.
+    """
+
+    repaired: set[int] = set()
+
+    def visit(resources: Any, depth: int) -> None:
+        resources = resources.get_object() if resources is not None else None
+        if not isinstance(resources, DictionaryObject) or depth > _MAX_RESOURCE_DEPTH:
+            return
+        fonts = resources.get("/Font")
+        fonts = fonts.get_object() if fonts is not None else None
+        if isinstance(fonts, DictionaryObject):
+            for reference in fonts.values():
+                font = reference.get_object()
+                if not isinstance(font, DictionaryObject) or id(font) in repaired:
+                    continue
+                to_unicode = font.get("/ToUnicode")
+                to_unicode = to_unicode.get_object() if to_unicode is not None else None
+                codes = _ligature_codes(font)
+                if not codes or not isinstance(to_unicode, StreamObject):
+                    continue
+                entries = "\n".join(
+                    f"<{code:02X}> <{text.encode('utf-16-be').hex().upper()}>"
+                    for code, text in sorted(codes.items())
+                )
+                fixed = DecodedStreamObject()
+                fixed.set_data(
+                    to_unicode.get_data()
+                    + f"\n{len(codes)} beginbfchar\n{entries}\nendbfchar\n".encode()
+                )
+                font[NameObject("/ToUnicode")] = fixed
+                repaired.add(id(font))
+        xobjects = resources.get("/XObject")
+        xobjects = xobjects.get_object() if xobjects is not None else None
+        if isinstance(xobjects, DictionaryObject):
+            for reference in xobjects.values():
+                xobject = reference.get_object()
+                if isinstance(xobject, DictionaryObject) and xobject.get("/Subtype") == "/Form":
+                    visit(xobject.get("/Resources"), depth + 1)
+
+    try:
+        for page in reader.pages:
+            visit(page.get("/Resources"), 0)
+    except Exception:
+        logger.debug("Could not check the PDF's fonts for ligature mappings.", exc_info=True)
+    return len(repaired)
+
+
+# A word broken over a line end: "pur-\nchase". Letters only on both sides.
+_HYPHEN_BREAK_RE = re.compile(r"([^\W\d_]+)-\n([^\W\d_]+)")
+_WORDS_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")
+
+
+def rejoin_hyphenated(page_texts: Sequence[str]) -> list[str]:
+    """``page_texts`` with words broken across a line end ("pur-\nchase") made whole.
+
+    The document's own words decide each one: joined when the joined word appears
+    elsewhere, or when either half isn't a word of its own ("com-pliant"); kept
+    hyphenated when that form appears elsewhere, when the second half is capitalized,
+    or when both halves are words the document uses ("cost-\neffective").
+    """
+
+    unbroken = [_HYPHEN_BREAK_RE.sub(" ", text) for text in page_texts]
+    words: set[str] = set()
+    compounds: set[str] = set()
+    for text in unbroken:
+        for match in _WORDS_RE.finditer(text):
+            word = match.group(0).casefold()
+            (compounds if "-" in word else words).add(word)
+            words.update(word.split("-"))
+
+    def rejoin(match: re.Match[str]) -> str:
+        first, second = match.group(1), match.group(2)
+        joined, hyphenated = first + second, f"{first}-{second}"
+        if hyphenated.casefold() in compounds:
+            return hyphenated
+        if joined.casefold() in words:
+            return joined
+        if second[0].isupper():
+            return hyphenated
+        if first.casefold() in words and second.casefold() in words:
+            return hyphenated
+        return joined
+
+    return [_HYPHEN_BREAK_RE.sub(rejoin, text) for text in page_texts]
 
 
 # A line repeated at the top or bottom of most pages is a running header or footer
@@ -206,39 +414,70 @@ def strip_running_lines_keeping_first(
     repeat one line in (a table's header row under the running header, a heading that
     starts each page) can be content: its first copy stays, and only the repeats go.
     The kept copies are returned so they aren't taken for their page's section label.
+
+    A book's running head carries its page number at one end ("26 Chapter 1:
+    Prerequisites", "1.2 About Your App 27") and alternates between left and right
+    pages, so each version is on only half of them: an outermost line of two or more
+    words whose leading or trailing number moves in step with the page is matched page
+    by page, with even and odd pages counted apart. "Article 3" isn't one.
     """
 
     pages = [text.split("\n") for text in page_texts]
-    with_text = [lines for lines in pages if any(line.strip() for line in lines)]
-    if len(with_text) < _RUNNING_MIN_PAGES:
+    numbered = [
+        (number, lines)
+        for number, lines in enumerate(pages, start=1)
+        if any(line.strip() for line in lines)
+    ]
+    if len(numbered) < _RUNNING_MIN_PAGES:
         return list(page_texts), set()
-
-    def edges(lines: list[str]) -> dict[int, set[str]]:
-        indexed = [index for index, line in enumerate(lines) if line.strip()]
-        if not indexed:
-            return {}
-        picked = indexed[:_RUNNING_EDGE_LINES] + indexed[-_RUNNING_EDGE_LINES:]
-        outer = {indexed[0], indexed[-1]}
-        return {index: _line_keys(lines[index], index in outer) for index in picked}
 
     def outermost(lines: list[str]) -> set[int]:
         indexed = [index for index, line in enumerate(lines) if line.strip()]
         return {indexed[0], indexed[-1]} if indexed else set()
 
+    def edges(number: int, lines: list[str]) -> dict[int, set[str]]:
+        indexed = [index for index, line in enumerate(lines) if line.strip()]
+        if not indexed:
+            return {}
+        picked = indexed[:_RUNNING_EDGE_LINES] + indexed[-_RUNNING_EDGE_LINES:]
+        outer = {indexed[0], indexed[-1]}
+        result: dict[int, set[str]] = {}
+        for index in picked:
+            keys = _line_keys(lines[index], index in outer)
+            if index in outer:
+                tracking = _page_tracking_key(lines[index], number)
+                if tracking is not None:
+                    keys.add(tracking)
+            result[index] = keys
+        return result
+
     counts: dict[str, int] = {}
-    for lines in with_text:
-        for key in set().union(*edges(lines).values()):
+    for number, lines in numbered:
+        for key in set().union(*edges(number, lines).values()):
             counts[key] = counts.get(key, 0) + 1
-    needed = max(_RUNNING_MIN_PAGES, int(len(with_text) * _RUNNING_MIN_SHARE + 0.999))
-    running = {key for key, count in counts.items() if count >= needed}
+    needed = max(_RUNNING_MIN_PAGES, int(len(numbered) * _RUNNING_MIN_SHARE + 0.999))
+    by_parity = [sum(1 for number, _ in numbered if number % 2 == parity) for parity in (0, 1)]
+
+    def is_running(key: str) -> bool:
+        if key.startswith("#page:"):
+            parity = int(key.split(":", 2)[1])
+            return counts[key] >= max(2, math.ceil(by_parity[parity] * _RUNNING_MIN_SHARE))
+        return counts[key] >= needed
+
+    running = {key for key in counts if is_running(key)}
     if not running:
         return list(page_texts), set()
+    # Page-number offsets a running head proved ("26 Chapter 1" on page 1: 25). The
+    # other parity's head can change with every subsection ("1.2 About Your App 27",
+    # "1.2.2 Online versus Offline 29") and so never repeats; its number is still the
+    # page number, and goes — the title stays, as the page's section label.
+    offsets = {int(key.split(":", 3)[2]) for key in running if key.startswith("#page:")}
     cleaned: list[str] = []
     kept_once: set[str] = set()
-    for lines in pages:
+    for number, lines in enumerate(pages, start=1):
         outer = outermost(lines)
         drop: set[int] = set()
-        for index, keys in edges(lines).items():
+        for index, keys in edges(number, lines).items():
             matched = keys & running
             if not matched:
                 continue
@@ -247,9 +486,51 @@ def strip_running_lines_keeping_first(
                 kept_once.add(exact)
                 continue
             drop.add(index)
+        if offsets:
+            for index in outer - drop:
+                lines[index] = _without_page_number(lines[index], number, offsets)
         kept = [line for index, line in enumerate(lines) if index not in drop]
         cleaned.append(normalize_text("\n".join(kept)))
     return cleaned, kept_once
+
+
+# A number at either end of a line, set off by a space: "26 Chapter 1", "Your App 27".
+_LEADING_NUMBER_RE = re.compile(r"^(\d{1,4})\s+(?=\S)")
+_TRAILING_NUMBER_RE = re.compile(r"(?<=\S)\s+(\d{1,4})$")
+
+
+def _without_page_number(line: str, page_number: int, offsets: set[int]) -> str:
+    """``line`` minus a leading or trailing number that is ``page_number`` plus one of
+    ``offsets`` — when what is left is a head of two or more words."""
+
+    text = line.strip()
+    for pattern in (_LEADING_NUMBER_RE, _TRAILING_NUMBER_RE):
+        match = pattern.search(text)
+        if match is None or int(match.group(1)) - page_number not in offsets:
+            continue
+        rest = (text[: match.start()] + text[match.end() :]).strip()
+        if len([word for word in rest.split() if re.search(r"[^\W\d_]", word)]) >= 2:
+            return rest
+    return line
+
+
+def _page_tracking_key(line: str, page_number: int) -> str | None:
+    """A key matching the same line on pages of the same parity when its number at
+    either end is the page number plus a fixed offset (a book's running head)."""
+
+    exact = " ".join(line.split()).casefold()
+    for pattern in (_LEADING_NUMBER_RE, _TRAILING_NUMBER_RE):
+        match = pattern.search(exact)
+        if match is None:
+            continue
+        rest = exact[: match.start()] + "#" + exact[match.end() :]
+        # A running head says more than a numbered heading: "Article 3" or "Step 5"
+        # starting each page in turn is content, and keeps its number.
+        if len([word for word in rest.split() if re.search(r"[^\W\d_]", word)]) < 2:
+            return None
+        offset = int(match.group(1)) - page_number
+        return f"#page:{page_number % 2}:{offset}:{rest}"
+    return None
 
 
 # Content-stream operators that draw a rectangle or a line, plus XObject paints (a
@@ -293,6 +574,7 @@ def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[i
         import pdfplumber
 
         result: dict[int, list[str]] = {}
+        no_text_pages = 0
         with pdfplumber.open(BytesIO(content)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
                 if pages is not None and page_number not in pages:
@@ -303,6 +585,8 @@ def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[i
                     # the table finder — most pages of a prose PDF.
                     if not (page.rects or page.lines or page.curves):
                         continue
+                    if not getattr(page, "chars", True):
+                        no_text_pages += 1
                     blocks = [_table_to_markdown(table) for table in page.extract_tables() if table]
                     blocks = [block for block in blocks if block]
                     if blocks:
@@ -311,6 +595,14 @@ def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[i
                     # Parsed layout objects are cached per page until closed; on a long
                     # PDF they otherwise accumulate for the whole document.
                     page.close()
+        if no_text_pages and not result:
+            # pdfplumber found no characters where it looked for tables (a font with no
+            # usable text map): any table on those pages is indexed as plain text lines.
+            logger.info(
+                "PDF table extraction read no text on %d page(s); tables there are "
+                "indexed as plain text.",
+                no_text_pages,
+            )
         return result
     except Exception:
         logger.warning("PDF table extraction failed; continuing with text only.", exc_info=True)
@@ -321,7 +613,11 @@ def _table_to_markdown(rows: Sequence[Sequence[object]]) -> str:
     """Render an extracted table (list of rows of cells) as a Markdown table."""
 
     cleaned = [
-        [str(cell).strip().replace("\n", " ") if cell is not None else "" for cell in row]
+        # A "|" inside a cell would split it into two columns.
+        [
+            str(cell).strip().replace("\n", " ").replace("|", "\\|") if cell is not None else ""
+            for cell in row
+        ]
         for row in rows
         if any(cell is not None and str(cell).strip() for cell in row)
     ]

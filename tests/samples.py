@@ -5,26 +5,57 @@ from __future__ import annotations
 import io
 
 
-def pdf_bytes(pages: list[str]) -> bytes:
-    """A minimal valid PDF of Helvetica text, one entry per page ("\n" between lines)."""
+def pdf_bytes(
+    pages: list[str],
+    *,
+    ligature_fault: bool = False,
+    image_pages: frozenset[int] = frozenset(),
+) -> bytes:
+    """A minimal valid PDF of Helvetica text, one entry per page ("\n" between lines).
+
+    ``ligature_fault``: the font's /Differences puts the fi and fl glyphs at codes 33
+    and 34, while its /ToUnicode map says those codes are "!" and '"' (a real book's
+    fault: "speci!c"). ``image_pages`` (1-based) also draw a large page-sized image.
+    """
 
     objects: list[bytes] = []
     kids = " ".join(f"{3 + 2 * index} 0 R" for index in range(len(pages)))
     objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
     objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>".encode())
     font_id = 3 + 2 * len(pages)
+    cmap_id = font_id + 1
+    image_id = font_id + 2
     for index, text in enumerate(pages):
         content_id = 4 + 2 * index
+        image = f"/XObject << /Im1 {image_id} 0 R >> " if index + 1 in image_pages else ""
         objects.append(
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-            f"/Resources << /Font << /F1 {font_id} 0 R >> >> "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> {image}>> "
             f"/Contents {content_id} 0 R >>".encode()
         )
         # One line of text per "\n", each 14 points below the last.
         shown = " 0 -14 Td ".join(f"({line}) Tj" for line in text.split("\n"))
-        stream = f"BT /F1 12 Tf 72 720 Td {shown} ET".encode()
+        paint = "q 612 0 0 792 0 0 cm /Im1 Do Q " if index + 1 in image_pages else ""
+        stream = f"{paint}BT /F1 12 Tf 72 720 Td {shown} ET".encode()
         objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
-    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    if ligature_fault:
+        objects.append(
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type "
+            b"/Encoding /Differences [33 /fi 34 /fl] >> /ToUnicode %d 0 R >>" % cmap_id
+        )
+    else:
+        objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /X def "
+        b"1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfrange <20> <7E> <0020> "
+        b"endbfrange endcmap CMapName currentdict /CMap defineresource pop end end"
+    )
+    objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+    pixels = b"\x80" * 16
+    objects.append(
+        b"<< /Type /XObject /Subtype /Image /Width 1000 /Height 1000 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Length %d >>\nstream\n" % len(pixels) + pixels + b"\nendstream"
+    )
 
     out = io.BytesIO()
     out.write(b"%PDF-1.4\n")

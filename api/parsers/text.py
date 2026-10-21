@@ -140,7 +140,24 @@ def decode_text_document(filename: str, content: bytes, declared: str | None = N
     text = normalize_text(text)
     if not text:
         raise EmptyDocumentError(f"Document '{filename}' has no extractable text.")
+    if _looks_binary(text):
+        # latin-1 decodes any bytes, so an image or archive renamed to .txt was indexed
+        # as pages of control characters.
+        raise DocumentParseError(
+            f"'{filename}' looks like a binary file, not text; upload it in its own format."
+        )
     return text
+
+
+# Control characters other than tab, line and page breaks: text has next to none.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")
+_BINARY_SAMPLE_CHARS = 4096
+_BINARY_MAX_SHARE = 0.1
+
+
+def _looks_binary(text: str) -> bool:
+    sample = text[:_BINARY_SAMPLE_CHARS]
+    return len(_CONTROL_CHARS_RE.findall(sample)) > _BINARY_MAX_SHARE * len(sample)
 
 
 def parse_markdown_document(filename: str, text: str) -> list[DocumentSection]:
