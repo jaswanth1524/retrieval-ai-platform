@@ -489,6 +489,28 @@ class AppSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _warn_on_an_untuned_rerank_floor(self) -> "AppSettings":
+        # RERANK_MIN_SCORE is a sigmoid of the cross-encoder's logit, and each model's
+        # logits sit on their own scale: 0.15 was measured for the default reranker.
+        # Another one at the same floor dropped passages that answer the question
+        # ("not enough information"), so say so at startup. Compared by value, not by
+        # whether it was set: compose loads .env.example, which sets it.
+        fields = type(self).model_fields
+        if (
+            self.reranker_model != fields["reranker_model"].default
+            and self.rerank_min_score == fields["rerank_min_score"].default
+        ):
+            logging.getLogger(__name__).warning(
+                "RERANKER_MODEL=%s with RERANK_MIN_SCORE=%s: that floor was measured for "
+                "%s. Measure it for this model (eval/harness.py) or answers may say "
+                "the documents don't cover what they do.",
+                self.reranker_model,
+                self.rerank_min_score,
+                fields["reranker_model"].default,
+            )
+        return self
+
+    @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":
         # With only a read key, the "admin" routes would have no key at all: anyone
         # could change the corpus that readers need a key to look at.

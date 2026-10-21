@@ -316,3 +316,19 @@ def test_briefs_never_cover_more_documents_than_the_part_cap(
         ).summary_max_documents
         == 10
     )
+
+
+def test_a_different_reranker_at_the_default_floor_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The floor is on the default reranker's score scale; another model's scores for
+    # passages that answer the question fell below it.
+    with caplog.at_level("WARNING", logger="api.settings"):
+        AppSettings(_env_file=None)  # type: ignore[call-arg]
+        AppSettings(  # type: ignore[call-arg]
+            _env_file=None, reranker_model="Xenova/ms-marco-MiniLM-L-6-v2", rerank_min_score=0.4
+        )
+    assert not caplog.records
+    with caplog.at_level("WARNING", logger="api.settings"):
+        AppSettings(_env_file=None, reranker_model="Xenova/ms-marco-MiniLM-L-6-v2")  # type: ignore[call-arg]
+    assert "RERANK_MIN_SCORE=0.15" in caplog.text

@@ -1,0 +1,8 @@
+{"question": "Can I roll over leave I didn't use?", "relevant_filenames": ["leave_policy.md"], "relevant_passages": ["unused days carry over until the end of March"]}
+{"question": "How much time off do new parents get?", "relevant_filenames": ["leave_policy.md"], "relevant_passages": ["sixteen weeks of paid parental leave"]}
+{"question": "What is the most I can spend on accommodation per night?", "relevant_filenames": ["travel_policy.md"], "relevant_passages": ["Hotel stays are capped at one hundred eighty euros per night"]}
+{"question": "When do I get paid back for approved costs?", "relevant_filenames": ["expense_policy.md"], "relevant_passages": ["reimbursed with the next payroll run"]}
+{"question": "What if I lost the paper slip for a purchase?", "relevant_filenames": ["expense_policy.md"], "relevant_passages": ["Lost receipts need a signed declaration from your manager"]}
+{"question": "How fast must I flag a suspicious email?", "relevant_filenames": ["security_policy.md"], "relevant_passages": ["to the security desk within one hour"]}
+{"question": "Who fixes a cracked display on my work computer?", "relevant_filenames": ["it_equipment_policy.md"], "relevant_passages": ["repaired by the helpdesk within two days"]}
+{"question": "Can I fly premium on a long trip?", "relevant_filenames": ["travel_policy.md"], "relevant_passages": ["business class is allowed on flights longer than nine hours"]}
