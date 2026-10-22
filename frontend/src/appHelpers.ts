@@ -1,6 +1,7 @@
 // App-level constants and pure helpers (split out of App.tsx).
 import type { CitationResponse, PublicConfigResponse, QuestionOverrides } from './api/types';
 import type { ChatMode } from './components/ChatHeader';
+import type { ChatTurn } from './components/ChatMessage';
 import type { DocumentMeta } from './components/CorpusPanel';
 import type { RailPanel } from './components/IconRail';
 import { EMPTY_OVERRIDES } from './utils/overrides';
@@ -106,4 +107,17 @@ export function scopeLabel(
   }
   if (selectedFilenames.length === 1) return `${selectedFilenames[0]}${tagPart}`;
   return `${selectedFilenames.length} documents${tagPart}`;
+}
+
+/** Why a finished "not found" answer has no sources, for the inspector's Sources tab
+ *  (which otherwise said to ask a question, under an answer that had been asked). */
+export function notFoundSourcesMessage(turn: ChatTurn | undefined): string | undefined {
+  if (!turn?.notFound) return undefined;
+  const read = turn.contextSources?.length ?? 0;
+  if (read > 0) {
+    return `The answer cited nothing: it read ${read} passage${read === 1 ? '' : 's'} and none answered the question. They are listed under the answer.`;
+  }
+  return turn.scoped
+    ? 'Nothing in the selected documents matched this question.'
+    : 'Nothing in your documents matched this question.';
 }

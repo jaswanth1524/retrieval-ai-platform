@@ -61,7 +61,7 @@ The question-answering pipeline (`api/pipeline.py`):
 3. Hybrid search: dense + sparse retrieval, fused server-side in Qdrant with RRF `k=60` where supported, else fused in application code.
 4. Cross-encoder rerank the fused top-N candidates — scored as `filename › section` + text, the same string that was embedded — and drop anything below `RERANK_MIN_SCORE`. When nothing clears it, the `RERANK_FALLBACK_COUNT` (3) best-ranked passages are used anyway as *weak matches*: the prompt tells the model to answer from them only if they state the answer, and the answer is flagged `weak_matches` ("weak match" in the UI). Every reranker scores on its own scale, so a fixed floor alone refused questions the documents answer.
 5. Expand each surviving chunk's *generation* context with up to `CONTEXT_NEIGHBOR_RADIUS` neighboring chunks (small-to-big retrieval) — citations still point at the original chunk.
-6. Generate an answer through LiteLLM (Ollama or OpenAI) from a context-only, citation-required prompt — streamed over `/questions/stream` (which also emits `stage` progress frames ahead of each phase, since retrieval can run for tens of seconds before the first token) or returned whole from `/questions`.
+6. Generate an answer through LiteLLM (Ollama or OpenAI) from a context-only, citation-required prompt — streamed over `/questions/stream` (which also emits `stage` progress frames ahead of each phase, since retrieval can run for tens of seconds before the first token: `searching`, `waiting_for_model` when another question has the local model, `reading` with the prompt's size and, once measured, how long the model takes to read it) or returned whole from `/questions`. An answer that cites nothing gets its citations added: on a local model by matching its sentences to the passages (`CITATION_RETRY_MODE=auto`, "auto-cited" in the UI), on a hosted one by one more LLM call.
 7. Return the answer, citations, per-stage latency timings, and a trace ID.
 
 **Latency.** Two stages dominate: cross-encoder reranking (linear in `RERANK_CANDIDATES`) and, on a local model, LLM prefill (linear in prompt tokens). Measured on a 7-document, 158-chunk corpus, Apple M1 (Docker 8 CPUs) with `qwen2.5` via Ollama on Metal (~80 tok/s prefill, ~9 tok/s decode):
@@ -73,6 +73,10 @@ The question-answering pipeline (`api/pipeline.py`):
 | `Xenova/ms-marco-MiniLM-L-6-v2` | 1.7s | 4.3s | 0.8 GB | 43-45% overlap | 2 (incl. the Spanish one) |
 
 Faster rerankers change *which* chunks reach the model, and MiniLM is English-only — pick with `GET /traces/{id}` on your own corpus, not these figures. On the generation side, `CONTEXT_NEIGHBOR_RADIUS=0` cut the median question from 40s to 22s on that M1 by more than halving the prompt, at the cost of narrower context per chunk (it also changes what the diversity filter drops). `GET /traces/{id}` and `docrag_question_stage_seconds{stage=...}` give the per-stage split for your hardware — including `first_token` (request to the first streamed token) and `rerank_wait` (time a question queued behind another one's rerank).
+
+**Local models: timeouts and one question at a time.** Ollama sends nothing while it reads the prompt, and LiteLLM gives httpx a single timeout that limits exactly that silence — so with `LLM_REQUEST_TIMEOUT_SECONDS=60` an 8.5k-token prompt (about 80 s to read on an M1) failed before its first token. Each call to a local provider now gets `LLM_REQUEST_TIMEOUT_SECONDS` plus its estimated prompt tokens divided by `LLM_PREFILL_TOKENS_PER_SECOND` (40; or the slower rate measured on this server), and Ollama's non-streamed calls (condense, citation retry, summaries, `/questions`) are streamed and joined, so the timeout bounds a silence rather than the whole answer. The same prompt now answers (first token at 79 s). Ollama also answers one request at a time and queues the rest, with their timeouts running: a second question asked during a long one timed out unread. `OLLAMA_MAX_PARALLEL` (1) keeps the queue in DocRAG instead — the UI says "waiting for the model" — and a question's timeout starts when it is sent; the same two questions both answered (the second at 78 s). Raise it with Ollama's own `OLLAMA_NUM_PARALLEL`. Closing the connection does not stop Ollama reading a prompt (measured: an abandoned 30k-character prompt still held the model a minute later), so a stopped question keeps its place until Ollama lets go of it.
+
+Three opt-in settings make the prompt smaller, all off by default: `PROMPT_TOKEN_BUDGET` (neighbour text goes first, then the lowest-ranked passages, then the oldest history), `RERANK_RELATIVE_FLOOR` (drops passages far below the best one, on any reranker's scale; never causes a refusal) and `GENERATION_HISTORY_ASSISTANT_CHARS` (earlier answers clipped for the answering model). Measure them on your corpus with `make eval-answer` before turning them on.
 
 Measured again for the latency pass, on a different corpus: the 15 handbook documents plus this repository's README, CLAUDE.md and CHANGELOG as distractors (`CHUNK_SIZE_TOKENS=96`, about 450 chunks, 50 candidates reranked), jina int8, `qwen2.5` via Ollama on the same M1, answer and rerank caches off, ten questions each asked once after the corpus was indexed. Single runs on a laptop vary by tens of percent, so read the medians as a direction, not a benchmark:
 
@@ -261,7 +265,8 @@ Inside the repository, `uv run python -m cli` is the same command without instal
 docrag status
 docrag ingest ./handbook ./notes.pdf     # folders recursively; waits for indexing
 docrag add-url https://example.com/policy.html
-docrag ask "How many days of leave do I get?" --file handbook.pdf
+docrag ask "How many days of leave do I get?" --file handbook.pdf [--strict]
+docrag chat                              # questions from stdin, with the conversation
 docrag search "leave policy"
 docrag summarize handbook.pdf [other.pdf ...] --focus "deadlines"   # 2 = compare, 3+ = brief
 docrag read handbook.pdf [--around CHUNK_ID]   # a document's passages, or around a citation
@@ -278,7 +283,11 @@ docrag export backup.zip                 # and: import backup.zip
 ```
 
 `--json` gives machine-readable output; the exit code is 1 when a request (or any upload)
-failed. Uploads that meet a full indexing queue wait and retry, as the UI does. `ingest`,
+failed, and with `ask --strict` 3 when the documents don't answer the question. `ask`
+and `chat` say how an answer was grounded (not found, uncited, auto-cited, weak match)
+and, while a local model works, print the stage and the time waited every 15 s. `chat`
+asks each question with the conversation so far, leaving out answers that found nothing
+(`/new` starts over). Uploads that meet a full indexing queue wait and retry, as the UI does. `ingest`,
 `add-url` and `import` wait for indexing for up to `--timeout` seconds (default 3600, 0 =
 no limit); anything still indexing then is reported and goes on on the server.
 
@@ -286,7 +295,8 @@ The MCP server offers `list_documents`, `search_passages`, `ask`, `summarize`,
 `read_document` and `list_workspaces` to an MCP client, all read-only (the read-only key is
 enough). Answers keep their citations and list the exact sentences each one rests on, so
 the client can quote them with filename, page and section; `ask` and `search_passages`
-take `tags`, and `read_document` reads around a cited chunk (`around_chunk_id`).
+take `tags`, `ask` takes the conversation so far as `history` for a follow-up, and
+`read_document` reads around a cited chunk (`around_chunk_id`).
 `DOCRAG_WORKSPACE` in its environment points it at a workspace. For Claude Desktop,
 add to its MCP configuration (with `docrag-mcp` installed as above):
 
@@ -362,6 +372,8 @@ the folder read-only and point `WATCH_DIR` at it (see the commented line in
 
 ## Troubleshooting
 
+- **"The generation provider sent nothing for N s" / "did not finish within LLM_REQUEST_TIMEOUT_SECONDS".** A local model reading a long prompt on modest hardware. Raise `LLM_REQUEST_TIMEOUT_SECONDS` or lower `LLM_PREFILL_TOKENS_PER_SECOND` (the error names both); `PROMPT_TOKEN_BUDGET` makes the prompt smaller instead.
+- **Follow-ups or reworded questions get "not enough information" (a "weak match").** Retrieval found no close passage. A faster, non-default `RERANKER_MODEL` is the usual cause: on the handbook eval sets `Xenova/ms-marco-MiniLM-L-6-v2` left 3-4 of 10 follow-ups unanswered where the default jina reranker (with `RERANK_CANDIDATES=50`) answered all 10, with no unanswerable question answered by either. `GET /traces/{id}` shows the scores.
 - **"Cannot reach Ollama" / answers fail, uploads work.** Generation needs Ollama running on the host (`ollama serve`) with the model pulled (`ollama pull llama3.1:8b`); `OLLAMA_BASE_URL` points the container at `host.docker.internal`. `/health/ready` says which dependency is down. Upload, indexing and passage search never need the LLM.
 - **409 "Questions and uploads are refused until the index matches the configuration".** The collection was indexed with a different embedding model or tag, and questions are refused rather than compared across vector spaces. Restore the previous embedding settings, or rebuild: download a backup (⌘K → Download a backup), delete every document, then restore the backup; it re-indexes from the stored originals.
 - **The API restarts, exit code 137.** Out of memory: give Docker at least 4 GB, and keep `RERANKER_BATCH_SIZE` at or below `RERANK_CANDIDATES` (see the note under Run it).
@@ -468,15 +480,28 @@ so it only catches breakage. `LITELLM_MODE=PRODUCTION` stops LiteLLM loading the
 `.env` on import (and `LITELLM_LOCAL_MODEL_COST_MAP=True`, set in the Docker image and the tests, stops it fetching its model price list from GitHub); run from a directory without a `.env` (or unset what it sets) so the
 run uses exactly the settings you exported.
 
-`answer` mode runs the full pipeline and writes rows the RAGAS runner consumes:
+`answer` mode answers each question the way the API does (`RagPipeline.answer`: a
+follow-up's `history` is condensed, retrieval, prompt fitting, generation, citations and
+status) and writes rows the RAGAS runner consumes. Each row is saved as it finishes —
+at a minute per answer on a local model a run is long — so `--resume` picks an
+interrupted run up, and `--limit N` answers only the first N:
 
 ```bash
 uv run python -m eval.harness answer eval/datasets/retrieval_eval.sample.jsonl --output answers.json
 uv run python -m eval.ragas_runner answers.json
+make eval-answer EVAL_DATASET=eval/datasets/followup_eval.jsonl EVAL_ARGS=--resume
+make eval-retrieval      # handbook corpus vs its baseline, as CI runs it
+make eval-ragas LLM=ollama_chat/qwen2.5
 ```
 
+The Makefile targets index the handbook corpus into its own `eval_handbook` collection
+with the settings its baseline was measured with (`EVAL_QDRANT_URL`, default
+`http://127.0.0.1:6333`). A row's `answer_contains` (any of a few ways of stating the fact:
+`["sixty euros", "60 euros"]`) scores `fact_hit_rate` without a judge model.
+
 `answer` mode also prints how the answers went: `cited_relevant_rate` (an answer cited a
-labeled document), `answered_rate`, `uncited_rate` and, for rows marked
+labeled document), `answered_rate`, `uncited_rate`, `fact_hit_rate`, `error_rate` (a
+question the pipeline failed on is kept as an error row, not the end of the run) and, for rows marked
 `expect_no_context`, `refused_unanswerable_rate` (the answer said the documents don't
 cover it). A row can carry a `history` (the earlier turns, as the UI sends them); it is
 scored on the follow-up as the API rewrites it. `eval/datasets/followup_eval.jsonl` and

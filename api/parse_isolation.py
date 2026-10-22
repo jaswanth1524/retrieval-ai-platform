@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from multiprocessing.connection import Connection
 from typing import Any
 
@@ -35,17 +37,79 @@ def _forkserver_context() -> Any:
     with _context_lock:
         if _context is None:
             context = multiprocessing.get_context("forkserver")
-            # Imported once, in the server every child forks from.
-            context.set_forkserver_preload(["api.documents"])
+            # Imported once, in the server every child forks from: the parsers import
+            # their libraries lazily, which cost each child ~100-200 ms per library.
+            # (An unavailable one is skipped. Never the OCR engine: forking after ONNX
+            # Runtime starts its threads isn't safe.)
+            context.set_forkserver_preload(
+                ["api.documents", "pdfplumber", "docx", "openpyxl", "pptx", "bs4"]
+            )
             _context = context
         return _context
+
+
+# A pathological PDF had pypdf log ten multi-kilobyte font dictionaries per parse.
+_PARSER_LOGGERS = ("pypdf", "pdfminer")
+_SAMPLE_CHARS = 200
+
+
+class _CountingHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.count = 0
+        self.first = ""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.count += 1
+        if not self.first:
+            self.first = record.getMessage()[:_SAMPLE_CHARS]
+
+
+@contextmanager
+def summarized_parser_warnings(filename: str) -> Iterator[None]:
+    """Hold back the parser libraries' warnings while ``filename`` is parsed and log one
+    line about them afterwards: how many, and the first (cut short)."""
+
+    handler = _CountingHandler()
+    saved = []
+    for name in _PARSER_LOGGERS:
+        library = logging.getLogger(name)
+        saved.append((library, library.propagate))
+        library.addHandler(handler)
+        library.propagate = False
+    try:
+        yield
+    finally:
+        for library, propagate in saved:
+            library.removeHandler(handler)
+            library.propagate = propagate
+        if handler.count:
+            logger.warning(
+                "Parsing %s: the parser reported %d problem(s) with the file; the first: %s",
+                filename,
+                handler.count,
+                handler.first,
+            )
+
+
+def _parse(filename: str, content: bytes, settings: AppSettings) -> list[DocumentSection]:
+    with summarized_parser_warnings(filename):
+        return parse_document_bytes(filename, content, settings)
 
 
 def _parse_in_child(
     connection: Connection, filename: str, content: bytes, settings: AppSettings
 ) -> None:
     try:
-        result: tuple[str, object] = ("ok", parse_document_bytes(filename, content, settings))
+        # The child starts with no logging set up: its warnings bypassed LOG_FORMAT=json
+        # and LOG_LEVEL.
+        from api.logging_config import configure_logging
+
+        configure_logging(settings.log_level, settings.log_format)
+    except Exception:  # noqa: BLE001 - logging is no reason to fail a parse
+        pass
+    try:
+        result: tuple[str, object] = ("ok", _parse(filename, content, settings))
     except DocumentError as exc:
         result = ("document_error", exc)
     except BaseException as exc:  # noqa: BLE001 - reported to the parent, never raised here
@@ -64,7 +128,7 @@ def parse_with_limit(filename: str, content: bytes, settings: AppSettings) -> li
 
     timeout = float(settings.parse_timeout_seconds)
     if timeout <= 0:
-        return parse_document_bytes(filename, content, settings)
+        return _parse(filename, content, settings)
 
     context = _forkserver_context()
     receiver, sender = context.Pipe(duplex=False)

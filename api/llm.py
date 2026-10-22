@@ -5,7 +5,8 @@ from __future__ import annotations
 import functools
 import logging
 import threading
-from collections.abc import Iterable, Iterator, Sequence
+import time
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any, Literal, Protocol, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -137,7 +138,9 @@ def redact_url(url: str) -> str:
     return urlunsplit(parts._replace(netloc=netloc))
 
 
-def _connection_error(exc: Exception, settings: AppSettings) -> GenerationError:
+def _connection_error(
+    exc: Exception, settings: AppSettings, timeout: float | None = None
+) -> GenerationError:
     """Translate LiteLLM's connection/timeout errors, telling "too slow" apart from "unreachable".
 
     A slow local answer used to come back as "Cannot reach Ollama… start `ollama
@@ -145,9 +148,19 @@ def _connection_error(exc: Exception, settings: AppSettings) -> GenerationError:
     """
 
     if _is_request_timeout(exc):
+        base = float(settings.llm_request_timeout_seconds)
+        if timeout is not None and timeout > base:
+            # The base plus the time allowed to read this prompt
+            # (LLM_PREFILL_TOKENS_PER_SECOND): name both knobs.
+            return GenerationError(
+                f"The generation provider sent nothing for {timeout:.0f}s "
+                f"(LLM_REQUEST_TIMEOUT_SECONDS={base:g}s plus time to read the prompt). "
+                "Local models on modest hardware can need longer — raise "
+                "LLM_REQUEST_TIMEOUT_SECONDS or lower LLM_PREFILL_TOKENS_PER_SECOND."
+            )
         return GenerationError(
             "The generation provider did not finish within "
-            f"LLM_REQUEST_TIMEOUT_SECONDS={settings.llm_request_timeout_seconds:g}s. "
+            f"LLM_REQUEST_TIMEOUT_SECONDS={base:g}s. "
             "Local models on modest hardware can need longer — raise that setting."
         )
     if settings.llm_provider.lower().strip() == "ollama":
@@ -252,6 +265,202 @@ def _count_usage(response: object, settings: AppSettings) -> None:
                 totals[index] += value
 
 
+# Providers that read the prompt on the same machine and send nothing while they do.
+_LOCAL_PROVIDERS = ("ollama", "openai_compatible")
+# A prompt shorter than this is mostly request overhead: its speed says little about
+# how fast the server reads.
+_RATE_MIN_PROMPT_TOKENS = 500
+_RATE_SMOOTHING = 0.3
+_measured_rates: dict[tuple[str, str], float] = {}
+_rates_lock = threading.Lock()
+
+
+def _provider(settings: AppSettings) -> str:
+    return settings.llm_provider.lower().strip()
+
+
+def _rate_key(settings: AppSettings) -> tuple[str, str]:
+    provider = _provider(settings)
+    model = (
+        settings.openai_compatible_model if provider == "openai_compatible" else settings.llm_model
+    )
+    return provider, model
+
+
+def _estimated_prompt_tokens(messages: Sequence[ChatMessage]) -> int:
+    # api.prompting imports this module; it owns the (deliberately high) estimate.
+    from api.prompting import estimate_prompt_tokens
+
+    return estimate_prompt_tokens(messages)
+
+
+def measured_prefill_rate(settings: AppSettings) -> float | None:
+    """Estimated prompt tokens per second this process has seen the local model read
+    (time to the first streamed chunk), smoothed; None before a long enough prompt."""
+
+    with _rates_lock:
+        return _measured_rates.get(_rate_key(settings))
+
+
+def _record_prefill(settings: AppSettings, prompt_tokens: int, seconds: float) -> None:
+    if (
+        _provider(settings) not in _LOCAL_PROVIDERS
+        or prompt_tokens < _RATE_MIN_PROMPT_TOKENS
+        or seconds <= 0
+    ):
+        return
+    rate = prompt_tokens / seconds
+    key = _rate_key(settings)
+    with _rates_lock:
+        previous = _measured_rates.get(key)
+        _measured_rates[key] = (
+            rate if previous is None else previous + _RATE_SMOOTHING * (rate - previous)
+        )
+
+
+def request_timeout_seconds(messages: Sequence[ChatMessage], settings: AppSettings) -> float:
+    """``LLM_REQUEST_TIMEOUT_SECONDS``, plus time to read the prompt on a local server.
+
+    LiteLLM gives httpx a single number for Ollama (an ``httpx.Timeout`` is turned back
+    into its read part), applied as the longest silence allowed — and a local server is
+    silent for the whole prompt read, ~70 tokens/s on an M1. The prompt's estimated
+    tokens over ``LLM_PREFILL_TOKENS_PER_SECOND`` (or the slower rate measured here)
+    are added, so a long prompt gets the time it needs while a server that stops
+    mid-answer still fails after the base timeout.
+    """
+
+    base = float(settings.llm_request_timeout_seconds)
+    configured = float(settings.llm_prefill_tokens_per_second)
+    if configured <= 0 or _provider(settings) not in _LOCAL_PROVIDERS:
+        return base
+    measured = measured_prefill_rate(settings)
+    rate = min(configured, measured) if measured else configured
+    return base + _estimated_prompt_tokens(messages) / rate
+
+
+def expected_prefill_ms(messages: Sequence[ChatMessage], settings: AppSettings) -> float | None:
+    """How long the local model should take to read ``messages`` at its measured rate;
+    None when no rate has been measured (or the provider isn't local)."""
+
+    if _provider(settings) not in _LOCAL_PROVIDERS:
+        return None
+    measured = measured_prefill_rate(settings)
+    if not measured:
+        return None
+    return _estimated_prompt_tokens(messages) / measured * 1000
+
+
+# A call waiting for Ollama longer than this gives up: something is stuck.
+_SLOT_WAIT_SECONDS = 900.0
+_slots: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+_slots_lock = threading.Lock()
+# The slot keys the current thread holds: a call made while its question already holds
+# the slot (condense, answer, citation retry, follow-ups) doesn't wait for itself.
+_held = threading.local()
+
+
+def _held_keys() -> set[tuple[str, int]]:
+    keys = getattr(_held, "keys", None)
+    if keys is None:
+        keys = set()
+        _held.keys = keys
+    return cast(set[tuple[str, int]], keys)
+
+
+class GenerationSlot:
+    """One of ``OLLAMA_MAX_PARALLEL`` places for calls to one Ollama server.
+
+    Ollama answers one request at a time by default and queues the rest — with each
+    queued request's timeout running, so a second question timed out without ever
+    being read. Calls wait here instead, and their timeout starts once they are sent.
+    A no-op for other providers, with ``OLLAMA_MAX_PARALLEL=0``, and on a thread that
+    already holds the slot (re-entrant per thread). ``release`` works from any thread:
+    a stream may be closed by another thread than the one that opened it.
+    """
+
+    def __init__(self, settings: AppSettings) -> None:
+        self._key: tuple[str, int] | None = None
+        self._semaphore: threading.BoundedSemaphore | None = None
+        self._owner: set[tuple[str, int]] | None = None
+        self.acquired = False
+        if _provider(settings) == "ollama" and settings.ollama_max_parallel > 0:
+            self._key = (settings.ollama_base_url.rstrip("/"), int(settings.ollama_max_parallel))
+            with _slots_lock:
+                self._semaphore = _slots.setdefault(
+                    self._key, threading.BoundedSemaphore(self._key[1])
+                )
+
+    @property
+    def needed(self) -> bool:
+        """Whether this thread has to take a place (False: no limit, or already held)."""
+
+        return self._semaphore is not None and self._key not in _held_keys()
+
+    def try_acquire(self) -> bool:
+        """Take a place if one is free now; True also when none is needed."""
+
+        if not self.needed:
+            return True
+        assert self._semaphore is not None
+        if self._semaphore.acquire(blocking=False):
+            self._mark_held()
+            return True
+        return False
+
+    def acquire(self, should_stop: Callable[[], bool] | None = None) -> bool:
+        """Wait for a place; False when ``should_stop`` reported the caller gone first."""
+
+        if not self.needed:
+            return True
+        assert self._semaphore is not None
+        deadline = time.monotonic() + _SLOT_WAIT_SECONDS
+        while not self._semaphore.acquire(timeout=1.0):
+            if should_stop is not None and should_stop():
+                return False
+            if time.monotonic() >= deadline:
+                raise GenerationError(
+                    "The local model stayed busy with other requests for "
+                    f"{_SLOT_WAIT_SECONDS / 60:g} minutes; try again shortly."
+                )
+        self._mark_held()
+        return True
+
+    def _mark_held(self) -> None:
+        keys = _held_keys()
+        assert self._key is not None
+        keys.add(self._key)
+        self._owner = keys
+        self.acquired = True
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        self.acquired = False
+        assert self._semaphore is not None and self._owner is not None and self._key
+        self._owner.discard(self._key)
+        self._semaphore.release()
+
+    def __enter__(self) -> GenerationSlot:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+def _stream_kwargs(settings: AppSettings) -> dict[str, object]:
+    """Ask for token usage on a stream's last chunk where the provider supports it.
+
+    Without it LiteLLM's Ollama stream reported no usage at all (measured), so the
+    prompt size a local model read was never known. Not sent to OpenAI-compatible
+    servers: some reject the field.
+    """
+
+    if _provider(settings) in ("ollama", "openai"):
+        return {"stream_options": {"include_usage": True}}
+    return {}
+
+
 class LiteLLMGenerator:
     """Generate answers with LiteLLM while keeping provider selection configurable."""
 
@@ -273,34 +482,77 @@ class LiteLLMGenerator:
 
         model, provider_kwargs = completion_model_and_kwargs(settings)
         reset_finish_reason()
-        try:
-            response = self.completion_client(
-                model=model,
-                messages=list(messages),
-                temperature=float(settings.llm_temperature),
-                max_tokens=effective_max_tokens(settings, model),
-                timeout=float(settings.llm_request_timeout_seconds),
-                num_retries=int(settings.llm_num_retries),
-                # Some models (e.g. the gpt-5 family) reject params other models
-                # accept fine (temperature != 1). Let LiteLLM drop an unsupported
-                # param for the selected model rather than raising, so provider
-                # quirks don't turn into a hard failure.
-                drop_params=True,
-                **provider_kwargs,
-            )
-        except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
-            raise _connection_error(exc, settings) from exc
-        except Exception as exc:
-            # LiteLLM/provider SDKs raise many distinct exception types (auth,
-            # connection, rate limit, ...); this boundary's job is translating all
-            # of them into our domain error so api/error_handlers.py maps them to a clean 502
-            # instead of an opaque 500.
-            if _never_connected(exc):
-                raise _connection_error(exc, settings) from exc
-            raise _provider_failure(exc) from exc
+        # Ollama sends nothing until a non-streamed answer is complete, so its timeout
+        # (the longest silence allowed) had to cover reading the prompt *and* writing
+        # the whole answer. Streamed and joined, it covers the read, then each gap.
+        streamed = _provider(settings) == "ollama"
+        timeout = request_timeout_seconds(messages, settings)
+        with GenerationSlot(settings):
+            try:
+                response = self.completion_client(
+                    model=model,
+                    messages=list(messages),
+                    temperature=float(settings.llm_temperature),
+                    max_tokens=effective_max_tokens(settings, model),
+                    timeout=timeout,
+                    num_retries=int(settings.llm_num_retries),
+                    # Some models (e.g. the gpt-5 family) reject params other models
+                    # accept fine (temperature != 1). Let LiteLLM drop an unsupported
+                    # param for the selected model rather than raising, so provider
+                    # quirks don't turn into a hard failure.
+                    drop_params=True,
+                    **({"stream": True, **_stream_kwargs(settings)} if streamed else {}),
+                    **provider_kwargs,
+                )
+                if streamed and not _is_whole_response(response):
+                    return "".join(self._read_stream(response, settings))
+            except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
+                raise _connection_error(exc, settings, timeout) from exc
+            except GenerationError:
+                raise
+            except Exception as exc:
+                # LiteLLM/provider SDKs raise many distinct exception types (auth,
+                # connection, rate limit, ...); this boundary's job is translating all
+                # of them into our domain error so api/error_handlers.py maps them to a
+                # clean 502 instead of an opaque 500.
+                if _never_connected(exc):
+                    raise _connection_error(exc, settings, timeout) from exc
+                raise _provider_failure(exc) from exc
         _record_finish_reason(response)
         _count_usage(response, settings)
         return extract_completion_text(response)
+
+    def _read_stream(
+        self,
+        response: object,
+        settings: AppSettings,
+        on_first_chunk: Callable[[], None] | None = None,
+    ) -> Iterator[str]:
+        """The text deltas of a streamed response; records its finish reason and the
+        usage its last report carries, and releases the response however it ends."""
+
+        # completion_client's return type is `object` (it must also cover the
+        # non-streaming response) — with stream=True it is actually an iterable of
+        # chunks; cast narrows that for the loop below.
+        last_with_usage: object | None = None
+        first = True
+        try:
+            for chunk in cast(Iterable[object], response):
+                if first:
+                    first = False
+                    if on_first_chunk is not None:
+                        on_first_chunk()
+                _record_finish_reason(chunk)
+                if read_value(chunk, "usage") is not None:
+                    last_with_usage = chunk
+                delta = extract_delta_text(chunk)
+                if delta:
+                    yield delta
+        finally:
+            _close_stream(response)
+        if last_with_usage is not None:
+            # The last report only: some providers repeat running totals per chunk.
+            _count_usage(last_with_usage, settings)
 
     def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterator[str]:
         """Call the LiteLLM provider with ``stream=True`` and yield assistant text deltas.
@@ -314,41 +566,50 @@ class LiteLLMGenerator:
 
         model, provider_kwargs = completion_model_and_kwargs(settings)
         reset_finish_reason()
+        timeout = request_timeout_seconds(messages, settings)
+        slot = GenerationSlot(settings)
+        slot.acquire()
         try:
+            started = time.monotonic()
+
+            def read_rate() -> None:
+                _record_prefill(
+                    settings, _estimated_prompt_tokens(messages), time.monotonic() - started
+                )
+
             response = self.completion_client(
                 model=model,
                 messages=list(messages),
                 temperature=float(settings.llm_temperature),
                 max_tokens=effective_max_tokens(settings, model),
-                timeout=float(settings.llm_request_timeout_seconds),
+                timeout=timeout,
                 num_retries=int(settings.llm_num_retries),
                 drop_params=True,
                 stream=True,
+                **_stream_kwargs(settings),
                 **provider_kwargs,
             )
-            # completion_client's return type is `object` (it must also cover the
-            # non-streaming response `complete` uses) — with stream=True it is
-            # actually an iterable of chunks; cast narrows that for the loop below.
-            last_with_usage: object | None = None
-            try:
-                for chunk in cast(Iterable[object], response):
-                    _record_finish_reason(chunk)
-                    if read_value(chunk, "usage") is not None:
-                        last_with_usage = chunk
-                    delta = extract_delta_text(chunk)
-                    if delta:
-                        yield delta
-            finally:
-                _close_stream(response)
-            if last_with_usage is not None:
-                # The last report only: some providers repeat running totals per chunk.
-                _count_usage(last_with_usage, settings)
+            yield from self._read_stream(response, settings, on_first_chunk=read_rate)
         except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
-            raise _connection_error(exc, settings) from exc
+            raise _connection_error(exc, settings, timeout) from exc
         except Exception as exc:
             if _never_connected(exc):
-                raise _connection_error(exc, settings) from exc
+                raise _connection_error(exc, settings, timeout) from exc
             raise _provider_failure(exc) from exc
+        finally:
+            slot.release()
+
+
+def _is_whole_response(response: object) -> bool:
+    """A complete (non-streamed) response: a client that ignored ``stream=True``."""
+
+    choices = read_value(response, "choices")
+    return (
+        isinstance(choices, Sequence)
+        and not isinstance(choices, (str, bytes))
+        and bool(choices)
+        and read_value(choices[0], "message") is not None
+    )
 
 
 def _close_stream(response: object) -> None:

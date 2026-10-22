@@ -133,6 +133,7 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         history_message_count=trace.history_message_count,
         query_variants=trace.query_variants,
         citation_retry_used=trace.citation_retry_used,
+        citation_backfilled=trace.citation_backfilled,
         request_id=trace.request_id,
         usage=usage_response(trace.usage),
     )

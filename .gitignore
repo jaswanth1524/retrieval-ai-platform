@@ -35,6 +35,12 @@ storage/
 uploads/
 qdrant_storage/
 
+# Eval output (make eval-answer / eval-ragas)
+eval-answers.json
+eval-answers.json.partial.jsonl
+eval-ragas.json
+eval-results.json
+
 # Verification scratch space
 .verify-scratch/
 

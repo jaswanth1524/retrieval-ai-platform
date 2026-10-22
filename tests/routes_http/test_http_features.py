@@ -28,7 +28,9 @@ from api.repository import VectorRepository
 from tests.routes_http.support import (
     ApiTestContext,
     FakeEmbeddingProvider,
+    hermetic_app,
     keyed_client,
+    make_settings,
     upload_and_wait,
     wait_for_job,
 )
@@ -685,3 +687,54 @@ def test_search_narrows_by_page_section_and_left_out_documents(
     assert found(page_min=2) == []
     reversed_range = client.post("/search", json={"query": "alpha", "page_min": 3, "page_max": 2})
     assert reversed_range.status_code == 422
+
+
+@pytest.mark.timeout(60)
+def test_the_real_ollama_generator_answers_through_both_routes_without_waiting_on_itself() -> None:
+    """The stream route takes the Ollama slot and then calls LiteLLMGenerator, which
+    takes it again on the same thread (re-entrant); the sync route takes it once. Each
+    had to finish in time, not wait on itself for the slot."""
+
+    from fastapi.testclient import TestClient
+    from qdrant_client import QdrantClient
+
+    from api.dependencies import clear_dependency_caches, get_generator
+    from api.llm import GenerationSlot, LiteLLMGenerator
+
+    settings = make_settings(llm_provider="ollama", citation_retry_enabled=False)
+    calls: list[bool] = []
+
+    def completion_client(**kwargs: Any) -> Any:
+        calls.append(bool(kwargs.get("stream")))
+        chunks = [
+            {"choices": [{"delta": {"content": "Alpha is documented "}}]},
+            {"choices": [{"delta": {"content": "[1]."}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 5}},
+        ]
+        return iter(chunks)
+
+    clear_dependency_caches()
+    app = hermetic_app(settings, QdrantClient(":memory:"))
+    app.dependency_overrides[get_generator] = lambda: LiteLLMGenerator(settings, completion_client)
+    with TestClient(app) as client:
+        assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+        with client.stream("POST", "/questions/stream", json={"question": "alpha"}) as response:
+            frames = [
+                json.loads(line[6:]) for line in response.iter_lines() if line.startswith("data: ")
+            ]
+        stages = [frame["stage"] for frame in frames if frame["type"] == "stage"]
+        assert "reading" in stages and "waiting_for_model" not in stages
+        done = (
+            frames[-1]
+            if frames[-1]["type"] == "done"
+            else next(f for f in frames if f["type"] == "done")
+        )
+        assert done["answer"] == "Alpha is documented [1]."
+        assert done["usage"] == {"prompt_tokens": 50, "completion_tokens": 5}
+        answer = client.post("/questions", json={"question": "alpha", "use_cache": False}).json()
+        assert answer["answer"] == "Alpha is documented [1]."
+    assert calls == [True, True]  # Ollama: the sync answer is streamed and joined too
+    after = GenerationSlot(settings)
+    assert after.try_acquire()  # both routes gave the slot back
+    after.release()
+    clear_dependency_caches()

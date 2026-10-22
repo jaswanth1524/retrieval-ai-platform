@@ -475,6 +475,9 @@ class TraceDetailResponse(BaseModel):
     query_variants: list[str] = Field(default_factory=list)
     # True when a zero-citation answer was retried and the retry supplied citations.
     citation_retry_used: bool = False
+    # True when a zero-citation answer had citations added by matching its sentences to
+    # the sources (CITATION_RETRY_MODE), without a second LLM call.
+    citation_backfilled: bool = False
     # The X-Request-ID of the request that asked it, to find its log lines.
     request_id: str | None = None
     usage: UsageResponse | None = None
@@ -583,6 +586,9 @@ class QuestionResponse(BaseModel):
     weak_matches: bool = False
     # The provider stopped at the token limit (LLM_MAX_TOKENS): the answer is cut off.
     truncated: bool = False
+    # The model cited nothing; its citations were added by matching its sentences to the
+    # sources (CITATION_RETRY_MODE), so check them ("auto-cited" in the UI).
+    citation_backfilled: bool = False
     # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.
     followups: list[str] = []
     # None when the provider reported no usage, and on a cache hit.

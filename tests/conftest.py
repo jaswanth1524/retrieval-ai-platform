@@ -71,6 +71,26 @@ def _settings_without_dotenv(monkeypatch: pytest.MonkeyPatch) -> Generator[None]
 
 
 @pytest.fixture(autouse=True)
+def _fresh_llm_process_state() -> Generator[None]:
+    """Each test starts with no measured prompt-read rate and free Ollama slots.
+
+    Both are process-wide in ``api.llm``: a test that left a stream unclosed would
+    otherwise hold the slot every later Ollama test waits on.
+    """
+
+    from api import llm
+
+    def reset() -> None:
+        llm._slots.clear()
+        llm._measured_rates.clear()
+        llm._held.__dict__.clear()  # the slots this (the test's) thread holds
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
 def _drop_log_handlers_added_by_the_test() -> Generator[None]:
     """Remove the ``api``/``eval`` log handlers a test attached, when it ends.
 

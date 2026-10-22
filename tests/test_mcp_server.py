@@ -273,3 +273,26 @@ def test_answers_list_the_exact_quotes_their_citations_rest_on() -> None:
         [],
     )
     assert '    "Alpha is the first letter."' in format_answer(result)
+
+
+@pytest.mark.asyncio
+async def test_ask_takes_the_conversation_as_history(
+    server: MCPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list[Any] = []
+    original = DocragClient.ask
+
+    def spy(self: DocragClient, *args: Any, **kwargs: Any) -> StreamResult:
+        sent.append(kwargs.get("history"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DocragClient, "ask", spy)
+    history = [
+        {"role": "user", "content": "What is alpha?"},
+        {"role": "assistant", "content": "The first letter."},
+        {"role": "system", "content": "ignored"},
+        {"role": "user", "content": "  "},
+    ]
+    answer = text_of(await server.call_tool("ask", {"question": "and beta?", "history": history}))
+    assert answer.startswith("Alpha is documented [1].")
+    assert sent == [history[:2]]

@@ -229,6 +229,36 @@ class Reranker(Protocol):
     def score(self, query: str, documents: Sequence[str]) -> list[float]: ...
 
 
+# The best passages a relative cut always keeps: a two-part question often needs two.
+RELATIVE_FLOOR_KEEP = 2
+
+
+def relative_cut(
+    kept: Sequence[RerankedChunk], scored: Sequence[RerankedChunk], floor: float
+) -> tuple[list[RerankedChunk], set[str]]:
+    """``kept`` minus the passages scoring below ``floor`` of the way from the median
+    scored candidate to the best one, always keeping ``RELATIVE_FLOOR_KEEP``; and the
+    point ids it cut. Relative, so it reads any cross-encoder's scale the same way.
+    """
+
+    if floor <= 0 or len(kept) <= RELATIVE_FLOOR_KEEP or not scored:
+        return list(kept), set()
+    scores = sorted(chunk.rerank_score for chunk in scored)
+    middle = len(scores) // 2
+    median = scores[middle] if len(scores) % 2 else (scores[middle - 1] + scores[middle]) / 2
+    top = max(scores)
+    if top - median <= 1e-9:
+        return list(kept), set()
+    result: list[RerankedChunk] = []
+    cut: set[str] = set()
+    for index, chunk in enumerate(kept):
+        if index < RELATIVE_FLOOR_KEEP or (chunk.rerank_score - median) / (top - median) >= floor:
+            result.append(chunk)
+        else:
+            cut.add(chunk.point_id)
+    return result, cut
+
+
 @dataclass(frozen=True)
 class RerankOutcome:
     """Full result of a rerank pass, for callers that need the dropped candidates too.

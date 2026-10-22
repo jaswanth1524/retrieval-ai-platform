@@ -80,6 +80,12 @@ dev = [
 
 [tool.uv]
 package = false
+# fastembed (every release up to 0.9.0) caps pillow<13, while 12.3.0 carries two dozen
+# advisories fixed only in 13.0.0. fastembed uses Pillow for its image models only;
+# DocRAG loads text embedding and reranking models. The PDF (pdfplumber), PPTX and OCR
+# parsers are Pillow's real users here, and run with Pillow 13. Drop this once fastembed
+# allows it.
+override-dependencies = ["pillow>=13"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

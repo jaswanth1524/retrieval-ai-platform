@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CitationResponse, DocumentTask } from '../api/types';
+import type { StageTiming } from '../hooks/useChat';
+import { STREAMING_STAGE_LABELS } from '../utils/stages';
 import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
@@ -17,6 +19,8 @@ interface ChatThreadProps {
   // SSE frames (see useChat). Optional so a caller that doesn't track it keeps the old
   // hardcoded labels rather than rendering nothing.
   stage?: string | null;
+  /** When the question in flight was asked, and the server's reading estimate. */
+  stageTiming?: StageTiming | null;
   engineerMode: boolean;
   currentModelLabel?: string;
   onRetry?: (question: string, task?: DocumentTask) => void;
@@ -44,6 +48,9 @@ interface ChatThreadProps {
   onUpload?: () => void;
   /** A turn to bring into view (a conversation search hit); a new object each time. */
   focusTurn?: { turnId: string } | null;
+  /** A "not found" answer's next steps (see ChatMessage). */
+  onAskEverywhere?: (question: string) => void;
+  onSearchPassages?: (question: string) => void;
 }
 
 // How close to the bottom still counts as "following along". Wide enough to survive
@@ -59,7 +66,10 @@ function progressAnnouncement(
   justFinished: boolean,
 ): string {
   if (pending) {
-    if (lastTurn?.role === 'assistant' && lastTurn.content) return 'Answer streaming.';
+    // Once text streams, only a stage after it (checking citations) is news.
+    if (lastTurn?.role === 'assistant' && lastTurn.content) {
+      return stage && !STREAMING_STAGE_LABELS.has(stage) ? stage : 'Answer streaming.';
+    }
     return stage ?? 'retrieving…';
   }
   // A stopped or cut-off answer is not "ready", and a failure is announced by its own
@@ -98,6 +108,7 @@ function ChatThread({
   pending,
   busy = pending,
   stage,
+  stageTiming = null,
   engineerMode,
   currentModelLabel,
   onRetry,
@@ -116,6 +127,8 @@ function ChatThread({
   onSuggest,
   onUpload,
   focusTurn = null,
+  onAskEverywhere,
+  onSearchPassages,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
@@ -307,6 +320,18 @@ function ChatThread({
                 ? (stage ?? 'generating answer…')
                 : undefined
             }
+            streamStartedAt={
+              pending && turn.id === lastTurn?.id && turn.role === 'assistant'
+                ? stageTiming?.askedAt
+                : undefined
+            }
+            streamEtaMs={
+              pending && turn.id === lastTurn?.id && turn.role === 'assistant'
+                ? stageTiming?.etaMs
+                : undefined
+            }
+            onAskEverywhere={onAskEverywhere}
+            onSearchPassages={onSearchPassages}
             onRetry={onRetry}
             onRegenerate={onRegenerate}
             onEditQuestion={onEditQuestion}
@@ -332,7 +357,11 @@ function ChatThread({
                 A
               </span>
               <div className="chat-message__answer">
-                <StreamingSkeleton stage={stage ?? 'retrieving…'} />
+                <StreamingSkeleton
+                  stage={stage ?? 'retrieving…'}
+                  startedAt={stageTiming?.askedAt}
+                  etaMs={stageTiming?.etaMs}
+                />
               </div>
             </div>
           </div>

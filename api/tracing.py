@@ -31,6 +31,8 @@ DropReason = Literal[
     "not_scored",
     "context_budget",
     "context_limit",
+    # Over the floor, but far below the best passage (RERANK_RELATIVE_FLOOR).
+    "relative_cut",
 ]
 TRACE_DROP_REASONS: tuple[str, ...] = get_args(DropReason)
 
@@ -106,6 +108,8 @@ class QueryTrace:
     query_variants: list[str] = field(default_factory=list)
     # True when the answer initially lacked citations and a stricter retry supplied them.
     citation_retry_used: bool = False
+    # The answer's citations were added by matching it to the sources, not by the model.
+    citation_backfilled: bool = False
     # (prompt, completion) tokens reported for the answer's LLM calls, when reported.
     usage: tuple[int, int] | None = None
     # The HTTP request it came from (X-Request-ID), to find its log lines.
@@ -169,6 +173,7 @@ def build_trace_candidates(
     min_score: float,
     diversity_dropped_ids: AbstractSet[str] = frozenset(),
     context_budget_dropped_ids: AbstractSet[str] = frozenset(),
+    relative_cut_ids: AbstractSet[str] = frozenset(),
 ) -> list[TraceCandidate]:
     """Join the fused, scored, kept, and context-selected candidate lists by point id.
 
@@ -197,6 +202,8 @@ def build_trace_candidates(
                 drop_reason = "below_min_score"
             elif candidate.point_id in diversity_dropped_ids:
                 drop_reason = "near_duplicate"
+            elif candidate.point_id in relative_cut_ids:
+                drop_reason = "relative_cut"
             else:
                 drop_reason = "top_k_cut"
         elif candidate.point_id in context_budget_dropped_ids:

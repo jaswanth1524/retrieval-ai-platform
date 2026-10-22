@@ -1346,6 +1346,11 @@
       "title": "Cached",
       "type": "boolean"
      },
+     "citation_backfilled": {
+      "default": false,
+      "title": "Citation Backfilled",
+      "type": "boolean"
+     },
      "followups": {
       "default": [],
       "items": {
@@ -1768,6 +1773,11 @@
       "title": "Chunks Total",
       "type": "integer"
      },
+     "citation_backfilled": {
+      "default": false,
+      "title": "Citation Backfilled",
+      "type": "boolean"
+     },
      "followups": {
       "default": [],
       "items": {
@@ -1930,7 +1940,8 @@
        "top_k_cut",
        "not_scored",
        "context_budget",
-       "context_limit"
+       "context_limit",
+       "relative_cut"
       ]
      },
      "filename": {
@@ -2092,6 +2103,11 @@
       },
       "title": "Candidates",
       "type": "array"
+     },
+     "citation_backfilled": {
+      "default": false,
+      "title": "Citation Backfilled",
+      "type": "boolean"
      },
      "citation_retry_used": {
       "default": false,

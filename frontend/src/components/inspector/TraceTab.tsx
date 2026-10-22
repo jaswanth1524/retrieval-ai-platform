@@ -55,7 +55,11 @@ function buildSpans(trace: TraceDetailResponse): Span[] {
       'generate',
       t.generate_ms,
       'model',
-      trace.citation_retry_used ? 'no citations, retried' : `${trace.cited_source_numbers.length} cited`,
+      trace.citation_retry_used
+        ? 'no citations, retried'
+        : trace.citation_backfilled
+          ? `no citations, ${trace.cited_source_numbers.length} matched`
+          : `${trace.cited_source_numbers.length} cited`,
     ],
     // Its own span since generate_ms stopped including it: the bars add up to the total.
     [

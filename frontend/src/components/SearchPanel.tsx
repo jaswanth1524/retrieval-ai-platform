@@ -5,6 +5,7 @@ import type { SearchResultResponse } from '../api/types';
 import './SearchPanel.css';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
 import { pageLabel } from '../utils/pages';
+import { useStableHandler } from '../hooks/useStableHandler';
 
 interface SearchPanelProps {
   /** The active conversation's scope: the same documents a question would search. */
@@ -15,6 +16,9 @@ interface SearchPanelProps {
   /** Bumped by the panel's own action button to clear the search. */
   resetKey: number;
   onAuthFailure: (err: unknown) => boolean;
+  /** A search asked for from elsewhere (a "not found" answer): shown and run at once.
+   *  A new object (``id``) each time, so the same query can be asked for twice. */
+  request?: { query: string; id: number } | null;
 }
 
 const SNIPPET_CHARS = 220;
@@ -22,7 +26,14 @@ const SNIPPET_CHARS = 220;
 /** Passage search (POST /search): the ranked chunks a question would be answered from,
  *  with their scores, and no LLM involved — so it works when none is reachable and shows
  *  at a glance whether a document answers a question at all. */
-function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }: SearchPanelProps) {
+function SearchPanel({
+  filenames,
+  tags,
+  onOpenSource,
+  resetKey,
+  onAuthFailure,
+  request = null,
+}: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResultResponse[] | null>(null);
   const [weak, setWeak] = useState(false);
@@ -41,9 +52,8 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
     setSearching(false);
   }, [resetKey]);
 
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    const trimmed = query.trim();
+  const run = useStableHandler(async (text: string) => {
+    const trimmed = text.trim();
     if (!trimmed) return;
     // A newer search replaces one still running.
     controllerRef.current?.abort();
@@ -79,7 +89,18 @@ function SearchPanel({ filenames, tags, onOpenSource, resetKey, onAuthFailure }:
     } finally {
       if (controllerRef.current === controller) setSearching(false);
     }
+  });
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    await run(query);
   };
+
+  useEffect(() => {
+    if (!request) return;
+    setQuery(request.query.slice(0, MAX_QUESTION_CHARS));
+    void run(request.query.slice(0, MAX_QUESTION_CHARS));
+  }, [request, run]);
 
   const scope =
     filenames.length > 0 || tags.length > 0

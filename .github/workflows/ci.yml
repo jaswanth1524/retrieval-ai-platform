@@ -121,9 +121,7 @@ jobs:
         # ships, and ragas carries advisories with no fixed release to move to.
         run: |
           uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$RUNNER_TEMP/requirements.txt"
-          # Skipped advisories, each with its reason: .github/ci/pip-audit-ignore.txt.
-          mapfile -t ignores < <(awk '!/^#/ && NF {print "--ignore-vuln"; print $1}' .github/ci/pip-audit-ignore.txt)
-          uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt" "${ignores[@]}"
+          uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$RUNNER_TEMP/requirements.txt"
 
   qdrant:
     # The unit suite runs Qdrant in-process (":memory:"), which never exercises the

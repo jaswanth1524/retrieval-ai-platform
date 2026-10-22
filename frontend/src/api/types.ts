@@ -387,6 +387,8 @@ export type TraceDropReason =
   | 'context_budget'
   // Kept by the reranker, but past max_context_chunks.
   | 'context_limit'
+  // Over the floor, but far below the best passage (RERANK_RELATIVE_FLOOR).
+  | 'relative_cut'
   // The server declares drop_reason extensible (x-extensible-enum): a reason added there
   // must still type-check here, and is shown with its underscores replaced.
   | (string & {});
@@ -460,6 +462,9 @@ export interface TraceDetailResponse {
   history_message_count?: number;
   query_variants?: string[];
   citation_retry_used?: boolean;
+  /** The model cited nothing; the citations were added by matching its sentences to the
+   *  sources (CITATION_RETRY_MODE). Absent from older servers. */
+  citation_backfilled?: boolean;
   /** The X-Request-ID of the request that produced it, for finding its log lines. */
   request_id?: string | null;
   usage?: UsageResponse | null;

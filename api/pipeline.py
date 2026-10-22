@@ -58,12 +58,25 @@ from api.generation import (
     generate_query_variants,
     needs_condense,
     source_citations,
-    will_retry_citations,
+    will_call_llm_for_citations,
 )
 from api.ingest_service import DocumentIngestOutcome as DocumentIngestOutcome
 from api.ingest_service import IngestService as IngestService
-from api.llm import begin_usage, reset_finish_reason, stopped_at_token_limit, usage_totals
-from api.prompting import condense_question_detailed, one_line, with_answer_language
+from api.llm import (
+    GenerationSlot,
+    begin_usage,
+    expected_prefill_ms,
+    reset_finish_reason,
+    stopped_at_token_limit,
+    usage_totals,
+)
+from api.prompting import (
+    clip_text,
+    condense_question_detailed,
+    estimate_prompt_tokens,
+    one_line,
+    with_answer_language,
+)
 from api.qdrant_schema import check_dense_dimension
 from api.repository import PassageFilter, VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
@@ -71,6 +84,7 @@ from api.reranking import (
     RerankedChunk,
     Reranker,
     RerankOutcome,
+    relative_cut,
     rerank_candidates_detailed,
 )
 from api.retrieval import (
@@ -132,6 +146,8 @@ class RetrievalPhase:
     # Part of rerank_ms spent waiting for the reranker (another question was scoring).
     rerank_wait_ms: float = 0.0
     diversity_dropped_ids: frozenset[str] = frozenset()
+    # Cleared the floor, cut for scoring far below the best (RERANK_RELATIVE_FLOOR).
+    relative_cut_ids: frozenset[str] = frozenset()
     query_variants: list[str] = field(default_factory=list)
     # Search only: nothing cleared rerank_min_score, so context_chunks are the closest
     # passages instead (see _retrieve_and_rerank).
@@ -169,6 +185,11 @@ class StageEvent(TypedDict):
     # ``steps``, both 1-based. Absent on single-step stages.
     step: NotRequired[int]
     steps: NotRequired[int]
+    # "reading": the prompt the model is about to read, in estimated tokens, and how
+    # long the local model should take to read it at its measured rate (absent before
+    # one is measured, and for hosted providers).
+    prompt_tokens: NotRequired[int]
+    eta_ms: NotRequired[float]
 
 
 class DeltaEvent(TypedDict):
@@ -206,6 +227,8 @@ class DoneEvent(TypedDict):
     weak_matches: NotRequired[bool]
     # The provider cut the answer off at the token limit.
     truncated: NotRequired[bool]
+    # The answer's citations were added by matching it to the sources (backfill).
+    citation_backfilled: NotRequired[bool]
     usage: NotRequired[dict[str, int] | None]
     # Summaries only: passages read, of the passages the documents hold. Fewer than
     # the total when a long document was read at evenly spaced passages.
@@ -258,6 +281,21 @@ def _without_unanswered_exchanges(history: list[ChatMessage]) -> list[ChatMessag
 
 # Only whether an earlier answer cites anything matters, so ranges are clamped small.
 _HISTORY_CITATION_CHECK_MAX = 1000
+
+
+def _clip_earlier_answers(history: list[ChatMessage], settings: AppSettings) -> list[ChatMessage]:
+    """``history`` with each earlier answer cut to GENERATION_HISTORY_ASSISTANT_CHARS
+    (0: unchanged). The answering model reads all of it before the first token."""
+
+    limit = int(settings.generation_history_assistant_chars)
+    if limit <= 0:
+        return history
+    return [
+        {"role": "assistant", "content": clip_text(message["content"], limit)}
+        if message["role"] == "assistant"
+        else message
+        for message in history
+    ]
 
 
 def _with_interpretation(question: str, condensed: str | None) -> str:
@@ -495,6 +533,7 @@ class RagPipeline:
         citation_retry_used: bool = False,
         usage: tuple[int, int] | None = None,
         condense_note: str | None = None,
+        citation_backfilled: bool = False,
     ) -> QueryTrace:
         """The trace of a question that ran to an answer (or to "insufficient context")."""
 
@@ -512,6 +551,7 @@ class RagPipeline:
                 selected,
                 min_score=float(effective_settings.rerank_min_score),
                 diversity_dropped_ids=phase.diversity_dropped_ids,
+                relative_cut_ids=phase.relative_cut_ids,
                 context_budget_dropped_ids=context_budget_dropped_ids,
             ),
             prompt_messages=prompt_messages,
@@ -525,6 +565,7 @@ class RagPipeline:
             history_message_count=history_message_count,
             query_variants=phase.query_variants,
             citation_retry_used=citation_retry_used,
+            citation_backfilled=citation_backfilled,
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
             usage=usage,
@@ -785,6 +826,14 @@ class RagPipeline:
                 drop_neighbours=False,
             )
             below_min_score = bool(diverse_outcome.kept)
+        relative_cut_ids: set[str] = set()
+        if for_generation and not below_min_score:
+            trimmed, relative_cut_ids = relative_cut(
+                diverse_outcome.kept,
+                outcome.scored,
+                float(effective_settings.rerank_relative_floor),
+            )
+            diverse_outcome = RerankOutcome(scored=diverse_outcome.scored, kept=trimmed)
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
@@ -818,6 +867,7 @@ class RagPipeline:
             query_expansion_ms=query_expansion_ms,
             context_expansion_ms=context_expansion_ms,
             diversity_dropped_ids=frozenset(diversity_dropped),
+            relative_cut_ids=frozenset(relative_cut_ids),
             query_variants=queries[1:],
             below_min_score=below_min_score,
         )
@@ -902,6 +952,7 @@ class RagPipeline:
                     top_rerank_score=hit.top_rerank_score,
                     weak_matches=hit.weak_matches,
                     truncated=hit.truncated,
+                    citation_backfilled=hit.citation_backfilled,
                     followups=list(hit.followups),
                 )
         grounded = self._answer_uncached(question, overrides, filenames, history, tags)
@@ -916,6 +967,7 @@ class RagPipeline:
                     grounded.top_rerank_score,
                     grounded.truncated,
                     weak_matches=grounded.weak_matches,
+                    citation_backfilled=grounded.citation_backfilled,
                     followups=tuple(grounded.followups),
                 ),
             )
@@ -958,6 +1010,7 @@ class RagPipeline:
                     "top_rerank_score": hit.top_rerank_score,
                     "weak_matches": hit.weak_matches,
                     "truncated": hit.truncated,
+                    "citation_backfilled": hit.citation_backfilled,
                 }
                 if hit.followups:
                     yield {"type": "followups", "questions": list(hit.followups)}
@@ -980,6 +1033,7 @@ class RagPipeline:
                     done.get("top_rerank_score"),
                     done.get("truncated", False),
                     weak_matches=done.get("weak_matches", False),
+                    citation_backfilled=done.get("citation_backfilled", False),
                     followups=tuple(followups),
                 ),
             )
@@ -1049,7 +1103,7 @@ class RagPipeline:
             fitted = fit_prompt_to_context_window(
                 prompt_question,
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
-                truncated_history,
+                _clip_earlier_answers(truncated_history, effective_settings),
                 effective_settings,
                 weak_matches=phase.below_min_score,
             )
@@ -1128,6 +1182,7 @@ class RagPipeline:
                     condense_note=condense_note,
                     history_message_count=len(truncated_history),
                     citation_retry_used=grounded.citation_retry_used,
+                    citation_backfilled=grounded.citation_backfilled,
                     usage=usage,
                 )
             )
@@ -1180,6 +1235,7 @@ class RagPipeline:
         condensed_question: str | None = None
         condense_note: str | None = None
         truncated_history: list[ChatMessage] = []
+        slot: GenerationSlot | None = None
         # Set the moment a trace has been stored (success, insufficient-context, or a
         # caught error below) — the `finally` clause uses this to detect the one case
         # none of those cover: the client disconnecting (GeneratorExit, a BaseException
@@ -1229,7 +1285,7 @@ class RagPipeline:
             fitted = fit_prompt_to_context_window(
                 prompt_question,
                 phase.context_chunks[: int(effective_settings.max_context_chunks)],
-                truncated_history,
+                _clip_earlier_answers(truncated_history, effective_settings),
                 effective_settings,
                 weak_matches=phase.below_min_score,
             )
@@ -1291,6 +1347,24 @@ class RagPipeline:
             )
             if should_stop is not None and should_stop():
                 return  # the finally below records the trace as closed early
+            # Held until the answer, its citation retry and follow-ups are done, so
+            # another question's call can't slip in between them; released below.
+            slot = GenerationSlot(effective_settings)
+            if not slot.try_acquire():
+                # Another question has the local model. Waiting inside Ollama ran this
+                # request's timeout; waiting here doesn't, and the reader is told why.
+                yield {"type": "stage", "stage": "waiting_for_model"}
+                if not slot.acquire(should_stop):
+                    return  # the finally below records the trace as closed early
+            reading: StageEvent = {
+                "type": "stage",
+                "stage": "reading",
+                "prompt_tokens": estimate_prompt_tokens(messages),
+            }
+            eta_ms = expected_prefill_ms(messages, effective_settings)
+            if eta_ms is not None:
+                reading["eta_ms"] = round(eta_ms)
+            yield reading
             generate_start = time.monotonic()
             first_token_ms = 0.0
             reset_finish_reason()
@@ -1315,10 +1389,22 @@ class RagPipeline:
             # uses, so the retry-trigger condition can't drift between response modes.
             # The retry is a whole unstreamed generation after the last delta; without
             # this frame the UI sits on its streaming label with nothing moving.
-            if will_retry_citations(answer, all_sources, effective_settings):
+            if will_call_llm_for_citations(
+                answer,
+                all_sources,
+                effective_settings,
+                weak_matches=phase.below_min_score,
+                context_chunks=selected,
+            ):
                 yield {"type": "stage", "stage": "verifying_citations"}
             outcome = finalize_citations(
-                messages, answer, all_sources, self._generator, effective_settings
+                messages,
+                answer,
+                all_sources,
+                self._generator,
+                effective_settings,
+                weak_matches=phase.below_min_score,
+                context_chunks=selected,
             )
             answer = outcome.answer
             # The last call made the answer: the citation retry's when it fired.
@@ -1361,6 +1447,7 @@ class RagPipeline:
                         condense_note=condense_note,
                         history_message_count=len(truncated_history),
                         citation_retry_used=citation_retry_used,
+                        citation_backfilled=outcome.backfilled,
                         usage=usage,
                     )
                 )
@@ -1376,6 +1463,7 @@ class RagPipeline:
                 "top_rerank_score": _top_rerank_score(phase),
                 "weak_matches": phase.below_min_score,
                 "truncated": truncated,
+                "citation_backfilled": outcome.backfilled,
                 "usage": usage_dict(usage),
             }
             if (
@@ -1408,3 +1496,5 @@ class RagPipeline:
                 # return once `should_stop` reported the client gone.
                 _store_error_trace("Stream closed before completion.")
                 finalized = True
+            if slot is not None:
+                slot.release()

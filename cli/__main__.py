@@ -7,6 +7,7 @@ repository the module runs it directly:
     uv run python -m cli ingest ./handbook ./notes.pdf
     uv run python -m cli add-url https://example.com/policy.html
     uv run python -m cli ask "How many days of leave do I get?" --file handbook.pdf
+    uv run python -m cli chat   # follow-up questions, with the conversation as history
     uv run python -m cli search "leave policy"
     uv run python -m cli summarize handbook.pdf [other.pdf] [--focus "deadlines"]
     uv run python -m cli read handbook.pdf [--around CHUNK_ID]
@@ -18,7 +19,7 @@ repository the module runs it directly:
 ``--url`` / ``DOCRAG_URL`` (default http://127.0.0.1:8000) and ``--api-key`` /
 ``DOCRAG_API_KEY`` select the server; these flags (and ``--json``) go before or after
 the command. Exit codes: 0 ok, 1 a request failed (or some uploads, or some restored
-documents, did), 2 bad arguments.
+documents, did), 2 bad arguments, 3 (``ask --strict``) the documents don't answer it.
 """
 
 from __future__ import annotations
@@ -26,12 +27,24 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
-from cli.client import FINISHED_JOB_STATES, DocragClient, DocragError, StreamResult
+from cli.client import (
+    FINISHED_JOB_STATES,
+    REFUSED_STATUSES,
+    DocragClient,
+    DocragError,
+    StreamResult,
+    grounding_notes,
+)
+
+# `ask --strict`: the documents don't answer the question (a script can tell).
+EXIT_NOT_ANSWERED = 3
 
 
 def ingestible(paths: Sequence[Path], extensions: set[str]) -> tuple[list[Path], list[Path]]:
@@ -82,27 +95,75 @@ def _print_sources(result: StreamResult, out: TextIO) -> None:
     read, total = result.done.get("chunks_read"), result.done.get("chunks_total")
     if isinstance(read, int) and isinstance(total, int) and read < total:
         print(f"\n(read {read} of {total} passages, evenly spaced)", file=out)
-    status = result.done.get("answer_status")
-    if status and status != "answered":
-        print(f"\n(answer status: {status})", file=out)
-    elif result.done.get("weak_matches"):
-        print(
-            "\n(weak match: no passage matched the question closely; check the sources)",
-            file=out,
-        )
+    for note in grounding_notes(result.done):
+        print(f"\n({note})", file=out)
     if result.followups:
         print("\nYou could also ask:", file=out)
         for question in result.followups:
             print(f"  - {question}", file=out)
 
 
-def _stage_printer(err: TextIO) -> Any:
-    def show(event: dict[str, Any]) -> None:
+# The server's stage names, as the web UI words them; an unknown one prints as sent.
+STAGE_NAMES = {
+    "condensing": "reading the conversation",
+    "searching": "searching documents",
+    "waiting_for_model": "waiting for the model (another question is using it)",
+    "reading": "reading the passages",
+    "verifying_citations": "checking citations",
+    "reading_documents": "reading the document",
+    "summarizing": "taking notes",
+    "combining": "combining notes",
+}
+# How often a wait with nothing printed says it is still going.
+TICK_SECONDS = 15.0
+
+
+class StageReporter:
+    """Prints each stage to stderr, and every ``TICK_SECONDS`` of silence the stage and
+    the time waited — a local model can take minutes before its first word, and a
+    terminal showing nothing for that long looks hung."""
+
+    def __init__(
+        self, err: TextIO, tick: float = TICK_SECONDS, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._err = err
+        self._tick = tick
+        self._clock = clock
+        self._started = clock()
+        self._label = "searching documents"
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def stage(self, event: dict[str, Any]) -> None:
+        name = str(event.get("stage"))
         step, steps = event.get("step"), event.get("steps")
         progress = f" {step}/{steps}" if step and steps else ""
-        print(f"[{event.get('stage')}{progress}]", file=err)
+        self._label = f"{STAGE_NAMES.get(name, name)}{progress}"
+        eta = event.get("eta_ms")
+        hint = (
+            f", about {round(eta / 1000)}s" if isinstance(eta, (int, float)) and eta >= 5000 else ""
+        )
+        print(f"[{self._label}{hint}]", file=self._err, flush=True)
 
-    return show
+    def delta(self) -> None:
+        """The answer is arriving: no more ticks."""
+
+        self._stop.set()
+
+    def __enter__(self) -> StageReporter:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._tick):
+            waited = round(self._clock() - self._started)
+            print(f"[{self._label}… {waited}s]", file=self._err, flush=True)
 
 
 # The /config field naming each provider's model. llm_model is Ollama's: printing it
@@ -250,41 +311,112 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     return 0 if succeeded else 1
 
 
-def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+def _ask_once(
+    client: DocragClient,
+    args: argparse.Namespace,
+    question: str,
+    out: TextIO,
+    history: list[dict[str, str]] | None = None,
+) -> StreamResult:
+    """Ask one question, streaming the answer to ``out`` (unless --json) with progress
+    on stderr (unless --quiet), then print its sources and notes."""
+
     streamed: list[str] = []
+    reporter = StageReporter(sys.stderr)
+    quiet = args.json or args.quiet
 
     def write(text: str) -> None:
+        reporter.delta()
         streamed.append(text)
         out.write(text)
         out.flush()
 
-    result = client.ask(
-        args.question,
-        filenames=args.file or None,
-        tags=args.tag or None,
-        provider=args.provider,
-        on_delta=None if args.json else write,
-        on_stage=None if args.json or args.quiet else _stage_printer(sys.stderr),
-    )
+    if quiet:
+        reporter.delta()  # never ticks
+    with reporter:
+        result = client.ask(
+            question,
+            filenames=args.file or None,
+            tags=args.tag or None,
+            provider=args.provider,
+            on_delta=None if args.json else write,
+            on_stage=None if quiet else reporter.stage,
+            history=history,
+        )
     if args.json:
         print(json.dumps({**result.done, "followups": result.followups}), file=out)
-        return 0
+        return result
     print(file=out)
     # A citation retry replaces the streamed text with the answer that cites its sources.
     final = str(result.done.get("answer", ""))
     if final.strip() != "".join(streamed).strip():
         print(f"\n[revised after the citation check]\n{final}", file=out)
     _print_sources(result, out)
+    return result
+
+
+def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    result = _ask_once(client, args, args.question, out)
+    if args.strict and result.done.get("answer_status") in REFUSED_STATUSES:
+        return EXIT_NOT_ANSWERED
     return 0
 
 
+# The server keeps at most this many history messages (CONVERSATION_MAX_HISTORY_MESSAGES
+# defaults to 12), and takes each up to 4000 characters.
+CHAT_HISTORY_MESSAGES = 12
+CHAT_MESSAGE_MAX_CHARS = 4000
+
+
+def cmd_chat(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Questions read from stdin, each asked with the conversation so far, so a
+    follow-up ("and for contractors?") is read with it. An answer saying the documents
+    don't cover it is left out of that history, as in the web UI: sent back, it primed
+    the next question to be refused too. ``/new`` starts over; an empty line, ``/quit``
+    or end of input stops."""
+
+    history: list[dict[str, str]] = []
+    prompt = "" if args.json else "> "
+    while True:
+        if prompt:
+            print(prompt, end="", file=out, flush=True)
+        line = sys.stdin.readline()
+        question = line.strip()
+        if not line or not question or question in ("/quit", "/exit"):
+            return 0
+        if question == "/new":
+            history = []
+            print("(new conversation)", file=out)
+            continue
+        try:
+            result = _ask_once(client, args, question, out, list(history) or None)
+        except DocragError as exc:
+            code = f" ({exc.status_code})" if exc.status_code else ""
+            print(f"error{code}: {exc}", file=sys.stderr)
+            continue
+        if result.done.get("answer_status") in REFUSED_STATUSES:
+            continue
+        answer = str(result.done.get("answer", ""))[:CHAT_MESSAGE_MAX_CHARS]
+        history.extend(
+            [
+                {"role": "user", "content": question[:CHAT_MESSAGE_MAX_CHARS]},
+                {"role": "assistant", "content": answer},
+            ]
+        )
+        history = history[-CHAT_HISTORY_MESSAGES:]
+
+
 def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    result = client.summarize(
-        args.files,
-        instruction=args.focus,
-        provider=args.provider,
-        on_stage=None if args.json or args.quiet else _stage_printer(sys.stderr),
-    )
+    reporter = StageReporter(sys.stderr)
+    if args.json or args.quiet:
+        reporter.delta()  # never ticks
+    with reporter:
+        result = client.summarize(
+            args.files,
+            instruction=args.focus,
+            provider=args.provider,
+            on_stage=None if args.json or args.quiet else reporter.stage,
+        )
     if args.json:
         print(json.dumps(result.done), file=out)
         return 0
@@ -619,6 +751,17 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--tag", action="append", help="Limit to documents with this tag.")
     ask.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
     ask.add_argument("--quiet", action="store_true", help="No progress lines on stderr.")
+    ask.add_argument(
+        "--strict",
+        action="store_true",
+        help=f"Exit {EXIT_NOT_ANSWERED} when the documents don't answer the question.",
+    )
+
+    chat = command("chat", "Ask questions from stdin, each with the conversation so far.")
+    chat.add_argument("--file", action="append", help="Limit to this document (repeatable).")
+    chat.add_argument("--tag", action="append", help="Limit to documents with this tag.")
+    chat.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
+    chat.add_argument("--quiet", action="store_true", help="No progress lines on stderr.")
 
     summarize = command(
         "summarize", "Summarize a document, compare two, or write one brief across several."
@@ -691,6 +834,7 @@ COMMANDS = {
     "ingest": cmd_ingest,
     "add-url": cmd_add_url,
     "ask": cmd_ask,
+    "chat": cmd_chat,
     "summarize": cmd_summarize,
     "search": cmd_search,
     "read": cmd_read,

@@ -244,9 +244,15 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
     'truncated',
     'followUp',
     'weakMatch',
+    'autoCited',
+    'scoped',
   ] as const;
   for (const flag of flags) {
     if (turn[flag] === true) sanitized[flag] = true;
+  }
+  if (Array.isArray(turn.contextSources)) {
+    const context = turn.contextSources.filter(isCitation).map(withValidSpans).slice(0, 20);
+    if (context.length > 0) sanitized.contextSources = context;
   }
   const task = sanitizeTask(turn.task);
   if (task) sanitized.task = task;

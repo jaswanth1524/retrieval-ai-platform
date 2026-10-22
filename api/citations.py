@@ -18,7 +18,7 @@ from api.llm import (
     last_finish_reason,
     reset_finish_reason,
 )
-from api.metrics import citation_retries_total
+from api.metrics import citation_backfills_total, citation_retries_total
 from api.prompting import (
     CHARS_PER_TOKEN_ESTIMATE,
     clip_text,
@@ -443,7 +443,9 @@ def answer_status(answer: str, cited_count: int, source_count: int) -> str:
     if source_count <= 0:
         return "no_context"
     if cited_count == 0:
-        return "insufficient_context" if states_insufficiency(answer) else "uncited"
+        if states_insufficiency(answer) or only_declines(answer):
+            return "insufficient_context"
+        return "uncited"
     return "insufficient_context" if declines_to_answer(answer) else "answered"
 
 
@@ -467,6 +469,8 @@ _DECLINE_HINTS = (
     "do not address",
     "does not discuss",
     "do not discuss",
+    "does not include",
+    "do not include",
     "unrelated",
     "not related",
     "no information",
@@ -478,7 +482,8 @@ _DECLINE_HINTS = (
 # travel". After an opening refusal it explains the refusal; it answers nothing.
 _ABOUT_THE_SOURCES_RE = re.compile(
     r"^\s*(?:\[\d[^\]]*\][\s,]*(?:(?:and|,)\s*\[\d[^\]]*\][\s,]*)*|(?:the |these |other )?"
-    r"(?:provided |given |retrieved )?(?:context|documents?|sources?|passages?|excerpts?|texts?)\b)"
+    r"(?:provided |given |retrieved |available )?"
+    r"(?:context|documents?|sources?|passages?|excerpts?|texts?|sections?)\b)"
     r"[^.]*?\b(?:discuss(?:es)?|cover(?:s)?|focus(?:es)?|describe(?:s)?|is about|are about|"
     r"pertain(?:s)?|relate(?:s)?|deal(?:s)? with|concern(?:s)?|talk(?:s)? about)\b"
 )
@@ -542,13 +547,42 @@ def declines_to_answer(answer: str) -> bool:
     )
 
 
+# An aside: "The document gives sixteen weeks of leave — it does not specify days".
+_ASIDE_RE = re.compile(r"\s[-–—]\s|\s*[–—]\s*|;")
+
+
 def opens_with_a_refusal(sentence: str) -> bool:
     """``sentence`` says the sources don't hold the answer: it declines, and about the
     documents ("The provided documents do not contain enough information …", "The
-    policy does not specify …")."""
+    policy does not specify …") — not after first giving something ("The document
+    states parents get sixteen weeks of leave — it does not specify the days [1]",
+    "Mileage is thirty cents per kilometre, but the policy does not give the currency"
+    are answers with a caveat)."""
 
-    return _declines(sentence) and bool(
-        _SOURCES_SUBJECT_RE.search(_fold(strip_citation_markers(sentence)))
+    if not (
+        _declines(sentence) and _SOURCES_SUBJECT_RE.search(_fold(strip_citation_markers(sentence)))
+    ):
+        return False
+    # Where the sentence first turns: an aside, or a contrast ("…, but the document does
+    # not specify the currency"). What it says before that decides it.
+    text = _normalize_negation(_fold(sentence))
+    first = _CONTRAST_RE.split(_ASIDE_RE.split(text, maxsplit=1)[0], maxsplit=1)[0]
+    if first == text or not _LETTER_RE.search(strip_citation_markers(first)):
+        return True
+    return _declines(first, about_the_sources=True)
+
+
+def only_declines(answer: str) -> bool:
+    """Every sentence of ``answer`` says the sources don't have it ("The documents do not
+    mention fuel cards."), so an uncited answer is a refusal — unlike "The documents do
+    not mention fuel cards. Mileage is 30 cents.", which answers part of it."""
+
+    sentences = [answer[start:end] for start, end in sentence_spans(answer)]
+    sentences = [s for s in sentences if _LETTER_RE.search(strip_citation_markers(s))]
+    return (
+        bool(sentences)
+        and opens_with_a_refusal(sentences[0])
+        and all(_declines(s, about_the_sources=True) for s in sentences[1:])
     )
 
 
@@ -662,22 +696,132 @@ class CitationOutcome:
     # rather than by the callers because this is the only place that knows whether the
     # call happened at all — and it happens in both response modes.
     retry_ms: float = 0.0
+    # The citations were added by backfill_citations, not written by the model.
+    backfilled: bool = False
+
+
+def _citation_steps(settings: AppSettings) -> tuple[bool, bool]:
+    """Whether an uncited answer is backfilled, and whether it gets the LLM retry
+    (CITATION_RETRY_MODE; CITATION_RETRY_ENABLED=false turns both off)."""
+
+    mode = settings.citation_retry_mode
+    if not settings.citation_retry_enabled or mode == "off":
+        return False, False
+    if mode == "llm":
+        return False, True
+    if mode == "backfill":
+        return True, False
+    local = settings.llm_provider.lower().strip() in ("ollama", "openai_compatible")
+    return local, True
 
 
 def will_retry_citations(
-    answer: str, all_sources: Sequence[SourceCitation], settings: AppSettings
+    answer: str,
+    all_sources: Sequence[SourceCitation],
+    settings: AppSettings,
+    *,
+    weak_matches: bool = False,
 ) -> bool:
-    """Whether ``finalize_citations`` will make its retry call for this answer.
+    """Whether ``finalize_citations`` will try to add citations to this answer.
 
     Split out so the streaming path can announce the retry *before* it blocks, without
     restating the condition — two copies would drift the first time either changed.
+
+    ``weak_matches``: the prompt told the model to decline *without citing* when the
+    nearest passages don't answer, so a refusal there is what was asked for — the retry
+    asked for citations on it and cost a second generation for nothing.
     """
 
+    if weak_matches:
+        sentences = [answer[start:end] for start, end in sentence_spans(answer)]
+        if sentences and opens_with_a_refusal(sentences[0]):
+            return False
     return (
         not cited_sources(answer, all_sources)
-        and settings.citation_retry_enabled
+        and any(_citation_steps(settings))
         and needs_citation_retry(answer, len(all_sources))
     )
+
+
+def will_call_llm_for_citations(
+    answer: str,
+    all_sources: Sequence[SourceCitation],
+    settings: AppSettings,
+    *,
+    weak_matches: bool = False,
+    context_chunks: Sequence[RerankedChunk] | None = None,
+) -> bool:
+    """Whether ``finalize_citations`` will make the LLM retry call: it will add
+    citations, and backfilling (when it applies) won't find them. The stream announces
+    the call before it blocks; a backfill takes no noticeable time."""
+
+    if not will_retry_citations(answer, all_sources, settings, weak_matches=weak_matches):
+        return False
+    backfill, llm_retry = _citation_steps(settings)
+    if backfill and context_chunks:
+        filled = backfill_citations(answer, context_chunks)
+        if filled is not None and cited_sources(filled, all_sources):
+            return False
+    return llm_retry
+
+
+# Backfilling cites on the match alone, so its bar is above the span highlighter's:
+# most of a sentence's content words, and at least three of them, in one source.
+BACKFILL_MIN_SHARED_WORDS = 3
+BACKFILL_MIN_COVERAGE = 0.5
+_SENTENCE_END_RE = re.compile(r"[.!?。！？]+[\"'”’)\]]*\s*$")
+
+
+def backfill_citations(answer: str, chunks: Sequence[RerankedChunk]) -> str | None:
+    """``answer`` with ``[n]`` added to each sentence a source plainly states, or None
+    when no sentence matched one (or the answer already cites).
+
+    The LLM citation retry is a second full generation — about a minute on a local
+    model — to add markers to an answer that is usually right. Here each sentence is
+    matched against the prompt's sources the way citation spans are (content words,
+    spelled-out numbers as digits, one or two adjacent source sentences) and gets the
+    best one's number. A sentence saying the sources lack something is left alone.
+    """
+
+    if not chunks or _CITATION_RE.search(answer):
+        return None
+    sources = [
+        (chunk.expanded_text or chunk.text, sentence_spans(chunk.expanded_text or chunk.text))
+        for chunk in chunks
+    ]
+    pieces: list[str] = []
+    last = 0
+    matched = False
+    for start, end in sentence_spans(answer):
+        sentence = answer[start:end]
+        claim = _content_words(sentence)
+        if len(claim) < BACKFILL_MIN_SHARED_WORDS or _declines(sentence):
+            continue
+        best: tuple[tuple[float, int, int], int] | None = None
+        for number, (text, spans) in enumerate(sources, start=1):
+            found = _best_span(claim, text, spans)
+            if found is None:
+                continue
+            coverage = found[0][0]
+            if (
+                coverage < BACKFILL_MIN_COVERAGE
+                or coverage * len(claim) < BACKFILL_MIN_SHARED_WORDS
+            ):
+                continue
+            if best is None or found[0][0] > best[0][0]:
+                best = (found[0], number)
+        if best is None:
+            continue
+        ending = _SENTENCE_END_RE.search(sentence)
+        cut = start + (ending.start() if ending else len(sentence.rstrip()))
+        pieces.append(answer[last:cut])
+        pieces.append(f" [{best[1]}]")
+        last = cut
+        matched = True
+    if not matched:
+        return None
+    pieces.append(answer[last:])
+    return "".join(pieces)
 
 
 # A line that copies a source's header from the prompt ("[1] filename=I-2.pdf; page=1-2;
@@ -699,6 +843,9 @@ def finalize_citations(
     all_sources: Sequence[SourceCitation],
     generator: ChatGenerator,
     settings: AppSettings,
+    *,
+    weak_matches: bool = False,
+    context_chunks: Sequence[RerankedChunk] | None = None,
 ) -> CitationOutcome:
     """Filter ``answer`` to its cited sources, retrying once if none are cited.
 
@@ -715,6 +862,10 @@ def finalize_citations(
     when only 3 sources exist yields empty ``cited`` but no retry, because the marker
     check in ``needs_citation_retry`` short-circuits first. Retrying there would mean
     re-prompting a model that did cite, just badly, so it's left alone.
+
+    ``context_chunks`` (the prompt's sources, in order) let an uncited answer be
+    backfilled without an LLM call (CITATION_RETRY_MODE); ``weak_matches`` skips adding
+    citations to a refusal the weak-match prompt asked to be uncited.
     """
 
     answer = strip_echoed_source_headers(answer)
@@ -722,7 +873,23 @@ def finalize_citations(
     final_messages = list(prompt_messages)
     retry_used = False
     retry_ms = 0.0
-    if will_retry_citations(answer, all_sources, settings):
+    backfill, llm_retry = _citation_steps(settings)
+    if (
+        backfill
+        and context_chunks
+        and will_retry_citations(answer, all_sources, settings, weak_matches=weak_matches)
+    ):
+        filled = backfill_citations(answer, context_chunks)
+        if filled is not None and cited_sources(filled, all_sources):
+            citation_backfills_total.inc()
+            return CitationOutcome(
+                answer=filled,
+                cited=cited_sources(filled, all_sources),
+                retry_used=False,
+                prompt_messages=final_messages,
+                backfilled=True,
+            )
+    if llm_retry and will_retry_citations(answer, all_sources, settings, weak_matches=weak_matches):
         # Timed around the call itself, not around the `if` — a retry that fails or
         # still comes back uncited cost just as much wall-clock as one that worked, and
         # attributing it to generate_ms is what made this stage invisible before.

@@ -11,6 +11,7 @@ interface RetrievalTabProps {
 const DROP_REASON_LABELS: Record<string, string> = {
   context_limit: 'beyond context limit',
   context_budget: 'over context budget',
+  relative_cut: 'far below the best',
 };
 
 function dropReasonLabel(reason: string): string {

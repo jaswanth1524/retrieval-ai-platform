@@ -266,8 +266,10 @@ def fit_prompt_to_context_window(
 
     chunks = list(context_chunks)
     kept_history = list(history or [])
-    window = context_window_tokens(settings)
     budget = prompt_token_budget(settings)
+    configured = int(settings.prompt_token_budget)
+    if configured > 0:
+        budget = configured if budget is None else min(budget, configured)
     if budget is None:
         return FittedPrompt(chunks, kept_history)
     dropped: list[str] = []
@@ -278,6 +280,13 @@ def fit_prompt_to_context_window(
             build_grounded_messages(query, chunks, kept_history or None, weak_matches=weak_matches)
         )
 
+    # Neighbour text first, from the lowest-ranked passage up: it is context around a
+    # passage, and dropping it keeps every passage the reranker chose.
+    for index in reversed(range(len(chunks))):
+        if size() <= budget:
+            break
+        if chunks[index].expanded_text is not None:
+            chunks[index] = replace(chunks[index], expanded_text=None)
     while size() > budget:
         if len(chunks) > 1:
             dropped.append(chunks.pop().point_id)
@@ -288,16 +297,15 @@ def fit_prompt_to_context_window(
             # One chunk and no history still don't fit: send it anyway rather than
             # answer from nothing; the operator's window is simply too small.
             logger.warning(
-                "The prompt exceeds the %d-token context window even with one source; "
-                "raise OLLAMA_NUM_CTX / LLM_CONTEXT_WINDOW.",
-                window,
+                "The prompt exceeds its %d-token budget even with one source; raise "
+                "OLLAMA_NUM_CTX / LLM_CONTEXT_WINDOW / PROMPT_TOKEN_BUDGET.",
+                budget,
             )
             break
     if dropped or dropped_history:
         logger.info(
-            "Fitted the prompt to a %d-token window: dropped %d source(s) and %d "
-            "history message(s).",
-            window,
+            "Fitted the prompt to %d tokens: dropped %d source(s) and %d history message(s).",
+            budget,
             len(dropped),
             dropped_history,
         )

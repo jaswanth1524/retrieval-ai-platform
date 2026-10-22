@@ -128,6 +128,12 @@ class AppSettings(BaseSettings):
     # passage that answered the question: "what are foundational models" scored 0.006
     # with MiniLM and 0.154 with jina against "Foundation models: You have trained ...".
     rerank_fallback_count: int = Field(default=3, ge=0, le=20)
+    # Opt-in (0 = off): of the passages that cleared the floor, keep only those scoring
+    # within this share of the way from the median candidate's score to the best one
+    # ((score - median) / (top - median) >= this), and always the best two. Works on
+    # any reranker's scale, and only ever trims the prompt — never turns an answer into
+    # a refusal. A low-scoring sixth passage is ~1k tokens of prompt to read.
+    rerank_relative_floor: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Checked at startup (case-insensitive): a typo used to boot fine and then fail
     # every question with a 400 that blamed the client.
@@ -143,6 +149,13 @@ class AppSettings(BaseSettings):
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_max_tokens: PositiveInt = 512
     llm_request_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    # Local providers (Ollama, OpenAI-compatible) send nothing while they read the
+    # prompt, and LiteLLM hands its timeout to httpx as the longest silence allowed
+    # (it turns an httpx.Timeout back into one number for Ollama), so a 6k-token prompt
+    # on an M1 timed out before the first token. Each call's timeout grows by its
+    # estimated prompt tokens divided by this rate (or by the slower rate this server
+    # has been measured at). 0 turns the scaling off; hosted providers never scale.
+    llm_prefill_tokens_per_second: float = Field(default=40.0, ge=0.0)
     llm_num_retries: int = Field(default=0, ge=0)
     ollama_base_url: str = "http://localhost:11434"
     # Ollama unloads a model from memory 5 minutes after its last use by default,
@@ -154,6 +167,12 @@ class AppSettings(BaseSettings):
     # but cut the loaded model from 8.2 GB to 5.3 GB. Too small silently truncates the
     # front of the prompt (the grounding rules), so leave headroom for history.
     ollama_num_ctx: int = Field(default=0, ge=0)
+    # How many LLM calls this process sends Ollama at once. Ollama answers one request
+    # at a time unless OLLAMA_NUM_PARALLEL says otherwise and queues the rest — where
+    # each waiting request's timeout runs, so a second question timed out without ever
+    # being read. Calls past this wait here instead (the stream says so), and their
+    # timeout starts when they are sent. 0 = no limit (match a raised OLLAMA_NUM_PARALLEL).
+    ollama_max_parallel: int = Field(default=1, ge=0)
     # The model's context window in tokens, for fitting the prompt into it. 0 (default)
     # uses OLLAMA_NUM_CTX when the provider is Ollama and that is set; for OpenAI and
     # Anthropic models, the window LiteLLM's bundled model table gives; else no fitting.
@@ -161,6 +180,11 @@ class AppSettings(BaseSettings):
     # history until it fits with LLM_MAX_TOKENS to spare — an over-long prompt had its
     # *front* (the grounding rules) silently cut by the model server.
     llm_context_window: int = Field(default=0, ge=0)
+    # Opt-in (0 = off): the most estimated tokens a question's prompt may take, whatever
+    # the window. Over it, neighbour text goes first (lowest-ranked passage first), then
+    # whole lowest-ranked passages, then the oldest history. A local model reads a
+    # prompt at ~70 tokens/s on an M1, so prompt size is most of the wait.
+    prompt_token_budget: int = Field(default=0, ge=0)
     # Questions answered at once; past it a question gets 429 + Retry-After at once
     # instead of holding a request thread for a minute (api/admission.py). 0 = no cap.
     max_concurrent_questions: int = Field(default=4, ge=0)
@@ -371,6 +395,10 @@ class AppSettings(BaseSettings):
     # Server-side truncation cap (most recent messages kept) — independent of the
     # request schema's own cap, so an operator can tighten it without a schema change.
     conversation_max_history_messages: int = Field(default=12, ge=0)
+    # Opt-in (0 = off): earlier answers sent to the answering model are cut to this many
+    # characters each (the condense step keeps its own 1500). The question already
+    # carries its resolved meaning ("Read with the conversation as: ...").
+    generation_history_assistant_chars: int = Field(default=0, ge=0)
     # The condense call only needs to produce one rewritten sentence — capped well
     # below llm_max_tokens so a runaway rewrite can't burn the generation token budget.
     condense_max_tokens: PositiveInt = 128
@@ -388,6 +416,14 @@ class AppSettings(BaseSettings):
     # reminder to cite. Never loops; falls back to the original answer if the retry
     # still lacks citations. See api/generation.py.
     citation_retry_enabled: bool = True
+    # How an uncited answer gets its citations. "llm": the retry above (a second full
+    # generation — about a minute on a local model). "backfill": each answer sentence
+    # a source plainly states (most of its content words, in one or two adjacent
+    # sentences of the source) gets that source's [n]; no LLM call. "auto" (default):
+    # backfill first for local providers (Ollama, OpenAI-compatible), the LLM retry only
+    # when nothing matched; the LLM retry for hosted providers. "off": neither (as
+    # CITATION_RETRY_ENABLED=false).
+    citation_retry_mode: Literal["auto", "llm", "backfill", "off"] = "auto"
 
     # Suggested follow-up questions (default OFF: one more LLM call per answer, which on
     # a local model is seconds). When on, an answer that cited its sources gets up to

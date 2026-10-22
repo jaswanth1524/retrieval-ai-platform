@@ -43,3 +43,14 @@
   border-radius: 50%;
   animation: dr-spin 0.7s linear infinite;
 }
+
+.streaming-skeleton__elapsed {
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.streaming-skeleton__elapsed::before {
+  content: '·';
+  margin-right: 8px;
+}

@@ -75,6 +75,7 @@ import {
   HIDDEN_FEEDBACK_PANEL,
   NO_SOURCES,
   PANEL_META,
+  notFoundSourcesMessage,
   scopeLabel,
 } from './appHelpers';
 
@@ -96,6 +97,8 @@ function App() {
   const [searchOpened, setSearchOpened] = useState(false);
   if (rail === 'search' && !searchOpened) setSearchOpened(true);
   const [searchResetKey, setSearchResetKey] = useState(0);
+  // A search started from elsewhere (a "not found" answer's "Search the passages").
+  const [searchRequest, setSearchRequest] = useState<{ query: string; id: number } | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sources');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -141,6 +144,7 @@ function App() {
     streamingConversationId,
     askedTurns,
     stage,
+    stageTiming,
     ask,
     cancel,
     clear: clearTurns,
@@ -644,6 +648,24 @@ function App() {
       }),
     [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
   );
+  // A "not found" answer asked within some documents: the same question over all of
+  // them, with the conversation's scope cleared so the next question searches them too.
+  const askEverywhere = useCallback(
+    (question: string) => {
+      setScope({ filenames: [], tags: [] });
+      return ask(question, selectedProvider, advancedOptions, undefined, {
+        tags: [],
+        modelLabel: currentModelLabel,
+      });
+    },
+    [ask, setScope, selectedProvider, advancedOptions, currentModelLabel],
+  );
+  // ...or the passages a search finds for it, without asking the model again.
+  const searchForPassages = useStableHandler((question: string) => {
+    setSearchRequest({ query: question, id: Date.now() });
+    setRail('search');
+    if (panelCollapsed) setPanelDrawerOpen(true);
+  });
   // Like the composer's Send: not before the app has booted, nor with a refused key —
   // and not while any answer streams (one question at a time; it would be ignored).
   const summarizeDisabled = booting || apiStatus === 'unauthorized' || pending;
@@ -1146,6 +1168,7 @@ function App() {
               tags={selectedTags}
               onOpenSource={handleOpenSource}
               resetKey={searchResetKey}
+              request={searchRequest}
               onAuthFailure={noteAuthFailure}
             />
           </div>
@@ -1204,6 +1227,9 @@ function App() {
               pending={streamingHere}
               busy={pending}
               stage={streamingHere ? stage : null}
+              stageTiming={streamingHere ? stageTiming : null}
+              onAskEverywhere={askEverywhere}
+              onSearchPassages={searchForPassages}
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
@@ -1285,6 +1311,7 @@ function App() {
               traceReady={inspectedTraceReady}
               onOpenSource={handleOpenSource}
               overlay={tooNarrowForInspector}
+              sourcesEmptyMessage={notFoundSourcesMessage(inspectedTurn)}
             />
           )}
           {paletteOpen && (
