@@ -8,7 +8,7 @@ from api.parsers.common import (
     DocumentParseError,
     DocumentSection,
     EmptyDocumentError,
-    render_row,
+    row_groups,
 )
 from api.settings import AppSettings
 
@@ -64,18 +64,12 @@ def parse_csv_document(
         ]
 
     sections: list[DocumentSection] = []
-    for start in range(0, len(data_rows), rows_per_section):
-        group = data_rows[start : start + rows_per_section]
-        rendered = [(number, render_row(header, row)) for number, row in group]
-        rendered = [(number, line) for number, line in rendered if line]
-        if not rendered:
-            continue
-        label = f"Rows {group[0][0]}-{group[-1][0]}"
+    for first, last, rendered in row_groups(header, data_rows, rows_per_section):
         sections.append(
             DocumentSection(
                 filename=filename,
                 page=1,
-                section=label,
+                section=f"Rows {first}-{last}",
                 text="\n".join(line for _, line in rendered),
                 # Chunks keep rows whole and are labelled with the rows they hold.
                 line_rows=tuple(number for number, _ in rendered),

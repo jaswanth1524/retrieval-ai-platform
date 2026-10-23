@@ -227,6 +227,13 @@ def _sentence_units(
             sentences = section.text.split("\n")
             rows = list(section.line_rows)
             if len(rows) != len(sentences):
+                # Every chunk of the section then loses its row label.
+                logger.warning(
+                    "Section %r has %d lines but %d row numbers; labelling it without rows.",
+                    section.section,
+                    len(sentences),
+                    len(rows),
+                )
                 rows = [None] * len(sentences)
         else:
             sentences = _SENTENCE_SPLIT_RE.split(section.text)

@@ -120,24 +120,14 @@ def parse_html_document(
     email's subject), else the page's ``<title>``.
     """
 
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(text, "html.parser")
+    soup = _visible_soup(text)
     title_tag = soup.title.get_text(strip=True) if soup.title else ""
-    for element in soup(list(_HTML_STRIP_TAGS)):
-        element.decompose()
-    for element in [tag for tag in soup.find_all(True) if _is_hidden(tag)]:
-        element.decompose()
     sections = _sections(filename, _content_root(soup), title_tag, default_section)
     if sections:
         return sections
     # Nothing in the main content (or a page whose text all sat in its chrome): the
-    # whole page, as before.
-    soup = BeautifulSoup(text, "html.parser")
-    for element in soup(list(_HTML_STRIP_TAGS)):
-        element.decompose()
-    for element in [tag for tag in soup.find_all(True) if _is_hidden(tag)]:
-        element.decompose()
+    # whole page, as before — parsed afresh, since the first pass rewrote its tree.
+    soup = _visible_soup(text)
     sections = _sections(filename, soup.body or soup, title_tag, default_section)
     if not sections:
         whole = normalize_text(soup.get_text(" ", strip=True))
@@ -146,6 +136,19 @@ def parse_html_document(
         label = cap_section(default_section if default_section else title_tag)
         return [DocumentSection(filename=filename, page=1, section=label, text=whole)]
     return sections
+
+
+def _visible_soup(text: str) -> Any:
+    """``text`` parsed, without scripts/styles (``_HTML_STRIP_TAGS``) or hidden elements."""
+
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(text, "html.parser")
+    for element in soup(list(_HTML_STRIP_TAGS)):
+        element.decompose()
+    for element in [tag for tag in soup.find_all(True) if _is_hidden(tag)]:
+        element.decompose()
+    return soup
 
 
 def _sections(

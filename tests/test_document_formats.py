@@ -494,7 +494,8 @@ def test_parse_csv_keeps_quoted_multiline_cells_and_unicode_line_breaks() -> Non
     sections = parse_document_bytes("notes.csv", content)
 
     text = "\n".join(section.text for section in sections)
-    assert "notes: first line\nsecond line" in text
+    # One row is one line (chunker v9): the cell's line break became a space.
+    assert "notes: first line second line" in text
     assert "notes: one two" in text
     assert sections[0].section == "Rows 2-3"
 

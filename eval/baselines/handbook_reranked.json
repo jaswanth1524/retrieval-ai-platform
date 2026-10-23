@@ -35,7 +35,7 @@
     "arm": "reranked",
     "chunk_overlap_tokens": 8,
     "chunk_size_tokens": 48,
-    "chunker_version": 8,
+    "chunker_version": 9,
     "context_diversity_enabled": true,
     "context_diversity_max_similarity": 0.6,
     "context_neighbor_max_chars": 0,

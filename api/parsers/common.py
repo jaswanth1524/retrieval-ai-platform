@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Literal
@@ -220,17 +220,38 @@ def refuse_zip_xml_dtd(filename: str, content: bytes, kind: str) -> None:
         raise DocumentParseError(f"Could not parse {kind} '{filename}'.") from exc
 
 
+_CELL_LINE_BREAK_RE = re.compile(r"[ \t]*[\r\n]+[ \t]*")
+
+
 def render_row(header: list[str], row: list[str]) -> str:
     """Render one table row as "col1: v1; col2: v2" so any chunk slice self-describes.
 
-    Empty cells are left out; a column without a header is named by its position.
+    Empty cells are left out; a column without a header is named by its position. A
+    line break inside a cell becomes a space: a row is one line, and the chunker's one
+    row label per line (``DocumentSection.line_rows``) relies on it.
     """
 
     parts: list[str] = []
     for index, value in enumerate(row):
-        cell = value.strip()
+        cell = _CELL_LINE_BREAK_RE.sub(" ", value.strip())
         if not cell:
             continue
         column = header[index] if index < len(header) and header[index] else f"col{index + 1}"
         parts.append(f"{column}: {cell}")
     return "; ".join(parts)
+
+
+def row_groups(
+    header: list[str], rows: Sequence[tuple[int, list[str]]], per_group: int
+) -> Iterator[tuple[int, int, list[tuple[int, str]]]]:
+    """``rows`` (spreadsheet row number, cells) in groups of ``per_group``, each as
+    ``(first number, last number, [(number, rendered row)])`` without the rows that
+    render empty; a group with nothing left is skipped. CSV and XLSX label their
+    sections from the numbers."""
+
+    for start in range(0, len(rows), per_group):
+        group = rows[start : start + per_group]
+        rendered = [(number, render_row(header, cells)) for number, cells in group]
+        rendered = [(number, line) for number, line in rendered if line]
+        if rendered:
+            yield group[0][0], group[-1][0], rendered
