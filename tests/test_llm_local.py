@@ -251,3 +251,23 @@ def test_a_timeout_names_the_time_it_actually_allowed() -> None:
         LiteLLMGenerator(settings, completion_client=timing_out).complete(
             [{"role": "user", "content": ""}], ollama(llm_prefill_tokens_per_second=0)
         )
+
+
+def test_a_non_streamed_ollama_call_measures_its_read_too() -> None:
+    settings = ollama()
+    client = StreamingClient([chunk("a"), chunk("b")], delay=0.2)
+    LiteLLMGenerator(settings, completion_client=client).complete(LONG, settings)
+    assert measured_prefill_rate(settings) is not None
+
+
+def test_one_cold_load_does_not_drag_the_measured_rate_but_two_slow_reads_do() -> None:
+    settings = ollama()
+    llm._record_prefill(settings, 7000, 100.0)  # 70 tokens/s
+    llm._record_prefill(settings, 7000, 1000.0)  # 7/s: the model was loading
+    assert measured_prefill_rate(settings) == pytest.approx(70)
+    llm._record_prefill(settings, 7000, 100.0)
+    assert measured_prefill_rate(settings) == pytest.approx(70)
+    # Slow twice in a row: the server really is slower now.
+    llm._record_prefill(settings, 7000, 1000.0)
+    llm._record_prefill(settings, 7000, 1000.0)
+    assert measured_prefill_rate(settings) == pytest.approx(7)

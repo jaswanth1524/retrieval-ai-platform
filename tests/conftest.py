@@ -78,11 +78,15 @@ def _fresh_llm_process_state() -> Generator[None]:
     otherwise hold the slot every later Ollama test waits on.
     """
 
-    from api import llm
+    from api import citations, llm
 
     def reset() -> None:
         llm._slots.clear()
         llm._measured_rates.clear()
+        llm._slow_samples.clear()
+        # Memoized span matching: results depend on constants tests patch.
+        citations._span_index.cache_clear()
+        citations._backfill.cache_clear()
         llm._held.__dict__.clear()  # the slots this (the test's) thread holds
 
     reset()

@@ -120,3 +120,63 @@ def test_an_explicit_close_callback_replaces_the_iterators_own() -> None:
 
     assert called.is_set()
     assert not closed.is_set()
+
+
+def test_a_quiet_stream_hears_the_client_leave_at_once_under_asgi_2_4() -> None:
+    """Nothing is sent while a question waits for the model, so a failed send can't tell
+    Starlette the client left: the response listens for it and stops the work."""
+
+    stop = threading.Event()
+    left_at: list[float] = []
+
+    def quiet() -> Iterator[str]:
+        yield "data: started\n\n"
+        stop.wait(10)  # the pipeline waiting; ends when stopped
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+
+        async def receive() -> Message:
+            await asyncio.sleep(0.2)
+            left_at.append(loop.time())
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            return None
+
+        response = ClosingStreamingResponse(quiet(), on_disconnect=stop.set)
+        started = loop.time()
+        await response(_scope("2.4"), receive, send)
+        assert loop.time() - started < 3
+
+    asyncio.run(scenario())
+    assert stop.is_set() and left_at
+
+
+def test_the_client_leaving_stops_the_work_at_once_under_asgi_2_3_too() -> None:
+    """Starlette hears the disconnect here, but its cleanup waits for the step in flight
+    (blocked until the next keepalive): the stop must not wait with it."""
+
+    stop = threading.Event()
+    stopped_after: list[float] = []
+
+    def quiet() -> Iterator[str]:
+        yield "data: started\n\n"
+        started = __import__("time").monotonic()
+        stop.wait(10)
+        stopped_after.append(__import__("time").monotonic() - started)
+
+    async def scenario() -> None:
+        async def receive() -> Message:
+            await asyncio.sleep(0.2)
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            return None
+
+        await ClosingStreamingResponse(quiet(), on_disconnect=stop.set)(
+            _scope("2.3"), receive, send
+        )
+
+    asyncio.run(scenario())
+    assert stop.is_set() and stopped_after and stopped_after[0] < 3

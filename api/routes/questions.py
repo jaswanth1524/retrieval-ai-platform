@@ -288,6 +288,8 @@ def register(app: FastAPI) -> None:
             event_source(),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
+            # Stops the pipeline as soon as the client leaves (see the class).
+            on_disconnect=stop.set,
             # Also after a disconnect before the first frame, which never runs the
             # generator (and so never its finally). The release is idempotent.
             background=BackgroundTask(lease.release_if_not_handed_off),
@@ -330,6 +332,7 @@ def register(app: FastAPI) -> None:
             answer_status=grounded.answer_status,
             truncated=grounded.truncated,
             usage=usage_response(grounded.usage),
+            citation_backfilled=grounded.citation_backfilled,
             chunks_read=result.chunks_read,
             chunks_total=result.chunks_total,
         )
@@ -381,5 +384,6 @@ def register(app: FastAPI) -> None:
             event_source(),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
+            on_disconnect=stop.set,
             background=BackgroundTask(lease.release_if_not_handed_off),
         )

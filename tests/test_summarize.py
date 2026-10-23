@@ -594,3 +594,122 @@ def test_notes_for_several_documents_say_the_others_are_read_separately() -> Non
     list(_summarizer(_long_document(3), generator, settings).summarize_stream(request))
     assert generator.notes_prompts
     assert not any(marker in prompt for prompt in generator.notes_prompts)
+
+
+@pytest.mark.parametrize("mode", ["backfill", "auto"])
+def test_an_uncited_local_summary_is_backfilled_without_a_retry_or_its_stage(mode: str) -> None:
+    repository = FakeRepository(
+        {"a.txt": [_payload("a.txt", 1, "The office opens at nine on weekdays.")]}
+    )
+    generator = ScriptedGenerator(answer="The office opens at nine on weekdays.")
+    settings = _settings(llm_provider="ollama", citation_retry_mode=mode)
+
+    events = list(
+        _summarizer(repository, generator, settings).summarize_stream(
+            SummaryRequest(mode="summarize", filenames=("a.txt",))
+        )
+    )
+
+    assert len(generator.calls) == 1
+    assert "verifying_citations" not in [e.get("stage") for e in events if e["type"] == "stage"]
+    done = events[-1]
+    assert done["answer"] == "The office opens at nine on weekdays [1]."
+    assert done["answer_status"] == "answered"
+
+
+def test_a_summary_waits_for_the_local_model_between_parts_and_says_so() -> None:
+    from api.llm import GenerationSlot
+
+    texts = ["word " * 150 for _ in range(3)]
+    repository = FakeRepository(
+        {"a.txt": [_payload("a.txt", index, text) for index, text in enumerate(texts, 1)]}
+    )
+    settings = _settings(llm_provider="ollama", summary_batch_chars=1000)
+    generator = ScriptedGenerator(notes=["n [1]."] * 3)
+    holder = GenerationSlot(settings)
+    assert holder.acquire()
+    events: list[Any] = []
+    waiting = threading.Event()
+
+    def run() -> None:
+        for event in _summarizer(repository, generator, settings).summarize_stream(
+            SummaryRequest(mode="summarize", filenames=("a.txt",))
+        ):
+            events.append(event)
+            if event.get("stage") == "waiting_for_model":
+                waiting.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert waiting.wait(10)
+    assert generator.calls == []
+    holder.release()
+    thread.join(10)
+    assert events[-1]["type"] == "done"
+    after = GenerationSlot(settings)
+    assert after.try_acquire()
+    after.release()
+
+
+def test_a_summary_whose_reader_left_while_waiting_calls_no_model() -> None:
+    from api.llm import GenerationSlot
+
+    repository = FakeRepository({"a.txt": [_payload("a.txt", 1, "Alpha.")]})
+    settings = _settings(llm_provider="ollama")
+    generator = ScriptedGenerator()
+    holder = GenerationSlot(settings)
+    assert holder.acquire()
+    gone = threading.Event()
+    events: list[Any] = []
+    thread = threading.Thread(
+        target=lambda: events.extend(
+            _summarizer(repository, generator, settings).summarize_stream(
+                SummaryRequest(mode="summarize", filenames=("a.txt",)), should_stop=gone.is_set
+            )
+        )
+    )
+    thread.start()
+    time.sleep(0.5)
+    gone.set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert generator.calls == []
+    assert events[-1].get("stage") == "waiting_for_model"
+    holder.release()
+
+
+def test_combined_notes_are_cut_to_their_weighted_share_of_the_budget() -> None:
+    from api.prompting import weighted_length
+    from api.summarize import build_combine_messages
+
+    notes = [("a.txt", n, 20, "要点" * 300 + f" [{n}]") for n in range(1, 21)]
+    prompt = build_combine_messages("Summarize", "summarize", notes, 2000)[-1]["content"]
+    bodies = [
+        block.split(" of 20:\n", 1)[1] for block in prompt.split("\n\n") if " of 20:" in block
+    ]
+    assert len(bodies) == 20
+    # 100 weighted characters each (plus the " …" marking the cut), never 400 raw ones.
+    assert all(weighted_length(body.removesuffix(" …")) <= 100 for body in bodies)
+
+
+def test_a_backfilled_summary_says_so_in_its_answer_trace_and_cache() -> None:
+    repository = FakeRepository(
+        {"a.txt": [_payload("a.txt", 1, "The office opens at nine on weekdays.")]}
+    )
+    generator = ScriptedGenerator(answer="The office opens at nine on weekdays.")
+    traces = Traces()
+    summarizer = _summarizer(
+        repository,
+        generator,
+        _settings(llm_provider="ollama", citation_retry_mode="backfill"),
+        trace_store=traces,
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=600),
+    )
+    request = SummaryRequest(mode="summarize", filenames=("a.txt",))
+
+    first = summarizer.summarize(request)
+    assert first.grounded.citation_backfilled is True
+    assert traces.traces[-1].citation_backfilled is True
+    assert traces.traces[-1].citation_retry_used is False
+    again = list(summarizer.summarize_stream(request))
+    assert again[-1]["cached"] is True and again[-1]["citation_backfilled"] is True

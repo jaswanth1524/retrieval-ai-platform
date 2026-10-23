@@ -207,3 +207,15 @@ def test_a_refusal_that_describes_the_sections_it_had_is_still_a_refusal() -> No
         "available sections cover invoicing, remote work location, and equipment use only [1]."
     )
     assert declines_to_answer(answer)
+
+
+def test_a_marker_only_in_an_echoed_source_header_announces_the_retry() -> None:
+    # qwen2.5 appends "[1] filename=…" lines; they are stripped before the citation
+    # check, so the announcement must not count their markers either.
+    settings = settings_for("ollama", citation_retry_mode="llm")
+    answer = "Contractors get sick leave from day one.\n[1] filename=doc1.md; page=1"
+    sources = source_citations(CHUNKS)
+    assert will_call_llm_for_citations(answer, sources, settings, context_chunks=CHUNKS)
+    generator = CountingGenerator("Contractors get sick leave from day one [1].")
+    outcome = finalize_citations([], answer, sources, generator, settings, context_chunks=CHUNKS)
+    assert outcome.retry_used and len(generator.calls) == 1

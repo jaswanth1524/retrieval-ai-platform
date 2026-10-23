@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import time
@@ -340,14 +341,36 @@ def _claims_by_source(answer: str, max_number: int) -> dict[int, list[set[str]]]
     return claims
 
 
+class _SpanIndex:
+    """A source text's sentences, with the content words of each sentence (or pair of
+    sentences) worked out once: every claim of an answer is matched against every
+    source, and recomputing them per claim cost ~90 ms of CPU per backfill."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.sentences = sentence_spans(text)
+        self._words: dict[tuple[int, int], set[str]] = {}
+
+    def words(self, start: int, end: int) -> set[str]:
+        found = self._words.get((start, end))
+        if found is None:
+            found = self._words[(start, end)] = _content_words(self.text[start:end])
+        return found
+
+
+@functools.lru_cache(maxsize=64)
+def _span_index(text: str) -> _SpanIndex:
+    return _SpanIndex(text)
+
+
 def _best_span(
-    claim: set[str], text: str, sentences: Sequence[tuple[int, int]]
+    claim: set[str], index: _SpanIndex
 ) -> tuple[tuple[float, int, int], int, int] | None:
+    sentences = index.sentences
     # A pair only when each of its sentences carries part of the claim by itself:
     # otherwise one shared word ("staff") pulled an unrelated sentence into the quote.
     relevant = [
-        len(claim & _content_words(text[start:end])) >= SPAN_MIN_SHARED_WORDS
-        for start, end in sentences
+        len(claim & index.words(start, end)) >= SPAN_MIN_SHARED_WORDS for start, end in sentences
     ]
     candidates = [*sentences]
     candidates += [
@@ -357,7 +380,7 @@ def _best_span(
     ]
     best: tuple[tuple[float, int, int], int, int] | None = None
     for start, end in candidates:
-        words = _content_words(text[start:end])
+        words = index.words(start, end)
         shared = len(claim & words)
         if shared < SPAN_MIN_SHARED_WORDS:
             continue
@@ -389,12 +412,12 @@ def attach_spans(
             result.append(source)
             continue
         text = chunks[index].text
-        sentences = sentence_spans(text)
+        spans_index = _span_index(text)
         found: dict[tuple[int, int], tuple[float, int, int]] = {}
         for claim in claims[source.source_number]:
             if not claim:
                 continue
-            best = _best_span(claim, text, sentences)
+            best = _best_span(claim, spans_index)
             if best is not None:
                 key, start, end = best
                 found[(start, end)] = max(key, found.get((start, end), key))
@@ -755,6 +778,9 @@ def will_call_llm_for_citations(
     citations, and backfilling (when it applies) won't find them. The stream announces
     the call before it blocks; a backfill takes no noticeable time."""
 
+    # Judged on the text finalize_citations judges: a marker that only appears in an
+    # echoed source header line is stripped there, and would hide the retry here.
+    answer = strip_echoed_source_headers(answer)
     if not will_retry_citations(answer, all_sources, settings, weak_matches=weak_matches):
         return False
     backfill, llm_retry = _citation_steps(settings)
@@ -785,10 +811,13 @@ def backfill_citations(answer: str, chunks: Sequence[RerankedChunk]) -> str | No
 
     if not chunks or _CITATION_RE.search(answer):
         return None
-    sources = [
-        (chunk.expanded_text or chunk.text, sentence_spans(chunk.expanded_text or chunk.text))
-        for chunk in chunks
-    ]
+    # Asked twice per answer (will_call_llm_for_citations, then finalize_citations).
+    return _backfill(answer, tuple(chunk.expanded_text or chunk.text for chunk in chunks))
+
+
+@functools.lru_cache(maxsize=16)
+def _backfill(answer: str, texts: tuple[str, ...]) -> str | None:
+    sources = [_span_index(text) for text in texts]
     pieces: list[str] = []
     last = 0
     matched = False
@@ -798,8 +827,8 @@ def backfill_citations(answer: str, chunks: Sequence[RerankedChunk]) -> str | No
         if len(claim) < BACKFILL_MIN_SHARED_WORDS or _declines(sentence):
             continue
         best: tuple[tuple[float, int, int], int] | None = None
-        for number, (text, spans) in enumerate(sources, start=1):
-            found = _best_span(claim, text, spans)
+        for number, source_index in enumerate(sources, start=1):
+            found = _best_span(claim, source_index)
             if found is None:
                 continue
             coverage = found[0][0]
