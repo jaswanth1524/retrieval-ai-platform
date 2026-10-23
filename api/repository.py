@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from threading import Lock
@@ -64,6 +63,16 @@ def clear_metadata_cache() -> None:
 
     with _metadata_lock:
         _metadata_cache.clear()
+
+
+def forget_metadata(client: QdrantClient, collection: str) -> None:
+    """Forget one collection's cached listing and its scan lock (a deleted workspace):
+    the other workspaces' listings stay warm, and a lock per collection ever deleted
+    is no longer kept for the life of the process."""
+
+    with _metadata_lock:
+        _metadata_cache.get(client, {}).pop(collection, None)
+        _metadata_scan_locks.get(client, {}).pop(collection, None)
 
 
 def clear_hybrid_fallback_cache() -> None:
@@ -136,7 +145,94 @@ class DocumentMetadata:
         return self.heuristic_chunked and counter_mode == "hf"
 
 
-_SCROLL_PAGE_SIZE = 256
+class _MetadataFold:
+    """One document's metadata, folded point by point during a listing scroll.
+
+    ``page_count`` is the highest page seen (pages are 1-based). ``byte_size``,
+    ``uploaded_at`` and the source come from the first point that has them (every chunk
+    of one ingest carries the same values); a document ingested before those fields
+    existed has none. The chunker version is the lowest seen, None when any point has
+    none (legacy: stale).
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.max_page = 0
+        self.byte_size: int | None = None
+        self.uploaded_at: float | None = None
+        self.min_version: int | None = None
+        self.unversioned = False
+        self.tags: dict[str, None] = {}
+        self.fingerprints: set[str] = set()
+        self.heuristic = False
+        # None stands for a point without one.
+        self.hashes: set[str | None] = set()
+        self.totals: set[int | None] = set()
+        self.source: tuple[str, str | None, str | None] | None = None
+
+    def add(self, payload: dict[str, Any]) -> None:
+        self.count += 1
+        page = payload.get("page")
+        if isinstance(page, int):
+            self.max_page = max(self.max_page, page)
+        size = payload.get("byte_size")
+        if isinstance(size, int) and self.byte_size is None:
+            self.byte_size = size
+        stamp = payload.get("uploaded_at")
+        if isinstance(stamp, int | float) and self.uploaded_at is None:
+            self.uploaded_at = float(stamp)
+        version = payload.get("chunker_version")
+        if isinstance(version, int) and not isinstance(version, bool):
+            lowest = self.min_version
+            self.min_version = version if lowest is None else min(lowest, version)
+        else:
+            self.unversioned = True
+        point_tags = payload.get("tags")
+        if isinstance(point_tags, list):
+            self.tags.update((tag, None) for tag in point_tags if isinstance(tag, str))
+        fingerprint = payload.get("chunking_fingerprint")
+        if isinstance(fingerprint, str):
+            self.fingerprints.add(fingerprint)
+        if payload.get("token_counter") == "heuristic":
+            self.heuristic = True
+        digest = payload.get("content_sha256")
+        self.hashes.add(digest if isinstance(digest, str) else None)
+        total = payload.get("document_chunks")
+        self.totals.add(total if isinstance(total, int) and not isinstance(total, bool) else None)
+        url = payload.get("source_url")
+        if isinstance(url, str) and self.source is None:
+            etag = payload.get("source_etag")
+            modified = payload.get("source_last_modified")
+            self.source = (
+                url,
+                etag if isinstance(etag, str) else None,
+                modified if isinstance(modified, str) else None,
+            )
+
+    def result(self) -> DocumentMetadata:
+        url, etag, modified = self.source if self.source is not None else (None, None, None)
+        return DocumentMetadata(
+            chunk_count=self.count,
+            page_count=self.max_page,
+            byte_size=self.byte_size,
+            uploaded_at=self.uploaded_at,
+            chunker_version=None if self.unversioned else self.min_version,
+            tags=tuple(self.tags),
+            chunking_fingerprints=frozenset(self.fingerprints),
+            heuristic_chunked=self.heuristic,
+            content_sha256=_single_hash(self.hashes),
+            document_chunks=_single_value(self.totals),
+            source_url=url,
+            source_etag=etag,
+            source_last_modified=modified,
+        )
+
+
+# Points per scroll page. Ids and a handful of payload fields are small: at 256 a 50k-point
+# document took ~200 round trips (measured: ids 2.5-3.5x and the metadata scan ~2x
+# faster at 2048). Pages carrying whole payloads (chunk text) stay small.
+_SCROLL_PAGE_SIZE = 2048
+_FULL_PAYLOAD_PAGE_SIZE = 256
 # Points fetched per requested ordinal by fetch_neighbors (see there).
 _NEIGHBOR_COPIES_ALLOWED = 4
 
@@ -285,7 +381,7 @@ class VectorRepository:
                 scroll_filter=scroll_filter,
                 with_payload=with_payload,
                 with_vectors=False,
-                limit=_SCROLL_PAGE_SIZE,
+                limit=_FULL_PAYLOAD_PAGE_SIZE if with_payload is True else _SCROLL_PAGE_SIZE,
                 offset=offset,
             )
             yield from points
@@ -493,19 +589,7 @@ class VectorRepository:
         """
 
         self.ensure_ready(settings, strict=False)
-        chunk_counts: Counter[str] = Counter()
-        max_page: dict[str, int] = {}
-        byte_size: dict[str, int] = {}
-        uploaded_at: dict[str, float] = {}
-        min_version: dict[str, int] = {}
-        unversioned: set[str] = set()
-        tags: dict[str, dict[str, None]] = {}
-        fingerprints: dict[str, set[str]] = {}
-        heuristic: set[str] = set()
-        # Each filename's hashes; None stands for a point without one.
-        hashes: dict[str, set[str | None]] = {}
-        totals: dict[str, set[int | None]] = {}
-        sources: dict[str, tuple[str, str | None, str | None]] = {}
+        folds: dict[str, _MetadataFold] = {}
         for point in self._scroll_all(
             settings,
             scroll_filter=(
@@ -540,63 +624,25 @@ class VectorRepository:
             filename = point.payload.get("filename")
             if not isinstance(filename, str):
                 continue
-            chunk_counts[filename] += 1
-            page = point.payload.get("page")
-            if isinstance(page, int):
-                max_page[filename] = max(max_page.get(filename, 0), page)
-            size = point.payload.get("byte_size")
-            if isinstance(size, int) and filename not in byte_size:
-                byte_size[filename] = size
-            stamp = point.payload.get("uploaded_at")
-            if isinstance(stamp, int | float) and filename not in uploaded_at:
-                uploaded_at[filename] = float(stamp)
-            version = point.payload.get("chunker_version")
-            if isinstance(version, int) and not isinstance(version, bool):
-                min_version[filename] = min(min_version.get(filename, version), version)
-            else:
-                unversioned.add(filename)
-            point_tags = point.payload.get("tags")
-            if isinstance(point_tags, list):
-                ordered = tags.setdefault(filename, {})
-                ordered.update((tag, None) for tag in point_tags if isinstance(tag, str))
-            fingerprint = point.payload.get("chunking_fingerprint")
-            if isinstance(fingerprint, str):
-                fingerprints.setdefault(filename, set()).add(fingerprint)
-            if point.payload.get("token_counter") == "heuristic":
-                heuristic.add(filename)
-            digest = point.payload.get("content_sha256")
-            hashes.setdefault(filename, set()).add(digest if isinstance(digest, str) else None)
-            total = point.payload.get("document_chunks")
-            totals.setdefault(filename, set()).add(
-                total if isinstance(total, int) and not isinstance(total, bool) else None
-            )
-            url = point.payload.get("source_url")
-            if isinstance(url, str) and filename not in sources:
-                etag = point.payload.get("source_etag")
-                modified = point.payload.get("source_last_modified")
-                sources[filename] = (
-                    url,
-                    etag if isinstance(etag, str) else None,
-                    modified if isinstance(modified, str) else None,
-                )
-        return {
-            filename: DocumentMetadata(
-                chunk_count=count,
-                page_count=max_page.get(filename, 0),
-                byte_size=byte_size.get(filename),
-                uploaded_at=uploaded_at.get(filename),
-                chunker_version=None if filename in unversioned else min_version.get(filename),
-                tags=tuple(tags.get(filename, {})),
-                chunking_fingerprints=frozenset(fingerprints.get(filename, ())),
-                heuristic_chunked=filename in heuristic,
-                content_sha256=_single_hash(hashes.get(filename, set())),
-                document_chunks=_single_value(totals.get(filename, set())),
-                source_url=sources[filename][0] if filename in sources else None,
-                source_etag=sources[filename][1] if filename in sources else None,
-                source_last_modified=sources[filename][2] if filename in sources else None,
-            )
-            for filename, count in chunk_counts.items()
-        }
+            folds.setdefault(filename, _MetadataFold()).add(point.payload)
+        return {filename: fold.result() for filename, fold in folds.items()}
+
+    def content_sha256_of(self, settings: AppSettings, filename: str) -> str | None:
+        """The content hash one point of ``filename`` carries (one point read), or None
+        when it isn't indexed or has none."""
+
+        self.ensure_ready(settings, strict=False)
+        points, _ = self._call(
+            settings,
+            "scroll",
+            collection_name=settings.qdrant_collection,
+            scroll_filter=_single_filename_filter(filename),
+            with_payload=["content_sha256"],
+            with_vectors=False,
+            limit=1,
+        )
+        stored = points[0].payload.get("content_sha256") if points and points[0].payload else None
+        return stored if isinstance(stored, str) else None
 
     def document_metadata(self, settings: AppSettings, filename: str) -> DocumentMetadata | None:
         """One document's metadata, read now (not from the cached listing), or None
@@ -700,6 +746,32 @@ class VectorRepository:
             points=_single_filename_filter(filename),
             wait=True,
         )
+
+    def delete_filename(self, settings: AppSettings, filename: str) -> int:
+        """Remove every point of ``filename``; how many there were. Caller holds its
+        filename lock, so nothing is written to it between the count and the delete.
+
+        By filter, in one call: listing the ids first and deleting those took twice as
+        long under the lock (measured: 0.48 s against 0.24 s at 50k points)."""
+
+        self.ensure_ready(settings, strict=False)
+        selector = _single_filename_filter(filename)
+        count = self._call(
+            settings,
+            "count",
+            collection_name=settings.qdrant_collection,
+            count_filter=selector,
+            exact=True,
+        ).count
+        if count:
+            self._call(
+                settings,
+                "delete",
+                collection_name=settings.qdrant_collection,
+                points_selector=models.FilterSelector(filter=selector),
+                wait=True,
+            )
+        return int(count)
 
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None:
         """Remove specific points by id — a single call regardless of how many

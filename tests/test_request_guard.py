@@ -280,3 +280,47 @@ def test_the_export_counts_against_the_rate_limit() -> None:
 
     asyncio.run(main())
     assert statuses == [200, 429, 200]
+
+
+def test_every_full_key_route_is_guarded_before_its_body_is_read() -> None:
+    """The guard's hand-kept list (needs_full_key) agrees with the routes' own
+    require_full_key dependency, for every route the app has."""
+
+    import re
+
+    from fastapi.dependencies.models import Dependant
+    from fastapi.routing import APIRoute
+    from qdrant_client import QdrantClient
+
+    from api.dependencies import require_full_key
+    from api.request_guard import needs_full_key
+    from tests.routes_http.support import hermetic_app, make_settings
+
+    def requires_full_key(dependant: Dependant) -> bool:
+        return any(
+            dep.call is require_full_key or requires_full_key(dep) for dep in dependant.dependencies
+        )
+
+    examples = {"filename": "a.pdf", "job_id": "j1", "version": "123", "name": "legal"}
+    app = hermetic_app(make_settings(), QdrantClient(":memory:"))
+
+    def flat(routes: list[Any]) -> list[Any]:
+        # An included APIRouter is one entry wrapping its routes (FastAPI 0.13x).
+        out: list[Any] = []
+        for route in routes:
+            inner = getattr(route, "original_router", None)
+            out.extend(flat(inner.routes) if inner is not None else [route])
+        return out
+
+    checked = 0
+    for route in flat(list(app.routes)):
+        if not isinstance(route, APIRoute):
+            continue
+        path = re.sub(r"\{(\w+)(?::[^}]*)?\}", lambda m: examples.get(m[1], "x"), route.path)
+        for method in route.methods or ():
+            assert needs_full_key(method, path) == requires_full_key(route.dependant), (
+                method,
+                route.path,
+            )
+            checked += 1
+    assert checked > 30

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+from weakref import WeakKeyDictionary
 
 from fastapi import HTTPException
 from qdrant_client import QdrantClient
@@ -112,5 +114,34 @@ def list_workspaces(client: QdrantClient, base_collection: str) -> list[str]:
     return sorted(name for name in names if _NAME_RE.match(name))
 
 
+# Workspace collections this process has seen exist, per client. Every request naming a
+# workspace checks it with Qdrant; while Qdrant is briefly unreachable, one seen before
+# counts as existing, so a request that needs nothing from Qdrant (a job poll, every
+# second during an upload) still works instead of failing with a 503.
+_seen_workspaces: WeakKeyDictionary[QdrantClient, set[str]] = WeakKeyDictionary()
+_seen_lock = threading.Lock()
+
+
 def workspace_exists(client: QdrantClient, base_collection: str, name: str) -> bool:
-    return bool(client.collection_exists(collection_for(base_collection, name)))
+    collection = collection_for(base_collection, name)
+    try:
+        exists = bool(client.collection_exists(collection))
+    except Exception:
+        with _seen_lock:
+            if collection in _seen_workspaces.get(client, set()):
+                return True
+        raise
+    with _seen_lock:
+        seen = _seen_workspaces.setdefault(client, set())
+        if exists:
+            seen.add(collection)
+        else:
+            seen.discard(collection)
+    return exists
+
+
+def forget_workspace(client: QdrantClient, collection: str) -> None:
+    """A deleted workspace no longer counts as existing when Qdrant can't be asked."""
+
+    with _seen_lock:
+        _seen_workspaces.get(client, set()).discard(collection)

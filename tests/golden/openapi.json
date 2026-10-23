@@ -517,6 +517,22 @@
       "title": "Deferred",
       "type": "array"
      },
+     "failed": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Failed",
+      "type": "array"
+     },
+     "in_progress": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "In Progress",
+      "type": "array"
+     },
      "jobs": {
       "items": {
        "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
@@ -3599,6 +3615,9 @@
        }
       },
       "description": "Successful Response"
+     },
+     "409": {
+      "description": "The document is already being indexed, originals aren't kept (RAW_DOCUMENT_DIR), or the index was built for another embedding setup."
      },
      "422": {
       "content": {

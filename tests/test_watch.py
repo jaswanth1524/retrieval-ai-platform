@@ -569,3 +569,26 @@ def test_a_file_that_cannot_be_parsed_is_not_retried(tmp_path: Path) -> None:
     clock.now += 10_000
     assert not any(folder.scan_once().values())
     assert len(recorder.enqueued) == 1
+
+
+def test_a_delete_that_fails_is_retried_and_the_others_still_happen(tmp_path: Path) -> None:
+    for name in ("a.txt", "b.txt", "c.txt"):
+        write(tmp_path / name, name)
+    recorder = Recorder()
+    folder = watcher(tmp_path, recorder, watch_delete_missing=True)
+    folder.scan_once()
+    folder.scan_once()
+    real_delete = recorder.delete
+    down = {"a.txt"}
+
+    def flaky(name: str) -> None:
+        if name in down:
+            raise ConnectionError("qdrant unreachable")
+        real_delete(name)
+
+    folder._delete = flaky
+    (tmp_path / "a.txt").unlink()
+    (tmp_path / "b.txt").unlink()
+    assert folder.scan_once()["deleted"] == ["b.txt"]
+    down.clear()
+    assert folder.scan_once()["deleted"] == ["a.txt"]

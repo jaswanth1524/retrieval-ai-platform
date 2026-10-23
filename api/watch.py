@@ -480,6 +480,15 @@ class FolderWatcher:
                     done["deleted"].append(name)
                 except (DocumentNotFoundError, HTTPException) as exc:
                     logger.warning("Watched folder: could not delete %s: %s", name, exc)
+                except Exception:  # noqa: BLE001 - one failed delete must not end the pass
+                    # Qdrant unreachable, say: still seen, so the next pass tries again,
+                    # and the remaining deletions (and this pass's status) still happen.
+                    logger.warning(
+                        "Watched folder: could not delete %s; trying again next pass.",
+                        name,
+                        exc_info=True,
+                    )
+                    continue
             self._seen.discard(name)
             self._sent.pop(name, None)
             self._pending.pop(name, None)

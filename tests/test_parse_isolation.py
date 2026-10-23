@@ -46,3 +46,48 @@ def test_a_parse_past_the_limit_is_stopped_and_its_process_killed() -> None:
 def test_zero_parses_in_this_process() -> None:
     sections = parse_with_limit("notes.txt", b"Intro\nalpha", make_test_settings())
     assert sections[0].text.endswith("alpha")
+
+
+def exit_without_a_result(connection: object, *args: object) -> None:
+    """A child that dies the way an OOM kill or a native crash leaves it: no answer."""
+
+    import os
+
+    os._exit(3)
+
+
+def test_a_child_that_dies_without_an_answer_is_a_parse_error_with_its_exit_code() -> None:
+    with pytest.raises(DocumentParseError, match=r"exited unexpectedly \(exit code 3\)"):
+        parse_with_limit(
+            "notes.txt",
+            b"Intro\nalpha",
+            make_test_settings(parse_timeout_seconds=60),
+            _target=exit_without_a_result,
+        )
+
+
+def test_a_child_that_cannot_start_closes_its_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    from multiprocessing.connection import Connection
+
+    from api import parse_isolation
+
+    closed: list[Connection] = []
+    real_close = Connection.close
+
+    def tracking_close(self: Connection) -> None:
+        closed.append(self)
+        real_close(self)
+
+    class NoProcess:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise OSError("too many open files")
+
+    context = parse_isolation._forkserver_context()
+    monkeypatch.setattr(Connection, "close", tracking_close)
+    monkeypatch.setattr(type(context), "Process", NoProcess)
+    with pytest.raises(OSError, match="too many open files"):
+        parse_with_limit("notes.txt", b"x", make_test_settings(parse_timeout_seconds=60))
+    assert len(closed) == 2

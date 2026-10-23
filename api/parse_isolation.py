@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from multiprocessing.connection import Connection
 from typing import Any
@@ -122,9 +122,17 @@ def _parse_in_child(
         connection.close()
 
 
-def parse_with_limit(filename: str, content: bytes, settings: AppSettings) -> list[DocumentSection]:
+def parse_with_limit(
+    filename: str,
+    content: bytes,
+    settings: AppSettings,
+    *,
+    _target: Callable[[Connection, str, bytes, AppSettings], None] = _parse_in_child,
+) -> list[DocumentSection]:
     """``parse_document_bytes`` in a child process that is killed after
-    ``settings.parse_timeout_seconds``; in this process when that is 0."""
+    ``settings.parse_timeout_seconds``; in this process when that is 0.
+
+    ``_target`` is the child's entry point (tests swap in one that crashes)."""
 
     timeout = float(settings.parse_timeout_seconds)
     if timeout <= 0:
@@ -132,13 +140,20 @@ def parse_with_limit(filename: str, content: bytes, settings: AppSettings) -> li
 
     context = _forkserver_context()
     receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_parse_in_child,
-        args=(sender, filename, content, settings),
-        name="docrag-parse",
-        daemon=True,
-    )
-    process.start()
+    try:
+        process = context.Process(
+            target=_target,
+            args=(sender, filename, content, settings),
+            name="docrag-parse",
+            daemon=True,
+        )
+        process.start()
+    except BaseException:
+        # No child (the forkserver died, or no file descriptors left): nothing else
+        # would close the pipe.
+        receiver.close()
+        sender.close()
+        raise
     sender.close()  # the child holds the only writing end now
     try:
         if not receiver.poll(timeout):
@@ -150,6 +165,7 @@ def parse_with_limit(filename: str, content: bytes, settings: AppSettings) -> li
             status, payload = receiver.recv()
         except EOFError:
             # The child died without a word: killed for memory, or a crash in native code.
+            process.join(timeout=5)  # for its exit code
             raise DocumentParseError(
                 f"Reading '{filename}' failed: the parser process exited unexpectedly "
                 f"(exit code {process.exitcode})."

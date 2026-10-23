@@ -247,6 +247,10 @@ class DocumentReindexAllResponse(BaseModel):
     jobs: list[DocumentJobAcceptedResponse]
     # Stale and re-indexable, but the ingest backlog was full; retry later.
     deferred: list[str] = []
+    # Already being indexed (an earlier re-index, or an upload): not queued twice.
+    in_progress: list[str] = []
+    # Could not be queued (logged on the server); the others were.
+    failed: list[str] = []
 
 
 class DocumentDeleteResponse(BaseModel):

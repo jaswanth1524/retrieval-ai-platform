@@ -9,6 +9,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Literal
 
 from fastapi import HTTPException
@@ -301,6 +302,46 @@ def admit_or_refuse(key: str) -> int:
         raise WorkspaceClosingError(exc.group) from None
 
 
+@dataclass(frozen=True)
+class IngestQueue:
+    """Where an upload, URL fetch, re-index, version restore or import is queued: the
+    job store, the ingest executor, the backlog and the request's ingest service."""
+
+    job_store: JobStore
+    executor: ThreadPoolExecutor
+    backlog: IngestBacklog
+    ingest_service: IngestService
+
+    def enqueue(
+        self,
+        *,
+        filename: str,
+        content: bytes,
+        raw_store: RawDocumentStore | None,
+        uploaded_at: float | None = None,
+        precondition: Callable[[], None] | None = None,
+        tags: tuple[str, ...] | None = None,
+        source: DocumentSource | None = None,
+        dedupe: bool = False,
+    ) -> DocumentJobAcceptedResponse:
+        """``enqueue_ingest`` with this queue's collaborators."""
+
+        return enqueue_ingest(
+            job_store=self.job_store,
+            executor=self.executor,
+            backlog=self.backlog,
+            ingest_service=self.ingest_service,
+            filename=filename,
+            content=content,
+            raw_store=raw_store,
+            uploaded_at=uploaded_at,
+            precondition=precondition,
+            tags=tags,
+            source=source,
+            dedupe=dedupe,
+        )
+
+
 def enqueue_ingest(
     *,
     job_store: JobStore,
@@ -459,13 +500,20 @@ def refuse_near_duplicate_name(filename: str, existing: Iterable[str]) -> None:
             )
 
 
+def indexing_now(settings: AppSettings) -> set[str]:
+    """Filenames in ``settings``' workspace with an upload, re-index or delete admitted
+    and not yet finished."""
+
+    in_flight = (filename_of(settings, key) for key in ingest_sequencer.in_flight())
+    return {name for name in in_flight if name}
+
+
 def known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
     """Every indexed filename in ``settings``' workspace plus those with an upload or
     delete in flight: what a new name is checked against by
     ``refuse_near_duplicate_name`` (uploads, URL ingest, import and the folder watcher)."""
 
-    in_flight = (filename_of(settings, key) for key in ingest_sequencer.in_flight())
-    return [*repository.filename_metadata(settings), *(name for name in in_flight if name)]
+    return [*repository.filename_metadata(settings), *indexing_now(settings)]
 
 
 def require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
@@ -558,21 +606,22 @@ def delete_indexed_document(
                 )
             if superseded == "delete":
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
-            point_ids = repository.point_ids_for_filename(settings, filename)
-            if point_ids:
-                repository.delete_by_ids(settings, point_ids)
+            points_deleted = repository.delete_filename(settings, filename)
+            if points_deleted:
                 # Right away, not after the original below: if removing that
                 # raises, cached answers must still stop citing the deleted points.
                 bump_corpus_generation([filename], collection=settings.qdrant_collection)
             # Also when no points remain: an original orphaned by an earlier failed
             # ingest was otherwise undeletable, since the 404 came first.
-            removed_original = _delete_original(raw_store, filename, points_gone=bool(point_ids))
-            if not point_ids and not removed_original:
+            removed_original = _delete_original(
+                raw_store, filename, points_gone=bool(points_deleted)
+            )
+            if not points_deleted and not removed_original:
                 raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
             ingest_sequencer.mark_applied(key, sequence, deleted=True)
     finally:
         ingest_sequencer.release(key)
-    return len(point_ids)
+    return points_deleted
 
 
 def _delete_original(

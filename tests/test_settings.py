@@ -332,3 +332,27 @@ def test_a_different_reranker_at_the_default_floor_is_warned_about(
     with caplog.at_level("WARNING", logger="api.settings"):
         AppSettings(_env_file=None, reranker_model="Xenova/ms-marco-MiniLM-L-6-v2")  # type: ignore[call-arg]
     assert "RERANK_MIN_SCORE=0.15" in caplog.text
+
+
+@pytest.mark.parametrize("name", ["", "docs/legal", "a:b", "x" * 256, "a?b", "a|b"])
+def test_a_collection_name_qdrant_would_refuse_is_refused_at_startup(name: str) -> None:
+    with pytest.raises(ValidationError, match="QDRANT_COLLECTION must be 1-255"):
+        AppSettings(_env_file=None, qdrant_collection=name)  # type: ignore[call-arg]
+
+
+def test_settings_that_would_silently_do_nothing_are_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="api.settings")
+    AppSettings(_env_file=None, chunk_size_tokens=1024, raw_document_versions=3)  # type: ignore[call-arg]
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "CHUNK_SIZE_TOKENS=1024" in messages
+    assert "RAW_DOCUMENT_VERSIONS=3 has no effect" in messages
+    caplog.clear()
+    AppSettings(_env_file=None)  # type: ignore[call-arg]
+    assert not caplog.records
+
+
+def test_a_collection_name_qdrant_accepts_is_accepted() -> None:
+    for name in ("docs.v2", "a b", "x" * 255, "ünï"):
+        assert AppSettings(_env_file=None, qdrant_collection=name).qdrant_collection == name  # type: ignore[call-arg]

@@ -734,3 +734,34 @@ def test_search_hits_carry_only_the_fields_a_candidate_is_built_from() -> None:
             "a",
         )
         assert chunk.text == "hello" and chunk.chunk_ordinal == 3
+
+
+def test_delete_filename_removes_only_that_files_points_and_counts_them() -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    repository.upsert(
+        settings,
+        [make_point("p1", "guide.md"), make_point("p2", "guide.md"), make_point("p3", "other.md")],
+    )
+
+    assert repository.delete_filename(settings, "guide.md") == 2
+    assert repository.point_ids_for_filename(settings, "guide.md") == []
+    assert len(repository.point_ids_for_filename(settings, "other.md")) == 1
+    assert repository.delete_filename(settings, "guide.md") == 0
+
+
+def test_forgetting_one_collections_listing_keeps_the_others() -> None:
+    import api.repository as repository_module
+
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    kept, gone = make_settings(qdrant_collection="docs"), make_settings(qdrant_collection="old")
+    for settings in (kept, gone):
+        repository.upsert(settings, [make_point("p1", "guide.md")])
+        repository.filename_metadata(settings)
+    assert {"docs", "old"} <= set(repository_module._metadata_cache[client])
+
+    repository_module.forget_metadata(client, "old")
+
+    assert set(repository_module._metadata_cache[client]) == {"docs"}
+    assert "old" not in repository_module._metadata_scan_locks.get(client, {})

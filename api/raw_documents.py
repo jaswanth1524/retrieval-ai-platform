@@ -164,8 +164,16 @@ class RawDocumentStore:
             return None
 
     def read(self, filename: str) -> bytes | None:
+        """The stored original's bytes, or None when none is stored — including one
+        deleted (or made unreadable) since the caller checked for it."""
+
         path = self.path(filename)
-        return path.read_bytes() if path is not None else None
+        if path is None:
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
 
     def path(self, filename: str) -> Path | None:
         """Path of the stored original, or None when none is stored."""

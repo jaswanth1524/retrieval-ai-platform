@@ -11,6 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 SUMMARY_DOCUMENTS_LIMIT = 10
 
 _VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+# Longest input the supported embedding models read (bge, e5, MiniLM: 512 tokens).
+_EMBEDDING_MAX_TOKENS = 512
+# The characters Qdrant v1.19 refuses in a collection name (checked against the server).
+_BAD_COLLECTION_CHARS = re.compile(r'[<>:"/\\|?*\x00]')
 # OpenAI reasoning models (gpt-5 family, o-series) accept a reasoning_effort knob;
 # "" disables sending it (uses the provider default).
 _VALID_REASONING_EFFORTS = frozenset({"", "minimal", "low", "medium", "high"})
@@ -554,6 +558,25 @@ class AppSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _warn_on_settings_that_do_nothing(self) -> "AppSettings":
+        log = logging.getLogger(__name__)
+        if self.chunk_size_tokens > _EMBEDDING_MAX_TOKENS:
+            # The embedder cuts every longer input to its limit without a word, so the
+            # end of each chunk would be indexed for BM25 but never embedded.
+            log.warning(
+                "CHUNK_SIZE_TOKENS=%d is past the %d tokens embedding models read; the "
+                "end of every chunk would be left out of its vector.",
+                self.chunk_size_tokens,
+                _EMBEDDING_MAX_TOKENS,
+            )
+        if self.raw_document_versions and not self.raw_document_dir:
+            log.warning(
+                "RAW_DOCUMENT_VERSIONS=%d has no effect without RAW_DOCUMENT_DIR.",
+                self.raw_document_versions,
+            )
+        return self
+
+    @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":
         # With only a read key, the "admin" routes would have no key at all: anyone
         # could change the corpus that readers need a key to look at.
@@ -598,6 +621,12 @@ class AppSettings(BaseSettings):
         # workspace's: a base name containing it would read as a workspace itself.
         if "__ws_" in value:
             raise ValueError("QDRANT_COLLECTION must not contain '__ws_' (used for workspaces).")
+        # Qdrant's own rules (only what the server refuses), checked at startup rather
+        # than as an error on the first request.
+        if not value or len(value) > 255 or _BAD_COLLECTION_CHARS.search(value):
+            raise ValueError(
+                'QDRANT_COLLECTION must be 1-255 characters, without any of < > : " / \\ | ? *.'
+            )
         return value
 
     @field_validator("log_level", mode="before")
