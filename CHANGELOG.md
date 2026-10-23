@@ -12,8 +12,8 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
-text-extraction pass (pass 9). **Re-index: recommended** — chunker version 8 (see
-Changed). Every document
+text-extraction pass (pass 9), then a correctness pass (pass 10). **Re-index:
+recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
 before. No embedding change: the index stays compatible, and nothing is refused. The
@@ -27,6 +27,24 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- **Chunker version 9** (pass 10). A line break inside a table cell (CSV, XLSX, HTML,
+  PPTX, DOCX) becomes a space: one quoted multi-line cell gave its section more lines
+  than row numbers, and every chunk of it was then labelled with the whole range
+  ("Rows 2-31") instead of its own rows. A PDF page whose tables pdfplumber can't read
+  loses only its own tables (every table already read was dropped). A scanned page with
+  only a stamp of text keeps the stamp when OCR doesn't read it (`MAX_OCR_PAGES=0`, or
+  past the limit); a PDF of only such pages was refused as empty. Eval baselines
+  re-measured: identical. **Recommended.**
+- Pass 10: "Import all conversations" keeps each conversation's own dates and fills the
+  room the history has left (100 conversations). When the file holds more, it asks
+  first: remove the least recently used conversations (never pinned ones, the open one,
+  or one being answered) to import them all, or import only what fits. Before, every
+  import was stamped "now" and an import of 100 silently pushed every older
+  conversation out. **None.**
+- Pass 10, CLI: `delete` goes on past a file it can't delete and exits 1 at the end
+  (`--json`: `{"deleted": [...], "failed": [{filename, error, status}]}`, was
+  `{"deleted": [...]}`); Ctrl-C exits 130 (in `chat` it stops the answer and keeps the
+  conversation); `export --json`. **None.**
 - **Chunker version 8** (pass 9). Every parsed document has ligature characters written
   out ("ﬁnance") and soft hyphens and zero-width spaces removed — they split a word in
   two for BM25 — and questions get the same clean-up (no NFKC: superscripts, fractions
@@ -123,6 +141,10 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 10: `POST /documents/reindex` lists `in_progress` (already being indexed; not
+  queued a second time) and `failed` (could not be queued; the others were), and
+  `POST /documents/{filename}/reindex` is a 409 while that document is being indexed. The
+  CLI's `reindex --stale` prints both. **None.**
 - Pass 9: stream `stage` frames `waiting_for_model` (another question has the local
   model) and `reading` (`prompt_tokens`, and `eta_ms` once this server's prompt-reading
   speed is measured); `citation_backfilled` on answers, `done`, traces and the answer
@@ -333,6 +355,18 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   Counted in `docrag_rate_limited_total`.
 
 ### Faster
+- Pass 10: matching an answer's sentences to its sources (citation backfill and spans)
+  works out each source's sentence words once: ~180 ms of CPU per local-model answer
+  became ~12 ms (15 sentences, 6 sources). Id and metadata scrolls read 2048 points a
+  page (was 256): a 50k-point document's ids 2.5-3.5x and its metadata ~2x faster. A
+  re-upload with dedupe checks one point's hash before scanning the document under its
+  lock (2 ms instead of 0.06-0.6 s when the file changed). A tag-scoped question's
+  stored-tag lookup runs on its own small pool: on the shared one, a few cold lookups
+  (a whole-collection scan each) held every worker and other questions' searches
+  waited behind them. An ingest already refused
+  (cancelled, superseded, its original deleted while queued) stops before parsing.
+  Deleting a document removes its points by filter in one call (0.24 s instead of
+  0.48 s at 50k points, under the document's lock).
 - The reranker scores candidates shortest first, so each batch pads to similar lengths:
   about 22% faster over 50 candidates (jina int8, M1). The int8 model's scores depend
   slightly on which passages share a batch, so low-scoring candidates can trade places
@@ -371,6 +405,53 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 10: a follow-up's rewrite and every summary call wait their turn at a local model
+  (`OLLAMA_MAX_PARALLEL`) the way an answer does: announced (`waiting_for_model`), and
+  given up when the reader leaves. They used to wait up to 15 minutes silently, holding
+  the question's slot after the reader had gone. Opt-in query expansion does the same.
+- Pass 10: a streamed question or summary whose reader leaves stops at once. Starlette
+  heard the disconnect, but its cleanup waited for the stream's step in flight, which
+  on a quiet stream (waiting for the local model) blocked until the next 15 s keepalive:
+  the question kept its slot that long (measured live: freed after ~1 s now, was held
+  for the whole of the other answer). Summaries also report `citation_backfilled`. `/questions`
+  holds the model through the answer, its citation retry and follow-ups, as the stream
+  does, and its `total_ms` includes the follow-ups.
+- Pass 10: summaries get citation backfill on local models like answers do (`backfill`
+  mode used to show "checking citations…" and add none); an answer whose only marker sat
+  in an echoed source-header line now announces its citation retry; a combined summary's
+  notes are cut by weighted length (CJK) with no per-note floor that could overrun a
+  small context window.
+- Pass 10: the learned prompt-reading rate ignores one cold model load (the next slow read
+  is believed) and is also learned from non-streamed calls.
+- Pass 10: "Re-index all" no longer fails with a 500, leaving queued jobs without ids, when
+  an original is deleted mid-loop or one job can't be queued, and doesn't queue a
+  document a second time while its first re-index runs; a single re-index of an
+  original that vanished is a 404. A backup listing one name twice queues it once. A
+  watched-folder deletion that fails (Qdrant down) is retried next pass instead of ending
+  the pass. A parse child that can't start no longer leaks its pipe, and one that dies
+  reports its exit code.
+- Pass 10: the browser never saves over a chat history it failed to read (one IndexedDB
+  read error used to replace the full history with the 20-conversation localStorage
+  copy); a conversation renamed or pinned in one tab reaches the others (it wasn't in
+  that copy when it was old, and the next tab's save undid the rename); "Ask about these"
+  scopes at most 500 documents (more made every question a 422); the corpus list
+  refreshes when a background job ends even if another started meanwhile; a finished
+  upload shows its chunk count at once.
+- Pass 10, CLI and eval: a job poll that fails briefly (a restart, a 502) no longer
+  reports a still-running upload as failed; `chat` and the MCP `ask` trim history to
+  what the server accepts (a long earlier answer was a 422); an upload waiting on a full
+  queue stops at `--timeout`. `eval.harness answer` exits 1 when every question failed,
+  `--resume` survives a half-written last line and re-scores kept rows, and its output
+  feeds `ragas_runner` (rows with an error or no context are skipped and counted). The
+  retrieval baseline gate compares every level the baseline has (`unanswerable` too).
+- Pass 10: the UI's readiness check times out like every other request (a server that
+  accepted the connection and never answered left it pending). Deleting a workspace
+  forgets only its own cached listing (every workspace's was dropped). A workspace seen
+  to exist still counts as existing while Qdrant is briefly unreachable, so requests
+  that need nothing from Qdrant (job polls during an upload) don't fail with a 503.
+- Pass 10: `QDRANT_COLLECTION` is checked at startup against what Qdrant refuses
+  (empty, over 255 characters, `< > : " / \ | ? *`); `CHUNK_SIZE_TOKENS` past 512 and
+  `RAW_DOCUMENT_VERSIONS` without `RAW_DOCUMENT_DIR` are warned about.
 - Pass 9: long questions on a local model timed out before the first token.
   `LLM_REQUEST_TIMEOUT_SECONDS` reached httpx as the longest silence allowed (LiteLLM
   turns an `httpx.Timeout` back into one number for Ollama), and Ollama is silent while
@@ -689,6 +770,11 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   starts.
 
 ### Accessibility
+- Pass 10: Regenerate, Retry, Ask again, the rating buttons and follow-up suggestions
+  stay focusable while they can't act (`aria-disabled`): pressing one used to drop
+  keyboard focus to the page for the whole answer. Copying an answer is announced on
+  the thread's status line ("Answer copied."). An open document viewer is no longer
+  re-rendered on every streamed frame (~17 ms a frame with 2000 passages).
 - Pass 7: "Load earlier/later" in the viewer moves focus to the first passage it loaded
   once the button goes; the composer's scope menu closes when focus leaves it; on touch
   screens Enter adds a line (send with the button) and the keyboard hint is hidden; the
