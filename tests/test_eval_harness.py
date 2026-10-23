@@ -588,21 +588,26 @@ def test_answer_rows_are_saved_as_they_finish_and_a_run_resumes(
 
     examples = [example("first"), example("second")]
     output = tmp_path / "answers.json"
-    # A failing question is kept as an error row; the run goes on.
-    assert run_answer_eval(examples, Collab(Broken("x")), output) == 0  # type: ignore[arg-type]
+    # A failing question is kept as an error row; the run goes on — and a run where
+    # every question failed exits 1.
+    assert run_answer_eval(examples, Collab(Broken("x")), output) == 1  # type: ignore[arg-type]
     rows = json.loads(output.read_text())
     assert [r["answer_status"] for r in rows] == ["error", "error"]
     assert "error_rate: 1.000" in capsys.readouterr().out
     assert not partial_path(output).exists()
 
     # An interrupted run left one saved row: --resume answers only the other.
+    # Its last line was cut off mid-write by the kill.
     partial_path(output).write_text(
-        json.dumps({"index": 0, "row": {"question": "first", "answer": "kept c1 [1]"}}) + "\n"
+        json.dumps({"index": 0, "row": {"question": "first", "answer": "kept c1 [1]"}})
+        + '\n{"index": 1, "row": {"quest'
     )
     generator = ScriptedGenerator("c1 it is [1].")
     run_answer_eval(examples, Collab(generator), output, resume=True)  # type: ignore[arg-type]
     rows = json.loads(output.read_text())
     assert [r["answer"] for r in rows] == ["kept c1 [1]", "c1 it is [1]."]
+    # The kept row is scored against the dataset's facts as they are now.
+    assert rows[0]["fact_hit"] is True
     assert len(generator.prompts) == 1
     assert "[2/2] answered" in capsys.readouterr().out
 
@@ -630,3 +635,156 @@ def test_answer_contains_is_validated_and_scored(tmp_path: Path) -> None:
     ]
     assert answer_metrics(examples, rows)["fact_hit_rate"] == 0.5
     assert AnswerRow.from_dict(rows[0].to_dict()) == AnswerRow("q", "x", ["c"], None, fact_hit=True)
+
+
+def test_answer_rows_feed_ragas_with_the_unscorable_ones_left_out(tmp_path: Path) -> None:
+    from eval.harness import AnswerRow
+    from eval.ragas_runner import load_examples
+
+    rows = [
+        AnswerRow("ok", "It is c1 [1].", ["c1 text"], "c1"),
+        AnswerRow("failed", "", [""], None, answer_status="error", error="Timeout"),
+        AnswerRow("refused", "Not covered.", [""], None, answer_status="no_context"),
+    ]
+    path = tmp_path / "answers.json"
+    import json
+
+    path.write_text(json.dumps([row.to_dict() for row in rows]))
+    assert [example.question for example in load_examples(path)] == ["ok"]
+
+
+def test_the_baseline_gate_covers_every_level_it_measured(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from eval.harness import _check_baseline
+
+    results = {
+        "aggregate": {
+            "filename": {"hit@1": 1.0},
+            "unanswerable": {"no_context_rate": 0.5},
+        },
+        "fingerprint": {},
+    }
+    baseline = {
+        "aggregate": {
+            "filename": {"hit@1": 1.0},
+            "unanswerable": {"no_context_rate": 1.0},
+        },
+        "fingerprint": {},
+    }
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps(baseline))
+    assert _check_baseline(results, path, 0.05) == 1
+    assert "unanswerable: no_context_rate" in capsys.readouterr().err
+
+
+def test_the_answer_run_reads_each_document_once() -> None:
+    from eval.harness import RetrievalExample, answer_for_question
+
+    class Counting(AnsweringRepository):
+        reads = 0
+
+        def chunks_for_filename(self, settings: AppSettings, filename: str) -> Any:
+            type(self).reads += 1
+            return super().chunks_for_filename(settings, filename)
+
+    repository = Counting([_point("c1", "a.md")])
+    texts: dict[str, dict[str, str]] = {}
+    for question in ("first", "second"):
+        row = answer_for_question(
+            RetrievalExample(question, None, frozenset({"a.md"}), frozenset()),
+            repository=repository,
+            embedding_provider=FakeEmbeddingProvider(),
+            reranker=FakeReranker(["c1"]),
+            generator=ScriptedGenerator("c1 [1]."),
+            settings=make_settings(),
+            texts=texts,
+        )
+        assert row.contexts == ["c1"]
+    assert Counting.reads == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "message"),
+    [
+        ("d.csv", "question\n", "must be a .json or .jsonl file"),
+        ("d.jsonl", '{"question": "q"}\n{oops\n', "Invalid JSON on line 2"),
+        ("d.json", "{oops", "not valid JSON"),
+        ("d.json", '{"rows": []}', "must be a list or contain an 'examples' list"),
+        ("d.json", '["just a string"]', "must be a JSON object"),
+        ("d.json", "[]", "at least one example"),
+        ("d.jsonl", '{"question": "q", "reference": 3}\n', "'reference' must be a string"),
+        ("d.jsonl", '{"question": "q", "expect_no_context": "yes"}\n', "must be true or false"),
+        (
+            "d.jsonl",
+            '{"question": "q", "expect_no_context": true, "relevant_filenames": ["a.md"]}\n',
+            "can't also name relevant",
+        ),
+        ("d.jsonl", '{"question": "q", "history": [{"role": "bot", "content": "x"}]}\n', "history"),
+        ("d.jsonl", '{"question": "  "}\n', "'question' must be a non-empty string"),
+    ],
+)
+def test_a_malformed_dataset_is_refused_with_its_reason(
+    tmp_path: Path, name: str, content: str, message: str
+) -> None:
+    path = tmp_path / name
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(HarnessDataError, match=message):
+        load_retrieval_dataset(path)
+
+
+def test_main_runs_retrieval_and_answer_modes_with_their_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import eval.harness as harness
+
+    dataset = tmp_path / "d.jsonl"
+    dataset.write_text(
+        '{"question": "a?", "relevant_filenames": ["a.md"]}\n'
+        '{"question": "b?", "relevant_filenames": ["b.md"]}\n',
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, Any]] = []
+    monkeypatch.setattr(harness, "get_settings", lambda: make_settings())
+    monkeypatch.setattr(harness, "Collaborators", lambda settings: "collaborators")
+
+    def fake_retrieval(examples: Any, collab: Any, ks: Any, arm: str) -> dict[str, Any]:
+        calls.append(("retrieval", (len(examples), ks, arm)))
+        return {"aggregate": {}, "fingerprint": {}}
+
+    def fake_baseline(results: Any, path: Path, max_regression: float) -> int:
+        calls.append(("baseline", (path.name, max_regression)))
+        return 1
+
+    def fake_answer(examples: Any, collab: Any, output: Path, *, resume: bool) -> int:
+        calls.append(("answer", (len(examples), output.name, resume)))
+        return 0
+
+    monkeypatch.setattr(harness, "run_retrieval_eval", fake_retrieval)
+    monkeypatch.setattr(harness, "_check_baseline", fake_baseline)
+    monkeypatch.setattr(harness, "run_answer_eval", fake_answer)
+
+    out = tmp_path / "r.json"
+    assert harness.main(["retrieval", str(dataset), "--arm", "fused", "--output", str(out)]) == 0
+    assert calls[-1] == ("retrieval", (2, harness.DEFAULT_KS, "fused"))
+    assert out.exists()
+    baseline = tmp_path / "b.json"
+    assert (
+        harness.main(
+            ["retrieval", str(dataset), "--baseline", str(baseline), "--max-regression", "0.1"]
+        )
+        == 1
+    )
+    assert calls[-1] == ("baseline", ("b.json", 0.1))
+    answers = tmp_path / "a.json"
+    assert (
+        harness.main(["answer", str(dataset), "--output", str(answers), "--limit", "1", "--resume"])
+        == 0
+    )
+    assert calls[-1] == ("answer", (1, "a.json", True))
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text("{oops\n", encoding="utf-8")
+    assert harness.main(["retrieval", str(bad)]) == 2
+    assert "Invalid JSON" in capsys.readouterr().err
