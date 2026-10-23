@@ -247,3 +247,108 @@ describe('the inspector on a "not found" answer', () => {
     );
   });
 });
+
+describe('pass 10: asking about a selection', () => {
+  it('limits the scope to the documents a question can carry, each once', async () => {
+    const { scopeForAskAbout } = await import('../../src/appHelpers');
+    const many = Array.from({ length: 503 }, (_, n) => `doc-${n}.md`);
+    const result = scopeForAskAbout([...many, 'doc-0.md']);
+    expect(result.selected).toBe(503);
+    expect(result.filenames).toHaveLength(500);
+    expect(new Set(result.filenames).size).toBe(500);
+    expect(scopeForAskAbout(['a.md', 'a.md'])).toEqual({ filenames: ['a.md'], selected: 1 });
+  });
+});
+
+describe('pass 10: server activity', () => {
+  it('re-lists the documents when a job ends even if another one started meanwhile', async () => {
+    vi.useFakeTimers();
+    try {
+      const { default: ServerActivity, ACTIVE_JOBS_POLL_MS } = await import(
+        '../../src/components/corpus/ServerActivity'
+      );
+      const job = (id: string) => ({
+        job_id: id,
+        filename: `${id}.md`,
+        state: 'embedding' as const,
+        chunks_total: 0,
+        chunks_done: 0,
+        error: null,
+        result: null,
+      });
+      const listed = vi
+        .spyOn(api, 'listActiveJobs')
+        .mockResolvedValueOnce({ jobs: [job('a')] })
+        .mockResolvedValueOnce({ jobs: [job('b')] });
+      const finished = vi.fn();
+      render(
+        <ServerActivity
+          workspace=""
+          followed={new Set()}
+          watchEnabled={false}
+          canScan={false}
+          onJobsFinished={finished}
+        />,
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(finished).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ACTIVE_JOBS_POLL_MS);
+      });
+      expect(listed).toHaveBeenCalledTimes(2);
+      expect(finished).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('pass 10: copy is announced', () => {
+  it('says on the thread status line that the answer was copied', async () => {
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    try {
+      render(
+        <ChatThread
+          turns={[
+            { id: 'q', role: 'user', content: 'Q?', sources: [], timestamp: 1, timings: null, traceId: null },
+            { id: 'a', role: 'assistant', content: 'Answer.', sources: [], timestamp: 2, timings: null, traceId: null },
+          ]}
+          pending={false}
+          engineerMode={false}
+        />,
+      );
+      await act(async () => {
+        await userEvent.click(screen.getByTestId('chat-message-copy'));
+      });
+      expect(writeText).toHaveBeenCalled();
+      expect(screen.getByTestId('chat-status')).toHaveTextContent('Answer copied.');
+      expect(document.querySelectorAll('[aria-live], [role="status"]')).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('pass 10: reading a conversation file', () => {
+  it('tells an export of all conversations from one, and anything else', async () => {
+    const { parseConversationFile } = await import('../../src/appHelpers');
+    expect(parseConversationFile('not json')).toEqual({ kind: 'none' });
+    expect(parseConversationFile('null')).toEqual({ kind: 'none' });
+    expect(parseConversationFile('[{"role": "user"}]')).toEqual({
+      kind: 'one',
+      raw: [{ role: 'user' }],
+    });
+    expect(
+      parseConversationFile('{"docrag_conversations": [{"title": "A", "turns": []}, 3]}'),
+    ).toEqual({
+      kind: 'many',
+      items: [
+        { raw: { title: 'A', turns: [] }, title: 'A' },
+        { raw: 3, title: undefined },
+      ],
+    });
+  });
+});

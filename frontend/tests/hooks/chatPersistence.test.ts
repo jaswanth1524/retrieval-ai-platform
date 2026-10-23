@@ -413,6 +413,22 @@ describe('what each store keeps of a long history', () => {
     expect(kept).not.toContain('c49');
   });
 
+  it('a conversation renamed or pinned just now reaches the copy other tabs read', () => {
+    // Other tabs learn of changes only through localStorage; a rename of an old
+    // conversation left out of it was overwritten by the next tab's save.
+    const list = many(LOCAL_STORAGE_MAX_CONVERSATIONS + 30);
+    const oldest = list.length - 1;
+    list[oldest] = { ...list[oldest], title: 'Renamed', editedAt: Date.now() + 1000 };
+    const kept = conversationsForLocalStorage({
+      version: 2,
+      activeConversationId: 'c0',
+      conversations: list,
+    }).map((c) => c.id);
+
+    expect(kept).toHaveLength(LOCAL_STORAGE_MAX_CONVERSATIONS);
+    expect(kept).toContain(`c${oldest}`);
+  });
+
   it('a conversation missing from the compact copy is not read as deleted', () => {
     const local = storage(many(3));
     const merged = mergeConversations(local, [local.conversations[0]], true);

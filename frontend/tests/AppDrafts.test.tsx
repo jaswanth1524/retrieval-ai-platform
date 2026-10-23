@@ -6,9 +6,10 @@ import { afterEach, expect, it, vi } from 'vitest';
 let finishLoad: ((value: unknown) => void) | undefined;
 vi.mock('../src/hooks/chatStore', () => ({
   chatStoreAvailable: () => true,
-  loadChatStore: () =>
+  readChatStore: () =>
     new Promise((resolve) => {
-      finishLoad = resolve;
+      finishLoad = (value) =>
+        resolve(value == null ? { status: 'empty' } : { status: 'data', value });
     }),
   saveChatStore: async () => true,
   clearChatStore: async () => true,

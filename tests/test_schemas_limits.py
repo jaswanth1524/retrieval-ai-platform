@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from api.documents import SUPPORTED_EXTENSIONS
-from api.schemas import MAX_QUESTION_CHARS
+from api.schemas import MAX_QUESTION_CHARS, REQUEST_FILENAMES_MAX
 
 UTILS = Path(__file__).resolve().parents[1] / "frontend" / "src" / "utils"
 LIMITS_TS = UTILS / "limits.ts"
@@ -33,3 +33,9 @@ def test_the_frontend_workspace_name_rule_matches_the_api() -> None:
     match = re.search(r"export const WORKSPACE_NAME_PATTERN = /(.+)/;", LIMITS_TS.read_text())
     assert match is not None
     assert match.group(1) == _NAME_RE.pattern
+
+
+def test_the_frontend_scope_limit_matches_the_api() -> None:
+    match = re.search(r"export const MAX_SCOPE_FILENAMES = (\d+);", LIMITS_TS.read_text())
+    assert match is not None
+    assert int(match.group(1)) == REQUEST_FILENAMES_MAX

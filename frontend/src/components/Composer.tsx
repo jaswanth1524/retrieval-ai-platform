@@ -6,7 +6,7 @@ import { isImeComposing } from '../utils/keyboard';
 import { enterAddsNewline } from '../utils/platform';
 import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
-import { MAX_QUESTION_CHARS } from '../utils/limits';
+import { MAX_QUESTION_CHARS, MAX_SCOPE_FILENAMES } from '../utils/limits';
 import { isProviderAllowed, isProviderUsable } from '../utils/providers';
 
 // The most tags and files one question may be scoped to (api/schemas.py's
@@ -15,7 +15,6 @@ import { isProviderAllowed, isProviderUsable } from '../utils/providers';
 const MAX_SCOPE_TAGS = 20;
 // The most of the window the question box grows to before it scrolls.
 const COMPOSER_MAX_HEIGHT_SHARE = 0.4;
-const MAX_SCOPE_FILENAMES = 500;
 
 interface ComposerProps {
   onSubmit: (question: string) => void;

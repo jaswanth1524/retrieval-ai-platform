@@ -258,6 +258,20 @@ export function useCorpus(callbacks: CorpusCallbacks) {
           // Dedupe by name — re-uploading the same filename replaces its chunks
           // server-side, so the corpus list should not grow a second entry for it.
           setIndexedFilenames((prev) => (prev.includes(indexedName) ? prev : [...prev, indexedName]));
+          // The listing is refreshed once the whole batch ends; until then a new card
+          // read "0 chunks". The job's own count is shown in the meantime.
+          const chunks = status.result?.chunks_ingested;
+          if (typeof chunks === 'number') {
+            setDocuments((prev) => {
+              const before = prev[indexedName] as DocumentMeta | undefined;
+              return {
+                ...prev,
+                [indexedName]: before
+                  ? { ...before, chunks }
+                  : { chunks, stale: false, reindexable: false, tags: [] },
+              };
+            });
+          }
         }
       } catch (err) {
         if (err instanceof UploadCancelled) {
@@ -424,6 +438,15 @@ export function useCorpus(callbacks: CorpusCallbacks) {
           tone: 'warn',
           title: `${response.deferred.length} document${response.deferred.length === 1 ? '' : 's'} not started`,
           body: 'The indexing queue is full. Re-index the rest once these finish.',
+        });
+      }
+      // Fields an older server doesn't send.
+      const failed = response.failed ?? [];
+      if (failed.length > 0) {
+        deps.current.pushToast({
+          tone: 'bad',
+          title: `${failed.length} document${failed.length === 1 ? '' : 's'} could not be re-indexed`,
+          body: failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : ''),
         });
       }
       const items: UploadItem[] = response.jobs.map((job) => ({

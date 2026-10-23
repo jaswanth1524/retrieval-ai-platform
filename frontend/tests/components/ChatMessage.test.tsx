@@ -116,7 +116,7 @@ describe('ChatMessage', () => {
         busy
       />,
     );
-    expect(screen.getByTestId('chat-message-regenerate')).toBeDisabled();
+    expect(screen.getByTestId('chat-message-regenerate')).toHaveAttribute('aria-disabled', 'true');
 
     rerender(
       <ChatMessage
@@ -126,7 +126,7 @@ describe('ChatMessage', () => {
         busy
       />,
     );
-    expect(screen.getByTestId('chat-message-retry')).toBeDisabled();
+    expect(screen.getByTestId('chat-message-retry')).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('renders no per-turn trace drawer — trace detail lives in the inspector now', () => {
@@ -402,7 +402,7 @@ describe('ChatMessage', () => {
     expect(onAskFollowup).toHaveBeenCalledWith('Where is gamma?');
 
     rerender(<ChatMessage turn={turn} engineerMode={false} onAskFollowup={onAskFollowup} busy />);
-    expect(screen.getAllByTestId('chat-message-followup')[0]).toBeDisabled();
+    expect(screen.getAllByTestId('chat-message-followup')[0]).toHaveAttribute('aria-disabled', 'true');
     // Without the handler (an older answer), nothing is offered.
     rerender(<ChatMessage turn={turn} engineerMode={false} />);
     expect(screen.queryByTestId('chat-message-followup')).not.toBeInTheDocument();
@@ -659,8 +659,8 @@ describe('ChatMessage', () => {
         traceId: 'trace-1',
         kind: 'question',
       });
-      expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
-      expect(screen.getByTestId('chat-message-feedback-down')).toBeDisabled();
+      expect(screen.getByTestId('chat-message-feedback-up')).toHaveAttribute('aria-disabled', 'true');
+      expect(screen.getByTestId('chat-message-feedback-down')).toHaveAttribute('aria-disabled', 'true');
       expect(screen.getByTestId('chat-message-feedback-up')).toHaveAttribute('aria-pressed', 'true');
     });
 
@@ -693,7 +693,7 @@ describe('ChatMessage', () => {
       const { rerender } = render(
         <ChatMessage {...props} turn={makeTurn({ role: 'assistant', content: 'A.', feedback: 'up' })} />,
       );
-      expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
+      expect(screen.getByTestId('chat-message-feedback-up')).toHaveAttribute('aria-disabled', 'true');
 
       rerender(<ChatMessage {...props} turn={makeTurn({ role: 'assistant', content: 'A.' })} />);
 
@@ -713,7 +713,7 @@ describe('ChatMessage', () => {
       );
 
       expect(screen.getByTestId('chat-message-feedback-down')).toHaveAttribute('aria-pressed', 'true');
-      expect(screen.getByTestId('chat-message-feedback-up')).toBeDisabled();
+      expect(screen.getByTestId('chat-message-feedback-up')).toHaveAttribute('aria-disabled', 'true');
     });
 
     it('renders no feedback buttons on the turn actively streaming', () => {
@@ -870,4 +870,24 @@ describe('ChatMessage answer-progress announcement', () => {
     expect(screen.getByTestId('chat-message-stopped')).toBeInTheDocument();
     expect(screen.getByTestId('chat-message-cached')).toBeInTheDocument();
   });
+});
+
+
+it('keeps focus on an answer button that turns inactive when pressed', async () => {
+  const onRetry = vi.fn();
+  const turn = makeTurn({ role: 'assistant', content: 'Answer.' });
+  const { rerender } = render(
+    <ChatMessage turn={turn} engineerMode={false} regenerateQuestion="Q?" onRetry={onRetry} />,
+  );
+  const button = screen.getByTestId('chat-message-regenerate');
+  button.focus();
+  await userEvent.keyboard('{Enter}');
+  expect(onRetry).toHaveBeenCalledTimes(1);
+  // The question is now being asked: the button stays focused, and does nothing.
+  rerender(
+    <ChatMessage turn={turn} engineerMode={false} regenerateQuestion="Q?" onRetry={onRetry} busy />,
+  );
+  expect(document.activeElement).toBe(screen.getByTestId('chat-message-regenerate'));
+  await userEvent.keyboard('{Enter}');
+  expect(onRetry).toHaveBeenCalledTimes(1);
 });

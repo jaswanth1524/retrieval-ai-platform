@@ -1900,3 +1900,80 @@ it('asking an unanswered question again replaces it rather than repeating it', a
     ['assistant', 'Ten days [1].'],
   ]);
 });
+
+it('imports a whole export into the room left, keeping its dates and every existing chat', () => {
+  const { result } = renderHook(() => useChat());
+  const turn = (id: string, role: string, content: string) => ({
+    id,
+    role,
+    content,
+    sources: [],
+    timestamp: 1,
+    timings: null,
+    traceId: null,
+  });
+  const pair = (n: number) => [
+    turn(`q${n}`, 'user', `Question ${n}?`),
+    turn(`a${n}`, 'assistant', `Answer ${n}.`),
+  ];
+  act(() => {
+    for (let n = 0; n < MAX_CONVERSATIONS - 3; n += 1) result.current.importConversation(pair(n));
+  });
+  const before = new Set(result.current.conversations.map((c) => c.id));
+  const old = Date.UTC(2025, 0, 1);
+  const items = [1, 2, 3, 4, 5].map((n) => ({
+    raw: { turns: pair(100 + n), createdAt: old + n, updatedAt: old + n * 1000 },
+    title: `Imported ${n}`,
+  }));
+
+  let outcome!: { imported: number; skipped: number };
+  act(() => {
+    outcome = result.current.importConversations(items);
+  });
+
+  expect(outcome.imported + outcome.skipped).toBe(5);
+  expect(outcome.skipped).toBeGreaterThan(0);
+  const after = result.current.conversations;
+  expect(after.length).toBeLessThanOrEqual(MAX_CONVERSATIONS);
+  // Nothing that was there is gone.
+  for (const id of before) expect(after.some((c) => c.id === id)).toBe(true);
+  // The newest of the imported ones came in, with its own date.
+  const newest = after.find((c) => c.title === 'Imported 5');
+  expect(newest?.updatedAt).toBe(old + 5000);
+});
+
+it('makes room for an import only when asked, never removing a pinned or the active chat', () => {
+  const { result } = renderHook(() => useChat());
+  const turn = (id: string, role: string, content: string) => ({
+    id,
+    role,
+    content,
+    sources: [],
+    timestamp: 1,
+    timings: null,
+    traceId: null,
+  });
+  const pair = (n: number) => [turn(`q${n}`, 'user', `Q ${n}?`), turn(`a${n}`, 'assistant', `A ${n}.`)];
+  act(() => {
+    for (let n = 0; n < MAX_CONVERSATIONS - 2; n += 1) result.current.importConversation(pair(n));
+  });
+  // The oldest one pinned: it stays whatever happens.
+  const oldest = [...result.current.conversations].sort((a, b) => a.updatedAt - b.updatedAt)[0];
+  act(() => {
+    result.current.setPinned(oldest.id, true);
+  });
+  const now = Date.now();
+  const items = [1, 2, 3, 4, 5].map((n) => ({
+    raw: { turns: pair(500 + n), createdAt: now - n, updatedAt: now - n },
+  }));
+  expect(result.current.importPreview(items)).toEqual({ valid: 5, room: 1 });
+
+  let outcome!: { imported: number; skipped: number; removed: number };
+  act(() => {
+    outcome = result.current.importConversations(items, { makeRoom: true });
+  });
+
+  expect(outcome).toEqual({ imported: 5, skipped: 0, removed: 4 });
+  expect(result.current.conversations.length).toBe(MAX_CONVERSATIONS);
+  expect(result.current.conversations.some((c) => c.id === oldest.id)).toBe(true);
+});

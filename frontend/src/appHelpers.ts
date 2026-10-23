@@ -4,6 +4,7 @@ import type { ChatMode } from './components/ChatHeader';
 import type { ChatTurn } from './components/ChatMessage';
 import type { DocumentMeta } from './components/CorpusPanel';
 import type { RailPanel } from './components/IconRail';
+import { MAX_SCOPE_FILENAMES } from './utils/limits';
 import { EMPTY_OVERRIDES } from './utils/overrides';
 import { readStored, readStoredJson } from './utils/safeStorage';
 
@@ -120,4 +121,48 @@ export function notFoundSourcesMessage(turn: ChatTurn | undefined): string | und
   return turn.scoped
     ? 'Nothing in the selected documents matched this question.'
     : 'Nothing in your documents matched this question.';
+}
+
+/** The documents "Ask about these" limits a conversation to: each once, at most the
+ *  server's MAX_SCOPE_FILENAMES (past it every question and search was a 422), and how
+ *  many were selected in all. */
+export function scopeForAskAbout(filenames: readonly string[]): {
+  filenames: string[];
+  selected: number;
+} {
+  const unique = [...new Set(filenames)];
+  return { filenames: unique.slice(0, MAX_SCOPE_FILENAMES), selected: unique.length };
+}
+
+/** What a conversation file holds: "Export all conversations" wrote several (each with
+ *  its title), a single conversation's export is one; ``none`` when it isn't JSON. */
+export function parseConversationFile(
+  text: string,
+):
+  | { kind: 'many'; items: { raw: unknown; title?: string }[] }
+  | { kind: 'one'; raw: unknown }
+  | { kind: 'none' } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: 'none' };
+  }
+  const many =
+    parsed && typeof parsed === 'object' && 'docrag_conversations' in parsed
+      ? (parsed as { docrag_conversations: unknown }).docrag_conversations
+      : null;
+  if (Array.isArray(many)) {
+    return {
+      kind: 'many',
+      items: many.map((item: unknown) => ({
+        raw: item,
+        title:
+          item && typeof item === 'object' && typeof (item as { title?: unknown }).title === 'string'
+            ? (item as { title: string }).title
+            : undefined,
+      })),
+    };
+  }
+  return parsed === null ? { kind: 'none' } : { kind: 'one', raw: parsed };
 }

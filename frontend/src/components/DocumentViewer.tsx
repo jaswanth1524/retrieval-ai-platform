@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { ContentPage } from '../api/client';
@@ -461,4 +461,6 @@ function DocumentViewer({
   );
 }
 
-export default DocumentViewer;
+// Memoized: App re-renders on every frame of a streaming answer, and an open viewer
+// holds up to every passage of a document.
+export default memo(DocumentViewer);
