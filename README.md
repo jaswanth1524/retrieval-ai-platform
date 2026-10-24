@@ -231,7 +231,25 @@ curl -fsS -H "$KEY" -H 'Content-Type: application/json' \
 # Passages only, no LLM:
 curl -fsS -H "$KEY" -H 'Content-Type: application/json' -d '{"query": "leave policy"}' \
   http://127.0.0.1:8000/search | jq '.results[] | {filename, page, rerank_score}'
+# A question narrowed like a search (pages, a section, chunk ids, documents left out),
+# answered as bullet points in German:
+curl -fsS -H "$KEY" -H 'Content-Type: application/json' \
+  -d '{"question": "What changed?", "filenames": ["handbook.pdf"], "page_min": 10,
+       "page_max": 14, "answer_format": "bullets", "answer_language": "German"}' \
+  http://127.0.0.1:8000/questions | jq '{answer, usage}'
+# Every trace of the workspace as JSON Lines (all of them with TRACE_STORE_PATH):
+curl -fsS -H "$KEY" http://127.0.0.1:8000/traces/export -o traces.jsonl
 ```
+
+`usage.cost_usd` is an estimate at the hosted model's list price (LiteLLM's bundled
+table); local models have none. An identical question asked while the same one is being
+answered waits for it and gets its answer (`cached: true`) rather than running again.
+
+Every change to the corpus (delete, tag change, re-index, refresh, version restore, job
+cancel, backup import, workspace create/delete) is logged on `api.audit` — with
+`LOG_FORMAT=json` as an `audit` object carrying the workspace, the kind of key used
+(`full`, `read`, `open`, or `system` for the folder watcher) and the client address. It
+is kept at any `LOG_LEVEL`. With one shared key it says which key, not which person.
 
 To scrape the metrics with Prometheus when `API_KEY` is set (`/metrics` needs the full key; `http_headers` needs a recent Prometheus — on an older one, put the header on a proxy in front):
 
@@ -280,7 +298,27 @@ docrag watch [--scan]                    # the watched folder's state
 docrag versions handbook.pdf [--restore VERSION]   # needs RAW_DOCUMENT_VERSIONS
 docrag queries [--uncovered]             # the query log (QUERY_LOG_ENABLED)
 docrag export backup.zip                 # and: import backup.zip
+docrag ask "What changed?" --file handbook.pdf --page-min 10 --answer-format bullets \
+  --format markdown                      # sources as footnotes with their quotes
+docrag completion zsh > "${fpath[1]}/_docrag"   # or bash; generated from the commands
 ```
+
+Named servers live in `~/.config/docrag/config.toml` (`DOCRAG_CONFIG` for another file),
+picked with `--profile NAME` or `DOCRAG_PROFILE`; `[default]` applies without one. A key
+is never written there — `key_env` names the variable holding it:
+
+```toml
+[default]
+url = "http://127.0.0.1:8000"
+
+[profiles.prod]
+url = "https://docs.example.com"
+workspace = "legal"
+key_env = "DOCRAG_PROD_KEY"
+```
+
+Flags win over `DOCRAG_*` variables, which win over the profile. At a terminal `chat`
+edits lines and remembers earlier questions (↑) in `$XDG_STATE_HOME/docrag/history`.
 
 `--json` gives machine-readable output; the exit code is 1 when a request (or any upload,
 or any file `delete` names) failed, with `ask --strict` 3 when the documents don't answer
@@ -520,6 +558,22 @@ single citation are skipped. The output is validated like `validate` before it i
 uv run python -m eval.harness from-feedback --store data/feedback.db \
   --output eval/datasets/from_feedback.jsonl --review review.jsonl
 # or from a backup: --export docrag-backup.zip
+```
+
+A comparison has more than one fact to state: `answer_contains_all` lists one group per
+side (`[["sixty euros", "60 euros"], ["forty-five euros", "45 euros"]]`), and the answer
+must state one of each. `eval/datasets/compare_eval.jsonl` is such a set.
+
+Two runs of the same command compare question by question — every question that got
+better or worse, with what moved — and a run becomes one HTML page (with RAGAS scores
+and a diff against a base run when given):
+
+```bash
+uv run python -m eval.harness diff before.json after.json [--fail-on-regression]
+uv run python -m eval.harness report answers.json --ragas ragas.json --diff before.json \
+  --output report.html
+make eval-diff BEFORE=old-answers.json AFTER=eval-answers.json
+make eval-report         # eval-answers.json (+ eval-ragas.json) as eval-report.html
 ```
 
 The metric math and the harness logic (ranking per arm, passage resolution, the
