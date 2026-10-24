@@ -7,6 +7,9 @@ interface TracesPanelProps {
   traces: TraceSummaryResponse[] | null;
   error: string | null;
   onSelect: (traceId: string) => void;
+  /** Download every trace of this workspace as JSON Lines (full key only). */
+  onExport?: () => void;
+  exporting?: boolean;
 }
 
 function latencyClass(totalMs: number | null): string {
@@ -23,7 +26,7 @@ function formatLatency(totalMs: number | null): string {
 
 type StatusFilter = 'all' | 'problems';
 
-function TracesPanel({ traces, error, onSelect }: TracesPanelProps) {
+function TracesPanel({ traces, error, onSelect, onExport, exporting = false }: TracesPanelProps) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
   if (error) {
@@ -68,6 +71,18 @@ function TracesPanel({ traces, error, onSelect }: TracesPanelProps) {
           />
           errors &amp; no context only
         </label>
+        {onExport && (
+          <button
+            type="button"
+            className="traces-panel__export mono"
+            onClick={onExport}
+            disabled={exporting}
+            title="Download every trace as JSON Lines"
+            data-testid="traces-export"
+          >
+            {exporting ? 'exporting…' : 'export JSONL'}
+          </button>
+        )}
       </div>
       {shown.length === 0 && (
         <p className="traces-panel__message">No traces match.</p>

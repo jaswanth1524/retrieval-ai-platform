@@ -63,10 +63,32 @@ def answer_language_instruction(settings: AppSettings) -> str:
     return f"Write the answer in {language}."
 
 
-def with_answer_language(messages: list[ChatMessage], settings: AppSettings) -> list[ChatMessage]:
-    """``messages`` with ANSWER_LANGUAGE's sentence added to the system message."""
+# ANSWER_FORMAT / a question's answer_format: one fixed sentence each, so the prompt
+# prefix stays cacheable per format.
+_ANSWER_FORMAT_INSTRUCTIONS = {
+    "bullets": "Format the answer as a bulleted list, one point per line, each point "
+    "with its citation.",
+    "table": "Where the content allows it, format the answer as a Markdown table, with "
+    "citations inside the cells; otherwise answer in prose.",
+    "brief": "Keep the answer to two or three sentences.",
+}
 
-    instruction = answer_language_instruction(settings)
+
+def answer_format_instruction(settings: AppSettings) -> str:
+    """The system-prompt sentence for ANSWER_FORMAT ("" for "default")."""
+
+    return _ANSWER_FORMAT_INSTRUCTIONS.get(settings.answer_format, "")
+
+
+def with_answer_language(messages: list[ChatMessage], settings: AppSettings) -> list[ChatMessage]:
+    """``messages`` with ANSWER_LANGUAGE's and ANSWER_FORMAT's sentences added to the
+    system message, after the grounding rules (which they never replace)."""
+
+    instruction = " ".join(
+        sentence
+        for sentence in (answer_language_instruction(settings), answer_format_instruction(settings))
+        if sentence
+    )
     if not instruction or not messages or messages[0]["role"] != "system":
         return messages
     first = {"role": "system", "content": f"{messages[0]['content']} {instruction}"}
@@ -277,7 +299,12 @@ def fit_prompt_to_context_window(
 
     def size() -> int:
         return estimate_prompt_tokens(
-            build_grounded_messages(query, chunks, kept_history or None, weak_matches=weak_matches)
+            with_answer_language(
+                build_grounded_messages(
+                    query, chunks, kept_history or None, weak_matches=weak_matches
+                ),
+                settings,
+            )
         )
 
     # Neighbour text first, from the lowest-ranked passage up: it is context around a

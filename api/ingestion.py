@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from threading import Lock
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 from uuid import NAMESPACE_URL, uuid5
 
 import numpy as np
@@ -16,10 +17,12 @@ from qdrant_client import models
 
 from api.documents import DocumentChunk, EmptyDocumentError, contextual_text
 from api.embeddings import EmbeddedText, EmbeddingError
-from api.metrics import ingest_stage_seconds
+from api.metrics import ingest_stage_seconds, ingest_vectors_reused_total
 from api.qdrant_schema import check_dense_dimension
 from api.settings import AppSettings
 from api.workspaces import document_key
+
+logger = logging.getLogger(__name__)
 
 
 class IngestionError(RuntimeError):
@@ -55,6 +58,15 @@ class WriteRepository(Protocol):
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None: ...
 
     def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]: ...
+
+
+class VectorLookup(Protocol):
+    """Reads stored vectors back (``VectorRepository.stored_vectors``); a repository
+    without it simply embeds every chunk."""
+
+    def stored_vectors(
+        self, settings: AppSettings, point_ids: Sequence[str]
+    ) -> dict[str, tuple[list[float], models.SparseVector, str | None]]: ...
 
 
 @dataclass(frozen=True)
@@ -289,8 +301,18 @@ def ingest_chunks(
     repository.ensure_ready(settings)
 
     total = len(chunks)
+    reuse_start = time.monotonic()
+    reused = _reusable_vectors(repository, settings, chunks)
+    if reused:
+        ingest_stage_seconds.labels(stage="reuse").observe(time.monotonic() - reuse_start)
+        ingest_vectors_reused_total.inc(len(reused))
+        logger.info(
+            "Reusing the stored vectors of %d of %d chunk(s); embedding the rest.",
+            len(reused),
+            total,
+        )
     embed_start = time.monotonic()
-    embeddings = _embed_all(chunks, settings, embedding_provider, precondition, on_progress)
+    embeddings = _embed_all(chunks, settings, embedding_provider, precondition, on_progress, reused)
     ingest_stage_seconds.labels(stage="embed").observe(time.monotonic() - embed_start)
 
     # Filenames are locked in sorted order so two multi-file ingests that share more
@@ -354,34 +376,88 @@ def ingest_chunks(
         )
 
 
+def _reusable_vectors(
+    repository: WriteRepository, settings: AppSettings, chunks: Sequence[DocumentChunk]
+) -> dict[int, _StoredEmbedding]:
+    """The stored vectors of the chunks that didn't change, by position in ``chunks``.
+
+    A point id hashes the filename, page, section and text — everything the embedded
+    text (``contextual_text``) is made of — and the collection's checks (embedding tag,
+    dense model, passage prefix, sparse language) refuse any write under another
+    embedding setup, so a stored point with the same id holds the vectors this chunk
+    would get. The chunking fingerprint must match too: it names the dense model and
+    the chunker version, which is bumped whenever what gets embedded changes. Only ids
+    already stored for these filenames are read back (a new document costs one scroll).
+    """
+
+    lookup = getattr(repository, "stored_vectors", None)
+    if not settings.ingest_reuse_vectors or lookup is None:
+        return {}
+    stored_ids: set[str] = set()
+    for filename in {chunk.filename for chunk in chunks}:
+        stored_ids.update(repository.point_ids_for_filename(settings, filename))
+    if not stored_ids:
+        return {}
+    wanted = {
+        position: point_id
+        for position, chunk in enumerate(chunks)
+        if (point_id := point_id_for_chunk(chunk)) in stored_ids
+    }
+    if not wanted:
+        return {}
+    stored = cast(VectorLookup, repository).stored_vectors(settings, list(set(wanted.values())))
+    dimension = int(settings.qdrant_dense_vector_size)
+    reused: dict[int, _StoredEmbedding] = {}
+    for position, point_id in wanted.items():
+        found = stored.get(point_id)
+        if found is None:
+            continue
+        dense, sparse, fingerprint = found
+        if fingerprint != chunks[position].chunking_fingerprint or len(dense) != dimension:
+            continue
+        reused[position] = _StoredEmbedding.of(EmbeddedText(dense=dense, sparse=sparse))
+    return reused
+
+
 def _embed_all(
     chunks: Sequence[DocumentChunk],
     settings: AppSettings,
     embedding_provider: EmbeddingProvider,
     precondition: Callable[[], None] | None,
     on_progress: Callable[[int, int], None] | None,
+    reused: dict[int, _StoredEmbedding] | None = None,
 ) -> list[_StoredEmbedding]:
-    """Every chunk's vectors, embedded in ``ingest_batch_size`` batches with no lock
-    held; ``precondition`` checked before each batch, progress reported after it."""
+    """Every chunk's vectors — ``reused`` ones as given, the others embedded in
+    ``ingest_batch_size`` batches with no lock held; ``precondition`` checked before
+    each batch, progress (reused chunks counted as done) reported after it."""
 
+    reused = reused or {}
     batch_size = int(settings.ingest_batch_size)
     total = len(chunks)
-    embeddings: list[_StoredEmbedding] = []
-    for start in range(0, total, batch_size):
+    pending = [position for position in range(total) if position not in reused]
+    embeddings: list[_StoredEmbedding | None] = [reused.get(position) for position in range(total)]
+    if precondition is not None and not pending:
+        precondition()
+    for start in range(0, len(pending), batch_size):
         if precondition is not None:
             precondition()
-        batch = chunks[start : start + batch_size]
-        embedded = embedding_provider.embed_texts([_contextual_embedding_text(c) for c in batch])
-        if len(embedded) != len(batch):
+        positions = pending[start : start + batch_size]
+        embedded = embedding_provider.embed_texts(
+            [_contextual_embedding_text(chunks[position]) for position in positions]
+        )
+        if len(embedded) != len(positions):
             raise EmbeddingError(
-                f"Embedding count mismatch: got {len(embedded)}, expected {len(batch)}."
+                f"Embedding count mismatch: got {len(embedded)}, expected {len(positions)}."
             )
         if start == 0:
             check_dense_dimension(len(embedded[0].dense), settings)
-        embeddings.extend(_StoredEmbedding.of(embedding) for embedding in embedded)
+        for position, embedding in zip(positions, embedded, strict=True):
+            embeddings[position] = _StoredEmbedding.of(embedding)
         if on_progress is not None:
-            on_progress(min(start + batch_size, total), total)
-    return embeddings
+            on_progress(len(reused) + min(start + batch_size, len(pending)), total)
+    if on_progress is not None and not pending:
+        on_progress(total, total)
+    return [embedding for embedding in embeddings if embedding is not None]
 
 
 def _upsert_all(

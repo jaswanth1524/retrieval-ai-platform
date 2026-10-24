@@ -5,7 +5,7 @@ import type { ChatTurn } from './components/ChatMessage';
 import type { DocumentMeta } from './components/CorpusPanel';
 import type { RailPanel } from './components/IconRail';
 import { MAX_SCOPE_FILENAMES } from './utils/limits';
-import { EMPTY_OVERRIDES } from './utils/overrides';
+import { EMPTY_OVERRIDES, isAnswerFormat, isAnswerLanguage } from './utils/overrides';
 import { readStored, readStoredJson } from './utils/safeStorage';
 
 export const ADVANCED_OPTIONS_STORAGE_KEY = 'docrag-advanced-options';
@@ -22,6 +22,11 @@ export function loadPersistedOverrides(): QuestionOverrides {
     rerankTopK: parsed.rerankTopK ?? null,
     maxContextChunks: parsed.maxContextChunks ?? null,
     llmTemperature: parsed.llmTemperature ?? null,
+    answerFormat: isAnswerFormat(parsed.answerFormat) ? parsed.answerFormat : null,
+    answerLanguage:
+      typeof parsed.answerLanguage === 'string' && isAnswerLanguage(parsed.answerLanguage)
+        ? parsed.answerLanguage.trim()
+        : null,
   };
 }
 
@@ -47,6 +52,8 @@ export function clampOverrides(
         ? Math.min(maxContextChunks, rerankTopK)
         : maxContextChunks,
     llmTemperature: within(overrides.llmTemperature, config.llm_temperature_max, 0),
+    answerFormat: overrides.answerFormat ?? null,
+    answerLanguage: overrides.answerLanguage ?? null,
   };
 }
 
@@ -83,8 +90,11 @@ export function canPreviewOriginal(
 }
 
 // Shared empty values: a fresh [] per render would re-render the memoized child.
-export const NO_HIDDEN_PANELS: RailPanel[] = [];
-export const HIDDEN_FEEDBACK_PANEL: RailPanel[] = ['feedback'];
+/** The rail panels to leave out: feedback and the query log are operator data (full
+ *  key), and each exists only when the server has it on. */
+export function hiddenPanels(feedbackAvailable: boolean, unansweredAvailable: boolean): RailPanel[] {
+  return [...(feedbackAvailable ? [] : ['feedback' as const]), ...(unansweredAvailable ? [] : ['unanswered' as const])];
+}
 export const NO_SOURCES: CitationResponse[] = [];
 
 export const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
@@ -93,6 +103,7 @@ export const PANEL_META: Record<RailPanel, { title: string; actionLabel: string 
   search: { title: 'Search passages', actionLabel: 'Clear' },
   traces: { title: 'Traces', actionLabel: 'Refresh' },
   feedback: { title: 'Feedback', actionLabel: 'Refresh' },
+  unanswered: { title: 'Unanswered questions', actionLabel: 'Refresh' },
 };
 
 export function scopeLabel(

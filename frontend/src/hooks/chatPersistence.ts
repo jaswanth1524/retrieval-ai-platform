@@ -5,7 +5,7 @@
  * versioned payloads, sanitizing what is read back, compacting what is written, and
  * merging two copies of the same history.
  */
-import type { CitationResponse, DocumentTask } from '../api/types';
+import type { CitationResponse, DocumentTask, PassageNarrowing } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
 import { WORKSPACE_NAME_PATTERN } from '../utils/limits';
@@ -14,6 +14,9 @@ import { WORKSPACE_NAME_PATTERN } from '../utils/limits';
 export interface ConversationScope {
   filenames: string[];
   tags: string[];
+  /** A page range within the one scoped document (used only while exactly one is). */
+  pageMin?: number;
+  pageMax?: number;
 }
 
 export const EMPTY_SCOPE: ConversationScope = { filenames: [], tags: [] };
@@ -212,6 +215,34 @@ export function sanitizeTask(value: unknown): DocumentTask | null {
   return sanitized;
 }
 
+/** A question's saved narrowing, within what the server takes (schemas.PassageNarrowing),
+ *  or null when nothing usable is left. */
+export function sanitizeNarrowing(value: unknown): PassageNarrowing | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const page = (item: unknown) =>
+    typeof item === 'number' && Number.isInteger(item) && item >= 1 ? item : undefined;
+  const strings = (list: unknown, max: number, maxChars: number) =>
+    Array.isArray(list)
+      ? list
+          .filter((item): item is string => typeof item === 'string' && item !== '' && item.length <= maxChars)
+          .slice(0, max)
+      : [];
+  const narrowing: PassageNarrowing = {};
+  const pageMin = page(raw.page_min);
+  const pageMax = page(raw.page_max);
+  if (pageMin !== undefined && !(pageMax !== undefined && pageMin > pageMax)) narrowing.page_min = pageMin;
+  if (pageMax !== undefined && !(pageMin !== undefined && pageMin > pageMax)) narrowing.page_max = pageMax;
+  if (typeof raw.section === 'string' && raw.section && raw.section.length <= 200) {
+    narrowing.section = raw.section;
+  }
+  const exclude = strings(raw.exclude_filenames, 500, 1024);
+  if (exclude.length > 0) narrowing.exclude_filenames = exclude;
+  const chunkIds = strings(raw.chunk_ids, 100, 64);
+  if (chunkIds.length > 0) narrowing.chunk_ids = chunkIds;
+  return Object.keys(narrowing).length > 0 ? narrowing : null;
+}
+
 function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
@@ -256,6 +287,8 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   }
   const task = sanitizeTask(turn.task);
   if (task) sanitized.task = task;
+  const narrowing = sanitizeNarrowing(turn.narrowing);
+  if (narrowing) sanitized.narrowing = narrowing;
   const followups = cleanFollowups(turn.followups);
   if (followups.length > 0) sanitized.followups = followups;
   if (Array.isArray(turn.irrelevantSources)) {
@@ -269,8 +302,13 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   }
   const usage = turn.usage as unknown;
   if (usage && typeof usage === 'object') {
-    const { prompt, completion } = usage as Record<string, unknown>;
-    if (isCount(prompt) && isCount(completion)) sanitized.usage = { prompt, completion };
+    const { prompt, completion, costUsd } = usage as Record<string, unknown>;
+    if (isCount(prompt) && isCount(completion)) {
+      sanitized.usage = { prompt, completion };
+      if (typeof costUsd === 'number' && Number.isFinite(costUsd) && costUsd >= 0) {
+        sanitized.usage.costUsd = costUsd;
+      }
+    }
   }
   const coverage = turn.coverage as unknown;
   if (coverage && typeof coverage === 'object') {
@@ -701,7 +739,25 @@ export function sanitizeScope(value: unknown): ConversationScope | undefined {
   const raw = value as Partial<ConversationScope>;
   const strings = (list: unknown) =>
     Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : [];
-  return { filenames: strings(raw.filenames), tags: strings(raw.tags) };
+  const page = (item: unknown) =>
+    typeof item === 'number' && Number.isInteger(item) && item >= 1 && item <= 1_000_000 ? item : undefined;
+  const scope: ConversationScope = { filenames: strings(raw.filenames), tags: strings(raw.tags) };
+  const pageMin = page(raw.pageMin);
+  const pageMax = page(raw.pageMax);
+  if (pageMin !== undefined && (pageMax === undefined || pageMin <= pageMax)) scope.pageMin = pageMin;
+  if (pageMax !== undefined && (pageMin === undefined || pageMin <= pageMax)) scope.pageMax = pageMax;
+  return scope;
+}
+
+/** The scope's page range as question narrowing — only while exactly one document is
+ *  scoped (a range across several documents means nothing). */
+export function scopePageNarrowing(scope: ConversationScope): { page_min?: number; page_max?: number } | undefined {
+  if (scope.filenames.length !== 1) return undefined;
+  if (scope.pageMin === undefined && scope.pageMax === undefined) return undefined;
+  return {
+    ...(scope.pageMin !== undefined ? { page_min: scope.pageMin } : {}),
+    ...(scope.pageMax !== undefined ? { page_max: scope.pageMax } : {}),
+  };
 }
 
 // Logs an unreadable or unrecognized-shape persisted value before it's replaced with an

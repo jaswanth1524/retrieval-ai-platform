@@ -16,12 +16,18 @@ export interface ReadinessResponse {
   index_detail?: string | null;
   /** Uploaded originals are kept (RAW_DOCUMENT_DIR): a backup can rebuild the index. */
   originals_kept?: boolean;
+  /** Each model the startup warmup loaded: "failed" makes the server degraded until a
+   *  background retry loads it; "fallback" is the tokenizer's heuristic. Empty when
+   *  warmup is off; absent on older servers. */
+  models?: Record<string, 'ok' | 'failed' | 'fallback'>;
 }
 
 /** Tokens the provider reported for an answer's LLM calls. */
 export interface UsageResponse {
   prompt_tokens: number;
   completion_tokens: number;
+  /** An estimate at the hosted model's list price; absent for local models. */
+  cost_usd?: number | null;
 }
 
 // 'unauthorized' is distinct from 'error' on purpose: the server is reachable and
@@ -75,6 +81,14 @@ export interface PublicConfigResponse {
   answer_language?: string;
   /** SUMMARY_MAX_DOCUMENTS: the most documents one brief covers; absent on older servers. */
   summary_max_documents?: number;
+  /** ANSWER_FORMAT: how answers are laid out unless a question asks otherwise. */
+  answer_format?: string;
+  /** QUERY_LOG_ENABLED: GET /query-log lists what the documents didn't answer. */
+  query_log_enabled?: boolean;
+  /** Replaced originals are kept (RAW_DOCUMENT_VERSIONS): versions can be restored. */
+  document_versions_enabled?: boolean;
+  /** TRACE_STORE_PATH: traces survive a restart and all of them can be exported. */
+  traces_persisted?: boolean;
 }
 
 /** A watched file waiting to be tried again after a failure. */
@@ -119,6 +133,11 @@ export interface SearchRequest {
   filenames?: string[];
   tags?: string[];
   rerank_top_k?: number;
+  page_min?: number;
+  page_max?: number;
+  section?: string;
+  exclude_filenames?: string[];
+  chunk_ids?: string[];
 }
 
 export interface SearchResultResponse {
@@ -166,6 +185,10 @@ export interface QuestionOverrides {
   rerankTopK: number | null;
   maxContextChunks: number | null;
   llmTemperature: number | null;
+  /** How answers are laid out; null = the server's ANSWER_FORMAT. */
+  answerFormat?: AnswerFormat | null;
+  /** A language name or "match"; null = the server's ANSWER_LANGUAGE. */
+  answerLanguage?: string | null;
 }
 
 export interface DocumentIngestResponse {
@@ -370,9 +393,28 @@ export interface SummaryCoverage {
   total: number;
 }
 
+/** How an answer is laid out (ANSWER_FORMAT, or per question). */
+export type AnswerFormat = 'default' | 'bullets' | 'table' | 'brief';
+
+/** Where in the documents a question looks: the same narrowing POST /search takes. */
+export interface PassageNarrowing {
+  page_min?: number;
+  page_max?: number;
+  /** Exactly this section label. */
+  section?: string;
+  exclude_filenames?: string[];
+  /** Only these passages (picked in the Search panel). */
+  chunk_ids?: string[];
+}
+
 export interface QuestionOptions {
   /** Ask this whole-document task instead of a retrieval question. */
   task?: DocumentTask;
+  /** Narrow where the question looks. */
+  narrowing?: PassageNarrowing;
+  answerFormat?: AnswerFormat;
+  /** A language name, or "match" the question's. */
+  answerLanguage?: string;
   /** Only documents carrying one of these tags. */
   tags?: string[];
   /** Skip the server's answer cache (Regenerate). */
@@ -413,6 +455,38 @@ export interface TraceConfigResponse {
   tags?: string[] | null;
   /** The cross-encoder that scored the candidates. */
   reranker_model?: string | null;
+  answer_format?: string;
+  answer_language?: string;
+  /** The question's narrowing (only the parts it had). */
+  narrowing?: Record<string, unknown> | null;
+  /** The model the provider was asked for. */
+  llm_model?: string | null;
+}
+
+/** GET /query-log: one logged question (QUERY_LOG_ENABLED). */
+export interface QueryLogEntryResponse {
+  created_at: number;
+  question: string;
+  status: string;
+  top_score: number | null;
+  mode: string;
+  trace_id: string | null;
+}
+
+export interface QueryLogResponse {
+  queries: QueryLogEntryResponse[];
+}
+
+/** GET /documents/{filename}/versions: replaced originals kept. */
+export interface DocumentVersionResponse {
+  version: string;
+  saved_at: number;
+  size: number;
+}
+
+export interface DocumentVersionsResponse {
+  filename: string;
+  versions: DocumentVersionResponse[];
 }
 
 export interface TraceCandidateResponse {

@@ -103,6 +103,17 @@ class RetrievalExample:
     # Answer mode: the answer must state one of these (case/space-insensitive), e.g.
     # ["sixty euros", "60 euros"]. Scored as ``fact_hit_rate`` without a judge LLM.
     answer_contains: tuple[str, ...] = ()
+    # A question about several things (a comparison): the answer must state one of
+    # each group, e.g. [["sixty euros", "60 euros"], ["forty-five euros", "45 euros"]].
+    answer_contains_all: tuple[tuple[str, ...], ...] = ()
+
+    @property
+    def fact_groups(self) -> tuple[tuple[str, ...], ...]:
+        """What the answer must state: one of each group (``answer_contains`` is one)."""
+
+        if self.answer_contains_all:
+            return self.answer_contains_all
+        return (self.answer_contains,) if self.answer_contains else ()
 
     @property
     def labeled(self) -> bool:
@@ -270,8 +281,9 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
         answer_contains=tuple(
             sorted(_string_set(data.get("answer_contains"), index, "answer_contains"))
         ),
+        answer_contains_all=_fact_groups(data.get("answer_contains_all"), index),
     )
-    if expect_no_context and example.answer_contains:
+    if expect_no_context and example.fact_groups:
         raise HarnessDataError(
             f"Example {index}: an 'expect_no_context' question has no fact to state "
             "('answer_contains')."
@@ -284,6 +296,16 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
             "files, chunks or passages."
         )
     return example
+
+
+def _fact_groups(value: Any, index: int) -> tuple[tuple[str, ...], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise HarnessDataError(
+            f"Example {index}: 'answer_contains_all' must be a non-empty list of lists."
+        )
+    return tuple(tuple(sorted(_string_set(group, index, "answer_contains_all"))) for group in value)
 
 
 def _history(value: Any, index: int) -> tuple[dict[str, str], ...]:
@@ -525,6 +547,24 @@ def build_parser() -> argparse.ArgumentParser:
         "(OUTPUT.partial.jsonl) and answer only the rest.",
     )
 
+    diff = sub.add_parser(
+        "diff", help="List the questions that got better or worse between two runs (no Qdrant)."
+    )
+    diff.add_argument("before", type=Path, help="A retrieval result or answer run (JSON).")
+    diff.add_argument("after", type=Path, help="The same command's output to compare.")
+    diff.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="Exit 1 when any question got worse.",
+    )
+
+    report = sub.add_parser("report", help="Write one run as a self-contained HTML page.")
+    report.add_argument("run", type=Path, help="A retrieval result or answer run (JSON).")
+    report.add_argument("--output", type=Path, required=True, help="The HTML file to write.")
+    report.add_argument("--ragas", type=Path, help="ragas_runner output for the same answers.")
+    report.add_argument("--diff", type=Path, dest="base", help="A base run to compare with.")
+    report.add_argument("--title", help="Page title (default: the run's file name).")
+
     feedback = sub.add_parser(
         "from-feedback",
         help="Draft a labeled dataset from answer ratings (no Qdrant).",
@@ -613,6 +653,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return ingest_directory(args.directory, get_settings())
     if args.command == "from-feedback":
         return dataset_from_feedback(args)
+    if args.command in ("diff", "report"):
+        return compare_runs(args)
 
     try:
         examples = load_retrieval_dataset(args.dataset)
@@ -643,6 +685,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.limit > 0:
         examples = examples[: args.limit]
     return run_answer_eval(examples, Collaborators(settings), args.output, resume=args.resume)
+
+
+def compare_runs(args: argparse.Namespace) -> int:
+    """``diff`` and ``report``: read run files only (no Qdrant, no models)."""
+
+    from eval.compare import RunFileError, diff_runs, format_diff, load_run, render_report
+
+    try:
+        if args.command == "diff":
+            result = diff_runs(load_run(args.before), load_run(args.after))
+            print(format_diff(result))
+            return 1 if args.fail_on_regression and result.regressed else 0
+        run = load_run(args.run)
+        base = load_run(args.base) if args.base is not None else None
+        page = render_report(run, title=args.title or args.run.name, ragas=args.ragas, base=base)
+        args.output.write_text(page, encoding="utf-8")
+    except (RunFileError, OSError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"wrote {args.output}")
+    return 0
 
 
 def ingestible_files(directory: Path) -> tuple[list[Path], list[Path]]:

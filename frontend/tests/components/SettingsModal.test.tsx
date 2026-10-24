@@ -33,7 +33,13 @@ function makeConfig(overrides: Partial<PublicConfigResponse> = {}): PublicConfig
   };
 }
 
-const EMPTY: QuestionOverrides = { rerankTopK: null, maxContextChunks: null, llmTemperature: null };
+const EMPTY: QuestionOverrides = {
+  rerankTopK: null,
+  maxContextChunks: null,
+  llmTemperature: null,
+  answerFormat: null,
+  answerLanguage: null,
+};
 
 function setup(props: Partial<Parameters<typeof SettingsModal>[0]> = {}) {
   const merged = {

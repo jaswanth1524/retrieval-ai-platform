@@ -172,6 +172,9 @@ class GroundedAnswer:
     # (prompt, completion) tokens the provider reported for the answer's calls (the
     # citation retry included); None when it reported none, and on a cache hit.
     usage: tuple[int, int] | None = None
+    # What that usage cost at the hosted model's list price (llm.usage_cost_usd); None
+    # for local providers, unlisted models and cache hits.
+    cost_usd: float | None = None
     # The best cross-encoder score (0-1) among the candidates, kept or not. None when
     # retrieval found nothing to score.
     top_rerank_score: float | None = None

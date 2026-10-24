@@ -21,6 +21,7 @@ PAIRS = [
     ("unanswerable_eval.jsonl", "corpus_handbook"),
     ("followup_eval.jsonl", "corpus_handbook"),
     ("paraphrase_eval.jsonl", "corpus_handbook"),
+    ("compare_eval.jsonl", "corpus_handbook"),
 ]
 
 

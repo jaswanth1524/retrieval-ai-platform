@@ -21,7 +21,7 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from qdrant_client.http.models.models import QueryResponse
 
 from api.corpus import changed_since, corpus_generation
-from api.documents import CHUNKER_VERSION
+from api.documents import CHUNKER_VERSION, DocumentChunk
 from api.embeddings import EmbeddedText
 from api.qdrant_schema import (
     VectorStoreUnavailableError,
@@ -403,6 +403,40 @@ class VectorRepository:
                 settings, scroll_filter=_single_filename_filter(filename), with_payload=False
             )
         ]
+
+    def stored_vectors(
+        self, settings: AppSettings, point_ids: Sequence[str]
+    ) -> dict[str, tuple[list[float], models.SparseVector, str | None]]:
+        """The dense and sparse vectors and the chunking fingerprint of each of
+        ``point_ids`` that is stored, read in batches (ingestion reuses them)."""
+
+        self.ensure_ready(settings)
+        found: dict[str, tuple[list[float], models.SparseVector, str | None]] = {}
+        dense_name = settings.qdrant_dense_vector_name
+        sparse_name = settings.qdrant_sparse_vector_name
+        ids = list(point_ids)
+        for start in range(0, len(ids), _FULL_PAYLOAD_PAGE_SIZE):
+            points = self._call(
+                settings,
+                "retrieve",
+                collection_name=settings.qdrant_collection,
+                ids=ids[start : start + _FULL_PAYLOAD_PAGE_SIZE],
+                with_payload=[DocumentChunk.PAYLOAD_FINGERPRINT_KEY],
+                with_vectors=[dense_name, sparse_name],
+            )
+            for point in points:
+                vectors = point.vector if isinstance(point.vector, dict) else {}
+                dense = vectors.get(dense_name)
+                sparse = vectors.get(sparse_name)
+                if not isinstance(dense, list) or not isinstance(sparse, models.SparseVector):
+                    continue
+                fingerprint = (point.payload or {}).get(DocumentChunk.PAYLOAD_FINGERPRINT_KEY)
+                found[str(point.id)] = (
+                    [float(value) for value in dense],
+                    sparse,
+                    fingerprint if isinstance(fingerprint, str) else None,
+                )
+        return found
 
     def chunks_for_filename(self, settings: AppSettings, filename: str) -> list[dict[str, object]]:
         """Return all payloads for a filename, ordered by ``chunk_ordinal``.
@@ -917,14 +951,18 @@ def _is_missing_collection(exc: BaseException) -> bool:
 
 @dataclass(frozen=True)
 class PassageFilter:
-    """Narrows a search to passages by where they are (POST /search): a page range,
-    one section (its exact label), and documents left out. Pages and sections are
-    keyword/integer-indexed payload fields, so these are plain Qdrant filters."""
+    """Narrows a search (POST /search) or a question to passages by where they are: a
+    page range, one section (its exact label), documents left out, or picked passages.
+    Pages, sections and chunk ids are indexed payload fields, so these are plain Qdrant
+    filters."""
 
     page_min: int | None = None
     page_max: int | None = None
     section: str | None = None
     exclude_filenames: tuple[str, ...] = ()
+    # Only these passages (chunk ids): a question about passages picked in the Search
+    # panel. Still searched and reranked like any other scope.
+    chunk_ids: tuple[str, ...] = ()
 
 
 def _scope_filter(
@@ -952,6 +990,12 @@ def _scope_filter(
         if narrow.section:
             must.append(
                 models.FieldCondition(key="section", match=models.MatchValue(value=narrow.section))
+            )
+        if narrow.chunk_ids:
+            must.append(
+                models.FieldCondition(
+                    key="chunk_id", match=models.MatchAny(any=list(narrow.chunk_ids))
+                )
             )
         if narrow.exclude_filenames:
             must_not.append(

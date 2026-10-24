@@ -713,3 +713,36 @@ def test_a_backfilled_summary_says_so_in_its_answer_trace_and_cache() -> None:
     assert traces.traces[-1].citation_retry_used is False
     again = list(summarizer.summarize_stream(request))
     assert again[-1]["cached"] is True and again[-1]["citation_backfilled"] is True
+
+
+def test_an_identical_summary_waits_for_the_running_one() -> None:
+    import threading
+
+    gate = threading.Event()
+    entered = threading.Event()
+
+    class GatedGenerator(ScriptedGenerator):
+        def _reply(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+            entered.set()
+            assert gate.wait(10)
+            return super()._reply(messages, settings)
+
+    repository = FakeRepository({"a.txt": [_payload("a.txt", 1, "Alpha.")]})
+    generator = GatedGenerator()
+    summarizer = _summarizer(
+        repository, generator, answer_cache=AnswerCache(max_entries=8, ttl_seconds=60)
+    )
+    request = SummaryRequest(mode="summarize", filenames=("a.txt",))
+    results: list[Any] = []
+    leader = threading.Thread(target=lambda: results.append(summarizer.summarize(request)))
+    leader.start()
+    assert entered.wait(5)
+    follower_events = summarizer.summarize_stream(request)
+    assert next(follower_events) == {"type": "stage", "stage": "joining_identical_question"}
+    gate.set()
+    rest = list(follower_events)
+    leader.join(10)
+
+    done = next(event for event in rest if event["type"] == "done")
+    assert done["cached"] is True and done["chunks_read"] == 1
+    assert len(generator.calls) == 1

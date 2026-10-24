@@ -312,3 +312,34 @@ def test_scalar_quantization_is_applied_in_place_and_searches_rescore(
     clear_readiness_cache()
     repository.ensure_ready(settings)  # back to "none": removed in place
     assert client.get_collection(settings.qdrant_collection).config.quantization_config is None
+
+
+def test_a_reingest_reuses_the_original_vectors_even_from_a_quantized_collection(
+    server: tuple[QdrantClient, AppSettings],
+) -> None:
+    """Scalar quantization keeps an int8 copy for search; ``retrieve`` must still hand
+    back the original float vectors, or a re-index would write the lossy ones."""
+
+    client, settings = server
+    quantized = settings.model_copy(update={"qdrant_quantization": "scalar"})
+    repository = VectorRepository(client)
+    chunks = [chunk("c1", "alpha exact", page=1), chunk("c2", "semantic only", page=2)]
+    vectors = [
+        embedding([0.6, 0.8, 0.0], [10, 30], [1.0, 0.25]),
+        embedding([0.0, 0.6, 0.8], [20], [0.5]),
+    ]
+    ingest_chunks(repository, quantized, chunks, StaticEmbeddingProvider(vectors))
+
+    class Refusing:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            raise AssertionError("nothing changed, so nothing is embedded")
+
+    ingest_chunks(repository, quantized, chunks, Refusing())
+
+    records, _ = client.scroll(
+        collection_name=settings.qdrant_collection, with_payload=True, with_vectors=True
+    )
+    stored = {record.payload["chunk_id"]: record.vector for record in records if record.payload}
+    assert stored["c1"][settings.qdrant_dense_vector_name] == pytest.approx([0.6, 0.8, 0.0])
+    sparse = stored["c1"][settings.qdrant_sparse_vector_name]
+    assert list(sparse.indices) == [10, 30] and list(sparse.values) == pytest.approx([1.0, 0.25])

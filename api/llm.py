@@ -16,7 +16,7 @@ from litellm import exceptions as litellm_exceptions
 from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
-from api.metrics import llm_tokens_total
+from api.metrics import llm_cost_usd_total, llm_tokens_total
 from api.settings import AppSettings
 
 _OLLAMA_MODEL_PREFIXES = ("ollama/", "ollama_chat/")
@@ -255,14 +255,53 @@ def _count_usage(response: object, settings: AppSettings) -> None:
         return
     provider = settings.llm_provider.lower().strip()
     totals = getattr(_last_call, "usage", None)
+    counted = [0, 0]
     for index, (kind, key) in enumerate(
         (("prompt", "prompt_tokens"), ("completion", "completion_tokens"))
     ):
         value = read_value(usage, key)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             llm_tokens_total.labels(provider=provider, kind=kind).inc(value)
+            counted[index] = value
             if isinstance(totals, list):
                 totals[index] += value
+    cost = usage_cost_usd(settings, (counted[0], counted[1]))
+    if cost:
+        model, _ = completion_model_and_kwargs(settings)
+        llm_cost_usd_total.labels(provider=provider, model=model).inc(cost)
+
+
+def model_prices(model: str) -> tuple[float, float] | None:
+    """US dollars per prompt and per completion token for ``model`` from LiteLLM's
+    bundled price table (read as data, like ``prompting._known_context_window``), or
+    None when it isn't listed with both prices."""
+
+    table = getattr(litellm, "model_cost", {}) or {}
+    entry = table.get(model) or table.get(model.split("/", 1)[-1])
+    if not isinstance(entry, dict):
+        return None
+    prompt = entry.get("input_cost_per_token")
+    completion = entry.get("output_cost_per_token")
+    if not isinstance(prompt, int | float) or not isinstance(completion, int | float):
+        return None
+    return float(prompt), float(completion)
+
+
+def usage_cost_usd(settings: AppSettings, usage: tuple[int, int] | None) -> float | None:
+    """What ``usage`` cost at the configured hosted model's list price; None for local
+    providers (nothing is billed), unlisted models, or no reported usage. An estimate:
+    the table bundled with LiteLLM, not the provider's invoice."""
+
+    if usage is None or _provider(settings) in _LOCAL_PROVIDERS:
+        return None
+    try:
+        model, _ = completion_model_and_kwargs(settings)
+    except GenerationConfigError:
+        return None
+    prices = model_prices(model)
+    if prices is None:
+        return None
+    return round(usage[0] * prices[0] + usage[1] * prices[1], 8)
 
 
 # Providers that read the prompt on the same machine and send nothing while they do.

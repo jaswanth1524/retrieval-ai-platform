@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from api.dependencies import (
     require_api_key,
@@ -18,6 +20,7 @@ from api.schemas import (
     TraceDetailResponse,
     TraceListResponse,
 )
+from api.streaming import ClosingStreamingResponse
 from api.tracing import TraceNotFoundError
 from api.workspaces import workspace_of
 
@@ -57,6 +60,27 @@ def register(app: FastAPI) -> None:
                 )
                 for row in rows
             ]
+        )
+
+    # Every trace of the request's workspace as JSON Lines, oldest first: all archived
+    # ones with TRACE_STORE_PATH, else the in-memory ring's. Prompts quote documents and
+    # what users asked, so the full key only (and rate-limited like /export). Registered
+    # before /traces/{trace_id}, which would otherwise take "export" as an id.
+    @app.get(
+        "/traces/export",
+        dependencies=[Depends(require_full_key)],
+        response_class=StreamingResponse,
+        responses={200: {"content": {"application/x-ndjson": {}}}},
+    )
+    def export_traces(trace_store: TraceStoreDep, settings: SettingsDep) -> StreamingResponse:
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        return ClosingStreamingResponse(
+            trace_store.export_lines(workspace_of(settings)),
+            media_type="application/x-ndjson",
+            headers={
+                "Content-Disposition": f'attachment; filename="docrag-traces-{stamp}.jsonl"',
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.get("/traces", response_model=TraceListResponse, dependencies=[Depends(require_api_key)])

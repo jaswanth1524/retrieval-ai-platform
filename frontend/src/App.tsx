@@ -3,7 +3,9 @@ import { api, apiErrorMessage } from './api/client';
 import type {
   CitationResponse,
   DocumentTask,
+  PassageNarrowing,
   FeedbackItemResponse,
+  QueryLogEntryResponse,
   LlmProvider,
   PublicConfigResponse,
   QuestionOverrides,
@@ -31,7 +33,8 @@ import ToastRow from './components/ToastRow';
 import SearchPanel from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import FeedbackPanel from './components/FeedbackPanel';
-import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
+import UnansweredPanel from './components/UnansweredPanel';
+import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS, scopePageNarrowing } from './hooks/chatPersistence';
 import { useChat } from './hooks/useChat';
 import { useStableHandler } from './hooks/useStableHandler';
 import { prefetchCitationContent } from './utils/contentPrefetch';
@@ -53,6 +56,8 @@ import { useToasts } from './hooks/useToasts';
 import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
+import { chatToHtml } from './utils/exportHtml';
+import { folderPickNote, pickFolderFiles } from './utils/folderFiles';
 import { initialProvider } from './utils/providers';
 import { readStored, writeStored } from './utils/safeStorage';
 import {
@@ -72,8 +77,7 @@ import {
   CITATION_PREFETCH_DWELL_MS,
   WEAK_SUPPORT_MARGIN,
   canPreviewOriginal,
-  NO_HIDDEN_PANELS,
-  HIDDEN_FEEDBACK_PANEL,
+  hiddenPanels,
   NO_SOURCES,
   PANEL_META,
   notFoundSourcesMessage,
@@ -212,6 +216,7 @@ function App() {
     handleCancelUpload,
     handleReindex,
     handleRefreshFromUrl,
+    handleRestoreVersion,
     handleUploadFromUrl,
     handleReindexMany,
     handleReindexAllStale,
@@ -303,6 +308,10 @@ function App() {
     (filename: string) => void handleRefreshFromUrl(filename, workspace),
     [handleRefreshFromUrl, workspace],
   );
+  const restoreVersionHere = useCallback(
+    (filename: string, version: string) => void handleRestoreVersion(filename, version, workspace),
+    [handleRestoreVersion, workspace],
+  );
   const reindexHere = useCallback(
     (filename: string) => void handleReindex(filename, workspace),
     [handleReindex, workspace],
@@ -350,6 +359,24 @@ function App() {
     (tags: string[]) => setScope((prev) => ({ ...prev, tags })),
     [setScope],
   );
+  const pageRange = useMemo(
+    () => ({ min: scope.pageMin, max: scope.pageMax }),
+    [scope.pageMin, scope.pageMax],
+  );
+  const setPageRange = useCallback(
+    (range: { min?: number; max?: number }) =>
+      setScope((prev) => {
+        const { pageMin: _min, pageMax: _max, ...rest } = prev;
+        return {
+          ...rest,
+          ...(range.min !== undefined ? { pageMin: range.min } : {}),
+          ...(range.max !== undefined ? { pageMax: range.max } : {}),
+        };
+      }),
+    [setScope],
+  );
+  // The scope's page range, while exactly one document is scoped.
+  const scopePages = useMemo(() => scopePageNarrowing(scope), [scope]);
 
   // A pinned trace belongs to one conversation's turns, so anything that replaces the
   // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
@@ -483,6 +510,26 @@ function App() {
     if (rail === 'feedback' && !feedbackPanelAvailable) setRail('chat');
   }, [rail, feedbackPanelAvailable]);
 
+  // Likewise the questions the documents didn't answer (QUERY_LOG_ENABLED, full key).
+  const unansweredPanelAvailable = Boolean(config?.query_log_enabled) && !readOnly;
+  useEffect(() => {
+    if (rail === 'unanswered' && !unansweredPanelAvailable) setRail('chat');
+  }, [rail, unansweredPanelAvailable]);
+  const {
+    items: unanswered,
+    error: unansweredError,
+    load: loadUnanswered,
+  } = usePanelList<QueryLogEntryResponse>(
+    rail === 'unanswered',
+    async (signal) => (await api.listUnanswered(500, signal)).queries,
+    noteAuthFailure,
+    'Could not load the unanswered questions.',
+  );
+  const hiddenRailPanels = useMemo(
+    () => hiddenPanels(feedbackPanelAvailable, unansweredPanelAvailable),
+    [feedbackPanelAvailable, unansweredPanelAvailable],
+  );
+
   const {
     items: traces,
     error: tracesError,
@@ -526,6 +573,29 @@ function App() {
 
   // Files dropped anywhere outside the corpus panel's own dropzone upload directly
   // (that dropzone stages them for review instead).
+  // A dropped folder: its documents only (one per name, at most MAX_FOLDER_FILES),
+  // with a note of what was left out rather than one rejection per stray file.
+  const uploadFolder = useStableHandler((files: File[]) => {
+    const pick = pickFolderFiles(files, acceptedExtensions(config?.supported_extensions));
+    const note = folderPickNote(pick);
+    const maxBytes = config?.max_upload_bytes ?? DEFAULT_MAX_UPLOAD_BYTES;
+    const { accepted, rejected } = validateUploads(
+      pick.files,
+      maxBytes,
+      acceptedExtensions(config?.supported_extensions),
+    );
+    if (note || rejected.length > 0) {
+      pushToast({
+        tone: 'warn',
+        title: `${accepted.length} file${accepted.length === 1 ? '' : 's'} from the folder uploading`,
+        body: [note, ...rejected.map((item) => item.message)].filter(Boolean).join(' '),
+      });
+    }
+    if (accepted.length > 0) {
+      setRail('corpus');
+      void handleUpload(accepted);
+    }
+  });
   const fileDragActive = useWindowFileDrop(apiReachable && !readOnly, (files) => {
     const { accepted, rejected } = validateUploads(
       files,
@@ -543,9 +613,9 @@ function App() {
       setRail('corpus');
       void handleUpload(accepted);
     }
-  });
+  }, uploadFolder);
   const booted = apiStatus === 'ok' || apiStatus === 'unauthorized';
-  const { connectionLost, version: serverVersion, updatedTo, indexProblem } =
+  const { connectionLost, version: serverVersion, updatedTo, indexProblem, failedModels } =
     useServerHealth(booted);
   useCorpusAutoRefresh(
     corpusChecked && apiStatus === 'ok',
@@ -631,27 +701,37 @@ function App() {
   // onRetry prop through ChatThread — an unstable reference here would defeat
   // React.memo(ChatMessage) and reintroduce a full-list re-render on every SSE delta.
   const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
-  const currentScopeLabel = scopeLabel(indexedFilenames, selectedFilenames, selectedTags);
+  const currentScopeLabel =
+    scopeLabel(indexedFilenames, selectedFilenames, selectedTags) +
+    (scopePages
+      ? ` · p.${scopePages.page_min ?? 1}${scopePages.page_max !== undefined ? `–${scopePages.page_max}` : '+'}`
+      : '');
   // `task`: a summary or comparison (its own documents; the scope doesn't apply).
   const askQuestion = useCallback(
-    (question: string, task?: DocumentTask) =>
-      ask(question, selectedProvider, advancedOptions, scopeFilenames, {
+    (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => {
+      const looking = narrowing ?? scopePages;
+      return ask(question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
         modelLabel: currentModelLabel,
         ...(task ? { task } : {}),
-      }),
-    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
+        ...(looking && !task ? { narrowing: looking } : {}),
+      });
+    },
+    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel, scopePages],
   );
   // Regenerate must produce a new answer, not the cached copy of the one on screen.
   const regenerateQuestion = useCallback(
-    (question: string, task?: DocumentTask) =>
-      ask(question, selectedProvider, advancedOptions, scopeFilenames, {
+    (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => {
+      const looking = narrowing ?? scopePages;
+      return ask(question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
         bypassCache: true,
         modelLabel: currentModelLabel,
         ...(task ? { task } : {}),
-      }),
-    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
+        ...(looking && !task ? { narrowing: looking } : {}),
+      });
+    },
+    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel, scopePages],
   );
   // A "not found" answer asked within some documents: the same question over all of
   // them, with the conversation's scope cleared so the next question searches them too.
@@ -665,6 +745,12 @@ function App() {
     },
     [ask, setScope, selectedProvider, advancedOptions, currentModelLabel],
   );
+  // From the Search panel: the search's question over only the passages ticked there,
+  // in the open conversation (the scope still applies; they were found within it).
+  const askAboutPassages = useStableHandler((question: string, chunkIds: string[]) => {
+    void askQuestion(question, undefined, { chunk_ids: chunkIds });
+    if (panelCollapsed) setPanelDrawerOpen(false);
+  });
   // ...or the passages a search finds for it, without asking the model again.
   const searchForPassages = useStableHandler((question: string) => {
     setSearchRequest({ query: question, id: Date.now() });
@@ -842,9 +928,35 @@ function App() {
     downloadFile(
       `docrag-${conversationTitleRef.current ?? 'chat'}.md`.replace(/[^\w.-]+/g, '-'),
       'text/markdown',
-      chatToMarkdown(turnsRef.current),
+      chatToMarkdown(turnsRef.current, conversationTitleRef.current),
     );
   }, []);
+  const exportHtml = useStableHandler(() => {
+    if (turnsRef.current.length === 0) return;
+    const title = conversationTitleRef.current ?? 'DocRAG conversation';
+    void chatToHtml(turnsRef.current, title).then(
+      (html) => downloadFile(`docrag-${title}.html`.replace(/[^\w.-]+/g, '-'), 'text/html', html),
+      () => pushToast({ tone: 'bad', title: 'Could not export the conversation' }),
+    );
+  });
+  // Every trace of this workspace as JSON Lines: what the server holds (all of them
+  // with TRACE_STORE_PATH), for offline analysis or turning into eval rows.
+  const [exportingTraces, setExportingTraces] = useState(false);
+  const exportTraces = useStableHandler(() => {
+    if (exportingTraces) return;
+    setExportingTraces(true);
+    api
+      .exportTraces()
+      .then(({ blob, filename }) => downloadFile(filename, 'application/x-ndjson', blob))
+      .catch((err) => {
+        if (!noteAuthFailure(err)) {
+          pushToast({ tone: 'bad', title: 'Could not export the traces', body: apiErrorMessage(err, 'Try again.') });
+        }
+      })
+      .finally(() => setExportingTraces(false));
+  });
+  // The print stylesheet (global.css) leaves only the conversation on the page.
+  const printConversation = useStableHandler(() => window.print());
 
   const exportAllConversations = useCallback(() => {
     const stamp = new Date().toISOString().slice(0, 10);
@@ -920,6 +1032,12 @@ function App() {
     (text: string) => setPrefill((prev) => ({ text, nonce: (prev?.nonce ?? 0) + 1 })),
     [],
   );
+  // From the Unanswered panel: into the composer (not sent — usually a document has to
+  // be added first), on narrow screens closing the drawer it was picked in.
+  const askUnansweredAgain = useStableHandler((question: string) => {
+    suggestQuestion(question);
+    if (panelCollapsed) setPanelDrawerOpen(false);
+  });
 
   const commands = useCommands(
     {
@@ -953,6 +1071,8 @@ function App() {
       pinConversation,
       exportMarkdown,
       exportJson,
+      exportHtml,
+      printConversation,
       searchPassages: () => {
         setRail('search');
         if (panelCollapsed) setPanelDrawerOpen(true);
@@ -1057,6 +1177,7 @@ function App() {
     }
     else if (rail === 'search') setSearchResetKey((key) => key + 1);
     else if (rail === 'feedback') loadFeedback();
+    else if (rail === 'unanswered') loadUnanswered();
     else loadTraces();
   });
 
@@ -1109,7 +1230,7 @@ function App() {
         onToggleTheme={toggleTheme}
         onOpenSettings={openSettings}
         settingsAvailable={configLoaded}
-        hidden={feedbackPanelAvailable ? NO_HIDDEN_PANELS : HIDDEN_FEEDBACK_PANEL}
+        hidden={hiddenRailPanels}
       />
       <ContextPanel
         title={PANEL_META[rail].title}
@@ -1187,6 +1308,10 @@ function App() {
             onAskAbout={askAbout}
             summaryMaxDocuments={config?.summary_max_documents}
             onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? refreshHere : undefined}
+            onRestoreVersion={
+              config?.document_versions_enabled && !readOnly ? restoreVersionHere : undefined
+            }
+            workspace={workspace}
             summarizeDisabled={summarizeDisabled}
           />
         )}
@@ -1201,16 +1326,33 @@ function App() {
               resetKey={searchResetKey}
               request={searchRequest}
               onAuthFailure={noteAuthFailure}
+              onAskAboutPassages={askAboutPassages}
+              askDisabled={summarizeDisabled}
             />
           </div>
         )}
         {rail === 'traces' && (
-          <TracesPanel traces={traces} error={tracesError} onSelect={handleSelectTrace} />
+          <TracesPanel
+            traces={traces}
+            error={tracesError}
+            onSelect={handleSelectTrace}
+            onExport={readOnly ? undefined : exportTraces}
+            exporting={exportingTraces}
+          />
         )}
         {rail === 'feedback' && (
           <FeedbackPanel
             feedback={feedbackItems}
             error={feedbackError}
+            onSelectTrace={handleSelectTrace}
+          />
+        )}
+        {rail === 'unanswered' && (
+          <UnansweredPanel
+            questions={unanswered}
+            error={unansweredError}
+            onAsk={askUnansweredAgain}
+            onSearch={searchForPassages}
             onSelectTrace={handleSelectTrace}
           />
         )}
@@ -1230,6 +1372,7 @@ function App() {
           <>
             <ServerNotices
               indexProblem={indexProblem}
+              failedModels={failedModels}
               updatedTo={updatedTo}
               workspacesEnabled={workspacesEnabled}
               onReload={reloadPage}
@@ -1312,6 +1455,8 @@ function App() {
             onSelectedFilenamesChange={setSelectedFilenames}
             availableTags={availableTags}
             selectedTags={selectedTags}
+            pageRange={pageRange}
+            onPageRangeChange={setPageRange}
             onSelectedTagsChange={setSelectedTags}
             config={config}
             provider={selectedProvider}

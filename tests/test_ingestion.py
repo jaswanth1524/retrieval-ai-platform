@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Any
 from uuid import UUID
 
@@ -143,12 +144,11 @@ def test_ingest_chunks_keeps_matching_point_when_chunk_is_unchanged() -> None:
     ingest_chunks(repository, settings, [unchanged], FakeEmbeddingProvider([make_embedding()]))
 
     new_chunk = make_chunk(chunk_id="added", text="new text")
-    ingest_chunks(
-        repository,
-        settings,
-        [unchanged, new_chunk],
-        FakeEmbeddingProvider([make_embedding(), make_embedding(0.2)]),
-    )
+    second = FakeEmbeddingProvider([make_embedding(0.2)])
+    ingest_chunks(repository, settings, [unchanged, new_chunk], second)
+
+    # Only the new chunk was embedded; the unchanged one kept its stored vectors.
+    assert len(second.seen_texts) == 1 and "new text" in second.seen_texts[0]
 
     records, _ = client.scroll(
         collection_name=settings.qdrant_collection,
@@ -542,3 +542,105 @@ def test_held_vectors_round_trip_exactly() -> None:
     assert all(type(index) is int for index in restored.sparse.indices)
     # Dense: float32, as the model produced it.
     assert restored.dense == np.asarray(original.dense, dtype=np.float32).tolist()
+
+
+class RecordingEmbeddingProvider:
+    """Embeds every text it is given (one vector each), remembering them."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+        self.texts.extend(texts)
+        return [make_embedding(0.1 + 0.01 * len(self.texts)) for _ in texts]
+
+
+def _stored_vectors(client: QdrantClient, settings: AppSettings) -> dict[str, Any]:
+    records, _ = client.scroll(
+        collection_name=settings.qdrant_collection, with_payload=True, with_vectors=True, limit=100
+    )
+    return {record.payload["chunk_id"]: record.vector for record in records if record.payload}
+
+
+def test_a_reingest_embeds_only_the_chunks_that_changed() -> None:
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    chunks = [
+        make_chunk(chunk_id="a", text="first passage", page=1),
+        make_chunk(chunk_id="b", text="second passage", page=2),
+        make_chunk(chunk_id="c", text="third passage", page=3),
+    ]
+    ingest_chunks(repository, settings, chunks, RecordingEmbeddingProvider())
+    before = _stored_vectors(client, settings)
+
+    unchanged = RecordingEmbeddingProvider()
+    progress: list[tuple[int, int]] = []
+    ingest_chunks(
+        repository, settings, chunks, unchanged, on_progress=lambda *p: progress.append(p)
+    )
+    assert unchanged.texts == []
+    assert progress == [(3, 3)]
+    assert _stored_vectors(client, settings) == before
+
+    edited = [
+        chunks[0],
+        make_chunk(chunk_id="b2", text="second passage, edited", page=2),
+        chunks[2],
+    ]
+    changed = RecordingEmbeddingProvider()
+    ingest_chunks(repository, settings, edited, changed, on_progress=lambda *p: progress.append(p))
+    assert len(changed.texts) == 1 and "edited" in changed.texts[0]
+    after = _stored_vectors(client, settings)
+    assert set(after) == {"a", "b2", "c"}
+    assert after["a"] == before["a"] and after["c"] == before["c"]
+    assert progress[-1] == (3, 3)
+
+
+def test_vectors_are_not_reused_across_a_chunking_change_or_when_turned_off() -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    chunk = replace(make_chunk(chunk_id="a", text="first passage"), chunking_fingerprint="old")
+    ingest_chunks(repository, settings, [chunk], RecordingEmbeddingProvider())
+
+    refingerprinted = RecordingEmbeddingProvider()
+    ingest_chunks(
+        repository, settings, [replace(chunk, chunking_fingerprint="new")], refingerprinted
+    )
+    assert len(refingerprinted.texts) == 1
+
+    off = RecordingEmbeddingProvider()
+    ingest_chunks(
+        repository,
+        make_settings(ingest_reuse_vectors=False),
+        [replace(chunk, chunking_fingerprint="new")],
+        off,
+    )
+    assert len(off.texts) == 1
+
+
+def test_reused_vectors_keep_the_new_payload() -> None:
+    """Only the embedding is skipped: every point is still written with this upload's
+    payload (upload time, tags, hash)."""
+
+    settings = make_settings()
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    chunk = make_chunk(chunk_id="a", text="first passage")
+    ingest_chunks(
+        repository, settings, [replace(chunk, uploaded_at=1.0)], RecordingEmbeddingProvider()
+    )
+
+    ingest_chunks(
+        repository,
+        settings,
+        [replace(chunk, uploaded_at=2.0, tags=("finance",), content_sha256="abc")],
+        RecordingEmbeddingProvider(),
+    )
+
+    records, _ = client.scroll(collection_name=settings.qdrant_collection, with_payload=True)
+    (payload,) = [record.payload for record in records]
+    assert payload is not None
+    assert payload["uploaded_at"] == 2.0
+    assert payload["tags"] == ["finance"]
+    assert payload["content_sha256"] == "abc"

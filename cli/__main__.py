@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import threading
 import time
@@ -43,6 +45,8 @@ from cli.client import (
     grounding_notes,
     trim_history,
 )
+from cli.completion import completion_script
+from cli.config import Profile, ProfileError, load_profile, resolve
 
 # `ask --strict`: the documents don't answer the question (a script can tell).
 EXIT_NOT_ANSWERED = 3
@@ -109,6 +113,7 @@ STAGE_NAMES = {
     "condensing": "reading the conversation",
     "searching": "searching documents",
     "waiting_for_model": "waiting for the model (another question is using it)",
+    "joining_identical_question": "the same question is being answered; waiting for it",
     "reading": "reading the passages",
     "verifying_citations": "checking citations",
     "reading_documents": "reading the document",
@@ -312,6 +317,69 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     return 0 if succeeded else 1
 
 
+ANSWER_FORMATS = ("default", "bullets", "table", "brief")
+
+
+def question_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The narrowing and answer-style flags ``ask`` and ``chat`` share."""
+
+    return {
+        "page_min": args.page_min,
+        "page_max": args.page_max,
+        "section": args.section,
+        "exclude_filenames": args.exclude,
+        "answer_format": args.answer_format,
+        "answer_language": args.language,
+    }
+
+
+def _question_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--page-min", type=int, help="Only passages from this page on.")
+    parser.add_argument("--page-max", type=int, help="Only passages up to this page.")
+    parser.add_argument("--section", help="Only passages under this exact section label.")
+    parser.add_argument("--exclude", action="append", help="Leave this document out (repeatable).")
+    parser.add_argument(
+        "--answer-format", choices=ANSWER_FORMATS, help="How the answer is laid out."
+    )
+    parser.add_argument(
+        "--language", help='Answer in this language ("German"), or "match" the question.'
+    )
+
+
+_MARKER_RE = re.compile(r"\[(\d{1,6})\]")
+
+
+def answer_markdown(result: StreamResult) -> str:
+    """The answer as Markdown: its ``[n]`` markers as footnotes, each source a footnote
+    with the quotes the answer rests on — ready to paste into a document or a ticket."""
+
+    answer = _MARKER_RE.sub(r"[^\1]", str(result.done.get("answer", "")).strip())
+    lines = [answer]
+    notes = grounding_notes(result.done)
+    if notes:
+        lines.append("")
+        lines.extend(f"> {note}" for note in notes)
+    sources = result.done.get("sources") or []
+    if sources:
+        lines.append("")
+    for source in sources:
+        page, end = source.get("page"), source.get("page_end")
+        pages = f"p.{page}-{end}" if end else f"p.{page}"
+        line = (
+            f"[^{source.get('source_number')}]: {source.get('filename')}, {pages}"
+            f" · {source.get('section') or '-'}"
+        )
+        quotes = [
+            " ".join(str(span.get("quote", "")).split())
+            for span in source.get("spans") or []
+            if isinstance(span, dict) and span.get("quote")
+        ]
+        if quotes:
+            line += " — " + " … ".join(f"“{quote}”" for quote in quotes)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _ask_once(
     client: DocragClient,
     args: argparse.Namespace,
@@ -324,7 +392,11 @@ def _ask_once(
 
     streamed: list[str] = []
     reporter = StageReporter(sys.stderr)
-    quiet = args.json or args.quiet
+    output_format = getattr(args, "format", None) or ("json" if args.json else "text")
+    as_json = output_format == "json"
+    # Markdown is written once the answer is final: its [n] markers become footnotes.
+    streaming = output_format == "text"
+    quiet = as_json or args.quiet
 
     def write(text: str) -> None:
         reporter.delta()
@@ -340,11 +412,15 @@ def _ask_once(
             filenames=args.file or None,
             tags=args.tag or None,
             provider=args.provider,
-            on_delta=None if args.json else write,
+            on_delta=write if streaming else None,
             on_stage=None if quiet else reporter.stage,
             history=history,
+            options=question_options(args),
         )
-    if args.json:
+    if output_format == "markdown":
+        print(answer_markdown(result), file=out)
+        return result
+    if as_json:
         print(json.dumps({**result.done, "followups": result.followups}), file=out)
         return result
     print(file=out)
@@ -372,10 +448,64 @@ def cmd_chat(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
 
     history: list[dict[str, str]] = []
     prompt = "" if args.json else "> "
+    line_editing = _start_line_editing() if sys.stdin.isatty() and prompt else None
+    try:
+        return _chat_loop(client, args, out, history, prompt, line_editing)
+    finally:
+        if line_editing is not None:
+            line_editing()
+
+
+def _start_line_editing() -> Callable[[], None] | None:
+    """At a terminal: arrow keys, editing and earlier questions (↑) at the prompt, kept
+    in ``$XDG_STATE_HOME/docrag/history``; the returned callable saves them. None where
+    Python has no readline (Windows)."""
+
+    try:
+        import readline
+    except ImportError:  # pragma: no cover - platform dependent
+        return None
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    path = Path(base) / "docrag" / "history"
+    try:
+        readline.read_history_file(path)
+    except OSError:
+        pass  # none yet
+    readline.set_history_length(CHAT_HISTORY_LINES)
+
+    def save() -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(path)
+        except OSError:
+            pass  # a read-only home: editing still worked
+
+    return save
+
+
+# Questions remembered for ↑ in `chat` across sessions.
+CHAT_HISTORY_LINES = 500
+
+
+def _chat_loop(
+    client: DocragClient,
+    args: argparse.Namespace,
+    out: TextIO,
+    history: list[dict[str, str]],
+    prompt: str,
+    line_editing: Callable[[], None] | None,
+) -> int:
     while True:
-        if prompt:
-            print(prompt, end="", file=out, flush=True)
-        line = sys.stdin.readline()
+        if line_editing is not None:
+            try:
+                line = input(prompt) + "\n"
+            except EOFError:
+                print(file=out)
+                line = ""
+        else:
+            if prompt:
+                print(prompt, end="", file=out, flush=True)
+            line = sys.stdin.readline()
         question = line.strip()
         if not line or not question or question in ("/quit", "/exit"):
             return 0
@@ -724,6 +854,11 @@ def _add_global_flags(parser: argparse.ArgumentParser, default: Any) -> None:
     parser.add_argument("--api-key", default=default, help="X-API-Key (DOCRAG_API_KEY).")
     parser.add_argument("--workspace", default=default, help="Workspace to use (DOCRAG_WORKSPACE).")
     parser.add_argument(
+        "--profile",
+        default=default,
+        help="A [profiles.NAME] of ~/.config/docrag/config.toml (DOCRAG_PROFILE).",
+    )
+    parser.add_argument(
         "--json", action="store_true", default=default, help="Machine-readable output."
     )
 
@@ -743,6 +878,8 @@ def build_parser() -> argparse.ArgumentParser:
     def command(name: str, help: str) -> argparse.ArgumentParser:
         return sub.add_parser(name, help=help, parents=[shared])
 
+    completion = command("completion", "Print a shell completion script.")
+    completion.add_argument("shell", choices=("bash", "zsh"))
     command("status", "Version, provider, document count.")
     command("documents", "List indexed documents.")
 
@@ -776,12 +913,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"Exit {EXIT_NOT_ANSWERED} when the documents don't answer the question.",
     )
+    _question_flags(ask)
+    ask.add_argument(
+        "--format",
+        choices=("text", "markdown", "json"),
+        help="text (streamed, default), markdown (footnoted sources) or json (= --json).",
+    )
 
     chat = command("chat", "Ask questions from stdin, each with the conversation so far.")
     chat.add_argument("--file", action="append", help="Limit to this document (repeatable).")
     chat.add_argument("--tag", action="append", help="Limit to documents with this tag.")
     chat.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
     chat.add_argument("--quiet", action="store_true", help="No progress lines on stderr.")
+    _question_flags(chat)
 
     summarize = command(
         "summarize", "Summarize a document, compare two, or write one brief across several."
@@ -895,8 +1039,24 @@ def main(
     _tolerate_unencodable_output()  # first: argparse's own errors echo the arguments
     args = build_parser().parse_args(argv)
     stream = out or sys.stdout
+    if args.command == "completion":
+        # Needs no server: the script is made from this parser.
+        print(completion_script(build_parser(), args.shell), file=stream)
+        return 0
     owned = client is None
-    active = client or DocragClient(args.url, args.api_key, workspace=args.workspace)
+    if client is None:
+        try:
+            profile = load_profile(args.profile)
+        except ProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        profile = profile or Profile()
+        client = DocragClient(
+            resolve(args.url, "DOCRAG_URL", profile.url),
+            resolve(args.api_key, "DOCRAG_API_KEY", profile.api_key()),
+            workspace=resolve(args.workspace, "DOCRAG_WORKSPACE", profile.workspace),
+        )
+    active = client
     try:
         return COMMANDS[args.command](active, args, stream)
     except DocragError as exc:

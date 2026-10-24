@@ -43,6 +43,14 @@ interface ComposerProps {
   draftKey?: string;
   /** Text to put in the box (an example question); a new nonce puts it in again. */
   prefill?: { text: string; nonce: number } | null;
+  /** A page range within the one scoped document; offered while exactly one is. */
+  pageRange?: { min?: number; max?: number };
+  onPageRangeChange?: (range: { min?: number; max?: number }) => void;
+}
+
+function pageInput(value: string): number | undefined {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined;
 }
 
 // Typing is saved this long after the last keystroke.
@@ -73,6 +81,8 @@ function Composer({
   onSelectedTagsChange,
   draftKey,
   prefill,
+  pageRange,
+  onPageRangeChange,
 }: ComposerProps) {
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
@@ -294,6 +304,7 @@ function Composer({
       )}
       <div className="composer__box">
         <textarea
+          dir="auto"
           ref={textareaRef}
           id={QUESTION_INPUT_ID}
           className="composer__textarea"
@@ -386,6 +397,36 @@ function Composer({
                         <span>#{tag}</span>
                       </label>
                     ))}
+                  </div>
+                )}
+                {onPageRangeChange && selectedFilenames.length === 1 && (
+                  <div className="composer__popover-pages" data-testid="scope-pages">
+                    <span>Pages</span>
+                    <input
+                      type="number"
+                      min={1}
+                      inputMode="numeric"
+                      value={pageRange?.min ?? ''}
+                      onChange={(event) =>
+                        onPageRangeChange({ ...pageRange, min: pageInput(event.target.value) })
+                      }
+                      aria-label={`First page of ${selectedFilenames[0]}`}
+                      placeholder="from"
+                      data-testid="scope-page-min"
+                    />
+                    <span>to</span>
+                    <input
+                      type="number"
+                      min={pageRange?.min ?? 1}
+                      inputMode="numeric"
+                      value={pageRange?.max ?? ''}
+                      onChange={(event) =>
+                        onPageRangeChange({ ...pageRange, max: pageInput(event.target.value) })
+                      }
+                      aria-label={`Last page of ${selectedFilenames[0]}`}
+                      placeholder="to"
+                      data-testid="scope-page-max"
+                    />
                   </div>
                 )}
                 {visibleFilenames.map((filename) => (

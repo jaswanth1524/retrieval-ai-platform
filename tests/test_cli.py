@@ -1132,3 +1132,45 @@ def test_chat_reports_a_server_error_and_goes_on(
     code, _ = run(client, "chat", "--quiet")
     assert code == 0 and asked == ["Busy?", "Next?"]
     assert "error (429): Every question slot is taken." in capsys.readouterr().err
+
+
+def test_ask_sends_the_narrowing_and_answer_style(client: DocragClient, tmp_path: Path) -> None:
+    run(client, "ingest", str(corpus(tmp_path)))
+    sent: list[dict[str, object]] = []
+    original = client._stream  # noqa: SLF001
+
+    def recording(path, body, *rest, **kwargs):  # type: ignore[no-untyped-def]
+        sent.append(body)
+        return original(path, body, *rest, **kwargs)
+
+    client._stream = recording  # type: ignore[method-assign]  # noqa: SLF001
+
+    code, out = run(
+        client,
+        "--json",
+        "ask",
+        "alpha",
+        "--page-min",
+        "1",
+        "--section",
+        "Intro",
+        "--exclude",
+        "notes.md",
+        "--answer-format",
+        "bullets",
+        "--language",
+        "match",
+    )
+
+    assert code == 0, out
+    assert sent == [
+        {
+            "question": "alpha",
+            "page_min": 1,
+            "section": "Intro",
+            "exclude_filenames": ["notes.md"],
+            "answer_format": "bullets",
+            "answer_language": "match",
+        }
+    ]
+    assert json.loads(out)["sources"][0]["filename"] == "guide.txt"

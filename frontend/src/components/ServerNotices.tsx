@@ -4,6 +4,8 @@ import './ServerNotices.css';
 
 interface ServerNoticesProps {
   indexProblem: IndexProblem | null;
+  /** Models that failed to load ("embedding", "reranker", "tokenizer"). */
+  failedModels?: string[];
   updatedTo: string | null;
   /** Workspaces are on: the index check covers the default workspace only. */
   workspacesEnabled?: boolean;
@@ -11,10 +13,34 @@ interface ServerNoticesProps {
 }
 
 /** What the server reported about itself that the user has to act on. */
-function ServerNotices({ indexProblem, updatedTo, workspacesEnabled, onReload }: ServerNoticesProps) {
-  if (!indexProblem && !updatedTo) return null;
+const MODEL_NAMES: Record<string, string> = {
+  embedding: 'embedding models',
+  reranker: 'reranker',
+  tokenizer: 'tokenizer',
+};
+
+function ServerNotices({
+  indexProblem,
+  failedModels = [],
+  updatedTo,
+  workspacesEnabled,
+  onReload,
+}: ServerNoticesProps) {
+  if (!indexProblem && !updatedTo && failedModels.length === 0) return null;
+  const models = failedModels.map((name) => MODEL_NAMES[name] ?? name).join(' and ');
   return (
     <div className="server-notices">
+      {failedModels.length > 0 && (
+        <div className="server-notice server-notice--bad" role="alert" data-testid="models-failed">
+          <p className="server-notice__title">
+            The server couldn’t load its {models}: questions and searches will fail.
+          </p>
+          <p className="server-notice__body">
+            It keeps retrying in the background. If this stays, check the model settings and the
+            server log.
+          </p>
+        </div>
+      )}
       {indexProblem && (
         <div className="server-notice server-notice--bad" role="alert" data-testid="index-mismatch">
           <p className="server-notice__title">

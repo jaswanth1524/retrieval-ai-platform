@@ -12,7 +12,8 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
-text-extraction pass (pass 9), then a correctness pass (pass 10). **Re-index:
+text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
+(pass 11). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -141,6 +142,78 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 11: questions take the narrowing `POST /search` has — `page_min`/`page_max`,
+  `section`, `exclude_filenames` — and `chunk_ids` (both endpoints), so a question can be
+  asked over passages picked in the Search panel ("Ask about these"), a page range of the
+  one scoped document (the composer's scope popover), or away from some documents.
+  Picked passages are the context exactly (no neighbour text is added). Every
+  narrowing filters the same hybrid search, fusion and rerank, on every search leg (a
+  follow-up's rewrite and raw question, expansion variants). Answers can be laid out
+  (`ANSWER_FORMAT`, or `answer_format` per question: `bullets`, `table`, `brief`) and
+  written in a language per question (`answer_language`, over `ANSWER_LANGUAGE`); one
+  fixed sentence after the grounding rules, never replacing them. Settings → Answers
+  sets both in the UI; the CLI has `ask --page-min/--page-max/--section/--exclude/
+  --answer-format/--language`, MCP `ask` the same. All in the answer cache key and the
+  trace. **None.**
+- Pass 11: identical questions (and summaries) asked while one is running wait for it
+  and replay its answer (`cached: true`, same trace id) instead of running retrieval,
+  the rerank and the LLM again — at a local model the second used to queue behind the
+  first for its whole generation. A stream shows `joining_identical_question`. Only
+  without history and with the answer cache on; Regenerate never joins; a leader that
+  fails leaves the follower to ask itself. `docrag_answer_inflight_joins_total`.
+  **None.**
+- Pass 11: estimated cost per answer (`usage.cost_usd` on responses, `done`, traces) at
+  the hosted model's list price from LiteLLM's bundled table, and
+  `docrag_llm_cost_usd_total{provider,model}`; local models cost nothing. Usage now
+  counts every LLM call of a question (the condense and query expansion; on
+  `POST /questions` the follow-ups too). Traces record the model (`config.llm_model`).
+  **None.**
+- Pass 11: `TRACE_STORE_PATH` (off) also keeps traces in sqlite (`TRACE_STORE_MAX_ROWS`,
+  5000): a cached answer's or a feedback row's trace still opens after the in-memory ring
+  moved on or the server restarted. `GET /traces/export` (full key) downloads a
+  workspace's traces as JSON Lines; the Traces panel has "export JSONL". **None.**
+- Pass 11: a re-upload, re-index, URL refresh or watched-folder change embeds only the
+  chunks that changed; the rest keep their stored vectors (same point id — filename,
+  page, section, text — and same chunking fingerprint). An 800-chunk document with one
+  page edited re-indexed in 0.8 s instead of 109 s (M1, bge-small). After a chunker or
+  chunk-setting change the chunks' text changes too, so nothing is reused there. A
+  re-index therefore no longer re-embeds unchanged chunks; `INGEST_REUSE_VECTORS=false`
+  embeds every chunk again. The embedding setup itself (dense and sparse models, BM25
+  language, passage prefix) is checked on the collection before any write, as before.
+  `docrag_ingest_vectors_reused_total`, ingest stage `reuse`. **None.**
+- Pass 11: `AUTO_REINDEX_STALE` (off; needs `RAW_DOCUMENT_DIR`) re-indexes stale
+  documents in the background, every workspace, at most `AUTO_REINDEX_BATCH` (4) jobs at
+  a time so uploads still get through; it skips an index built for another embedding
+  setup and waits for the tokenizer. `docrag_stale_documents`. **None.**
+- Pass 11: `/health/ready` reports each model the startup warmup loaded (`models`): one
+  that failed makes it `degraded` (503) until a background retry (once a minute, when
+  readiness is asked) loads it; the UI says which. A tokenizer falling back to the
+  heuristic counter is shown, never degraded. **None.**
+- Pass 11: an audit line on `api.audit` (an `audit` object under `LOG_FORMAT=json`) for
+  every document delete, tag change, re-index, refresh, version restore, job cancel,
+  backup import and workspace create/delete, with the workspace, the key used
+  (full/read/open; "system" for the folder watcher) and the client address. Kept at any
+  `LOG_LEVEL`. Not per-user: there is one shared key. **None.**
+- Pass 11, UI: an "Unanswered questions" panel (`QUERY_LOG_ENABLED`, full key) lists what
+  the documents didn't answer, each with Ask / Search / Trace; a document's earlier
+  versions (`RAW_DOCUMENT_VERSIONS`) are listed and restored from its card (⧗); totals
+  for the corpus (documents, passages, pages, size, stale); "Upload a folder…" and
+  dropped folders (one file per name, other types left out and named, at most 500);
+  export a conversation as a self-contained web page, print it (only the conversation
+  is printed), and the Markdown export has the title and each source's quotes; right-
+  to-left text (Arabic, Hebrew) is laid out by its own direction; the answer footer
+  shows tokens and cost. **None.**
+- Pass 11, CLI: profiles in `~/.config/docrag/config.toml` (`--profile`,
+  `DOCRAG_PROFILE`; a key is named by the variable holding it, `key_env`, never written
+  in the file); `docrag completion bash|zsh`; `ask --format markdown` (sources as
+  footnotes with their quotes); `chat` edits lines and remembers questions at a
+  terminal. **None.**
+- Pass 11, eval: `harness diff A.json B.json` lists every question that got better or
+  worse between two runs (`--fail-on-regression`), `harness report` writes a run (with
+  RAGAS scores, and a diff against a base) as one HTML page; `make eval-diff`,
+  `make eval-report`. Datasets may name several facts the answer must all state
+  (`answer_contains_all`); `eval/datasets/compare_eval.jsonl` asks two-sided questions
+  of the handbook corpus. **None.**
 - Pass 10: `POST /documents/reindex` lists `in_progress` (already being indexed; not
   queued a second time) and `failed` (could not be queued; the others were), and
   `POST /documents/{filename}/reindex` is a 409 while that document is being indexed. The

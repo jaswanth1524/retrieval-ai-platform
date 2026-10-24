@@ -2678,3 +2678,121 @@ def test_query_expansion_waits_for_the_local_model_and_says_so() -> None:
     assert stages[:2] == ["waiting_for_model", "searching"]
     assert events[-1]["type"] == "done"
     assert generator.held == [True, True]
+
+
+class NarrowRecordingRepository(CountingRepository):
+    """Records the narrowing each hybrid search was given."""
+
+    def __init__(self, inner: VectorRepository) -> None:
+        super().__init__(inner)
+        self.narrowings: list[Any] = []
+
+    def hybrid_search(  # type: ignore[override]
+        self,
+        settings: AppSettings,
+        query_embedding: Any,
+        filenames: Any = None,
+        tags: Any = None,
+        narrow: Any = None,
+    ) -> Any:
+        self.search_calls += 1
+        self.narrowings.append(narrow)
+        return self.inner.hybrid_search(settings, query_embedding, filenames, tags, narrow=narrow)
+
+
+def test_a_question_narrowing_reaches_every_search_leg() -> None:
+    """The condensed rewrite, the raw follow-up searched beside it and each expansion
+    variant are all narrowed — a leg searched unnarrowed would bring passages back
+    from outside the pages the user asked about."""
+
+    from api.pipeline import AnswerOverrides
+    from api.repository import PassageFilter
+
+    settings = make_settings(query_expansion_enabled=True, query_expansion_count=2)
+    inner = VectorRepository(QdrantClient(":memory:"))
+    IngestService(inner, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    recording = NarrowRecordingRepository(inner)
+    generator = SequencedGenerator(
+        ["What does alpha cover?", "variant one\nvariant two", "Alpha is documented [1]."]
+    )
+    pipeline = RagPipeline(
+        repository=recording,  # type: ignore[arg-type]
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+    )
+    narrow = PassageFilter(page_min=1, page_max=1)
+
+    pipeline.answer(
+        "And what about it?",
+        AnswerOverrides(narrow=narrow),
+        history=[
+            {"role": "user", "content": "Tell me about alpha."},
+            {"role": "assistant", "content": "Alpha is a guide [1]."},
+        ],
+    )
+
+    # Rewrite + raw follow-up + 2 variants.
+    assert recording.search_calls == 4
+    assert recording.narrowings == [narrow] * 4
+
+
+def test_the_answer_format_and_language_reach_the_prompt_and_the_cache_key() -> None:
+    from api.answer_cache import AnswerCache
+    from api.pipeline import AnswerOverrides
+
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    generator = FakeGenerator("Alpha is documented [1].")
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=generator,
+        settings=settings,
+        answer_cache=AnswerCache(10, 600),
+    )
+
+    plain = pipeline.answer("alpha")
+    bullets = pipeline.answer("alpha", AnswerOverrides(answer_format="bullets"))
+    german = pipeline.answer("alpha", AnswerOverrides(answer_language="German"))
+
+    assert not plain.cached and not bullets.cached and not german.cached
+    assert "Write the answer in German." in generator.messages[0]["content"]
+    assert pipeline.answer("alpha", AnswerOverrides(answer_format="bullets")).cached
+
+
+def test_picked_passages_are_answered_without_their_neighbours() -> None:
+    """A question over chunk_ids (Ask about these) reads only those passages."""
+
+    from api.repository import PassageFilter
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=20)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    text = " ".join(f"Sentence {i} talks about alpha topic {i}." for i in range(12)).encode()
+    IngestService(repository, OnePerText(), settings).ingest("guide.txt", b"Intro\n" + text)
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+    )
+    everything = pipeline.retrieve("alpha")
+    assert any(chunk.expanded_text for chunk in everything.context_chunks)
+    picked = everything.context_chunks[0].chunk_id
+
+    phase = pipeline.retrieve("alpha", narrow=PassageFilter(chunk_ids=(picked,)))
+
+    assert [chunk.chunk_id for chunk in phase.context_chunks] == [picked]
+    assert phase.context_chunks[0].expanded_text is None

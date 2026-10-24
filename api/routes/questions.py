@@ -29,6 +29,7 @@ from api.metrics import (
     summaries_total,
 )
 from api.pipeline import AnswerOverrides, timings_dict
+from api.repository import PassageFilter
 from api.routes.deps import (
     DocumentSummarizerDep,
     QuestionSlotsDep,
@@ -43,6 +44,7 @@ from api.routes.responses import (
 )
 from api.schemas import (
     CitationResponse,
+    PassageNarrowing,
     QuestionRequest,
     QuestionResponse,
     RequestProvider,
@@ -153,6 +155,33 @@ def summary_request(request: SummaryRequest) -> PipelineSummaryRequest:
     )
 
 
+def passage_narrowing(request: PassageNarrowing) -> PassageFilter | None:
+    """A request's page/section/passage/exclusion narrowing, or None when it has none."""
+
+    narrow = PassageFilter(
+        page_min=request.page_min,
+        page_max=request.page_max,
+        section=request.section,
+        exclude_filenames=tuple(request.exclude_filenames or ()),
+        chunk_ids=tuple(dict.fromkeys(request.chunk_ids or ())),
+    )
+    return None if narrow == PassageFilter() else narrow
+
+
+def question_overrides(request: QuestionRequest) -> AnswerOverrides:
+    """Everything a question changes about how it is answered, for the pipeline."""
+
+    return AnswerOverrides(
+        llm_provider=request.llm_provider,
+        rerank_top_k=request.rerank_top_k,
+        max_context_chunks=request.max_context_chunks,
+        llm_temperature=request.llm_temperature,
+        answer_format=request.answer_format,
+        answer_language=request.answer_language,
+        narrow=passage_narrowing(request),
+    )
+
+
 def register(app: FastAPI) -> None:
     """Register the question routes."""
 
@@ -170,12 +199,7 @@ def register(app: FastAPI) -> None:
         try:
             grounded = pipeline.answer(
                 request.question,
-                AnswerOverrides(
-                    llm_provider=request.llm_provider,
-                    rerank_top_k=request.rerank_top_k,
-                    max_context_chunks=request.max_context_chunks,
-                    llm_temperature=request.llm_temperature,
-                ),
+                question_overrides(request),
                 filenames=request.filenames,
                 history=history_messages(request.history),
                 tags=request.tags,
@@ -210,7 +234,7 @@ def register(app: FastAPI) -> None:
             truncated=grounded.truncated,
             citation_backfilled=grounded.citation_backfilled,
             followups=grounded.followups,
-            usage=usage_response(grounded.usage),
+            usage=usage_response(grounded.usage, grounded.cost_usd),
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
@@ -224,12 +248,7 @@ def register(app: FastAPI) -> None:
         # Taken here, before the 200 is committed, so a full server can still say 429.
         lease = StreamLease(question_slot(slots))
         stop = threading.Event()
-        overrides = AnswerOverrides(
-            llm_provider=request.llm_provider,
-            rerank_top_k=request.rerank_top_k,
-            max_context_chunks=request.max_context_chunks,
-            llm_temperature=request.llm_temperature,
-        )
+        overrides = question_overrides(request)
 
         def event_source() -> Iterator[str]:
             # The try/except below turns a mid-stream domain error into a clean SSE
@@ -331,7 +350,7 @@ def register(app: FastAPI) -> None:
             cached=grounded.cached,
             answer_status=grounded.answer_status,
             truncated=grounded.truncated,
-            usage=usage_response(grounded.usage),
+            usage=usage_response(grounded.usage, grounded.cost_usd),
             citation_backfilled=grounded.citation_backfilled,
             chunks_read=result.chunks_read,
             chunks_total=result.chunks_total,

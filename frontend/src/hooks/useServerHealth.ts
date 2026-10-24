@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { ReadinessResponse } from '../api/types';
 import { useConnectionMonitor } from './useConnectionMonitor';
@@ -17,7 +17,13 @@ export interface ServerHealth {
   updatedTo: string | null;
   /** The default workspace's index was built for another embedding setup. */
   indexProblem: IndexProblem | null;
+  /** Models that failed to load at startup ("embedding", "reranker"): questions fail
+   *  until the server's background retry loads them. */
+  failedModels: string[];
 }
+
+/** How often readiness is asked again while a model is down, to see it recover. */
+export const FAILED_MODEL_RECHECK_MS = 60_000;
 
 /**
  * The connection monitor plus what /health and /health/ready say beyond "up": the
@@ -71,6 +77,23 @@ export function useServerHealth(booted: boolean): ServerHealth {
     if (booted && restored) void checkReadiness();
   }, [booted, connectionLost, checkReadiness]);
 
+  const models = readiness?.models;
+  const failedModels = useMemo(
+    () =>
+      Object.entries(models ?? {})
+        // The tokenizer only falls back to a heuristic count; questions still work.
+        .filter(([name, state]) => state === 'failed' && name !== 'tokenizer')
+        .map(([name]) => name)
+        .sort(),
+    [models],
+  );
+  const anyFailed = failedModels.length > 0;
+  useEffect(() => {
+    if (!booted || !anyFailed) return;
+    const timer = setInterval(() => void checkReadiness(), FAILED_MODEL_RECHECK_MS);
+    return () => clearInterval(timer);
+  }, [booted, anyFailed, checkReadiness]);
+
   const indexProblem =
     readiness && readiness.index_compatible === false
       ? {
@@ -78,5 +101,5 @@ export function useServerHealth(booted: boolean): ServerHealth {
           originalsKept: Boolean(readiness.originals_kept),
         }
       : null;
-  return { connectionLost, version, updatedTo, indexProblem };
+  return { connectionLost, version, updatedTo, indexProblem, failedModels };
 }

@@ -20,6 +20,7 @@ from typing import Any
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from api.audit import set_actor
 from api.dependencies import READ_ONLY_KEY_ERROR, get_app_settings, key_access
 from api.metrics import rate_limited_total
 from api.rate_limit import RateLimiter, retry_after_seconds
@@ -68,7 +69,9 @@ def is_rate_limited(method: str, path: str) -> bool:
     """Requests RATE_LIMIT_PER_MINUTE counts: changes, plus the export, which reads
     every stored original."""
 
-    return method in RATE_LIMITED_METHODS or (method == "GET" and path == "/export")
+    return method in RATE_LIMITED_METHODS or (
+        method == "GET" and path in ("/export", "/traces/export")
+    )
 
 
 def is_guarded_path(path: str) -> bool:
@@ -84,7 +87,9 @@ def needs_full_key(method: str, path: str) -> bool:
     """Routes the read-only key (API_READ_KEY) may not use: changes to the corpus, and
     operator data (feedback, metrics, the full export)."""
 
-    if path in ("/metrics", "/export", "/query-log") or (path == "/feedback" and method == "GET"):
+    if path in ("/metrics", "/export", "/query-log", "/traces/export") or (
+        path == "/feedback" and method == "GET"
+    ):
         return True
     if method == "POST" and path in ("/import", "/watch/scan"):
         return True
@@ -146,6 +151,8 @@ class RequestGuardMiddleware:
         settings = self._settings(scope)
         raw_headers = scope.get("headers", [])
         headers = {key.lower(): value for key, value in raw_headers}
+        client = scope.get("client")
+        set_actor("open", str(client[0]) if client else "unknown")
         if settings.api_key:
             # The dict above keeps the last copy and FastAPI's dependency reads the
             # first; one header, so both checks judge the same key.
@@ -164,6 +171,7 @@ class RequestGuardMiddleware:
             if access == "read" and needs_full_key(method, path):
                 await _reject(send, 403, READ_ONLY_KEY_ERROR)
                 return
+            set_actor(access, str(client[0]) if client else "unknown")
 
         if is_rate_limited(method, path):
             wait = self._rate_limited(scope, settings)

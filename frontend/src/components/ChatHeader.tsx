@@ -53,7 +53,7 @@ function ChatHeader({
 
   return (
     <header className="chat-header">
-      <h1 className="chat-header__title">{title}</h1>
+      <h1 className="chat-header__title" dir="auto">{title}</h1>
       <span className="chat-header__scope">{scopeLabel}</span>
       {hasTurns && (
         <div className="chat-header__actions">

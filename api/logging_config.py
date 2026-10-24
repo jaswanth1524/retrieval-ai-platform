@@ -41,6 +41,9 @@ class JsonFormatter(logging.Formatter):
         http = getattr(record, "http", None)
         if isinstance(http, dict):
             entry["http"] = http
+        audit = getattr(record, "audit", None)
+        if isinstance(audit, dict):
+            entry["audit"] = audit
         if record.exc_info:
             entry["exception"] = self.formatException(record.exc_info)
         return json.dumps(entry, ensure_ascii=False)
@@ -92,6 +95,9 @@ def configure_logging(level: str, log_format: Literal["text", "json"] = "text") 
                     "propagate": True,
                 },
                 **access_loggers,
+                # Audit lines (api/audit.py) are kept at any LOG_LEVEL: a quieter log
+                # must not also lose the record of what was deleted.
+                "api.audit": {"level": "INFO", "propagate": True},
             },
         }
     )

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { CitationResponse, DocumentTask } from '../api/types';
+import type { CitationResponse } from '../api/types';
 import type { StageTiming } from '../hooks/useChat';
 import { STREAMING_STAGE_LABELS } from '../utils/stages';
-import ChatMessage, { type ChatTurn, type FeedbackPayload } from './ChatMessage';
+import ChatMessage, { type AskAgain, type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
 
@@ -23,9 +23,9 @@ interface ChatThreadProps {
   stageTiming?: StageTiming | null;
   engineerMode: boolean;
   currentModelLabel?: string;
-  onRetry?: (question: string, task?: DocumentTask) => void;
+  onRetry?: AskAgain;
   // Regenerate (skips the answer cache); falls back to onRetry when absent.
-  onRegenerate?: (question: string, task?: DocumentTask) => void;
+  onRegenerate?: AskAgain;
   onEditQuestion?: (turnId: string, question: string) => void;
   // Ask one of the latest answer's suggested follow-ups.
   onAskFollowup?: (question: string) => void;
@@ -347,6 +347,7 @@ function ChatThread({
             onEditQuestion={onEditQuestion}
             regenerateQuestion={turn.role === 'assistant' ? questions[index]?.content : undefined}
             regenerateTask={turn.role === 'assistant' ? questions[index]?.task : undefined}
+            regenerateNarrowing={turn.role === 'assistant' ? questions[index]?.narrowing : undefined}
             busy={busy}
             onAskFollowup={turn.id === lastTurn?.id ? onAskFollowup : undefined}
             weakSupportBelow={weakSupportBelow}

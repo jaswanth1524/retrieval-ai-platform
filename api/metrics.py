@@ -31,6 +31,13 @@ answer_cache_hits_total = Counter(
     "Questions answered from the answer cache (not counted in the stage histograms).",
 )
 
+answer_inflight_joins_total = Counter(
+    "docrag_answer_inflight_joins_total",
+    "Questions and summaries that waited for an identical one already running: "
+    "outcome=replayed (its answer was reused) or ran (it left none; asked again).",
+    ["outcome"],
+)
+
 ingest_jobs_total = Counter(
     "docrag_ingest_jobs_total",
     "Total background ingestion jobs, labeled by outcome and (for outcome=failed) error_type.",
@@ -50,9 +57,21 @@ ingest_job_seconds = Histogram(
 
 # Where an ingest's time goes. "write" is everything under the filename lock:
 # snapshot, upserts, storing the original and stale cleanup.
+ingest_vectors_reused_total = Counter(
+    "docrag_ingest_vectors_reused_total",
+    "Chunks indexed with their stored vectors instead of being embedded again "
+    "(INGEST_REUSE_VECTORS): unchanged chunks of a re-indexed document.",
+)
+
+stale_documents = Gauge(
+    "docrag_stale_documents",
+    "Documents with a stored original that are indexed with older chunking, as of the "
+    "last AUTO_REINDEX_STALE pass (all workspaces).",
+)
+
 ingest_stage_seconds = Histogram(
     "docrag_ingest_stage_seconds",
-    "Wall-clock time of each ingestion stage (parse, chunk, embed, write).",
+    "Wall-clock time of each ingestion stage (parse, chunk, reuse, embed, write).",
     labelnames=("stage",),
     buckets=INGEST_LATENCY_BUCKETS,
 )
@@ -119,6 +138,13 @@ llm_tokens_total = Counter(
     "docrag_llm_tokens_total",
     "Tokens the LLM provider reported using, labeled by provider and kind.",
     labelnames=("provider", "kind"),
+)
+
+llm_cost_usd_total = Counter(
+    "docrag_llm_cost_usd_total",
+    "Estimated cost in US dollars of the tokens hosted LLM providers reported, from "
+    "LiteLLM's bundled price table (local providers and unlisted models count nothing).",
+    labelnames=("provider", "model"),
 )
 
 question_slots_in_use = Gauge(

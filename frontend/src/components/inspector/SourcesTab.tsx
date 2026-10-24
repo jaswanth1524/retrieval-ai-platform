@@ -64,7 +64,7 @@ function SourcesTab({ sources, candidates, onOpenSource, emptyMessage }: Sources
                 {pageLabel(source.page, source.page_end)} &middot; {source.section}
               </span>
             </span>
-            <span className="sources-tab__quote">{source.text}</span>
+            <span className="sources-tab__quote" dir="auto">{source.text}</span>
             {score !== null && (
               <span className="sources-tab__score-row">
                 <span className="sources-tab__track">

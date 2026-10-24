@@ -145,6 +145,7 @@ const STAGE_LABELS: Record<string, string> = {
   condensing: 'reading the conversation…',
   searching: 'searching documents…',
   waiting_for_model: 'waiting for the model — another question is using it…',
+  joining_identical_question: 'the same question is being answered — waiting for it…',
   reading: 'reading the passages…',
   verifying_citations: 'checking citations…',
   reading_documents: 'reading the document…',
@@ -436,6 +437,8 @@ export function useChat(): UseChatResult {
     let trailing: TrailingStream | null = null;
 
     const task = options?.task;
+    // Kept on the question's turns so Retry and Regenerate look in the same passages.
+    const narrowing = options?.narrowing && Object.keys(options.narrowing).length > 0 ? options.narrowing : undefined;
     // The first question binds the conversation to the workspace it was asked in
     // (api/client sends that one's header); the default is recorded as no field.
     const workspace = getWorkspace();
@@ -457,7 +460,7 @@ export function useChat(): UseChatResult {
         JSON.stringify(last.task ?? null) === JSON.stringify(task ?? null);
       return [
         ...(unanswered ? prev.slice(0, -1) : prev),
-        { ...makeTurn('user', question), ...(task ? { task } : {}) },
+        { ...makeTurn('user', question), ...(task ? { task } : {}), ...(narrowing ? { narrowing } : {}) },
       ];
     });
     setPending(true);
@@ -621,6 +624,9 @@ export function useChat(): UseChatResult {
                         usage: {
                           prompt: grounding.usage.prompt_tokens,
                           completion: grounding.usage.completion_tokens,
+                          ...(typeof grounding.usage.cost_usd === 'number'
+                            ? { costUsd: grounding.usage.cost_usd }
+                            : {}),
                         },
                       }
                     : {}),
@@ -671,7 +677,12 @@ export function useChat(): UseChatResult {
           ...prev.map((turn) =>
             turn.id === assistantTurnId && turn.content !== '' ? { ...turn, incomplete: true } : turn,
           ),
-          { ...makeTurn('error', message), question, ...(task ? { task } : {}) },
+          {
+            ...makeTurn('error', message),
+            question,
+            ...(task ? { task } : {}),
+            ...(narrowing ? { narrowing } : {}),
+          },
         ]);
       }
     } finally {

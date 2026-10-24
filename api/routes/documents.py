@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, Upl
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 
-from api.chunking import TokenCounter
+from api.audit import audit
 from api.corpus import bump_corpus_generation
 from api.dependencies import (
     require_api_key,
@@ -24,7 +24,6 @@ from api.dependencies import (
 from api.documents import (
     DocumentNotFoundError,
     DocumentSource,
-    chunking_fingerprint,
     normalize_tags,
     validate_upload_filename,
 )
@@ -40,13 +39,15 @@ from api.ingest_jobs import (
     known_filenames,
     original_still_stored,
     refuse_near_duplicate_name,
+    reindex_stale,
     require_raw_store,
+    source_of,
+    staleness,
     stored_filename,
 )
 from api.ingestion import filename_write_lock
 from api.jobs import IngestJob, JobNotFoundError, JobStore
 from api.metrics import corpus_documents
-from api.repository import DocumentMetadata
 from api.restore import BackupImportError, restore_backup
 from api.routes.deps import (
     FeedbackStoreDep,
@@ -75,7 +76,6 @@ from api.schemas import (
     ImportResponse,
     UrlIngestRequest,
 )
-from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
 from api.upload import read_upload_within_limit
 from api.url_fetch import BacklogFullError, FetchedDocument, fetch_document, loggable_url
@@ -104,12 +104,6 @@ def _job_status(job_store: JobStore, job_id: str, workspace: str) -> DocumentJob
     if job is None or job.workspace != workspace:
         raise JobNotFoundError(f"No ingestion job found with id '{job_id}'.")
     return _job_response(job)
-
-
-def _source_of(meta: DocumentMetadata) -> DocumentSource | None:
-    if not meta.source_url:
-        return None
-    return DocumentSource(meta.source_url, meta.source_etag, meta.source_last_modified)
 
 
 def _job_response(job: IngestJob) -> DocumentJobStatusResponse:
@@ -173,7 +167,7 @@ def list_documents(
 ) -> DocumentListResponse:
     metadata = repository.filename_metadata(settings)
     corpus_documents.set(len(metadata))
-    is_stale = _staleness(settings, token_counter)
+    is_stale = staleness(settings, token_counter)
     stored_originals = raw_store.stored_names() if raw_store is not None else set()
     return DocumentListResponse(
         filenames=sorted(metadata),
@@ -365,11 +359,19 @@ def restore_document_version(
     content = store.read_version(name, version)
     if content is None:
         raise DocumentNotFoundError(f"No version '{version}' of '{name}'.")
-    return queue.enqueue(
+    accepted = queue.enqueue(
         filename=name,
         content=content,
         raw_store=store,
     )
+    audit(
+        "document.version_restore",
+        workspace=workspace_of(settings),
+        filename=name,
+        version=version,
+        job_id=accepted.job_id,
+    )
+    return accepted
 
 
 # Fetches a URL-ingested document again from where it came from, conditionally: a
@@ -424,7 +426,7 @@ async def refresh_document_from_url(
             status_code=200,
             media_type="application/json",
         )
-    return await run_in_threadpool(
+    accepted = await run_in_threadpool(
         queue.enqueue,
         filename=name,
         content=fetched.content,
@@ -433,6 +435,10 @@ async def refresh_document_from_url(
         # Its tags carry over (as on any re-upload); unchanged bytes are left alone.
         dedupe=True,
     )
+    audit(
+        "document.refresh", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
+    )
+    return accepted
 
 
 # Re-chunks and re-embeds a document from its stored original (RAW_DOCUMENT_DIR),
@@ -452,57 +458,20 @@ def reindex_stale_documents(
     token_counter: TokenCounterDep,
 ) -> DocumentReindexAllResponse:
     store = require_raw_store(raw_store)
-    is_stale = _staleness(settings, token_counter)
-    # 409 now, not one failed job per document, when the index can't take them.
-    repository.ensure_writable(settings)
-    metadata = repository.filename_metadata(settings)
-    busy = indexing_now(settings)
-    jobs: list[DocumentJobAcceptedResponse] = []
-    deferred: list[str] = []
-    in_progress: list[str] = []
-    failed: list[str] = []
-    for name, meta in sorted(metadata.items()):
-        if not is_stale(meta):
-            continue
-        if name in busy:
-            # Still listed as stale until its job finishes: a second click would
-            # parse and embed the whole document again.
-            in_progress.append(name)
-            continue
-        size = store.size(name)
-        if size is None:
-            continue
-        # Checked before reading: once the backlog is full, reading every remaining
-        # original into memory only to defer it cost the whole corpus in RAM.
-        if not queue.backlog.has_room(size):
-            deferred.append(name)
-            continue
-        content = store.read(name)
-        if content is None:
-            continue
-        try:
-            jobs.append(
-                queue.enqueue(
-                    filename=name,
-                    content=content,
-                    raw_store=None,
-                    uploaded_at=meta.uploaded_at,
-                    precondition=original_still_stored(store, name),
-                    source=_source_of(meta),
-                )
-            )
-        except HTTPException as exc:
-            if exc.status_code == 503:
-                deferred.append(name)
-            else:
-                failed.append(name)
-        except Exception:
-            # The jobs already queued keep running; failing the request here left
-            # the client without their ids.
-            logger.exception("Could not queue the re-index of %s.", name)
-            failed.append(name)
+    outcome = reindex_stale(repository, settings, queue, store, token_counter)
+    audit(
+        "document.reindex_stale",
+        workspace=workspace_of(settings),
+        queued=len(outcome.jobs),
+        deferred=len(outcome.deferred),
+        in_progress=len(outcome.in_progress),
+        failed=len(outcome.failed),
+    )
     return DocumentReindexAllResponse(
-        jobs=jobs, deferred=deferred, in_progress=in_progress, failed=failed
+        jobs=outcome.jobs,
+        deferred=outcome.deferred,
+        in_progress=outcome.in_progress,
+        failed=outcome.failed,
     )
 
 
@@ -544,7 +513,7 @@ def reindex_document(
     if content is None:
         raise DocumentNotFoundError(f"No stored original for '{name}' to re-index.")
     meta = repository.document_metadata(settings, name)
-    return queue.enqueue(
+    accepted = queue.enqueue(
         filename=name,
         content=content,
         # The original is already stored, byte-identical. Passing the store would
@@ -553,8 +522,12 @@ def reindex_document(
         uploaded_at=meta.uploaded_at if meta is not None else None,
         precondition=original_still_stored(store, name),
         # A re-index is the same document: where it came from carries over.
-        source=_source_of(meta) if meta is not None else None,
+        source=source_of(meta) if meta is not None else None,
     )
+    audit(
+        "document.reindex", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
+    )
+    return accepted
 
 
 @router.delete(
@@ -612,6 +585,7 @@ def set_document_tags(
             raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
         repository.set_tags(settings, filename, tags)
     bump_corpus_generation([filename], collection=settings.qdrant_collection)
+    audit("document.tags", workspace=workspace_of(settings), filename=filename, tags=list(tags))
     return DocumentTagsResponse(filename=filename, tags=list(tags))
 
 
@@ -675,7 +649,9 @@ def cancel_document_job(
                 "cleanly. Delete the document once it finishes instead."
             ),
         )
-    return _job_status(job_store, job_id, workspace)
+    status = _job_status(job_store, job_id, workspace)
+    audit("job.cancel", workspace=workspace, job_id=job_id, filename=status.filename)
+    return status
 
 
 # Guarded alongside GET /documents: this returns every chunk's raw text, so leaving
@@ -889,6 +865,15 @@ def import_backup(
         )
     except BackupImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit(
+        "backup.import",
+        workspace=workspace_of(settings),
+        queued=len(outcome.jobs),
+        deferred=len(outcome.deferred),
+        skipped=len(outcome.skipped),
+        rejected=len(outcome.rejected),
+        feedback_imported=outcome.feedback_imported,
+    )
     return ImportResponse(
         jobs=outcome.jobs,
         deferred=outcome.deferred,
@@ -904,13 +889,3 @@ def register(app: FastAPI) -> None:
     """Register the document and export routes."""
 
     app.include_router(router)
-
-
-def _staleness(
-    settings: AppSettings, token_counter: TokenCounter
-) -> Callable[[DocumentMetadata], bool]:
-    """The one staleness rule the listing and bulk re-index share."""
-
-    fingerprint = chunking_fingerprint(settings)
-    counter_mode = str(getattr(token_counter, "mode", "unknown"))
-    return lambda meta: meta.is_stale(fingerprint, counter_mode)

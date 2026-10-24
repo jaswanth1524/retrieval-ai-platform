@@ -2,23 +2,28 @@
 prompt, and stage timings for one answered question.
 
 Traces are process-local and lost on restart — the same tradeoff as ``api.jobs``'
-``IngestJobStore``: there is no requirement for durable trace history across process
-restarts, only visibility into a running instance for debugging retrieval quality.
+``IngestJobStore`` — unless TRACE_STORE_PATH also keeps them on disk
+(``api.trace_archive``).
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import logging
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import Literal, Protocol, get_args
+from typing import Any, Literal, Protocol, get_args
 
 from api.generation import ChatMessage
 from api.metrics import traces_evicted_total
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievedChunk
+
+logger = logging.getLogger(__name__)
 
 TraceStatus = Literal["ok", "insufficient_context", "error"]
 TraceMode = Literal["sync", "stream"]
@@ -74,6 +79,13 @@ class TraceConfig:
     tags: list[str] | None = None
     # The cross-encoder that scored the candidates: rerank_min_score was tuned for one.
     reranker_model: str | None = None
+    answer_format: str = "default"
+    answer_language: str = ""
+    # The model the provider was asked for (LiteLLM's name, e.g. "ollama_chat/qwen2.5").
+    llm_model: str | None = None
+    # The question's passage narrowing (page range, section, picked passages,
+    # documents left out), only the parts given; None when it had none.
+    narrowing: dict[str, Any] | None = None
 
 
 @dataclass
@@ -112,6 +124,7 @@ class QueryTrace:
     citation_backfilled: bool = False
     # (prompt, completion) tokens reported for the answer's LLM calls, when reported.
     usage: tuple[int, int] | None = None
+    cost_usd: float | None = None
     # The HTTP request it came from (X-Request-ID), to find its log lines.
     request_id: str | None = None
     # The workspace it was asked in ("" = the default): GET /traces shows a workspace
@@ -125,11 +138,49 @@ class TraceSink(Protocol):
     def add(self, trace: QueryTrace) -> None: ...
 
 
-class TraceStore:
-    """Thread-safe in-memory ring buffer of recent query traces."""
+class TraceArchiveStore(Protocol):
+    """Where traces are also kept on disk (``api.trace_archive.TraceArchive``)."""
 
-    def __init__(self, max_retained: int) -> None:
+    def add(self, trace: QueryTrace) -> None: ...
+
+    def get(self, trace_id: str) -> QueryTrace | None: ...
+
+    def recent(self, workspace: str | None, limit: int) -> list[QueryTrace]: ...
+
+    def export_lines(self, workspace: str) -> Iterator[str]: ...
+
+
+def trace_to_json(trace: QueryTrace) -> str:
+    return json.dumps(dataclasses.asdict(trace), ensure_ascii=False)
+
+
+def _known_fields[T](cls: type[T], data: dict[str, Any]) -> dict[str, Any]:
+    # A row written by another version may carry a field this one doesn't know (or
+    # lack one it added, which then takes its default).
+    names = {field.name for field in dataclasses.fields(cls)}  # type: ignore[arg-type]
+    return {key: value for key, value in data.items() if key in names}
+
+
+def trace_from_json(body: str) -> QueryTrace:
+    data = json.loads(body)
+    config = data.get("config")
+    data["config"] = TraceConfig(**_known_fields(TraceConfig, config)) if config else None
+    data["candidates"] = [
+        TraceCandidate(**_known_fields(TraceCandidate, candidate))
+        for candidate in data.get("candidates") or []
+    ]
+    usage = data.get("usage")
+    data["usage"] = tuple(usage) if isinstance(usage, list) and len(usage) == 2 else None
+    return QueryTrace(**_known_fields(QueryTrace, data))
+
+
+class TraceStore:
+    """Thread-safe in-memory ring buffer of recent query traces, optionally backed by
+    an on-disk archive (TRACE_STORE_PATH) that outlives the ring and restarts."""
+
+    def __init__(self, max_retained: int, archive: TraceArchiveStore | None = None) -> None:
         self._max_retained = max_retained
+        self._archive = archive
         self._lock = Lock()
         self._traces: OrderedDict[str, QueryTrace] = OrderedDict()
 
@@ -140,6 +191,11 @@ class TraceStore:
             while len(self._traces) > self._max_retained:
                 self._traces.popitem(last=False)
                 traces_evicted_total.inc()
+        if self._archive is not None:
+            try:
+                self._archive.add(trace)
+            except Exception:  # noqa: BLE001 - a full disk must not fail the answer
+                logger.warning("Could not archive trace %s.", trace.trace_id, exc_info=True)
 
     def get(self, trace_id: str) -> QueryTrace | None:
         """Return a snapshot of a trace, or None if unknown/evicted.
@@ -151,17 +207,41 @@ class TraceStore:
 
         with self._lock:
             trace = self._traces.get(trace_id)
-            return replace(trace) if trace is not None else None
+            if trace is not None:
+                return replace(trace)
+        if self._archive is None:
+            return None
+        try:
+            return self._archive.get(trace_id)
+        except Exception:  # noqa: BLE001 - an unreadable archive is a miss
+            logger.warning("Could not read trace %s from the archive.", trace_id, exc_info=True)
+            return None
 
     def list_traces(self, workspace: str | None = None) -> list[QueryTrace]:
-        """Return the retained traces, newest first; only ``workspace``'s when given."""
+        """Return the retained traces, newest first; only ``workspace``'s when given.
+        With an archive, its newest ``max_retained`` (they outlive a restart)."""
 
+        if self._archive is not None:
+            try:
+                return self._archive.recent(workspace, self._max_retained)
+            except Exception:  # noqa: BLE001 - fall back to what memory holds
+                logger.warning("Could not list traces from the archive.", exc_info=True)
         with self._lock:
             return [
                 replace(trace)
                 for trace in reversed(self._traces.values())
                 if workspace is None or trace.workspace == workspace
             ]
+
+    def export_lines(self, workspace: str) -> Iterator[str]:
+        """``workspace``'s traces as JSON Lines, oldest first: every archived one, or
+        the ring's without an archive."""
+
+        if self._archive is not None:
+            yield from self._archive.export_lines(workspace)
+            return
+        for trace in reversed(self.list_traces(workspace)):
+            yield trace_to_json(trace) + "\n"
 
 
 def build_trace_candidates(

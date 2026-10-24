@@ -1,6 +1,7 @@
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import ConfirmInline from '../ConfirmInline';
 import TagEditor from './TagEditor';
+import VersionHistory from './VersionHistory';
 import { extensionOf } from './cardHelpers';
 import type { DocCard } from './types';
 
@@ -30,6 +31,10 @@ interface DocumentCardProps {
   onSetTags?: (filename: string, tags: string[]) => Promise<void>;
   /** Fetch a URL-ingested document again (URL ingest on, full key). */
   onRefreshFromUrl?: (filename: string) => void;
+  /** Put an earlier original back (RAW_DOCUMENT_VERSIONS on, full key). */
+  onRestoreVersion?: (filename: string, version: string) => void;
+  /** The workspace the card is shown in, for the versions request. */
+  workspace?: string;
 }
 
 /** The source's host, for a short link label ("example.com"). */
@@ -66,7 +71,10 @@ const DocumentCard = memo(function DocumentCard({
   onDismissUpload,
   onSetTags,
   onRefreshFromUrl,
+  onRestoreVersion,
+  workspace,
 }: DocumentCardProps) {
+  const [showVersions, setShowVersions] = useState(false);
   return (
     <article
       className={`corpus-panel__card${selected ? ' corpus-panel__card--selected' : ''}`}
@@ -144,6 +152,19 @@ const DocumentCard = memo(function DocumentCard({
                 title="Download the uploaded file"
               >
                 ⇱
+              </button>
+            )}
+            {card.hasOriginal && onRestoreVersion && (
+              <button
+                type="button"
+                className="corpus-panel__read"
+                onClick={() => setShowVersions((open) => !open)}
+                aria-expanded={showVersions}
+                aria-label={`Earlier versions of ${card.filename}`}
+                title="Earlier versions of the original"
+                data-testid="corpus-versions-toggle"
+              >
+                ⧗
               </button>
             )}
             {card.canReindex && (
@@ -265,6 +286,15 @@ const DocumentCard = memo(function DocumentCard({
         >
           <div className="corpus-panel__bar-fill" style={{ width: `${card.pct}%` }} />
         </div>
+      )}
+      {showVersions && card.status === 'indexed' && onRestoreVersion && (
+        <VersionHistory
+          filename={card.filename}
+          workspace={workspace}
+          disabled={disabled}
+          onRestore={onRestoreVersion}
+          onClose={() => setShowVersions(false)}
+        />
       )}
       {card.status === 'indexed' && onSetTags && (
         <TagEditor filename={card.filename} tags={card.tags} disabled={disabled} onSave={onSetTags} />

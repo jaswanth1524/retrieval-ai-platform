@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -45,14 +46,18 @@ from api.llm import (
     effective_max_tokens,
     reset_finish_reason,
     stopped_at_token_limit,
+    usage_cost_usd,
     usage_totals,
 )
 from api.pipeline import (
     DoneEvent,
     QuestionAbandoned,
     StreamEvent,
+    lead_or_join,
     replay_cached,
     timings_dict,
+    trace_model_name,
+    usage_cost,
     usage_dict,
     usage_tuple,
     wait_for_model,
@@ -564,6 +569,7 @@ class DocumentSummarizer:
             answer_status=done.get("answer_status", "answered"),
             truncated=done.get("truncated", False),
             usage=usage_tuple(done.get("usage")),
+            cost_usd=usage_cost(done.get("usage")),
             citation_backfilled=done.get("citation_backfilled", False),
         )
         return SummaryResult(grounded, done.get("chunks_read", 0), done.get("chunks_total", 0))
@@ -585,8 +591,18 @@ class DocumentSummarizer:
         started = time.monotonic()
         settings = self._effective_settings(request)
         key = summary_cache_key(request, settings) if self._answer_cache is not None else None
+        lead: threading.Event | None = None
         if key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
+            if hit is None:
+                # The same summary already being written: wait for it, not write it twice.
+                joined = yield from lead_or_join(self._answer_cache, key, should_stop)
+                if joined is None:
+                    return
+                if isinstance(joined, CachedAnswer):
+                    hit = joined
+                else:
+                    lead = joined
             if hit is not None:
                 read, total = hit.coverage or (0, 0)
                 yield from replay_cached(hit, started, chunks_read=read, chunks_total=total)
@@ -611,9 +627,13 @@ class DocumentSummarizer:
                             coverage=(event.get("chunks_read", 0), event.get("chunks_total", 0)),
                         ),
                     )
+                    if lead is not None:
+                        self._answer_cache.inflight.finish(key, lead)
                 yield event
         finally:
             events.close()
+            if lead is not None and key is not None and self._answer_cache is not None:
+                self._answer_cache.inflight.finish(key, lead)
 
     def _run(
         self,
@@ -660,6 +680,9 @@ class DocumentSummarizer:
                         rerank_min_score=float(settings.rerank_min_score),
                         fused_top_n=int(settings.fused_top_n),
                         filenames=list(request.filenames),
+                        answer_format=settings.answer_format,
+                        answer_language=settings.answer_language,
+                        llm_model=trace_model_name(settings),
                     ),
                     candidates=[],
                     prompt_messages=final_messages,
@@ -670,6 +693,7 @@ class DocumentSummarizer:
                     request_id=current_request_id(),
                     workspace=workspace_of(self._settings),
                     usage=usage,
+                    cost_usd=usage_cost_usd(settings, usage),
                     citation_retry_used=citation_retry_used,
                     citation_backfilled=citation_backfilled,
                 )
@@ -839,7 +863,7 @@ class DocumentSummarizer:
                 "citation_backfilled": outcome.backfilled,
                 "chunks_read": chunks_read,
                 "chunks_total": chunks_total,
-                "usage": usage_dict(usage),
+                "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
             }
         except QuestionAbandoned:
             return

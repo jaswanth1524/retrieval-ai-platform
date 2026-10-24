@@ -239,3 +239,21 @@
   margin-bottom: 4px;
   border-bottom: 1px solid var(--rule);
 }
+
+.composer__popover-pages {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.composer__popover-pages input {
+  width: 64px;
+  font: inherit;
+  padding: 2px 4px;
+  border: 1px solid var(--rule, rgba(128, 128, 128, 0.4));
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+}

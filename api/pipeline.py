@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -52,6 +53,7 @@ from api.generation import (
     StageTimings,
     answer_messages,
     citation_from_dict,
+    completion_model_and_kwargs,
     finish_answer,
     fit_prompt_to_context_window,
     generate_followups,
@@ -69,8 +71,10 @@ from api.llm import (
     expected_prefill_ms,
     reset_finish_reason,
     stopped_at_token_limit,
+    usage_cost_usd,
     usage_totals,
 )
+from api.metrics import answer_inflight_joins_total
 from api.prompting import (
     clip_text,
     condense_question_detailed,
@@ -123,6 +127,28 @@ class AnswerOverrides:
     rerank_top_k: int | None = None
     max_context_chunks: int | None = None
     llm_temperature: float | None = None
+    # Folded into the settings copy like the fields above (ANSWER_FORMAT,
+    # ANSWER_LANGUAGE), so the prompt and the answer cache key read them from there.
+    answer_format: str | None = None
+    answer_language: str | None = None
+    # Narrows retrieval to a page range, a section, picked passages, or away from some
+    # documents — on every search leg (rewrite, raw follow-up, expansion variants).
+    narrow: PassageFilter | None = None
+
+
+def _narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
+    """A question's passage narrowing as the trace shows it (only the parts set)."""
+
+    if narrow is None:
+        return None
+    record = {
+        "page_min": narrow.page_min,
+        "page_max": narrow.page_max,
+        "section": narrow.section,
+        "exclude_filenames": list(narrow.exclude_filenames),
+        "chunk_ids": list(narrow.chunk_ids),
+    }
+    return {key: value for key, value in record.items() if value not in (None, [])} or None
 
 
 @dataclass(frozen=True)
@@ -375,12 +401,33 @@ def replay_cached(hit: CachedAnswer, started: float, **done_fields: Any) -> Iter
         yield {"type": "followups", "questions": list(hit.followups)}
 
 
-def usage_dict(usage: tuple[int, int] | None) -> dict[str, int] | None:
-    """Token usage as the ``done`` frame and responses carry it."""
+def usage_dict(
+    usage: tuple[int, int] | None, cost_usd: float | None = None
+) -> dict[str, Any] | None:
+    """Token usage (and its estimated cost, when known) as ``done`` frames carry it."""
 
     if usage is None:
         return None
-    return {"prompt_tokens": usage[0], "completion_tokens": usage[1]}
+    record: dict[str, Any] = {"prompt_tokens": usage[0], "completion_tokens": usage[1]}
+    if cost_usd is not None:
+        record["cost_usd"] = cost_usd
+    return record
+
+
+def trace_model_name(settings: AppSettings) -> str | None:
+    """The model a trace records, or None when the provider isn't configured."""
+
+    try:
+        return completion_model_and_kwargs(settings)[0]
+    except GenerationConfigError:
+        return None
+
+
+def usage_cost(usage: object) -> float | None:
+    """The estimated cost in a ``done`` frame's usage, if any."""
+
+    cost = usage.get("cost_usd") if isinstance(usage, dict) else None
+    return float(cost) if isinstance(cost, int | float) else None
 
 
 def usage_tuple(usage: object) -> tuple[int, int] | None:
@@ -482,6 +529,57 @@ def wait_for_model(
     return slot
 
 
+# How often a follower waiting for an identical run checks whether its reader left.
+_JOIN_POLL_SECONDS = 0.5
+
+
+def lead_or_join(
+    cache: AnswerCache, key: CacheKey, should_stop: Callable[[], bool] | None
+) -> Generator[StreamEvent, None, threading.Event | CachedAnswer | None]:
+    """Lead the run of ``key`` (returns the event the caller must ``finish``), or wait
+    for the identical one already running and return its cached answer.
+
+    A follower announces itself (``joining_identical_question``) and waits for as long
+    as the leader runs — a leader may legitimately wait minutes for a local model, and a
+    follower that gave up would only queue behind it. None: the reader left while
+    waiting. A leader that leaves no answer (failed, abandoned) makes the follower lead
+    the question itself.
+    """
+
+    announced = False
+    while True:
+        event, leading = cache.inflight.claim(key)
+        if leading:
+            # The previous leader may have finished between our lookup and the claim.
+            hit = cache.get(key)
+            if hit is None:
+                return event
+            cache.inflight.finish(key, event)
+            return hit
+        if not announced:
+            announced = True
+            yield {"type": "stage", "stage": "joining_identical_question"}
+        while not event.wait(_JOIN_POLL_SECONDS):
+            if should_stop is not None and should_stop():
+                return None
+        hit = cache.get(key)
+        if hit is not None:
+            answer_inflight_joins_total.labels(outcome="replayed").inc()
+            return hit
+        answer_inflight_joins_total.labels(outcome="ran").inc()
+
+
+def drain[T](events: Generator[StreamEvent, None, T]) -> T:
+    """Run a stage-yielding generator to its return value (the sync route has no
+    stream to send its frames to)."""
+
+    while True:
+        try:
+            next(events)
+        except StopIteration as stop:
+            return cast(T, stop.value)
+
+
 class RagPipeline:
     """Composes retrieval, reranking, and generation behind a single call."""
 
@@ -526,6 +624,8 @@ class RagPipeline:
                 "rerank_top_k": overrides.rerank_top_k,
                 "max_context_chunks": overrides.max_context_chunks,
                 "llm_temperature": overrides.llm_temperature,
+                "answer_format": overrides.answer_format,
+                "answer_language": overrides.answer_language,
             }.items()
             if value is not None
         }
@@ -536,6 +636,7 @@ class RagPipeline:
         effective_settings: AppSettings,
         filenames: Sequence[str] | None,
         tags: Sequence[str] | None = None,
+        narrow: PassageFilter | None = None,
     ) -> TraceConfig:
         return TraceConfig(
             llm_provider=effective_settings.llm_provider,
@@ -547,6 +648,10 @@ class RagPipeline:
             filenames=list(filenames) if filenames else None,
             tags=list(tags) if tags else None,
             reranker_model=effective_settings.reranker_model,
+            answer_format=effective_settings.answer_format,
+            answer_language=effective_settings.answer_language,
+            narrowing=_narrowing_record(narrow),
+            llm_model=trace_model_name(effective_settings),
         )
 
     def _phase_timings(
@@ -589,6 +694,7 @@ class RagPipeline:
         condensed_question: str | None,
         history_message_count: int,
         condense_note: str | None = None,
+        narrow: PassageFilter | None = None,
     ) -> QueryTrace:
         """The trace of a question that failed (or was abandoned) before finishing."""
 
@@ -598,7 +704,7 @@ class RagPipeline:
             question=question,
             mode=mode,
             status="error",
-            config=self._trace_config(effective_settings, filenames, tags)
+            config=self._trace_config(effective_settings, filenames, tags, narrow)
             if effective_settings is not None
             else None,
             candidates=[],
@@ -637,6 +743,7 @@ class RagPipeline:
         usage: tuple[int, int] | None = None,
         condense_note: str | None = None,
         citation_backfilled: bool = False,
+        narrow: PassageFilter | None = None,
     ) -> QueryTrace:
         """The trace of a question that ran to an answer (or to "insufficient context")."""
 
@@ -646,7 +753,7 @@ class RagPipeline:
             question=question,
             mode=mode,
             status=status,
-            config=self._trace_config(effective_settings, filenames, tags),
+            config=self._trace_config(effective_settings, filenames, tags, narrow),
             candidates=build_trace_candidates(
                 phase.fused_candidates,
                 phase.scored_chunks,
@@ -672,6 +779,7 @@ class RagPipeline:
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
             usage=usage,
+            cost_usd=usage_cost_usd(effective_settings, usage),
         )
 
     def _truncate_history(
@@ -790,6 +898,27 @@ class RagPipeline:
         wanted = {" ".join(tag.split()).casefold() for tag in tags}
         stored = self._repository.stored_tags(settings)
         return sorted(tag for tag in stored if tag.casefold() in wanted) or list(tags)
+
+    def _expand_context(
+        self, kept: Sequence[RerankedChunk], settings: AppSettings, for_generation: bool
+    ) -> tuple[list[RerankedChunk], float]:
+        """The kept passages with neighbour text for the prompt, and the time taken.
+
+        Timed apart from rerank: neighbour expansion is a Qdrant round trip, not model
+        scoring, and folding it into rerank_ms hid it from every latency breakdown.
+        Only the max_context_chunks prefix reaches the prompt, so only it is expanded;
+        the tail stays in the list unexpanded because traces report it as kept.
+        """
+
+        if not for_generation:
+            return list(kept), 0.0
+        start = time.monotonic()
+        limit = int(settings.max_context_chunks)
+        expanded = [
+            *expand_with_neighbors(kept[:limit], self._repository, settings),
+            *kept[limit:],
+        ]
+        return expanded, (time.monotonic() - start) * 1000
 
     def _expand_query(self, query: str, settings: AppSettings) -> tuple[list[str], float]:
         """QUERY_EXPANSION_ENABLED's variant phrasings of ``query`` and the time taken."""
@@ -924,23 +1053,12 @@ class RagPipeline:
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
 
-        # Timed apart from rerank: neighbour expansion is a Qdrant round trip, not model
-        # scoring, and folding it into rerank_ms hid it from every latency breakdown.
-        # Only the max_context_chunks prefix reaches the prompt, so only it is expanded;
-        # the tail stays in the list unexpanded because traces report it as kept.
-        context_expansion_start = time.monotonic()
-        context_limit = int(effective_settings.max_context_chunks)
-        expanded = (
-            [
-                *expand_with_neighbors(
-                    diverse_outcome.kept[:context_limit], self._repository, effective_settings
-                ),
-                *diverse_outcome.kept[context_limit:],
-            ]
-            if for_generation
-            else list(diverse_outcome.kept)
+        # Picked passages (chunk_ids) are the context exactly: their neighbours were not
+        # picked, and the question was asked about these alone.
+        picked_only = narrow is not None and bool(narrow.chunk_ids)
+        expanded, context_expansion_ms = self._expand_context(
+            diverse_outcome.kept, effective_settings, for_generation and not picked_only
         )
-        context_expansion_ms = (time.monotonic() - context_expansion_start) * 1000
 
         return RetrievalPhase(
             context_chunks=expanded,
@@ -1000,8 +1118,9 @@ class RagPipeline:
         if self._answer_cache is None or history or not question.strip():
             return None
         try:
-            settings = self._effective_settings(overrides or AnswerOverrides())
-            return answer_cache_key(question, settings, filenames, tags)
+            overrides = overrides or AnswerOverrides()
+            settings = self._effective_settings(overrides)
+            return answer_cache_key(question, settings, filenames, tags, overrides.narrow)
         except (RetrievalConfigError, GenerationConfigError):
             # The uncached path raises it with its proper handling, error trace
             # included (a provider without its key failed here, before the trace).
@@ -1025,8 +1144,15 @@ class RagPipeline:
 
         started = time.monotonic()
         key = self._cache_key(question, overrides, filenames, tags, history)
+        lead: threading.Event | None = None
         if key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
+            if hit is None:
+                joined = drain(lead_or_join(self._answer_cache, key, None))
+                if isinstance(joined, CachedAnswer):
+                    hit = joined
+                elif joined is not None:
+                    lead = joined
             if hit is not None:
                 return GroundedAnswer(
                     answer=hit.answer,
@@ -1041,22 +1167,28 @@ class RagPipeline:
                     citation_backfilled=hit.citation_backfilled,
                     followups=list(hit.followups),
                 )
-        grounded = self._answer_uncached(question, overrides, filenames, history, tags)
-        if key is not None and self._answer_cache is not None:
-            self._answer_cache.put(
-                key,
-                CachedAnswer(
-                    grounded.answer,
-                    tuple(grounded.sources),
-                    grounded.trace_id,
-                    grounded.answer_status,
-                    grounded.top_rerank_score,
-                    grounded.truncated,
-                    weak_matches=grounded.weak_matches,
-                    citation_backfilled=grounded.citation_backfilled,
-                    followups=tuple(grounded.followups),
-                ),
-            )
+        try:
+            grounded = self._answer_uncached(question, overrides, filenames, history, tags)
+            if key is not None and self._answer_cache is not None:
+                self._answer_cache.put(
+                    key,
+                    CachedAnswer(
+                        grounded.answer,
+                        tuple(grounded.sources),
+                        grounded.trace_id,
+                        grounded.answer_status,
+                        grounded.top_rerank_score,
+                        grounded.truncated,
+                        weak_matches=grounded.weak_matches,
+                        citation_backfilled=grounded.citation_backfilled,
+                        followups=tuple(grounded.followups),
+                    ),
+                )
+        finally:
+            # After the store, so followers find the answer; on a failure they find
+            # none and each asks itself.
+            if lead is not None and key is not None and self._answer_cache is not None:
+                self._answer_cache.inflight.finish(key, lead)
         return grounded
 
     def answer_stream(
@@ -1079,8 +1211,17 @@ class RagPipeline:
 
         started = time.monotonic()
         key = self._cache_key(question, overrides, filenames, tags, history)
+        lead: threading.Event | None = None
         if key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
+            if hit is None:
+                joined = yield from lead_or_join(self._answer_cache, key, should_stop)
+                if joined is None:
+                    return
+                if isinstance(joined, CachedAnswer):
+                    hit = joined
+                else:
+                    lead = joined
             if hit is not None:
                 yield from replay_cached(
                     hit,
@@ -1093,6 +1234,10 @@ class RagPipeline:
         events = self._answer_stream_uncached(
             question, overrides, filenames, history, tags, should_stop
         )
+
+        def finish_lead() -> None:
+            if lead is not None and key is not None and self._answer_cache is not None:
+                self._answer_cache.inflight.finish(key, lead)
 
         def store(followups: Sequence[str]) -> None:
             if key is None or done is None or self._answer_cache is None:
@@ -1121,6 +1266,8 @@ class RagPipeline:
                 if event["type"] == "done":
                     done = event
                     store(())
+                    # Followers replay it now; they never wait for the follow-ups.
+                    finish_lead()
                 elif event["type"] == "followups":
                     store(event["questions"])
                 yield event
@@ -1130,6 +1277,7 @@ class RagPipeline:
             # ran whenever the inner generator was freed — never, while anything (a
             # tracer, a traceback) still held it.
             events.close()
+            finish_lead()
 
     def _answer_uncached(
         self,
@@ -1162,6 +1310,9 @@ class RagPipeline:
         # Held from the answer through its citation retry and follow-ups, as the stream
         # does, so another question's call can't slip in between them at a local model.
         slot: GenerationSlot | None = None
+        # Every LLM call this question makes counts: the condense, query expansion,
+        # the answer, its citation retry and the follow-ups.
+        begin_usage()
 
         try:
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
@@ -1174,6 +1325,7 @@ class RagPipeline:
                 effective_settings,
                 filenames,
                 tags,
+                narrow=(overrides or AnswerOverrides()).narrow,
                 also_search=question if condensed_question else None,
             )
             prompt_question = _with_interpretation(question.strip(), condensed_question)
@@ -1190,7 +1342,6 @@ class RagPipeline:
             slot.acquire()
             generate_start = time.monotonic()
             reset_finish_reason()
-            begin_usage()
             grounded = generate_grounded_answer(
                 query=prompt_question,
                 context_chunks=selected,
@@ -1205,7 +1356,6 @@ class RagPipeline:
             generate_ms = (time.monotonic() - generate_start) * 1000 - grounded.citation_retry_ms
             # The last call made the answer: the citation retry's when it fired.
             truncated = stopped_at_token_limit()
-            usage = usage_totals()
             timings = self._phase_timings(
                 phase,
                 total_start=total_start,
@@ -1220,6 +1370,7 @@ class RagPipeline:
                 trace_store.add(
                     self._error_trace(
                         trace_id=trace_id,
+                        narrow=(overrides or AnswerOverrides()).narrow,
                         question=question,
                         mode="sync",
                         effective_settings=effective_settings,
@@ -1253,6 +1404,8 @@ class RagPipeline:
         finally:
             if slot is not None:
                 slot.release()
+        usage = usage_totals()
+        cost_usd = usage_cost_usd(effective_settings, usage)
         if wants_followups:
             # The response waited for them (even when none came back), so the total does.
             timings = replace(timings, total_ms=(time.monotonic() - total_start) * 1000)
@@ -1264,6 +1417,7 @@ class RagPipeline:
             trace_store.add(
                 self._finished_trace(
                     trace_id=trace_id,
+                    narrow=(overrides or AnswerOverrides()).narrow,
                     question=question,
                     mode="sync",
                     status=_trace_status(status),
@@ -1295,6 +1449,7 @@ class RagPipeline:
             truncated=truncated,
             followups=followups,
             usage=usage,
+            cost_usd=cost_usd,
         )
 
     def _answer_stream_uncached(
@@ -1335,6 +1490,7 @@ class RagPipeline:
             trace_store.add(
                 self._error_trace(
                     trace_id=trace_id,
+                    narrow=(overrides or AnswerOverrides()).narrow,
                     question=question,
                     mode="stream",
                     effective_settings=effective_settings,
@@ -1349,6 +1505,9 @@ class RagPipeline:
             )
 
         try:
+            # Everything this answer calls the LLM for, from the condense on (the
+            # follow-ups come after `done` and aren't in its usage).
+            begin_usage()
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
             truncated_history = self._truncate_history(history, effective_settings)
             # Announced before the call, and only when it will actually happen — an
@@ -1385,6 +1544,7 @@ class RagPipeline:
                 filenames,
                 tags,
                 should_stop,
+                narrow=(overrides or AnswerOverrides()).narrow,
                 also_search=question if condensed_question else None,
                 expansion=expansion,
             )
@@ -1407,6 +1567,7 @@ class RagPipeline:
                     trace_store.add(
                         self._finished_trace(
                             trace_id=trace_id,
+                            narrow=(overrides or AnswerOverrides()).narrow,
                             question=question,
                             mode="stream",
                             status="insufficient_context",
@@ -1468,7 +1629,6 @@ class RagPipeline:
             generate_start = time.monotonic()
             first_token_ms = 0.0
             reset_finish_reason()
-            begin_usage()
             for delta in self._generator.stream(messages, effective_settings):
                 if not parts:
                     first_token_ms = (time.monotonic() - total_start) * 1000
@@ -1525,6 +1685,7 @@ class RagPipeline:
                 trace_store.add(
                     self._finished_trace(
                         trace_id=trace_id,
+                        narrow=(overrides or AnswerOverrides()).narrow,
                         question=question,
                         mode="stream",
                         status=_trace_status(status),
@@ -1562,7 +1723,7 @@ class RagPipeline:
                 "weak_matches": phase.below_min_score,
                 "truncated": truncated,
                 "citation_backfilled": outcome.backfilled,
-                "usage": usage_dict(usage),
+                "usage": usage_dict(usage, usage_cost_usd(effective_settings, usage)),
             }
             if (
                 effective_settings.followups_enabled

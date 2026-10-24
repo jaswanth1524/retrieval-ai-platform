@@ -219,3 +219,39 @@ a {
     opacity: 1;
   }
 }
+
+/* Print (⌘K → "Print conversation", or the browser's own Print): only the open
+   conversation, on the page's full height — no rail, panels, composer or controls. */
+@media print {
+  .app-shell {
+    display: block;
+    height: auto;
+  }
+  .icon-rail,
+  .context-panel,
+  .inspector,
+  .composer,
+  .server-notices,
+  .toast-row,
+  .app-skip-link,
+  .chat-header > :not(.chat-header__title),
+  .chat-message__action,
+  .chat-message__copy,
+  .chat-message__feedback,
+  .chat-message__regenerate,
+  .chat-message__retry,
+  .chat-message__followups,
+  .chat-message__note-actions {
+    display: none !important;
+  }
+  .app-main,
+  .chat-thread {
+    display: block;
+    overflow: visible !important;
+    height: auto;
+  }
+  .chat-thread__rail > .chat-message {
+    content-visibility: visible !important;
+    break-inside: avoid-page;
+  }
+}

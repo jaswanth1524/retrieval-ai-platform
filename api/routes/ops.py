@@ -16,6 +16,7 @@ from api.dependencies import (
     supplied_key_bytes,
 )
 from api.documents import SUPPORTED_EXTENSIONS
+from api.model_health import ModelHealth
 from api.qdrant_schema import index_compatibility
 from api.routes.deps import OllamaCheckDep, QdrantCheckDep, QdrantClientDep, SettingsDep
 from api.routes.questions import allowed_request_providers
@@ -73,6 +74,12 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         watch_enabled=bool(settings.watch_dir),
         answer_language=settings.answer_language,
         summary_max_documents=settings.summary_max_documents,
+        answer_format=settings.answer_format,
+        query_log_enabled=settings.query_log_enabled,
+        document_versions_enabled=bool(
+            settings.raw_document_dir and int(settings.raw_document_versions) > 0
+        ),
+        traces_persisted=bool(settings.trace_enabled and settings.trace_store_path),
     )
 
 
@@ -112,16 +119,24 @@ def register(app: FastAPI) -> None:
         else:
             provider_ok = bool(settings.openai_api_key)
         index_detail = index_compatibility(qdrant_client, settings) if qdrant_ok else None
+        # Set by the startup warmup (WARMUP_MODELS); absent when it didn't run.
+        health: ModelHealth | None = getattr(app.state, "model_health", None)
+        models_ok = True
+        if health is not None:
+            health.retry_failed()
+            models_ok = not health.degraded()
+        ready = qdrant_ok and provider_ok and models_ok
         body = ReadinessResponse(
-            status="ok" if qdrant_ok and provider_ok else "degraded",
+            status="ok" if ready else "degraded",
             qdrant=qdrant_ok,
             generation_provider=provider_ok,
             llm_provider=settings.llm_provider,
             index_compatible=index_detail is None,
             index_detail=index_detail,
             originals_kept=bool(settings.raw_document_dir),
+            models=health.states() if health is not None else {},
         )
-        status_code = 200 if qdrant_ok and provider_ok else 503
+        status_code = 200 if ready else 503
         return JSONResponse(status_code=status_code, content=body.model_dump())
 
     # Guarded when a key is configured. The labels carry no content (only `stage` and

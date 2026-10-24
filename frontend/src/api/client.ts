@@ -11,6 +11,7 @@ import type {
   DocumentListResponse,
   DocumentReindexAllResponse,
   DocumentTagsResponse,
+  DocumentVersionsResponse,
   FeedbackListResponse,
   FeedbackRequest,
   FeedbackResponse,
@@ -20,7 +21,9 @@ import type {
   HistoryMessage,
   ImportResponse,
   LlmProvider,
+  PassageNarrowing,
   PublicConfigResponse,
+  QueryLogResponse,
   ReadinessResponse,
   UsageResponse,
   WatchStatusResponse,
@@ -322,6 +325,25 @@ function questionRequestBody(
   if (history && history.length > 0) body.history = history;
   if (options?.tags && options.tags.length > 0) body.tags = options.tags;
   if (options?.bypassCache) body.use_cache = false;
+  Object.assign(body, narrowingBody(options?.narrowing));
+  const answerFormat = options?.answerFormat ?? overrides?.answerFormat;
+  if (answerFormat) body.answer_format = answerFormat;
+  const answerLanguage = options?.answerLanguage ?? overrides?.answerLanguage;
+  if (answerLanguage) body.answer_language = answerLanguage;
+  return body;
+}
+
+/** The narrowing fields that are set, as the server names them (questions and search). */
+export function narrowingBody(narrowing: PassageNarrowing | undefined): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (!narrowing) return body;
+  if (narrowing.page_min != null) body.page_min = narrowing.page_min;
+  if (narrowing.page_max != null) body.page_max = narrowing.page_max;
+  if (narrowing.section) body.section = narrowing.section;
+  if (narrowing.exclude_filenames && narrowing.exclude_filenames.length > 0) {
+    body.exclude_filenames = narrowing.exclude_filenames;
+  }
+  if (narrowing.chunk_ids && narrowing.chunk_ids.length > 0) body.chunk_ids = narrowing.chunk_ids;
   return body;
 }
 
@@ -613,6 +635,34 @@ export const api = {
   // Lists recent query traces (newest first) for the trace history browser.
   listTraces: (signal?: AbortSignal) =>
     request<TraceListResponse>('/traces', { signal }),
+
+  // Every trace of this workspace as JSON Lines (full key): all archived ones with
+  // TRACE_STORE_PATH, else the ones the server still holds in memory.
+  exportTraces: async (signal?: AbortSignal): Promise<{ blob: Blob; filename: string }> => {
+    const { response, blob } = await downloadBlob('/traces/export', signal);
+    const disposition = response.headers.get('Content-Disposition') ?? '';
+    const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'docrag-traces.jsonl';
+    return { blob, filename };
+  },
+
+  // What was asked that the documents didn't answer, newest first (QUERY_LOG_ENABLED;
+  // full key; 404 when the log is off).
+  listUnanswered: (limit = 200, signal?: AbortSignal) =>
+    request<QueryLogResponse>(`/query-log?uncovered=true&limit=${limit}`, { signal }),
+
+  // Earlier originals of a document kept when it was replaced (RAW_DOCUMENT_VERSIONS).
+  listDocumentVersions: (filename: string, signal?: AbortSignal, workspace?: string) =>
+    request<DocumentVersionsResponse>(`/documents/${encodeURIComponent(filename)}/versions`, {
+      signal,
+      workspace,
+    }),
+
+  // Puts an earlier version back: indexed like an upload of those bytes; poll the job.
+  restoreDocumentVersion: (filename: string, version: string, signal?: AbortSignal, workspace?: string) =>
+    request<DocumentJobAcceptedResponse>(
+      `/documents/${encodeURIComponent(filename)}/versions/${encodeURIComponent(version)}/restore`,
+      { method: 'POST', signal, workspace },
+    ),
 
   // Uploads and ingests run in a background job (see api.uploadDocument) — this
   // polls the job status endpoint until it reaches a terminal state, so the caller

@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.auto_reindex import ReindexTarget, StaleReindexer
 from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
@@ -31,6 +32,7 @@ from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
+    IngestQueue,
     delete_indexed_document,
     enqueue_ingest,
     known_filenames,
@@ -40,6 +42,7 @@ from api.ingest_service import IngestService
 from api.llm import GenerationConfigError, completion_model_and_kwargs
 from api.logging_config import configure_logging
 from api.metrics import build_info
+from api.model_health import ModelHealth, ModelState
 from api.qdrant_schema import check_dense_dimension
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
@@ -61,6 +64,7 @@ from api.version import app_version
 from api.watch import FolderWatcher, WatchedJob
 from api.workspaces import (
     WorkspaceError,
+    list_workspaces,
     settings_for,
     validate_name,
     workspace_exists,
@@ -157,8 +161,9 @@ def run_model_warmup(
     reranker: WarmupReranker | None,
     token_counter: WarmupTokenCounter | None = None,
     settings: AppSettings | None = None,
-) -> None:
-    """Force the lazy-loaded models to load once, logging duration or failure.
+) -> dict[str, ModelState]:
+    """Force the lazy-loaded models to load once, logging duration or failure; each
+    warmed model's state (``api/model_health.py``).
 
     Both models are constructed with ``lazy_load=True``, so the real download/load
     cost is paid on first use, not at construction — this runs that first use at boot
@@ -186,14 +191,16 @@ def run_model_warmup(
     if token_counter is not None:
         tasks["tokenizer"] = lambda: token_counter.count("warmup")
     if not tasks:
-        return
+        return {}
 
     start = time.monotonic()
     failed = False
+    states: dict[str, ModelState] = {}
     with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="docrag-warmup") as pool:
         futures = {name: pool.submit(task) for name, task in tasks.items()}
     for name, future in futures.items():
         exc = future.exception()
+        states[name] = "ok" if exc is None else "failed"
         if exc is not None:
             failed = True
             logger.error(
@@ -203,8 +210,36 @@ def run_model_warmup(
                 name,
                 exc_info=exc,
             )
+    # The HF tokenizer falls back to the heuristic counter instead of raising.
+    if token_counter is not None and getattr(token_counter, "mode", None) == "heuristic":
+        states["tokenizer"] = "fallback"
     if not failed:
         logger.info("Model warmup completed in %.1fs", time.monotonic() - start)
+    return states
+
+
+def warm_models(
+    settings: AppSettings, names: frozenset[str] | None = None
+) -> dict[str, ModelState]:
+    """Build and warm the models (``names`` only, when given). A model that can't even
+    be constructed counts as failed."""
+
+    def wanted(name: str) -> bool:
+        return names is None or name in names
+
+    embedding = (
+        _build_for_warmup("embedding models", get_embedding_provider)
+        if wanted("embedding")
+        else None
+    )
+    reranker = _build_for_warmup("reranker", get_reranker) if wanted("reranker") else None
+    token_counter = get_token_counter() if wanted("tokenizer") else None
+    states = run_model_warmup(embedding, reranker, token_counter, settings)
+    if wanted("embedding") and embedding is None:
+        states["embedding"] = "failed"
+    if wanted("reranker") and reranker is None:
+        states["reranker"] = "failed"
+    return states
 
 
 def _build_for_warmup[T](name: str, factory: Callable[[], T]) -> T | None:
@@ -305,6 +340,51 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
     return watcher
 
 
+def start_stale_reindexer(settings: AppSettings) -> StaleReindexer | None:
+    """Start AUTO_REINDEX_STALE's background passes (api/auto_reindex.py), or None
+    when there are no stored originals to re-index from."""
+
+    if get_raw_document_store() is None:
+        return None
+    client = get_qdrant_client()
+    repository = VectorRepository(client)
+    token_counter = get_token_counter()
+
+    def target(workspace_settings: AppSettings, raw_store: RawDocumentStore) -> ReindexTarget:
+        service = IngestService(
+            repository, get_embedding_provider(), workspace_settings, token_counter
+        )
+        queue = IngestQueue(
+            get_ingest_job_store(), get_ingest_executor(), get_ingest_backlog(), service
+        )
+        return ReindexTarget(workspace_settings, raw_store, queue)
+
+    def targets() -> list[ReindexTarget]:
+        base_store = get_raw_document_store()
+        if base_store is None:
+            return []
+        found = [target(settings, base_store)]
+        if settings.workspaces_enabled:
+            for name in list_workspaces(client, settings.qdrant_collection):
+                workspace_settings = settings_for(settings, name)
+                if not workspace_settings.raw_document_dir:
+                    continue
+                found.append(
+                    target(
+                        workspace_settings,
+                        RawDocumentStore(
+                            workspace_settings.raw_document_dir,
+                            int(workspace_settings.raw_document_versions),
+                        ),
+                    )
+                )
+        return found
+
+    reindexer = StaleReindexer(settings, repository, targets, get_ingest_job_store(), token_counter)
+    reindexer.start()
+    return reindexer
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
@@ -312,19 +392,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_app_settings()
     check_writable_storage(settings)
     if settings.warmup_models:
-        await run_in_threadpool(
-            run_model_warmup,
-            _build_for_warmup("embedding models", get_embedding_provider),
-            _build_for_warmup("reranker", get_reranker),
-            get_token_counter(),
-            settings,
-        )
+        health = ModelHealth(lambda names: warm_models(settings, names))
+        health.record(await run_in_threadpool(warm_models, settings))
+        # For /health/ready: a model that never loaded makes the app "degraded".
+        app.state.model_health = health
     watcher = start_folder_watcher(settings) if settings.watch_dir else None
     # For GET /watch and POST /watch/scan.
     app.state.watcher = watcher
+    reindexer = start_stale_reindexer(settings) if settings.auto_reindex_stale else None
     try:
         yield
     finally:
+        if reindexer is not None:
+            reindexer.stop()
         if watcher is not None:
             watcher.stop()
     shutdown_executors()

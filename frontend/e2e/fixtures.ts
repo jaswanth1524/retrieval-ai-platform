@@ -77,6 +77,8 @@ const CONFIG = {
   llm_temperature_max: 2,
   feedback_enabled: false,
   raw_documents_enabled: false,
+  query_log_enabled: false,
+  document_versions_enabled: false,
 };
 
 type JobStep = { status: number; body?: object };
@@ -144,6 +146,12 @@ export class MockApi {
   activeJobs: object[] = [];
   /** GET /watch (needs config.watch_enabled); null answers 404. */
   watchStatus: object | null = null;
+  /** GET /query-log?uncovered=true rows (needs config.query_log_enabled). */
+  unanswered: object[] = [];
+  /** GET /documents/{f}/versions, by filename (needs config.document_versions_enabled). */
+  versions: Record<string, object[]> = {};
+  /** Every POST /documents/{f}/versions/{v}/restore, as "filename@version". */
+  readonly restoredVersions: string[] = [];
   /** In-flight ingest jobs by id: the file each one indexes, how often it was polled and
    *  whether it was cancelled. Every job walks `jobSteps` on its own, so a bulk re-index
    *  runs several at once. */
@@ -156,7 +164,7 @@ export class MockApi {
   async install(page: Page): Promise<void> {
     await page.route(
       (url) =>
-        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch)(\/|$)/.test(
+        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch|query-log)(\/|$)/.test(
           url.pathname,
         ),
       (route) => this.handle(route),
@@ -197,6 +205,18 @@ export class MockApi {
     }
     if (path === '/access') return this.json(route, 200, { access: this.access });
     if (path === '/traces') return this.json(route, 200, { traces: this.traces });
+    if (path === '/traces/export') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/x-ndjson',
+        headers: { 'Content-Disposition': 'attachment; filename="docrag-traces-test.jsonl"' },
+        body: this.traces.map((trace) => JSON.stringify(trace)).join('\n') + (this.traces.length ? '\n' : ''),
+      });
+    }
+    if (path === '/query-log') {
+      if (!this.config.query_log_enabled) return this.configured(route, 404, { detail: 'The query log is not enabled.' });
+      return this.json(route, 200, { queries: this.unanswered });
+    }
     if (path.startsWith('/traces/')) {
       return this.json(route, 200, {
         trace_id: path.slice('/traces/'.length),
@@ -298,6 +318,16 @@ export class MockApi {
         (name) => this.documents.includes(name) && this.reindexableFilenames.includes(name),
       );
       return this.json(route, 202, { jobs: due.map((name) => this.startJob(name)), deferred: [] });
+    }
+
+    const versionRoute = /^\/documents\/([^/]+)\/versions(?:\/([^/]+)\/restore)?$/.exec(path);
+    if (versionRoute) {
+      const filename = decodeURIComponent(versionRoute[1]);
+      if (versionRoute[2] && method === 'POST') {
+        this.restoredVersions.push(`${filename}@${decodeURIComponent(versionRoute[2])}`);
+        return this.json(route, 202, this.startJob(filename));
+      }
+      return this.json(route, 200, { filename, versions: this.versions[filename] ?? [] });
     }
 
     const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags|original))?$/.exec(path);

