@@ -145,6 +145,8 @@ describe('App', () => {
         rerankTopK: null,
         maxContextChunks: 4,
         llmTemperature: null,
+        answerFormat: null,
+        answerLanguage: null,
       }),
     );
   });
@@ -172,6 +174,8 @@ describe('App', () => {
         rerankTopK: 3,
         maxContextChunks: 3,
         llmTemperature: null,
+        answerFormat: null,
+        answerLanguage: null,
       }),
     );
   });

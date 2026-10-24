@@ -14,6 +14,8 @@ import type { RejectedFile } from '../utils/uploadValidation';
 import BulkBar from './corpus/BulkBar';
 import { progressPercent } from './corpus/cardHelpers';
 import DocumentCard from './corpus/DocumentCard';
+import { corpusTotals } from './corpus/cardHelpers';
+import { droppedEntries, filesUnder, folderPickNote, hasFolder, pickFolderFiles } from '../utils/folderFiles';
 import UrlIngestForm from './corpus/UrlIngestForm';
 import type { DocCard, DocumentMeta, UploadItem } from './corpus/types';
 import './CorpusPanel.css';
@@ -61,6 +63,10 @@ interface CorpusPanelProps {
   summaryMaxDocuments?: number;
   /** Fetch a URL-ingested document again; absent when URL ingest is off. */
   onRefreshFromUrl?: (filename: string) => void;
+  /** Put an earlier original back (RAW_DOCUMENT_VERSIONS on, full key). */
+  onRestoreVersion?: (filename: string, version: string) => void;
+  /** The workspace the panel shows (for per-card requests). */
+  workspace?: string;
   /** Summaries can't be asked right now (booting, the key was refused): the buttons
    *  stay, disabled, like the composer's Send. */
   summarizeDisabled?: boolean;
@@ -126,10 +132,14 @@ function CorpusPanel({
   onAskAbout,
   summaryMaxDocuments,
   onRefreshFromUrl,
+  onRestoreVersion,
+  workspace,
   summarizeDisabled = false,
   onUploadFromUrl,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
+  const [folderNote, setFolderNote] = useState<string | null>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [confirming, setConfirming] = useState<string | null>(null);
@@ -151,7 +161,7 @@ function CorpusPanel({
   // the Upload buttons silently did nothing for as long as a re-index ran.
   const submitting = uploads.some((item) => item.status === 'uploading' && item.file !== undefined);
 
-  const handleFilesChange = (fileList: FileList | null) => {
+  const handleFilesChange = (fileList: FileList | File[] | null) => {
     if (!fileList || fileList.length === 0) return;
     const { accepted, rejected } = validateUploads(
       Array.from(fileList),
@@ -160,6 +170,14 @@ function CorpusPanel({
     );
     setRejectedFiles(rejected);
     setStagedFiles((prev) => [...prev, ...accepted]);
+  };
+
+  // A folder's documents (picked, or dropped): one per name, other types left out,
+  // with one line saying so instead of a rejection per stray file.
+  const handleFolderFiles = (files: File[]) => {
+    const pick = pickFolderFiles(files, acceptedExtensions(supportedExtensions));
+    handleFilesChange(pick.files);
+    setFolderNote(folderPickNote(pick));
   };
 
   const removeStagedFile = (index: number) => {
@@ -171,6 +189,7 @@ function CorpusPanel({
     const files = stagedFiles;
     setStagedFiles([]);
     setRejectedFiles([]);
+    setFolderNote(null);
     if (inputRef.current) inputRef.current.value = '';
     await onUpload(files);
   };
@@ -187,6 +206,13 @@ function CorpusPanel({
   const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
     setDragOver(false);
+    // Read during the event: the browser empties the item list once it returns.
+    const entries = droppedEntries(event.dataTransfer);
+    if (hasFolder(entries)) {
+      void filesUnder(entries!).then(handleFolderFiles);
+      return;
+    }
+    setFolderNote(null);
     handleFilesChange(event.dataTransfer.files);
   };
 
@@ -322,6 +348,9 @@ function CorpusPanel({
     trimmedQuery === ''
       ? uploadCards
       : uploadCards.filter((card) => card.filename.toLowerCase().includes(trimmedQuery));
+  // The whole indexed corpus at a glance (pages and sizes only where the server
+  // recorded them).
+  const totals = useMemo(() => corpusTotals(filenames, documents), [filenames, documents]);
   const filteredCards = [...visibleIndexed, ...visibleUploads];
   const cardCount = indexedCards.length + uploadCards.length;
 
@@ -431,6 +460,39 @@ function CorpusPanel({
         />
       </label>
       )}
+      {!readOnly && (
+        <div className="corpus-panel__folder">
+          <button
+            type="button"
+            className="corpus-panel__folder-button"
+            onClick={() => folderInputRef.current?.click()}
+            disabled={submitting}
+            data-testid="upload-folder"
+          >
+            Upload a folder…
+          </button>
+          <input
+            ref={folderInputRef}
+            type="file"
+            className="corpus-panel__folder-input"
+            // Not in React's typings; the browsers that matter all take it.
+            {...{ webkitdirectory: '', directory: '' }}
+            multiple
+            onChange={(event) => {
+              handleFolderFiles(Array.from(event.target.files ?? []));
+              event.target.value = '';
+            }}
+            aria-hidden="true"
+            tabIndex={-1}
+            data-testid="upload-folder-input"
+          />
+        </div>
+      )}
+      {folderNote && (
+        <p className="corpus-panel__folder-note" role="status" data-testid="upload-folder-note">
+          {folderNote}
+        </p>
+      )}
       {!readOnly && onUploadFromUrl && (
         <UrlIngestForm disabled={disabled} onSubmit={onUploadFromUrl} />
       )}
@@ -475,6 +537,12 @@ function CorpusPanel({
         <div className="corpus-panel__error" role="alert">
           {deleteError}
         </div>
+      )}
+
+      {totals && (
+        <p className="corpus-panel__totals mono" data-testid="corpus-totals">
+          {totals}
+        </p>
       )}
 
       {/* One card's ↻ is enough for one document; after a chunker upgrade every
@@ -618,6 +686,8 @@ function CorpusPanel({
             onDismissUpload={onDismissUpload}
             onSetTags={onSetTags}
             onRefreshFromUrl={onRefreshFromUrl}
+            onRestoreVersion={onRestoreVersion}
+            workspace={workspace}
           />
         ))}
       </div>

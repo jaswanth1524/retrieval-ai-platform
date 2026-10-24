@@ -19,9 +19,15 @@ interface SearchPanelProps {
   /** A search asked for from elsewhere (a "not found" answer): shown and run at once.
    *  A new object (``id``) each time, so the same query can be asked for twice. */
   request?: { query: string; id: number } | null;
+  /** Ask the search's question over only the passages ticked here. */
+  onAskAboutPassages?: (question: string, chunkIds: string[]) => void;
+  /** Asking can't start now (booting, an answer streaming): the bar's button waits. */
+  askDisabled?: boolean;
 }
 
 const SNIPPET_CHARS = 220;
+// The server takes at most this many chunk ids per question (REQUEST_CHUNK_IDS_MAX).
+const MAX_PICKED_PASSAGES = 100;
 
 /** Passage search (POST /search): the ranked chunks a question would be answered from,
  *  with their scores, and no LLM involved — so it works when none is reachable and shows
@@ -33,8 +39,13 @@ function SearchPanel({
   resetKey,
   onAuthFailure,
   request = null,
+  onAskAboutPassages,
+  askDisabled = false,
 }: SearchPanelProps) {
   const [query, setQuery] = useState('');
+  // Ticked passages, by chunk id, and the query that found them (asked about them).
+  const [picked, setPicked] = useState<Set<string>>(() => new Set());
+  const [searchedQuery, setSearchedQuery] = useState('');
   const [results, setResults] = useState<SearchResultResponse[] | null>(null);
   const [weak, setWeak] = useState(false);
   const [searching, setSearching] = useState(false);
@@ -47,6 +58,7 @@ function SearchPanel({
     controllerRef.current?.abort();
     setQuery('');
     setResults(null);
+    setPicked(new Set());
     setWeak(false);
     setError(null);
     setSearching(false);
@@ -72,6 +84,8 @@ function SearchPanel({
       );
       if (controller.signal.aborted) return;
       setResults(response.results);
+      setPicked(new Set());
+      setSearchedQuery(trimmed);
       setWeak(response.weak_matches === true && response.results.length > 0);
     } catch (err) {
       if (controller.signal.aborted) return;
@@ -156,9 +170,53 @@ function SearchPanel({
           better ones.
         </p>
       )}
+      {onAskAboutPassages && picked.size > 0 && (
+        <div className="search-panel__ask-bar" data-testid="search-ask-bar">
+          <span className="mono">
+            {picked.size} passage{picked.size === 1 ? '' : 's'} picked
+          </span>
+          <button
+            type="button"
+            onClick={() => setPicked(new Set())}
+            className="search-panel__ask-clear"
+          >
+            Clear
+          </button>
+          <button
+            type="button"
+            className="search-panel__ask"
+            aria-disabled={askDisabled}
+            onClick={() => {
+              if (askDisabled) return;
+              onAskAboutPassages(searchedQuery, [...picked]);
+            }}
+            data-testid="search-ask-picked"
+          >
+            Ask about {picked.size === 1 ? 'it' : 'these'}
+          </button>
+        </div>
+      )}
       {results?.map((result) => (
+        <div key={result.chunk_id} className="search-panel__item">
+          {onAskAboutPassages && (
+            <input
+              type="checkbox"
+              className="search-panel__pick"
+              checked={picked.has(result.chunk_id)}
+              onChange={(event) => {
+                const checked = event.target.checked;
+                setPicked((prev) => {
+                  const next = new Set(prev);
+                  if (checked && next.size < MAX_PICKED_PASSAGES) next.add(result.chunk_id);
+                  else next.delete(result.chunk_id);
+                  return next;
+                });
+              }}
+              aria-label={`Pick passage ${result.rank} of ${result.filename}`}
+              data-testid="search-pick"
+            />
+          )}
         <button
-          key={result.chunk_id}
           type="button"
           className="search-panel__result"
           onClick={() => onOpenSource(result.filename, result.chunk_id)}
@@ -176,12 +234,13 @@ function SearchPanel({
             {pageLabel(result.page, result.page_end)}
             {result.section ? ` · ${result.section}` : ''}
           </span>
-          <span className="search-panel__snippet">
+          <span className="search-panel__snippet" dir="auto">
             {result.text.length > SNIPPET_CHARS
               ? `${result.text.slice(0, SNIPPET_CHARS).trimEnd()}…`
               : result.text}
           </span>
         </button>
+        </div>
       ))}
     </>
   );

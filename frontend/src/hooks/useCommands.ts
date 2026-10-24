@@ -58,6 +58,9 @@ export interface CommandActions {
   readDocument?: (filename: string) => void;
   copyLastAnswer?: () => void;
   exportAllConversations?: () => void;
+  /** The open conversation as one self-contained HTML page. */
+  exportHtml?: () => void;
+  printConversation?: () => void;
   /** The next (1) or previous (-1) conversation in the list. */
   cycleConversation?: (step: 1 | -1) => void;
   showShortcuts?: () => void;
@@ -170,10 +173,24 @@ export function useCommands(
         disabled: !hasTurns,
       },
       {
+        id: 'export-html',
+        glyph: '⇩',
+        label: 'Export conversation as a web page (HTML)',
+        run: () => run.current.exportHtml?.(),
+        disabled: !hasTurns,
+      },
+      {
         id: 'export-json',
         glyph: '⇩',
         label: 'Export conversation as JSON',
         run: () => run.current.exportJson(),
+        disabled: !hasTurns,
+      },
+      {
+        id: 'print',
+        glyph: '⎙',
+        label: 'Print conversation',
+        run: () => run.current.printConversation?.(),
         disabled: !hasTurns,
       },
       {

@@ -7,7 +7,7 @@ export const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   minute: '2-digit',
 });
 
-const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+export const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   year: 'numeric',
   month: 'short',
   day: 'numeric',
@@ -23,7 +23,7 @@ export function formatTurnTime(timestamp: number, now = Date.now()): string {
     : DATE_TIME_FORMATTER.format(timestamp);
 }
 
-function speakerLabel(role: ChatTurn['role']): string {
+export function speakerLabel(role: ChatTurn['role']): string {
   if (role === 'user') return 'You';
   if (role === 'assistant') return 'DocRAG';
   return 'Error';
@@ -41,15 +41,29 @@ export function withCitationFootnotes(content: string, sources: CitationResponse
   return [content, citationLines(sources)].filter(Boolean).join('\n\n');
 }
 
-export function chatToMarkdown(turns: ChatTurn[]): string {
+/** Each source line followed by the passages its answer rests on, as quotes. */
+function citationLinesWithQuotes(sources: CitationResponse[]): string {
+  return sources
+    .map((source) => {
+      const line = `[${source.source_number}] ${source.filename} · ${pageLabel(source.page, source.page_end)} · ${source.section}`;
+      const quotes = (source.spans ?? []).map((span) => `> ${span.quote.replace(/\s+/g, ' ').trim()}`);
+      return [line, ...quotes].join('\n');
+    })
+    .join('\n');
+}
+
+/** A conversation as Markdown: its title, then each turn (dated), its sources and the
+ *  quotes they rest on. */
+export function chatToMarkdown(turns: ChatTurn[], title?: string): string {
   const blocks = turns.map((turn) => {
     // Always dated: an export is read later, away from the conversation.
     const heading = `## ${speakerLabel(turn.role)} (${DATE_TIME_FORMATTER.format(turn.timestamp)})`;
-    return [heading, withCitationFootnotes(turn.content, turn.sources)]
+    return [heading, turn.content, citationLinesWithQuotes(turn.sources)]
       .filter(Boolean)
       .join('\n\n');
   });
-  return blocks.join('\n\n---\n\n');
+  const body = blocks.join('\n\n---\n\n');
+  return title ? `# ${title}\n\n${body}` : body;
 }
 
 export function chatToJson(turns: ChatTurn[]): string {

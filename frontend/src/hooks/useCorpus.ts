@@ -369,6 +369,21 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest(workspace);
     };
 
+    // An earlier original put back (RAW_DOCUMENT_VERSIONS): indexed like an upload of
+    // those bytes, and the version it replaces is kept in its turn.
+    const handleRestoreVersion = async (
+      filename: string,
+      version: string,
+      workspace = getWorkspace(),
+    ) => {
+      const id = newId();
+      setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true, workspace }]);
+      await runIngestJob(id, filename, workspace, (signal) =>
+        api.restoreDocumentVersion(filename, version, signal, workspace),
+      );
+      await refreshAfterIngest(workspace);
+    };
+
     // A document fetched by URL, fetched again. The server asks conditionally: a source
     // that hasn't changed (304) starts no job.
     const handleRefreshFromUrl = async (filename: string, workspace = getWorkspace()) => {
@@ -575,6 +590,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleCancelUpload,
       handleUploadFromUrl,
       handleReindex,
+      handleRestoreVersion,
       handleRefreshFromUrl,
       handleReindexMany,
       handleReindexAllStale,

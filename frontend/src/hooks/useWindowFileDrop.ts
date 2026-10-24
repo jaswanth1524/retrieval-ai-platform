@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { droppedEntries, filesUnder, hasFolder } from '../utils/folderFiles';
 
 function carriesFiles(event: DragEvent): boolean {
   return Array.from(event.dataTransfer?.types ?? []).includes('Files');
@@ -9,15 +10,23 @@ function carriesFiles(event: DragEvent): boolean {
  * Without a window-level handler, a PDF dropped outside the corpus panel's dropzone
  * made the browser navigate to it, unloading the app and any answer in progress.
  * Drops the dropzone already handled (it calls preventDefault) are left alone, and so
- * are drags that carry no files (text, links). Returns whether files are being
- * dragged over the window, for an overlay. */
-export function useWindowFileDrop(enabled: boolean, onFiles: (files: File[]) => void): boolean {
+ * are drags that carry no files (text, links). A dropped folder is walked and its
+ * files handed to ``onFolder`` (``onFiles`` without one): the drop's own file list
+ * holds only an unreadable entry per folder. Returns whether files are being dragged
+ * over the window, for an overlay. */
+export function useWindowFileDrop(
+  enabled: boolean,
+  onFiles: (files: File[]) => void,
+  onFolder?: (files: File[]) => void,
+): boolean {
   const [dragging, setDragging] = useState(false);
   // dragenter/dragleave fire for every child crossed; a depth count tells when the
   // drag has really left the window.
   const depth = useRef(0);
   const onFilesRef = useRef(onFiles);
   onFilesRef.current = onFiles;
+  const onFolderRef = useRef(onFolder);
+  onFolderRef.current = onFolder;
 
   useEffect(() => {
     const reset = () => {
@@ -45,8 +54,17 @@ export function useWindowFileDrop(enabled: boolean, onFiles: (files: File[]) => 
       reset();
       if (event.defaultPrevented) return; // the corpus dropzone took it
       event.preventDefault();
+      if (!enabled) return;
+      // Read during the event: the browser empties the item list once it returns.
+      const entries = droppedEntries(event.dataTransfer);
+      if (hasFolder(entries)) {
+        void filesUnder(entries!).then((files) => {
+          if (files.length > 0) (onFolderRef.current ?? onFilesRef.current)(files);
+        });
+        return;
+      }
       const files = Array.from(event.dataTransfer?.files ?? []);
-      if (enabled && files.length > 0) onFilesRef.current(files);
+      if (files.length > 0) onFilesRef.current(files);
     };
     window.addEventListener('dragenter', handleDragEnter);
     window.addEventListener('dragleave', handleDragLeave);

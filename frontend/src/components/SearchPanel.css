@@ -104,3 +104,51 @@
   opacity: 0.85;
   overflow-wrap: anywhere;
 }
+
+.search-panel__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.search-panel__pick {
+  margin: 12px 0 0 10px;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
+
+.search-panel__ask-bar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 12px 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--rail-2);
+  font-size: 11px;
+  color: var(--rail-text);
+}
+
+.search-panel__ask-bar > span {
+  flex: 1;
+}
+
+.search-panel__ask,
+.search-panel__ask-clear {
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--rail-text);
+  font: inherit;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.search-panel__ask {
+  border-color: var(--accent);
+  color: var(--accent);
+}

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { TraceDetailResponse } from '../../api/types';
+import { formatCost } from '../../utils/cost';
 
 interface TraceTabProps {
   trace: TraceDetailResponse;
@@ -105,9 +106,15 @@ function TraceIds({ trace }: TraceTabProps) {
           request <span className="trace-tab__id">{trace.request_id}</span>
         </span>
       )}
+      {trace.config?.llm_model && (
+        <span data-testid="trace-model">
+          model <span className="trace-tab__id">{trace.config.llm_model}</span>
+        </span>
+      )}
       {trace.usage && (
         <span data-testid="trace-usage">
           tokens {trace.usage.prompt_tokens} in · {trace.usage.completion_tokens} out
+          {typeof trace.usage.cost_usd === 'number' ? ` · ${formatCost(trace.usage.cost_usd)}` : ''}
         </span>
       )}
     </div>

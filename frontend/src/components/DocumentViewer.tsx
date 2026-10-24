@@ -421,7 +421,7 @@ function DocumentViewer({
                 <div className="document-viewer__chunk-meta mono">
                   {pageLabel(chunk.page, chunk.page_end)} &middot; {chunk.section}
                 </div>
-                <p className="document-viewer__chunk-text">
+                <p className="document-viewer__chunk-text" dir="auto">
                   {isTarget && highlights?.length ? (
                     <MarkedText text={chunk.text} quotes={highlights} />
                   ) : (

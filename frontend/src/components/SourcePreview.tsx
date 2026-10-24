@@ -18,7 +18,7 @@ function SourcePreview({ citation }: SourcePreviewProps) {
             {pageLabel(citation.page, citation.page_end)} &middot; {citation.section}
           </span>
         </div>
-        <p className="source-preview__quote">
+        <p className="source-preview__quote" dir="auto">
           {/* The passage the answer rests on when the server found one, else the
               chunk's opening. Older turns are saved without either (see useChat); the
               citation still opens the document at this passage. */}

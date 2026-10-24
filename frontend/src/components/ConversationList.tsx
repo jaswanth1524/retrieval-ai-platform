@@ -199,7 +199,7 @@ function ConversationList({
                   aria-current={conversation.id === activeId ? 'true' : undefined}
                   data-testid="conversation-select"
                 >
-                  <span className="conversation-list__title">
+                  <span className="conversation-list__title" dir="auto">
                     {conversation.pinned && (
                       <>
                         {/* aria-label on a plain span is ignored: screen readers said

@@ -4,7 +4,14 @@ import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
-import { EMPTY_OVERRIDES } from '../utils/overrides';
+import { ANSWER_FORMATS, EMPTY_OVERRIDES, isAnswerFormat, isAnswerLanguage } from '../utils/overrides';
+
+const FORMAT_LABELS: Record<string, string> = {
+  default: 'prose',
+  bullets: 'bullet points',
+  table: 'a table where it fits',
+  brief: 'brief (two or three sentences)',
+};
 
 interface SettingsModalProps {
   config: PublicConfigResponse;
@@ -92,6 +99,7 @@ function SettingsModal({
   // directly, so a drag doesn't localStorage-write on every tick and Cancel (unmount,
   // since the modal is only ever conditionally rendered) discards it for free.
   const [draftOverrides, setDraftOverrides] = useState(overrides);
+  const [languageDraft, setLanguageDraft] = useState(overrides.answerLanguage ?? '');
   const [notifyDraft, setNotifyDraft] = useState(notifyOnAnswer);
   const [notifyBlocked, setNotifyBlocked] = useState(false);
 
@@ -243,12 +251,66 @@ function SettingsModal({
             <button
               type="button"
               className="settings__reset"
-              onClick={() => setDraftOverrides(EMPTY_OVERRIDES)}
+              onClick={() => {
+                setDraftOverrides(EMPTY_OVERRIDES);
+                setLanguageDraft('');
+              }}
               disabled={disabled}
               data-testid="settings-reset"
             >
               Reset to server defaults
             </button>
+          </section>
+
+          <section className="settings__section">
+            <h3 className="settings__section-title mono">Answers</h3>
+            <label className="settings__field-label" htmlFor="settings-answer-format">
+              Layout
+            </label>
+            <select
+              id="settings-answer-format"
+              className="settings__input"
+              value={draftOverrides.answerFormat ?? ''}
+              onChange={(event) =>
+                setDraftOverrides({
+                  ...draftOverrides,
+                  answerFormat: isAnswerFormat(event.target.value) ? event.target.value : null,
+                })
+              }
+              disabled={disabled}
+              data-testid="settings-answer-format"
+            >
+              <option value="">Server default ({FORMAT_LABELS[config.answer_format ?? 'default'] ?? 'prose'})</option>
+              {ANSWER_FORMATS.map((format) => (
+                <option key={format} value={format}>
+                  {FORMAT_LABELS[format]}
+                </option>
+              ))}
+            </select>
+            <label className="settings__field-label" htmlFor="settings-answer-language">
+              Language
+            </label>
+            <input
+              id="settings-answer-language"
+              className="settings__input"
+              value={languageDraft}
+              onChange={(event) => {
+                const value = event.target.value;
+                setLanguageDraft(value);
+                setDraftOverrides({
+                  ...draftOverrides,
+                  answerLanguage: isAnswerLanguage(value) ? value.trim() : null,
+                });
+              }}
+              placeholder={config.answer_language || 'the model’s choice'}
+              disabled={disabled}
+              data-testid="settings-answer-language"
+            />
+            <p className="settings__hint">
+              {languageDraft.trim() && !isAnswerLanguage(languageDraft)
+                ? 'A language name (“German”), or “match” to answer in the question’s language.'
+                : 'A language name, or “match” for the question’s own. Empty uses the server’s setting.'}
+            </p>
           </section>
 
           <section className="settings__section">
