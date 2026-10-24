@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import threading
@@ -44,6 +45,8 @@ from cli.client import (
     grounding_notes,
     trim_history,
 )
+from cli.completion import completion_script
+from cli.config import Profile, ProfileError, load_profile, resolve
 
 # `ask --strict`: the documents don't answer the question (a script can tell).
 EXIT_NOT_ANSWERED = 3
@@ -445,10 +448,64 @@ def cmd_chat(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
 
     history: list[dict[str, str]] = []
     prompt = "" if args.json else "> "
+    line_editing = _start_line_editing() if sys.stdin.isatty() and prompt else None
+    try:
+        return _chat_loop(client, args, out, history, prompt, line_editing)
+    finally:
+        if line_editing is not None:
+            line_editing()
+
+
+def _start_line_editing() -> Callable[[], None] | None:
+    """At a terminal: arrow keys, editing and earlier questions (↑) at the prompt, kept
+    in ``$XDG_STATE_HOME/docrag/history``; the returned callable saves them. None where
+    Python has no readline (Windows)."""
+
+    try:
+        import readline
+    except ImportError:  # pragma: no cover - platform dependent
+        return None
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    path = Path(base) / "docrag" / "history"
+    try:
+        readline.read_history_file(path)
+    except OSError:
+        pass  # none yet
+    readline.set_history_length(CHAT_HISTORY_LINES)
+
+    def save() -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(path)
+        except OSError:
+            pass  # a read-only home: editing still worked
+
+    return save
+
+
+# Questions remembered for ↑ in `chat` across sessions.
+CHAT_HISTORY_LINES = 500
+
+
+def _chat_loop(
+    client: DocragClient,
+    args: argparse.Namespace,
+    out: TextIO,
+    history: list[dict[str, str]],
+    prompt: str,
+    line_editing: Callable[[], None] | None,
+) -> int:
     while True:
-        if prompt:
-            print(prompt, end="", file=out, flush=True)
-        line = sys.stdin.readline()
+        if line_editing is not None:
+            try:
+                line = input(prompt) + "\n"
+            except EOFError:
+                print(file=out)
+                line = ""
+        else:
+            if prompt:
+                print(prompt, end="", file=out, flush=True)
+            line = sys.stdin.readline()
         question = line.strip()
         if not line or not question or question in ("/quit", "/exit"):
             return 0
@@ -797,6 +854,11 @@ def _add_global_flags(parser: argparse.ArgumentParser, default: Any) -> None:
     parser.add_argument("--api-key", default=default, help="X-API-Key (DOCRAG_API_KEY).")
     parser.add_argument("--workspace", default=default, help="Workspace to use (DOCRAG_WORKSPACE).")
     parser.add_argument(
+        "--profile",
+        default=default,
+        help="A [profiles.NAME] of ~/.config/docrag/config.toml (DOCRAG_PROFILE).",
+    )
+    parser.add_argument(
         "--json", action="store_true", default=default, help="Machine-readable output."
     )
 
@@ -816,6 +878,8 @@ def build_parser() -> argparse.ArgumentParser:
     def command(name: str, help: str) -> argparse.ArgumentParser:
         return sub.add_parser(name, help=help, parents=[shared])
 
+    completion = command("completion", "Print a shell completion script.")
+    completion.add_argument("shell", choices=("bash", "zsh"))
     command("status", "Version, provider, document count.")
     command("documents", "List indexed documents.")
 
@@ -975,8 +1039,24 @@ def main(
     _tolerate_unencodable_output()  # first: argparse's own errors echo the arguments
     args = build_parser().parse_args(argv)
     stream = out or sys.stdout
+    if args.command == "completion":
+        # Needs no server: the script is made from this parser.
+        print(completion_script(build_parser(), args.shell), file=stream)
+        return 0
     owned = client is None
-    active = client or DocragClient(args.url, args.api_key, workspace=args.workspace)
+    if client is None:
+        try:
+            profile = load_profile(args.profile)
+        except ProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        profile = profile or Profile()
+        client = DocragClient(
+            resolve(args.url, "DOCRAG_URL", profile.url),
+            resolve(args.api_key, "DOCRAG_API_KEY", profile.api_key()),
+            workspace=resolve(args.workspace, "DOCRAG_WORKSPACE", profile.workspace),
+        )
+    active = client
     try:
         return COMMANDS[args.command](active, args, stream)
     except DocragError as exc:

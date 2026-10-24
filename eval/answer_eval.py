@@ -108,6 +108,15 @@ def states_fact(answer: str, facts: Sequence[str]) -> bool | None:
     return any(_normalized(fact) in text for fact in facts)
 
 
+def states_facts(answer: str, groups: Sequence[Sequence[str]]) -> bool | None:
+    """Whether ``answer`` states one fact of every group (a comparison names both
+    sides); None when there are none to check."""
+
+    if not groups:
+        return None
+    return all(states_fact(answer, group) for group in groups)
+
+
 def answer_for_question(
     example: RetrievalExample,
     *,
@@ -149,7 +158,7 @@ def answer_for_question(
         reference=example.reference,
         cited_filenames=sorted({source.filename for source in grounded.sources}),
         answer_status=grounded.answer_status,
-        fact_hit=states_fact(grounded.answer, example.answer_contains),
+        fact_hit=states_facts(grounded.answer, example.fact_groups),
         seconds=time.monotonic() - started,
         weak_matches=grounded.weak_matches,
         citation_backfilled=grounded.citation_backfilled,
@@ -219,7 +228,7 @@ def answer_metrics(
         metrics["refused_unanswerable_rate"] = sum(
             r.answer_status in ("no_context", "insufficient_context") for _, r in unanswerable
         ) / len(unanswerable)
-    facts = [r for e, r in zip(examples, rows, strict=True) if e.answer_contains]
+    facts = [r for e, r in zip(examples, rows, strict=True) if e.fact_groups]
     if facts:
         metrics["fact_hit_rate"] = sum(bool(r.fact_hit) for r in facts) / len(facts)
     if rows:
@@ -267,7 +276,7 @@ def run_answer_eval(
             if 0 <= index < len(examples) and examples[index].question == row.question:
                 # Scored against the dataset as it is now (its facts may have changed).
                 saved[index] = replace(
-                    row, fact_hit=states_fact(row.answer, examples[index].answer_contains)
+                    row, fact_hit=states_facts(row.answer, examples[index].fact_groups)
                 )
         print(f"resuming: {len(saved)} of {len(examples)} rows already answered")
     else:
@@ -297,7 +306,7 @@ def run_answer_eval(
                     contexts=[""],
                     reference=example.reference,
                     answer_status="error",
-                    fact_hit=False if example.answer_contains else None,
+                    fact_hit=False if example.fact_groups else None,
                     seconds=time.monotonic() - started,
                     error=f"{type(exc).__name__}: {exc}",
                 )

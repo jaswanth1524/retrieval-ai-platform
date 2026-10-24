@@ -33,8 +33,16 @@ build-backend = "hatchling.build"
 
 # This directory is the `cli` package itself: ship its modules under that name.
 [tool.hatch.build.targets.wheel]
-only-include = ["__init__.py", "__main__.py", "client.py", "mcp_server.py"]
+only-include = ["__init__.py", "__main__.py", "client.py", "completion.py", "config.py", "mcp_server.py"]
 sources = { "" = "cli" }
 
 [tool.hatch.build.targets.sdist]
-only-include = ["__init__.py", "__main__.py", "client.py", "mcp_server.py", "pyproject.toml"]
+only-include = [
+  "__init__.py",
+  "__main__.py",
+  "client.py",
+  "completion.py",
+  "config.py",
+  "mcp_server.py",
+  "pyproject.toml",
+]

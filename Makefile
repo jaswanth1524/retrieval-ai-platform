@@ -2,7 +2,7 @@
 # `make check` runs the backend and frontend gates as CI does (coverage floor and
 # dependency audits included); e2e and Docker stay separate.
 
-.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-answer eval-ragas
+.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-answer eval-ragas eval-diff eval-report
 
 check: backend frontend
 
@@ -27,6 +27,7 @@ backend:
 	uv run python -m eval.harness validate eval/datasets/unanswerable_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/followup_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/paraphrase_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/compare_eval.jsonl
 	req=$$(mktemp) && uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$$req" \
 		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req"; \
 		status=$$?; rm -f "$$req"; exit $$status
@@ -76,3 +77,13 @@ eval-answer: eval-ingest
 eval-ragas:
 	LITELLM_MODE=PRODUCTION uv run python -m eval.ragas_runner $(EVAL_OUT) --llm $(LLM) \
 		--embeddings fastembed --output eval-ragas.json
+
+# Which questions got better or worse between two runs of the same command, e.g.
+# make eval-diff BEFORE=old-answers.json AFTER=eval-answers.json
+eval-diff:
+	uv run python -m eval.harness diff $(BEFORE) $(AFTER)
+
+# One run as an HTML page (with eval-ragas's scores when present).
+eval-report:
+	uv run python -m eval.harness report $(EVAL_OUT) --output eval-report.html \
+		$(if $(wildcard eval-ragas.json),--ragas eval-ragas.json,)

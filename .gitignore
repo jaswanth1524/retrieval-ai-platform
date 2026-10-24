@@ -40,6 +40,7 @@ eval-answers.json
 eval-answers.json.partial.jsonl
 eval-ragas.json
 eval-results.json
+eval-report.html
 
 # Verification scratch space
 .verify-scratch/
