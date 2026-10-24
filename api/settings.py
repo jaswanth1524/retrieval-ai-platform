@@ -281,6 +281,18 @@ class AppSettings(BaseSettings):
     # upsert is a round trip with wait=True under the filename lock, so writing a
     # 1,000-chunk document in 64-point calls held the lock through 16 of them.
     ingest_upsert_batch_size: PositiveInt = 256
+    # A re-upload, re-index, URL refresh or watched-folder change reuses the stored
+    # vectors of every chunk that didn't change (same point id — filename, page,
+    # section and text — and same chunking fingerprint) and embeds only the rest.
+    # False embeds every chunk again.
+    ingest_reuse_vectors: bool = True
+    # Re-index stale documents in the background (api/auto_reindex.py): after an
+    # upgrade that changes chunking, or a chunk-setting change, every document with a
+    # stored original (RAW_DOCUMENT_DIR) is brought up to date without anyone clicking
+    # "re-index all". At most AUTO_REINDEX_BATCH of its jobs run at once, so uploads
+    # still get through. Off by default.
+    auto_reindex_stale: bool = False
+    auto_reindex_batch: PositiveInt = 4
     # Upload bytes allowed to sit queued or in progress at once. Every accepted upload
     # holds its full content in memory until its ingest job finishes, and the executor
     # queue itself is unbounded — past this budget uploads get 503 + Retry-After
@@ -574,6 +586,9 @@ class AppSettings(BaseSettings):
                 "RAW_DOCUMENT_VERSIONS=%d has no effect without RAW_DOCUMENT_DIR.",
                 self.raw_document_versions,
             )
+        if self.auto_reindex_stale and not self.raw_document_dir:
+            # Re-indexing reads each document's stored original.
+            log.warning("AUTO_REINDEX_STALE has no effect without RAW_DOCUMENT_DIR.")
         return self
 
     @model_validator(mode="after")

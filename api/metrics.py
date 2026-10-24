@@ -50,9 +50,21 @@ ingest_job_seconds = Histogram(
 
 # Where an ingest's time goes. "write" is everything under the filename lock:
 # snapshot, upserts, storing the original and stale cleanup.
+ingest_vectors_reused_total = Counter(
+    "docrag_ingest_vectors_reused_total",
+    "Chunks indexed with their stored vectors instead of being embedded again "
+    "(INGEST_REUSE_VECTORS): unchanged chunks of a re-indexed document.",
+)
+
+stale_documents = Gauge(
+    "docrag_stale_documents",
+    "Documents with a stored original that are indexed with older chunking, as of the "
+    "last AUTO_REINDEX_STALE pass (all workspaces).",
+)
+
 ingest_stage_seconds = Histogram(
     "docrag_ingest_stage_seconds",
-    "Wall-clock time of each ingestion stage (parse, chunk, embed, write).",
+    "Wall-clock time of each ingestion stage (parse, chunk, reuse, embed, write).",
     labelnames=("stage",),
     buckets=INGEST_LATENCY_BUCKETS,
 )

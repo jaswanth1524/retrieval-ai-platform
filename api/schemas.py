@@ -81,6 +81,10 @@ class ReadinessResponse(BaseModel):
     # Whether uploaded originals are kept (RAW_DOCUMENT_DIR): only then can a backup
     # rebuild the index, so the UI offers that way out of a mismatch only then.
     originals_kept: bool = False
+    # Each model the startup warmup loaded: "ok", "failed" (questions will fail until a
+    # background retry loads it; makes `status` degraded) or "fallback" (the tokenizer
+    # fell back to the heuristic counter; never degraded). Empty when warmup is off.
+    models: dict[str, Literal["ok", "failed", "fallback"]] = Field(default_factory=dict)
 
 
 class PublicConfigResponse(BaseModel):

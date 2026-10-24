@@ -14,12 +14,14 @@ from typing import Literal
 
 from fastapi import HTTPException
 
+from api.audit import audit
 from api.corpus import bump_corpus_generation
 from api.documents import (
     DocumentError,
     DocumentNotFoundError,
     DocumentSource,
     UnsupportedDocumentError,
+    chunking_fingerprint,
     normalize_filename,
 )
 from api.embeddings import EmbeddingError
@@ -39,7 +41,7 @@ from api.metrics import (
 from api.pipeline import IngestService
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
-from api.repository import VectorRepository
+from api.repository import DocumentMetadata, VectorRepository
 from api.schemas import (
     DocumentJobAcceptedResponse,
 )
@@ -508,6 +510,100 @@ def indexing_now(settings: AppSettings) -> set[str]:
     return {name for name in in_flight if name}
 
 
+def staleness(settings: AppSettings, token_counter: object) -> Callable[[DocumentMetadata], bool]:
+    """The one staleness rule the listing, bulk re-index and AUTO_REINDEX_STALE share."""
+
+    fingerprint = chunking_fingerprint(settings)
+    counter_mode = str(getattr(token_counter, "mode", "unknown"))
+    return lambda meta: meta.is_stale(fingerprint, counter_mode)
+
+
+def source_of(meta: DocumentMetadata) -> DocumentSource | None:
+    """Where a URL-fetched document came from, carried over by a re-index."""
+
+    if not meta.source_url:
+        return None
+    return DocumentSource(meta.source_url, meta.source_etag, meta.source_last_modified)
+
+
+@dataclass(frozen=True)
+class StaleReindex:
+    """What one pass over the stale documents queued (``reindex_stale``)."""
+
+    jobs: list[DocumentJobAcceptedResponse]
+    # Not queued: the backlog was full (or ``limit`` reached); try again later.
+    deferred: list[str]
+    # Already being indexed: their job will make them current.
+    in_progress: list[str]
+    # Couldn't be queued for another reason (logged).
+    failed: list[str]
+
+
+def reindex_stale(
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    store: RawDocumentStore,
+    token_counter: object,
+    *,
+    limit: int | None = None,
+) -> StaleReindex:
+    """Queue a re-index of every stale document with a stored original (at most
+    ``limit`` jobs; the rest are deferred) — ``POST /documents/reindex`` and the
+    background AUTO_REINDEX_STALE pass."""
+
+    is_stale = staleness(settings, token_counter)
+    # 409 now, not one failed job per document, when the index can't take them.
+    repository.ensure_writable(settings)
+    metadata = repository.filename_metadata(settings)
+    busy = indexing_now(settings)
+    jobs: list[DocumentJobAcceptedResponse] = []
+    deferred: list[str] = []
+    in_progress: list[str] = []
+    failed: list[str] = []
+    for name, meta in sorted(metadata.items()):
+        if not is_stale(meta):
+            continue
+        if name in busy:
+            # Still listed as stale until its job finishes: a second click would
+            # parse and embed the whole document again.
+            in_progress.append(name)
+            continue
+        size = store.size(name)
+        if size is None:
+            continue
+        # Checked before reading: once the backlog is full, reading every remaining
+        # original into memory only to defer it cost the whole corpus in RAM.
+        if (limit is not None and len(jobs) >= limit) or not queue.backlog.has_room(size):
+            deferred.append(name)
+            continue
+        content = store.read(name)
+        if content is None:
+            continue
+        try:
+            jobs.append(
+                queue.enqueue(
+                    filename=name,
+                    content=content,
+                    raw_store=None,
+                    uploaded_at=meta.uploaded_at,
+                    precondition=original_still_stored(store, name),
+                    source=source_of(meta),
+                )
+            )
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                deferred.append(name)
+            else:
+                failed.append(name)
+        except Exception:
+            # The jobs already queued keep running; failing the request here left
+            # the client without their ids.
+            logger.exception("Could not queue the re-index of %s.", name)
+            failed.append(name)
+    return StaleReindex(jobs, deferred, in_progress, failed)
+
+
 def known_filenames(repository: VectorRepository, settings: AppSettings) -> list[str]:
     """Every indexed filename in ``settings``' workspace plus those with an upload or
     delete in flight: what a new name is checked against by
@@ -621,6 +717,13 @@ def delete_indexed_document(
             ingest_sequencer.mark_applied(key, sequence, deleted=True)
     finally:
         ingest_sequencer.release(key)
+    audit(
+        "document.delete",
+        workspace=workspace_of(settings),
+        filename=filename,
+        points_deleted=points_deleted,
+        original_removed=removed_original,
+    )
     return points_deleted
 
 

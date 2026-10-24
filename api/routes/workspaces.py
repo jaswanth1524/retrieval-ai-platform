@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from qdrant_client import QdrantClient
 
+from api.audit import audit
 from api.corpus import bump_corpus_generation
 from api.dependencies import (
     clear_workspace_raw_stores,
@@ -140,6 +141,7 @@ def register(app: FastAPI) -> None:
                 repository.ensure_writable, settings_for(settings, name), create_workspace=True
             )
         )
+        audit("workspace.create", workspace=name)
         return WorkspaceResponse(name=name)
 
     @app.delete(
@@ -183,4 +185,5 @@ def register(app: FastAPI) -> None:
             _delete_if_empty(client, target, name)
         finally:
             ingest_sequencer.reopen(group)
+        audit("workspace.delete", workspace=name)
         return WorkspaceResponse(name=name)
