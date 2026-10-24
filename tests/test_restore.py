@@ -145,3 +145,14 @@ def test_feedback_past_the_byte_cap_stops_and_keeps_the_rows_before_it(
 
     assert [row.id for row in sink.rows] == ["row-0", "row-1", "row-2"]
     assert outcome.feedback_imported == 3
+
+
+def test_a_name_listed_twice_in_the_manifest_is_queued_once() -> None:
+    recorder = Recorder()
+
+    outcome = _restore(
+        _zip([_document("a.txt"), _document("a.txt")], {"originals/a.txt": b"alpha"}), recorder
+    )
+
+    assert recorder.queued == [("a.txt", b"alpha")]
+    assert outcome.skipped == ["a.txt"]

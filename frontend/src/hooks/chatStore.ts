@@ -65,10 +65,18 @@ async function withDb<T>(work: (db: IDBDatabase) => Promise<T>): Promise<T> {
   }
 }
 
-export async function loadChatStore(): Promise<unknown> {
-  if (!chatStoreAvailable()) return null;
+/** What reading the stored history found. ``failed`` is not ``empty``: a history that
+ *  couldn't be read may well still be there, and saving over it would replace it with
+ *  localStorage's compact copy. */
+export type ChatStoreRead =
+  | { status: 'data'; value: unknown }
+  | { status: 'empty' }
+  | { status: 'failed' };
+
+export async function readChatStore(): Promise<ChatStoreRead> {
+  if (!chatStoreAvailable()) return { status: 'empty' };
   try {
-    return await withDb(
+    const value = await withDb(
       (db) =>
         new Promise<unknown>((resolve, reject) => {
           const request = db.transaction(STORE, 'readonly').objectStore(STORE).get(KEY);
@@ -76,9 +84,16 @@ export async function loadChatStore(): Promise<unknown> {
           request.onerror = () => reject(request.error);
         }),
     );
+    return value === null ? { status: 'empty' } : { status: 'data', value };
   } catch {
-    return null;
+    return { status: 'failed' };
   }
+}
+
+/** The stored history, or null when there is none or it can't be read. */
+export async function loadChatStore(): Promise<unknown> {
+  const read = await readChatStore();
+  return read.status === 'data' ? read.value : null;
 }
 
 function write(apply: (store: IDBObjectStore) => void): Promise<boolean> {

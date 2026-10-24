@@ -296,3 +296,24 @@ async def test_ask_takes_the_conversation_as_history(
     answer = text_of(await server.call_tool("ask", {"question": "and beta?", "history": history}))
     assert answer.startswith("Alpha is documented [1].")
     assert sent == [history[:2]]
+
+
+@pytest.mark.asyncio
+async def test_ask_trims_a_long_history_to_what_the_server_takes(
+    server: MCPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list[Any] = []
+    original = DocragClient.ask
+
+    def spy(self: DocragClient, *args: Any, **kwargs: Any) -> StreamResult:
+        sent.append(kwargs.get("history"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DocragClient, "ask", spy)
+    history = [
+        {"role": "user", "content": "What is alpha?"},
+        {"role": "assistant", "content": "Alpha [1]. " * 1000},  # an answer with its sources
+    ]
+    answer = text_of(await server.call_tool("ask", {"question": "and beta?", "history": history}))
+    assert answer.startswith("Alpha is documented [1].")
+    assert len(sent[0][1]["content"]) <= 4000

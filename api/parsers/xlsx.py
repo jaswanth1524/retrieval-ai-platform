@@ -13,7 +13,7 @@ from api.parsers.common import (
     cap_section,
     check_zip_expanded_size,
     refuse_zip_xml_dtd,
-    render_row,
+    row_groups,
 )
 from api.settings import AppSettings
 
@@ -99,25 +99,20 @@ def _sheet_sections(
             )
         ]
     sections: list[DocumentSection] = []
-    for start in range(0, len(data_rows), rows_per_section):
-        group = data_rows[start : start + rows_per_section]
-        rendered = [(number, render_row(header, row)) for number, row in group]
-        rendered = [(number, line) for number, line in rendered if line]
-        if rendered:
-            first, last = group[0][0], group[-1][0]
-            label = f"{title} · Row {first}" if first == last else f"{title} · Rows {first}-{last}"
-            sections.append(
-                DocumentSection(
-                    filename=filename,
-                    page=page,
-                    section=cap_section(label),
-                    text="\n".join(line for _, line in rendered),
-                    boundary="isolated",
-                    # Chunks keep rows whole and are labelled with the rows they hold.
-                    line_rows=tuple(number for number, _ in rendered),
-                    row_label_prefix=f"{title[:80]} · ",
-                )
+    for first, last, rendered in row_groups(header, data_rows, rows_per_section):
+        label = f"{title} · Row {first}" if first == last else f"{title} · Rows {first}-{last}"
+        sections.append(
+            DocumentSection(
+                filename=filename,
+                page=page,
+                section=cap_section(label),
+                text="\n".join(line for _, line in rendered),
+                boundary="isolated",
+                # Chunks keep rows whole and are labelled with the rows they hold.
+                line_rows=tuple(number for number, _ in rendered),
+                row_label_prefix=f"{title[:80]} · ",
             )
+        )
     return sections
 
 

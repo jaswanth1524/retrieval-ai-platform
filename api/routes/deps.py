@@ -31,6 +31,7 @@ from api.dependencies import (
     get_vector_repository,
 )
 from api.feedback import FeedbackStore
+from api.ingest_jobs import IngestQueue
 from api.jobs import IngestBacklog, JobStore
 from api.pipeline import IngestService, RagPipeline
 from api.query_log import QueryLogStore
@@ -79,6 +80,21 @@ IngestExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_ingest_executor)]
 
 
 IngestBacklogDep = Annotated[IngestBacklog, Depends(get_ingest_backlog)]
+
+
+def get_ingest_queue(
+    job_store: IngestJobStoreDep,
+    executor: IngestExecutorDep,
+    backlog: IngestBacklogDep,
+    ingest_service: IngestServiceDep,
+) -> IngestQueue:
+    """The four collaborators every route that queues an ingest takes, together.
+    Sub-dependencies, so a test's override of any one of them still applies."""
+
+    return IngestQueue(job_store, executor, backlog, ingest_service)
+
+
+IngestQueueDep = Annotated[IngestQueue, Depends(get_ingest_queue)]
 
 
 QuestionSlotsDep = Annotated[QuestionSlots, Depends(get_question_slots)]

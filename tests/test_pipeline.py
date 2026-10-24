@@ -2490,3 +2490,191 @@ def test_the_reading_stage_carries_the_measured_eta() -> None:
     events = list(_streaming_pipeline(settings).answer_stream("alpha"))
     reading = next(event for event in events if event.get("stage") == "reading")
     assert reading["eta_ms"] == round(reading["prompt_tokens"] / 100 * 1000)
+
+
+class SlotRecordingGenerator(SequencedGenerator):
+    """Records, per call, whether the calling thread held the local model's place."""
+
+    def __init__(self, answers: list[str], settings: AppSettings) -> None:
+        super().__init__(answers)
+        self.settings = settings
+        self.held: list[bool] = []
+
+    def _record(self) -> None:
+        from api.llm import GenerationSlot
+
+        self.held.append(not GenerationSlot(self.settings).needed)
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        self._record()
+        return super().complete(messages, settings)
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings):
+        self._record()
+        yield from super().stream(messages, settings)
+
+
+_FOLLOW_UP_HISTORY: list[ChatMessage] = [
+    {"role": "user", "content": "What is alpha?"},
+    {"role": "assistant", "content": "Alpha is the first letter [1]."},
+]
+
+
+def test_a_follow_up_waits_for_the_local_model_before_condensing_and_says_so() -> None:
+    from api.llm import GenerationSlot
+
+    settings = make_settings(llm_provider="ollama")
+    pipeline = _streaming_pipeline(settings)
+    generator = SlotRecordingGenerator(["What is alpha in detail?", "Alpha [1]."], settings)
+    pipeline._generator = generator
+    holder = GenerationSlot(settings)
+    assert holder.acquire()
+    events: list[dict[str, Any]] = []
+    waiting = threading.Event()
+
+    def ask() -> None:
+        for event in pipeline.answer_stream("Explain in more detail", history=_FOLLOW_UP_HISTORY):
+            events.append(dict(event))
+            if event.get("stage") == "waiting_for_model":
+                waiting.set()
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+    assert waiting.wait(10)
+    assert generator.calls == []  # the condense call waits too
+    holder.release()
+    thread.join(10)
+    stages = [event["stage"] for event in events if event["type"] == "stage"]
+    assert stages[:2] == ["waiting_for_model", "condensing"]
+    assert events[-1]["type"] == "done"
+    # Both calls ran holding the place; it was given back in between and at the end.
+    assert generator.held == [True, True]
+    after = GenerationSlot(settings)
+    assert after.try_acquire()
+    after.release()
+
+
+def test_a_follow_up_whose_reader_left_while_waiting_never_condenses() -> None:
+    from api.llm import GenerationSlot
+
+    settings = make_settings(llm_provider="ollama")
+    pipeline = _streaming_pipeline(settings)
+    generator = SlotRecordingGenerator(["What is alpha?"], settings)
+    pipeline._generator = generator
+    holder = GenerationSlot(settings)
+    assert holder.acquire()
+    gone = threading.Event()
+    events: list[Any] = []
+    thread = threading.Thread(
+        target=lambda: events.extend(
+            pipeline.answer_stream(
+                "Explain in more detail", history=_FOLLOW_UP_HISTORY, should_stop=gone.is_set
+            )
+        )
+    )
+    thread.start()
+    time.sleep(0.5)
+    gone.set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert generator.calls == []
+    assert events[-1]["stage"] == "waiting_for_model"
+    holder.release()
+
+
+def test_a_sync_answer_holds_the_local_model_through_its_citation_retry() -> None:
+    settings = make_settings(llm_provider="ollama", citation_retry_mode="llm")
+    pipeline = _streaming_pipeline(settings)
+    generator = SlotRecordingGenerator(
+        ["Alpha has no marker.", "Alpha is documented [1]."], settings
+    )
+    pipeline._generator = generator
+
+    result = pipeline.answer("alpha")
+
+    assert result.citation_retry_used
+    assert generator.held == [True, True]
+
+
+def test_an_ingest_already_refused_is_refused_before_it_parses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import api.ingest_service as ingest_service_module
+    from api.ingestion import IngestionError
+
+    parsed: list[str] = []
+    real_parse = ingest_service_module.parse_with_limit
+
+    def counting_parse(filename: str, content: bytes, settings: AppSettings) -> Any:
+        parsed.append(filename)
+        return real_parse(filename, content, settings)
+
+    monkeypatch.setattr(ingest_service_module, "parse_with_limit", counting_parse)
+    settings = make_settings()
+    service = IngestService(
+        VectorRepository(QdrantClient(":memory:")),
+        StaticEmbeddingProvider([make_embedding(1.0)]),
+        settings,
+    )
+
+    def deleted_while_queued() -> None:
+        raise IngestionError("'guide.txt' was deleted before its re-index ran")
+
+    with pytest.raises(IngestionError, match="deleted before"):
+        service.ingest("guide.txt", b"Intro\nalpha beta", precondition=deleted_while_queued)
+    assert parsed == []
+
+
+def test_a_changed_upload_is_told_from_one_point_not_a_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    service = IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings)
+    service.ingest("guide.txt", b"Intro\nalpha beta", dedupe=True)
+    scans: list[str] = []
+    real_scan = VectorRepository.document_metadata
+
+    def counting_scan(self: VectorRepository, s: AppSettings, filename: str) -> Any:
+        scans.append(filename)
+        return real_scan(self, s, filename)
+
+    monkeypatch.setattr(VectorRepository, "document_metadata", counting_scan)
+    edited = service.ingest("guide.txt", b"Intro\nalpha beta gamma", dedupe=True)
+    assert edited.chunks_ingested == 1 and scans == []
+    same = service.ingest("guide.txt", b"Intro\nalpha beta gamma", dedupe=True)
+    assert same.unchanged and scans == ["guide.txt"]
+
+
+def test_query_expansion_waits_for_the_local_model_and_says_so() -> None:
+    from api.llm import GenerationSlot
+
+    settings = make_settings(
+        llm_provider="ollama", query_expansion_enabled=True, query_expansion_count=2
+    )
+    pipeline = _streaming_pipeline(settings)
+    generator = SlotRecordingGenerator(
+        ["alpha variant one\nalpha variant two", "Alpha [1]."], settings
+    )
+    pipeline._generator = generator
+    holder = GenerationSlot(settings)
+    assert holder.acquire()
+    events: list[dict[str, Any]] = []
+    waiting = threading.Event()
+
+    def ask() -> None:
+        for event in pipeline.answer_stream("alpha"):
+            events.append(dict(event))
+            if event.get("stage") == "waiting_for_model":
+                waiting.set()
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+    assert waiting.wait(10)
+    assert generator.calls == []
+    holder.release()
+    thread.join(10)
+    stages = [event["stage"] for event in events if event["type"] == "stage"]
+    assert stages[:2] == ["waiting_for_model", "searching"]
+    assert events[-1]["type"] == "done"
+    assert generator.held == [True, True]

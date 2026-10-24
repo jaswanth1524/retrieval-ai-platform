@@ -375,13 +375,17 @@ export function compactForStorage(
 export type PersistOutcome = 'saved' | 'partial' | 'failed';
 
 /** The conversations localStorage's copy holds: the active one, the pinned ones and
- *  the most recently used, LOCAL_STORAGE_MAX_CONVERSATIONS in all. A conversation left
- *  out is never read as deleted (only a tombstone deletes; see mergeConversations). */
+ *  the most recently changed, LOCAL_STORAGE_MAX_CONVERSATIONS in all. A conversation
+ *  left out is never read as deleted (only a tombstone deletes; see mergeConversations).
+ *
+ *  "Changed" includes a rename or a pin (``lastEdit``), not only a new turn: this copy
+ *  is how other tabs hear of a change, and an old conversation renamed here and left
+ *  out was overwritten by the next save of a tab that never saw the rename. */
 export function conversationsForLocalStorage(storage: ChatStorageV2): Conversation[] {
   const { conversations, activeConversationId } = storage;
   if (conversations.length <= LOCAL_STORAGE_MAX_CONVERSATIONS) return conversations;
   const kept = new Set<string>();
-  const sorted = [...conversations].sort(byRecentUse);
+  const sorted = [...conversations].sort((a, b) => lastEdit(b) - lastEdit(a));
   for (const conversation of sorted) {
     if (conversation.id === activeConversationId) kept.add(conversation.id);
   }

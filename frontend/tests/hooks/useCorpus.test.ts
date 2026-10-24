@@ -480,3 +480,47 @@ describe('useCorpus across workspaces', () => {
     ]);
   });
 });
+
+it("shows a finished upload's chunk count before the batch's listing refresh", async () => {
+  const finish: Array<() => void> = [];
+  api.uploadDocument.mockImplementation(async (sent: File) => ({
+    job_id: `job-${sent.name}`,
+    filename: sent.name,
+    state: 'queued',
+  }));
+  api.pollDocumentJob.mockImplementation(
+    (jobId: string) =>
+      new Promise((resolve) =>
+        finish.push(() =>
+          resolve(
+            jobStatus({
+              job_id: jobId,
+              state: 'done',
+              result: {
+                filename: jobId.replace('job-', ''),
+                collection_name: 'documents',
+                sections_parsed: 1,
+                chunks_ingested: 7,
+              } as DocumentJobStatusResponse['result'],
+            }),
+          ),
+        ),
+      ),
+  );
+  api.listDocuments.mockResolvedValue({ filenames: [] });
+  const { result } = setup();
+  let upload: Promise<void> | undefined;
+  act(() => {
+    upload = result.current.handleUpload(['a.txt', 'b.txt'].map((n) => new File(['x'], n)));
+  });
+  await waitFor(() => expect(finish).toHaveLength(2));
+  await act(async () => {
+    finish[0]();
+  });
+  // b.txt still indexing: the listing hasn't been re-read, yet a.txt has its count.
+  await waitFor(() => expect(result.current.documents['a.txt']?.chunks).toBe(7));
+  await act(async () => {
+    finish[1]();
+    await upload;
+  });
+});

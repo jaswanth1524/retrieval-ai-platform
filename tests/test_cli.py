@@ -847,3 +847,288 @@ def test_the_stage_reporter_ticks_while_nothing_arrives() -> None:
     lines = err.getvalue().splitlines()
     assert lines[0] == "[reading the passages, about 42s]"
     assert any(line.startswith("[reading the passages… ") for line in lines[1:])
+
+
+def _flaky_jobs(failures: list[int | None]) -> tuple[DocragClient, list[str]]:
+    """A server whose job polls fail with ``failures`` (a status, or None for a dropped
+    connection) in turn, then report the job done."""
+
+    log: list[str] = []
+    queue = list(failures)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request.url.path)
+        if request.url.path == "/documents":
+            return httpx.Response(202, json={"job_id": "j", "filename": "a.txt", "state": "queued"})
+        if queue:
+            status = queue.pop(0)
+            if status is None:
+                raise httpx.ConnectError("connection reset")
+            return httpx.Response(status, json={"detail": "nope"})
+        return httpx.Response(200, json={"job_id": "j", "filename": "a.txt", "state": "done"})
+
+    docrag = DocragClient(
+        "http://x", "", transport=httpx.MockTransport(handler), sleep=lambda _: None
+    )
+    return docrag, log
+
+
+def test_a_poll_that_fails_for_a_moment_does_not_end_the_wait(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("Intro\nText.")
+    docrag, _ = _flaky_jobs([502, None])
+    assert docrag.wait_for_jobs(["j"])["j"]["state"] == "done"
+    docrag, _ = _flaky_jobs([503, None])
+    assert docrag.index_files([tmp_path / "a.txt"])[tmp_path / "a.txt"]["state"] == "done"
+    docrag, _ = _flaky_jobs([502])
+    assert docrag.wait_for_job("j")["state"] == "done"
+
+
+def test_a_job_the_server_lost_or_a_server_down_for_good_is_unknown() -> None:
+    docrag, log = _flaky_jobs([404])
+    assert docrag.wait_for_jobs(["j"])["j"]["state"] == "unknown"
+    assert len(log) == 1
+    docrag, _ = _flaky_jobs([None, None, None, None])
+    status = docrag.wait_for_jobs(["j"])["j"]
+    assert status["state"] == "unknown" and "Cannot reach" in status["error"]
+
+
+def test_history_is_trimmed_to_what_the_server_takes() -> None:
+    from cli.client import HISTORY_MESSAGE_MAX_CHARS, trim_history
+
+    long_answer = "word " * 2000  # 10 000 characters
+    history = [
+        {"role": "assistant", "content": "an answer to a question left out"},
+        *[
+            message
+            for n in range(8)
+            for message in (
+                {"role": "user", "content": f"Question {n}?"},
+                {"role": "assistant", "content": long_answer if n == 7 else f"Answer {n}."},
+            )
+        ],
+        {"role": "system", "content": "ignored"},
+    ]
+    trimmed = trim_history(history)
+    assert trimmed[0]["role"] == "user"
+    assert len(trimmed) <= 12
+    assert all(len(m["content"]) <= HISTORY_MESSAGE_MAX_CHARS for m in trimmed)
+    assert sum(len(m["content"]) for m in trimmed) <= 8000
+    assert trimmed[-1]["content"].endswith("word…")  # cut at a word, and marked
+    assert trimmed[-2] == {"role": "user", "content": "Question 7?"}
+
+
+def test_delete_goes_on_past_a_failure_and_reports_each() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/missing.txt"):
+            return httpx.Response(404, json={"detail": "No indexed document named 'missing.txt'."})
+        return httpx.Response(200, json={"filename": "x", "points_deleted": 1})
+
+    code, out = run(mock_client(handler), "delete", "a.txt", "missing.txt", "b.txt", "--json")
+    assert code == 1
+    report = json.loads(out)
+    assert report["deleted"] == ["a.txt", "b.txt"]
+    assert [item["filename"] for item in report["failed"]] == ["missing.txt"]
+
+
+def test_export_reports_json(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"PK\x05\x06" + b"\x00" * 18)
+
+    target = tmp_path / "backup.zip"
+    code, out = run(mock_client(handler), "export", str(target), "--json")
+    assert code == 0
+    assert json.loads(out) == {"output": str(target), "bytes": 22}
+
+
+def test_ctrl_c_stops_an_answer_in_chat_but_not_the_conversation(
+    client: DocragClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli.client import StreamResult
+
+    asked: list[str] = []
+
+    def fake_ask(question: str, *args: object, **kwargs: object) -> StreamResult:
+        asked.append(question)
+        if question == "Slow?":
+            raise KeyboardInterrupt
+        return StreamResult({"answer": "Yes [1].", "sources": [], "answer_status": "answered"}, [])
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    monkeypatch.setattr("sys.stdin", io.StringIO("Slow?\nNext?\n"))
+    code, _ = run(client, "chat", "--quiet")
+    assert code == 0 and asked == ["Slow?", "Next?"]
+
+    def interrupted(*args: object, **kwargs: object) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "documents", interrupted)
+    assert run(client, "documents")[0] == 130
+
+
+def test_an_upload_waits_for_a_full_queue_only_until_the_deadline(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("Intro\nText.")
+    now = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "queue full"}, headers={"Retry-After": "15"})
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    docrag = DocragClient(
+        "http://x", "", transport=httpx.MockTransport(handler), sleep=sleep, clock=lambda: now[0]
+    )
+    statuses = docrag.index_files([tmp_path / "a.txt"], timeout=40)
+    assert statuses[tmp_path / "a.txt"]["state"] == "failed"
+    assert "when the wait ended" in statuses[tmp_path / "a.txt"]["error"]
+    assert now[0] <= 40
+
+
+class FakeServer:
+    """Answers the routes the maintenance commands use; records each request."""
+
+    def __init__(self, *, workspaces_enabled: bool = True) -> None:
+        self.log: list[str] = []
+        self.workspaces_enabled = workspaces_enabled
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        method, path = request.method, request.url.path
+        self.log.append(f"{method} {path}")
+        job = {"job_id": "j1", "filename": "a.txt", "state": "queued"}
+        done = {**job, "state": "done", "chunks_total": 3, "chunks_done": 3}
+        routes: dict[tuple[str, str], object] = {
+            ("POST", "/documents/reindex"): {
+                "jobs": [job],
+                "deferred": ["b.txt"],
+                "in_progress": ["c.txt"],
+                "failed": ["d.txt"],
+            },
+            ("POST", "/documents/a.txt/refresh"): job,
+            ("POST", "/documents/same.txt/refresh"): {"filename": "same.txt", "unchanged": True},
+            ("GET", "/documents/jobs/j1"): done,
+            ("GET", "/documents/a.txt/versions"): {
+                "versions": [{"version": "171", "size": 12}, {"version": "170", "size": 9}]
+            },
+            ("GET", "/documents/new.txt/versions"): {"versions": []},
+            ("POST", "/documents/a.txt/versions/171/restore"): job,
+            ("GET", "/query-log"): {
+                "queries": [
+                    {"status": "no_context", "top_score": 0.02, "question": "Gym?"},
+                    {"status": "answered", "top_score": None, "question": "Leave?"},
+                ]
+            },
+            ("GET", "/documents/jobs"): {
+                "jobs": [{**job, "state": "embedding", "chunks_total": 10, "chunks_done": 4}]
+            },
+            ("DELETE", "/documents/jobs/j1"): {**job, "cancelled": True},
+            ("GET", "/workspaces"): {
+                "enabled": self.workspaces_enabled,
+                "workspaces": ["legal"] if self.workspaces_enabled else [],
+            },
+            ("POST", "/workspaces"): {"name": "legal"},
+            ("DELETE", "/workspaces/legal"): {"deleted": "legal"},
+            ("GET", "/watch"): {
+                "folder": "/inbox",
+                "files": 3,
+                "retrying": [{"filename": "x.pdf", "attempts": 2, "error": "Qdrant down"}],
+                "gave_up": ["y.pdf"],
+                "problems": ["z.bin: unsupported"],
+            },
+            ("POST", "/watch/scan"): {"folder": "/inbox"},
+        }
+        body = routes.get((method, path))
+        if body is None:
+            return httpx.Response(404, json={"detail": f"no route {method} {path}"})
+        return httpx.Response(200 if method == "GET" else 202, json=body)
+
+
+def test_reindex_stale_reports_every_outcome_and_follows_the_jobs() -> None:
+    code, out = run(mock_client(FakeServer()), "reindex", "--stale")
+    assert code == 1  # one deferred and one failed
+    assert "1 queued, 1 deferred (queue full)" in out
+    assert "already being indexed: c.txt" in out
+    assert "could not be queued: d.txt" in out
+    assert "ok    a.txt" in out
+    code, _ = run(mock_client(FakeServer()), "reindex", "a.txt", "--stale")
+    assert code == 2
+
+
+def test_refresh_follows_a_job_or_says_unchanged() -> None:
+    code, out = run(mock_client(FakeServer()), "refresh", "a.txt")
+    assert code == 0 and "ok    a.txt" in out
+    code, out = run(mock_client(FakeServer()), "refresh", "same.txt")
+    assert code == 0 and "same.txt: unchanged at its source" in out
+    code, out = run(mock_client(FakeServer()), "refresh", "same.txt", "--json")
+    assert json.loads(out)["unchanged"] is True
+    code, out = run(mock_client(FakeServer()), "refresh", "a.txt", "--json")
+    assert json.loads(out)[0]["state"] == "done"
+
+
+def test_versions_lists_and_restores() -> None:
+    code, out = run(mock_client(FakeServer()), "versions", "a.txt")
+    assert code == 0 and out.splitlines() == ["171  12 bytes", "170  9 bytes"]
+    code, out = run(mock_client(FakeServer()), "versions", "new.txt")
+    assert "no earlier versions of new.txt" in out
+    code, out = run(mock_client(FakeServer()), "versions", "a.txt", "--json")
+    assert [v["version"] for v in json.loads(out)] == ["171", "170"]
+    server = FakeServer()
+    code, out = run(mock_client(server), "versions", "a.txt", "--restore", "171")
+    assert code == 0 and "POST /documents/a.txt/versions/171/restore" in server.log
+
+
+def test_queries_and_jobs_print_rows_and_cancel() -> None:
+    code, out = run(mock_client(FakeServer()), "queries")
+    assert "no_context" in out and " 0.02  Gym?" in out and "    -  Leave?" in out
+    code, out = run(mock_client(FakeServer()), "jobs")
+    assert out.strip() == "j1  embedding 4/10  a.txt"
+    code, out = run(mock_client(FakeServer()), "jobs", "--cancel", "j1")
+    assert out.strip() == "cancel requested: a.txt (queued)"
+    code, out = run(mock_client(FakeServer()), "jobs", "--cancel", "j1", "--json")
+    assert json.loads(out)["cancelled"] is True
+
+
+def test_workspaces_list_create_and_delete() -> None:
+    code, out = run(mock_client(FakeServer()), "workspaces", "list")
+    assert out.splitlines() == ["(default)", "legal"]
+    code, out = run(mock_client(FakeServer(workspaces_enabled=False)), "workspaces", "list")
+    assert "not enabled" in out
+    server = FakeServer()
+    assert run(mock_client(server), "workspaces", "create", "legal")[1].strip() == (
+        "created workspace legal"
+    )
+    code, out = run(mock_client(server), "workspaces", "delete", "legal", "--json")
+    assert json.loads(out) == {"delete": "legal"}
+    assert "DELETE /workspaces/legal" in server.log
+    assert run(mock_client(server), "workspaces", "create")[0] == 2
+
+
+def test_watch_shows_retries_give_ups_and_starts_a_pass() -> None:
+    server = FakeServer()
+    code, out = run(mock_client(server), "watch", "--scan")
+    assert code == 0
+    assert "POST /watch/scan" in server.log
+    assert "watching /inbox: 3 files" in out
+    assert "(a pass was started" in out
+    assert "retry   x.pdf (attempt 2): Qdrant down" in out
+    assert "gave up y.pdf" in out
+    assert "skip    z.bin: unsupported" in out
+
+
+def test_chat_reports_a_server_error_and_goes_on(
+    client: DocragClient, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cli.client import StreamResult
+
+    asked: list[str] = []
+
+    def fake_ask(question: str, *args: object, **kwargs: object) -> StreamResult:
+        asked.append(question)
+        if question == "Busy?":
+            raise DocragError("Every question slot is taken.", 429)
+        return StreamResult({"answer": "Yes [1].", "sources": [], "answer_status": "answered"}, [])
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    monkeypatch.setattr("sys.stdin", io.StringIO("Busy?\nNext?\n"))
+    code, _ = run(client, "chat", "--quiet")
+    assert code == 0 and asked == ["Busy?", "Next?"]
+    assert "error (429): Every question slot is taken." in capsys.readouterr().err

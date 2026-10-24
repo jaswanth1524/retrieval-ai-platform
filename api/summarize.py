@@ -26,20 +26,19 @@ from typing import Any, Literal
 from api.answer_cache import AnswerCache, CachedAnswer, CacheKey
 from api.citations import (
     answer_status,
-    attach_spans,
     citation_from_dict,
-    finalize_citations,
     source_citations,
-    will_retry_citations,
+    will_call_llm_for_citations,
 )
 from api.corpus import corpus_generation
 from api.documents import DocumentNotFoundError
 from api.errors import public_error_message
-from api.generation import GroundedAnswer, StageTimings
+from api.generation import GroundedAnswer, StageTimings, finish_answer
 from api.llm import (
     ChatGenerator,
     ChatMessage,
     GenerationError,
+    GenerationSlot,
     add_usage,
     begin_usage,
     completion_model_and_kwargs,
@@ -52,9 +51,11 @@ from api.pipeline import (
     DoneEvent,
     QuestionAbandoned,
     StreamEvent,
+    replay_cached,
     timings_dict,
     usage_dict,
     usage_tuple,
+    wait_for_model,
 )
 from api.prompting import (
     CHARS_PER_TOKEN_ESTIMATE,
@@ -363,10 +364,14 @@ def build_combine_messages(
     ``notes`` are ``(filename, part, parts, text)``. Each is cut to its share of
     ``budget`` so the combined prompt stays within one part's size."""
 
-    share = max(budget // max(len(notes), 1), 400)
+    # Weighted like the parts were packed (a CJK character is a token), and with no
+    # floor: a fixed minimum per note let many notes overrun a small window together.
+    share = max(budget // max(len(notes), 1), 1)
     blocks = []
     for filename, index, count, text in notes:
-        clipped = text if len(text) <= share else text[:share].rstrip() + " …"
+        clipped = clip_to_weight(text, share)
+        if clipped != text:
+            clipped = clipped.rstrip() + " …"
         blocks.append(f"Notes on {one_line(filename)}, part {index} of {count}:\n{clipped}")
     joined = "\n\n".join(blocks)
     return [
@@ -496,8 +501,15 @@ class DocumentSummarizer:
             for step, job in enumerate(jobs, start=1):
                 if stop_requested():
                     raise QuestionAbandoned
-                yield {"type": "stage", "stage": "summarizing", "step": step, "steps": steps}
-                texts.append(note(job))
+                # One part at a time at a local model, each waiting its turn (and the
+                # place given back between parts, so a question isn't held up behind
+                # a whole long summary).
+                slot = yield from wait_for_model(settings, should_stop)
+                try:
+                    yield {"type": "stage", "stage": "summarizing", "step": step, "steps": steps}
+                    texts.append(note(job))
+                finally:
+                    slot.release()
             return texts
 
         def counted(job: tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]):  # type: ignore[no-untyped-def]
@@ -552,6 +564,7 @@ class DocumentSummarizer:
             answer_status=done.get("answer_status", "answered"),
             truncated=done.get("truncated", False),
             usage=usage_tuple(done.get("usage")),
+            citation_backfilled=done.get("citation_backfilled", False),
         )
         return SummaryResult(grounded, done.get("chunks_read", 0), done.get("chunks_total", 0))
 
@@ -575,22 +588,8 @@ class DocumentSummarizer:
         if key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
             if hit is not None:
-                sources = [asdict(source) for source in hit.sources]
                 read, total = hit.coverage or (0, 0)
-                yield {"type": "sources", "sources": sources, "trace_id": hit.trace_id}
-                yield {"type": "delta", "text": hit.answer}
-                yield {
-                    "type": "done",
-                    "answer": hit.answer,
-                    "sources": sources,
-                    "timings": timings_dict(_elapsed_timings(started)),
-                    "trace_id": hit.trace_id,
-                    "cached": True,
-                    "answer_status": hit.answer_status,
-                    "truncated": hit.truncated,
-                    "chunks_read": read,
-                    "chunks_total": total,
-                }
+                yield from replay_cached(hit, started, chunks_read=read, chunks_total=total)
                 return
         events = self._run(request, settings, should_stop, mode, stream=mode == "stream")
         try:
@@ -608,6 +607,7 @@ class DocumentSummarizer:
                             event.get("answer_status", "answered"),
                             None,
                             event.get("truncated", False),
+                            citation_backfilled=event.get("citation_backfilled", False),
                             coverage=(event.get("chunks_read", 0), event.get("chunks_total", 0)),
                         ),
                     )
@@ -630,6 +630,7 @@ class DocumentSummarizer:
         final_messages: list[ChatMessage] | None = None
         parts_text: list[str] = []
         finalized = False
+        slot: GenerationSlot | None = None
 
         def store_trace(
             status: Literal["ok", "insufficient_context", "error"],
@@ -639,6 +640,8 @@ class DocumentSummarizer:
             timings: StageTimings | None = None,
             error: str | None = None,
             usage: tuple[int, int] | None = None,
+            citation_retry_used: bool = False,
+            citation_backfilled: bool = False,
         ) -> None:
             if self._trace_store is None or trace_id is None:
                 return
@@ -667,6 +670,8 @@ class DocumentSummarizer:
                     request_id=current_request_id(),
                     workspace=workspace_of(self._settings),
                     usage=usage,
+                    citation_retry_used=citation_retry_used,
+                    citation_backfilled=citation_backfilled,
                 )
             )
 
@@ -773,6 +778,8 @@ class DocumentSummarizer:
             final_settings = settings.model_copy(
                 update={"llm_max_tokens": int(settings.summary_max_tokens)}
             )
+            # Held through the final call and its citation retry, like an answer's.
+            slot = yield from wait_for_model(final_settings, should_stop)
             yield {
                 "type": "sources",
                 "sources": [asdict(source) for source in all_sources],
@@ -793,16 +800,17 @@ class DocumentSummarizer:
             if not answer:
                 raise GenerationError("Generation provider returned an empty answer.")
 
-            if stream and will_retry_citations(answer, all_sources, final_settings):
+            if stream and will_call_llm_for_citations(
+                answer, all_sources, final_settings, context_chunks=selected
+            ):
                 yield {"type": "stage", "stage": "verifying_citations"}
-            outcome = finalize_citations(
-                final_messages, answer, all_sources, self._generator, final_settings
+            outcome, cited = finish_answer(
+                final_messages, answer, selected, self._generator, final_settings
             )
             answer = outcome.answer
             final_messages = list(outcome.prompt_messages)
             truncated = stopped_at_token_limit()
             usage = usage_totals()
-            cited = attach_spans(answer, outcome.cited, selected)
             timings = _elapsed_timings(
                 started,
                 search_ms=read_ms,
@@ -816,6 +824,8 @@ class DocumentSummarizer:
                 cited=[source.source_number for source in cited],
                 timings=timings,
                 usage=usage,
+                citation_retry_used=outcome.retry_used,
+                citation_backfilled=outcome.backfilled,
             )
             finalized = True
             yield {
@@ -826,6 +836,7 @@ class DocumentSummarizer:
                 "trace_id": trace_id,
                 "answer_status": answer_status(answer, len(cited), len(selected)),
                 "truncated": truncated,
+                "citation_backfilled": outcome.backfilled,
                 "chunks_read": chunks_read,
                 "chunks_total": chunks_total,
                 "usage": usage_dict(usage),
@@ -842,6 +853,8 @@ class DocumentSummarizer:
                 finalized = True
             raise
         finally:
+            if slot is not None:
+                slot.release()
             if not finalized:
                 store_trace(
                     "error",

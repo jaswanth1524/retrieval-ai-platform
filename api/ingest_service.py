@@ -105,6 +105,12 @@ class IngestService:
             )
             if unchanged is not None:
                 return unchanged
+        elif precondition is not None:
+            # Once now, before the parse (up to PARSE_TIMEOUT_SECONDS, OCR included): a
+            # job already refused (cancelled, superseded, its original deleted while it
+            # waited) fails here instead of after it. The check under the filename lock
+            # still decides; this only saves the work.
+            precondition()
         parse_start = time.monotonic()
         sections = parse_with_limit(filename, content, self._settings)
         chunk_start = time.monotonic()
@@ -210,6 +216,10 @@ class IngestService:
         with filename_write_lock(document_key(settings, name)):
             if precondition is not None:
                 precondition()
+            # One point first: a changed file (the usual case) shows it at once, where
+            # the full scan read every point under the lock (~0.6 s at 50k points).
+            if self._repository.content_sha256_of(settings, name) != digest:
+                return None
             meta = self._repository.document_metadata(settings, name)
             if meta is None or meta.content_sha256 != digest or tags is not None:
                 return None

@@ -28,6 +28,14 @@ JOB_POLL_SECONDS = 1.0
 # Job states after which a job never changes; "unknown" is this client's own, for a job
 # the server no longer knows (evicted from its job store, or the server restarted).
 FINISHED_JOB_STATES = ("done", "failed", "unknown")
+# History the server takes (REQUEST_HISTORY_MAX_MESSAGES and _MESSAGE_MAX_CHARS in
+# api/schemas.py), and the total the web UI keeps it to (useChat.buildHistory).
+HISTORY_MAX_MESSAGES = 12
+HISTORY_MESSAGE_MAX_CHARS = 4000
+HISTORY_CHAR_BUDGET = 8000
+# A job poll that fails this many times in a row (the server unreachable, a 5xx or a
+# 429) ends the wait as "unknown"; fewer are a blip, and the job goes on on the server.
+JOB_POLL_MAX_FAILURES = 3
 # `index_files` keeps at most this many uploads indexing at once: enough to keep the
 # server's ingest workers busy, well under its job retention (INGEST_JOBS_MAX_RETAINED,
 # 50 by default — a finished job is evicted past it, and would read as unknown) and its
@@ -38,6 +46,45 @@ INGEST_WINDOW = 8
 class Cancelled(Exception):
     """``should_stop`` asked a stream to stop (an MCP tool call was cancelled). The
     connection is closed, which stops the answer on the server and frees its slot."""
+
+
+def _clip_message(content: str, max_chars: int = HISTORY_MESSAGE_MAX_CHARS) -> str:
+    """``content`` cut to ``max_chars`` (the "…" included) at a word when one is near."""
+
+    if len(content) <= max_chars:
+        return content
+    budget = max_chars - 1
+    hard = content[:budget]
+    last_break = hard.rfind(" ")
+    cut = hard[:last_break] if last_break >= budget - int(max_chars * 0.12) else hard
+    return cut.rstrip() + "…"
+
+
+def trim_history(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Conversation history the server accepts, kept as the web UI keeps it: user and
+    assistant messages with text, the last ``HISTORY_MAX_MESSAGES``, each cut at a word
+    to ``HISTORY_MESSAGE_MAX_CHARS``, the newest within ``HISTORY_CHAR_BUDGET``, and
+    starting on a question. An agent passing back a whole earlier answer, sources and
+    quotes included, no longer gets a 422."""
+
+    turns = [
+        {"role": str(message["role"]), "content": str(message.get("content", ""))}
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") in ("user", "assistant")
+        and str(message.get("content", "")).strip()
+    ][-HISTORY_MAX_MESSAGES:]
+    kept: list[dict[str, str]] = []
+    used = 0
+    for turn in reversed(turns):
+        content = _clip_message(turn["content"])
+        used += len(content)
+        if used > HISTORY_CHAR_BUDGET and kept:
+            break
+        kept.insert(0, {"role": turn["role"], "content": content})
+    while kept and kept[0]["role"] == "assistant":
+        kept.pop(0)
+    return kept
 
 
 class DocragError(RuntimeError):
@@ -148,6 +195,7 @@ class DocragClient:
         )
         self._sleep = sleep
         self._clock = clock
+        self._poll_failures: dict[str, int] = {}
 
     def close(self) -> None:
         if self._owns_http:
@@ -255,8 +303,9 @@ class DocragClient:
         oldest first, so a follow-up ("and for contractors?") is read with it."""
 
         body: dict[str, Any] = {"question": question}
-        if history:
-            body["history"] = history
+        trimmed = trim_history(history or [])
+        if trimmed:
+            body["history"] = trimmed
         if filenames:
             body["filenames"] = filenames
         if tags:
@@ -345,9 +394,9 @@ class DocragClient:
 
     # -- changes -----------------------------------------------------------------------
 
-    def upload(self, path: Path) -> dict[str, Any]:
+    def upload(self, path: Path, *, deadline: float | None = None) -> dict[str, Any]:
         """Upload one file; waits out a full indexing queue (503) or a rate limit (429),
-        each with its Retry-After."""
+        each with its Retry-After — but not past ``deadline`` (this client's clock)."""
 
         try:
             content = path.read_bytes()
@@ -363,7 +412,13 @@ class DocragClient:
             except httpx.HTTPError as exc:
                 raise self._unreachable(exc) from exc
             if response.status_code in (429, 503) and attempt + 1 < UPLOAD_MAX_ATTEMPTS:
-                self._sleep(_retry_after(response))
+                wait = _retry_after(response)
+                if deadline is not None and self._clock() + wait > deadline:
+                    raise DocragError(
+                        f"{_detail(response)} (still, when the wait ended)",
+                        response.status_code,
+                    )
+                self._sleep(wait)
                 continue
             if response.status_code >= 400:
                 raise DocragError(_detail(response), response.status_code)
@@ -394,15 +449,22 @@ class DocragClient:
 
         deadline = None if timeout is None else self._clock() + timeout
         while True:
-            status: dict[str, Any] = self._json("GET", f"/documents/jobs/{_quote(job_id)}")
-            if on_progress is not None:
-                on_progress(status)
-            if status.get("state") in ("done", "failed"):
-                return status
+            status = self._poll_job(job_id)
+            if status.get("state") == "unknown":
+                raise DocragError(str(status.get("error")), status.get("status_code"))
+            if status.get("state") != "unreachable":
+                if on_progress is not None:
+                    on_progress(status)
+                if status.get("state") in ("done", "failed"):
+                    return status
             if deadline is not None and self._clock() >= deadline:
+                state = (
+                    "unconfirmed (the server isn't answering)"
+                    if status.get("state") == "unreachable"
+                    else status.get("state", "running")
+                )
                 raise DocragError(
-                    f"Still {status.get('state', 'running')} after {timeout:g} s "
-                    f"(job {job_id}); it goes on on the server."
+                    f"Still {state} after {timeout:g} s (job {job_id}); it goes on on the server."
                 )
             self._sleep(JOB_POLL_SECONDS)
 
@@ -425,7 +487,9 @@ class DocragClient:
         statuses: dict[str, dict[str, Any]] = {}
         while pending:
             for job_id, status in self._job_statuses(pending).items():
-                statuses[job_id] = status
+                # A failed poll keeps the last status the server reported.
+                if status.get("state") != "unreachable" or job_id not in statuses:
+                    statuses[job_id] = status
                 if status.get("state") in FINISHED_JOB_STATES:
                     pending.remove(job_id)
                     if on_finished is not None:
@@ -467,7 +531,7 @@ class DocragClient:
             while queue and len(indexing) < window and not timed_out:
                 path = queue.pop(0)
                 try:
-                    indexing[self.upload(path)["job_id"]] = path
+                    indexing[self.upload(path, deadline=deadline)["job_id"]] = path
                 except DocragError as exc:
                     finish(path, {"state": "failed", "error": str(exc)})
             finished = 0
@@ -475,7 +539,7 @@ class DocragClient:
                 if status.get("state") in FINISHED_JOB_STATES:
                     finish(indexing.pop(job_id), status)
                     finished += 1
-                else:
+                elif status.get("state") != "unreachable" or indexing[job_id] not in statuses:
                     statuses[indexing[job_id]] = status
             if timed_out or (deadline is not None and self._clock() >= deadline):
                 break
@@ -487,15 +551,31 @@ class DocragClient:
         return statuses
 
     def _job_statuses(self, job_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """One status per job; ``unknown`` (with the error) for one the server lost."""
+        """One status per job (see ``_poll_job``)."""
 
-        statuses: dict[str, dict[str, Any]] = {}
-        for job_id in job_ids:
-            try:
-                statuses[job_id] = self._json("GET", f"/documents/jobs/{_quote(job_id)}")
-            except DocragError as exc:
-                statuses[job_id] = {"job_id": job_id, "state": "unknown", "error": str(exc)}
-        return statuses
+        return {job_id: self._poll_job(job_id) for job_id in job_ids}
+
+    def _poll_job(self, job_id: str) -> dict[str, Any]:
+        """The job's status; ``unknown`` (with the error) for one the server lost, or
+        after ``JOB_POLL_MAX_FAILURES`` failed polls in a row; ``unreachable`` for one
+        failed poll before that — a restart or a dropped connection is no reason to
+        report a job that is still indexing as failed."""
+
+        try:
+            status: dict[str, Any] = self._json("GET", f"/documents/jobs/{_quote(job_id)}")
+        except DocragError as exc:
+            failures = self._poll_failures.get(job_id, 0) + 1
+            transient = (
+                exc.status_code is None or exc.status_code in (408, 429) or (exc.status_code >= 500)
+            )
+            error = {"job_id": job_id, "error": str(exc), "status_code": exc.status_code}
+            if transient and failures < JOB_POLL_MAX_FAILURES:
+                self._poll_failures[job_id] = failures
+                return {**error, "state": "unreachable"}
+            self._poll_failures.pop(job_id, None)
+            return {**error, "state": "unknown"}
+        self._poll_failures.pop(job_id, None)
+        return status
 
     def delete(self, filename: str) -> None:
         self._request("DELETE", f"/documents/{_quote(filename)}")

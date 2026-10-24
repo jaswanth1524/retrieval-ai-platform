@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CitationResponse, DocumentTask } from '../api/types';
 import type { StageTiming } from '../hooks/useChat';
 import { STREAMING_STAGE_LABELS } from '../utils/stages';
@@ -147,6 +147,15 @@ function ChatThread({
   // Scrolled up away from the bottom: offer the way back (state only flips on change,
   // so scrolling costs no render).
   const [showJump, setShowJump] = useState(false);
+  // A short notice from one message (a copy), said on the status line, then cleared.
+  const [notice, setNotice] = useState('');
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const announce = useCallback((message: string) => {
+    clearTimeout(noticeTimerRef.current);
+    setNotice(message);
+    noticeTimerRef.current = setTimeout(() => setNotice(''), 3000);
+  }, []);
+  useEffect(() => () => clearTimeout(noticeTimerRef.current), []);
   // Set when a question this thread watched finishes, so "Answer ready." is said once
   // for a new answer — never for history shown on a reload or conversation switch.
   const [justFinished, setJustFinished] = useState(false);
@@ -247,7 +256,7 @@ function ChatThread({
   // One per message used to leave dozens of regions in a long conversation.
   const statusRegion = (
     <span className="chat-thread__status visually-hidden" role="status" data-testid="chat-status">
-      {progressAnnouncement(pending, lastTurn, stage, justFinished)}
+      {notice || progressAnnouncement(pending, lastTurn, stage, justFinished)}
     </span>
   );
 
@@ -332,6 +341,7 @@ function ChatThread({
             }
             onAskEverywhere={onAskEverywhere}
             onSearchPassages={onSearchPassages}
+            onAnnounce={announce}
             onRetry={onRetry}
             onRegenerate={onRegenerate}
             onEditQuestion={onEditQuestion}

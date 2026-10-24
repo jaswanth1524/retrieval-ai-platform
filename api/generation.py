@@ -71,6 +71,7 @@ __all__ = [
     "ChatGenerator",
     "ChatMessage",
     "CitationOutcome",
+    "CitationSpan",
     "CompletionClient",
     "EXPANSION_SYSTEM_PROMPT",
     "FittedPrompt",
@@ -81,15 +82,15 @@ __all__ = [
     "LiteLLMGenerator",
     "SourceCitation",
     "StageTimings",
+    "answer_messages",
+    "attach_spans",
     "build_condense_messages",
     "build_expansion_messages",
     "build_grounded_messages",
+    "citation_from_dict",
     "cited_numbers",
     "cited_sources",
     "completion_model_and_kwargs",
-    "attach_spans",
-    "citation_from_dict",
-    "CitationSpan",
     "condense_question",
     "context_window_tokens",
     "effective_max_tokens",
@@ -97,10 +98,11 @@ __all__ = [
     "extract_completion_text",
     "extract_delta_text",
     "finalize_citations",
+    "finish_answer",
     "fit_prompt_to_context_window",
     "format_context_chunk",
-    "generate_grounded_answer",
     "generate_followups",
+    "generate_grounded_answer",
     "generate_query_variants",
     "needs_citation_retry",
     "needs_condense",
@@ -196,6 +198,49 @@ class GroundedAnswer:
     followups: list[str] = field(default_factory=list)
 
 
+def answer_messages(
+    query: str,
+    context_chunks: Sequence[RerankedChunk],
+    history: Sequence[ChatMessage] | None,
+    settings: AppSettings,
+    *,
+    weak_matches: bool = False,
+) -> list[ChatMessage]:
+    """The answering prompt both response modes send (ANSWER_LANGUAGE applied)."""
+
+    return with_answer_language(
+        build_grounded_messages(query, context_chunks, history, weak_matches=weak_matches),
+        settings,
+    )
+
+
+def finish_answer(
+    messages: Sequence[ChatMessage],
+    answer: str,
+    context_chunks: Sequence[RerankedChunk],
+    generator: ChatGenerator,
+    settings: AppSettings,
+    *,
+    weak_matches: bool = False,
+) -> tuple[CitationOutcome, list[SourceCitation]]:
+    """Citations for a generated ``answer``: filtered to the sources it cites, added
+    when it cites none (backfill, then the LLM retry; CITATION_RETRY_MODE), and each
+    cited source's supporting span attached. Shared by both response modes, so what
+    makes an answer cited can't drift between them."""
+
+    all_sources = source_citations(context_chunks)
+    outcome = finalize_citations(
+        messages,
+        answer,
+        all_sources,
+        generator,
+        settings,
+        weak_matches=weak_matches,
+        context_chunks=context_chunks,
+    )
+    return outcome, attach_spans(outcome.answer, outcome.cited, context_chunks)
+
+
 def generate_grounded_answer(
     query: str,
     context_chunks: Sequence[RerankedChunk],
@@ -216,30 +261,19 @@ def generate_grounded_answer(
     if not selected_chunks:
         return GroundedAnswer(answer=INSUFFICIENT_CONTEXT_ANSWER, sources=[])
 
-    messages = with_answer_language(
-        build_grounded_messages(
-            normalized_query, selected_chunks, history, weak_matches=weak_matches
-        ),
-        settings,
+    messages = answer_messages(
+        normalized_query, selected_chunks, history, settings, weak_matches=weak_matches
     )
     answer = generator.complete(messages, settings).strip()
     if not answer:
         raise GenerationError("Generation provider returned an empty answer.")
 
-    all_sources = source_citations(selected_chunks)
-    outcome = finalize_citations(
-        messages,
-        answer,
-        all_sources,
-        generator,
-        settings,
-        weak_matches=weak_matches,
-        context_chunks=selected_chunks,
+    outcome, cited = finish_answer(
+        messages, answer, selected_chunks, generator, settings, weak_matches=weak_matches
     )
-
     return GroundedAnswer(
         answer=outcome.answer,
-        sources=attach_spans(outcome.answer, outcome.cited, selected_chunks),
+        sources=cited,
         citation_retry_used=outcome.retry_used,
         citation_backfilled=outcome.backfilled,
         citation_retry_ms=outcome.retry_ms,

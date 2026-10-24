@@ -40,22 +40,28 @@ function ServerActivity({
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let running = 0;
+    let running = new Set<string>();
     const poll = async () => {
       try {
         const response = await api.listActiveJobs(controller.signal, workspace);
         if (controller.signal.aborted) return;
         setJobs(response.jobs);
-        if (running > 0 && response.jobs.length < running) finishedRef.current();
-        running = response.jobs.length;
+        const now = new Set(response.jobs.map((job) => job.job_id));
+        // By id, not by count: one job ending as another starts left the count, and the
+        // document list, unchanged.
+        if ([...running].some((id) => !now.has(id))) finishedRef.current();
+        running = now;
       } catch {
         if (controller.signal.aborted) return;
         // An older server, or a refused key: nothing to show.
         setJobs([]);
-        running = 0;
+        running = new Set();
       }
       // Fast while something runs; otherwise only as often as the watcher is checked.
-      timer = setTimeout(() => void poll(), running > 0 ? ACTIVE_JOBS_POLL_MS : WATCH_STATUS_POLL_MS);
+      timer = setTimeout(
+        () => void poll(),
+        running.size > 0 ? ACTIVE_JOBS_POLL_MS : WATCH_STATUS_POLL_MS,
+      );
     };
     void poll();
     return () => {

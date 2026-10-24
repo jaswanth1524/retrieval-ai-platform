@@ -16,6 +16,7 @@ import type { FeedbackPayload } from './components/ChatMessage';
 import Composer from './components/Composer';
 import { NEW_CONVERSATION_DRAFT, pruneDrafts } from './utils/drafts';
 import { QUESTION_INPUT_ID } from './utils/id';
+import { MAX_SCOPE_FILENAMES } from './utils/limits';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
 import CorpusPanel from './components/CorpusPanel';
@@ -76,6 +77,8 @@ import {
   NO_SOURCES,
   PANEL_META,
   notFoundSourcesMessage,
+  parseConversationFile,
+  scopeForAskAbout,
   scopeLabel,
 } from './appHelpers';
 
@@ -167,6 +170,8 @@ function App() {
     removeFromScopes,
     editAndResend,
     importConversation,
+    importConversations,
+    importPreview,
     historyReady,
     allConversationsJson,
   } = useChat();
@@ -698,15 +703,22 @@ function App() {
   // "Ask about these": the open conversation's scope becomes those documents, and the
   // question box takes focus. Before, the composer's scope popover was the only way.
   const askAbout = useStableHandler((filenames: string[]) => {
-    setScope({ filenames: [...new Set(filenames)], tags: [] });
+    const { filenames: scoped, selected } = scopeForAskAbout(filenames);
+    setScope({ filenames: scoped, tags: [] });
     setPanelDrawerOpen(false);
-    pushToast({
-      tone: 'good',
-      title:
-        filenames.length === 1
-          ? `Asking about ${filenames[0]}`
-          : `Asking about ${filenames.length} documents`,
-    });
+    pushToast(
+      scoped.length < selected
+        ? {
+            tone: 'warn',
+            title: `Asking about the first ${scoped.length} of ${selected} documents`,
+            body: `A question can be limited to at most ${MAX_SCOPE_FILENAMES} documents; ask without a selection to search them all.`,
+          }
+        : {
+            tone: 'good',
+            title:
+              scoped.length === 1 ? `Asking about ${scoped[0]}` : `Asking about ${scoped.length} documents`,
+          },
+    );
     window.requestAnimationFrame(() => document.getElementById(QUESTION_INPUT_ID)?.focus());
   });
   const editQuestion = useCallback(
@@ -973,48 +985,67 @@ function App() {
   );
 
   const handleImportFile = async (file: File) => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await file.text());
-    } catch {
-      parsed = null;
-    }
-    // "Export all conversations" wrote several; a single conversation's export is turns.
-    const many =
-      parsed && typeof parsed === 'object' && 'docrag_conversations' in parsed
-        ? (parsed as { docrag_conversations: unknown }).docrag_conversations
-        : null;
+    const parsed = parseConversationFile(await file.text());
     let count = 0;
-    if (Array.isArray(many)) {
-      for (const item of [...many].reverse()) {
-        const title =
-          item && typeof item === 'object' && typeof (item as { title?: unknown }).title === 'string'
-            ? (item as { title: string }).title
-            : undefined;
-        if (importConversation(item, title)) count += 1;
-      }
-    } else if (parsed !== null && importConversation(parsed)) {
+    let skipped = 0;
+    let removed = 0;
+    if (parsed.kind === 'many') {
+      const items = parsed.items;
+      // Asked first: making room removes conversations, which can't be undone.
+      const { valid, room } = importPreview(items);
+      const makeRoom =
+        valid > room &&
+        window.confirm(
+          `This file has ${valid} conversations and the history has room for ${room} ` +
+            `(it keeps ${MAX_CONVERSATIONS}).\n\nOK: remove up to ${valid - room} of the ` +
+            'least recently used conversations (never pinned ones) to import them all.\n' +
+            `Cancel: import only the ${room} that fit.`,
+        );
+      ({ imported: count, skipped, removed } = importConversations(items, { makeRoom }));
+    } else if (parsed.kind === 'one' && importConversation(parsed.raw)) {
       count = 1;
     }
     const imported = count > 0;
     pushToast(
-      imported
+      skipped > 0
         ? {
-            tone: 'good',
-            title: count === 1 ? 'Conversation imported' : `${count} conversations imported`,
-            body: file.name,
+            tone: 'warn',
+            title: `${count} of ${count + skipped} conversations imported`,
+            body:
+              `History keeps ${MAX_CONVERSATIONS} conversations` +
+              (removed > 0 ? `; ${removed} older ones were removed. ` : '. ') +
+              'Delete some and import the file again for the rest.',
           }
-        : {
-            tone: 'bad',
-            title: "Couldn't import that file",
-            body: 'Choose a conversation exported as JSON from DocRAG.',
-          },
+        : removed > 0
+          ? {
+              tone: 'good',
+              title: `${count} conversations imported`,
+              body: `${removed} older conversation${removed === 1 ? ' was' : 's were'} removed to make room.`,
+            }
+        : imported
+          ? {
+              tone: 'good',
+              title: count === 1 ? 'Conversation imported' : `${count} conversations imported`,
+              body: file.name,
+            }
+          : {
+              tone: 'bad',
+              title: "Couldn't import that file",
+              body: 'Choose a conversation exported as JSON from DocRAG.',
+            },
     );
     if (imported) {
       setPinnedTraceId(null);
       setRail('chat');
     }
   };
+
+  // Stable, so the memoized viewer isn't re-rendered (every passage of a long document)
+  // on each frame of an answer streaming meanwhile.
+  const closeSourceView = useStableHandler(() => setSourceView(null));
+  const downloadViewedOriginal = useStableHandler(() => {
+    if (sourceView) downloadOriginal(sourceView.filename);
+  });
 
   const handlePanelAction = useStableHandler(() => {
     if (rail === 'chat') {
@@ -1359,10 +1390,10 @@ function App() {
               filename={sourceView.filename}
               chunkId={sourceView.chunkId}
               highlights={sourceView.highlights}
-              onClose={() => setSourceView(null)}
+              onClose={closeSourceView}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
-                  ? () => downloadOriginal(sourceView.filename)
+                  ? downloadViewedOriginal
                   : undefined
               }
               canPreviewOriginal={canPreviewOriginal(

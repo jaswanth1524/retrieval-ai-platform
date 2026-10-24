@@ -204,6 +204,8 @@ interface ChatMessageProps {
   // (offered when it was asked within some), or look at the closest passages.
   onAskEverywhere?: (question: string) => void;
   onSearchPassages?: (question: string) => void;
+  /** Says something on the thread's one status line (a message carries no live region). */
+  onAnnounce?: (message: string) => void;
 }
 
 /** What the reader should know about how an answer was grounded, in words: the flags
@@ -272,6 +274,7 @@ function ChatMessage({
   streamEtaMs,
   onAskEverywhere,
   onSearchPassages,
+  onAnnounce,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -342,6 +345,8 @@ function ChatMessage({
 
   const settle = (ok: boolean) => {
     clearTimeout(copyTimerRef.current);
+    // The label change alone wasn't announced: it is the only sign the copy worked.
+    onAnnounce?.(ok ? 'Answer copied.' : 'Copy failed.');
     if (ok) {
       setCopied(true);
       copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
@@ -480,10 +485,11 @@ function ChatMessage({
                   type="button"
                   className="chat-message__edit-button"
                   onClick={() => {
+                    if (busy) return;
                     setDraft(turn.content);
                     setEditing(true);
                   }}
-                  disabled={busy}
+                  aria-disabled={busy || undefined}
                   aria-label="Edit this question"
                   title="Edit and ask again in a new chat"
                   data-testid="chat-message-edit"
@@ -501,8 +507,8 @@ function ChatMessage({
           <button
             type="button"
             className="chat-message__action"
-            onClick={() => askAgain(onRetry, turn.content, turn.task)}
-            disabled={busy}
+            onClick={() => !busy && askAgain(onRetry, turn.content, turn.task)}
+            aria-disabled={busy || undefined}
             data-testid="chat-message-ask-again"
           >
             Ask again
@@ -645,8 +651,10 @@ function ChatMessage({
                 <button
                   type="button"
                   className="chat-message__regenerate"
-                  disabled={busy}
-                  onClick={() => askAgain(onRegenerate ?? onRetry, regenerateQuestion, regenerateTask)}
+                  aria-disabled={busy || undefined}
+                  onClick={() =>
+                    !busy && askAgain(onRegenerate ?? onRetry, regenerateQuestion, regenerateTask)
+                  }
                   data-testid="chat-message-regenerate"
                 >
                   Regenerate
@@ -665,8 +673,8 @@ function ChatMessage({
                     aria-pressed={feedbackGiven === 'up'}
                     aria-label="Helpful"
                     title="Helpful"
-                    disabled={feedbackGiven !== null}
-                    onClick={() => submitFeedback('up')}
+                    aria-disabled={feedbackGiven !== null || undefined}
+                    onClick={() => feedbackGiven === null && submitFeedback('up')}
                     data-testid="chat-message-feedback-up"
                   >
                     <span aria-hidden="true">{feedbackGiven === 'up' ? '▲' : '△'}</span>
@@ -677,8 +685,8 @@ function ChatMessage({
                     aria-pressed={feedbackGiven === 'down'}
                     aria-label="Not helpful"
                     title="Not helpful"
-                    disabled={feedbackGiven !== null}
-                    onClick={() => submitFeedback('down')}
+                    aria-disabled={feedbackGiven !== null || undefined}
+                    onClick={() => feedbackGiven === null && submitFeedback('down')}
                     data-testid="chat-message-feedback-down"
                   >
                     <span aria-hidden="true">{feedbackGiven === 'down' ? '▼' : '▽'}</span>
@@ -695,8 +703,8 @@ function ChatMessage({
                       <button
                         type="button"
                         className="chat-message__action"
-                        disabled={busy}
-                        onClick={() => onAskEverywhere(regenerateQuestion)}
+                        aria-disabled={busy || undefined}
+                        onClick={() => !busy && onAskEverywhere(regenerateQuestion)}
                         data-testid="chat-message-ask-everywhere"
                       >
                         Ask across all documents
@@ -770,8 +778,8 @@ function ChatMessage({
                     key={question}
                     type="button"
                     className="chat-message__followup"
-                    disabled={busy}
-                    onClick={() => onAskFollowup(question)}
+                    aria-disabled={busy || undefined}
+                    onClick={() => !busy && onAskFollowup(question)}
                     data-testid="chat-message-followup"
                   >
                     {question}
@@ -803,8 +811,8 @@ function ChatMessage({
               <button
                 type="button"
                 className="chat-message__retry"
-                disabled={busy}
-                onClick={() => askAgain(onRetry, turn.question!, turn.task)}
+                aria-disabled={busy || undefined}
+                onClick={() => !busy && askAgain(onRetry, turn.question!, turn.task)}
                 data-testid="chat-message-retry"
               >
                 Retry

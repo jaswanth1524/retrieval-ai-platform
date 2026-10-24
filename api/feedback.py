@@ -24,7 +24,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 from api.sqlite_store import enable_wal, sqlite_transaction
 
@@ -255,27 +255,12 @@ class FeedbackStore:
         scope, params = _workspace_filter(workspace)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT rowid, id, trace_id, question, answer_excerpt, cited_filenames_json, "
-                "rating, citation_source_number, created_at, workspace, kind FROM feedback "
+                f"SELECT rowid, {_FEEDBACK_COLUMNS} FROM feedback "
                 f"WHERE (created_at > ? OR (created_at = ? AND rowid > ?)){scope} "
                 "ORDER BY created_at ASC, rowid ASC LIMIT ?",
                 (created_at, created_at, rowid, *params, limit),
             ).fetchall()
-        page = [
-            Feedback(
-                id=row[1],
-                trace_id=row[2],
-                question=row[3],
-                answer_excerpt=row[4],
-                cited_filenames=json.loads(row[5]),
-                rating=row[6],
-                citation_source_number=row[7],
-                created_at=row[8],
-                workspace=row[9],
-                kind=_kind(row[10]),
-            )
-            for row in rows
-        ]
+        page = [_feedback(row[1:]) for row in rows]
         return page, ((rows[-1][8], rows[-1][0]) if rows else None)
 
     def list_recent(self, limit: int = 100, workspace: str | None = None) -> list[Feedback]:
@@ -287,26 +272,33 @@ class FeedbackStore:
         where = f"WHERE {scope.removeprefix(' AND ')} " if scope else ""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, trace_id, question, answer_excerpt, cited_filenames_json, "
-                f"rating, citation_source_number, created_at, workspace, kind FROM feedback {where}"
+                f"SELECT {_FEEDBACK_COLUMNS} FROM feedback {where}"
                 "ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
-        return [
-            Feedback(
-                id=row[0],
-                trace_id=row[1],
-                question=row[2],
-                answer_excerpt=row[3],
-                cited_filenames=json.loads(row[4]),
-                rating=row[5],
-                citation_source_number=row[6],
-                created_at=row[7],
-                workspace=row[8],
-                kind=_kind(row[9]),
-            )
-            for row in rows
-        ]
+        return [_feedback(row) for row in rows]
+
+
+# The columns a Feedback is read from, in this order (both queries select them so).
+_FEEDBACK_COLUMNS = (
+    "id, trace_id, question, answer_excerpt, cited_filenames_json, rating, "
+    "citation_source_number, created_at, workspace, kind"
+)
+
+
+def _feedback(row: Sequence[Any]) -> Feedback:
+    return Feedback(
+        id=row[0],
+        trace_id=row[1],
+        question=row[2],
+        answer_excerpt=row[3],
+        cited_filenames=json.loads(row[4]),
+        rating=row[5],
+        citation_source_number=row[6],
+        created_at=row[7],
+        workspace=row[8],
+        kind=_kind(row[9]),
+    )
 
 
 def _kind(value: object) -> FeedbackKind:

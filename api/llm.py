@@ -271,7 +271,12 @@ _LOCAL_PROVIDERS = ("ollama", "openai_compatible")
 # how fast the server reads.
 _RATE_MIN_PROMPT_TOKENS = 500
 _RATE_SMOOTHING = 0.3
+# A read this many times slower than the average is usually the model loading first
+# (the time to the first chunk includes it): left out, unless the next one is as slow,
+# which means the server really got slower.
+_RATE_OUTLIER_FACTOR = 3.0
 _measured_rates: dict[tuple[str, str], float] = {}
+_slow_samples: dict[tuple[str, str], float] = {}
 _rates_lock = threading.Lock()
 
 
@@ -313,6 +318,15 @@ def _record_prefill(settings: AppSettings, prompt_tokens: int, seconds: float) -
     key = _rate_key(settings)
     with _rates_lock:
         previous = _measured_rates.get(key)
+        if previous is not None and rate * _RATE_OUTLIER_FACTOR < previous:
+            earlier_slow = _slow_samples.pop(key, None)
+            if earlier_slow is None:
+                _slow_samples[key] = rate
+                return
+            # Twice in a row: the new speed, not a cold load.
+            _measured_rates[key] = (earlier_slow + rate) / 2
+            return
+        _slow_samples.pop(key, None)
         _measured_rates[key] = (
             rate if previous is None else previous + _RATE_SMOOTHING * (rate - previous)
         )
@@ -488,6 +502,13 @@ class LiteLLMGenerator:
         streamed = _provider(settings) == "ollama"
         timeout = request_timeout_seconds(messages, settings)
         with GenerationSlot(settings):
+            started = time.monotonic()
+
+            def read_rate() -> None:
+                _record_prefill(
+                    settings, _estimated_prompt_tokens(messages), time.monotonic() - started
+                )
+
             try:
                 response = self.completion_client(
                     model=model,
@@ -505,7 +526,9 @@ class LiteLLMGenerator:
                     **provider_kwargs,
                 )
                 if streamed and not _is_whole_response(response):
-                    return "".join(self._read_stream(response, settings))
+                    # Condense, summary parts and /questions read prompts too: their
+                    # reads teach the rate the next "reading" stage's estimate uses.
+                    return "".join(self._read_stream(response, settings, on_first_chunk=read_rate))
             except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
                 raise _connection_error(exc, settings, timeout) from exc
             except GenerationError:

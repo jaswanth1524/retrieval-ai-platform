@@ -35,18 +35,10 @@ import type {
 } from './types';
 import { readStored, writeStored } from '../utils/safeStorage';
 
-export class ApiClientError extends Error {
-  statusCode?: number;
-  /** Seconds from the response's Retry-After header (a 503 the server expects to clear). */
-  retryAfterSeconds?: number;
+import { ApiClientError } from './errors';
+import { readSseStream } from './sse';
 
-  constructor(message: string, statusCode?: number, retryAfterSeconds?: number) {
-    super(message);
-    this.name = 'ApiClientError';
-    this.statusCode = statusCode;
-    this.retryAfterSeconds = retryAfterSeconds;
-  }
-}
+export { ApiClientError };
 
 /** The API's own message for a failed call (already client-safe), else ``fallback``
  *  for anything that isn't an API error (a bug, a network stack's raw text). */
@@ -130,6 +122,33 @@ interface RequestOptions extends Omit<RequestInit, 'headers'> {
   workspace?: string;
 }
 
+/** An AbortSignal that fires ``timeoutMs`` after the last ``reset`` (or creation), or
+ *  when ``callerSignal`` does. ``dispose`` once the request — its body included — is
+ *  over. Shared by every request so each has a timeout and honours its caller's abort:
+ *  one without either (the readiness check) hung when the server stopped answering. */
+function deadline(
+  timeoutMs: number,
+  callerSignal?: AbortSignal | null,
+): { signal: AbortSignal; reset: () => void; dispose: () => void } {
+  const controller = new AbortController();
+  let timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromCaller = () => controller.abort();
+  callerSignal?.addEventListener('abort', abortFromCaller);
+  // A signal aborted before the call never fires 'abort' again, so the request ran.
+  if (callerSignal?.aborted) controller.abort();
+  return {
+    signal: controller.signal,
+    reset: () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    },
+    dispose: () => {
+      clearTimeout(timeoutId);
+      callerSignal?.removeEventListener('abort', abortFromCaller);
+    },
+  };
+}
+
 async function request<T>(path: string, options?: RequestOptions): Promise<T> {
   const {
     timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -138,14 +157,9 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
     workspace = getWorkspace(),
     ...init
   } = options ?? {};
-  const timeoutController = new AbortController();
-  const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
-  // Let the caller's own signal (e.g. aborted on component unmount) cancel the
-  // request too, without losing the timeout's independent ability to cancel it.
-  const abortFromCaller = () => timeoutController.abort();
-  callerSignal?.addEventListener('abort', abortFromCaller);
-  // A signal aborted before the call never fires 'abort' again, so the request ran.
-  if (callerSignal?.aborted) timeoutController.abort();
+  // The caller's own signal (e.g. aborted on unmount) cancels the request too, without
+  // losing the timeout's independent ability to cancel it.
+  const limit = deadline(timeoutMs, callerSignal);
 
   // The timeout and the caller's signal stay armed until the body is read: cleared once
   // the headers arrived, a server that then stalled mid-body hung the promise for good,
@@ -156,10 +170,10 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
       response = await fetch(`${BASE_URL}${path}`, {
         ...init,
         headers: { ...authHeaders(workspace), ...headers },
-        signal: timeoutController.signal,
+        signal: limit.signal,
       });
     } catch (err) {
-      if (timeoutController.signal.aborted) {
+      if (limit.signal.aborted) {
         throw new ApiClientError('Request timed out or was cancelled.');
       }
       throw new ApiClientError(`API request failed: ${(err as Error).message}`);
@@ -172,14 +186,13 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
     try {
       return (await response.json()) as T;
     } catch {
-      if (timeoutController.signal.aborted) {
+      if (limit.signal.aborted) {
         throw new ApiClientError('Request timed out or was cancelled.');
       }
       throw new ApiClientError('API response was not valid JSON.');
     }
   } finally {
-    clearTimeout(timeoutId);
-    callerSignal?.removeEventListener('abort', abortFromCaller);
+    limit.dispose();
   }
 }
 
@@ -236,20 +249,16 @@ async function downloadBlob(
   signal?: AbortSignal,
 ): Promise<{ response: Response; blob: Blob }> {
   const workspace = getWorkspace();
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-  const abortFromCaller = () => controller.abort();
-  signal?.addEventListener('abort', abortFromCaller);
-  if (signal?.aborted) controller.abort();
+  const limit = deadline(DOWNLOAD_TIMEOUT_MS, signal);
   try {
     let response: Response;
     try {
       response = await fetch(`${BASE_URL}${path}`, {
         headers: authHeaders(workspace),
-        signal: controller.signal,
+        signal: limit.signal,
       });
     } catch (err) {
-      if (controller.signal.aborted) throw new ApiClientError('Request timed out or was cancelled.');
+      if (limit.signal.aborted) throw new ApiClientError('Request timed out or was cancelled.');
       throw new ApiClientError(`API request failed: ${(err as Error).message}`);
     }
     if (!response.ok) {
@@ -263,8 +272,7 @@ async function downloadBlob(
       throw new ApiClientError('The download was interrupted or timed out.');
     }
   } finally {
-    clearTimeout(timeoutId);
-    signal?.removeEventListener('abort', abortFromCaller);
+    limit.dispose();
   }
 }
 
@@ -378,113 +386,36 @@ export interface QuestionStreamHandlers {
   ) => void;
 }
 
-type QuestionStreamEvent =
-  | {
-      type: 'stage';
-      stage: string;
-      step?: number;
-      steps?: number;
-      prompt_tokens?: number;
-      eta_ms?: number;
-    }
-  | { type: 'sources'; sources: CitationResponse[]; trace_id: string | null }
-  | { type: 'delta'; text: string }
-  | {
-      type: 'done';
-      answer: string;
-      sources: CitationResponse[];
-      timings: TimingsResponse;
-      trace_id: string | null;
-      cached?: boolean;
-      answer_status?: AnswerStatus;
-      top_rerank_score?: number | null;
-      weak_matches?: boolean;
-      truncated?: boolean;
-      citation_backfilled?: boolean;
-      chunks_read?: number;
-      chunks_total?: number;
-      usage?: UsageResponse | null;
-    }
-  | { type: 'followups'; questions: string[] }
-  | { type: 'error'; detail: string };
-
-async function readSseStream(
-  response: Response,
-  onEvent: (event: QuestionStreamEvent) => void,
-  onChunk?: () => void,
-): Promise<void> {
-  if (!response.body) {
-    throw new ApiClientError('Streaming response had no body.');
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  // Parsed by the SSE rules, not this server's exact framing: a proxy that rewrites
-  // line endings to CRLF, splits one event's data over several `data:` lines or drops
-  // the space after the colon used to make frames vanish — and a last frame with no
-  // blank line after it (the connection closed) was dropped.
-  let dataLines: string[] = [];
-  const dispatch = () => {
-    if (dataLines.length > 0) {
-      onEvent(JSON.parse(dataLines.join('\n')) as QuestionStreamEvent);
-    }
-    dataLines = [];
-  };
-  const takeLine = (line: string) => {
-    if (line === '') {
-      dispatch();
-      return;
-    }
-    if (line.startsWith(':')) return; // a comment: the keepalive ping
-    const colon = line.indexOf(':');
-    const field = colon === -1 ? line : line.slice(0, colon);
-    let value = colon === -1 ? '' : line.slice(colon + 1);
-    if (value.startsWith(' ')) value = value.slice(1);
-    if (field === 'data') dataLines.push(value);
-  };
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      onChunk?.();
-      buffer += decoder.decode(value, { stream: true });
-      // A lone "\r" at the very end may be the first half of a "\r\n": wait for more.
-      const lines = buffer.split(/\r\n|\r(?!$)|\n/);
-      buffer = lines.pop() ?? '';
-      lines.forEach(takeLine);
-    }
-    buffer += decoder.decode();
-    for (const line of buffer.split(/\r\n|\r|\n/)) takeLine(line);
-    dispatch();
-  } finally {
-    // Leaving early — a backend `error` event, a malformed frame, an abort — used to
-    // leave the body locked to this reader until GC. cancel() releases the lock and
-    // tells the browser to stop pulling bytes we will never read.
-    await reader.cancel().catch(() => {
-      // Already errored or closed; nothing left to release.
-    });
-  }
-}
-
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/health', { signal }),
 
   // Open, and 503 with the same body when degraded: that body is the answer here (an
   // index built for another embedding setup), so it is read whatever the status.
   readiness: async (signal?: AbortSignal): Promise<ReadinessResponse> => {
-    let response: Response;
+    // Its own fetch (a 503 carries the body to read), with the same timeout as every
+    // other request: without one, a server that accepted the connection and never
+    // answered left the readiness check, and the notices it drives, pending for good.
+    const limit = deadline(DEFAULT_TIMEOUT_MS, signal);
     try {
-      response = await fetch(`${BASE_URL}/health/ready`, { signal });
-    } catch (err) {
-      throw new ApiClientError(`API request failed: ${(err as Error).message}`);
-    }
-    if (!response.ok && response.status !== 503) {
-      throw new ApiClientError(await extractErrorDetail(response), response.status);
-    }
-    try {
-      return (await response.json()) as ReadinessResponse;
-    } catch {
-      throw new ApiClientError('API response was not valid JSON.');
+      let response: Response;
+      try {
+        response = await fetch(`${BASE_URL}/health/ready`, { signal: limit.signal });
+      } catch (err) {
+        if (limit.signal.aborted) {
+          throw new ApiClientError('Request timed out or was cancelled.');
+        }
+        throw new ApiClientError(`API request failed: ${(err as Error).message}`);
+      }
+      if (!response.ok && response.status !== 503) {
+        throw new ApiClientError(await extractErrorDetail(response), response.status);
+      }
+      try {
+        return (await response.json()) as ReadinessResponse;
+      } catch {
+        throw new ApiClientError('API response was not valid JSON.');
+      }
+    } finally {
+      limit.dispose();
     }
   },
 
@@ -754,16 +685,9 @@ export const api = {
     signal?: AbortSignal,
     options?: QuestionOptions,
   ): Promise<void> => {
-    const timeoutController = new AbortController();
-    let timeoutId = setTimeout(() => timeoutController.abort(), STREAM_IDLE_TIMEOUT_MS);
-    const resetIdleTimeout = () => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => timeoutController.abort(), STREAM_IDLE_TIMEOUT_MS);
-    };
-    const abortFromCaller = () => timeoutController.abort();
-    signal?.addEventListener('abort', abortFromCaller);
-    // An already-aborted signal never fires 'abort', so the question was sent anyway.
-    if (signal?.aborted) timeoutController.abort();
+    // Bounds silence, not the whole answer: reset on every chunk (readSseStream).
+    const limit = deadline(STREAM_IDLE_TIMEOUT_MS, signal);
+    const resetIdleTimeout = limit.reset;
     let sawDone = false;
     const workspace = getWorkspace();
 
@@ -779,10 +703,10 @@ export const api = {
               ? summaryRequestBody(task, llmProvider, overrides, options)
               : questionRequestBody(question, llmProvider, overrides, filenames, history, options),
           ),
-          signal: timeoutController.signal,
+          signal: limit.signal,
         });
       } catch (err) {
-        if (timeoutController.signal.aborted) {
+        if (limit.signal.aborted) {
           throw new ApiClientError('Request timed out or was cancelled.');
         }
         throw new ApiClientError(`API request failed: ${(err as Error).message}`);
@@ -852,7 +776,7 @@ export const api = {
         if (sawDone) return;
         // A backend `error` event already threw the right thing — don't re-wrap it.
         if (err instanceof ApiClientError) throw err;
-        if (timeoutController.signal.aborted) {
+        if (limit.signal.aborted) {
           throw new ApiClientError('Request timed out or was cancelled.');
         }
         throw new ApiClientError(`API request failed: ${(err as Error).message}`);
@@ -863,8 +787,7 @@ export const api = {
         throw new ApiClientError('The answer stream ended before the server finished.');
       }
     } finally {
-      clearTimeout(timeoutId);
-      signal?.removeEventListener('abort', abortFromCaller);
+      limit.dispose();
     }
   },
 };

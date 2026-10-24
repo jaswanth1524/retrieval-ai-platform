@@ -11,8 +11,9 @@ import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
 from collections.abc import Set as AbstractSet
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from api.answer_cache import (
     AnswerCache,
@@ -31,6 +32,7 @@ from api.citations import (
 
 # Neighbour expansion and ingestion live in their own modules now; their names are
 # re-exported here (``x as x``) so every existing ``from api.pipeline import`` works.
+from api.context_expansion import _TAG_LOOKUP_EXECUTOR as _TAG_LOOKUP_EXECUTOR
 from api.context_expansion import _VARIANT_EXECUTOR as _VARIANT_EXECUTOR
 from api.context_expansion import _clip_head as _clip_head
 from api.context_expansion import _clip_tail as _clip_tail
@@ -48,10 +50,9 @@ from api.generation import (
     GroundedAnswer,
     SourceCitation,
     StageTimings,
-    attach_spans,
-    build_grounded_messages,
+    answer_messages,
     citation_from_dict,
-    finalize_citations,
+    finish_answer,
     fit_prompt_to_context_window,
     generate_followups,
     generate_grounded_answer,
@@ -75,7 +76,6 @@ from api.prompting import (
     condense_question_detailed,
     estimate_prompt_tokens,
     one_line,
-    with_answer_language,
 )
 from api.qdrant_schema import check_dense_dimension
 from api.repository import PassageFilter, VectorRepository, reciprocal_rank_fusion
@@ -350,6 +350,31 @@ def _citation_dict(source: SourceCitation) -> dict[str, Any]:
     return dataclasses.asdict(source)
 
 
+def replay_cached(hit: CachedAnswer, started: float, **done_fields: Any) -> Iterator[StreamEvent]:
+    """A cached answer (or summary) streamed as it first went out: its sources, the
+    whole text as one delta, ``done`` marked ``cached`` (``done_fields`` adds what only
+    one kind has), then its follow-ups, if any."""
+
+    sources = [_citation_dict(source) for source in hit.sources]
+    yield {"type": "sources", "sources": sources, "trace_id": hit.trace_id}
+    yield {"type": "delta", "text": hit.answer}
+    done: dict[str, Any] = {
+        "type": "done",
+        "answer": hit.answer,
+        "sources": sources,
+        "timings": timings_dict(_cached_timings(started)),
+        "trace_id": hit.trace_id,
+        "cached": True,
+        "answer_status": hit.answer_status,
+        "truncated": hit.truncated,
+        "citation_backfilled": hit.citation_backfilled,
+        **done_fields,
+    }
+    yield cast(DoneEvent, done)
+    if hit.followups:
+        yield {"type": "followups", "questions": list(hit.followups)}
+
+
 def usage_dict(usage: tuple[int, int] | None) -> dict[str, int] | None:
     """Token usage as the ``done`` frame and responses carry it."""
 
@@ -375,8 +400,86 @@ def timings_dict(timings: StageTimings) -> dict[str, float]:
     return dataclasses.asdict(timings)
 
 
+@dataclass(frozen=True)
+class _PassageSelection:
+    outcome: RerankOutcome
+    diversity_dropped: set[str]
+    below_min_score: bool
+    relative_cut_ids: set[str]
+
+
+def _select_passages(
+    outcome: RerankOutcome, settings: AppSettings, *, for_generation: bool
+) -> _PassageSelection:
+    """The reranked passages kept for the prompt (or a search): near-duplicates dropped,
+    the closest ones kept when none clears the floor, and the relative cut applied."""
+
+    # A chunk next to a kept one is dropped on the promise that neighbour expansion
+    # puts its text back — true only when expansion brings the whole neighbour.
+    # With CONTEXT_NEIGHBOR_MAX_CHARS capping it, a well-scored passage was lost.
+    diverse_outcome, diversity_dropped = select_diverse(
+        outcome,
+        settings,
+        drop_neighbours=for_generation and int(settings.context_neighbor_max_chars) == 0,
+    )
+    # Nothing cleared rerank_min_score: the closest passages are used anyway,
+    # flagged. A search (no answer) shows up to rerank_top_k of them; the cross-
+    # encoder scores a bare keyword low against a passage that has it ("laptop":
+    # 0.11 for the IT equipment policy, which it ranks first). An answer gets
+    # rerank_fallback_count of them, and the prompt tells the model they match only
+    # weakly, so it answers from them only when they hold the answer: the floor is
+    # on one model's score scale, and a fixed one refused questions the documents
+    # answer ("what are foundational models": 0.006 with MiniLM, 0.154 with jina).
+    below_min_score = False
+    fallback_count = min(
+        int(settings.rerank_top_k),
+        int(settings.rerank_fallback_count) if for_generation else int(settings.rerank_top_k),
+    )
+    if fallback_count > 0 and not diverse_outcome.kept and outcome.scored:
+        # rerank_top_k too: select_diverse fills up to it from the scored list, so
+        # an answer got 8 below-the-bar passages instead of rerank_fallback_count.
+        unfloored = settings.model_copy(
+            update={"rerank_min_score": 0.0, "rerank_top_k": fallback_count}
+        )
+        diverse_outcome, diversity_dropped = select_diverse(
+            RerankOutcome(scored=outcome.scored, kept=outcome.scored[:fallback_count]),
+            unfloored,
+            drop_neighbours=False,
+        )
+        below_min_score = bool(diverse_outcome.kept)
+    relative_cut_ids: set[str] = set()
+    if for_generation and not below_min_score:
+        trimmed, relative_cut_ids = relative_cut(
+            diverse_outcome.kept,
+            outcome.scored,
+            float(settings.rerank_relative_floor),
+        )
+        diverse_outcome = RerankOutcome(scored=diverse_outcome.scored, kept=trimmed)
+    return _PassageSelection(diverse_outcome, diversity_dropped, below_min_score, relative_cut_ids)
+
+
 class QuestionAbandoned(Exception):
     """The client left mid-question; stop before the next expensive stage."""
+
+
+def wait_for_model(
+    settings: AppSettings, should_stop: Callable[[], bool] | None
+) -> Generator[StreamEvent, None, GenerationSlot]:
+    """Take this thread's place at the local model (OLLAMA_MAX_PARALLEL), held.
+
+    Yields a ``waiting_for_model`` frame first when another request has it, so the
+    reader sees why nothing moves, and raises ``QuestionAbandoned`` when the client
+    leaves while waiting. The caller releases the returned slot; generator calls made
+    while it is held take no second place (the slot is re-entrant per thread). With no
+    limit (hosted providers, 0) it returns at once and holds nothing.
+    """
+
+    slot = GenerationSlot(settings)
+    if not slot.try_acquire():
+        yield {"type": "stage", "stage": "waiting_for_model"}
+        if not slot.acquire(should_stop):
+            raise QuestionAbandoned
+    return slot
 
 
 class RagPipeline:
@@ -688,6 +791,58 @@ class RagPipeline:
         stored = self._repository.stored_tags(settings)
         return sorted(tag for tag in stored if tag.casefold() in wanted) or list(tags)
 
+    def _expand_query(self, query: str, settings: AppSettings) -> tuple[list[str], float]:
+        """QUERY_EXPANSION_ENABLED's variant phrasings of ``query`` and the time taken."""
+
+        start = time.monotonic()
+        variants = generate_query_variants(
+            query.strip(), int(settings.query_expansion_count), self._generator, settings
+        )
+        return variants, (time.monotonic() - start) * 1000
+
+    def _search(
+        self,
+        queries: Sequence[str],
+        settings: AppSettings,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        tag_variants: Future[list[str]] | None,
+        narrow: PassageFilter | None,
+    ) -> tuple[list[RetrievedChunk], float, float]:
+        """Every query embedded and hybrid-searched side by side, the result lists
+        RRF-fused when there are several; the candidates, embed_ms and search_ms."""
+
+        embed_start = time.monotonic()
+        query_embeddings = _map_concurrently(
+            lambda query: embed_query(query, self._embedding_provider), queries
+        )
+        embed_ms = (time.monotonic() - embed_start) * 1000
+        check_dense_dimension(len(query_embeddings[0].dense), settings)
+        if tag_variants is not None:
+            tags = tag_variants.result()
+
+        search_start = time.monotonic()
+        # Passed only when set, so a repository double without the parameter still works.
+        narrowing = {"narrow": narrow} if narrow is not None else {}
+        result_lists = _map_concurrently(
+            lambda embedding: self._repository.hybrid_search(
+                settings, embedding, filenames, tags, **narrowing
+            ),
+            query_embeddings,
+        )
+        points = (
+            result_lists[0]
+            if len(result_lists) == 1
+            else reciprocal_rank_fusion(
+                result_lists,
+                k=int(settings.rrf_k),
+                limit=int(settings.fused_top_n),
+            )
+        )
+        candidates = points_to_chunks(points)
+        search_ms = (time.monotonic() - search_start) * 1000
+        return candidates, embed_ms, search_ms
+
     def _retrieve_and_rerank(
         self,
         question: str,
@@ -699,8 +854,12 @@ class RagPipeline:
         for_generation: bool = True,
         narrow: PassageFilter | None = None,
         also_search: str | None = None,
+        expansion: tuple[list[str], float] | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
+
+        ``expansion`` is ``_expand_query``'s result when the caller already ran it (the
+        stream does, so it can wait for the local model with a frame first).
 
         ``also_search`` is a second query searched alongside ``question`` and fused
         with it (the raw follow-up next to its condensed rewrite); the rerank scores
@@ -723,7 +882,7 @@ class RagPipeline:
         # only the search below needs the stored spellings.
         tag_variants = (
             submit_in_context(
-                _VARIANT_EXECUTOR,
+                _TAG_LOOKUP_EXECUTOR,
                 functools.partial(self._stored_tag_variants, tags, effective_settings),
             )
             if tags
@@ -735,15 +894,10 @@ class RagPipeline:
         # Left un-timed (query_expansion_ms stays 0.0) when disabled, like condense_ms.
         variants: list[str] = []
         query_expansion_ms = 0.0
-        if effective_settings.query_expansion_enabled and for_generation:
-            query_expansion_start = time.monotonic()
-            variants = generate_query_variants(
-                normalized_query,
-                int(effective_settings.query_expansion_count),
-                self._generator,
-                effective_settings,
-            )
-            query_expansion_ms = (time.monotonic() - query_expansion_start) * 1000
+        if expansion is not None:
+            variants, query_expansion_ms = expansion
+        elif effective_settings.query_expansion_enabled and for_generation:
+            variants, query_expansion_ms = self._expand_query(normalized_query, effective_settings)
         queries = [normalized_query, *variants]
         # The raw follow-up searched next to its rewrite: a rewrite that lost or changed
         # what the user asked no longer takes the raw question's matches with it.
@@ -751,35 +905,9 @@ class RagPipeline:
         if extra_query and extra_query.casefold() not in {q.casefold() for q in queries}:
             queries.insert(1, extra_query)
 
-        embed_start = time.monotonic()
-        query_embeddings = _map_concurrently(
-            lambda query: embed_query(query, self._embedding_provider), queries
+        candidates, embed_ms, search_ms = self._search(
+            queries, effective_settings, filenames, tags, tag_variants, narrow
         )
-        embed_ms = (time.monotonic() - embed_start) * 1000
-        check_dense_dimension(len(query_embeddings[0].dense), effective_settings)
-        if tag_variants is not None:
-            tags = tag_variants.result()
-
-        search_start = time.monotonic()
-        # Passed only when set, so a repository double without the parameter still works.
-        narrowing = {"narrow": narrow} if narrow is not None else {}
-        result_lists = _map_concurrently(
-            lambda embedding: self._repository.hybrid_search(
-                effective_settings, embedding, filenames, tags, **narrowing
-            ),
-            query_embeddings,
-        )
-        points = (
-            result_lists[0]
-            if len(result_lists) == 1
-            else reciprocal_rank_fusion(
-                result_lists,
-                k=int(effective_settings.rrf_k),
-                limit=int(effective_settings.fused_top_n),
-            )
-        )
-        candidates = points_to_chunks(points)
-        search_ms = (time.monotonic() - search_start) * 1000
         if should_stop is not None and should_stop():
             raise QuestionAbandoned
 
@@ -790,50 +918,8 @@ class RagPipeline:
             reranker=self._reranker,
             settings=effective_settings,
         )
-        # A chunk next to a kept one is dropped on the promise that neighbour expansion
-        # puts its text back — true only when expansion brings the whole neighbour.
-        # With CONTEXT_NEIGHBOR_MAX_CHARS capping it, a well-scored passage was lost.
-        diverse_outcome, diversity_dropped = select_diverse(
-            outcome,
-            effective_settings,
-            drop_neighbours=for_generation
-            and int(effective_settings.context_neighbor_max_chars) == 0,
-        )
-        # Nothing cleared rerank_min_score: the closest passages are used anyway,
-        # flagged. A search (no answer) shows up to rerank_top_k of them; the cross-
-        # encoder scores a bare keyword low against a passage that has it ("laptop":
-        # 0.11 for the IT equipment policy, which it ranks first). An answer gets
-        # rerank_fallback_count of them, and the prompt tells the model they match only
-        # weakly, so it answers from them only when they hold the answer: the floor is
-        # on one model's score scale, and a fixed one refused questions the documents
-        # answer ("what are foundational models": 0.006 with MiniLM, 0.154 with jina).
-        below_min_score = False
-        fallback_count = min(
-            int(effective_settings.rerank_top_k),
-            int(effective_settings.rerank_fallback_count)
-            if for_generation
-            else int(effective_settings.rerank_top_k),
-        )
-        if fallback_count > 0 and not diverse_outcome.kept and outcome.scored:
-            # rerank_top_k too: select_diverse fills up to it from the scored list, so
-            # an answer got 8 below-the-bar passages instead of rerank_fallback_count.
-            unfloored = effective_settings.model_copy(
-                update={"rerank_min_score": 0.0, "rerank_top_k": fallback_count}
-            )
-            diverse_outcome, diversity_dropped = select_diverse(
-                RerankOutcome(scored=outcome.scored, kept=outcome.scored[:fallback_count]),
-                unfloored,
-                drop_neighbours=False,
-            )
-            below_min_score = bool(diverse_outcome.kept)
-        relative_cut_ids: set[str] = set()
-        if for_generation and not below_min_score:
-            trimmed, relative_cut_ids = relative_cut(
-                diverse_outcome.kept,
-                outcome.scored,
-                float(effective_settings.rerank_relative_floor),
-            )
-            diverse_outcome = RerankOutcome(scored=diverse_outcome.scored, kept=trimmed)
+        selection = _select_passages(outcome, effective_settings, for_generation=for_generation)
+        diverse_outcome = selection.outcome
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
@@ -866,10 +952,10 @@ class RagPipeline:
             rerank_wait_ms=rerank_wait_ms,
             query_expansion_ms=query_expansion_ms,
             context_expansion_ms=context_expansion_ms,
-            diversity_dropped_ids=frozenset(diversity_dropped),
-            relative_cut_ids=frozenset(relative_cut_ids),
+            diversity_dropped_ids=frozenset(selection.diversity_dropped),
+            relative_cut_ids=frozenset(selection.relative_cut_ids),
             query_variants=queries[1:],
-            below_min_score=below_min_score,
+            below_min_score=selection.below_min_score,
         )
 
     def retrieve(
@@ -996,24 +1082,12 @@ class RagPipeline:
         if key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
             if hit is not None:
-                sources = [_citation_dict(source) for source in hit.sources]
-                yield {"type": "sources", "sources": sources, "trace_id": hit.trace_id}
-                yield {"type": "delta", "text": hit.answer}
-                yield {
-                    "type": "done",
-                    "answer": hit.answer,
-                    "sources": sources,
-                    "timings": timings_dict(_cached_timings(started)),
-                    "trace_id": hit.trace_id,
-                    "cached": True,
-                    "answer_status": hit.answer_status,
-                    "top_rerank_score": hit.top_rerank_score,
-                    "weak_matches": hit.weak_matches,
-                    "truncated": hit.truncated,
-                    "citation_backfilled": hit.citation_backfilled,
-                }
-                if hit.followups:
-                    yield {"type": "followups", "questions": list(hit.followups)}
+                yield from replay_cached(
+                    hit,
+                    started,
+                    top_rerank_score=hit.top_rerank_score,
+                    weak_matches=hit.weak_matches,
+                )
                 return
         done: DoneEvent | None = None
         events = self._answer_stream_uncached(
@@ -1085,6 +1159,9 @@ class RagPipeline:
         condensed_question: str | None = None
         condense_note: str | None = None
         truncated_history: list[ChatMessage] = []
+        # Held from the answer through its citation retry and follow-ups, as the stream
+        # does, so another question's call can't slip in between them at a local model.
+        slot: GenerationSlot | None = None
 
         try:
             effective_settings = self._effective_settings(overrides or AnswerOverrides())
@@ -1109,6 +1186,8 @@ class RagPipeline:
             )
             selected = fitted.context_chunks
 
+            slot = GenerationSlot(effective_settings)
+            slot.acquire()
             generate_start = time.monotonic()
             reset_finish_reason()
             begin_usage()
@@ -1135,6 +1214,8 @@ class RagPipeline:
                 citation_retry_ms=grounded.citation_retry_ms,
             )
         except Exception as exc:
+            if slot is not None:
+                slot.release()
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
                     self._error_trace(
@@ -1155,6 +1236,26 @@ class RagPipeline:
                 )
             raise
 
+        try:
+            status = answer_status(grounded.answer, len(grounded.sources), len(selected))
+            wants_followups = effective_settings.followups_enabled and status == "answered"
+            followups = (
+                generate_followups(
+                    question.strip(),
+                    grounded.answer,
+                    _cited_chunks(grounded.sources, selected),
+                    self._generator,
+                    effective_settings,
+                )
+                if wants_followups
+                else []
+            )
+        finally:
+            if slot is not None:
+                slot.release()
+        if wants_followups:
+            # The response waited for them (even when none came back), so the total does.
+            timings = replace(timings, total_ms=(time.monotonic() - total_start) * 1000)
         if trace_store is not None and trace_id is not None:
             # Captured from generation, not rebuilt here. A second
             # build_grounded_messages call would agree today but is a re-derivation that
@@ -1165,9 +1266,7 @@ class RagPipeline:
                     trace_id=trace_id,
                     question=question,
                     mode="sync",
-                    status=_trace_status(
-                        answer_status(grounded.answer, len(grounded.sources), len(selected))
-                    ),
+                    status=_trace_status(status),
                     effective_settings=effective_settings,
                     filenames=filenames,
                     tags=tags,
@@ -1186,18 +1285,6 @@ class RagPipeline:
                     usage=usage,
                 )
             )
-        status = answer_status(grounded.answer, len(grounded.sources), len(selected))
-        followups = (
-            generate_followups(
-                question.strip(),
-                grounded.answer,
-                _cited_chunks(grounded.sources, selected),
-                self._generator,
-                effective_settings,
-            )
-            if effective_settings.followups_enabled and status == "answered"
-            else []
-        )
         return replace(
             grounded,
             timings=timings,
@@ -1266,13 +1353,32 @@ class RagPipeline:
             truncated_history = self._truncate_history(history, effective_settings)
             # Announced before the call, and only when it will actually happen — an
             # unconditional frame would report a stage that never ran for the majority
-            # of questions, which is worse than no frame.
-            if self._will_condense(question, truncated_history, effective_settings):
-                yield {"type": "stage", "stage": "condensing"}
-            retrieval_query, condense_ms, condensed_question, condense_note = self._condense_query(
-                question, truncated_history, effective_settings
-            )
-            yield {"type": "stage", "stage": "searching"}
+            # of questions, which is worse than no frame. The rewrite is an LLM call:
+            # it waits its turn at a local model like the answer does (announced, and
+            # given up if the reader leaves), and gives the place back for retrieval.
+            condense_slot: GenerationSlot | None = None
+            try:
+                if self._will_condense(question, truncated_history, effective_settings):
+                    condense_slot = yield from wait_for_model(effective_settings, should_stop)
+                    yield {"type": "stage", "stage": "condensing"}
+                retrieval_query, condense_ms, condensed_question, condense_note = (
+                    self._condense_query(question, truncated_history, effective_settings)
+                )
+            finally:
+                if condense_slot is not None:
+                    condense_slot.release()
+            # Query expansion (opt-in) is an LLM call too: it waits its turn at a local
+            # model like the condense call, and gives the place back for retrieval.
+            expansion: tuple[list[str], float] | None = None
+            if effective_settings.query_expansion_enabled and retrieval_query.strip():
+                expansion_slot = yield from wait_for_model(effective_settings, should_stop)
+                try:
+                    yield {"type": "stage", "stage": "searching"}
+                    expansion = self._expand_query(retrieval_query, effective_settings)
+                finally:
+                    expansion_slot.release()
+            else:
+                yield {"type": "stage", "stage": "searching"}
             phase = self._retrieve_and_rerank(
                 retrieval_query,
                 effective_settings,
@@ -1280,6 +1386,7 @@ class RagPipeline:
                 tags,
                 should_stop,
                 also_search=question if condensed_question else None,
+                expansion=expansion,
             )
             prompt_question = _with_interpretation(question.strip(), condensed_question)
             fitted = fit_prompt_to_context_window(
@@ -1336,26 +1443,19 @@ class RagPipeline:
                 "trace_id": trace_id,
             }
 
-            messages = with_answer_language(
-                build_grounded_messages(
-                    prompt_question,
-                    selected,
-                    fitted.history or None,
-                    weak_matches=phase.below_min_score,
-                ),
+            messages = answer_messages(
+                prompt_question,
+                selected,
+                fitted.history or None,
                 effective_settings,
+                weak_matches=phase.below_min_score,
             )
             if should_stop is not None and should_stop():
                 return  # the finally below records the trace as closed early
             # Held until the answer, its citation retry and follow-ups are done, so
             # another question's call can't slip in between them; released below.
-            slot = GenerationSlot(effective_settings)
-            if not slot.try_acquire():
-                # Another question has the local model. Waiting inside Ollama ran this
-                # request's timeout; waiting here doesn't, and the reader is told why.
-                yield {"type": "stage", "stage": "waiting_for_model"}
-                if not slot.acquire(should_stop):
-                    return  # the finally below records the trace as closed early
+            # Waiting inside Ollama ran this request's timeout; waiting here doesn't.
+            slot = yield from wait_for_model(effective_settings, should_stop)
             reading: StageEvent = {
                 "type": "stage",
                 "stage": "reading",
@@ -1397,21 +1497,19 @@ class RagPipeline:
                 context_chunks=selected,
             ):
                 yield {"type": "stage", "stage": "verifying_citations"}
-            outcome = finalize_citations(
+            # Spans only now: the sources frame went out before there was an answer.
+            outcome, cited = finish_answer(
                 messages,
                 answer,
-                all_sources,
+                selected,
                 self._generator,
                 effective_settings,
                 weak_matches=phase.below_min_score,
-                context_chunks=selected,
             )
             answer = outcome.answer
             # The last call made the answer: the citation retry's when it fired.
             truncated = stopped_at_token_limit()
             usage = usage_totals()
-            # Spans only now: the sources frame went out before there was an answer.
-            cited = attach_spans(answer, outcome.cited, selected)
             citation_retry_used = outcome.retry_used
 
             timings = self._phase_timings(
@@ -1422,13 +1520,14 @@ class RagPipeline:
                 citation_retry_ms=outcome.retry_ms,
                 first_token_ms=first_token_ms,
             )
+            status = answer_status(answer, len(cited), len(selected))
             if trace_store is not None and trace_id is not None:
                 trace_store.add(
                     self._finished_trace(
                         trace_id=trace_id,
                         question=question,
                         mode="stream",
-                        status=_trace_status(answer_status(answer, len(cited), len(selected))),
+                        status=_trace_status(status),
                         effective_settings=effective_settings,
                         filenames=filenames,
                         tags=tags,
@@ -1452,7 +1551,6 @@ class RagPipeline:
                     )
                 )
             finalized = True
-            status = answer_status(answer, len(cited), len(selected))
             yield {
                 "type": "done",
                 "answer": answer,

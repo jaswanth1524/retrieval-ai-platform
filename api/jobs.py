@@ -87,9 +87,7 @@ class IngestBacklog:
 
     def try_reserve(self, size: int) -> bool:
         with self._lock:
-            if self._pending and self._pending + size > self._max_bytes:
-                return False
-            if self._max_jobs is not None and self._jobs >= self._max_jobs:
+            if not self._fits(size):
                 return False
             self._pending += size
             self._jobs += 1
@@ -104,9 +102,13 @@ class IngestBacklog:
         """
 
         with self._lock:
-            if self._pending and self._pending + size > self._max_bytes:
-                return False
-            return self._max_jobs is None or self._jobs < self._max_jobs
+            return self._fits(size)
+
+    def _fits(self, size: int) -> bool:
+        # Under the lock. An empty backlog takes anything, however large.
+        if self._pending and self._pending + size > self._max_bytes:
+            return False
+        return self._max_jobs is None or self._jobs < self._max_jobs
 
     def release(self, size: int) -> None:
         with self._lock:

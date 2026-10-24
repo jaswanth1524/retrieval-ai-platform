@@ -282,8 +282,10 @@ docrag queries [--uncovered]             # the query log (QUERY_LOG_ENABLED)
 docrag export backup.zip                 # and: import backup.zip
 ```
 
-`--json` gives machine-readable output; the exit code is 1 when a request (or any upload)
-failed, and with `ask --strict` 3 when the documents don't answer the question. `ask`
+`--json` gives machine-readable output; the exit code is 1 when a request (or any upload,
+or any file `delete` names) failed, with `ask --strict` 3 when the documents don't answer
+the question, and 130 after Ctrl-C (in `chat`, Ctrl-C stops the answer and the
+conversation goes on). `ask`
 and `chat` say how an answer was grounded (not found, uncited, auto-cited, weak match)
 and, while a local model works, print the stage and the time waited every 15 s. `chat`
 asks each question with the conversation so far, leaving out answers that found nothing

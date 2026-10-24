@@ -40,29 +40,7 @@ def parse_pdf_document(
     max_pdf_pages = int(limits.max_pdf_pages)
     max_ocr_pages = int(limits.max_ocr_pages)
 
-    try:
-        reader = PdfReader(BytesIO(content))
-    except Exception as exc:  # pypdf raises several parser-specific exceptions.
-        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
-    if reader.is_encrypted:
-        # An owner-password-only PDF opens with the empty user password; anything else
-        # can't be read, and used to fail as an "unexpected server error".
-        try:
-            decrypted = reader.decrypt("")
-        except Exception as exc:
-            raise DocumentParseError(f"PDF '{filename}' is password-protected.") from exc
-        if not decrypted:
-            raise DocumentParseError(f"PDF '{filename}' is password-protected.")
-    try:
-        page_count = len(reader.pages)
-    except Exception as exc:
-        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
-    if page_count > max_pdf_pages:
-        raise DocumentParseError(
-            f"PDF '{filename}' has {page_count} pages; the limit is {max_pdf_pages} "
-            "(MAX_PDF_PAGES). Split it into smaller files."
-        )
-
+    reader = _open_reader(filename, content, max_pdf_pages)
     tables_by_page = _extract_pdf_tables(content, _pages_that_draw_lines(reader))
     repaired = repair_ligature_maps(reader)
     if repaired:
@@ -116,6 +94,58 @@ def parse_pdf_document(
             continue
         sections.append(section)
 
+    sections = _with_ocr(filename, content, sections, stamped, empty_pages, max_ocr_pages)
+    if not sections:
+        raise EmptyDocumentError(f"PDF '{filename}' has no extractable text.")
+    return sections
+
+
+# A page with less text than this that draws a large image is a scan with a stamp on it.
+_STAMP_MAX_CHARS = 20
+# Width x height, in image pixels: about a third of a page scanned at 150 dpi.
+_LARGE_IMAGE_PIXELS = 500_000
+
+
+def _open_reader(filename: str, content: bytes, max_pdf_pages: int) -> PdfReader:
+    """The PDF opened (and decrypted when only an owner password is set), or a parse
+    error that says why it can't be read; a PDF over ``max_pdf_pages`` is refused."""
+
+    try:
+        reader = PdfReader(BytesIO(content))
+    except Exception as exc:  # pypdf raises several parser-specific exceptions.
+        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
+    if reader.is_encrypted:
+        # An owner-password-only PDF opens with the empty user password; anything else
+        # can't be read, and used to fail as an "unexpected server error".
+        try:
+            decrypted = reader.decrypt("")
+        except Exception as exc:
+            raise DocumentParseError(f"PDF '{filename}' is password-protected.") from exc
+        if not decrypted:
+            raise DocumentParseError(f"PDF '{filename}' is password-protected.")
+    try:
+        page_count = len(reader.pages)
+    except Exception as exc:
+        raise DocumentParseError(f"Could not parse PDF '{filename}'.") from exc
+    if page_count > max_pdf_pages:
+        raise DocumentParseError(
+            f"PDF '{filename}' has {page_count} pages; the limit is {max_pdf_pages} "
+            "(MAX_PDF_PAGES). Split it into smaller files."
+        )
+    return reader
+
+
+def _with_ocr(
+    filename: str,
+    content: bytes,
+    sections: list[DocumentSection],
+    stamped: dict[int, DocumentSection],
+    empty_pages: list[int],
+    max_ocr_pages: int,
+) -> list[DocumentSection]:
+    """``sections`` with the OCR'd text of ``empty_pages`` (up to ``max_ocr_pages``)
+    merged in by page, and each stamped page OCR didn't read kept as its stamp."""
+
     if len(empty_pages) > max_ocr_pages:
         logger.warning(
             "PDF %s: %d pages have no text layer; OCR'ing the first %d (MAX_OCR_PAGES) "
@@ -165,25 +195,20 @@ def parse_pdf_document(
             )
             for section, text in zip(ocr_sections, ocr_texts, strict=True)
         ]
-        read = {section.page for section in ocr_sections}
-        sections = sorted(
-            [
-                *sections,
-                *ocr_sections,
-                *(section for page, section in stamped.items() if page not in read),
-            ],
-            key=lambda section: section.page,
-        )
-
-    if not sections:
-        raise EmptyDocumentError(f"PDF '{filename}' has no extractable text.")
+    else:
+        ocr_sections = []
+    # A stamped page OCR didn't read (OCR off, past MAX_OCR_PAGES, or it found nothing)
+    # keeps the stamp's own text rather than being lost.
+    read = {section.page for section in ocr_sections}
+    sections = sorted(
+        [
+            *sections,
+            *ocr_sections,
+            *(section for page, section in stamped.items() if page not in read),
+        ],
+        key=lambda section: section.page,
+    )
     return sections
-
-
-# A page with less text than this that draws a large image is a scan with a stamp on it.
-_STAMP_MAX_CHARS = 20
-# Width x height, in image pixels: about a third of a page scanned at 150 dpi.
-_LARGE_IMAGE_PIXELS = 500_000
 
 
 def _draws_a_large_image(page: Any) -> bool:
@@ -591,6 +616,14 @@ def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[i
                     blocks = [block for block in blocks if block]
                     if blocks:
                         result[page_number] = blocks
+                except Exception:
+                    # One page pdfplumber can't read loses its own tables, not those
+                    # already read from every page before it.
+                    logger.warning(
+                        "PDF table extraction failed on page %d; continuing without it.",
+                        page_number,
+                        exc_info=True,
+                    )
                 finally:
                     # Parsed layout objects are cached per page until closed; on a long
                     # PDF they otherwise accumulate for the whole document.
@@ -674,7 +707,17 @@ def _ocr_pdf_pages(filename: str, content: bytes, page_numbers: list[int]) -> li
             if page_number > len(pdf.pages):
                 continue
             page = pdf.pages[page_number - 1]
-            resolution = ocr_resolution(float(page.width), float(page.height))
+            try:
+                resolution = ocr_resolution(float(page.width), float(page.height))
+            except Exception:
+                logger.warning(
+                    "PDF %s: could not read the size of page %d; skipping its OCR.",
+                    filename,
+                    page_number,
+                    exc_info=True,
+                )
+                page.close()
+                continue
             if resolution is None:
                 logger.warning(
                     "PDF %s: page %d is too large to OCR (%.0f x %.0f pt); skipping it.",

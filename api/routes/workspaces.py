@@ -21,7 +21,7 @@ from api.dependencies import (
 from api.ingestion import ingest_sequencer
 from api.qdrant_schema import forget_collection
 from api.raw_documents import VERSIONS_DIR, is_temp_file_name
-from api.repository import clear_metadata_cache
+from api.repository import forget_metadata
 from api.routes.deps import QdrantClientDep, VectorRepositoryDep
 from api.schemas import WorkspaceCreateRequest, WorkspaceListResponse, WorkspaceResponse
 from api.settings import AppSettings
@@ -29,6 +29,7 @@ from api.workspaces import (
     MAX_WORKSPACES,
     WorkspaceError,
     filename_of,
+    forget_workspace,
     list_workspaces,
     settings_for,
     validate_name,
@@ -87,7 +88,8 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
             ) from exc
     client.delete_collection(target.qdrant_collection)
     forget_collection(client, target)
-    clear_metadata_cache()
+    forget_metadata(client, target.qdrant_collection)
+    forget_workspace(client, target.qdrant_collection)
     # Answers cached for it are for a corpus that is gone (a workspace created again
     # under this name starts at a generation it never had).
     bump_corpus_generation(collection=target.qdrant_collection)

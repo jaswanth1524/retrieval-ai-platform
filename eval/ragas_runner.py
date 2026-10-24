@@ -74,10 +74,39 @@ def load_examples(path: Path) -> list[EvaluationExample]:
     raise EvaluationDataError("Evaluation dataset must be a .json or .jsonl file.")
 
 
+def _unscorable_answer_row(data: Mapping[str, Any]) -> bool:
+    """A row ``eval.harness answer`` wrote for a question that failed (``error``), or
+    that was answered from no passages: nothing for RAGAS to score. Only harness rows
+    (they carry ``answer_status``) are skipped; a hand-written row still has to be
+    complete."""
+
+    if "answer_status" not in data:
+        return False
+    contexts = data.get("contexts")
+    has_context = isinstance(contexts, list) and any(
+        isinstance(item, str) and item.strip() for item in contexts
+    )
+    answer = data.get("answer")
+    return (
+        bool(data.get("error"))
+        or not has_context
+        or not (isinstance(answer, str) and answer.strip())
+    )
+
+
+def _note_skipped(skipped: int) -> None:
+    if skipped:
+        print(
+            f"skipped {skipped} answer row(s) with an error or no context to score",
+            file=sys.stderr,
+        )
+
+
 def load_jsonl_examples(path: Path) -> list[EvaluationExample]:
     """Load examples from newline-delimited JSON."""
 
     examples: list[EvaluationExample] = []
+    skipped = 0
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
@@ -87,7 +116,11 @@ def load_jsonl_examples(path: Path) -> list[EvaluationExample]:
             raise EvaluationDataError(f"Invalid JSON on line {line_number}.") from exc
         if not isinstance(data, dict):
             raise EvaluationDataError(f"Line {line_number} must be a JSON object.")
+        if _unscorable_answer_row(data):
+            skipped += 1
+            continue
         examples.append(EvaluationExample.from_mapping(data))
+    _note_skipped(skipped)
     return require_examples(examples)
 
 
@@ -105,10 +138,15 @@ def load_json_examples(path: Path) -> list[EvaluationExample]:
         raise EvaluationDataError("JSON evaluation dataset must be a list or contain examples.")
 
     examples: list[EvaluationExample] = []
+    skipped = 0
     for index, item in enumerate(data, start=1):
         if not isinstance(item, dict):
             raise EvaluationDataError(f"Example {index} must be a JSON object.")
+        if _unscorable_answer_row(item):
+            skipped += 1
+            continue
         examples.append(EvaluationExample.from_mapping(item))
+    _note_skipped(skipped)
     return require_examples(examples)
 
 

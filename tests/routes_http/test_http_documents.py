@@ -701,7 +701,7 @@ def test_reindex_all_defers_what_the_backlog_cannot_take(
         response = client.post("/documents/reindex")
 
         assert response.status_code == 202
-        assert response.json() == {"jobs": [], "deferred": ["old.txt"]}
+        assert response.json()["jobs"] == [] and response.json()["deferred"] == ["old.txt"]
         assert reads == []  # deferred without reading the original into memory
 
 
@@ -1058,3 +1058,67 @@ def test_changing_the_chunk_settings_lists_documents_as_stale_and_reindex_all_fi
         assert [job["filename"] for job in accepted["jobs"]] == ["guide.txt"]
         assert wait_for_job(client, accepted["jobs"][0]["job_id"])["state"] == "done"
         assert client.get("/documents").json()["stale_filenames"] == []
+
+
+def _two_stale_documents(client: TestClient) -> None:
+    import api.ingest_service as pipeline_module
+    from api.documents import CHUNKER_VERSION
+
+    with pytest.MonkeyPatch.context() as older_chunker:
+        older_chunker.setattr(pipeline_module, "CHUNKER_VERSION", CHUNKER_VERSION - 1)
+        assert upload_and_wait(client, "a.txt", b"Intro\nalpha")["state"] == "done"
+        assert upload_and_wait(client, "b.txt", b"Intro\nbeta")["state"] == "done"
+
+
+def test_reindex_all_skips_a_document_already_being_indexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from api.ingestion import ingest_sequencer
+
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        _two_stale_documents(client)
+        busy = ingest_sequencer.admit("a.txt")  # a re-index clicked a moment ago
+        try:
+            body = client.post("/documents/reindex").json()
+            assert [job["filename"] for job in body["jobs"]] == ["b.txt"]
+            assert body["in_progress"] == ["a.txt"]
+            one = client.post("/documents/a.txt/reindex")
+            assert one.status_code == 409
+            assert "already being indexed" in one.json()["detail"]
+        finally:
+            ingest_sequencer.release("a.txt")
+        assert busy
+        assert wait_for_job(client, body["jobs"][0]["job_id"])["state"] == "done"
+
+
+def test_reindex_all_keeps_going_past_an_original_deleted_or_a_job_that_fails_to_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import api.ingest_jobs as routes
+
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        _two_stale_documents(client)
+        real_path = RawDocumentStore.path
+
+        def vanished(self: RawDocumentStore, filename: str) -> Path | None:
+            # Sized, then unreadable (deleted, or replaced by a directory) at the read.
+            return tmp_path if filename == "a.txt" else real_path(self, filename)
+
+        monkeypatch.setattr(RawDocumentStore, "path", vanished)
+        body = client.post("/documents/reindex").json()
+        assert [job["filename"] for job in body["jobs"]] == ["b.txt"]
+        assert client.post("/documents/a.txt/reindex").status_code == 404
+        assert wait_for_job(client, body["jobs"][0]["job_id"])["state"] == "done"
+        monkeypatch.setattr(RawDocumentStore, "path", real_path)
+
+        real_enqueue = routes.enqueue_ingest
+
+        def failing(**kwargs: object):  # type: ignore[no-untyped-def]
+            if kwargs["filename"] == "a.txt":
+                raise RuntimeError("job store unavailable")
+            return real_enqueue(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(routes, "enqueue_ingest", failing)
+        response = client.post("/documents/reindex")
+        assert response.status_code == 202
+        assert response.json()["failed"] == ["a.txt"]

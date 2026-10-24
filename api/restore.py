@@ -224,6 +224,8 @@ def _restore_document(
         outcome.jobs.append(
             enqueue(filename, content, _uploaded_at(document.get("uploaded_at")), tags)
         )
+        # A manifest that lists the name twice queues it once.
+        existing_filenames.add(filename)
     except WorkspaceClosingError:
         # The workspace is being deleted: that delete either goes through, and the
         # workspace is gone, or doesn't, and the document comes in on the next try.

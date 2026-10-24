@@ -19,8 +19,14 @@ from api.settings import AppSettings
 
 # Query-expansion variants are embedded and searched side by side: four sequential
 # embed+search round trips were the whole cost of turning expansion on. Neighbour
-# expansion fetches its per-file scrolls here too.
-_VARIANT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="docrag-variants")
+# expansion fetches its per-file scrolls here too. Shared by every question: 8 covers
+# MAX_CONCURRENT_QUESTIONS' default 4 with two queries each (a follow-up and its rewrite).
+_VARIANT_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="docrag-variants")
+# The stored-tag lookup of a tag-scoped question runs on its own: when the listing is
+# cold it scans the whole collection, and on the shared pool four such lookups held
+# every worker — other questions' searches waited behind them (measured: a fan-out
+# waited 1 s behind four 1 s lookups).
+_TAG_LOOKUP_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-tags")
 
 
 def _map_concurrently[T, R](function: Callable[[T], R], items: Sequence[T]) -> list[R]:

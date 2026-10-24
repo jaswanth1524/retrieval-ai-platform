@@ -189,6 +189,10 @@ export interface DocumentReindexAllResponse {
   jobs: DocumentJobAcceptedResponse[];
   /** Stale and re-indexable, but the ingest backlog was full — retry later. */
   deferred: string[];
+  /** Already being indexed: not queued a second time. */
+  in_progress?: string[];
+  /** Could not be queued; the others were. */
+  failed?: string[];
 }
 
 export interface DocumentJobStatusResponse {

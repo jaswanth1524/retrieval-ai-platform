@@ -288,26 +288,9 @@ def ingest_chunks(
     # without paying for embedding work on chunks that can't be written anyway.
     repository.ensure_ready(settings)
 
-    batch_size = int(settings.ingest_batch_size)
-    upsert_batch_size = int(settings.ingest_upsert_batch_size)
     total = len(chunks)
     embed_start = time.monotonic()
-    embeddings: list[_StoredEmbedding] = []
-    for start in range(0, total, batch_size):
-        if precondition is not None:
-            precondition()
-        batch = chunks[start : start + batch_size]
-        embedded = embedding_provider.embed_texts([_contextual_embedding_text(c) for c in batch])
-        if len(embedded) != len(batch):
-            raise EmbeddingError(
-                f"Embedding count mismatch: got {len(embedded)}, expected {len(batch)}."
-            )
-        if start == 0:
-            check_dense_dimension(len(embedded[0].dense), settings)
-        embeddings.extend(_StoredEmbedding.of(embedding) for embedding in embedded)
-        if on_progress is not None:
-            on_progress(min(start + batch_size, total), total)
-
+    embeddings = _embed_all(chunks, settings, embedding_provider, precondition, on_progress)
     ingest_stage_seconds.labels(stage="embed").observe(time.monotonic() - embed_start)
 
     # Filenames are locked in sorted order so two multi-file ingests that share more
@@ -344,32 +327,9 @@ def ingest_chunks(
         for filename in filenames:
             stale_candidate_ids.update(repository.point_ids_for_filename(settings, filename))
 
-        new_ids: set[str] = set()
-        for start in range(0, total, upsert_batch_size):
-            points = [
-                build_point(chunk, embedding.restore(), settings)
-                for chunk, embedding in zip(
-                    chunks[start : start + upsert_batch_size],
-                    embeddings[start : start + upsert_batch_size],
-                    strict=True,
-                )
-            ]
-            if start == 0 and before_first_write is not None:
-                before_first_write()
-            try:
-                repository.upsert(settings, points)
-            except Exception as exc:
-                if start == 0:
-                    raise IngestionError(
-                        f"Indexing failed while updating {', '.join(filenames)}; the previous "
-                        "version remains indexed. Please retry the upload."
-                    ) from exc
-                raise IngestionError(
-                    f"Indexing failed partway through updating {', '.join(filenames)} "
-                    f"({start} of {total} chunks already indexed alongside the previous "
-                    "version). Please retry the upload."
-                ) from exc
-            new_ids.update(str(point.id) for point in points)
+        new_ids = _upsert_all(
+            repository, settings, chunks, embeddings, filenames, before_first_write
+        )
 
         # Every batch of the new version is live from here on, so its original bytes
         # belong to it now — before stale cleanup, whose failure still leaves the new
@@ -392,6 +352,79 @@ def ingest_chunks(
             collection_name=settings.qdrant_collection,
             points_count=total,
         )
+
+
+def _embed_all(
+    chunks: Sequence[DocumentChunk],
+    settings: AppSettings,
+    embedding_provider: EmbeddingProvider,
+    precondition: Callable[[], None] | None,
+    on_progress: Callable[[int, int], None] | None,
+) -> list[_StoredEmbedding]:
+    """Every chunk's vectors, embedded in ``ingest_batch_size`` batches with no lock
+    held; ``precondition`` checked before each batch, progress reported after it."""
+
+    batch_size = int(settings.ingest_batch_size)
+    total = len(chunks)
+    embeddings: list[_StoredEmbedding] = []
+    for start in range(0, total, batch_size):
+        if precondition is not None:
+            precondition()
+        batch = chunks[start : start + batch_size]
+        embedded = embedding_provider.embed_texts([_contextual_embedding_text(c) for c in batch])
+        if len(embedded) != len(batch):
+            raise EmbeddingError(
+                f"Embedding count mismatch: got {len(embedded)}, expected {len(batch)}."
+            )
+        if start == 0:
+            check_dense_dimension(len(embedded[0].dense), settings)
+        embeddings.extend(_StoredEmbedding.of(embedding) for embedding in embedded)
+        if on_progress is not None:
+            on_progress(min(start + batch_size, total), total)
+    return embeddings
+
+
+def _upsert_all(
+    repository: WriteRepository,
+    settings: AppSettings,
+    chunks: Sequence[DocumentChunk],
+    embeddings: Sequence[_StoredEmbedding],
+    filenames: Sequence[str],
+    before_first_write: Callable[[], None] | None,
+) -> set[str]:
+    """Write every chunk in ``ingest_upsert_batch_size`` batches (caller holds the
+    filename locks); the ids written. A failure says whether the previous version is
+    still whole (first batch) or now sits beside part of the new one."""
+
+    upsert_batch_size = int(settings.ingest_upsert_batch_size)
+    total = len(chunks)
+    new_ids: set[str] = set()
+    for start in range(0, total, upsert_batch_size):
+        points = [
+            build_point(chunk, embedding.restore(), settings)
+            for chunk, embedding in zip(
+                chunks[start : start + upsert_batch_size],
+                embeddings[start : start + upsert_batch_size],
+                strict=True,
+            )
+        ]
+        if start == 0 and before_first_write is not None:
+            before_first_write()
+        try:
+            repository.upsert(settings, points)
+        except Exception as exc:
+            if start == 0:
+                raise IngestionError(
+                    f"Indexing failed while updating {', '.join(filenames)}; the previous "
+                    "version remains indexed. Please retry the upload."
+                ) from exc
+            raise IngestionError(
+                f"Indexing failed partway through updating {', '.join(filenames)} "
+                f"({start} of {total} chunks already indexed alongside the previous "
+                "version). Please retry the upload."
+            ) from exc
+        new_ids.update(str(point.id) for point in points)
+    return new_ids
 
 
 @dataclass(frozen=True)

@@ -147,7 +147,10 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
+/* aria-disabled: a button that can't act right now but keeps keyboard focus (a
+   disabled one dropped it to the page as soon as it was pressed). */
+button:disabled,
+button[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.6;
 }

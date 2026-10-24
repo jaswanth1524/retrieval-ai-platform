@@ -10,11 +10,12 @@ import type {
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
 import { sliceWhole } from '../utils/text';
-import { chatStoreAvailable, clearChatStore, loadChatStore, saveChatStore } from './chatStore';
+import { useChatPersistence } from './useChatPersistence';
+import { useConversationActions } from './useConversationActions';
+import type { ImportItem } from './useConversationActions';
+export type { ImportItem } from './useConversationActions';
 import {
-  CHAT_STORAGE_KEY,
   EMPTY_SCOPE,
-  MAX_PINNED_CONVERSATIONS,
   TITLE_MAX_CHARS,
   applyDeleteHeldDuringStream,
   byRecentUse,
@@ -22,16 +23,7 @@ import {
   cleanFollowups,
   conversationWorkspace,
   deriveTitle,
-  emptyConversation,
-  isOnlyEmpty,
   loadStorage,
-  mergeConversations,
-  parseConversations,
-  parseDeleted,
-  persistStorage,
-  forChatStore,
-  LOCAL_STORAGE_MAX_CONVERSATIONS,
-  sanitizeTurn,
   searchConversations as searchStoredConversations,
   withoutConversation,
 } from './chatPersistence';
@@ -229,6 +221,17 @@ export interface UseChatResult {
   ) => Promise<void>;
   /** Add a conversation from a JSON export; false when the file holds no turns. */
   importConversation: (raw: unknown, title?: string) => boolean;
+  /** Add the conversations of an "Export all" file, with their own dates, into the
+   *  room the history has left. Existing conversations are pushed out to make room only
+   *  with ``makeRoom`` (the least recently used, never a pinned, the active or the
+   *  answering one); ``removed`` counts those, ``skipped`` the valid ones that didn't fit. */
+  importConversations: (
+    items: readonly ImportItem[],
+    options?: { makeRoom?: boolean },
+  ) => { imported: number; skipped: number; removed: number };
+  /** How many of ``items`` are valid conversations, and how many fit without removing
+   *  any (asked before importing, to offer making room). */
+  importPreview: (items: readonly ImportItem[]) => { valid: number; room: number };
   cancel: () => void;
   clear: () => void;
   newConversation: () => void;
@@ -304,8 +307,6 @@ interface TrailingStream {
   controller: AbortController;
 }
 
-// How long IndexedDB writes are held back so a burst of changes is written once.
-const CHAT_STORE_SAVE_DELAY_MS = 300;
 
 export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
@@ -316,13 +317,6 @@ export function useChat(): UseChatResult {
   // one asked in last: other conversations can be opened while an answer streams.
   const [streamingConversationId, setStreamingConversationId] = useState<string | null>(null);
   const [askedConversationId, setAskedConversationId] = useState<string | null>(null);
-  // True when the last persist attempt failed even after the reduced-payload retry
-  // below — the session is memory-only from that point on until a write succeeds.
-  const [persistError, setPersistError] = useState(false);
-  // True when the reduced-payload retry *succeeded*: the active conversation is saved
-  // but the others aren't. Distinct from persistError because "some of this survives a
-  // reload" and "none of this survives a reload" need different warnings.
-  const [persistPartial, setPersistPartial] = useState(false);
 
   const { conversations, activeConversationId } = storage;
   const activeConversation =
@@ -348,211 +342,27 @@ export function useChat(): UseChatResult {
       NO_TURNS,
     [conversations, askedConversationId, activeConversation],
   );
-  // The next IndexedDB write, held back by CHAT_STORE_SAVE_DELAY_MS (see the save effect).
-  const pendingChatStoreRef = useRef<ChatStorageV2 | null>(null);
-  const chatStoreTimerRef = useRef<number | undefined>(undefined);
-  const mountedRef = useRef(true);
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-  const flushChatStore = () => {
-    window.clearTimeout(chatStoreTimerRef.current);
-    const pendingStorage = pendingChatStoreRef.current;
-    pendingChatStoreRef.current = null;
-    if (pendingStorage === null) return;
-    // Mirrors persistStorage: a lone empty conversation clears the store rather than
-    // being saved, so it can't come back next to a new one after a reload.
-    void (
-      isOnlyEmpty(pendingStorage) ? clearChatStore() : saveChatStore(forChatStore(pendingStorage))
-    ).then(
-      (saved) => {
-        if (!mountedRef.current) return;
-        // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
-        if (saved) {
-          setPersistError(false);
-          setPersistPartial(false);
-        } else {
-          // Only localStorage's compact copy (older passage text and turns dropped) is
-          // saved now. This used to pass without a word.
-          setPersistPartial(true);
-        }
-      },
-    );
-  };
-  // IndexedDB holds the full history (see chatStore.ts). Nothing is written there until
-  // it has been read: saving first would replace it with localStorage's compact copy.
-  const [chatStoreReady, setChatStoreReady] = useState(() => !chatStoreAvailable());
-
-  useEffect(() => {
-    if (chatStoreReady) return;
-    let cancelled = false;
-    void loadChatStore().then((raw) => {
-      if (cancelled) return;
-      // An empty conversation holds nothing to restore, and merging one in next to the
-      // fresh one this load already made showed two "New chat" rows.
-      const incoming = parseConversations(raw)?.filter((c) => c.turns.length > 0);
-      const deleted = parseDeleted(raw);
-      if ((incoming && incoming.length > 0) || deleted?.length) {
-        setStorage((prev) =>
-          mergeConversations(
-            prev,
-            incoming ?? [],
-            true,
-            deleted,
-            Date.now(),
-            streamingConversationIdRef.current,
-          ),
-        );
-      }
-      setChatStoreReady(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // Once, on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
   // The assistant turn being streamed right now, if any — see the pagehide flush.
   const streamingTurnIdRef = useRef<string | null>(null);
   // The conversation it streams into, and the text not yet applied to it (deltas are
   // applied once per animation frame, and a hidden tab runs no frames).
   const streamingConversationIdRef = useRef<string | null>(null);
   const bufferedDeltaRef = useRef('');
-
-  // What a reload or a discarded tab would find: the answer being streamed is cut off
-  // there, so it is saved as stopped — saved as-is it read as finished after the
-  // reload, and went back as history.
-  const persistStreamSnapshot = () => {
-    const turnId = streamingTurnIdRef.current;
-    const current = storageRef.current;
-    const pendingText = bufferedDeltaRef.current;
-    const snapshot =
-      turnId === null
-        ? current
-        : {
-            ...current,
-            conversations: current.conversations.map((conversation) => ({
-              ...conversation,
-              turns: conversation.turns.map((turn) =>
-                turn.id === turnId
-                  ? { ...turn, content: turn.content + pendingText, stopped: true }
-                  : turn,
-              ),
-            })),
-          };
-    persistStorage(snapshot);
-    // Best effort: the page may be gone before this commits; localStorage has it.
-    // This snapshot supersedes any write still waiting on its timer.
-    window.clearTimeout(chatStoreTimerRef.current);
-    pendingChatStoreRef.current = null;
-    if (chatStoreAvailable()) void saveChatStore(forChatStore(snapshot));
-  };
-
-  // While an answer streams: the other conversations and the selection as last seen,
-  // to tell a delta (skipped) from a rename, pin, delete or switch elsewhere (saved).
-  const outsideStreamRef = useRef<{
-    others: Conversation[];
-    active: string | null;
-    deleted: ChatStorageV2['deleted'];
-  } | null>(null);
-
-  useEffect(() => {
-    // Skip writes while a stream is in flight — the assistant turn's content mutates
-    // on every delta, and persisting each one would thrash localStorage. `pagehide`
-    // below covers a reload or navigation that lands mid-stream. A change outside the
-    // streaming conversation is saved at once, though: conversations stay usable
-    // mid-answer, and a rename or delete made then used to wait for the answer to end
-    // (other tabs didn't see it, and closing the tab lost it).
-    if (pending) {
-      const streamingId = streamingConversationIdRef.current;
-      const seen = {
-        others: storage.conversations.filter((conversation) => conversation.id !== streamingId),
-        active: storage.activeConversationId,
-        deleted: storage.deleted,
-      };
-      const before = outsideStreamRef.current;
-      outsideStreamRef.current = seen;
-      const changed =
-        before !== null &&
-        (before.active !== seen.active ||
-          before.deleted !== seen.deleted ||
-          before.others.length !== seen.others.length ||
-          before.others.some((conversation, index) => conversation !== seen.others[index]));
-      if (changed && chatStoreReady) persistStreamSnapshot();
-      return;
-    }
-    outsideStreamRef.current = null;
-    const outcome = persistStorage(storage);
-    setPersistError(outcome === 'failed');
-    // Without IndexedDB, localStorage's copy is all there is, and it holds only the
-    // most recent conversations.
-    setPersistPartial(
-      outcome === 'partial' ||
-        (outcome === 'saved' &&
-          !chatStoreAvailable() &&
-          storage.conversations.length > LOCAL_STORAGE_MAX_CONVERSATIONS),
-    );
-    if (!chatStoreReady || !chatStoreAvailable()) return;
-    // Coalesced: every scope click, rename or rating used to rewrite the whole history
-    // in IndexedDB at once; a burst of changes now costs one write. The timer is not
-    // cancelled on unmount (the write must still land), and a hidden tab or pagehide
-    // flushes it early.
-    pendingChatStoreRef.current = storage;
-    window.clearTimeout(chatStoreTimerRef.current);
-    chatStoreTimerRef.current = window.setTimeout(flushChatStore, CHAT_STORE_SAVE_DELAY_MS);
-  }, [storage, pending, chatStoreReady]);
-
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.visibilityState !== 'hidden') return;
-      // Mid-answer nothing is saved until the answer ends, and a mobile browser can
-      // discard a hidden tab without a pagehide: the question and the answer so far
-      // were lost. The finished answer replaces this copy when it lands.
-      if (streamingTurnIdRef.current !== null) persistStreamSnapshot();
-      else flushChatStore();
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => document.removeEventListener('visibilitychange', onVisibility);
-    // flushChatStore and persistStreamSnapshot only read refs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    // A reload, a link followed in this tab, or a closed tab during a 1-2 minute answer
-    // used to lose the question and everything streamed so far.
-    window.addEventListener('pagehide', persistStreamSnapshot);
-    return () => window.removeEventListener('pagehide', persistStreamSnapshot);
-    // persistStreamSnapshot only reads refs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    const onStorage = (event: StorageEvent) => {
-      if (event.key !== CHAT_STORAGE_KEY || !event.newValue) return;
-      try {
-        const payload: unknown = JSON.parse(event.newValue);
-        const incoming = parseConversations(payload);
-        if (!incoming) return;
-        setStorage((prev) =>
-          mergeConversations(
-            prev,
-            incoming,
-            false,
-            parseDeleted(payload),
-            Date.now(),
-            streamingConversationIdRef.current,
-          ),
-        );
-      } catch {
-        // Another tab wrote something unreadable; keep what this tab has.
-      }
-    };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
-  }, []);
+  const { persistError, persistPartial, historyReady } = useChatPersistence(storage, setStorage, pending, {
+    storageRef,
+    streamingTurnIdRef,
+    streamingConversationIdRef,
+    bufferedDeltaRef,
+  });
+  const {
+    importConversation,
+    importPreview,
+    importConversations,
+    newConversation,
+    switchConversation,
+    renameConversation,
+    setPinned,
+  } = useConversationActions(setStorage, storageRef, streamingConversationIdRef);
 
   // Tracks the in-flight question's controller: doubles as a reentrancy guard and lets
   // unmount cancel a hung request.
@@ -927,37 +737,6 @@ export function useChat(): UseChatResult {
     [runAsk],
   );
 
-  const importConversation = useCallback((raw: unknown, title?: string) => {
-    // Fine mid-answer: the answer is written to the conversation it was asked in, by id.
-    const candidate = Array.isArray(raw) ? { turns: raw } : raw;
-    if (!candidate || typeof candidate !== 'object') return false;
-    const record = candidate as Partial<Conversation>;
-    if (!Array.isArray(record.turns)) return false;
-    // Fresh turn ids: importing the same file twice must not produce clashing keys.
-    const turns = record.turns
-      .map(sanitizeTurn)
-      .filter((turn): turn is ChatTurn => turn !== null)
-      .map((turn) => ({ ...turn, id: newId() }));
-    if (turns.length === 0) return false;
-    const now = Date.now();
-    const conversation: Conversation = {
-      id: newId(),
-      title: (title ?? '').trim().slice(0, TITLE_MAX_CHARS) || deriveTitle(turns),
-      createdAt: now,
-      updatedAt: now,
-      turns,
-    };
-    // An export carries only turns: it joins the workspace it is imported into.
-    const workspace = getWorkspace();
-    if (workspace) conversation.workspace = workspace;
-    setStorage((prev) => ({
-      ...prev,
-      activeConversationId: conversation.id,
-      conversations: capConversations([conversation, ...prev.conversations], conversation.id),
-    }));
-    return true;
-  }, []);
-
   const setScope = useCallback(
     (next: ConversationScope | ((prev: ConversationScope) => ConversationScope)) => {
       setStorage((prev) => ({
@@ -1054,67 +833,9 @@ export function useChat(): UseChatResult {
     }));
   }, []);
 
-  const newConversation = useCallback(() => {
-    setStorage((prev) => {
-      // Reuse an already-empty active conversation instead of stacking blanks — but as a
-      // new chat: a document scope set on it ("Ask about these") went on to scope the
-      // first question of what the user had just asked to be a fresh conversation.
-      const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
-      if (active && active.turns.length === 0) {
-        if (!active.scope?.filenames.length && !active.scope?.tags.length) return prev;
-        return {
-          ...prev,
-          conversations: prev.conversations.map((c) =>
-            c.id === active.id ? { ...c, scope: EMPTY_SCOPE, editedAt: Date.now() } : c,
-          ),
-        };
-      }
-      const conversation = emptyConversation();
-      // Past the cap, the least recently *used* unpinned conversation goes — not the
-      // oldest created, which dropped a conversation still in daily use.
-      const conversations = capConversations([conversation, ...prev.conversations], conversation.id);
-      return { ...prev, activeConversationId: conversation.id, conversations };
-    });
-  }, []);
-
-  const switchConversation = useCallback((id: string) => {
-    setStorage((prev) =>
-      prev.conversations.some((conversation) => conversation.id === id)
-        ? { ...prev, activeConversationId: id }
-        : prev,
-    );
-  }, []);
-
-  const renameConversation = useCallback((id: string, title: string) => {
-    const trimmed = title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX_CHARS);
-    if (!trimmed) return;
-    setStorage((prev) => ({
-      ...prev,
-      conversations: prev.conversations.map((conversation) =>
-        conversation.id === id ? { ...conversation, title: trimmed, editedAt: Date.now() } : conversation,
-      ),
-    }));
-  }, []);
-
   const deleteConversation = useCallback((id: string) => {
     if (isStreamingInto(id)) return;
     setStorage((prev) => withoutConversation(prev, id, Date.now()));
-  }, []);
-
-  const setPinned = useCallback((id: string, pinned: boolean) => {
-    const current = storageRef.current.conversations;
-    const target = current.find((conversation) => conversation.id === id);
-    if (!target || Boolean(target.pinned) === pinned) return Boolean(target);
-    if (pinned && current.filter((c) => c.pinned).length >= MAX_PINNED_CONVERSATIONS) return false;
-    setStorage((prev) => ({
-      ...prev,
-      conversations: prev.conversations.map((conversation) =>
-        conversation.id === id
-          ? { ...conversation, pinned: pinned || undefined, editedAt: Date.now() }
-          : conversation,
-      ),
-    }));
-    return true;
   }, []);
 
   const searchConversations = useCallback(
@@ -1213,7 +934,7 @@ export function useChat(): UseChatResult {
 
   return {
     turns,
-    historyReady: chatStoreReady,
+    historyReady,
     streamingConversationId,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
@@ -1223,6 +944,8 @@ export function useChat(): UseChatResult {
     removeFromScopes,
     editAndResend,
     importConversation,
+    importConversations,
+    importPreview,
     pending,
     stage,
     stageTiming,

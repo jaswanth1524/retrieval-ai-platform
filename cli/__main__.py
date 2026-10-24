@@ -41,6 +41,7 @@ from cli.client import (
     DocragError,
     StreamResult,
     grounding_notes,
+    trim_history,
 )
 
 # `ask --strict`: the documents don't answer the question (a script can tell).
@@ -362,12 +363,6 @@ def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     return 0
 
 
-# The server keeps at most this many history messages (CONVERSATION_MAX_HISTORY_MESSAGES
-# defaults to 12), and takes each up to 4000 characters.
-CHAT_HISTORY_MESSAGES = 12
-CHAT_MESSAGE_MAX_CHARS = 4000
-
-
 def cmd_chat(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     """Questions read from stdin, each asked with the conversation so far, so a
     follow-up ("and for contractors?") is read with it. An answer saying the documents
@@ -390,20 +385,25 @@ def cmd_chat(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
             continue
         try:
             result = _ask_once(client, args, question, out, list(history) or None)
+        except KeyboardInterrupt:
+            # Ctrl-C stops this answer (the connection closes, and with it the answer on
+            # the server); the conversation goes on. At the prompt it still ends it.
+            print("\n(stopped)", file=sys.stderr)
+            continue
         except DocragError as exc:
             code = f" ({exc.status_code})" if exc.status_code else ""
             print(f"error{code}: {exc}", file=sys.stderr)
             continue
         if result.done.get("answer_status") in REFUSED_STATUSES:
             continue
-        answer = str(result.done.get("answer", ""))[:CHAT_MESSAGE_MAX_CHARS]
         history.extend(
             [
-                {"role": "user", "content": question[:CHAT_MESSAGE_MAX_CHARS]},
-                {"role": "assistant", "content": answer},
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": str(result.done.get("answer", ""))},
             ]
         )
-        history = history[-CHAT_HISTORY_MESSAGES:]
+        # Kept to what the server takes; ask() trims what it sends the same way.
+        history = trim_history(history)
 
 
 def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -471,13 +471,25 @@ def cmd_read(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
 
 
 def cmd_delete(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Delete each file named; one that fails doesn't stop the rest (exit 1 if any did)."""
+
+    deleted: list[str] = []
+    failed: list[dict[str, Any]] = []
     for name in args.files:
-        client.delete(name)
+        try:
+            client.delete(name)
+        except DocragError as exc:
+            failed.append({"filename": name, "error": str(exc), "status": exc.status_code})
+            if not args.json:
+                code = f" ({exc.status_code})" if exc.status_code else ""
+                print(f"error{code}: {name}: {exc}", file=sys.stderr)
+            continue
+        deleted.append(name)
         if not args.json:
             print(f"deleted {name}", file=out)
     if args.json:
-        print(json.dumps({"deleted": args.files}), file=out)
-    return 0
+        print(json.dumps({"deleted": deleted, "failed": failed}), file=out)
+    return 1 if failed else 0
 
 
 def cmd_tags(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -530,9 +542,14 @@ def cmd_reindex(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     if args.stale:
         report = client.reindex_stale()
         jobs, deferred = report.get("jobs", []), report.get("deferred", [])
+        busy, failed = report.get("in_progress", []), report.get("failed", [])
         if not args.json:
             print(f"{len(jobs)} queued, {len(deferred)} deferred (queue full)", file=out)
-        return _follow(client, jobs, args, out) or (1 if deferred else 0)
+            if busy:
+                print(f"already being indexed: {', '.join(busy)}", file=out)
+            if failed:
+                print(f"could not be queued: {', '.join(failed)}", file=out)
+        return _follow(client, jobs, args, out) or (1 if deferred or failed else 0)
     return _follow(client, [client.reindex(args.file)], args, out)
 
 
@@ -646,7 +663,10 @@ def cmd_watch(client: DocragClient, args: argparse.Namespace, out: TextIO) -> in
 
 def cmd_export(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     written = client.export(Path(args.output))
-    print(f"wrote {written} bytes to {args.output}", file=out)
+    if args.json:
+        print(json.dumps({"output": args.output, "bytes": written}), file=out)
+    else:
+        print(f"wrote {written} bytes to {args.output}", file=out)
     return 0
 
 
@@ -886,6 +906,9 @@ def main(
     except OSError as exc:  # a local file the client didn't already explain
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130  # the shell's code for a run ended by Ctrl-C
     finally:
         if owned:
             active.close()

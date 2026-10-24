@@ -192,9 +192,13 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 # of text is OCR'd; DOCX reads content controls, tracked insertions and simple fields,
 # reads a merged cell once and labels table rows by their header; "|" in a PDF table cell
 # is escaped.
+# v9: a line break inside a table cell (CSV, XLSX, HTML, PPTX, DOCX) is a space, so a row stays
+# one line and keeps its row label; a PDF page whose tables pdfplumber can't read no
+# longer drops the tables of every other page; a stamped scan page OCR doesn't read keeps
+# its stamp's text.
 # Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
 # carry an older version is listed as stale, and re-indexing it applies this one.
-CHUNKER_VERSION = 8
+CHUNKER_VERSION = 9
 
 # The smallest share of CHUNK_SIZE_TOKENS a window keeps for text, whatever the
 # filename › section prefix costs. Without a floor a long name left one token per

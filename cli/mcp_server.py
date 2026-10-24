@@ -24,7 +24,14 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from cli.client import Cancelled, DocragClient, DocragError, StreamResult, grounding_notes
+from cli.client import (
+    Cancelled,
+    DocragClient,
+    DocragError,
+    StreamResult,
+    grounding_notes,
+    trim_history,
+)
 
 # A passage shown to the model is cut here: a search returns up to a dozen of them.
 _PASSAGE_CHARS = 1200
@@ -200,13 +207,8 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         contractors?") is read with it; leave out answers that said the documents don't
         cover the question."""
 
-        turns = [
-            {"role": str(turn.get("role")), "content": str(turn.get("content", ""))}
-            for turn in history or []
-            if isinstance(turn, dict)
-            and turn.get("role") in ("user", "assistant")
-            and str(turn.get("content", "")).strip()
-        ]
+        # Trimmed to what the server takes (an agent often passes whole earlier answers).
+        turns = trim_history(list(history or []))
         return await call(
             lambda client, should_stop: format_answer(
                 client.ask(
