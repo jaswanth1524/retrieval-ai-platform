@@ -74,6 +74,12 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         watch_enabled=bool(settings.watch_dir),
         answer_language=settings.answer_language,
         summary_max_documents=settings.summary_max_documents,
+        answer_format=settings.answer_format,
+        query_log_enabled=settings.query_log_enabled,
+        document_versions_enabled=bool(
+            settings.raw_document_dir and int(settings.raw_document_versions) > 0
+        ),
+        traces_persisted=bool(settings.trace_enabled and settings.trace_store_path),
     )
 
 

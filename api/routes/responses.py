@@ -69,10 +69,12 @@ def trace_summary_response(trace: QueryTrace) -> TraceSummaryResponse:
     )
 
 
-def usage_response(usage: tuple[int, int] | None) -> UsageResponse | None:
+def usage_response(
+    usage: tuple[int, int] | None, cost_usd: float | None = None
+) -> UsageResponse | None:
     if usage is None:
         return None
-    return UsageResponse(prompt_tokens=usage[0], completion_tokens=usage[1])
+    return UsageResponse(prompt_tokens=usage[0], completion_tokens=usage[1], cost_usd=cost_usd)
 
 
 def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
@@ -95,6 +97,10 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
                 filenames=trace.config.filenames,
                 tags=trace.config.tags,
                 reranker_model=trace.config.reranker_model,
+                answer_format=trace.config.answer_format,
+                answer_language=trace.config.answer_language,
+                narrowing=trace.config.narrowing,
+                llm_model=trace.config.llm_model,
             )
             if trace.config is not None
             else None
@@ -135,7 +141,7 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         citation_retry_used=trace.citation_retry_used,
         citation_backfilled=trace.citation_backfilled,
         request_id=trace.request_id,
-        usage=usage_response(trace.usage),
+        usage=usage_response(trace.usage, trace.cost_usd),
     )
 
 

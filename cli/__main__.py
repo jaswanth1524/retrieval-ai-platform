@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 import time
@@ -109,6 +110,7 @@ STAGE_NAMES = {
     "condensing": "reading the conversation",
     "searching": "searching documents",
     "waiting_for_model": "waiting for the model (another question is using it)",
+    "joining_identical_question": "the same question is being answered; waiting for it",
     "reading": "reading the passages",
     "verifying_citations": "checking citations",
     "reading_documents": "reading the document",
@@ -312,6 +314,69 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     return 0 if succeeded else 1
 
 
+ANSWER_FORMATS = ("default", "bullets", "table", "brief")
+
+
+def question_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The narrowing and answer-style flags ``ask`` and ``chat`` share."""
+
+    return {
+        "page_min": args.page_min,
+        "page_max": args.page_max,
+        "section": args.section,
+        "exclude_filenames": args.exclude,
+        "answer_format": args.answer_format,
+        "answer_language": args.language,
+    }
+
+
+def _question_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--page-min", type=int, help="Only passages from this page on.")
+    parser.add_argument("--page-max", type=int, help="Only passages up to this page.")
+    parser.add_argument("--section", help="Only passages under this exact section label.")
+    parser.add_argument("--exclude", action="append", help="Leave this document out (repeatable).")
+    parser.add_argument(
+        "--answer-format", choices=ANSWER_FORMATS, help="How the answer is laid out."
+    )
+    parser.add_argument(
+        "--language", help='Answer in this language ("German"), or "match" the question.'
+    )
+
+
+_MARKER_RE = re.compile(r"\[(\d{1,6})\]")
+
+
+def answer_markdown(result: StreamResult) -> str:
+    """The answer as Markdown: its ``[n]`` markers as footnotes, each source a footnote
+    with the quotes the answer rests on — ready to paste into a document or a ticket."""
+
+    answer = _MARKER_RE.sub(r"[^\1]", str(result.done.get("answer", "")).strip())
+    lines = [answer]
+    notes = grounding_notes(result.done)
+    if notes:
+        lines.append("")
+        lines.extend(f"> {note}" for note in notes)
+    sources = result.done.get("sources") or []
+    if sources:
+        lines.append("")
+    for source in sources:
+        page, end = source.get("page"), source.get("page_end")
+        pages = f"p.{page}-{end}" if end else f"p.{page}"
+        line = (
+            f"[^{source.get('source_number')}]: {source.get('filename')}, {pages}"
+            f" · {source.get('section') or '-'}"
+        )
+        quotes = [
+            " ".join(str(span.get("quote", "")).split())
+            for span in source.get("spans") or []
+            if isinstance(span, dict) and span.get("quote")
+        ]
+        if quotes:
+            line += " — " + " … ".join(f"“{quote}”" for quote in quotes)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _ask_once(
     client: DocragClient,
     args: argparse.Namespace,
@@ -324,7 +389,11 @@ def _ask_once(
 
     streamed: list[str] = []
     reporter = StageReporter(sys.stderr)
-    quiet = args.json or args.quiet
+    output_format = getattr(args, "format", None) or ("json" if args.json else "text")
+    as_json = output_format == "json"
+    # Markdown is written once the answer is final: its [n] markers become footnotes.
+    streaming = output_format == "text"
+    quiet = as_json or args.quiet
 
     def write(text: str) -> None:
         reporter.delta()
@@ -340,11 +409,15 @@ def _ask_once(
             filenames=args.file or None,
             tags=args.tag or None,
             provider=args.provider,
-            on_delta=None if args.json else write,
+            on_delta=write if streaming else None,
             on_stage=None if quiet else reporter.stage,
             history=history,
+            options=question_options(args),
         )
-    if args.json:
+    if output_format == "markdown":
+        print(answer_markdown(result), file=out)
+        return result
+    if as_json:
         print(json.dumps({**result.done, "followups": result.followups}), file=out)
         return result
     print(file=out)
@@ -776,12 +849,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"Exit {EXIT_NOT_ANSWERED} when the documents don't answer the question.",
     )
+    _question_flags(ask)
+    ask.add_argument(
+        "--format",
+        choices=("text", "markdown", "json"),
+        help="text (streamed, default), markdown (footnoted sources) or json (= --json).",
+    )
 
     chat = command("chat", "Ask questions from stdin, each with the conversation so far.")
     chat.add_argument("--file", action="append", help="Limit to this document (repeatable).")
     chat.add_argument("--tag", action="append", help="Limit to documents with this tag.")
     chat.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
     chat.add_argument("--quiet", action="store_true", help="No progress lines on stderr.")
+    _question_flags(chat)
 
     summarize = command(
         "summarize", "Summarize a document, compare two, or write one brief across several."

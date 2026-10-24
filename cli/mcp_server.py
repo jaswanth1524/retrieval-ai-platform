@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -197,6 +197,12 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         filenames: list[str] | None = None,
         tags: list[str] | None = None,
         history: list[dict[str, str]] | None = None,
+        page_min: int | None = None,
+        page_max: int | None = None,
+        section: str | None = None,
+        exclude_filenames: list[str] | None = None,
+        answer_format: Literal["default", "bullets", "table", "brief"] | None = None,
+        answer_language: str | None = None,
     ) -> str:
         """Answer a question from the indexed documents, with numbered citations and the
         exact quotes they rest on.
@@ -205,14 +211,29 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         those tags. history is the conversation so far, oldest first, as
         [{"role": "user" | "assistant", "content": "..."}], so a follow-up ("and for
         contractors?") is read with it; leave out answers that said the documents don't
-        cover the question."""
+        cover the question. page_min/page_max/section/exclude_filenames narrow where to
+        look; answer_format ("bullets", "table", "brief") and answer_language ("German",
+        or "match" the question) shape the answer."""
 
         # Trimmed to what the server takes (an agent often passes whole earlier answers).
         turns = trim_history(list(history or []))
+        options = {
+            "page_min": page_min,
+            "page_max": page_max,
+            "section": section,
+            "exclude_filenames": exclude_filenames,
+            "answer_format": answer_format,
+            "answer_language": answer_language,
+        }
         return await call(
             lambda client, should_stop: format_answer(
                 client.ask(
-                    question, filenames, should_stop=should_stop, tags=tags, history=turns or None
+                    question,
+                    filenames,
+                    should_stop=should_stop,
+                    tags=tags,
+                    history=turns or None,
+                    options=options,
                 )
             )
         )

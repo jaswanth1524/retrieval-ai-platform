@@ -968,6 +968,11 @@
       "title": "Allowed Request Providers",
       "type": "array"
      },
+     "answer_format": {
+      "default": "default",
+      "title": "Answer Format",
+      "type": "string"
+     },
      "answer_language": {
       "default": "",
       "title": "Answer Language",
@@ -990,6 +995,11 @@
      "dense_retrieval_limit": {
       "title": "Dense Retrieval Limit",
       "type": "integer"
+     },
+     "document_versions_enabled": {
+      "default": false,
+      "title": "Document Versions Enabled",
+      "type": "boolean"
      },
      "embedding_model_tag": {
       "title": "Embedding Model Tag",
@@ -1057,6 +1067,11 @@
       "title": "Qdrant Collection",
       "type": "string"
      },
+     "query_log_enabled": {
+      "default": false,
+      "title": "Query Log Enabled",
+      "type": "boolean"
+     },
      "raw_documents_enabled": {
       "default": false,
       "title": "Raw Documents Enabled",
@@ -1101,6 +1116,11 @@
       },
       "title": "Supported Extensions",
       "type": "array"
+     },
+     "traces_persisted": {
+      "default": false,
+      "title": "Traces Persisted",
+      "type": "boolean"
      },
      "url_ingest_enabled": {
       "default": false,
@@ -1216,6 +1236,70 @@
    "QuestionRequest": {
     "description": "Question-answering request.",
     "properties": {
+     "answer_format": {
+      "anyOf": [
+       {
+        "enum": [
+         "default",
+         "bullets",
+         "table",
+         "brief"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Format"
+     },
+     "answer_language": {
+      "anyOf": [
+       {
+        "maxLength": 40,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Language"
+     },
+     "chunk_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "maxItems": 100,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chunk Ids"
+     },
+     "exclude_filenames": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        "maxItems": 500,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Exclude Filenames"
+     },
      "filenames": {
       "anyOf": [
        {
@@ -1291,6 +1375,30 @@
       ],
       "title": "Max Context Chunks"
      },
+     "page_max": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Max"
+     },
+     "page_min": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Min"
+     },
      "question": {
       "maxLength": 4000,
       "minLength": 1,
@@ -1309,6 +1417,19 @@
        }
       ],
       "title": "Rerank Top K"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Section"
      },
      "tags": {
       "anyOf": [
@@ -1445,6 +1566,24 @@
    "SearchRequest": {
     "description": "Retrieval without an answer: the passages a question would be answered from.",
     "properties": {
+     "chunk_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "maxItems": 100,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chunk Ids"
+     },
      "exclude_filenames": {
       "anyOf": [
        {
@@ -2023,6 +2162,16 @@
    "TraceConfigResponse": {
     "description": "Effective per-request settings a trace was generated under.",
     "properties": {
+     "answer_format": {
+      "default": "default",
+      "title": "Answer Format",
+      "type": "string"
+     },
+     "answer_language": {
+      "default": "",
+      "title": "Answer Language",
+      "type": "string"
+     },
      "filenames": {
       "anyOf": [
        {
@@ -2041,6 +2190,17 @@
       "title": "Fused Top N",
       "type": "integer"
      },
+     "llm_model": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Llm Model"
+     },
      "llm_provider": {
       "title": "Llm Provider",
       "type": "string"
@@ -2052,6 +2212,18 @@
      "max_context_chunks": {
       "title": "Max Context Chunks",
       "type": "integer"
+     },
+     "narrowing": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Narrowing"
      },
      "rerank_min_score": {
       "title": "Rerank Min Score",
@@ -2412,11 +2584,22 @@
     "type": "object"
    },
    "UsageResponse": {
-    "description": "Tokens the provider reported for an answer's LLM calls (the citation retry and a\nsummary's notes included; condensing, query expansion and follow-ups not).",
+    "description": "Tokens the provider reported for an answer's LLM calls: the condense, query\nexpansion, the answer, its citation retry, a summary's notes, and (on POST\n/questions) the follow-ups; a stream's `done` comes before its follow-ups.",
     "properties": {
      "completion_tokens": {
       "title": "Completion Tokens",
       "type": "integer"
+     },
+     "cost_usd": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Cost Usd"
      },
      "prompt_tokens": {
       "title": "Prompt Tokens",
@@ -4722,6 +4905,64 @@
      }
     },
     "summary": "List Traces"
+   }
+  },
+  "/traces/export": {
+   "get": {
+    "operationId": "export_traces_traces_export_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/x-ndjson": {}
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Export Traces"
    }
   },
   "/traces/{trace_id}": {

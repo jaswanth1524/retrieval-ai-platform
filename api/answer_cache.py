@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock
 
 from api.corpus import corpus_generation
 from api.generation import SourceCitation, completion_model_and_kwargs
@@ -50,8 +50,13 @@ def answer_cache_key(
     settings: AppSettings,
     filenames: Sequence[str] | None,
     tags: Sequence[str] | None = None,
+    narrow: Hashable | None = None,
 ) -> CacheKey:
-    """Everything the answer depends on that can differ between two requests."""
+    """Everything the answer depends on that can differ between two requests.
+
+    ``narrow`` is the question's passage narrowing (``repository.PassageFilter``, a
+    frozen dataclass): a question asked over pages 3-4 is another answer.
+    """
 
     model, _ = completion_model_and_kwargs(settings)
     return (
@@ -67,8 +72,50 @@ def answer_cache_key(
         int(settings.rerank_top_k),
         int(settings.max_context_chunks),
         float(settings.llm_temperature),
+        settings.answer_language,
+        settings.answer_format,
+        narrow,
         corpus_generation(settings.qdrant_collection),
     )
+
+
+class InflightRuns:
+    """The questions (and summaries) being answered right now, by cache key.
+
+    Two identical questions arriving together each ran retrieval, the rerank and the
+    LLM; at a local model the second also queued behind the first for the whole
+    generation. Now the first *leads*: the others *follow*, waiting until the leader's
+    answer is in the cache and replaying it. A leader that fails or is abandoned leaves
+    no answer, and a follower then runs the question itself — no hand-over machinery.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._runs: dict[CacheKey, Event] = {}
+
+    def claim(self, key: CacheKey) -> tuple[Event, bool]:
+        """The event of ``key``'s run, and whether the caller now leads it."""
+
+        with self._lock:
+            event = self._runs.get(key)
+            if event is not None:
+                return event, False
+            event = Event()
+            self._runs[key] = event
+            return event, True
+
+    def finish(self, key: CacheKey, event: Event) -> None:
+        """Release ``key``'s followers (idempotent). Called right after the leader's
+        answer is cached, and again from its ``finally`` as a backstop."""
+
+        event.set()
+        with self._lock:
+            if self._runs.get(key) is event:
+                del self._runs[key]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._runs)
 
 
 class AnswerCache:
@@ -85,6 +132,8 @@ class AnswerCache:
         self._clock = clock
         self._lock = Lock()
         self._entries: OrderedDict[CacheKey, tuple[float, CachedAnswer]] = OrderedDict()
+        # Shared with the cache: a follower replays the leader's cached answer.
+        self.inflight = InflightRuns()
 
     def get(self, key: CacheKey) -> CachedAnswer | None:
         with self._lock:

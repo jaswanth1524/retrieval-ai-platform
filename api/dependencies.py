@@ -36,6 +36,7 @@ from api.repository import (
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
 from api.summarize import DocumentSummarizer
+from api.trace_archive import TraceArchive
 from api.tracing import TraceSink, TraceStore
 from api.workspaces import (
     WORKSPACE_HEADER,
@@ -259,7 +260,13 @@ def get_trace_store() -> TraceStore:
     dependency directly, or unit-test ``TraceStore`` in isolation.
     """
 
-    return TraceStore(max_retained=int(get_app_settings().trace_max_retained))
+    settings = get_app_settings()
+    archive = (
+        TraceArchive(settings.trace_store_path, int(settings.trace_store_max_rows))
+        if settings.trace_enabled and settings.trace_store_path
+        else None
+    )
+    return TraceStore(max_retained=int(settings.trace_max_retained), archive=archive)
 
 
 def get_rag_pipeline(

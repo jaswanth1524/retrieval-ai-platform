@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from api.citations import ANSWER_STATUSES
 from api.documents import MAX_TAGS_PER_DOCUMENT
-from api.settings import SUMMARY_DOCUMENTS_LIMIT
+from api.settings import SUMMARY_DOCUMENTS_LIMIT, AnswerFormat, normalize_answer_language
 from api.tracing import TRACE_DROP_REASONS
 
 # Bounds for per-question retrieval/generation overrides accepted by QuestionRequest.
@@ -53,8 +53,41 @@ REQUEST_TRACE_ID_MAX_CHARS = 64
 FEEDBACK_EXCERPT_MAX_CHARS = 2000
 FEEDBACK_CITED_FILENAMES_MAX = 50
 FEEDBACK_CITATION_NUMBER_MAX = 1000
+# Passages a question or search may be narrowed to (picked in the Search panel). Chunk
+# ids are 20 hex characters (documents.build_chunk_id).
+REQUEST_CHUNK_IDS_MAX = 100
+REQUEST_CHUNK_ID_MAX_CHARS = 64
 RequestFilename = Annotated[str, StringConstraints(max_length=REQUEST_FILENAME_MAX_CHARS)]
 RequestTag = Annotated[str, StringConstraints(max_length=REQUEST_TAG_MAX_CHARS)]
+RequestChunkId = Annotated[
+    str, StringConstraints(min_length=1, max_length=REQUEST_CHUNK_ID_MAX_CHARS)
+]
+
+
+class PassageNarrowing(BaseModel):
+    """Where in the documents to look, shared by POST /search and questions. Every field
+    narrows the same hybrid search, fusion and rerank; none replaces them."""
+
+    # Passages starting on a page in this range (either end optional).
+    page_min: int | None = Field(default=None, ge=1)
+    page_max: int | None = Field(default=None, ge=1)
+    # Passages under exactly this section label (as citations show it).
+    section: str | None = Field(default=None, min_length=1, max_length=SEARCH_SECTION_MAX_CHARS)
+    # Documents to leave out.
+    exclude_filenames: list[RequestFilename] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
+    )
+    # Only these passages, by chunk id.
+    chunk_ids: list[RequestChunkId] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_CHUNK_IDS_MAX
+    )
+
+    @model_validator(mode="after")
+    def _page_range_in_order(self) -> PassageNarrowing:
+        if self.page_min is not None and self.page_max is not None:
+            if self.page_min > self.page_max:
+                raise ValueError("page_min must not be greater than page_max.")
+        return self
 
 
 class HealthResponse(BaseModel):
@@ -142,6 +175,15 @@ class PublicConfigResponse(BaseModel):
     answer_language: str = ""
     # SUMMARY_MAX_DOCUMENTS: the most documents one brief may cover.
     summary_max_documents: int = 5
+    # ANSWER_FORMAT: how answers are laid out unless a question asks otherwise.
+    answer_format: str = "default"
+    # QUERY_LOG_ENABLED: GET /query-log (the questions the documents didn't answer).
+    query_log_enabled: bool = False
+    # RAW_DOCUMENT_VERSIONS > 0 with RAW_DOCUMENT_DIR: replaced originals are kept, so
+    # GET /documents/{f}/versions and their restore are available.
+    document_versions_enabled: bool = False
+    # TRACE_STORE_PATH: traces are kept on disk (GET /traces/export has them all).
+    traces_persisted: bool = False
 
 
 class DocumentIngestResponse(BaseModel):
@@ -387,6 +429,13 @@ class TraceConfigResponse(BaseModel):
     # The tag scope the question was asked under; None when it wasn't tag-scoped.
     tags: list[str] | None = None
     reranker_model: str | None = None
+    answer_format: str = "default"
+    answer_language: str = ""
+    # The question's passage narrowing (page_min, page_max, section, chunk_ids,
+    # exclude_filenames — only the ones given); None when it had none.
+    narrowing: dict[str, Any] | None = None
+    # The model the provider was asked for (LiteLLM's name).
+    llm_model: str | None = None
 
 
 class TraceCandidateResponse(BaseModel):
@@ -448,11 +497,15 @@ class QueryLogResponse(BaseModel):
 
 
 class UsageResponse(BaseModel):
-    """Tokens the provider reported for an answer's LLM calls (the citation retry and a
-    summary's notes included; condensing, query expansion and follow-ups not)."""
+    """Tokens the provider reported for an answer's LLM calls: the condense, query
+    expansion, the answer, its citation retry, a summary's notes, and (on POST
+    /questions) the follow-ups; a stream's `done` comes before its follow-ups."""
 
     prompt_tokens: int
     completion_tokens: int
+    # An estimate at the hosted model's list price (LiteLLM's bundled table); absent for
+    # local providers and models it doesn't list.
+    cost_usd: float | None = None
 
 
 class TraceDetailResponse(BaseModel):
@@ -498,7 +551,7 @@ class HistoryMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=REQUEST_HISTORY_MESSAGE_MAX_CHARS)
 
 
-class QuestionRequest(BaseModel):
+class QuestionRequest(PassageNarrowing):
     """Question-answering request."""
 
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
@@ -529,6 +582,14 @@ class QuestionRequest(BaseModel):
     )
     # False skips the answer cache's lookup (Regenerate); the new answer is still cached.
     use_cache: bool = True
+    # This answer's layout and language, over ANSWER_FORMAT / ANSWER_LANGUAGE.
+    answer_format: AnswerFormat | None = None
+    answer_language: str | None = Field(default=None, max_length=40)
+
+    @field_validator("answer_language", mode="after")
+    @classmethod
+    def _check_answer_language(cls, value: str | None) -> str | None:
+        return None if value is None else normalize_answer_language(value)
 
     @model_validator(mode="after")
     def _validate_context_within_rerank(self) -> QuestionRequest:
@@ -676,7 +737,7 @@ class AccessResponse(BaseModel):
     access: Literal["full", "read", "open"]
 
 
-class SearchRequest(BaseModel):
+class SearchRequest(PassageNarrowing):
     """Retrieval without an answer: the passages a question would be answered from."""
 
     query: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
@@ -688,22 +749,6 @@ class SearchRequest(BaseModel):
     )
     # How many reranked passages to return; capped by the server's fused_top_n (400).
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
-    # Passages starting on a page in this range (either end optional).
-    page_min: int | None = Field(default=None, ge=1)
-    page_max: int | None = Field(default=None, ge=1)
-    # Passages under exactly this section label (as citations show it).
-    section: str | None = Field(default=None, min_length=1, max_length=SEARCH_SECTION_MAX_CHARS)
-    # Documents to leave out.
-    exclude_filenames: list[RequestFilename] | None = Field(
-        default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
-    )
-
-    @model_validator(mode="after")
-    def _page_range_in_order(self) -> SearchRequest:
-        if self.page_min is not None and self.page_max is not None:
-            if self.page_min > self.page_max:
-                raise ValueError("page_min must not be greater than page_max.")
-        return self
 
 
 class SearchResultResponse(BaseModel):

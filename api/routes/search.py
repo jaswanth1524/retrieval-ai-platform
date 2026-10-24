@@ -6,25 +6,14 @@ from fastapi import Depends, FastAPI
 
 from api.dependencies import require_api_key
 from api.pipeline import AnswerOverrides
-from api.repository import PassageFilter
 from api.routes.deps import QuestionSlotsDep, RagPipelineDep
-from api.routes.questions import question_slot
+from api.routes.questions import passage_narrowing, question_slot
 from api.schemas import (
     SearchRequest,
     SearchResponse,
     SearchResultResponse,
     SearchTimingsResponse,
 )
-
-
-def _narrowing(request: SearchRequest) -> PassageFilter | None:
-    narrow = PassageFilter(
-        page_min=request.page_min,
-        page_max=request.page_max,
-        section=request.section,
-        exclude_filenames=tuple(request.exclude_filenames or ()),
-    )
-    return None if narrow == PassageFilter() else narrow
 
 
 def register(app: FastAPI) -> None:
@@ -46,7 +35,7 @@ def register(app: FastAPI) -> None:
                 filenames=request.filenames,
                 tags=request.tags,
                 for_generation=False,
-                narrow=_narrowing(request),
+                narrow=passage_narrowing(request),
             )
         finally:
             release()

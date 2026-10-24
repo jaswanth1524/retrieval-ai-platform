@@ -20,6 +20,21 @@ _BAD_COLLECTION_CHARS = re.compile(r'[<>:"/\\|?*\x00]')
 _VALID_REASONING_EFFORTS = frozenset({"", "minimal", "low", "medium", "high"})
 
 
+AnswerFormat = Literal["default", "bullets", "table", "brief"]
+
+
+def normalize_answer_language(value: str, name: str = "answer_language") -> str:
+    """ANSWER_LANGUAGE (and a question's ``answer_language``): empty, "match", or a
+    language name of letters and single spaces — it goes into the system prompt."""
+
+    value = " ".join(value.split())
+    if value.lower() == "match":
+        return "match"
+    if value and not re.fullmatch(r"[^\W\d_]+(?: [^\W\d_]+)*", value):
+        raise ValueError(f'{name} must be empty, "match", or a language name ("German").')
+    return value
+
+
 class AppSettings(BaseSettings):
     """Runtime settings shared by backend components."""
 
@@ -201,6 +216,11 @@ class AppSettings(BaseSettings):
     # language; or a language name ("German"). One fixed sentence in the system prompt,
     # so prompt prefix caching still applies.
     answer_language: str = Field(default="", max_length=40)
+    # How answers are laid out: "default" (the model's choice), "bullets", "table"
+    # (a Markdown table where the content allows it) or "brief" (two or three
+    # sentences). One fixed sentence after the grounding rules, which it never
+    # replaces. A question can ask for another (`answer_format`).
+    answer_format: AnswerFormat = "default"
     # Requests per minute each client may make that change something (POST, PATCH,
     # DELETE on the API: questions, searches, uploads, feedback...) or that present a
     # wrong API key; past it, 429 + Retry-After (api/rate_limit.py). Reads and job polls
@@ -400,6 +420,12 @@ class AppSettings(BaseSettings):
     # lists; oldest traces are pruned first once the cap is exceeded.
     trace_enabled: bool = True
     trace_max_retained: PositiveInt = 100
+    # Also keep traces in this sqlite file ("" = memory only): they then survive a
+    # restart and outlive the ring, so a cached answer's or a feedback row's trace id
+    # still opens. Holds prompts, so passages and what users typed. Oldest rows go past
+    # TRACE_STORE_MAX_ROWS. Never part of a backup.
+    trace_store_path: str = ""
+    trace_store_max_rows: PositiveInt = 5000
 
     # Conversation memory: the client sends recent prior turns with each question
     # (the server stays stateless — no session store). When history is present, one
@@ -609,14 +635,7 @@ class AppSettings(BaseSettings):
     @field_validator("answer_language", mode="after")
     @classmethod
     def _check_answer_language(cls, value: str) -> str:
-        value = " ".join(value.split())
-        if value.lower() == "match":
-            return "match"
-        if value and not re.fullmatch(r"[^\W\d_]+(?: [^\W\d_]+)*", value):
-            raise ValueError(
-                'ANSWER_LANGUAGE must be empty, "match", or a language name ("German").'
-            )
-        return value
+        return normalize_answer_language(value, "ANSWER_LANGUAGE")
 
     @field_validator("sparse_language", mode="before")
     @classmethod

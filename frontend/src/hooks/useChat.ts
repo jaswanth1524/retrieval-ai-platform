@@ -145,6 +145,7 @@ const STAGE_LABELS: Record<string, string> = {
   condensing: 'reading the conversation…',
   searching: 'searching documents…',
   waiting_for_model: 'waiting for the model — another question is using it…',
+  joining_identical_question: 'the same question is being answered — waiting for it…',
   reading: 'reading the passages…',
   verifying_citations: 'checking citations…',
   reading_documents: 'reading the document…',

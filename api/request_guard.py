@@ -69,7 +69,9 @@ def is_rate_limited(method: str, path: str) -> bool:
     """Requests RATE_LIMIT_PER_MINUTE counts: changes, plus the export, which reads
     every stored original."""
 
-    return method in RATE_LIMITED_METHODS or (method == "GET" and path == "/export")
+    return method in RATE_LIMITED_METHODS or (
+        method == "GET" and path in ("/export", "/traces/export")
+    )
 
 
 def is_guarded_path(path: str) -> bool:
@@ -85,7 +87,9 @@ def needs_full_key(method: str, path: str) -> bool:
     """Routes the read-only key (API_READ_KEY) may not use: changes to the corpus, and
     operator data (feedback, metrics, the full export)."""
 
-    if path in ("/metrics", "/export", "/query-log") or (path == "/feedback" and method == "GET"):
+    if path in ("/metrics", "/export", "/query-log", "/traces/export") or (
+        path == "/feedback" and method == "GET"
+    ):
         return True
     if method == "POST" and path in ("/import", "/watch/scan"):
         return True

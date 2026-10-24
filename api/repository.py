@@ -951,14 +951,18 @@ def _is_missing_collection(exc: BaseException) -> bool:
 
 @dataclass(frozen=True)
 class PassageFilter:
-    """Narrows a search to passages by where they are (POST /search): a page range,
-    one section (its exact label), and documents left out. Pages and sections are
-    keyword/integer-indexed payload fields, so these are plain Qdrant filters."""
+    """Narrows a search (POST /search) or a question to passages by where they are: a
+    page range, one section (its exact label), documents left out, or picked passages.
+    Pages, sections and chunk ids are indexed payload fields, so these are plain Qdrant
+    filters."""
 
     page_min: int | None = None
     page_max: int | None = None
     section: str | None = None
     exclude_filenames: tuple[str, ...] = ()
+    # Only these passages (chunk ids): a question about passages picked in the Search
+    # panel. Still searched and reranked like any other scope.
+    chunk_ids: tuple[str, ...] = ()
 
 
 def _scope_filter(
@@ -986,6 +990,12 @@ def _scope_filter(
         if narrow.section:
             must.append(
                 models.FieldCondition(key="section", match=models.MatchValue(value=narrow.section))
+            )
+        if narrow.chunk_ids:
+            must.append(
+                models.FieldCondition(
+                    key="chunk_id", match=models.MatchAny(any=list(narrow.chunk_ids))
+                )
             )
         if narrow.exclude_filenames:
             must_not.append(

@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -298,11 +298,19 @@ class DocragClient:
         should_stop: Callable[[], bool] | None = None,
         tags: list[str] | None = None,
         history: list[dict[str, str]] | None = None,
+        options: Mapping[str, Any] | None = None,
     ) -> StreamResult:
         """``history``: the conversation so far ({role: user|assistant, content}),
-        oldest first, so a follow-up ("and for contractors?") is read with it."""
+        oldest first, so a follow-up ("and for contractors?") is read with it.
 
-        body: dict[str, Any] = {"question": question}
+        ``options``: more request fields — narrowing (``page_min``, ``page_max``,
+        ``section``, ``exclude_filenames``, ``chunk_ids``) and ``answer_format`` /
+        ``answer_language``; None and empty values are left out."""
+
+        body: dict[str, Any] = {
+            key: value for key, value in (options or {}).items() if value not in (None, "", [])
+        }
+        body["question"] = question
         trimmed = trim_history(history or [])
         if trimmed:
             body["history"] = trimmed

@@ -31,6 +31,13 @@ answer_cache_hits_total = Counter(
     "Questions answered from the answer cache (not counted in the stage histograms).",
 )
 
+answer_inflight_joins_total = Counter(
+    "docrag_answer_inflight_joins_total",
+    "Questions and summaries that waited for an identical one already running: "
+    "outcome=replayed (its answer was reused) or ran (it left none; asked again).",
+    ["outcome"],
+)
+
 ingest_jobs_total = Counter(
     "docrag_ingest_jobs_total",
     "Total background ingestion jobs, labeled by outcome and (for outcome=failed) error_type.",
@@ -131,6 +138,13 @@ llm_tokens_total = Counter(
     "docrag_llm_tokens_total",
     "Tokens the LLM provider reported using, labeled by provider and kind.",
     labelnames=("provider", "kind"),
+)
+
+llm_cost_usd_total = Counter(
+    "docrag_llm_cost_usd_total",
+    "Estimated cost in US dollars of the tokens hosted LLM providers reported, from "
+    "LiteLLM's bundled price table (local providers and unlisted models count nothing).",
+    labelnames=("provider", "model"),
 )
 
 question_slots_in_use = Gauge(
