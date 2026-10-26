@@ -184,9 +184,8 @@ class DocragClient:
         self._headers = {"X-API-Key": key} if key else {}
         # The workspace to work in (WORKSPACES_ENABLED); none is the default workspace.
         space = workspace if workspace is not None else os.environ.get("DOCRAG_WORKSPACE", "")
-        if space:
-            self._headers["X-Workspace"] = space
-        self.workspace = space
+        self.workspace = ""
+        self.use_workspace(space)
         self._owns_http = http is None
         self._http = http or httpx.Client(
             base_url=url,
@@ -196,6 +195,16 @@ class DocragClient:
         self._sleep = sleep
         self._clock = clock
         self._poll_failures: dict[str, int] = {}
+
+    def use_workspace(self, name: str) -> None:
+        """Work in workspace ``name`` from now on ("" or "default" is the default one)."""
+
+        space = "" if name in ("", "default") else name
+        if space:
+            self._headers["X-Workspace"] = space
+        else:
+            self._headers.pop("X-Workspace", None)
+        self.workspace = space
 
     def close(self) -> None:
         if self._owns_http:
@@ -238,6 +247,35 @@ class DocragClient:
         result: dict[str, Any] = self._json("GET", "/health")
         return result
 
+    def readiness(self) -> dict[str, Any]:
+        """``GET /health/ready``: Qdrant, the generation provider, each model and the
+        index, whether ready (200) or degraded (503, with the same body)."""
+
+        try:
+            response = self._http.request("GET", "/health/ready", headers=self._headers)
+        except httpx.HTTPError as exc:
+            raise self._unreachable(exc) from exc
+        if response.status_code not in (200, 503):
+            raise DocragError(_detail(response), response.status_code)
+        result: dict[str, Any] = _response_json(response)
+        return result
+
+    def traces(self) -> list[dict[str, Any]]:
+        """Recent question traces, newest first (one line each)."""
+
+        result: dict[str, Any] = self._json("GET", "/traces")
+        return list(result.get("traces", []))
+
+    def trace(self, trace_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("GET", f"/traces/{_quote(trace_id)}")
+        return result
+
+    def feedback(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Recorded answer ratings, newest first (FEEDBACK_ENABLED, full key)."""
+
+        result: dict[str, Any] = self._json("GET", "/feedback", params={"limit": limit})
+        return list(result.get("feedback", []))
+
     def config(self) -> dict[str, Any]:
         result: dict[str, Any] = self._json("GET", "/config")
         return result
@@ -270,11 +308,16 @@ class DocragClient:
         filenames: list[str] | None = None,
         top_k: int | None = None,
         tags: list[str] | None = None,
+        options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """The whole ``POST /search`` response: ``results`` and ``weak_matches`` (none
-        cleared the relevance bar; these are the closest)."""
+        cleared the relevance bar; these are the closest). ``options``: narrowing
+        fields (``page_min``, ``section``, ``exclude_chunk_ids``, ``uploaded_after``…)."""
 
-        body: dict[str, Any] = {"query": query}
+        body: dict[str, Any] = {
+            key: value for key, value in (options or {}).items() if value not in (None, "", [])
+        }
+        body["query"] = query
         if filenames:
             body["filenames"] = filenames
         if tags:
@@ -639,6 +682,15 @@ class DocragClient:
         result: dict[str, Any] = self._json("GET", "/documents/jobs")
         return list(result.get("jobs", []))
 
+    def finished_jobs(self, *, failed_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        """Finished indexing jobs the server still keeps, newest first."""
+
+        state = "failed" if failed_only else "recent"
+        result: dict[str, Any] = self._json(
+            "GET", "/documents/jobs", params={"state": state, "limit": limit}
+        )
+        return list(result.get("jobs", []))
+
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         result: dict[str, Any] = self._json("DELETE", f"/documents/jobs/{_quote(job_id)}")
         return result
@@ -669,10 +721,26 @@ class DocragClient:
         only once the whole zip arrived: a failed or interrupted export never truncates
         an existing backup, and leaves nothing behind."""
 
+        return self.download("/export", destination)
+
+    def export_traces(self, destination: Path) -> int:
+        """Every kept trace as JSON Lines (``GET /traces/export``, full key)."""
+
+        return self.download("/traces/export", destination)
+
+    def original(self, filename: str, destination: Path) -> int:
+        """A document's stored original (RAW_DOCUMENT_DIR) into ``destination``."""
+
+        return self.download(f"/documents/{_quote(filename)}/original", destination)
+
+    def download(self, path: str, destination: Path) -> int:
+        """Stream ``GET path`` into ``destination`` through a temporary file beside it
+        (see ``export``); returns the bytes written."""
+
         written = 0
         connected = False
         try:
-            with self._http.stream("GET", "/export", headers=self._headers) as response:
+            with self._http.stream("GET", path, headers=self._headers) as response:
                 connected = True
                 if response.status_code >= 400:
                     response.read()

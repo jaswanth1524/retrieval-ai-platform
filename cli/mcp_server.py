@@ -17,6 +17,8 @@ changes the corpus.
 from __future__ import annotations
 
 import asyncio
+import datetime
+import re
 import threading
 from collections.abc import Callable
 from typing import Any, Literal
@@ -118,12 +120,49 @@ def format_passages(results: list[dict[str, Any]], weak: bool = False) -> str:
     return "\n\n".join(blocks)
 
 
+def _timestamp(value: str | None, name: str) -> float | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.strip()).timestamp()
+    except ValueError:
+        raise DocragError(f"{name} must be an ISO date (2024-05-31), not {value!r}.") from None
+
+
+def narrowing(
+    page_min: int | None,
+    page_max: int | None,
+    section: str | None,
+    exclude_filenames: list[str] | None,
+    exclude_chunk_ids: list[str] | None,
+    uploaded_after: str | None,
+    uploaded_before: str | None,
+) -> dict[str, Any]:
+    """A tool's narrowing arguments as request fields (dates as Unix seconds)."""
+
+    return {
+        "page_min": page_min,
+        "page_max": page_max,
+        "section": section,
+        "exclude_filenames": exclude_filenames,
+        "exclude_chunk_ids": exclude_chunk_ids,
+        "uploaded_after": _timestamp(uploaded_after, "uploaded_after"),
+        "uploaded_before": _timestamp(uploaded_before, "uploaded_before"),
+    }
+
+
+# api/workspaces.py's name rule (frontend utils/limits.ts WORKSPACE_NAME_PATTERN too).
+WORKSPACE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+
+
 def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> MCPServer:
     """The MCP server; ``client_factory`` makes the REST client (tests pass a fake)."""
 
     server: MCPServer = MCPServer(name="docrag", instructions=INSTRUCTIONS)
 
-    async def call(work: Callable[[DocragClient, Callable[[], bool]], str]) -> str:
+    async def call(
+        work: Callable[[DocragClient, Callable[[], bool]], str], workspace: str | None = None
+    ) -> str:
         """Run ``work(client, should_stop)`` off the event loop.
 
         A cancelled tool call (the client gave up, or sent a cancel notification)
@@ -137,6 +176,13 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
 
         def run() -> str:
             with client_factory() as client:
+                if workspace is not None:
+                    if workspace not in ("", "default") and not WORKSPACE_NAME_RE.match(workspace):
+                        return (
+                            f"{workspace!r} is not a workspace name (lowercase letters, "
+                            "digits and hyphens; list_workspaces names them)."
+                        )
+                    client.use_workspace(workspace)
                 try:
                     return work(client, cancelled.is_set)
                 except Cancelled:
@@ -154,8 +200,9 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
             raise
 
     @server.tool(annotations=_READ_ONLY)
-    async def list_documents() -> str:
-        """List the indexed documents with their passage counts and tags."""
+    async def list_documents(workspace: str | None = None) -> str:
+        """List the indexed documents with their passage counts and tags. workspace
+        picks another collection (list_workspaces names them)."""
 
         def work(client: DocragClient, should_stop: Callable[[], bool]) -> str:
             listing = client.documents()
@@ -169,7 +216,7 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
                 for name in names
             )
 
-        return await call(work)
+        return await call(work, workspace)
 
     @server.tool(annotations=_READ_ONLY)
     async def search_passages(
@@ -177,19 +224,38 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         filenames: list[str] | None = None,
         top_k: int | None = None,
         tags: list[str] | None = None,
+        page_min: int | None = None,
+        page_max: int | None = None,
+        section: str | None = None,
+        exclude_filenames: list[str] | None = None,
+        exclude_chunk_ids: list[str] | None = None,
+        uploaded_after: str | None = None,
+        uploaded_before: str | None = None,
+        workspace: str | None = None,
     ) -> str:
         """Find the passages that best match a query (hybrid search + rerank, no LLM).
 
         filenames limits the search to those documents, tags to documents with one of
-        those tags; top_k caps the results."""
+        those tags; top_k caps the results. page_min/page_max/section/exclude_filenames/
+        exclude_chunk_ids narrow where to look; uploaded_after/uploaded_before (ISO
+        dates, "2024-05-31") keep documents uploaded in that range."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
-            response = client.search_response(query, filenames, top_k, tags)
+            options = narrowing(
+                page_min,
+                page_max,
+                section,
+                exclude_filenames,
+                exclude_chunk_ids,
+                uploaded_after,
+                uploaded_before,
+            )
+            response = client.search_response(query, filenames, top_k, tags, options)
             return format_passages(
                 response.get("results", []), weak=bool(response.get("weak_matches"))
             )
 
-        return await call(work)
+        return await call(work, workspace)
 
     @server.tool(annotations=_READ_ONLY)
     async def ask(
@@ -203,6 +269,10 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         exclude_filenames: list[str] | None = None,
         answer_format: Literal["default", "bullets", "table", "brief"] | None = None,
         answer_language: str | None = None,
+        exclude_chunk_ids: list[str] | None = None,
+        uploaded_after: str | None = None,
+        uploaded_before: str | None = None,
+        workspace: str | None = None,
     ) -> str:
         """Answer a question from the indexed documents, with numbered citations and the
         exact quotes they rest on.
@@ -211,22 +281,29 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         those tags. history is the conversation so far, oldest first, as
         [{"role": "user" | "assistant", "content": "..."}], so a follow-up ("and for
         contractors?") is read with it; leave out answers that said the documents don't
-        cover the question. page_min/page_max/section/exclude_filenames narrow where to
-        look; answer_format ("bullets", "table", "brief") and answer_language ("German",
-        or "match" the question) shape the answer."""
+        cover the question. page_min/page_max/section/exclude_filenames/exclude_chunk_ids
+        narrow where to look, uploaded_after/uploaded_before (ISO dates) to documents
+        uploaded in that range; answer_format ("bullets", "table", "brief") and
+        answer_language ("German", or "match" the question) shape the answer."""
 
         # Trimmed to what the server takes (an agent often passes whole earlier answers).
         turns = trim_history(list(history or []))
-        options = {
-            "page_min": page_min,
-            "page_max": page_max,
-            "section": section,
-            "exclude_filenames": exclude_filenames,
-            "answer_format": answer_format,
-            "answer_language": answer_language,
-        }
-        return await call(
-            lambda client, should_stop: format_answer(
+
+        def work(client: DocragClient, should_stop: Callable[[], bool]) -> str:
+            options = {
+                **narrowing(
+                    page_min,
+                    page_max,
+                    section,
+                    exclude_filenames,
+                    exclude_chunk_ids,
+                    uploaded_after,
+                    uploaded_before,
+                ),
+                "answer_format": answer_format,
+                "answer_language": answer_language,
+            }
+            return format_answer(
                 client.ask(
                     question,
                     filenames,
@@ -236,10 +313,13 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
                     options=options,
                 )
             )
-        )
+
+        return await call(work, workspace)
 
     @server.tool(annotations=_READ_ONLY)
-    async def summarize(filenames: list[str], focus: str | None = None) -> str:
+    async def summarize(
+        filenames: list[str], focus: str | None = None, workspace: str | None = None
+    ) -> str:
         """Summarize one whole document, compare two (pass both names), or write one
         brief across several (pass them all; the server caps how many).
 
@@ -250,12 +330,17 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         return await call(
             lambda client, should_stop: format_answer(
                 client.summarize(filenames, focus, should_stop=should_stop)
-            )
+            ),
+            workspace,
         )
 
     @server.tool(annotations=_READ_ONLY)
     async def read_document(
-        filename: str, start: int = 1, count: int = 20, around_chunk_id: str | None = None
+        filename: str,
+        start: int = 1,
+        count: int = 20,
+        around_chunk_id: str | None = None,
+        workspace: str | None = None,
     ) -> str:
         """Read a document's indexed text, passage by passage, from passage `start` — or,
         with around_chunk_id (a chunk id from a citation), the passages around that one.
@@ -305,12 +390,13 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
                 )
             return result
 
-        return await call(work)
+        return await call(work, workspace)
 
     @server.tool(annotations=_READ_ONLY)
     async def list_workspaces() -> str:
-        """List the workspaces (separate document collections) on this server; this
-        server's tools use the one DOCRAG_WORKSPACE names, or the default."""
+        """List the workspaces (separate document collections) on this server. Every
+        tool takes `workspace` to work in one; without it, the one DOCRAG_WORKSPACE
+        names, or the default."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
             listing = client.workspaces()

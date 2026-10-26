@@ -42,6 +42,13 @@ def test_the_frontend_workspace_name_rule_matches_the_api() -> None:
     assert match.group(1) == _NAME_RE.pattern
 
 
+def test_the_mcp_servers_workspace_name_rule_matches_the_api() -> None:
+    from api.workspaces import _NAME_RE
+    from cli.mcp_server import WORKSPACE_NAME_RE
+
+    assert WORKSPACE_NAME_RE.pattern == _NAME_RE.pattern
+
+
 def test_the_frontend_scope_limit_matches_the_api() -> None:
     match = re.search(r"export const MAX_SCOPE_FILENAMES = (\d+);", LIMITS_TS.read_text())
     assert match is not None
