@@ -160,3 +160,45 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.conversation-list__filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 6px;
+  font-size: 11px;
+}
+
+.conversation-list__filter {
+  background: none;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  color: var(--rail-dim);
+  font: inherit;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.conversation-list__filter[aria-pressed='true'] {
+  color: var(--rail-text);
+  border-color: var(--rail-text);
+}
+
+.conversation-list__workspace-filter {
+  font: inherit;
+  background: transparent;
+  color: var(--rail-text);
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  padding: 1px 4px;
+}
+
+.conversation-list__group {
+  display: block;
+  padding: 8px 12px 2px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--rail-dim);
+}

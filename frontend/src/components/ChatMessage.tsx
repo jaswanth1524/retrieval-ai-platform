@@ -105,6 +105,8 @@ export interface ChatTurn {
   id: string;
   role: 'user' | 'assistant' | 'error';
   content: string;
+  // An answer the reader saved (☆), listed under "Saved" in the conversation list.
+  saved?: boolean;
   sources: CitationResponse[];
   timestamp: number;
   timings: TimingsResponse | null;
@@ -212,6 +214,10 @@ interface ChatMessageProps {
   onSearchPassages?: (question: string) => void;
   /** Says something on the thread's one status line (a message carries no live region). */
   onAnnounce?: (message: string) => void;
+  /** Save or unsave this answer. */
+  onToggleSaved?: (turnId: string, saved: boolean) => void;
+  /** This turn's position among the conversation's answers (1-based), for its label. */
+  answerNumber?: number;
 }
 
 /** What the reader should know about how an answer was grounded, in words: the flags
@@ -288,6 +294,8 @@ function ChatMessage({
   onAskEverywhere,
   onSearchPassages,
   onAnnounce,
+  onToggleSaved,
+  answerNumber,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -444,6 +452,16 @@ function ChatMessage({
       data-testid="chat-message"
       data-role={turn.role}
       data-turn-id={turn.id}
+      // Jump points for screen readers (and j/k): each question and answer is one.
+      role="article"
+      tabIndex={-1}
+      aria-label={
+        turn.role === 'user'
+          ? 'Question'
+          : turn.role === 'assistant'
+            ? `Answer${answerNumber ? ` ${answerNumber}` : ''}${turn.saved ? ', saved' : ''}`
+            : 'Error'
+      }
     >
       {turn.role === 'user' && (
         <div className="chat-message__row">
@@ -660,6 +678,21 @@ function ChatMessage({
                   {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
                 </button>
               )}
+              {turn.content && onToggleSaved && !streamStage && !turn.incomplete && (
+                <button
+                  type="button"
+                  className="chat-message__copy"
+                  aria-pressed={turn.saved ? 'true' : 'false'}
+                  onClick={() => {
+                    onToggleSaved(turn.id, !turn.saved);
+                    onAnnounce?.(turn.saved ? 'Answer unsaved.' : 'Answer saved.');
+                  }}
+                  title={turn.saved ? 'Saved — listed under Saved in the conversations' : 'Save this answer'}
+                  data-testid="chat-message-save"
+                >
+                  {turn.saved ? '★ Saved' : '☆ Save'}
+                </button>
+              )}
               {turn.content && regenerateQuestion && onRetry && !streamStage && !turn.incomplete && (
                 <button
                   type="button"
@@ -781,6 +814,20 @@ function ChatMessage({
                         : undefined
                     }
                     markedNotRelevant={turn.irrelevantSources?.includes(source.source_number)}
+                    score={source.rerank_score}
+                    onAskWithout={
+                      regenerateQuestion && onRetry && !regenerateTask && !streamStage && !turn.incomplete
+                        ? () =>
+                            askAgain(onRegenerate ?? onRetry, regenerateQuestion, undefined, {
+                              ...regenerateNarrowing,
+                              exclude_chunk_ids: [
+                                ...(regenerateNarrowing?.exclude_chunk_ids ?? []),
+                                source.chunk_id,
+                              ].slice(-100),
+                            })
+                        : undefined
+                    }
+                    askDisabled={busy}
                   />
                 ))}
               </div>

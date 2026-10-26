@@ -162,9 +162,18 @@ ingest_backlog_jobs = Gauge(
     "Ingest jobs admitted and not yet finished.",
 )
 
+url_refresh_total = Counter(
+    "docrag_url_refresh_total",
+    "Scheduled refreshes of URL-fetched documents (URL_REFRESH_INTERVAL_MINUTES), by "
+    "outcome: unchanged (the server said 304), queued (a job; the same bytes are left "
+    "as indexed), failed, deferred (no fetch slot or backlog room this pass).",
+    ["outcome"],
+)
+
 corpus_documents = Gauge(
     "docrag_corpus_documents",
-    "Indexed documents, as of the last document listing.",
+    "Indexed documents per workspace, as of that workspace's last document listing.",
+    ["workspace"],
 )
 
 

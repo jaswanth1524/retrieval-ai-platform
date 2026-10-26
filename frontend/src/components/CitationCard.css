@@ -60,6 +60,11 @@
   border-color: var(--bad);
 }
 
-.citation-card__irrelevant:disabled {
+.citation-card__irrelevant:disabled,
+.citation-card__irrelevant[aria-disabled='true'] {
   cursor: default;
+}
+
+.citation-card__score {
+  color: var(--dim);
 }

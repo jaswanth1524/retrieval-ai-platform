@@ -67,3 +67,42 @@
   border-color: var(--accent);
   color: var(--accent);
 }
+
+.unanswered-panel__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 6px;
+  font-size: 11px;
+}
+
+.unanswered-panel__view {
+  background: none;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  color: var(--rail-dim);
+  font: inherit;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.unanswered-panel__view[aria-pressed='true'] {
+  color: var(--rail-text);
+  border-color: var(--rail-text);
+}
+
+.unanswered-panel__filter {
+  flex: 1;
+  min-width: 80px;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--rail-text);
+  font: inherit;
+  padding: 2px 6px;
+}
+
+.unanswered-panel__missed {
+  color: var(--bad);
+}

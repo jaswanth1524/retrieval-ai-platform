@@ -23,7 +23,12 @@ from typing import IO, Any
 
 from fastapi import HTTPException
 
-from api.documents import DocumentError, normalize_tags, validate_upload_filename
+from api.documents import (
+    DocumentError,
+    DocumentSource,
+    normalize_tags,
+    validate_upload_filename,
+)
 from api.export import MANIFEST_VERSION
 from api.feedback import FEEDBACK_KINDS, Feedback, FeedbackStore
 from api.schemas import (
@@ -68,7 +73,14 @@ class ImportOutcome:
     feedback_skipped: int = 0
 
 
-Enqueue = Callable[[str, bytes, float | None, tuple[str, ...]], DocumentJobAcceptedResponse]
+Enqueue = Callable[
+    [str, bytes, float | None, tuple[str, ...], DocumentSource | None],
+    DocumentJobAcceptedResponse,
+]
+
+# A source string longer than this isn't one the server stored (MAX_URL_CHARS, or a
+# response header's value): the document is restored without it.
+_MAX_SOURCE_CHARS = 2048
 
 
 # What reading one damaged member raises: a CRC mismatch or truncation (BadZipFile,
@@ -222,7 +234,13 @@ def _restore_document(
         return
     try:
         outcome.jobs.append(
-            enqueue(filename, content, _uploaded_at(document.get("uploaded_at")), tags)
+            enqueue(
+                filename,
+                content,
+                _uploaded_at(document.get("uploaded_at")),
+                tags,
+                _source(document),
+            )
         )
         # A manifest that lists the name twice queues it once.
         existing_filenames.add(filename)
@@ -237,6 +255,22 @@ def _restore_document(
         outcome.deferred.append(filename)
     except DocumentError:
         outcome.rejected.append(filename)
+
+
+def _source(document: dict[str, Any]) -> DocumentSource | None:
+    """Where a URL-ingested document came from, when the manifest says so plausibly:
+    an http(s) URL and string validators. Anything else restores it as an upload."""
+
+    def text(key: str) -> str | None:
+        value = document.get(key)
+        if isinstance(value, str) and 0 < len(value) <= _MAX_SOURCE_CHARS:
+            return value
+        return None
+
+    url = text("source_url")
+    if url is None or not url.lower().startswith(("http://", "https://")):
+        return None
+    return DocumentSource(url, text("source_etag"), text("source_last_modified"))
 
 
 def _uploaded_at(value: object) -> float | None:

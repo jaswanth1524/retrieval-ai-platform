@@ -161,6 +161,8 @@ class SourceCitation:
     spans: tuple[CitationSpan, ...] = ()
     # The last page of a passage that crosses a page break; None on one page.
     page_end: int | None = None
+    # The cross-encoder's score for the passage (normalized to [0, 1]).
+    rerank_score: float | None = None
 
 
 def citation_from_dict(data: dict[str, Any]) -> SourceCitation:
@@ -171,8 +173,11 @@ def citation_from_dict(data: dict[str, Any]) -> SourceCitation:
     return SourceCitation(**fields, spans=spans)
 
 
-def source_citations(chunks: Sequence[RerankedChunk]) -> list[SourceCitation]:
-    """Return source metadata for chunks included in the prompt context."""
+def source_citations(
+    chunks: Sequence[RerankedChunk], *, scored: bool = True
+) -> list[SourceCitation]:
+    """Return source metadata for chunks included in the prompt context. ``scored``
+    False (a summary reads passages in order, never reranked) leaves out the score."""
 
     return [
         SourceCitation(
@@ -183,6 +188,7 @@ def source_citations(chunks: Sequence[RerankedChunk]) -> list[SourceCitation]:
             chunk_id=chunk.chunk_id,
             text=_truncate_excerpt(chunk.text),
             page_end=chunk.page_end,
+            rerank_score=chunk.rerank_score if scored else None,
         )
         for index, chunk in enumerate(chunks, start=1)
     ]
@@ -358,6 +364,39 @@ class _SpanIndex:
         return found
 
 
+# A Markdown heading flattened into a chunk's text ("## Receipts Submit receipts…"),
+# and a setext underline left after its title ("Receipts ===== Submit…").
+_HEADING_MARKER_RE = re.compile(r"#{1,6}\s+")
+_SETEXT_UNDERLINE_RE = re.compile(r"\s*[=-]{3,}\s+")
+
+
+def _past_heading(text: str, start: int, end: int, section: str) -> int:
+    """Where a quote should start: past a heading's ``#`` marker, and past the heading's
+    title when it is the chunk's section label (a heading met mid-chunk keeps its
+    title: nothing says where that title ends). The quote is still ``text[start:end]``,
+    so only ``start`` moves, and never past the claim itself."""
+
+    moved = start
+    marker = _HEADING_MARKER_RE.match(text, moved)
+    if marker is not None:
+        moved = marker.end()
+    label = section.strip()
+    if label and text.startswith(label, moved):
+        after = moved + len(label)
+        underline = _SETEXT_UNDERLINE_RE.match(text, after)
+        if underline is not None:
+            after = underline.end()
+        elif marker is not None and after < end and text[after].isspace():
+            after += 1
+            while after < end and text[after].isspace():
+                after += 1
+        else:
+            after = moved
+        moved = after
+    # A span that was nothing but the heading keeps it rather than becoming empty.
+    return moved if moved < end and text[moved:end].strip() else start
+
+
 @functools.lru_cache(maxsize=64)
 def _span_index(text: str) -> _SpanIndex:
     return _SpanIndex(text)
@@ -376,7 +415,10 @@ def _best_span(
     candidates += [
         (sentences[i][0], sentences[i + 1][1])
         for i in range(len(sentences) - 1)
-        if relevant[i] and relevant[i + 1]
+        # Never across a heading: the sentence before it belongs to another section.
+        if relevant[i]
+        and relevant[i + 1]
+        and not _HEADING_MARKER_RE.match(index.text, sentences[i + 1][0])
     ]
     best: tuple[tuple[float, int, int], int, int] | None = None
     for start, end in candidates:
@@ -429,9 +471,40 @@ def attach_spans(
             kept.append((start, end))
             if len(kept) == MAX_SPANS_PER_SOURCE:
                 break
-        spans = tuple(CitationSpan(start, end, text[start:end]) for start, end in sorted(kept))
+        section = chunks[index].section
+        trimmed = [(_past_heading(text, start, end, section), end) for start, end in sorted(kept)]
+        spans = tuple(CitationSpan(start, end, text[start:end]) for start, end in trimmed)
         result.append(replace(source, spans=spans) if spans else source)
     return result
+
+
+# A search result marks at most this many of its sentences.
+MAX_QUERY_SPANS = 2
+
+
+def query_spans(query: str, text: str, section: str = "") -> tuple[CitationSpan, ...]:
+    """The sentences of ``text`` that share the most content words with a search query,
+    to highlight in its result: at least two shared words (one for a query of fewer
+    than three), best first, at most ``MAX_QUERY_SPANS``, returned in text order.
+    Unlike an answer's spans there is no coverage floor: a query is a few keywords,
+    not a claim to support."""
+
+    claim = _content_words(query)
+    if not claim:
+        return ()
+    needed = 1 if len(claim) < 3 else SPAN_MIN_SHARED_WORDS
+    index = _span_index(text)
+    scored = []
+    for start, end in index.sentences:
+        shared = len(claim & index.words(start, end))
+        if shared >= needed:
+            scored.append((shared, -(end - start), start, end))
+    chosen = sorted(scored, reverse=True)[:MAX_QUERY_SPANS]
+    spans = []
+    for _, _, start, end in sorted(chosen, key=lambda item: item[2]):
+        start = _past_heading(text, start, end, section)
+        spans.append(CitationSpan(start, end, text[start:end]))
+    return tuple(spans)
 
 
 def needs_citation_retry(answer: str, source_count: int) -> bool:

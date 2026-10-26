@@ -51,6 +51,8 @@ interface ChatThreadProps {
   /** A "not found" answer's next steps (see ChatMessage). */
   onAskEverywhere?: (question: string) => void;
   onSearchPassages?: (question: string) => void;
+  /** Save or unsave an answer. */
+  onToggleSaved?: (turnId: string, saved: boolean) => void;
 }
 
 // How close to the bottom still counts as "following along". Wide enough to survive
@@ -129,6 +131,7 @@ function ChatThread({
   focusTurn = null,
   onAskEverywhere,
   onSearchPassages,
+  onToggleSaved,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
@@ -308,6 +311,8 @@ function ChatThread({
   // there's no ChatTurn yet to attach a skeleton to — render a placeholder in its slot.
   const awaitingFirstEvent = pending && lastTurn?.role !== 'assistant';
   const questions = precedingUserTurns(turns);
+  let answers = 0;
+  const answerNumbers = turns.map((turn) => (turn.role === 'assistant' ? (answers += 1) : 0));
 
   return (
     <div
@@ -359,6 +364,8 @@ function ChatThread({
             onOpenSource={onOpenSource}
             onCitationHover={onCitationHover}
             onCitationLeave={onCitationLeave}
+            onToggleSaved={onToggleSaved}
+            answerNumber={answerNumbers[index] || undefined}
           />
         ))}
         {awaitingFirstEvent && (

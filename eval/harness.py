@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import sys
+import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +136,10 @@ class RankedResult:
     # Nothing cleared RERANK_MIN_SCORE: the reranked arm returns the closest passages
     # (RERANK_FALLBACK_COUNT), which an answer is told match only weakly.
     below_min_score: bool = False
+    # Wall time of the ranking (condense included for a follow-up), and the pipeline's
+    # own stage timings when the arm ran it.
+    total_ms: float = 0.0
+    stages_ms: dict[str, float] = field(default_factory=dict)
 
 
 class Collaborators:
@@ -189,6 +195,7 @@ def rank_for_question(
     the pipeline's own condense step first (needs ``generator``), and the raw follow-up
     searched next to the rewrite, as the API does."""
 
+    started = time.monotonic()
     raw_question = question
     if history:
         pipeline = _pipeline(repository, embedding_provider, reranker, settings, generator)
@@ -204,6 +211,7 @@ def rank_for_question(
         return RankedResult(
             filenames=[chunk.filename for chunk in chunks],
             chunk_ids=[chunk.chunk_id for chunk in chunks],
+            total_ms=(time.monotonic() - started) * 1000,
         )
     if arm not in ("reranked", "fused"):
         raise ValueError(f"Unknown arm '{arm}'; expected one of {', '.join(ARMS)}.")
@@ -217,6 +225,12 @@ def rank_for_question(
         filenames=[chunk.filename for chunk in ranked],
         chunk_ids=[chunk.chunk_id for chunk in ranked],
         below_min_score=arm == "reranked" and phase.below_min_score,
+        total_ms=(time.monotonic() - started) * 1000,
+        stages_ms={
+            "embed_ms": phase.embed_ms,
+            "search_ms": phase.search_ms,
+            "rerank_ms": phase.rerank_ms,
+        },
     )
 
 
@@ -397,6 +411,7 @@ def run_retrieval_eval(
     filename_rows: list[dict[str, float]] = []
     chunk_rows: list[dict[str, float]] = []
     no_context_rows: list[dict[str, float]] = []
+    latencies: list[float] = []
     passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
     for index, example in enumerate(examples):
         ranked = rank_for_question(
@@ -409,7 +424,12 @@ def run_retrieval_eval(
             arm=arm,
             generator=getattr(collaborators, "generator", None),
         )
-        entry: dict[str, Any] = {"question": example.question}
+        entry: dict[str, Any] = {
+            "question": example.question,
+            "latency_ms": {"total_ms": round(ranked.total_ms, 1)}
+            | {name: round(value, 1) for name, value in ranked.stages_ms.items()},
+        }
+        latencies.append(ranked.total_ms)
         if example.expect_no_context:
             # Only the reranked arm applies RERANK_MIN_SCORE; the others always rank.
             # Passages below it (the answer fallback) don't count as found.
@@ -437,7 +457,27 @@ def run_retrieval_eval(
         "k_values": list(ks),
         "question_count": len(examples),
         "aggregate": levels,
+        # Informational, never compared with a baseline: it depends on the machine.
+        "latency_ms": latency_summary(latencies),
         "per_question": per_question,
+    }
+
+
+def latency_summary(values: Sequence[float]) -> dict[str, float]:
+    """p50, p95 and the mean of per-question wall times (ms), nearest-rank."""
+
+    if not values:
+        return {}
+    ordered = sorted(values)
+
+    def percentile(share: float) -> float:
+        rank = max(1, math.ceil(share * len(ordered)))
+        return round(ordered[rank - 1], 1)
+
+    return {
+        "p50": percentile(0.5),
+        "p95": percentile(0.95),
+        "mean": round(sum(ordered) / len(ordered), 1),
     }
 
 

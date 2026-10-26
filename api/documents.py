@@ -15,6 +15,7 @@ from api.chunking import (
     _group_sections_for_windowing,
     _sentence_units,
     _window_units,
+    join_units,
     merge_tiny_semantic_sections,
     window_label,
     window_pages,
@@ -36,8 +37,11 @@ from api.parsers.docx import parse_docx_document
 from api.parsers.eml import parse_eml_document
 from api.parsers.epub import parse_epub_document
 from api.parsers.html import parse_html_document
+from api.parsers.image import IMAGE_EXTENSIONS, ocr_available, parse_image_document
+from api.parsers.odt import parse_odt_document
 from api.parsers.pdf import parse_pdf_document
 from api.parsers.pptx import parse_pptx_document
+from api.parsers.structured import CODE_EXTENSIONS, parse_code_document, parse_json_document
 from api.parsers.text import (
     declared_html_charset,
     decode_text_document,
@@ -57,6 +61,7 @@ __all__ = [
     "MAX_FILENAME_BYTES",
     "MAX_TAGS_PER_DOCUMENT",
     "PARSERS",
+    "CORE_EXTENSIONS",
     "SUPPORTED_EXTENSIONS",
     "ChunkConfigError",
     "DocumentChunk",
@@ -141,6 +146,24 @@ def _parse_pptx(
     return parse_pptx_document(filename, content)
 
 
+def _parse_odt(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_odt_document(filename, content)
+
+
+def _parse_json(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_json_document(filename, decode_text_document(filename, content))
+
+
+def _parse_code(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_code_document(filename, decode_text_document(filename, content))
+
+
 # One parser per supported suffix (api/parsers/*); adding a format is one entry here.
 PARSERS: dict[str, Parser] = {
     ".pdf": parse_pdf_document,
@@ -155,8 +178,16 @@ PARSERS: dict[str, Parser] = {
     ".htm": _parse_html,
     ".csv": _parse_csv,
     ".txt": _parse_txt,
+    ".odt": _parse_odt,
+    ".json": _parse_json,
+    **dict.fromkeys(CODE_EXTENSIONS, _parse_code),
+    # Images only with the ocr extra: offering them without it would accept an upload
+    # that can only fail.
+    **(dict.fromkeys(IMAGE_EXTENSIONS, parse_image_document) if ocr_available() else {}),
 }
 SUPPORTED_EXTENSIONS = frozenset(PARSERS)
+# Supported whatever is installed: the frontend's fallback list names exactly these.
+CORE_EXTENSIONS = SUPPORTED_EXTENSIONS - IMAGE_EXTENSIONS
 
 
 # Chunker output format version — bumped when the chunking algorithm changes in a way
@@ -196,6 +227,10 @@ SUPPORTED_EXTENSIONS = frozenset(PARSERS)
 # one line and keeps its row label; a PDF page whose tables pdfplumber can't read no
 # longer drops the tables of every other page; a stamped scan page OCR doesn't read keeps
 # its stamp's text.
+# Not bumped (pass 12): table rows are joined by line breaks in the chunk text
+# (``chunking.join_units``) so a citation quotes one row. Chunk boundaries are
+# unchanged and only table chunks' text differs; a bump would have made every document
+# stale and re-embedded (vector reuse keys on the fingerprint) for that.
 # Stamped on every point (``DocumentChunk.chunker_version``); a document whose points
 # carry an older version is listed as stale, and re-indexing it applies this one.
 CHUNKER_VERSION = 9
@@ -441,7 +476,7 @@ def chunk_sections(
 
         units = _sentence_units(group, budget, token_counter)
         for window in _window_units(units, budget, window_overlap):
-            chunk_text = " ".join(unit.text for unit in window).strip()
+            chunk_text = join_units(window).strip()
             if not chunk_text:
                 continue
             page, page_end = window_pages(window)

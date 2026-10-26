@@ -1,5 +1,25 @@
-// api/documents.py SUPPORTED_EXTENSIONS, for a server too old to report its own
-// (PublicConfigResponse.supported_extensions), and until /config has loaded.
+// Source code and config files (api/parsers/structured.py CODE_EXTENSIONS).
+export const CODE_EXTENSIONS = [
+  '.py',
+  '.js',
+  '.ts',
+  '.go',
+  '.java',
+  '.rs',
+  '.rb',
+  '.c',
+  '.cpp',
+  '.h',
+  '.sh',
+  '.sql',
+  '.yaml',
+  '.yml',
+  '.toml',
+];
+
+// api/documents.py CORE_EXTENSIONS (every type but images, which need the server's OCR
+// extra), for a server too old to report its own (PublicConfigResponse.
+// supported_extensions), and until /config has loaded.
 export const ACCEPTED_EXTENSIONS = [
   '.pdf',
   '.txt',
@@ -13,6 +33,9 @@ export const ACCEPTED_EXTENSIONS = [
   '.eml',
   '.xlsx',
   '.pptx',
+  '.odt',
+  '.json',
+  ...CODE_EXTENSIONS,
 ];
 
 /** The suffixes to accept: the server's list when it sent one. */
@@ -20,13 +43,16 @@ export function acceptedExtensions(fromServer?: readonly string[]): readonly str
   return fromServer && fromServer.length > 0 ? fromServer : ACCEPTED_EXTENSIONS;
 }
 
-/** The dropzone's short list ("pdf docx md …"), without the alternate spellings. */
+/** The dropzone's short list ("pdf docx md …"), without the alternate spellings, and
+ *  source-code and config types said as one "code". */
 export function extensionsLabel(extensions: readonly string[]): string {
-  const alternates = new Set(['.markdown', '.htm']);
-  return extensions
-    .filter((extension) => !alternates.has(extension))
-    .map((extension) => extension.replace(/^\./, ''))
-    .join(' ');
+  const alternates = new Set(['.markdown', '.htm', '.jpeg', '.tif']);
+  const code = new Set(CODE_EXTENSIONS);
+  const shown = extensions
+    .filter((extension) => !alternates.has(extension) && !code.has(extension))
+    .map((extension) => extension.replace(/^\./, ''));
+  if (extensions.some((extension) => code.has(extension))) shown.push('code');
+  return shown.join(' ');
 }
 
 // Matches the backend's AppSettings.max_upload_bytes default — used only until

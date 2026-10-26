@@ -70,6 +70,9 @@ class RunDiff:
     only_after: list[str] = field(default_factory=list)
     # Aggregate metrics, before and after (retrieval only).
     aggregates: list[tuple[str, float, float]] = field(default_factory=list)
+    # Latency (ms) before and after, when both runs recorded it: shown, never judged —
+    # it depends on the machine and its load.
+    latency: list[tuple[str, float, float]] = field(default_factory=list)
 
 
 def _retrieval_change(before: dict[str, Any], after: dict[str, Any]) -> tuple[int, list[str]]:
@@ -142,6 +145,12 @@ def diff_runs(before: Run, after: Run) -> RunDiff:
                 if isinstance(value, int | float) and isinstance(other, int | float):
                     if value != other:
                         result.aggregates.append((f"{level} {metric}", float(value), float(other)))
+        old_latency = before.data.get("latency_ms") or {}
+        new_latency = after.data.get("latency_ms") or {}
+        for name in ("p50", "p95", "mean"):
+            a, b = old_latency.get(name), new_latency.get(name)
+            if isinstance(a, int | float) and isinstance(b, int | float):
+                result.latency.append((name, float(a), float(b)))
     return result
 
 
@@ -156,6 +165,8 @@ def format_diff(diff: RunDiff) -> str:
         lines.append(f"? only in the second run: {question}")
     for name, before, after in diff.aggregates:
         lines.append(f"  {name}: {before:.3f} → {after:.3f} ({after - before:+.3f})")
+    for name, before, after in diff.latency:
+        lines.append(f"  latency {name}: {before:.0f} → {after:.0f} ms ({after - before:+.0f})")
     return "\n".join(lines)
 
 
@@ -222,6 +233,11 @@ def render_report(
             for metric, value in sorted(metrics.items())
             if isinstance(value, int | float)
         ]
+        aggregate_rows += [
+            ["latency", f"{name} (ms)", f"{value:.0f}"]
+            for name, value in (run.data.get("latency_ms") or {}).items()
+            if isinstance(value, int | float)
+        ]
         parts.append("<h2>Aggregates</h2>" + _table(["level", "metric", "value"], aggregate_rows))
         question_rows = []
         for row in run.data["per_question"]:
@@ -232,10 +248,12 @@ def render_report(
                     " ".join(f"{m}={scores[m]:.2f}" for m in RETRIEVAL_METRICS if m in scores)
                 )
             cells.append("" if "no_context" not in row else str(row["no_context"]))
+            took = (row.get("latency_ms") or {}).get("total_ms")
+            cells.append(f"{took:.0f}" if isinstance(took, int | float) else "")
             question_rows.append(cells)
         parts.append(
             "<h2>Questions</h2>"
-            + _table(["question", "filename", "chunk", "refused"], question_rows)
+            + _table(["question", "filename", "chunk", "refused", "ms"], question_rows)
         )
     else:
         rows = run.data

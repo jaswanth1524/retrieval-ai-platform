@@ -344,6 +344,11 @@ export function narrowingBody(narrowing: PassageNarrowing | undefined): Record<s
     body.exclude_filenames = narrowing.exclude_filenames;
   }
   if (narrowing.chunk_ids && narrowing.chunk_ids.length > 0) body.chunk_ids = narrowing.chunk_ids;
+  if (narrowing.exclude_chunk_ids && narrowing.exclude_chunk_ids.length > 0) {
+    body.exclude_chunk_ids = narrowing.exclude_chunk_ids;
+  }
+  if (narrowing.uploaded_after != null) body.uploaded_after = narrowing.uploaded_after;
+  if (narrowing.uploaded_before != null) body.uploaded_before = narrowing.uploaded_before;
   return body;
 }
 
@@ -479,10 +484,12 @@ export const api = {
   listDocuments: (signal?: AbortSignal, workspace?: string) =>
     request<DocumentListResponse>('/documents', { signal, workspace }),
 
-  uploadDocument: (file: File, signal?: AbortSignal, workspace?: string) => {
+  // `tags` (optional) replace the document's tags; giving any re-indexes the same bytes.
+  uploadDocument: (file: File, signal?: AbortSignal, workspace?: string, tags?: string[]) => {
     const form = new FormData();
     // Do NOT set Content-Type manually — the browser sets the multipart boundary.
     form.append('file', file);
+    for (const tag of tags ?? []) form.append('tags', tag);
     return request<DocumentJobAcceptedResponse>('/documents', {
       method: 'POST',
       body: form,
@@ -511,11 +518,11 @@ export const api = {
   // poll the job the same way. 400 names why a URL can't be fetched.
   // The server answers once it has fetched the document (up to URL_INGEST_TIMEOUT_SECONDS,
   // 30 s by default): the 15 s default reported a fetch still running as failed.
-  uploadFromUrl: (url: string, signal?: AbortSignal, workspace?: string) =>
+  uploadFromUrl: (url: string, signal?: AbortSignal, workspace?: string, tags?: string[]) =>
     request<DocumentJobAcceptedResponse>('/documents/from-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(tags && tags.length > 0 ? { url, tags } : { url }),
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
       workspace,
@@ -592,6 +599,13 @@ export const api = {
   listActiveJobs: (signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobListResponse>('/documents/jobs', { signal, workspace }),
 
+  // Finished jobs the server still keeps, newest first: everything, or only failures.
+  listFinishedJobs: (failedOnly: boolean, signal?: AbortSignal, workspace?: string) =>
+    request<DocumentJobListResponse>(
+      `/documents/jobs?state=${failedOnly ? 'failed' : 'recent'}&limit=50`,
+      { signal, workspace },
+    ),
+
   // The watched folder (WATCH_DIR) as of its last pass; 404 when none is watched.
   watchStatus: (signal?: AbortSignal) =>
     request<WatchStatusResponse>('/watch', { signal, workspace: '' }),
@@ -645,10 +659,10 @@ export const api = {
     return { blob, filename };
   },
 
-  // What was asked that the documents didn't answer, newest first (QUERY_LOG_ENABLED;
-  // full key; 404 when the log is off).
-  listUnanswered: (limit = 200, signal?: AbortSignal) =>
-    request<QueryLogResponse>(`/query-log?uncovered=true&limit=${limit}`, { signal }),
+  // Every logged question and summary, newest first (QUERY_LOG_ENABLED; full key; 404
+  // when the log is off). The Asked questions panel picks the unanswered ones out.
+  listQueryLog: (limit = 500, signal?: AbortSignal) =>
+    request<QueryLogResponse>(`/query-log?limit=${limit}`, { signal }),
 
   // Earlier originals of a document kept when it was replaced (RAW_DOCUMENT_VERSIONS).
   listDocumentVersions: (filename: string, signal?: AbortSignal, workspace?: string) =>

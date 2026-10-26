@@ -343,3 +343,39 @@ def test_a_reingest_reuses_the_original_vectors_even_from_a_quantized_collection
     assert stored["c1"][settings.qdrant_dense_vector_name] == pytest.approx([0.6, 0.8, 0.0])
     sparse = stored["c1"][settings.qdrant_sparse_vector_name]
     assert list(sparse.indices) == [10, 30] and list(sparse.values) == pytest.approx([1.0, 0.25])
+
+
+def test_pages_upload_dates_and_left_out_passages_filter_on_the_server(
+    server: tuple[QdrantClient, AppSettings],
+) -> None:
+    """The page_end and uploaded_at indexes exist, and the narrowing is a valid server
+    filter on both transports (a nested should inside must)."""
+
+    from dataclasses import replace
+
+    from api.repository import PassageFilter
+
+    client, settings = server
+    repository = VectorRepository(client)
+    chunks = [
+        replace(chunk("c1", "alpha one", page=1), uploaded_at=100.0),
+        replace(chunk("c2", "alpha two", page=2), page_end=3, uploaded_at=200.0),
+        replace(chunk("c3", "alpha three", page=4), uploaded_at=300.0),
+    ]
+    ingest_chunks(
+        repository,
+        settings,
+        chunks,
+        StaticEmbeddingProvider([embedding([1.0, 0.0, 0.0], [10], [1.0])] * 3),
+    )
+    query = embedding([1.0, 0.0, 0.0], [10], [1.0])
+
+    def found(narrow: PassageFilter) -> set[str]:
+        points = repository.hybrid_search(settings, query, narrow=narrow)
+        return {str(point.payload["chunk_id"]) for point in points if point.payload}
+
+    assert found(PassageFilter(page_min=3, page_max=3)) == {"c2"}
+    assert found(PassageFilter(uploaded_after=150.0, uploaded_before=250.0)) == {"c2"}
+    assert found(PassageFilter(exclude_chunk_ids=("c1",))) == {"c2", "c3"}
+    schema = client.get_collection(settings.qdrant_collection).payload_schema or {}
+    assert {"page_end", "uploaded_at"} <= set(schema)

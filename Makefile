@@ -2,7 +2,7 @@
 # `make check` runs the backend and frontend gates as CI does (coverage floor and
 # dependency audits included); e2e and Docker stay separate.
 
-.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-answer eval-ragas eval-diff eval-report
+.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-mixed eval-answer eval-ragas eval-diff eval-report
 
 check: backend frontend
 
@@ -28,6 +28,7 @@ backend:
 	uv run python -m eval.harness validate eval/datasets/followup_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/paraphrase_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/compare_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/mixed_eval.jsonl
 	req=$$(mktemp) && uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$$req" \
 		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req"; \
 		status=$$?; rm -f "$$req"; exit $$status
@@ -68,6 +69,14 @@ eval-ingest:
 eval-retrieval: eval-ingest
 	$(EVAL_ENV) uv run python -m eval.harness retrieval eval/datasets/handbook_eval.jsonl \
 		--baseline eval/baselines/handbook_reranked.json --max-regression 0.06
+
+# The same questions over the handbook rendered as PDF, DOCX, HTML, ODT, PPTX and XLSX
+# (eval/make_mixed_corpus.py): what the parsers lose shows up against the Markdown run.
+eval-mixed:
+	$(EVAL_ENV:eval_handbook=eval_mixed) uv run python -m eval.harness ingest eval/corpus_mixed
+	$(EVAL_ENV:eval_handbook=eval_mixed) uv run python -m eval.harness retrieval \
+		eval/datasets/mixed_eval.jsonl --baseline eval/baselines/mixed_reranked.json \
+		--max-regression 0.06
 
 # e.g. make eval-answer EVAL_DATASET=eval/datasets/followup_eval.jsonl EVAL_ARGS="--resume"
 eval-answer: eval-ingest

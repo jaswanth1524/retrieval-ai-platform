@@ -251,6 +251,7 @@ export interface UseChatResult {
   allConversationsJson: () => string;
   /** Mark (or, after a failed send, unmark) one cited source of a turn not relevant. */
   setSourceIrrelevant: (turnId: string, sourceNumber: number, marked: boolean) => void;
+  setTurnSaved: (turnId: string, saved: boolean) => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
@@ -266,6 +267,11 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
 }
 
 const NO_TURNS: ChatTurn[] = [];
+
+function savedSummary(turns: readonly ChatTurn[]): { savedCount?: number; firstSavedTurnId?: string } {
+  const saved = turns.filter((turn) => turn.saved);
+  return saved.length > 0 ? { savedCount: saved.length, firstSavedTurnId: saved[0].id } : {};
+}
 
 /** Times a question refused with 429 is asked again on its own. */
 export const BUSY_RETRY_ATTEMPTS = 3;
@@ -725,6 +731,11 @@ export function useChat(): UseChatResult {
       const source = activeConversationRef.current;
       const index = source?.turns.findIndex((turn) => turn.id === turnId) ?? -1;
       if (!source || index < 0 || source.turns[index].role !== 'user') return;
+      // Passages the question was asked about (or without) stay with it when it is
+      // edited; otherwise the conversation's scope applies, as for any new question.
+      const asked = source.turns[index].narrowing;
+      const editedOptions =
+        asked?.chunk_ids || asked?.exclude_chunk_ids ? { ...options, narrowing: asked } : options;
       const prior = source.turns.slice(0, index);
       const now = Date.now();
       const fork: Conversation = {
@@ -743,7 +754,7 @@ export function useChat(): UseChatResult {
         activeConversationId: fork.id,
         conversations: capConversations([fork, ...prev.conversations], fork.id),
       }));
-      await runAsk(fork.id, question, buildHistory(prior), provider, overrides, filenames, options);
+      await runAsk(fork.id, question, buildHistory(prior), provider, overrides, filenames, editedOptions);
     },
     [runAsk],
   );
@@ -786,9 +797,19 @@ export function useChat(): UseChatResult {
         const keptTags = tags.filter(keepTag);
         if (kept.length === filenames.length && keptTags.length === tags.length) return conversation;
         changed = true;
+        // The page range and upload date stay; a page range only while its one
+        // document does.
+        const { pageMin, pageMax, uploadedAfter } = conversation.scope ?? EMPTY_SCOPE;
+        const pagesStay = kept.length === filenames.length;
         return {
           ...conversation,
-          scope: { tags: keptTags, filenames: kept },
+          scope: {
+            tags: keptTags,
+            filenames: kept,
+            ...(pagesStay && pageMin !== undefined ? { pageMin } : {}),
+            ...(pagesStay && pageMax !== undefined ? { pageMax } : {}),
+            ...(uploadedAfter !== undefined ? { uploadedAfter } : {}),
+          },
           editedAt: Date.now(),
         };
       });
@@ -893,6 +914,25 @@ export function useChat(): UseChatResult {
     [],
   );
 
+  const setTurnSaved = useCallback((turnId: string, saved: boolean) => {
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) =>
+        conversation.turns.some((turn) => turn.id === turnId)
+          ? {
+              ...conversation,
+              turns: conversation.turns.map((turn) => {
+                if (turn.id !== turnId) return turn;
+                const { saved: _previous, ...rest } = turn;
+                return saved ? { ...rest, saved: true } : rest;
+              }),
+              editedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    }));
+  }, []);
+
   const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
     // Stored on the turn, so a rating survives a reload or a conversation switch and
     // the buttons can't send a duplicate row for the same answer.
@@ -925,6 +965,7 @@ export function useChat(): UseChatResult {
       ...(conversation.workspace && conversation.turns.length > 0
         ? { workspace: conversation.workspace }
         : {}),
+      ...savedSummary(conversation.turns),
     }));
     const prev = summariesRef.current;
     const same =
@@ -936,7 +977,9 @@ export function useChat(): UseChatResult {
           summary.updatedAt === next[index].updatedAt &&
           summary.turnCount === next[index].turnCount &&
           summary.pinned === next[index].pinned &&
-          summary.workspace === next[index].workspace,
+          summary.workspace === next[index].workspace &&
+          summary.savedCount === next[index].savedCount &&
+          summary.firstSavedTurnId === next[index].firstSavedTurnId,
       );
     if (same) return prev;
     summariesRef.current = next;
@@ -975,6 +1018,7 @@ export function useChat(): UseChatResult {
     searchConversations,
     setTurnFeedback,
     setSourceIrrelevant,
+    setTurnSaved,
     allConversationsJson,
   };
 }

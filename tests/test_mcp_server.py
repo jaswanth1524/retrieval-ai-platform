@@ -317,3 +317,62 @@ async def test_ask_trims_a_long_history_to_what_the_server_takes(
     answer = text_of(await server.call_tool("ask", {"question": "and beta?", "history": history}))
     assert answer.startswith("Alpha is documented [1].")
     assert len(sent[0][1]["content"]) <= 4000
+
+
+@pytest.mark.asyncio
+async def test_search_leaves_out_a_passage_and_reads_upload_dates(server: MCPServer) -> None:
+    passages = text_of(await server.call_tool("search_passages", {"query": "alpha"}))
+    chunk_id = passages.split("(chunk ")[1].split(",")[0]
+    without = text_of(
+        await server.call_tool(
+            "search_passages", {"query": "alpha", "exclude_chunk_ids": [chunk_id]}
+        )
+    )
+    assert chunk_id not in without
+    future = text_of(
+        await server.call_tool(
+            "search_passages", {"query": "alpha", "uploaded_after": "2999-01-01"}
+        )
+    )
+    assert "guide.txt" not in future
+    bad = text_of(
+        await server.call_tool("search_passages", {"query": "alpha", "uploaded_after": "soon"})
+    )
+    assert "uploaded_after must be an ISO date" in bad
+
+
+@pytest.mark.asyncio
+async def test_each_tool_can_work_in_another_workspace() -> None:
+    clear_dependency_caches()
+    settings = make_settings(api_key="full-key", workspaces_enabled=True)
+    app = hermetic_app(settings, QdrantClient(":memory:"))
+    headers = {"X-API-Key": "full-key"}
+    with TestClient(app) as test_client:
+        assert (
+            test_client.post("/workspaces", json={"name": "legal"}, headers=headers).status_code
+            == 201
+        )
+        legal = {**headers, "X-Workspace": "legal"}
+        assert (
+            upload_and_wait(
+                test_client, "nda.txt", b"Intro\nThe NDA lasts two years.", headers=legal
+            )["state"]
+            == "done"
+        )
+        server = build_server(
+            lambda: DocragClient("http://testserver", "full-key", http=test_client)
+        )
+
+        default = text_of(await server.call_tool("list_documents", {}))
+        in_legal = text_of(await server.call_tool("list_documents", {"workspace": "legal"}))
+        back = text_of(await server.call_tool("list_documents", {"workspace": "default"}))
+        bad = text_of(await server.call_tool("list_documents", {"workspace": "../x"}))
+        read = text_of(
+            await server.call_tool("read_document", {"filename": "nda.txt", "workspace": "legal"})
+        )
+    clear_dependency_caches()
+
+    assert default == back == "No documents are indexed."
+    assert in_legal == "nda.txt (1 passages)"
+    assert "not a workspace name" in bad
+    assert "two years" in read

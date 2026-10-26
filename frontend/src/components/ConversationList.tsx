@@ -2,6 +2,7 @@ import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 're
 import { MAX_PINNED_CONVERSATIONS } from '../hooks/chatPersistence';
 import type { ConversationMatch, ConversationSummary } from '../hooks/useChat';
 import { formatRelativeTimeAgo } from '../utils/relativeTime';
+import { ALL_WORKSPACES, type ListFilter, dateGroup, listedConversations } from '../utils/conversationList';
 import ConfirmInline from './ConfirmInline';
 import './ConversationList.css';
 import { isImeComposing } from '../utils/keyboard';
@@ -22,6 +23,8 @@ interface ConversationListProps {
   disabled?: boolean;
   /** The conversation an answer is streaming into: it can't be deleted until it ends. */
   streamingId?: string | null;
+  /** Told the ids in the order shown, whenever it changes (for ] and [). */
+  onVisibleOrder?: (ids: string[]) => void;
 }
 
 function ConversationList({
@@ -34,7 +37,15 @@ function ConversationList({
   onSearch,
   disabled,
   streamingId = null,
+  onVisibleOrder,
 }: ConversationListProps) {
+  const [filter, setFilter] = useState<ListFilter>('all');
+  const [workspaceFilter, setWorkspaceFilter] = useState(ALL_WORKSPACES);
+  const workspaces = useMemo(
+    () => [...new Set(conversations.map((conversation) => conversation.workspace ?? ''))].sort(),
+    [conversations],
+  );
+  const anySaved = conversations.some((conversation) => (conversation.savedCount ?? 0) > 0);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
@@ -50,11 +61,8 @@ function ConversationList({
   );
   // Pinned first, each group most recently used first (the order they arrive in).
   const ordered = useMemo(
-    () => [
-      ...conversations.filter((conversation) => conversation.pinned),
-      ...conversations.filter((conversation) => !conversation.pinned),
-    ],
-    [conversations],
+    () => listedConversations(conversations, filter, workspaceFilter),
+    [conversations, filter, workspaceFilter],
   );
   // The active conversation always stays listed, so the list never hides where you are.
   const visible = needle
@@ -65,6 +73,21 @@ function ConversationList({
           matches.has(conversation.id),
       )
     : ordered;
+  const visibleKey = visible.map((conversation) => conversation.id).join(',');
+  useEffect(() => {
+    onVisibleOrder?.(visibleKey ? visibleKey.split(',') : []);
+  }, [visibleKey, onVisibleOrder]);
+  // A filter that hides everything it could show resets itself.
+  useEffect(() => {
+    if (filter === 'saved' && !anySaved) setFilter('all');
+  }, [filter, anySaved]);
+  useEffect(() => {
+    if (workspaceFilter !== ALL_WORKSPACES && !workspaces.includes(workspaceFilter)) {
+      setWorkspaceFilter(ALL_WORKSPACES);
+    }
+  }, [workspaceFilter, workspaces]);
+  // Date headings only for the plain list: a search or filter is its own grouping.
+  const grouped = !needle && filter === 'all';
   const pinLimitReached =
     conversations.filter((conversation) => conversation.pinned).length >= MAX_PINNED_CONVERSATIONS;
   const listRef = useRef<HTMLUListElement>(null);
@@ -131,8 +154,58 @@ function ConversationList({
           data-testid="conversation-search"
         />
       )}
+      {(anySaved || workspaces.length > 1) && (
+        <div className="conversation-list__filters" data-testid="conversation-filters">
+          {anySaved && (
+            <span role="group" aria-label="Show">
+              <button
+                type="button"
+                className="conversation-list__filter"
+                aria-pressed={filter === 'all'}
+                onClick={() => setFilter('all')}
+              >
+                All
+              </button>
+              <button
+                type="button"
+                className="conversation-list__filter"
+                aria-pressed={filter === 'saved'}
+                onClick={() => setFilter('saved')}
+                data-testid="conversation-filter-saved"
+              >
+                ★ Saved
+              </button>
+            </span>
+          )}
+          {workspaces.length > 1 && (
+            <select
+              className="conversation-list__workspace-filter"
+              value={workspaceFilter}
+              onChange={(event) => setWorkspaceFilter(event.target.value)}
+              aria-label="Workspace"
+              data-testid="conversation-filter-workspace"
+            >
+              <option value={ALL_WORKSPACES}>All workspaces</option>
+              {workspaces.map((name) => (
+                <option key={name || 'default'} value={name}>
+                  {name || 'default'}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
       <ul ref={listRef} className="conversation-list" aria-label="Conversations">
-        {visible.map((conversation, index) => (
+        {visible.map((conversation, index) => {
+          const group = conversation.pinned ? 'Pinned' : dateGroup(conversation.updatedAt);
+          const previous = visible[index - 1];
+          const previousGroup = previous
+            ? previous.pinned
+              ? 'Pinned'
+              : dateGroup(previous.updatedAt)
+            : null;
+          const heading = grouped && group !== previousGroup ? group : null;
+          return (
           <li
             key={conversation.id}
             className={`conversation-list__row-wrap${
@@ -144,6 +217,11 @@ function ConversationList({
             data-conversation-id={conversation.id}
             data-pinned={conversation.pinned ? 'true' : undefined}
           >
+            {heading && (
+              <span className="conversation-list__group" data-testid="conversation-group">
+                {heading}
+              </span>
+            )}
             {confirmingDeleteId === conversation.id ? (
               <ConfirmInline
                 className="conversation-list__confirm"
@@ -191,7 +269,9 @@ function ConversationList({
                   onClick={() => {
                     const match = matches.get(conversation.id);
                     if (match) onSwitch(conversation.id, match.turnId);
-                    else onSwitch(conversation.id);
+                    else if (filter === 'saved' && conversation.firstSavedTurnId) {
+                      onSwitch(conversation.id, conversation.firstSavedTurnId);
+                    } else onSwitch(conversation.id);
                   }}
                   onDoubleClick={() => startEditing(conversation)}
                   disabled={disabled}
@@ -224,6 +304,12 @@ function ConversationList({
                       <span data-testid="conversation-workspace">
                         {' '}
                         &middot; {conversation.workspace}
+                      </span>
+                    )}
+                    {(conversation.savedCount ?? 0) > 0 && (
+                      <span data-testid="conversation-saved-count">
+                        {' '}
+                        &middot; ★ {conversation.savedCount}
                       </span>
                     )}
                   </span>
@@ -272,7 +358,8 @@ function ConversationList({
               </div>
             )}
           </li>
-        ))}
+          );
+        })}
       </ul>
     </>
   );

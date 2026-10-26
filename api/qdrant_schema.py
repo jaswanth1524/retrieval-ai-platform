@@ -24,6 +24,10 @@ PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
     ("chunk_ordinal", models.PayloadSchemaType.INTEGER),
     # Question scope by document tag (PATCH /documents/{filename}/tags).
     ("tags", models.PayloadSchemaType.KEYWORD),
+    # Narrowing by page range (a passage crossing a page break) and upload date. Added
+    # to an existing collection in place at startup (ensure_payload_indexes).
+    ("page_end", models.PayloadSchemaType.INTEGER),
+    ("uploaded_at", models.PayloadSchemaType.FLOAT),
 )
 
 

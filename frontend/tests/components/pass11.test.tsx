@@ -73,12 +73,54 @@ describe('UnansweredPanel', () => {
     );
     expect(screen.getAllByTestId('unanswered-row')).toHaveLength(2);
     expect(screen.getByText('best match 0.04')).toBeInTheDocument();
-    await userEvent.click(screen.getAllByRole('button', { name: 'Ask' })[0]);
-    await userEvent.click(screen.getAllByRole('button', { name: 'Search' })[0]);
-    await userEvent.click(screen.getByRole('button', { name: 'Trace' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Ask “Who approves travel?” again' }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Search the passages for “Who approves travel?”' }),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Open the trace of “Who approves travel?”' }));
     expect(handlers.onAsk).toHaveBeenCalledWith('Who approves travel?');
     expect(handlers.onSearch).toHaveBeenCalledWith('Who approves travel?');
     expect(handlers.onSelectTrace).toHaveBeenCalledWith('t1');
+  });
+
+  it('groups repeats, filters, and shows every question or the most asked', async () => {
+    const now = Date.now() / 1000;
+    const entry = (question: string, status: string, offset = 0) => ({
+      created_at: now - offset,
+      question,
+      status,
+      top_score: 0.5,
+      mode: 'stream' as const,
+      trace_id: null,
+    });
+    render(
+      <UnansweredPanel
+        questions={[
+          entry('Who approves travel?', 'insufficient_context'),
+          entry('who approves  TRAVEL?', 'insufficient_context', 10),
+          entry('How many leave days?', 'ok', 20),
+          entry('How many leave days?', 'ok', 30),
+          entry('How many leave days?', 'ok', 40),
+        ]}
+        error={null}
+        onAsk={vi.fn()}
+        onSearch={vi.fn()}
+        onSelectTrace={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId('questions-summary')).toHaveTextContent('5 asked · 60% answered');
+    // Unanswered by default, repeats as one row.
+    expect(screen.getAllByTestId('unanswered-row')).toHaveLength(1);
+    expect(screen.getByTestId('questions-count')).toHaveTextContent('×2');
+
+    await userEvent.click(screen.getByTestId('questions-view-repeated'));
+    const rows = screen.getAllByTestId('unanswered-row');
+    expect(rows[0]).toHaveTextContent('How many leave days?');
+    expect(rows[0]).toHaveTextContent('×3');
+
+    await userEvent.click(screen.getByTestId('questions-view-all'));
+    await userEvent.type(screen.getByTestId('questions-filter'), 'leave');
+    expect(screen.getAllByTestId('unanswered-row')).toHaveLength(1);
   });
 
   it('says so when everything was answered, and shows an error', () => {

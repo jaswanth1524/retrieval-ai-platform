@@ -224,3 +224,23 @@ def test_a_brief_takes_several_documents_and_the_modes_check_their_counts(
     ):
         assert client.post("/questions/summary", json=body).status_code == 422, body
     assert client.get("/config").json()["summary_max_documents"] == 5
+
+
+def test_a_summary_the_documents_could_not_support_is_traced_as_such(
+    api_context: ApiTestContext,
+) -> None:
+    """The trace status decides what the query log counts as uncovered."""
+
+    _ingest(api_context.client)
+    api_context.generator.answer = (
+        "The provided documents do not contain enough information to summarize that."
+    )
+
+    body = api_context.client.post(
+        "/questions/summary", json={"mode": "summarize", "filenames": ["guide.txt"]}
+    ).json()
+    trace = api_context.client.get(f"/traces/{body['trace_id']}").json()
+
+    assert body["answer_status"] == "insufficient_context"
+    assert trace["status"] == "insufficient_context"
+    assert trace["answer_status"] == "insufficient_context"

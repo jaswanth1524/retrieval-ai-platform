@@ -164,6 +164,9 @@ def passage_narrowing(request: PassageNarrowing) -> PassageFilter | None:
         section=request.section,
         exclude_filenames=tuple(request.exclude_filenames or ()),
         chunk_ids=tuple(dict.fromkeys(request.chunk_ids or ())),
+        exclude_chunk_ids=tuple(dict.fromkeys(request.exclude_chunk_ids or ())),
+        uploaded_after=request.uploaded_after,
+        uploaded_before=request.uploaded_before,
     )
     return None if narrow == PassageFilter() else narrow
 

@@ -107,8 +107,10 @@ def test_search_lists_ranked_passages(client: DocragClient, tmp_path: Path) -> N
 
 
 def test_status_and_export(client: DocragClient, tmp_path: Path) -> None:
+    # The test server reaches no Ollama: not ready, so a script would see a failure.
     code, out = run(client, "status")
-    assert code == 0 and "documents: 0" in out
+    assert code == 1 and "documents: 0" in out
+    assert "qdrant: ok  llm provider: DOWN  index: ok" in out
 
     target = tmp_path / "backup.zip"
     code, out = run(client, "export", str(target))
@@ -250,10 +252,17 @@ def test_status_names_the_model_of_the_provider_in_use() -> None:
 
 
 def test_status_prints_the_default_providers_model(client: DocragClient) -> None:
+    from api.dependencies import get_ollama_reachability_checker
+
+    app = client._http.app  # type: ignore[attr-defined]  # noqa: SLF001
+    app.dependency_overrides[get_ollama_reachability_checker] = lambda: lambda _: True
     code, out = run(client, "status")
 
     assert code == 0
     assert "generation: ollama (llama3.1:8b)" in out
+    assert "qdrant: ok  llm provider: ok  index: ok" in out
+    code, out = run(client, "--json", "status")
+    assert code == 0 and json.loads(out)["ready"]["status"] == "ok"
 
 
 # -- review fixes ----------------------------------------------------------------------
@@ -1174,3 +1183,108 @@ def test_ask_sends_the_narrowing_and_answer_style(client: DocragClient, tmp_path
         }
     ]
     assert json.loads(out)["sources"][0]["filename"] == "guide.txt"
+
+
+def test_search_takes_the_same_narrowing_as_ask(client: DocragClient, tmp_path: Path) -> None:
+    import datetime
+
+    run(client, "ingest", str(corpus(tmp_path)))
+    sent: list[dict[str, object]] = []
+    original = client._json  # noqa: SLF001
+
+    def recording(method, path, *rest, **kwargs):  # type: ignore[no-untyped-def]
+        if path == "/search":
+            sent.append(kwargs["json"])
+        return original(method, path, *rest, **kwargs)
+
+    client._json = recording  # type: ignore[method-assign]  # noqa: SLF001
+
+    code, out = run(
+        client,
+        "search",
+        "alpha",
+        "--page-max",
+        "3",
+        "--exclude-chunk",
+        "abc",
+        "--uploaded-after",
+        "2000-01-01",
+    )
+
+    assert code == 0, out
+    assert sent == [
+        {
+            "query": "alpha",
+            "page_max": 3,
+            "exclude_chunk_ids": ["abc"],
+            "uploaded_after": datetime.datetime(2000, 1, 1).timestamp(),
+        }
+    ]
+    with pytest.raises(SystemExit) as refused:
+        run(client, "search", "alpha", "--uploaded-after", "last week")
+    assert refused.value.code == 2
+
+
+def test_traces_feedback_original_and_failed_jobs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from api.dependencies import get_feedback_store, get_ingest_job_store, get_raw_document_store
+    from api.feedback import FeedbackStore
+    from api.jobs import IngestJobStore
+    from api.raw_documents import RawDocumentStore
+
+    clear_dependency_caches()
+    settings = make_settings(
+        api_key="full-key", feedback_enabled=True, feedback_store_path=str(tmp_path / "feedback.db")
+    )
+    app = hermetic_app(settings, QdrantClient(":memory:"))
+    raw = RawDocumentStore(str(tmp_path / "raw"))
+    jobs = IngestJobStore(50)
+    app.dependency_overrides[get_raw_document_store] = lambda: raw
+    app.dependency_overrides[get_ingest_job_store] = lambda: jobs
+    feedback_store = FeedbackStore(str(tmp_path / "feedback.db"))
+    app.dependency_overrides[get_feedback_store] = lambda: feedback_store
+    with TestClient(app) as test_client:
+        client = DocragClient("http://testserver", "full-key", http=test_client)
+        docs = corpus(tmp_path)
+        run(client, "ingest", str(docs))
+        code, out = run(client, "--json", "ask", "alpha", "--quiet")
+        trace_id = json.loads(out)["trace_id"]
+
+        code, out = run(client, "traces")
+        assert code == 0 and trace_id in out
+        code, out = run(client, "traces", "show", trace_id)
+        assert code == 0 and out.startswith("alpha")
+        code, _ = run(client, "traces", "export", str(tmp_path / "traces.jsonl"))
+        assert code == 0
+        assert trace_id in (tmp_path / "traces.jsonl").read_text()
+        assert run(client, "traces", "show")[0] == 2
+
+        test_client.post(
+            "/feedback",
+            headers={"X-API-Key": "full-key"},
+            json={
+                "trace_id": trace_id,
+                "question": "alpha",
+                "answer_excerpt": "a",
+                "cited_filenames": [],
+                "rating": "down",
+                "citation_source_number": None,
+            },
+        )
+        code, out = run(client, "feedback")
+        assert code == 0 and "- question  alpha" in out
+
+        code, _ = run(client, "original", "guide.txt", "-o", str(tmp_path / "copy.txt"))
+        assert code == 0
+        assert (tmp_path / "copy.txt").read_bytes() == (docs / "guide.txt").read_bytes()
+
+        broken = jobs.create("broken.pdf")
+        jobs.update(broken.id, state="failed", error="Could not parse PDF 'broken.pdf'.")
+        code, out = run(client, "jobs", "--failed")
+        assert code == 0 and "broken.pdf" in out and "Could not parse PDF" in out
+        code, out = run(client, "jobs", "--recent")
+        assert "guide.txt" in out and "broken.pdf" in out
+        client.close()
+    clear_dependency_caches()
+    capsys.readouterr()

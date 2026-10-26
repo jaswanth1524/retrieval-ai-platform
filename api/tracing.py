@@ -130,6 +130,14 @@ class QueryTrace:
     # The workspace it was asked in ("" = the default): GET /traces shows a workspace
     # only its own, as the prompt and candidates quote its documents.
     workspace: str = ""
+    # The finished answer's ``citations.answer_status`` ("answered", "uncited",
+    # "insufficient_context", "no_context", ...): finer than ``status``, which only
+    # separates answered from not. None on errors and on traces from before it existed.
+    answer_status: str | None = None
+    # The answer stopped at the token limit (finish_reason "length").
+    truncated: bool = False
+    # History messages the prompt fitter left out to fit the context window.
+    dropped_history_messages: int = 0
 
 
 class TraceSink(Protocol):

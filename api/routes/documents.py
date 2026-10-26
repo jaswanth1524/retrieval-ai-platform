@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 
@@ -35,6 +35,7 @@ from api.ingest_jobs import (
     backlog_full_error,
     cancel_ingest_job,
     delete_indexed_document,
+    enqueue_refreshed,
     indexing_now,
     known_filenames,
     original_still_stored,
@@ -78,7 +79,13 @@ from api.schemas import (
 )
 from api.streaming import ClosingStreamingResponse
 from api.upload import read_upload_within_limit
-from api.url_fetch import BacklogFullError, FetchedDocument, fetch_document, loggable_url
+from api.url_fetch import (
+    BacklogFullError,
+    FetchedDocument,
+    fetch_document,
+    fetch_slots,
+    loggable_url,
+)
 from api.workspaces import document_key, workspace_of
 
 logger = logging.getLogger(__name__)
@@ -88,13 +95,15 @@ _ORIGINAL_CHUNK_BYTES = 64 * 1024
 _export_running = threading.Lock()
 # A page of /content is at most 2 * this + 1 chunks.
 CONTENT_MAX_RADIUS = 100
+# GET /documents/jobs?state=recent|failed returns at most this many.
+JOB_LIST_MAX_LIMIT = 500
 # Far past any real document; a 400-digit `start` used to reach Qdrant's filter and 500.
 CONTENT_MAX_ORDINAL = 1_000_000
 # /content with no paging parameters returns at most this many chunks.
 CONTENT_UNPAGED_MAX_CHUNKS = 2000
-# POST /documents/from-url downloads at most this many documents at once.
-URL_FETCH_MAX_CONCURRENT = 4
-_url_fetch_slots = threading.BoundedSemaphore(URL_FETCH_MAX_CONCURRENT)
+# POST /documents/from-url downloads at most URL_FETCH_MAX_CONCURRENT documents at once,
+# shared with the scheduled refresh.
+_url_fetch_slots = fetch_slots
 
 
 def _job_status(job_store: JobStore, job_id: str, workspace: str) -> DocumentJobStatusResponse:
@@ -166,7 +175,7 @@ def list_documents(
     token_counter: TokenCounterDep,
 ) -> DocumentListResponse:
     metadata = repository.filename_metadata(settings)
-    corpus_documents.set(len(metadata))
+    corpus_documents.labels(workspace=workspace_of(settings) or "default").set(len(metadata))
     is_stale = staleness(settings, token_counter)
     stored_originals = raw_store.stored_names() if raw_store is not None else set()
     return DocumentListResponse(
@@ -182,6 +191,7 @@ def list_documents(
             if meta.uploaded_at is not None
         },
         stale_filenames=sorted(name for name, meta in metadata.items() if is_stale(meta)),
+        incomplete_filenames=sorted(name for name, meta in metadata.items() if meta.incomplete),
         reindexable_filenames=sorted(set(metadata) & stored_originals),
         tags={name: list(meta.tags) for name, meta in metadata.items() if meta.tags},
         # Without the query string or fragment, which can carry a signed token: the
@@ -213,10 +223,18 @@ async def upload_document(
     queue: IngestQueueDep,
     raw_store: RawDocumentStoreDep,
     file: Annotated[UploadFile, File()],
+    tags: Annotated[
+        list[str] | None,
+        Form(
+            description="Tags to give the document (replacing any it has). Giving tags "
+            "re-indexes the same bytes rather than leaving them as indexed.",
+        ),
+    ] = None,
 ) -> DocumentJobAcceptedResponse:
     # Rejected here, not in the background job: an unusable name or type used to
     # be accepted with a 202 and only fail once the client polled the job.
     filename = validate_upload_filename(file.filename or "")
+    given_tags = normalize_tags(tags) if tags else None
     # 409 now, as /reindex and /import do, rather than a 202 for a job that can
     # only fail on a collection built for another embedding setup.
     await run_in_threadpool(repository.ensure_writable, settings)
@@ -234,14 +252,25 @@ async def upload_document(
     content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
     # job_store.create is a sqlite INSERT under JOB_STORE_BACKEND=sqlite; off the
     # event loop so it can't stall other in-flight requests.
-    return await run_in_threadpool(
+    accepted = await run_in_threadpool(
         queue.enqueue,
         filename=filename,
         content=content,
         raw_store=raw_store,
-        # The same bytes again (a re-upload, a file sent twice): left as indexed.
+        tags=given_tags,
+        # The same bytes again (a re-upload, a file sent twice): left as indexed —
+        # unless tags were given, which the ingest has to write.
         dedupe=True,
     )
+    audit(
+        "document.upload",
+        workspace=workspace_of(settings),
+        filename=filename,
+        size=len(content),
+        job_id=accepted.job_id,
+        **({"tags": list(given_tags)} if given_tags else {}),
+    )
+    return accepted
 
 
 # The server downloads the document (URL_INGEST_ENABLED, off by default) and it
@@ -270,6 +299,7 @@ async def upload_document_from_url(
 ) -> DocumentJobAcceptedResponse:
     if not settings.url_ingest_enabled:
         raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+    given_tags = normalize_tags(request.tags) if request.tags else None
     await run_in_threadpool(repository.ensure_writable, settings)
     fetched = await _fetch_for_ingest(
         queue,
@@ -305,15 +335,25 @@ async def upload_document_from_url(
         loggable_url(fetched.final_url),
         len(fetched.content),
     )
-    return await run_in_threadpool(
+    accepted = await run_in_threadpool(
         queue.enqueue,
         filename=fetched.filename,
         content=fetched.content,
         raw_store=raw_store,
         # The URL asked for (not where a redirect went): what a refresh fetches again.
         source=DocumentSource(request.url.strip(), fetched.etag, fetched.last_modified),
+        tags=given_tags,
         dedupe=True,
     )
+    audit(
+        "document.upload_from_url",
+        workspace=workspace_of(settings),
+        filename=fetched.filename,
+        url=loggable_url(request.url.strip()),
+        size=len(fetched.content),
+        job_id=accepted.job_id,
+    )
+    return accepted
 
 
 # Earlier versions of a document's original, kept by re-uploads when
@@ -344,6 +384,12 @@ def list_document_versions(
     response_model=DocumentJobAcceptedResponse,
     status_code=202,
     dependencies=[Depends(require_full_key)],
+    responses={
+        409: {
+            "description": "The document is already being indexed, originals aren't "
+            "kept (RAW_DOCUMENT_DIR), or the index was built for another embedding setup."
+        }
+    },
 )
 def restore_document_version(
     filename: str,
@@ -356,13 +402,29 @@ def restore_document_version(
     store = require_raw_store(raw_store)
     name = stored_filename(filename)
     repository.ensure_writable(settings)
+    # The same admission as a re-index: never alongside a job for the same document,
+    # and sized against the backlog before the bytes are read.
+    if name in indexing_now(settings):
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{name}' is already being indexed; wait for that job to finish.",
+        )
+    size = store.version_size(name, version)
+    if size is None:
+        raise DocumentNotFoundError(f"No version '{version}' of '{name}'.")
+    if not queue.backlog.has_room(size):
+        raise backlog_full_error()
     content = store.read_version(name, version)
     if content is None:
         raise DocumentNotFoundError(f"No version '{version}' of '{name}'.")
+    meta = repository.document_metadata(settings, name)
     accepted = queue.enqueue(
         filename=name,
         content=content,
         raw_store=store,
+        # An earlier version of a fetched document still came from that URL; a refresh
+        # brings the current one back.
+        source=source_of(meta) if meta is not None else None,
     )
     audit(
         "document.version_restore",
@@ -427,13 +489,7 @@ async def refresh_document_from_url(
             media_type="application/json",
         )
     accepted = await run_in_threadpool(
-        queue.enqueue,
-        filename=name,
-        content=fetched.content,
-        raw_store=raw_store,
-        source=DocumentSource(meta.source_url, fetched.etag, fetched.last_modified),
-        # Its tags carry over (as on any re-upload); unchanged bytes are left alone.
-        dedupe=True,
+        enqueue_refreshed, name, meta.source_url, fetched, queue, raw_store
     )
     audit(
         "document.refresh", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
@@ -601,12 +657,19 @@ def set_document_tags(
 def list_document_jobs(
     job_store: IngestJobStoreDep,
     settings: SettingsDep,
-    state: Annotated[Literal["active"], Query()] = "active",
+    state: Annotated[Literal["active", "recent", "failed"], Query()] = "active",
+    limit: Annotated[int, Query(ge=1, le=JOB_LIST_MAX_LIMIT)] = 50,
 ) -> DocumentJobListResponse:
-    # Only "active" for now: finished jobs are what each client polled itself.
-    return DocumentJobListResponse(
-        jobs=[_job_response(job) for job in job_store.list_active(workspace_of(settings))]
-    )
+    """Queued and running jobs (``active``, oldest first), or finished ones still
+    retained (``recent``, or only ``failed``, newest first) — a watcher's or an
+    import's failures, which no client polled."""
+
+    workspace = workspace_of(settings)
+    if state == "active":
+        jobs = job_store.list_active(workspace)
+    else:
+        jobs = job_store.list_finished(workspace, failed_only=state == "failed", limit=limit)
+    return DocumentJobListResponse(jobs=[_job_response(job) for job in jobs])
 
 
 @router.get(
@@ -795,6 +858,12 @@ def export_corpus(
             released.set()
             _export_running.release()
 
+    # A full read of the corpus: every original and the feedback leave the server.
+    audit(
+        "corpus.export",
+        workspace=workspace_of(settings),
+        originals_missing=archive.originals_missing,
+    )
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     return ClosingStreamingResponse(
         archive,
@@ -833,7 +902,11 @@ def import_backup(
     known: set[str] | None = None
 
     def enqueue(
-        filename: str, content: bytes, uploaded_at: float | None, tags: tuple[str, ...]
+        filename: str,
+        content: bytes,
+        uploaded_at: float | None,
+        tags: tuple[str, ...],
+        source: DocumentSource | None,
     ) -> DocumentJobAcceptedResponse:
         nonlocal known
         if raw_store is not None:
@@ -848,6 +921,7 @@ def import_backup(
             raw_store=raw_store,
             uploaded_at=uploaded_at,
             tags=tags,
+            source=source,
         )
 
     # The last step of recovering from an embedding change (export, delete all,

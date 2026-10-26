@@ -46,6 +46,7 @@ from api.schemas import (
     DocumentJobAcceptedResponse,
 )
 from api.settings import AppSettings
+from api.url_fetch import FetchedDocument
 from api.workspaces import WorkspaceClosingError, document_key, filename_of, workspace_of
 
 logger = logging.getLogger(__name__)
@@ -518,6 +519,26 @@ def staleness(settings: AppSettings, token_counter: object) -> Callable[[Documen
     return lambda meta: meta.is_stale(fingerprint, counter_mode)
 
 
+def enqueue_refreshed(
+    name: str,
+    source_url: str,
+    fetched: FetchedDocument,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+) -> DocumentJobAcceptedResponse:
+    """Index what a refresh of ``name`` fetched (the route's and the scheduled
+    refresh's): its tags carry over, as on any re-upload, unchanged bytes are left
+    alone, and the server's new validators are kept for the next conditional fetch."""
+
+    return queue.enqueue(
+        filename=name,
+        content=fetched.content,
+        raw_store=raw_store,
+        source=DocumentSource(source_url, fetched.etag, fetched.last_modified),
+        dedupe=True,
+    )
+
+
 def source_of(meta: DocumentMetadata) -> DocumentSource | None:
     """Where a URL-fetched document came from, carried over by a re-index."""
 
@@ -548,7 +569,7 @@ def reindex_stale(
     *,
     limit: int | None = None,
 ) -> StaleReindex:
-    """Queue a re-index of every stale document with a stored original (at most
+    """Queue a re-index of every stale or incomplete document with a stored original (at most
     ``limit`` jobs; the rest are deferred) — ``POST /documents/reindex`` and the
     background AUTO_REINDEX_STALE pass."""
 
@@ -562,7 +583,8 @@ def reindex_stale(
     in_progress: list[str] = []
     failed: list[str] = []
     for name, meta in sorted(metadata.items()):
-        if not is_stale(meta):
+        # Incomplete documents too: re-indexing from the original is their repair.
+        if not (is_stale(meta) or meta.incomplete):
             continue
         if name in busy:
             # Still listed as stale until its job finishes: a second click would

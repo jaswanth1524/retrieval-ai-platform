@@ -135,3 +135,36 @@ def test_the_background_loop_runs_a_pass_and_stops(
         wait_until(lambda: _stale(repository, current) == [])
     finally:
         reindexer.stop()
+
+
+def test_an_incomplete_document_is_repaired_from_its_original(
+    tmp_path: Path, executor: ThreadPoolExecutor
+) -> None:
+    from qdrant_client import models
+
+    from api.corpus import bump_corpus_generation
+
+    repository, settings, store, jobs, _ = _setup(tmp_path, executor)
+    client = repository._client  # noqa: SLF001
+    content = b"Intro\n" + " ".join(f"Sentence number {n} is here." for n in range(40)).encode()
+    service = IngestService(repository, FakeEmbeddingProvider(), settings, HeuristicTokenCounter())
+    service.ingest("long.txt", content)
+    store.save("long.txt", content)
+    whole = repository.filename_metadata(settings)["long.txt"].chunk_count
+    points, _ = client.scroll(
+        settings.qdrant_collection,
+        scroll_filter=models.Filter(
+            must=[models.FieldCondition(key="filename", match=models.MatchValue(value="long.txt"))]
+        ),
+        limit=1,
+    )
+    client.delete(
+        settings.qdrant_collection, points_selector=models.PointIdsList(points=[points[0].id])
+    )
+    bump_corpus_generation(["long.txt"], collection=settings.qdrant_collection)
+    assert repository.filename_metadata(settings)["long.txt"].incomplete
+
+    reindexer = _reindexer(repository, settings, store, jobs, executor)
+    assert reindexer.run_once() == 1
+    wait_until(lambda: not repository.filename_metadata(settings)["long.txt"].incomplete)
+    assert repository.filename_metadata(settings)["long.txt"].chunk_count == whole

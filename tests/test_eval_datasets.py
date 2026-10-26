@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from api.documents import parse_document_bytes
 from eval.harness import load_retrieval_dataset
 
 EVAL = Path(__file__).resolve().parents[1] / "eval"
@@ -22,6 +23,7 @@ PAIRS = [
     ("followup_eval.jsonl", "corpus_handbook"),
     ("paraphrase_eval.jsonl", "corpus_handbook"),
     ("compare_eval.jsonl", "corpus_handbook"),
+    ("mixed_eval.jsonl", "corpus_mixed"),
 ]
 
 
@@ -32,7 +34,13 @@ def _normalized(text: str) -> str:
 @pytest.mark.parametrize(("dataset", "corpus"), PAIRS)
 def test_labels_point_at_files_and_passages_in_the_corpus(dataset: str, corpus: str) -> None:
     examples = load_retrieval_dataset(EVAL / "datasets" / dataset)
-    texts = {path.name: _normalized(path.read_text()) for path in (EVAL / corpus).iterdir()}
+    # As indexed: a PDF or DOCX label must hold for the text its parser reads.
+    texts = {
+        path.name: _normalized(
+            " ".join(section.text for section in parse_document_bytes(path.name, path.read_bytes()))
+        )
+        for path in (EVAL / corpus).iterdir()
+    }
 
     assert examples
     for example in examples:
@@ -60,3 +68,28 @@ def test_the_multilingual_set_covers_each_language_and_cross_lingual_questions()
     assert labeled == {name for name in corpus if "archivada" not in name}
     english = [example for example in examples if example.question.isascii()]
     assert len({name for example in english for name in example.relevant_filenames}) == 3
+
+
+def test_the_mixed_corpus_is_the_handbook_in_other_formats() -> None:
+    """eval/make_mixed_corpus.py's output is committed: it must match the handbook."""
+
+    from eval.make_mixed_corpus import RENDERED, renamed
+
+    handbook = {path.name for path in (EVAL / "corpus_handbook").glob("*.md")}
+    mixed = {path.name for path in (EVAL / "corpus_mixed").iterdir()}
+    assert mixed == {renamed(name) for name in handbook}
+    assert {name.rsplit(".", 1)[1] for name in mixed} >= {
+        "pdf",
+        "docx",
+        "html",
+        "odt",
+        "pptx",
+        "xlsx",
+    }
+    for name in handbook - set(RENDERED):
+        assert (EVAL / "corpus_mixed" / name).read_bytes() == (
+            EVAL / "corpus_handbook" / name
+        ).read_bytes()
+    handbook_questions = load_retrieval_dataset(EVAL / "datasets" / "handbook_eval.jsonl")
+    mixed_questions = load_retrieval_dataset(EVAL / "datasets" / "mixed_eval.jsonl")
+    assert [e.question for e in mixed_questions] == [e.question for e in handbook_questions]

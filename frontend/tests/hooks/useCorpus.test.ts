@@ -71,7 +71,7 @@ describe('useCorpus', () => {
 
     api.listDocuments.mockResolvedValue({ filenames: ['policy.html'] });
     await act(() => result.current.handleRetryUpload(failed.id));
-    expect(api.uploadFromUrl).toHaveBeenLastCalledWith(url, expect.anything(), '');
+    expect(api.uploadFromUrl).toHaveBeenLastCalledWith(url, expect.anything(), '', undefined);
     // Done: its card gives way to the document's own once the listing has it.
     expect(result.current.uploads).toEqual([]);
     expect(result.current.indexedFilenames).toEqual(['policy.html']);
@@ -414,7 +414,7 @@ describe('useCorpus across workspaces', () => {
     setWorkspace('');
     await act(() => result.current.handleRetryUpload(result.current.uploads[0].id));
 
-    expect(api.uploadDocument).toHaveBeenLastCalledWith(file, expect.anything(), 'legal');
+    expect(api.uploadDocument).toHaveBeenLastCalledWith(file, expect.anything(), 'legal', undefined);
   });
 
   it('leaves the list of the workspace now in use alone when a delete or tag change ends', async () => {

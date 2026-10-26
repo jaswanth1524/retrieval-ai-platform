@@ -219,3 +219,17 @@ def test_a_marker_only_in_an_echoed_source_header_announces_the_retry() -> None:
     generator = CountingGenerator("Contractors get sick leave from day one [1].")
     outcome = finalize_citations([], answer, sources, generator, settings, context_chunks=CHUNKS)
     assert outcome.retry_used and len(generator.calls) == 1
+
+
+def test_a_bulleted_answer_is_backfilled_one_bullet_at_a_time() -> None:
+    """Each line of a bulleted answer (ANSWER_FORMAT=bullets) is its own sentence: a
+    bullet ending with no period isn't glued to the next one and cited as one."""
+
+    answer = (
+        "- Flights are booked at least fourteen days ahead\n"
+        "- The daily meal allowance abroad is sixty euros"
+    )
+    assert backfill_citations(answer, CHUNKS) == (
+        "- Flights are booked at least fourteen days ahead [1]\n"
+        "- The daily meal allowance abroad is sixty euros [2]"
+    )

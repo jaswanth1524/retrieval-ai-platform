@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.audit import audit
 from api.auto_reindex import ReindexTarget, StaleReindexer
 from api.dependencies import (
     get_app_settings,
@@ -60,6 +61,7 @@ from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
 from api.storage import check_writable_storage
+from api.url_refresh import RefreshTarget, UrlRefresher
 from api.version import app_version
 from api.watch import FolderWatcher, WatchedJob
 from api.workspaces import (
@@ -318,6 +320,14 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
             # its document just takes the new mtime.
             dedupe=True,
         )
+        audit(
+            "document.upload",
+            workspace=workspace_of(settings),
+            filename=filename,
+            size=len(content),
+            job_id=accepted.job_id,
+            source="watch",
+        )
         return accepted.job_id
 
     def job_lookup(job_id: str) -> WatchedJob | None:
@@ -385,6 +395,46 @@ def start_stale_reindexer(settings: AppSettings) -> StaleReindexer | None:
     return reindexer
 
 
+def start_url_refresher(settings: AppSettings) -> UrlRefresher:
+    """Start URL_REFRESH_INTERVAL_MINUTES's background passes (api/url_refresh.py) over
+    the default workspace and every other one."""
+
+    client = get_qdrant_client()
+    repository = VectorRepository(client)
+    token_counter = get_token_counter()
+
+    def target(
+        workspace_settings: AppSettings, raw_store: RawDocumentStore | None
+    ) -> RefreshTarget:
+        service = IngestService(
+            repository, get_embedding_provider(), workspace_settings, token_counter
+        )
+        queue = IngestQueue(
+            get_ingest_job_store(), get_ingest_executor(), get_ingest_backlog(), service
+        )
+        return RefreshTarget(workspace_settings, raw_store, queue)
+
+    def targets() -> list[RefreshTarget]:
+        found = [target(settings, get_raw_document_store())]
+        if settings.workspaces_enabled:
+            for name in list_workspaces(client, settings.qdrant_collection):
+                workspace_settings = settings_for(settings, name)
+                store = (
+                    RawDocumentStore(
+                        workspace_settings.raw_document_dir,
+                        int(workspace_settings.raw_document_versions),
+                    )
+                    if workspace_settings.raw_document_dir
+                    else None
+                )
+                found.append(target(workspace_settings, store))
+        return found
+
+    refresher = UrlRefresher(settings, repository, targets)
+    refresher.start()
+    return refresher
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
@@ -396,13 +446,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         health.record(await run_in_threadpool(warm_models, settings))
         # For /health/ready: a model that never loaded makes the app "degraded".
         app.state.model_health = health
-    watcher = start_folder_watcher(settings) if settings.watch_dir else None
-    # For GET /watch and POST /watch/scan.
-    app.state.watcher = watcher
-    reindexer = start_stale_reindexer(settings) if settings.auto_reindex_stale else None
+    watcher = None
+    reindexer = None
+    refresher = None
     try:
+        watcher = start_folder_watcher(settings) if settings.watch_dir else None
+        # For GET /watch and POST /watch/scan.
+        app.state.watcher = watcher
+        reindexer = start_stale_reindexer(settings) if settings.auto_reindex_stale else None
+        if settings.url_refresh_interval_minutes and settings.url_ingest_enabled:
+            refresher = start_url_refresher(settings)
         yield
     finally:
+        if refresher is not None:
+            refresher.stop()
         if reindexer is not None:
             reindexer.stop()
         if watcher is not None:

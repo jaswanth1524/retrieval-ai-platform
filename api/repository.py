@@ -94,7 +94,7 @@ SEARCH_PAYLOAD_FIELDS = [
     "chunk_ordinal",
 ]
 # Neighbour expansion reads only these.
-NEIGHBOR_PAYLOAD_FIELDS = ["chunk_ordinal", "text"]
+NEIGHBOR_PAYLOAD_FIELDS = ["chunk_ordinal", "text", "chunk_id"]
 # Distinct tags one facet call returns before stored_tags falls back to a full scan.
 TAG_FACET_LIMIT = 1000
 
@@ -128,6 +128,10 @@ class DocumentMetadata:
     source_url: str | None = None
     source_etag: str | None = None
     source_last_modified: str | None = None
+    # Points from more than one ingest, or fewer than the ingest that wrote them meant
+    # to write: a write cut off part way (a killed container) or a failed clean-up of
+    # the previous version's points. Never set for points from before those fields.
+    incomplete: bool = False
 
     def is_stale(self, fingerprint: str, counter_mode: str) -> bool:
         """Chunked differently from how it would be today, so re-indexing changes it.
@@ -225,7 +229,17 @@ class _MetadataFold:
             source_url=url,
             source_etag=etag,
             source_last_modified=modified,
+            incomplete=self._incomplete(),
         )
+
+    def _incomplete(self) -> bool:
+        # Every point one ingest writes carries the same hash and chunk total, so any
+        # mix means two ingests' points side by side. A document whose points all
+        # predate both fields (all None) is never flagged.
+        if len(self.hashes) > 1 or len(self.totals) > 1:
+            return True
+        total = _single_value(self.totals)
+        return total is not None and total != self.count
 
 
 # Points per scroll page. Ids and a handful of payload fields are small: at 256 a 50k-point
@@ -963,6 +977,11 @@ class PassageFilter:
     # Only these passages (chunk ids): a question about passages picked in the Search
     # panel. Still searched and reranked like any other scope.
     chunk_ids: tuple[str, ...] = ()
+    # Passages left out (an answer asked again without one of its sources).
+    exclude_chunk_ids: tuple[str, ...] = ()
+    # Documents uploaded in this range (Unix seconds).
+    uploaded_after: float | None = None
+    uploaded_before: float | None = None
 
 
 def _scope_filter(
@@ -981,10 +1000,26 @@ def _scope_filter(
     if tags:
         must.append(models.FieldCondition(key="tags", match=models.MatchAny(any=list(tags))))
     if narrow is not None:
-        if narrow.page_min is not None or narrow.page_max is not None:
+        if narrow.page_max is not None:
+            must.append(models.FieldCondition(key="page", range=models.Range(lte=narrow.page_max)))
+        if narrow.page_min is not None:
+            # Overlapping the range: starting in it, or starting before and running onto
+            # it. page_end is stored only on passages that cross a page break.
+            must.append(
+                models.Filter(
+                    should=[
+                        models.FieldCondition(key="page", range=models.Range(gte=narrow.page_min)),
+                        models.FieldCondition(
+                            key="page_end", range=models.Range(gte=narrow.page_min)
+                        ),
+                    ]
+                )
+            )
+        if narrow.uploaded_after is not None or narrow.uploaded_before is not None:
             must.append(
                 models.FieldCondition(
-                    key="page", range=models.Range(gte=narrow.page_min, lte=narrow.page_max)
+                    key="uploaded_at",
+                    range=models.Range(gte=narrow.uploaded_after, lte=narrow.uploaded_before),
                 )
             )
         if narrow.section:
@@ -1001,6 +1036,12 @@ def _scope_filter(
             must_not.append(
                 models.FieldCondition(
                     key="filename", match=models.MatchAny(any=list(narrow.exclude_filenames))
+                )
+            )
+        if narrow.exclude_chunk_ids:
+            must_not.append(
+                models.FieldCondition(
+                    key="chunk_id", match=models.MatchAny(any=list(narrow.exclude_chunk_ids))
                 )
             )
     if not must and not must_not:

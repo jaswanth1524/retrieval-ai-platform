@@ -813,3 +813,44 @@ def test_the_trace_records_the_narrowing_and_the_format(api_context: ApiTestCont
         "bulleted list"
         in client.get(f"/traces/{answer['trace_id']}").json()["prompt_messages"][0]["content"]
     )
+
+
+def test_search_results_mark_the_sentences_matching_the_query(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    doc = b"Intro\nThe office opens at nine. Parking passes are issued by reception."
+    assert upload_and_wait(client, "office.txt", doc)["state"] == "done"
+
+    results = client.post("/search", json={"query": "parking passes"}).json()["results"]
+
+    quotes = [span["quote"] for result in results for span in result["spans"]]
+    assert quotes == ["Parking passes are issued by reception."]
+    for result in results:
+        for span in result["spans"]:
+            assert result["text"][span["start"] : span["end"]] == span["quote"]
+
+
+def test_upload_dates_narrow_questions_and_must_be_in_order(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+
+    later = client.post("/search", json={"query": "alpha", "uploaded_after": 4_000_000_000})
+    assert later.status_code == 200 and later.json()["results"] == []
+    earlier = client.post("/search", json={"query": "alpha", "uploaded_before": 4_000_000_000})
+    assert [r["filename"] for r in earlier.json()["results"]] == ["guide.txt"]
+    reversed_range = client.post(
+        "/questions", json={"question": "alpha", "uploaded_after": 2, "uploaded_before": 1}
+    )
+    assert reversed_range.status_code == 422
+
+
+def test_a_summary_cites_its_passages_without_a_rerank_score(api_context: ApiTestContext) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+    body = client.post(
+        "/questions/summary", json={"mode": "summarize", "filenames": ["guide.txt"]}
+    ).json()
+    assert body["sources"] and all(source["rerank_score"] is None for source in body["sources"])
+    answer = client.post("/questions", json={"question": "alpha"}).json()
+    assert all(source["rerank_score"] is not None for source in answer["sources"])

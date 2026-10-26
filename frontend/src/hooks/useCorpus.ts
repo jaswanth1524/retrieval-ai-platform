@@ -18,6 +18,7 @@ class UploadCancelled extends Error {}
 
 function documentsFrom(response: DocumentListResponse): Record<string, DocumentMeta> {
   const stale = new Set(response.stale_filenames ?? []);
+  const incomplete = new Set(response.incomplete_filenames ?? []);
   const reindexable = new Set(response.reindexable_filenames ?? []);
   const documents: Record<string, DocumentMeta> = {};
   for (const filename of response.filenames) {
@@ -27,6 +28,7 @@ function documentsFrom(response: DocumentListResponse): Record<string, DocumentM
       bytes: response.byte_sizes?.[filename],
       uploadedAt: response.uploaded_ats?.[filename],
       stale: stale.has(filename),
+      ...(incomplete.has(filename) ? { incomplete: true } : {}),
       reindexable: reindexable.has(filename),
       tags: response.tags?.[filename] ?? [],
       ...(response.source_urls?.[filename] ? { sourceUrl: response.source_urls[filename] } : {}),
@@ -66,6 +68,10 @@ export function useCorpus(callbacks: CorpusCallbacks) {
   const [documents, setDocuments] = useState<Record<string, DocumentMeta>>({});
   const uploadsRef = useRef(uploads);
   uploadsRef.current = uploads;
+  // Tags given to every document this tab uploads or adds from a URL until changed.
+  const [uploadTags, setUploadTags] = useState<string[]>([]);
+  const uploadTagsRef = useRef(uploadTags);
+  uploadTagsRef.current = uploadTags;
   const indexedRef = useRef(indexedFilenames);
   indexedRef.current = indexedFilenames;
 
@@ -292,12 +298,17 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       }
     };
 
-    // Every upload body, first try or retry, goes through the same few send slots.
-    const sendUpload = (file: File, signal: AbortSignal, workspace: string) =>
-      sendSlots.run(() => api.uploadDocument(file, signal, workspace), signal);
+    const currentUploadTags = () =>
+      uploadTagsRef.current.length > 0 ? [...uploadTagsRef.current] : undefined;
 
-    const uploadOne = (file: File, id: string, workspace: string) =>
-      runIngestJob(id, file.name, workspace, (signal) => sendUpload(file, signal, workspace));
+    // Every upload body, first try or retry, goes through the same few send slots.
+    const sendUpload = (file: File, signal: AbortSignal, workspace: string, tags?: string[]) =>
+      sendSlots.run(() => api.uploadDocument(file, signal, workspace, tags), signal);
+
+    const uploadOne = (file: File, id: string, workspace: string, tags?: string[]) =>
+      runIngestJob(id, file.name, workspace, (signal) =>
+        sendUpload(file, signal, workspace, tags),
+      );
 
     // Stops an upload or re-index: before the server has it, locally; after, by asking
     // the server, which refuses (409) once the job has started writing to the index.
@@ -341,22 +352,25 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     };
 
     // The server fetches the document; the card shows the URL until it names the file.
-    const startFromUrl = (id: string, url: string, workspace: string) => async (signal: AbortSignal) => {
-      const accepted = await api.uploadFromUrl(url, signal, workspace);
-      setUploads((prev) =>
-        prev.map((item) => (item.id === id ? { ...item, filename: accepted.filename } : item)),
-      );
-      return accepted;
-    };
+    const startFromUrl =
+      (id: string, url: string, workspace: string, tags?: string[]) =>
+      async (signal: AbortSignal) => {
+        const accepted = await api.uploadFromUrl(url, signal, workspace, tags);
+        setUploads((prev) =>
+          prev.map((item) => (item.id === id ? { ...item, filename: accepted.filename } : item)),
+        );
+        return accepted;
+      };
 
     const handleUploadFromUrl = async (url: string) => {
       const id = newId();
       const workspace = getWorkspace();
+      const tags = currentUploadTags();
       setUploads((prev) => [
         ...prev,
-        { id, filename: url, status: 'uploading', sourceUrl: url, workspace },
+        { id, filename: url, status: 'uploading', sourceUrl: url, workspace, tags },
       ]);
-      await runIngestJob(id, url, workspace, startFromUrl(id, url, workspace));
+      await runIngestJob(id, url, workspace, startFromUrl(id, url, workspace, tags));
       await refreshAfterIngest(workspace);
     };
 
@@ -500,12 +514,14 @@ export function useCorpus(callbacks: CorpusCallbacks) {
 
     const handleUpload = async (files: File[]) => {
       const workspace = getWorkspace();
+      const tags = currentUploadTags();
       const newItems: UploadItem[] = files.map((file) => ({
         id: newId(),
         filename: file.name,
         status: 'uploading',
         file,
         workspace,
+        tags,
       }));
       setUploads((prev) => [...prev, ...newItems]);
       // A few bodies at a time (see UPLOAD_CONCURRENCY): a 20-file drop used to send 20
@@ -513,7 +529,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       // used to hold its slot until it was indexed, so the third one wasn't even sent
       // until the first had finished.
       await Promise.allSettled(
-        files.map((file, index) => uploadOne(file, newItems[index].id, workspace)),
+        files.map((file, index) => uploadOne(file, newItems[index].id, workspace, tags)),
       );
       // Once for the whole batch, not once per file. Chunk counts live server-side and
       // GET /documents scrolls the entire collection to compute them, so refreshing
@@ -532,12 +548,12 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         ),
       );
       // Retried where it was first sent, whichever workspace is in use now.
-      const { file, filename, sourceUrl, workspace = '' } = item;
+      const { file, filename, sourceUrl, workspace = '', tags } = item;
       await runIngestJob(id, filename, workspace, (signal) =>
         file
-          ? sendUpload(file, signal, workspace)
+          ? sendUpload(file, signal, workspace, tags)
           : sourceUrl
-            ? startFromUrl(id, sourceUrl, workspace)(signal)
+            ? startFromUrl(id, sourceUrl, workspace, tags)(signal)
             : api.reindexDocument(filename, signal, workspace),
       );
       await refreshAfterIngest(workspace);
@@ -621,6 +637,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     documents,
     availableTags,
     chunkTotal,
+    uploadTags,
+    setUploadTags,
     ...actions,
   };
 }

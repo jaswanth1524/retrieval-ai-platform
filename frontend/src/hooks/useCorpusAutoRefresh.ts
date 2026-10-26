@@ -2,6 +2,10 @@ import { useEffect, useRef } from 'react';
 
 /** At most one re-list per this long from the tab coming back into view. */
 export const CORPUS_REFRESH_MIN_INTERVAL_MS = 30_000;
+/** How often an empty corpus is listed again (its first document may come from the
+ *  watched folder or the CLI, and the composer waits for one), and a watched one. */
+export const EMPTY_CORPUS_POLL_MS = 15_000;
+export const WATCHED_CORPUS_POLL_MS = 60_000;
 
 /**
  * Re-lists the corpus when the tab comes back into view and when the connection comes
@@ -13,6 +17,7 @@ export function useCorpusAutoRefresh(
   enabled: boolean,
   connectionLost: boolean,
   refresh: () => Promise<unknown>,
+  pollMs: number | null = null,
 ): void {
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
@@ -34,6 +39,17 @@ export function useCorpusAutoRefresh(
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [enabled]);
+
+  // Polled while the tab is visible, for documents nobody in this tab added.
+  useEffect(() => {
+    if (!enabled || pollMs === null || connectionLost) return;
+    const timer = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      lastRef.current = Date.now();
+      refreshRef.current().catch(() => {});
+    }, pollMs);
+    return () => clearInterval(timer);
+  }, [enabled, pollMs, connectionLost]);
 
   const wasLost = useRef(connectionLost);
   useEffect(() => {

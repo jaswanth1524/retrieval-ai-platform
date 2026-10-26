@@ -79,6 +79,7 @@ const CONFIG = {
   raw_documents_enabled: false,
   query_log_enabled: false,
   document_versions_enabled: false,
+  watch_enabled: false,
 };
 
 type JobStep = { status: number; body?: object };
@@ -143,10 +144,14 @@ export class MockApi {
   /** GET /health/ready beyond "all up" (an index built for another embedding setup). */
   readiness: Record<string, unknown> = {};
   /** GET /documents/jobs: jobs indexing that the page didn't start. */
-  activeJobs: object[] = [];
+  activeJobs: ({ job_id: string } & Record<string, unknown>)[] = [];
+  /** GET /documents/jobs?state=failed|recent: finished jobs the server keeps. */
+  finishedJobs: object[] = [];
+  /** Ids of jobs started elsewhere that the page asked to cancel. */
+  readonly cancelledOutsideJobs: string[] = [];
   /** GET /watch (needs config.watch_enabled); null answers 404. */
   watchStatus: object | null = null;
-  /** GET /query-log?uncovered=true rows (needs config.query_log_enabled). */
+  /** GET /query-log rows (needs config.query_log_enabled). */
   unanswered: object[] = [];
   /** GET /documents/{f}/versions, by filename (needs config.document_versions_enabled). */
   versions: Record<string, object[]> = {};
@@ -273,6 +278,8 @@ export class MockApi {
     }
 
     if (path === '/documents/jobs' && method === 'GET') {
+      const state = new URL(request.url()).searchParams.get('state');
+      if (state === 'failed' || state === 'recent') return this.json(route, 200, { jobs: this.finishedJobs });
       return this.json(route, 200, { jobs: this.activeJobs });
     }
     if (path === '/watch' || path === '/watch/scan') {
@@ -281,6 +288,12 @@ export class MockApi {
     }
     if (path.startsWith('/documents/jobs/')) {
       const jobId = path.slice('/documents/jobs/'.length);
+      const outside = this.activeJobs.find((candidate) => candidate.job_id === jobId);
+      if (outside && method === 'DELETE') {
+        this.cancelledOutsideJobs.push(jobId);
+        this.activeJobs = this.activeJobs.filter((candidate) => candidate.job_id !== jobId);
+        return this.json(route, 202, { ...outside, state: 'queued', cancelled: true });
+      }
       const job = this.jobs.get(jobId);
       if (!job) return this.configured(route, 404, { detail: `Unknown job '${jobId}'.` });
       if (method === 'DELETE') {

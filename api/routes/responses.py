@@ -142,6 +142,9 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         citation_backfilled=trace.citation_backfilled,
         request_id=trace.request_id,
         usage=usage_response(trace.usage, trace.cost_usd),
+        answer_status=trace.answer_status,
+        truncated=trace.truncated,
+        dropped_history_messages=trace.dropped_history_messages,
     )
 
 

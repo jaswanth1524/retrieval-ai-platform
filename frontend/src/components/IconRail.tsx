@@ -15,7 +15,7 @@ const RAIL_ITEMS: RailItem[] = [
   { key: 'search', glyph: '⌕', label: 'Search passages' },
   { key: 'traces', glyph: '◔', label: 'Traces' },
   { key: 'feedback', glyph: '★', label: 'Feedback' },
-  { key: 'unanswered', glyph: '⁇', label: 'Unanswered questions' },
+  { key: 'unanswered', glyph: '⁇', label: 'Asked questions' },
 ];
 
 interface IconRailProps {

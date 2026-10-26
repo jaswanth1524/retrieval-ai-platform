@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from fastapi import Depends, FastAPI
 
+from api.citations import query_spans
 from api.dependencies import require_api_key
 from api.pipeline import AnswerOverrides
 from api.routes.deps import QuestionSlotsDep, RagPipelineDep
 from api.routes.questions import passage_narrowing, question_slot
 from api.schemas import (
+    CitationSpanResponse,
     SearchRequest,
     SearchResponse,
     SearchResultResponse,
@@ -52,6 +54,10 @@ def register(app: FastAPI) -> None:
                     retrieval_score=chunk.retrieval_score,
                     rerank_score=chunk.rerank_score,
                     page_end=chunk.page_end,
+                    spans=[
+                        CitationSpanResponse(start=span.start, end=span.end, quote=span.quote)
+                        for span in query_spans(request.query, chunk.text, chunk.section)
+                    ],
                 )
                 for rank, chunk in enumerate(phase.context_chunks, start=1)
             ],

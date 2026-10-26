@@ -25,6 +25,7 @@ documents, did), 2 bad arguments, 3 (``ask --strict``) the documents don't answe
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -189,22 +190,46 @@ def provider_model(config: dict[str, Any], provider: str) -> str:
     return str(config.get(field) or "?")
 
 
+# `docrag status` exits with this when the server answers but isn't ready (a model that
+# didn't load, Qdrant or the LLM provider unreachable, an incompatible index).
+EXIT_DEGRADED = 1
+
+
 def cmd_status(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     health = client.health()
+    ready = client.readiness()
     config = client.config()
     listing = client.documents()
+    degraded = ready.get("status") != "ok"
     if args.json:
-        print(json.dumps({"health": health, "config": config, "documents": listing}), file=out)
-        return 0
-    print(f"DocRAG {health.get('version', '?')} — {health.get('status')}", file=out)
+        print(
+            json.dumps({"health": health, "ready": ready, "config": config, "documents": listing}),
+            file=out,
+        )
+        return EXIT_DEGRADED if degraded else 0
+    print(f"DocRAG {health.get('version', '?')} — {ready.get('status')}", file=out)
     provider = str(config.get("llm_provider", ""))
     print(
         f"generation: {provider} ({provider_model(config, provider)}); "
         f"embeddings: {config.get('dense_embedding_model')}",
         file=out,
     )
+    checks = [
+        ("qdrant", ready.get("qdrant")),
+        ("llm provider", ready.get("generation_provider")),
+        ("index", ready.get("index_compatible", True)),
+    ]
+    print("  ".join(f"{name}: {'ok' if ok else 'DOWN'}" for name, ok in checks), file=out)
+    models = ready.get("models") or {}
+    if models:
+        print(
+            "models: " + ", ".join(f"{name} {state}" for name, state in sorted(models.items())),
+            file=out,
+        )
+    if ready.get("index_detail"):
+        print(f"index: {ready['index_detail']}", file=out)
     print(f"documents: {len(listing.get('filenames', []))}", file=out)
-    return 0
+    return EXIT_DEGRADED if degraded else 0
 
 
 def cmd_documents(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -320,24 +345,63 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
 ANSWER_FORMATS = ("default", "bullets", "table", "brief")
 
 
-def question_options(args: argparse.Namespace) -> dict[str, Any]:
-    """The narrowing and answer-style flags ``ask`` and ``chat`` share."""
+def narrowing_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The narrowing flags ``ask``, ``chat`` and ``search`` share, as request fields."""
 
     return {
         "page_min": args.page_min,
         "page_max": args.page_max,
         "section": args.section,
         "exclude_filenames": args.exclude,
+        "exclude_chunk_ids": args.exclude_chunk,
+        "uploaded_after": args.uploaded_after,
+        "uploaded_before": args.uploaded_before,
+    }
+
+
+def question_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The narrowing and answer-style flags ``ask`` and ``chat`` share."""
+
+    return {
+        **narrowing_options(args),
         "answer_format": args.answer_format,
         "answer_language": args.language,
     }
 
 
-def _question_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--page-min", type=int, help="Only passages from this page on.")
+def upload_time(value: str) -> float:
+    """An ``--uploaded-after/--before`` value: an ISO date or date-time (local time when
+    it names no zone), as Unix seconds."""
+
+    try:
+        return datetime.datetime.fromisoformat(value.strip()).timestamp()
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a date (2024-05-31) or date-time (2024-05-31T14:00)."
+        ) from None
+
+
+def _narrowing_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--page-min", type=int, help="Only passages on or after this page.")
     parser.add_argument("--page-max", type=int, help="Only passages up to this page.")
     parser.add_argument("--section", help="Only passages under this exact section label.")
     parser.add_argument("--exclude", action="append", help="Leave this document out (repeatable).")
+    parser.add_argument(
+        "--exclude-chunk",
+        action="append",
+        metavar="CHUNK_ID",
+        help="Leave this passage out (repeatable).",
+    )
+    parser.add_argument(
+        "--uploaded-after", type=upload_time, metavar="DATE", help="Documents uploaded since."
+    )
+    parser.add_argument(
+        "--uploaded-before", type=upload_time, metavar="DATE", help="Documents uploaded before."
+    )
+
+
+def _question_flags(parser: argparse.ArgumentParser) -> None:
+    _narrowing_flags(parser)
     parser.add_argument(
         "--answer-format", choices=ANSWER_FORMATS, help="How the answer is laid out."
     )
@@ -557,7 +621,11 @@ def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -
 
 def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     response = client.search_response(
-        args.query, filenames=args.file or None, top_k=args.top_k, tags=args.tag or None
+        args.query,
+        filenames=args.file or None,
+        top_k=args.top_k,
+        tags=args.tag or None,
+        options=narrowing_options(args),
     )
     results: list[dict[str, Any]] = response.get("results", [])
     if args.json:
@@ -727,19 +795,94 @@ def cmd_jobs(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
         else:
             print(f"cancel requested: {status.get('filename')} ({status.get('state')})", file=out)
         return 0
-    jobs = client.active_jobs()
+    if args.recent or args.failed:
+        jobs = client.finished_jobs(failed_only=args.failed, limit=args.limit)
+    else:
+        jobs = client.active_jobs()
     if args.json:
         print(json.dumps(jobs), file=out)
         return 0
     if not jobs:
-        print("no indexing jobs running", file=out)
+        print(
+            "no failed jobs kept"
+            if args.failed
+            else "no finished jobs kept"
+            if args.recent
+            else "no indexing jobs running",
+            file=out,
+        )
     for job in jobs:
         progress = (
             f" {job.get('chunks_done')}/{job.get('chunks_total')}"
-            if job.get("chunks_total")
+            if job.get("chunks_total") and job.get("state") not in ("done", "failed")
             else ""
         )
-        print(f"{job.get('job_id')}  {job.get('state')}{progress}  {job.get('filename')}", file=out)
+        line = f"{job.get('job_id')}  {job.get('state')}{progress}  {job.get('filename')}"
+        if job.get("error"):
+            line += f"\n    {job['error']}"
+        print(line, file=out)
+    return 0
+
+
+def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.action == "export":
+        if not args.target:
+            print("traces export needs a file to write", file=sys.stderr)
+            return 2
+        written = client.export_traces(Path(args.target))
+        print(f"wrote {written} bytes to {args.target}", file=sys.stderr)
+        return 0
+    if args.action == "show":
+        if not args.target:
+            print("traces show needs a trace id", file=sys.stderr)
+            return 2
+        trace = client.trace(args.target)
+        if args.json:
+            print(json.dumps(trace), file=out)
+            return 0
+        print(f"{trace.get('question')}\n  {trace.get('status')} · {trace.get('mode')}", file=out)
+        for candidate in trace.get("candidates") or []:
+            score = candidate.get("rerank_score")
+            shown = f"{score:.2f}" if isinstance(score, int | float) else "  - "
+            mark = "*" if candidate.get("selected_for_context") else " "
+            reason = candidate.get("drop_reason") or ""
+            print(
+                f"  {mark} {shown}  {candidate.get('filename')} p.{candidate.get('page')}"
+                f"  {reason}",
+                file=out,
+            )
+        if trace.get("answer"):
+            print(f"\n{trace['answer']}", file=out)
+        return 0
+    traces = client.traces()
+    if args.json:
+        print(json.dumps(traces), file=out)
+        return 0
+    for trace in traces:
+        total = trace.get("total_ms")
+        took = f"{total / 1000:.1f}s" if isinstance(total, int | float) else "-"
+        print(
+            f"{trace.get('trace_id')}  {trace.get('status'):20} {took:>6}  {trace.get('question')}",
+            file=out,
+        )
+    return 0
+
+
+def cmd_feedback(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    rows = client.feedback(limit=args.limit)
+    if args.json:
+        print(json.dumps(rows), file=out)
+        return 0
+    for row in rows:
+        thumb = "+" if row.get("rating") == "up" else "-"
+        print(f"{thumb} {row.get('kind', 'question'):9} {row.get('question')}", file=out)
+    return 0
+
+
+def cmd_original(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    destination = Path(args.output or Path(args.file).name)
+    written = client.original(args.file, destination)
+    print(f"wrote {written} bytes to {destination}", file=sys.stderr)
     return 0
 
 
@@ -940,6 +1083,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--file", action="append")
     search.add_argument("--tag", action="append")
     search.add_argument("--top-k", type=int)
+    _narrowing_flags(search)
 
     read = command("read", "Print a document's indexed passages.")
     read.add_argument("file")
@@ -974,8 +1118,22 @@ def build_parser() -> argparse.ArgumentParser:
     queries.add_argument("--uncovered", action="store_true", help="Only unanswered ones.")
     queries.add_argument("--limit", type=int, default=50)
 
-    jobs = command("jobs", "Indexing jobs running now.")
+    jobs = command("jobs", "Indexing jobs running now (or finished ones).")
     jobs.add_argument("--cancel", metavar="JOB_ID", help="Cancel this job.")
+    jobs.add_argument("--recent", action="store_true", help="Finished jobs, newest first.")
+    jobs.add_argument("--failed", action="store_true", help="Only failed jobs, newest first.")
+    jobs.add_argument("--limit", type=int, default=50)
+
+    traces = command("traces", "Recent question traces: list, show one, or export.")
+    traces.add_argument("action", nargs="?", choices=("list", "show", "export"), default="list")
+    traces.add_argument("target", nargs="?", help="The trace id (show) or file (export).")
+
+    feedback = command("feedback", "Recorded answer ratings (FEEDBACK_ENABLED, full key).")
+    feedback.add_argument("--limit", type=int, default=50)
+
+    original = command("original", "Download a document's stored original.")
+    original.add_argument("file")
+    original.add_argument("-o", "--output", help="Where to write it (default: its name).")
 
     workspaces = command("workspaces", "List, create or delete workspaces.")
     workspaces.add_argument("action", choices=("list", "create", "delete"))
@@ -1009,6 +1167,9 @@ COMMANDS = {
     "versions": cmd_versions,
     "queries": cmd_queries,
     "jobs": cmd_jobs,
+    "traces": cmd_traces,
+    "feedback": cmd_feedback,
+    "original": cmd_original,
     "workspaces": cmd_workspaces,
     "watch": cmd_watch,
     "export": cmd_export,

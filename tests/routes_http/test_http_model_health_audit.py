@@ -145,8 +145,10 @@ def test_delete_and_tag_changes_are_audited(
     assert api_context.client.delete("/documents/notes.txt").status_code == 200
 
     records = _audit_records(caplog)
-    assert [r["event"] for r in records] == ["document.tags", "document.delete"]
-    tags, delete = records
+    assert [r["event"] for r in records] == ["document.upload", "document.tags", "document.delete"]
+    upload, tags, delete = records
+    assert upload["filename"] == "notes.txt"
+    assert upload["size"] == len(b"alpha beta gamma")
     assert tags["tags"] == ["Finance"]
     assert delete["filename"] == "notes.txt"
     assert delete["workspace"] == "default"
@@ -162,7 +164,8 @@ def test_audit_records_which_key_was_used(caplog: pytest.LogCaptureFixture) -> N
         upload_and_wait(client, "notes.txt", b"alpha beta gamma", headers=headers)
         assert client.delete("/documents/notes.txt", headers=headers).status_code == 200
 
-    (record,) = _audit_records(caplog)
+    upload, record = _audit_records(caplog)
+    assert upload["event"] == "document.upload"
     assert record["key"] == "full"
 
 

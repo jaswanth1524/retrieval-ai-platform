@@ -2796,3 +2796,120 @@ def test_picked_passages_are_answered_without_their_neighbours() -> None:
 
     assert [chunk.chunk_id for chunk in phase.context_chunks] == [picked]
     assert phase.context_chunks[0].expanded_text is None
+
+
+def test_a_sync_question_with_nothing_to_answer_from_never_waits_for_the_model() -> None:
+    """The canned "not enough information" answer makes no LLM call, so it must not
+    queue behind another question's generation at a local model."""
+
+    from api.llm import GenerationSlot
+
+    settings = make_settings(llm_provider="ollama", rerank_fallback_count=0)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "models.txt", b"Kinds\nFoundation models"
+    )
+    traces = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=SequencedGenerator([]),
+        settings=settings,
+        trace_store=traces,
+    )
+    holder = GenerationSlot(settings)
+    assert holder.acquire()  # another question is generating
+    try:
+        result: list[Any] = []
+        thread = threading.Thread(target=lambda: result.append(pipeline.answer("anything")))
+        thread.start()
+        thread.join(10)
+        assert not thread.is_alive()
+    finally:
+        holder.release()
+    assert result[0].answer_status == "no_context"
+    assert traces.traces[0].answer_status == "no_context"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_trace_records_the_answer_status_and_what_the_prompt_left_out(stream: bool) -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    traces = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha is documented, with no marker."),
+        settings=settings.model_copy(update={"citation_retry_mode": "off"}),
+        trace_store=traces,
+    )
+    if stream:
+        list(pipeline.answer_stream("alpha"))
+    else:
+        pipeline.answer("alpha")
+    trace = traces.traces[0]
+    assert trace.answer_status == "uncited"
+    assert trace.status == "ok"
+    assert trace.truncated is False
+    assert trace.dropped_history_messages == 0
+
+
+def test_a_streamed_answer_with_no_context_still_reports_its_usage() -> None:
+    settings = make_settings(rerank_fallback_count=0)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "models.txt", b"Kinds\nFoundation models"
+    )
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=SequencedGenerator([]),
+        settings=settings,
+    )
+    done = [event for event in pipeline.answer_stream("anything") if event["type"] == "done"]
+    # The key is there (None: the fake generator reports no tokens), as on an answer.
+    assert "usage" in done[0]
+    assert done[0]["answer_status"] == "no_context"
+
+
+def test_a_left_out_passage_is_neither_a_source_nor_a_neighbour() -> None:
+    """Asking again without a source: the passage isn't retrieved, and its text doesn't
+    come back as another passage's neighbour context."""
+
+    from api.answer_cache import AnswerCache
+    from api.pipeline import AnswerOverrides
+    from api.repository import PassageFilter
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=20)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    text = " ".join(f"Sentence {i} talks about alpha topic {i}." for i in range(12)).encode()
+    IngestService(repository, OnePerText(), settings).ingest("guide.txt", b"Intro\n" + text)
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+        answer_cache=AnswerCache(10, 600),
+    )
+    everything = pipeline.retrieve("alpha")
+    left_out = everything.context_chunks[0]
+
+    narrow = PassageFilter(exclude_chunk_ids=(left_out.chunk_id,))
+    phase = pipeline.retrieve("alpha", narrow=narrow)
+
+    assert left_out.chunk_id not in {chunk.chunk_id for chunk in phase.context_chunks}
+    assert all(left_out.text not in (chunk.expanded_text or "") for chunk in phase.context_chunks)
+    # Not answered from the unnarrowed question's cache entry.
+    assert not pipeline.answer("alpha").cached
+    assert not pipeline.answer("alpha", AnswerOverrides(narrow=narrow)).cached
