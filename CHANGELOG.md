@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11). **Re-index:
+(pass 11), then a fixes-and-features pass (pass 12). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,23 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 12: a question's page range (`page_min`/`page_max`, on questions and
+  `POST /search`) matches a passage that runs onto the range from an earlier page, not
+  only one that starts in it (`page_end` is now an indexed payload field). **None.**
+- Pass 12: `usage` on an answer (`/questions`, the stream's `done`, summaries and the
+  trace) covers the work up to the answer: the condense, query expansion, the answer and
+  its citation retry. Pass 11 added the follow-up suggestions on `/questions` only, so
+  the same question reported different tokens by endpoint; follow-up tokens are still
+  in `docrag_llm_tokens_total` and the cost metric. The stream's "nothing found" `done`
+  now carries `usage` too. **None.**
+- Pass 12: `docrag_corpus_documents` has a `workspace` label; it showed whichever
+  workspace was listed last. A scrape config or dashboard reading the unlabelled series
+  needs the label. **None.**
+- Pass 12: new upload types: JSON (a section per top-level key, one `path › key: value`
+  line per value), source code and config files (`.py .js .ts .go .java .rs .rb .c .cpp
+  .h .sh .sql .yaml .yml .toml`, split at blank lines), ODT, and — only when the `ocr`
+  extra is installed — images (`.png .jpg .jpeg .tif .tiff`, each TIFF frame a page). A
+  watched folder now also picks up files of these types. **None.**
 - **Chunker version 9** (pass 10). A line break inside a table cell (CSV, XLSX, HTML,
   PPTX, DOCX) becomes a space: one quoted multi-line cell gave its section more lines
   than row numbers, and every chunk of it was then labelled with the whole range
@@ -142,6 +159,60 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 12: questions and `POST /search` take `exclude_chunk_ids` (leave passages out; a
+  left-out passage doesn't come back as another's neighbour text) and
+  `uploaded_after`/`uploaded_before` (Unix seconds; `uploaded_at` is now an indexed
+  payload field — documents indexed before upload times were recorded have none and are
+  left out by a date filter). Citations carry the passage's `rerank_score` (null for a
+  summary's passages, which are read in order); `POST /search` results carry `spans`,
+  the sentences sharing the most words with the query. UI: "↻ without" on a citation
+  asks again without that passage, its score is shown, Search marks the matching
+  sentence (and in the viewer), has filters (section, documents left out, pages, upload
+  date, result count) and follows the conversation's page range; the composer's scope
+  takes "Uploaded since". CLI: `ask`/`chat`/`search --exclude-chunk/--uploaded-after/
+  --uploaded-before`, and `search` takes `ask`'s page/section/exclude flags; MCP the
+  same. **None.**
+- Pass 12: tags on upload: a `tags` form field on `POST /documents` and `tags` on
+  `POST /documents/from-url` (checked before the 202); giving tags re-indexes even the
+  same bytes, so the tags are written. UI "Tag uploads" in the corpus panel (every
+  upload, drop and URL from the tab until changed). **None.**
+- Pass 12: `URL_REFRESH_INTERVAL_MINUTES` (0 = off; needs `URL_INGEST_ENABLED`) fetches
+  URL-ingested documents again in the background, conditionally (a 304 or the same bytes
+  re-index nothing), at most `URL_REFRESH_BATCH` per one-minute pass, in every workspace,
+  through the same fetch slots and backlog as the routes. `docrag_url_refresh_total`.
+  **None.**
+- Pass 12: `GET /documents` lists `incomplete_filenames`: points from two ingests side by
+  side, or fewer than the ingest meant to write (a container killed mid-write, a failed
+  clean-up of the previous version). Bulk re-index and `AUTO_REINDEX_STALE` repair them;
+  the card says "incomplete — re-index". Documents indexed before chunk totals were
+  recorded are never flagged. **None.**
+- Pass 12: `GET /documents/jobs?state=recent|failed` lists finished jobs the server
+  still keeps (newest first, `limit`): a watcher's or an import's failures nobody
+  polled. Traces carry `answer_status`, `truncated` and `dropped_history_messages`.
+  **None.**
+- Pass 12, UI: the Asked questions panel (was Unanswered) reads the whole query log: the
+  answer rate, unanswered / all / most asked, identical questions grouped with a count,
+  a filter, and buttons that name their question. Server activity shows the watched
+  folder's skipped and waiting files and its recent failures, and cancels a job started
+  elsewhere (full key). Settings shows readiness (Qdrant, the LLM provider, the index,
+  each model), and a notice says when Qdrant or the LLM provider goes away mid-session.
+  Answers can be saved (☆; a "Saved" filter in the conversation list, kept when the
+  history is full like pinned ones, up to 20 conversations); `j`/`k` move between
+  answers (each turn is an article for screen readers); the conversation list groups by
+  day and filters by workspace, and `]`/`[` follow its order; the document viewer asks
+  a question about one passage. An empty corpus (or a watched one) is listed again
+  every 15 s (60 s) so a document added by the CLI or the watcher enables the composer.
+  **None.**
+- Pass 12, CLI and MCP: `docrag status` reads `/health/ready` (Qdrant, the provider,
+  models, the index) and exits 1 when degraded; `docrag traces [list|show ID|export
+  FILE]`, `docrag feedback`, `docrag original FILE -o PATH`, `docrag jobs --recent
+  |--failed`; every MCP tool takes an optional `workspace`. **None.**
+- Pass 12, eval: `eval/corpus_mixed` (`eval/make_mixed_corpus.py`) is the handbook with
+  six documents rendered as PDF, DOCX, HTML, ODT, PPTX and XLSX, scored by
+  `eval/datasets/mixed_eval.jsonl` (the handbook questions) against
+  `eval/baselines/mixed_reranked.json` (`make eval-mixed`); measured identical to the
+  Markdown run question by question. Retrieval runs record per-question and p50/p95
+  latency, which `harness diff` and `harness report` show (never judged). **None.**
 - Pass 11: questions take the narrowing `POST /search` has — `page_min`/`page_max`,
   `section`, `exclude_filenames` — and `chunk_ids` (both endpoints), so a question can be
   asked over passages picked in the Search panel ("Ask about these"), a page range of the
@@ -478,6 +549,33 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 12: a summary the documents couldn't support is traced as
+  `insufficient_context` (it was always "ok"), so the query log lists it as unanswered.
+- Pass 12: a `/questions` answer with nothing to answer from no longer waits for another
+  question's generation at a local model (it makes no LLM call).
+- Pass 12: a backup keeps where a URL-fetched document came from (`source_url`, ETag,
+  Last-Modified in the manifest), so a restored copy can still be refreshed; older
+  backups still import.
+- Pass 12: restoring an earlier version 409s while the document is indexing, checks the
+  indexing queue's room before reading the file, and keeps the document's source URL.
+- Pass 12: uploads, URL ingests, watched-folder ingests, `GET /export` and
+  `POST /watch/scan` are audited too.
+- Pass 12: a citation of a table row (CSV, XLSX, a Markdown or PDF table) quotes that
+  row: rows are joined by line breaks in the chunk text, so a data table with no full
+  stops was one "sentence" and the quote was the whole chunk (measured on a 40-row CSV
+  at the default chunk size: 1,044 characters on average, now 55). Chunk boundaries and
+  every other chunk's text are unchanged, so `CHUNKER_VERSION` stays 9 and nothing is
+  listed as stale. **Recommended** for documents with tables — but a same-bytes
+  re-upload, the watcher and a URL refresh leave a document as indexed: use ↻ re-index
+  (or upload it with tags, or after a change). A bulleted answer is also backfilled
+  bullet by bullet.
+- Pass 12: citation quotes no longer start with a Markdown heading's `#` marker; the
+  chunk's own heading title (and a setext underline) stays off the quote, and a quote
+  never joins the sentence before a heading. **None.**
+- Pass 12, UI: editing a question keeps the page range (and passages it was asked
+  about or without); a page range typed back to front is read in order (it was a 422
+  on every question); removing a tag or document from the scope keeps the page range
+  while its one document stays; Search uses the conversation's page range.
 - Pass 10: a follow-up's rewrite and every summary call wait their turn at a local model
   (`OLLAMA_MAX_PARALLEL`) the way an answer does: announced (`waiting_for_model`), and
   given up when the reader leaves. They used to wait up to 15 minutes silently, holding
