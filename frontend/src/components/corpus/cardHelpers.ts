@@ -23,6 +23,7 @@ export function corpusTotals(
   let pages = 0;
   let bytes = 0;
   let stale = 0;
+  let incomplete = 0;
   for (const name of filenames) {
     const meta = documents[name];
     if (!meta) continue;
@@ -30,6 +31,7 @@ export function corpusTotals(
     pages += meta.pages ?? 0;
     bytes += meta.bytes ?? 0;
     if (meta.stale) stale += 1;
+    if (meta.incomplete) incomplete += 1;
   }
   const plural = (count: number, word: string) =>
     `${count.toLocaleString()} ${word}${count === 1 ? '' : 's'}`;
@@ -39,5 +41,6 @@ export function corpusTotals(
     ...(pages > 0 ? [plural(pages, 'page')] : []),
     ...(bytes > 0 ? [formatBytes(bytes)] : []),
     ...(stale > 0 ? [`${stale.toLocaleString()} with older chunking`] : []),
+    ...(incomplete > 0 ? [`${incomplete.toLocaleString()} incomplete`] : []),
   ].join(' · ');
 }

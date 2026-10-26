@@ -1,11 +1,15 @@
 import { memo } from 'react';
-import type { IndexProblem } from '../hooks/useServerHealth';
+import type { IndexProblem, ServiceDown } from '../hooks/useServerHealth';
 import './ServerNotices.css';
 
 interface ServerNoticesProps {
   indexProblem: IndexProblem | null;
   /** Models that failed to load ("embedding", "reranker", "tokenizer"). */
   failedModels?: string[];
+  /** Services the server can't reach now. */
+  servicesDown?: ServiceDown[];
+  /** The generation provider's name ("ollama"), for the notice. */
+  llmProvider?: string;
   updatedTo: string | null;
   /** Workspaces are on: the index check covers the default workspace only. */
   workspacesEnabled?: boolean;
@@ -22,14 +26,34 @@ const MODEL_NAMES: Record<string, string> = {
 function ServerNotices({
   indexProblem,
   failedModels = [],
+  servicesDown = [],
+  llmProvider,
   updatedTo,
   workspacesEnabled,
   onReload,
 }: ServerNoticesProps) {
-  if (!indexProblem && !updatedTo && failedModels.length === 0) return null;
+  if (!indexProblem && !updatedTo && failedModels.length === 0 && servicesDown.length === 0) {
+    return null;
+  }
   const models = failedModels.map((name) => MODEL_NAMES[name] ?? name).join(' and ');
   return (
     <div className="server-notices">
+      {servicesDown.includes('qdrant') && (
+        <div className="server-notice server-notice--bad" role="alert" data-testid="qdrant-down">
+          <p className="server-notice__title">
+            The server can’t reach its vector store (Qdrant): questions, searches and uploads
+            fail until it is back.
+          </p>
+        </div>
+      )}
+      {servicesDown.includes('llm') && (
+        <div className="server-notice server-notice--bad" role="alert" data-testid="llm-down">
+          <p className="server-notice__title">
+            The server can’t reach its language model{llmProvider ? ` (${llmProvider})` : ''}:
+            answers fail, but passage search still works.
+          </p>
+        </div>
+      )}
       {failedModels.length > 0 && (
         <div className="server-notice server-notice--bad" role="alert" data-testid="models-failed">
           <p className="server-notice__title">

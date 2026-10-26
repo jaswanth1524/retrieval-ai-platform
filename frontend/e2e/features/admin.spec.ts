@@ -22,7 +22,7 @@ test('the unanswered questions panel puts one back in the composer', async ({ pa
   await page.goto('/');
   await page.getByTestId('rail-unanswered').click();
   await expect(page.getByTestId('unanswered-row')).toContainText('Who approves travel?');
-  await page.getByTestId('unanswered-row').getByRole('button', { name: 'Ask', exact: true }).click();
+  await page.getByTestId('unanswered-row').getByTestId('unanswered-ask').click();
   await expect(page.getByTestId('question-textarea')).toHaveValue('Who approves travel?');
 });
 

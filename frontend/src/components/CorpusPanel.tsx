@@ -17,12 +17,16 @@ import DocumentCard from './corpus/DocumentCard';
 import { corpusTotals } from './corpus/cardHelpers';
 import { droppedEntries, filesUnder, folderPickNote, hasFolder, pickFolderFiles } from '../utils/folderFiles';
 import UrlIngestForm from './corpus/UrlIngestForm';
+import { parseUploadTags } from '../utils/tags';
 import type { DocCard, DocumentMeta, UploadItem } from './corpus/types';
 import './CorpusPanel.css';
 
 export type { DocumentMeta, UploadItem } from './corpus/types';
 
 interface CorpusPanelProps {
+  /** Tags every upload from this tab is given (until changed); absent: not offered. */
+  uploadTags?: string[];
+  onUploadTagsChange?: (tags: string[]) => void;
   /** Indexed documents, in display order. */
   filenames: string[];
   /** Their metadata. A document indexed moments ago may have none yet (it arrives with
@@ -86,6 +90,37 @@ const SORT_LABELS: Record<SortKey, string> = {
 const SORT_STORAGE_KEY = 'docrag-corpus-sort';
 // api/documents.py's MAX_TAGS_PER_DOCUMENT: a bulk "add tag" past it is refused there.
 const MAX_TAGS_PER_DOCUMENT = 20;
+
+/** The tags given to new uploads, typed as a comma-separated list; applied on blur or
+ *  Enter, so a half-typed tag isn't sent with a drop made meanwhile. */
+function UploadTagsField({ tags, onChange }: { tags: string[]; onChange: (tags: string[]) => void }) {
+  const [text, setText] = useState(tags.join(', '));
+  const commit = () => {
+    const parsed = parseUploadTags(text);
+    setText(parsed.join(', '));
+    onChange(parsed);
+  };
+  return (
+    <label className="corpus-panel__upload-tags">
+      <span>Tag uploads</span>
+      <input
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            commit();
+          }
+        }}
+        placeholder="hr, policy"
+        title="Tags given to each document uploaded or added from a URL (replacing its tags)"
+        data-testid="upload-tags"
+      />
+    </label>
+  );
+}
+
 // Shared, so a card with no tags doesn't get a fresh [] (and a re-render) every time.
 const NO_TAGS: string[] = [];
 
@@ -136,6 +171,8 @@ function CorpusPanel({
   workspace,
   summarizeDisabled = false,
   onUploadFromUrl,
+  uploadTags,
+  onUploadTagsChange,
 }: CorpusPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [folderNote, setFolderNote] = useState<string | null>(null);
@@ -271,12 +308,15 @@ function CorpusPanel({
         // Only flagged when it can be acted on. Without a stored original there is nothing
         // to re-index from, and a document indexed before versions were recorded counts as
         // stale even if the current chunker produced it — a label the user can't clear.
-        const isStale = canReindex && (meta?.stale ?? false);
-        if (isStale) parts.push('older chunking');
+        const isIncomplete = canReindex && (meta?.incomplete ?? false);
+        const isStale = canReindex && ((meta?.stale ?? false) || isIncomplete);
+        if (isIncomplete) parts.push('incomplete — re-index');
+        else if (isStale) parts.push('older chunking');
         return {
           key: `doc:${filename}`,
           filename,
           stale: isStale,
+          incomplete: isIncomplete,
           canReindex,
           hasOriginal,
           status: 'indexed' as const,
@@ -462,6 +502,9 @@ function CorpusPanel({
       )}
       {!readOnly && (
         <div className="corpus-panel__folder">
+          {onUploadTagsChange && (
+            <UploadTagsField tags={uploadTags ?? NO_TAGS} onChange={onUploadTagsChange} />
+          )}
           <button
             type="button"
             className="corpus-panel__folder-button"
@@ -556,6 +599,7 @@ function CorpusPanel({
           data-testid="reindex-all-stale"
         >
           ↻ Re-index {indexedCards.filter((card) => card.stale).length} documents with older chunking
+          or missing passages
         </button>
       )}
 

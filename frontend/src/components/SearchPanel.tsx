@@ -1,7 +1,11 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { ApiClientError, api, apiErrorMessage } from '../api/client';
-import type { SearchResultResponse } from '../api/types';
+import type { PassageNarrowing, SearchResultResponse } from '../api/types';
+import MarkedText from './MarkedText';
+import { snippetAround } from '../utils/snippet';
+import { toDateInput } from '../utils/dates';
+import { NO_FILTERS, type SearchFilters, positive, searchNarrowing } from '../utils/searchFilters';
 import './SearchPanel.css';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
 import { pageLabel } from '../utils/pages';
@@ -11,8 +15,10 @@ interface SearchPanelProps {
   /** The active conversation's scope: the same documents a question would search. */
   filenames: string[];
   tags: string[];
-  /** Open the passage in the document viewer. */
-  onOpenSource: (filename: string, chunkId: string) => void;
+  /** The conversation's page range (with exactly one document scoped) and upload date. */
+  narrowing?: PassageNarrowing;
+  /** Open the passage in the document viewer, its matching sentences marked. */
+  onOpenSource: (filename: string, chunkId: string, highlights?: string[]) => void;
   /** Bumped by the panel's own action button to clear the search. */
   resetKey: number;
   onAuthFailure: (err: unknown) => boolean;
@@ -26,6 +32,8 @@ interface SearchPanelProps {
 }
 
 const SNIPPET_CHARS = 220;
+// POST /search's rerank_top_k bound (REQUEST_RERANK_TOP_K_MAX).
+const MAX_RESULTS = 50;
 // The server takes at most this many chunk ids per question (REQUEST_CHUNK_IDS_MAX).
 const MAX_PICKED_PASSAGES = 100;
 
@@ -35,6 +43,7 @@ const MAX_PICKED_PASSAGES = 100;
 function SearchPanel({
   filenames,
   tags,
+  narrowing,
   onOpenSource,
   resetKey,
   onAuthFailure,
@@ -50,7 +59,10 @@ function SearchPanel({
   const [weak, setWeak] = useState(false);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [filters, setFilters] = useState<SearchFilters>(NO_FILTERS);
   const controllerRef = useRef<AbortController | null>(null);
+  const setFilter = (name: keyof SearchFilters) => (value: string) =>
+    setFilters((prev) => ({ ...prev, [name]: value }));
 
   useEffect(() => () => controllerRef.current?.abort(), []);
   useEffect(() => {
@@ -62,6 +74,7 @@ function SearchPanel({
     setWeak(false);
     setError(null);
     setSearching(false);
+    setFilters(NO_FILTERS);
   }, [resetKey]);
 
   const run = useStableHandler(async (text: string) => {
@@ -74,11 +87,14 @@ function SearchPanel({
     setSearching(true);
     setError(null);
     try {
+      const count = positive(filters.count, MAX_RESULTS);
       const response = await api.searchPassages(
         {
           query: trimmed,
           ...(filenames.length > 0 ? { filenames } : {}),
           ...(tags.length > 0 ? { tags } : {}),
+          ...searchNarrowing(filters, narrowing),
+          ...(count !== undefined ? { rerank_top_k: count } : {}),
         },
         controller.signal,
       );
@@ -116,10 +132,16 @@ function SearchPanel({
     void run(request.query.slice(0, MAX_QUESTION_CHARS));
   }, [request, run]);
 
+  const looking = searchNarrowing(filters, narrowing);
+  const filterCount = Object.values(filters).filter((value) => value.trim() !== '').length;
   const scope =
-    filenames.length > 0 || tags.length > 0
+    (filenames.length > 0 || tags.length > 0
       ? `Searching ${filenames.length > 0 ? `${filenames.length} selected document${filenames.length === 1 ? '' : 's'}` : 'all documents'}${tags.length > 0 ? ` · #${tags.join(' #')}` : ''}`
-      : 'Searching all documents';
+      : 'Searching all documents') +
+    (looking.page_min !== undefined || looking.page_max !== undefined
+      ? ` · p.${looking.page_min ?? 1}${looking.page_max !== undefined ? `–${looking.page_max}` : '+'}`
+      : '') +
+    (looking.uploaded_after !== undefined ? ` · uploaded since ${toDateInput(looking.uploaded_after)}` : '');
 
   return (
     <>
@@ -143,7 +165,82 @@ function SearchPanel({
           {searching ? '…' : 'Search'}
         </button>
       </form>
-      <p className="search-panel__scope mono">{scope}</p>
+      <p className="search-panel__scope mono" data-testid="search-scope">{scope}</p>
+      <details className="search-panel__filters" data-testid="search-filters">
+        <summary>Filters{filterCount > 0 ? ` (${filterCount})` : ''}</summary>
+        <div className="search-panel__filter-grid">
+          <label>
+            <span>Section</span>
+            <input
+              value={filters.section}
+              onChange={(event) => setFilter('section')(event.target.value)}
+              placeholder="exact label"
+              data-testid="search-filter-section"
+            />
+          </label>
+          <label>
+            <span>Leave out</span>
+            <input
+              value={filters.exclude}
+              onChange={(event) => setFilter('exclude')(event.target.value)}
+              placeholder="a.pdf, b.docx"
+              data-testid="search-filter-exclude"
+            />
+          </label>
+          <label>
+            <span>Pages</span>
+            <span className="search-panel__filter-pair">
+              <input
+                type="number"
+                min={1}
+                inputMode="numeric"
+                value={filters.pageMin}
+                onChange={(event) => setFilter('pageMin')(event.target.value)}
+                aria-label="First page"
+                placeholder="from"
+                data-testid="search-filter-page-min"
+              />
+              <input
+                type="number"
+                min={1}
+                inputMode="numeric"
+                value={filters.pageMax}
+                onChange={(event) => setFilter('pageMax')(event.target.value)}
+                aria-label="Last page"
+                placeholder="to"
+                data-testid="search-filter-page-max"
+              />
+            </span>
+          </label>
+          <label>
+            <span>Uploaded since</span>
+            <input
+              type="date"
+              value={filters.uploadedAfter}
+              onChange={(event) => setFilter('uploadedAfter')(event.target.value)}
+              data-testid="search-filter-uploaded"
+            />
+          </label>
+          <label>
+            <span>Results</span>
+            <input
+              type="number"
+              min={1}
+              max={MAX_RESULTS}
+              inputMode="numeric"
+              value={filters.count}
+              onChange={(event) => setFilter('count')(event.target.value)}
+              placeholder="8"
+              data-testid="search-filter-count"
+            />
+          </label>
+          {filterCount > 0 && (
+            <button type="button" className="search-panel__ask-clear" onClick={() => setFilters(NO_FILTERS)}>
+              Clear filters
+            </button>
+          )}
+        </div>
+      </details>
       {/* Mounted before any search, so the first result count is read out too. */}
       <span className="visually-hidden" role="status" data-testid="search-status">
         {searching
@@ -219,7 +316,13 @@ function SearchPanel({
         <button
           type="button"
           className="search-panel__result"
-          onClick={() => onOpenSource(result.filename, result.chunk_id)}
+          onClick={() =>
+            onOpenSource(
+              result.filename,
+              result.chunk_id,
+              result.spans?.length ? result.spans.map((span) => span.quote) : undefined,
+            )
+          }
           title="Open this passage in the document"
           data-testid="search-result"
         >
@@ -235,15 +338,22 @@ function SearchPanel({
             {result.section ? ` · ${result.section}` : ''}
           </span>
           <span className="search-panel__snippet" dir="auto">
-            {result.text.length > SNIPPET_CHARS
-              ? `${result.text.slice(0, SNIPPET_CHARS).trimEnd()}…`
-              : result.text}
+            <MarkedText
+              text={snippetAround(result.text, quotesOf(result), SNIPPET_CHARS)}
+              quotes={quotesOf(result)}
+              className="search-panel__match"
+              testId="search-match"
+            />
           </span>
         </button>
         </div>
       ))}
     </>
   );
+}
+
+function quotesOf(result: SearchResultResponse): string[] {
+  return (result.spans ?? []).map((span) => span.quote);
 }
 
 // Memoized: App re-renders on every streamed frame, and none of this depends on it.

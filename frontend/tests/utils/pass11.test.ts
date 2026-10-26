@@ -6,7 +6,7 @@ import {
   sanitizeNarrowing,
   sanitizeScope,
   sanitizeTurn,
-  scopePageNarrowing,
+  scopeNarrowing,
 } from '../../src/hooks/chatPersistence';
 import { formatCost } from '../../src/utils/cost';
 import { chatToMarkdown } from '../../src/utils/exportChat';
@@ -138,8 +138,8 @@ describe('narrowing', () => {
 
   it('applies a scope page range only while one document is scoped', () => {
     const scope = sanitizeScope({ filenames: ['a.pdf'], tags: [], pageMin: 3, pageMax: 7 })!;
-    expect(scopePageNarrowing(scope)).toEqual({ page_min: 3, page_max: 7 });
-    expect(scopePageNarrowing({ ...scope, filenames: ['a.pdf', 'b.pdf'] })).toBeUndefined();
+    expect(scopeNarrowing(scope)).toEqual({ page_min: 3, page_max: 7 });
+    expect(scopeNarrowing({ ...scope, filenames: ['a.pdf', 'b.pdf'] })).toBeUndefined();
     expect(sanitizeScope({ filenames: ['a'], tags: [], pageMin: 9, pageMax: 2 })).toEqual({
       filenames: ['a'],
       tags: [],

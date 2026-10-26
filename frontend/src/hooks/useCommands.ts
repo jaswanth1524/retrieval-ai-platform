@@ -64,6 +64,8 @@ export interface CommandActions {
   /** The next (1) or previous (-1) conversation in the list. */
   cycleConversation?: (step: 1 | -1) => void;
   showShortcuts?: () => void;
+  /** Move to the next (1) or previous (-1) answer in the thread. */
+  moveBetweenAnswers?: (step: 1 | -1) => void;
 }
 
 interface PaletteControls {
@@ -355,7 +357,8 @@ export function useCommands(
       command.run();
     };
     // Keys with no modifier, only while nothing editable has focus (they are text there):
-    // ? the shortcut list, ] and [ the next and previous conversation.
+    // ? the shortcut list, ] and [ the next and previous conversation, j and k the next
+    // and previous answer.
     const plainKey = (event: KeyboardEvent) => {
       if (event.repeat || paletteRef.current.otherDialogOpen) return;
       if (isEditable(event.target)) return;
@@ -367,6 +370,9 @@ export function useCommands(
       } else if (event.key === ']' || event.key === '[') {
         event.preventDefault();
         actions.cycleConversation?.(event.key === ']' ? 1 : -1);
+      } else if ((event.key === 'j' || event.key === 'k') && !event.shiftKey) {
+        event.preventDefault();
+        actions.moveBetweenAnswers?.(event.key === 'j' ? 1 : -1);
       }
     };
     document.addEventListener('keydown', onKeyDown);
@@ -391,5 +397,6 @@ export const PLAIN_KEYS: Array<[keys: string, what: string]> = [
   ['/', 'Type a question'],
   ['?', 'This list'],
   [']  [', 'Next / previous conversation'],
+  ['j  k', 'Next / previous answer'],
   ['Esc', 'Stop the answer, or close a dialog'],
 ];

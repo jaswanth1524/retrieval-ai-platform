@@ -29,6 +29,8 @@ export interface UploadItem {
   workspace?: string;
   /** Cancel was pressed and hasn't settled yet. */
   cancelling?: boolean;
+  /** Tags it was sent with (replacing the document's): a retry sends them again. */
+  tags?: string[];
 }
 
 /** One indexed document's metadata, from GET /documents. */
@@ -42,6 +44,9 @@ export interface DocumentMeta {
   uploadedAt?: number;
   /** Indexed by an older chunker. */
   stale: boolean;
+  /** Some of its passages are missing, or left from an earlier version (a write cut
+   *  off part way): re-indexing repairs it. */
+  incomplete?: boolean;
   /** Has a stored original the server can re-index from (and serve back). */
   reindexable: boolean;
   tags: string[];
@@ -60,6 +65,7 @@ export interface DocCard {
   cancelling?: boolean;
   status: 'indexed' | 'indexing' | 'failed';
   stale?: boolean;
+  incomplete?: boolean;
   canReindex?: boolean;
   hasOriginal?: boolean;
   detail: string;

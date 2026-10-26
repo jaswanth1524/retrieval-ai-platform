@@ -248,6 +248,19 @@
   font-size: 12px;
 }
 
+.composer__popover-pages {
+  flex-wrap: wrap;
+}
+
+.composer__popover-pages input[type='date'] {
+  width: auto;
+}
+
+.composer__popover-note {
+  flex-basis: 100%;
+  color: var(--dim);
+}
+
 .composer__popover-pages input {
   width: 64px;
   font: inherit;

@@ -20,10 +20,19 @@ export interface ServerHealth {
   /** Models that failed to load at startup ("embedding", "reranker"): questions fail
    *  until the server's background retry loads them. */
   failedModels: string[];
+  /** What the server can't reach now: "qdrant" (nothing works) and/or "llm" (answers
+   *  fail; search still works). */
+  servicesDown: ServiceDown[];
+  /** The last readiness report, for the Settings dialog; null until one arrived. */
+  readiness: ReadinessResponse | null;
 }
 
-/** How often readiness is asked again while a model is down, to see it recover. */
+export type ServiceDown = 'qdrant' | 'llm';
+
+/** How often readiness is asked again while a model or service is down, to see it
+ *  recover, and otherwise, to notice one going down mid-session. */
 export const FAILED_MODEL_RECHECK_MS = 60_000;
+export const READINESS_RECHECK_MS = 5 * 60_000;
 
 /**
  * The connection monitor plus what /health and /health/ready say beyond "up": the
@@ -87,10 +96,23 @@ export function useServerHealth(booted: boolean): ServerHealth {
         .sort(),
     [models],
   );
-  const anyFailed = failedModels.length > 0;
+  const qdrantDown = readiness !== null && !readiness.qdrant;
+  const llmDown = readiness !== null && !readiness.generation_provider;
+  const servicesDown = useMemo<ServiceDown[]>(
+    () => [...(qdrantDown ? ['qdrant' as const] : []), ...(llmDown ? ['llm' as const] : [])],
+    [qdrantDown, llmDown],
+  );
+  const anyFailed = failedModels.length > 0 || servicesDown.length > 0;
   useEffect(() => {
-    if (!booted || !anyFailed) return;
-    const timer = setInterval(() => void checkReadiness(), FAILED_MODEL_RECHECK_MS);
+    if (!booted) return;
+    // Often while something is down (to see it come back), rarely otherwise (to see
+    // Qdrant or the LLM provider go away while the page stays open).
+    const timer = setInterval(
+      () => {
+        if (document.visibilityState === 'visible') void checkReadiness();
+      },
+      anyFailed ? FAILED_MODEL_RECHECK_MS : READINESS_RECHECK_MS,
+    );
     return () => clearInterval(timer);
   }, [booted, anyFailed, checkReadiness]);
 
@@ -101,5 +123,5 @@ export function useServerHealth(booted: boolean): ServerHealth {
           originalsKept: Boolean(readiness.originals_kept),
         }
       : null;
-  return { connectionLost, version, updatedTo, indexProblem, failedModels };
+  return { connectionLost, version, updatedTo, indexProblem, failedModels, servicesDown, readiness };
 }

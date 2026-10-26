@@ -138,6 +138,9 @@ export interface SearchRequest {
   section?: string;
   exclude_filenames?: string[];
   chunk_ids?: string[];
+  exclude_chunk_ids?: string[];
+  uploaded_after?: number;
+  uploaded_before?: number;
 }
 
 export interface SearchResultResponse {
@@ -154,6 +157,9 @@ export interface SearchResultResponse {
   retrieval_score: number;
   /** Cross-encoder score, normalized to [0, 1]. */
   rerank_score: number;
+  /** The sentences sharing the most words with the query, for highlighting; absent
+   *  from older servers. */
+  spans?: CitationSpan[];
 }
 
 export interface SearchResponse {
@@ -255,6 +261,8 @@ export interface DocumentListResponse {
   uploaded_ats?: Record<string, number>;
   /** Indexed by an older chunker; re-indexing applies the current one. */
   stale_filenames?: string[];
+  /** Points from two ingests, or fewer than were written: re-indexing repairs them. */
+  incomplete_filenames?: string[];
   /** Have a stored original, so POST /documents/{f}/reindex works. */
   reindexable_filenames?: string[];
   /** Tagged documents only; an untagged one is absent. */
@@ -331,6 +339,9 @@ export interface CitationResponse {
   text: string;
   /** Only on the final answer's sources; absent from older servers and saved turns. */
   spans?: CitationSpan[];
+  /** The cross-encoder's score in [0, 1]; null for a summary's passages (read in order,
+   *  never ranked) and absent from older servers. */
+  rerank_score?: number | null;
 }
 
 export interface TimingsResponse {
@@ -405,6 +416,11 @@ export interface PassageNarrowing {
   exclude_filenames?: string[];
   /** Only these passages (picked in the Search panel). */
   chunk_ids?: string[];
+  /** Leave these passages out ("ask again without this source"). */
+  exclude_chunk_ids?: string[];
+  /** Documents uploaded in this range (Unix seconds). */
+  uploaded_after?: number;
+  uploaded_before?: number;
 }
 
 export interface QuestionOptions {
@@ -546,4 +562,11 @@ export interface TraceDetailResponse {
   /** The X-Request-ID of the request that produced it, for finding its log lines. */
   request_id?: string | null;
   usage?: UsageResponse | null;
+  /** answered / uncited / insufficient_context / no_context (extensible); absent from
+   *  older servers and on errors. */
+  answer_status?: string | null;
+  /** The answer stopped at the token limit. */
+  truncated?: boolean;
+  /** History messages left out of the prompt to fit the context window. */
+  dropped_history_messages?: number;
 }

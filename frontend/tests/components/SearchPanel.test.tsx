@@ -49,7 +49,7 @@ describe('SearchPanel', () => {
     expect(await screen.findByText('policy.pdf')).toBeInTheDocument();
     expect(screen.getByText('0.91')).toBeInTheDocument();
     await userEvent.click(screen.getByTestId('search-result'));
-    expect(onOpenSource).toHaveBeenCalledWith('policy.pdf', 'c1');
+    expect(onOpenSource).toHaveBeenCalledWith('policy.pdf', 'c1', undefined);
   });
 
   it('notes when the passages are only the closest ones', async () => {

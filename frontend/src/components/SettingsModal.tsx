@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { getApiKey, setApiKey } from '../api/client';
-import type { PublicConfigResponse, QuestionOverrides } from '../api/types';
+import type { PublicConfigResponse, QuestionOverrides, ReadinessResponse } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
@@ -25,6 +25,8 @@ interface SettingsModalProps {
   onNotifyOnAnswerChange?: (value: boolean) => void;
   /** The server's DocRAG version (/health); null when it doesn't say. */
   serverVersion?: string | null;
+  /** The server's last readiness report (/health/ready); null until one arrived. */
+  readiness?: ReadinessResponse | null;
 }
 
 const SYSTEM_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
@@ -92,6 +94,7 @@ function SettingsModal({
   notifyOnAnswer = false,
   onNotifyOnAnswerChange,
   serverVersion = null,
+  readiness = null,
 }: SettingsModalProps) {
   const dialogRef = useDialog(true, onClose);
   const [apiKeyDraft, setApiKeyDraft] = useState(getApiKey);
@@ -379,6 +382,38 @@ function SettingsModal({
                       {serverVersion}
                     </td>
                   </tr>
+                )}
+                {readiness && (
+                  <>
+                    <tr data-testid="settings-ready">
+                      <td>Server status</td>
+                      <td className="mono">{readiness.status === 'ok' ? 'ready' : 'degraded'}</td>
+                    </tr>
+                    <tr>
+                      <td>Vector store (Qdrant)</td>
+                      <td className="mono">{readiness.qdrant ? 'reachable' : 'unreachable'}</td>
+                    </tr>
+                    <tr>
+                      <td>Language model ({readiness.llm_provider})</td>
+                      <td className="mono">
+                        {readiness.generation_provider ? 'reachable' : 'unreachable'}
+                      </td>
+                    </tr>
+                    {readiness.index_compatible !== undefined && (
+                      <tr>
+                        <td>Index</td>
+                        <td className="mono">
+                          {readiness.index_compatible ? 'matches the embedding setup' : 'built for another setup'}
+                        </td>
+                      </tr>
+                    )}
+                    {Object.entries(readiness.models ?? {}).map(([name, state]) => (
+                      <tr key={name}>
+                        <td>Model: {name}</td>
+                        <td className="mono">{state}</td>
+                      </tr>
+                    ))}
+                  </>
                 )}
                 {SYSTEM_FIELDS.map(([label, key]) => (
                   <tr key={key}>

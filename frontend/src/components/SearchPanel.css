@@ -111,6 +111,14 @@
   gap: 2px;
 }
 
+/* Beside the pick box the result takes the rest of the row, never more: at 100% wide it
+   pushed its score and text past the panel's edge. */
+.search-panel__item .search-panel__result {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
 .search-panel__pick {
   margin: 12px 0 0 10px;
   flex-shrink: 0;
@@ -151,4 +159,52 @@
 .search-panel__ask {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.search-panel__filters {
+  padding: 0 12px 6px;
+  font-size: 11px;
+  color: var(--rail-dim);
+}
+
+.search-panel__filters summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.search-panel__filter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 8px;
+  padding-top: 6px;
+}
+
+.search-panel__filter-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.search-panel__filter-grid input {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--rail-text);
+  font: inherit;
+  padding: 3px 6px;
+}
+
+.search-panel__filter-pair {
+  display: flex;
+  gap: 4px;
+}
+
+.search-panel__match {
+  background: var(--accent-soft);
+  background: color-mix(in oklch, var(--accent) 28%, transparent);
+  color: inherit;
+  border-radius: 2px;
 }

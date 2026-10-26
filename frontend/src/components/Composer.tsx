@@ -8,6 +8,7 @@ import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
 import { MAX_QUESTION_CHARS, MAX_SCOPE_FILENAMES } from '../utils/limits';
 import { isProviderAllowed, isProviderUsable } from '../utils/providers';
+import { fromDateInput, toDateInput } from '../utils/dates';
 
 // The most tags and files one question may be scoped to (api/schemas.py's
 // MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
@@ -46,6 +47,9 @@ interface ComposerProps {
   /** A page range within the one scoped document; offered while exactly one is. */
   pageRange?: { min?: number; max?: number };
   onPageRangeChange?: (range: { min?: number; max?: number }) => void;
+  /** Only documents uploaded since this time (Unix seconds). */
+  uploadedAfter?: number;
+  onUploadedAfterChange?: (value: number | undefined) => void;
 }
 
 function pageInput(value: string): number | undefined {
@@ -83,6 +87,8 @@ function Composer({
   prefill,
   pageRange,
   onPageRangeChange,
+  uploadedAfter,
+  onUploadedAfterChange,
 }: ComposerProps) {
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
@@ -427,7 +433,25 @@ function Composer({
                       placeholder="to"
                       data-testid="scope-page-max"
                     />
+                    {pageRange?.min !== undefined &&
+                      pageRange.max !== undefined &&
+                      pageRange.min > pageRange.max && (
+                        <span className="composer__popover-note" role="status" data-testid="scope-pages-order">
+                          Read as pages {pageRange.max}–{pageRange.min}.
+                        </span>
+                      )}
                   </div>
+                )}
+                {onUploadedAfterChange && (
+                  <label className="composer__popover-pages" data-testid="scope-uploaded">
+                    <span>Uploaded since</span>
+                    <input
+                      type="date"
+                      value={toDateInput(uploadedAfter)}
+                      onChange={(event) => onUploadedAfterChange(fromDateInput(event.target.value))}
+                      data-testid="scope-uploaded-after"
+                    />
+                  </label>
                 )}
                 {visibleFilenames.map((filename) => (
                   <label key={filename} className="composer__popover-item" data-testid="scope-item">

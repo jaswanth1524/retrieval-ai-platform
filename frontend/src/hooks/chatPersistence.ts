@@ -10,6 +10,9 @@ import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
 import { WORKSPACE_NAME_PATTERN } from '../utils/limits';
 
+// Far past any upload; a bound so a damaged value can't reach the server as garbage.
+const MAX_TIMESTAMP_SECONDS = 32_503_680_000; // year 3000
+
 /** Which documents a conversation's questions search. Empty lists mean "everything". */
 export interface ConversationScope {
   filenames: string[];
@@ -17,6 +20,8 @@ export interface ConversationScope {
   /** A page range within the one scoped document (used only while exactly one is). */
   pageMin?: number;
   pageMax?: number;
+  /** Only documents uploaded since this time (Unix seconds). */
+  uploadedAfter?: number;
 }
 
 export const EMPTY_SCOPE: ConversationScope = { filenames: [], tags: [] };
@@ -59,6 +64,9 @@ export interface ConversationSummary {
   pinned?: boolean;
   // Only when not the default workspace.
   workspace?: string;
+  // Answers saved in it, and the first of them (to scroll to).
+  savedCount?: number;
+  firstSavedTurnId?: string;
 }
 
 /** The workspace a conversation belongs to ('' = the default), or null for one with no
@@ -94,6 +102,9 @@ export const FULL_TEXT_CONVERSATIONS = 20;
 // Pinned conversations are never the ones dropped past MAX_CONVERSATIONS; at most this
 // many, so there is always room left for the conversations in use.
 export const MAX_PINNED_CONVERSATIONS = 10;
+/** Conversations with a saved answer kept past MAX_CONVERSATIONS (beyond pinned ones);
+ *  past this many, the least recently used of them can go like any other. */
+export const MAX_SAVED_CONVERSATIONS = 20;
 export const TITLE_MAX_CHARS = 60;
 // Each source carries its full chunk text (~2 KB), up to 8 per answer, and it was the
 // bulk of what filled the ~5 MB quota. Only the most recent turns keep it on disk; older
@@ -240,6 +251,16 @@ export function sanitizeNarrowing(value: unknown): PassageNarrowing | null {
   if (exclude.length > 0) narrowing.exclude_filenames = exclude;
   const chunkIds = strings(raw.chunk_ids, 100, 64);
   if (chunkIds.length > 0) narrowing.chunk_ids = chunkIds;
+  const left = strings(raw.exclude_chunk_ids, 100, 64);
+  if (left.length > 0) narrowing.exclude_chunk_ids = left;
+  const time = (item: unknown) =>
+    typeof item === 'number' && Number.isFinite(item) && item >= 0 && item <= MAX_TIMESTAMP_SECONDS
+      ? item
+      : undefined;
+  const after = time(raw.uploaded_after);
+  const before = time(raw.uploaded_before);
+  if (after !== undefined && !(before !== undefined && after > before)) narrowing.uploaded_after = after;
+  if (before !== undefined && !(after !== undefined && after > before)) narrowing.uploaded_before = before;
   return Object.keys(narrowing).length > 0 ? narrowing : null;
 }
 
@@ -291,6 +312,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (narrowing) sanitized.narrowing = narrowing;
   const followups = cleanFollowups(turn.followups);
   if (followups.length > 0) sanitized.followups = followups;
+  if (turn.saved === true && turn.role === 'assistant') sanitized.saved = true;
   if (Array.isArray(turn.irrelevantSources)) {
     const numbers = turn.irrelevantSources.filter(
       (value): value is number => Number.isInteger(value) && value >= 1 && value <= 1000,
@@ -343,12 +365,17 @@ export function capConversations(
 ): Conversation[] {
   const sorted = [...conversations].sort(byRecentUse);
   if (sorted.length <= MAX_CONVERSATIONS) return sorted;
-  const protectedIds = new Set(
-    sorted
+  const protectedIds = new Set([
+    ...sorted
       .filter((conversation) => conversation.pinned)
       .slice(0, MAX_PINNED_CONVERSATIONS)
       .map((conversation) => conversation.id),
-  );
+    // Saved answers are kept like pinned conversations, the most recent first.
+    ...sorted
+      .filter((conversation) => conversation.turns.some((turn) => turn.saved))
+      .slice(0, MAX_SAVED_CONVERSATIONS)
+      .map((conversation) => conversation.id),
+  ]);
   if (keepId !== null) protectedIds.add(keepId);
   let room = MAX_CONVERSATIONS - protectedIds.size;
   return sorted.filter((conversation) => {
@@ -746,18 +773,30 @@ export function sanitizeScope(value: unknown): ConversationScope | undefined {
   const pageMax = page(raw.pageMax);
   if (pageMin !== undefined && (pageMax === undefined || pageMin <= pageMax)) scope.pageMin = pageMin;
   if (pageMax !== undefined && (pageMin === undefined || pageMin <= pageMax)) scope.pageMax = pageMax;
+  if (
+    typeof raw.uploadedAfter === 'number' &&
+    Number.isFinite(raw.uploadedAfter) &&
+    raw.uploadedAfter >= 0 &&
+    raw.uploadedAfter <= MAX_TIMESTAMP_SECONDS
+  ) {
+    scope.uploadedAfter = raw.uploadedAfter;
+  }
   return scope;
 }
 
-/** The scope's page range as question narrowing — only while exactly one document is
- *  scoped (a range across several documents means nothing). */
-export function scopePageNarrowing(scope: ConversationScope): { page_min?: number; page_max?: number } | undefined {
-  if (scope.filenames.length !== 1) return undefined;
-  if (scope.pageMin === undefined && scope.pageMax === undefined) return undefined;
-  return {
-    ...(scope.pageMin !== undefined ? { page_min: scope.pageMin } : {}),
-    ...(scope.pageMax !== undefined ? { page_max: scope.pageMax } : {}),
-  };
+/** The scope as question narrowing: its page range — only while exactly one document is
+ *  scoped (a range across several documents means nothing), and in order whichever end
+ *  was typed first — and its upload date. */
+export function scopeNarrowing(scope: ConversationScope): PassageNarrowing | undefined {
+  const narrowing: PassageNarrowing = {};
+  if (scope.filenames.length === 1) {
+    let { pageMin: min, pageMax: max } = scope;
+    if (min !== undefined && max !== undefined && min > max) [min, max] = [max, min];
+    if (min !== undefined) narrowing.page_min = min;
+    if (max !== undefined) narrowing.page_max = max;
+  }
+  if (scope.uploadedAfter !== undefined) narrowing.uploaded_after = scope.uploadedAfter;
+  return Object.keys(narrowing).length > 0 ? narrowing : undefined;
 }
 
 // Logs an unreadable or unrecognized-shape persisted value before it's replaced with an

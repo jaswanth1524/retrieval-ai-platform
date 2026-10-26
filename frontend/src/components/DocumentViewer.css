@@ -217,3 +217,53 @@
     border-radius: 0;
   }
 }
+
+.document-viewer__ask {
+  margin-left: 0.6rem;
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font: inherit;
+  padding: 0 0.4rem;
+  cursor: pointer;
+}
+
+.document-viewer__ask:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.document-viewer__ask-form {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0 0 0.5rem;
+}
+
+.document-viewer__ask-form input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+}
+
+.document-viewer__ask-form button {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.document-viewer__ask-form button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

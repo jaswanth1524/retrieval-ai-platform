@@ -34,7 +34,8 @@ import SearchPanel from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import FeedbackPanel from './components/FeedbackPanel';
 import UnansweredPanel from './components/UnansweredPanel';
-import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS, scopePageNarrowing } from './hooks/chatPersistence';
+import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS, scopeNarrowing } from './hooks/chatPersistence';
+import { DATE_FORMATTER } from './utils/dates';
 import { useChat } from './hooks/useChat';
 import { useStableHandler } from './hooks/useStableHandler';
 import { prefetchCitationContent } from './utils/contentPrefetch';
@@ -44,7 +45,11 @@ import ServerNotices from './components/ServerNotices';
 import SummaryDialog from './components/SummaryDialog';
 import ShortcutsDialog from './components/ShortcutsDialog';
 import ServerActivity from './components/corpus/ServerActivity';
-import { useCorpusAutoRefresh } from './hooks/useCorpusAutoRefresh';
+import {
+  EMPTY_CORPUS_POLL_MS,
+  WATCHED_CORPUS_POLL_MS,
+  useCorpusAutoRefresh,
+} from './hooks/useCorpusAutoRefresh';
 import { usePanelList } from './hooks/usePanelList';
 import { useAppBoot } from './hooks/useAppBoot';
 import { useWorkspaces } from './hooks/useWorkspaces';
@@ -167,6 +172,7 @@ function App() {
     persistPartial,
     setTurnFeedback,
     setSourceIrrelevant,
+    setTurnSaved,
     scope,
     conversationWorkspace,
     setScope,
@@ -211,6 +217,8 @@ function App() {
     chunkTotal,
     refreshDocuments,
     handleUpload,
+    uploadTags,
+    setUploadTags,
     handleRetryUpload,
     handleDismissUpload,
     handleCancelUpload,
@@ -375,8 +383,16 @@ function App() {
       }),
     [setScope],
   );
-  // The scope's page range, while exactly one document is scoped.
-  const scopePages = useMemo(() => scopePageNarrowing(scope), [scope]);
+  const setUploadedAfter = useCallback(
+    (value: number | undefined) =>
+      setScope((prev) => {
+        const { uploadedAfter: _after, ...rest } = prev;
+        return value !== undefined ? { ...rest, uploadedAfter: value } : rest;
+      }),
+    [setScope],
+  );
+  // The scope's page range (while exactly one document is scoped) and upload date.
+  const scopePages = useMemo(() => scopeNarrowing(scope), [scope]);
 
   // A pinned trace belongs to one conversation's turns, so anything that replaces the
   // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
@@ -521,9 +537,9 @@ function App() {
     load: loadUnanswered,
   } = usePanelList<QueryLogEntryResponse>(
     rail === 'unanswered',
-    async (signal) => (await api.listUnanswered(500, signal)).queries,
+    async (signal) => (await api.listQueryLog(500, signal)).queries,
     noteAuthFailure,
-    'Could not load the unanswered questions.',
+    'Could not load the asked questions.',
   );
   const hiddenRailPanels = useMemo(
     () => hiddenPanels(feedbackPanelAvailable, unansweredPanelAvailable),
@@ -615,12 +631,24 @@ function App() {
     }
   }, uploadFolder);
   const booted = apiStatus === 'ok' || apiStatus === 'unauthorized';
-  const { connectionLost, version: serverVersion, updatedTo, indexProblem, failedModels } =
-    useServerHealth(booted);
+  const {
+    connectionLost,
+    version: serverVersion,
+    updatedTo,
+    indexProblem,
+    failedModels,
+    servicesDown,
+    readiness,
+  } = useServerHealth(booted);
   useCorpusAutoRefresh(
     corpusChecked && apiStatus === 'ok',
     connectionLost,
     useStableHandler(() => refreshDocuments().catch(noteAuthFailure)),
+    indexedFilenames.length === 0
+      ? EMPTY_CORPUS_POLL_MS
+      : config?.watch_enabled
+        ? WATCHED_CORPUS_POLL_MS
+        : null,
   );
 
   const reloadPage = useStableHandler(() => window.location.reload());
@@ -703,8 +731,11 @@ function App() {
   const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
   const currentScopeLabel =
     scopeLabel(indexedFilenames, selectedFilenames, selectedTags) +
-    (scopePages
+    (scopePages && (scopePages.page_min !== undefined || scopePages.page_max !== undefined)
       ? ` · p.${scopePages.page_min ?? 1}${scopePages.page_max !== undefined ? `–${scopePages.page_max}` : '+'}`
+      : '') +
+    (scope.uploadedAfter !== undefined
+      ? ` · since ${DATE_FORMATTER.format(scope.uploadedAfter * 1000)}`
       : '');
   // `task`: a summary or comparison (its own documents; the scope doesn't apply).
   const askQuestion = useCallback(
@@ -750,6 +781,11 @@ function App() {
   const askAboutPassages = useStableHandler((question: string, chunkIds: string[]) => {
     void askQuestion(question, undefined, { chunk_ids: chunkIds });
     if (panelCollapsed) setPanelDrawerOpen(false);
+  });
+  // A question about one passage, from the document viewer: asked over it alone.
+  const askAboutViewedPassage = useStableHandler((question: string, chunkId: string) => {
+    setSourceView(null);
+    askAboutPassages(question, [chunkId]);
   });
   // ...or the passages a search finds for it, without asking the model again.
   const searchForPassages = useStableHandler((question: string) => {
@@ -813,9 +849,10 @@ function App() {
       return editAndResend(turnId, question, selectedProvider, advancedOptions, scopeFilenames, {
         tags: selectedTags,
         modelLabel: currentModelLabel,
+        ...(scopePages ? { narrowing: scopePages } : {}),
       });
     },
-    [editAndResend, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel],
+    [editAndResend, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel, scopePages],
   );
 
   // Same reasoning as askQuestion above — passed to both ChatThread and Inspector.
@@ -980,11 +1017,50 @@ function App() {
       () => done(false),
     );
   });
+  // The conversation list's order (pinned first, its filters and search applied) while
+  // it is shown: ] and [ walk what the reader sees. Else pinned first, by recent use.
+  const listedOrderRef = useRef<string[] | null>(null);
+  const noteListedOrder = useCallback((ids: string[]) => {
+    listedOrderRef.current = ids;
+  }, []);
+  useEffect(() => {
+    if (rail !== 'chat') listedOrderRef.current = null;
+  }, [rail]);
   const cycleConversation = useStableHandler((step: 1 | -1) => {
-    if (conversations.length < 2) return;
-    const index = conversations.findIndex((c) => c.id === activeConversationId);
-    const next = conversations[(index + step + conversations.length) % conversations.length];
-    if (next) switchConversation(next.id);
+    const order =
+      listedOrderRef.current ??
+      [
+        ...conversations.filter((conversation) => conversation.pinned),
+        ...conversations.filter((conversation) => !conversation.pinned),
+      ].map((conversation) => conversation.id);
+    if (order.length < 2) return;
+    const index = order.indexOf(activeConversationId ?? '');
+    // Not among those listed (filtered out): the first (or last) one.
+    const nextIndex = index < 0 ? (step === 1 ? 0 : order.length - 1) : (index + step + order.length) % order.length;
+    const next = order[nextIndex];
+    if (next && next !== activeConversationId) switchConversation(next);
+  });
+  const moveBetweenAnswers = useStableHandler((step: 1 | -1) => {
+    const answers = [
+      ...document.querySelectorAll<HTMLElement>('[data-testid="chat-message"][data-role="assistant"]'),
+    ];
+    if (answers.length === 0) return;
+    const current = answers.findIndex((answer) => answer.contains(document.activeElement));
+    let target: HTMLElement | undefined;
+    if (current >= 0) {
+      target = answers[current + step];
+    } else {
+      // Nothing focused yet: the first answer in view (j) or the last (k).
+      const inView = answers.filter((answer) => {
+        const box = answer.getBoundingClientRect();
+        return box.bottom > 0 && box.top < window.innerHeight;
+      });
+      const pool = inView.length > 0 ? inView : answers;
+      target = step === 1 ? pool[0] : pool[pool.length - 1];
+    }
+    if (!target) return;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView({ block: 'start', behavior: 'smooth' });
   });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const exportJson = useCallback(() => {
@@ -1091,6 +1167,7 @@ function App() {
       copyLastAnswer,
       exportAllConversations,
       cycleConversation,
+      moveBetweenAnswers,
       showShortcuts: () => {
         setPaletteOpen(false);
         setShortcutsOpen(true);
@@ -1252,6 +1329,7 @@ function App() {
             onPin={pinConversation}
             onSearch={searchConversations}
             streamingId={pending ? streamingConversationId : null}
+            onVisibleOrder={noteListedOrder}
           />
         )}
         {rail === 'corpus' && workspacesEnabled && (
@@ -1284,6 +1362,8 @@ function App() {
             documents={documents}
             uploads={workspaceUploads}
             onUpload={handleUpload}
+            uploadTags={uploadTags}
+            onUploadTagsChange={readOnly ? undefined : setUploadTags}
             onDelete={deleteDocumentHere}
             maxUploadBytes={config?.max_upload_bytes}
             supportedExtensions={config?.supported_extensions}
@@ -1322,6 +1402,7 @@ function App() {
             <SearchPanel
               filenames={selectedFilenames}
               tags={selectedTags}
+              narrowing={scopePages}
               onOpenSource={handleOpenSource}
               resetKey={searchResetKey}
               request={searchRequest}
@@ -1373,6 +1454,8 @@ function App() {
             <ServerNotices
               indexProblem={indexProblem}
               failedModels={failedModels}
+              servicesDown={servicesDown}
+              llmProvider={readiness?.llm_provider}
               updatedTo={updatedTo}
               workspacesEnabled={workspacesEnabled}
               onReload={reloadPage}
@@ -1404,6 +1487,7 @@ function App() {
               stageTiming={streamingHere ? stageTiming : null}
               onAskEverywhere={askEverywhere}
               onSearchPassages={searchForPassages}
+              onToggleSaved={setTurnSaved}
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
@@ -1457,6 +1541,8 @@ function App() {
             selectedTags={selectedTags}
             pageRange={pageRange}
             onPageRangeChange={setPageRange}
+            uploadedAfter={scope.uploadedAfter}
+            onUploadedAfterChange={setUploadedAfter}
             onSelectedTagsChange={setSelectedTags}
             config={config}
             provider={selectedProvider}
@@ -1507,6 +1593,7 @@ function App() {
             <SettingsModal
               config={config}
               serverVersion={serverVersion}
+              readiness={readiness}
               overrides={advancedOptions}
               onOverridesChange={updateAdvancedOptions}
               onClose={() => setSettingsOpen(false)}
@@ -1536,6 +1623,7 @@ function App() {
               chunkId={sourceView.chunkId}
               highlights={sourceView.highlights}
               onClose={closeSourceView}
+              onAskAboutPassage={summarizeDisabled ? undefined : askAboutViewedPassage}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
                   ? downloadViewedOriginal

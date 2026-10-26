@@ -103,7 +103,7 @@ export const PANEL_META: Record<RailPanel, { title: string; actionLabel: string 
   search: { title: 'Search passages', actionLabel: 'Clear' },
   traces: { title: 'Traces', actionLabel: 'Refresh' },
   feedback: { title: 'Feedback', actionLabel: 'Refresh' },
-  unanswered: { title: 'Unanswered questions', actionLabel: 'Refresh' },
+  unanswered: { title: 'Asked questions', actionLabel: 'Refresh' },
 };
 
 export function scopeLabel(

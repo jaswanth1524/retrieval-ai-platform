@@ -1,5 +1,4 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
 import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { ContentPage } from '../api/client';
 import type { DocumentChunkResponse, DocumentContentResponse } from '../api/types';
@@ -7,6 +6,8 @@ import { useDialog } from '../hooks/useDialog';
 import { CITATION_WINDOW_RADIUS, takePrefetchedContent } from '../utils/contentPrefetch';
 import './DocumentViewer.css';
 import { pageLabel } from '../utils/pages';
+import MarkedText from './MarkedText';
+import { MAX_QUESTION_CHARS } from '../utils/limits';
 
 interface DocumentViewerProps {
   filename: string;
@@ -18,6 +19,8 @@ interface DocumentViewerProps {
   canPreviewOriginal?: boolean;
   /** Passages of the cited chunk the answer rests on, marked within it. */
   highlights?: string[];
+  /** Ask a question about one passage only (absent while asking can't start). */
+  onAskAboutPassage?: (question: string, chunkId: string) => void;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -51,27 +54,6 @@ interface Loaded {
 /** ``text`` with each of ``quotes`` marked. Found by search rather than by the span's
  *  offsets, which count code points where JS strings count UTF-16 units; a quote that
  *  isn't in the text (the document changed since) is simply not marked. */
-function MarkedText({ text, quotes }: { text: string; quotes: string[] }) {
-  const ranges = quotes
-    .map((quote) => ({ start: quote ? text.indexOf(quote) : -1, length: quote.length }))
-    .filter((range) => range.start >= 0)
-    .sort((a, b) => a.start - b.start);
-  const parts: ReactNode[] = [];
-  let position = 0;
-  for (const { start, length } of ranges) {
-    if (start < position) continue;
-    parts.push(text.slice(position, start));
-    parts.push(
-      <mark key={start} className="document-viewer__quote" data-testid="viewer-quote">
-        {text.slice(start, start + length)}
-      </mark>,
-    );
-    position = start + length;
-  }
-  parts.push(text.slice(position));
-  return <>{parts}</>;
-}
-
 function ordinalOf(chunk: DocumentChunkResponse | undefined): number | null {
   return chunk?.chunk_ordinal ?? null;
 }
@@ -83,7 +65,10 @@ function DocumentViewer({
   onDownloadOriginal,
   canPreviewOriginal = false,
   highlights,
+  onAskAboutPassage,
 }: DocumentViewerProps) {
+  // The passage whose question box is open, and what is typed in it.
+  const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
   // Both keyed by filename, so pointing the open viewer at another document shows its
   // passages straight away, in the same render, with nothing of the previous original.
   const [modeFor, setModeFor] = useState<{ filename: string; mode: ViewerMode }>({
@@ -420,10 +405,59 @@ function DocumentViewer({
               >
                 <div className="document-viewer__chunk-meta mono">
                   {pageLabel(chunk.page, chunk.page_end)} &middot; {chunk.section}
+                  {onAskAboutPassage && asking?.chunkId !== chunk.chunk_id && (
+                    <button
+                      type="button"
+                      className="document-viewer__ask"
+                      onClick={() => setAsking({ chunkId: chunk.chunk_id, question: '' })}
+                      aria-label={`Ask about this passage (${pageLabel(chunk.page, chunk.page_end)})`}
+                      data-testid="viewer-ask"
+                    >
+                      Ask about this
+                    </button>
+                  )}
                 </div>
+                {onAskAboutPassage && asking?.chunkId === chunk.chunk_id && (
+                  <form
+                    className="document-viewer__ask-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      const question = asking.question.trim();
+                      if (!question) return;
+                      onAskAboutPassage(question, chunk.chunk_id);
+                      setAsking(null);
+                    }}
+                  >
+                    <input
+                      autoFocus
+                      value={asking.question}
+                      maxLength={MAX_QUESTION_CHARS}
+                      onChange={(event) =>
+                        setAsking({ chunkId: chunk.chunk_id, question: event.target.value })
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === 'Escape') {
+                          event.stopPropagation();
+                          setAsking(null);
+                        }
+                      }}
+                      placeholder="Your question about this passage…"
+                      aria-label="Question about this passage"
+                      data-testid="viewer-ask-input"
+                    />
+                    <button type="submit" disabled={!asking.question.trim()} data-testid="viewer-ask-submit">
+                      Ask
+                    </button>
+                  </form>
+                )}
                 <p className="document-viewer__chunk-text" dir="auto">
                   {isTarget && highlights?.length ? (
-                    <MarkedText text={chunk.text} quotes={highlights} />
+                    <MarkedText
+                      text={chunk.text}
+                      quotes={highlights}
+                      className="document-viewer__quote"
+                      testId="viewer-quote"
+                    />
                   ) : (
                     chunk.text
                   )}

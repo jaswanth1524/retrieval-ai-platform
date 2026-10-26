@@ -175,9 +175,11 @@ const DocumentCard = memo(function DocumentCard({
                 disabled={disabled}
                 aria-label={`Re-index ${card.filename}`}
                 title={
-                  card.stale
-                    ? 'Indexed by an older chunker — re-index from the stored original'
-                    : 'Re-index from the stored original'
+                  card.incomplete
+                    ? 'Some passages are missing or left from an earlier version — re-index from the stored original'
+                    : card.stale
+                      ? 'Indexed by an older chunker — re-index from the stored original'
+                      : 'Re-index from the stored original'
                 }
               >
                 ↻

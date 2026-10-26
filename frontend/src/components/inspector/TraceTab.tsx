@@ -117,6 +117,12 @@ function TraceIds({ trace }: TraceTabProps) {
           {typeof trace.usage.cost_usd === 'number' ? ` · ${formatCost(trace.usage.cost_usd)}` : ''}
         </span>
       )}
+      {trace.answer_status && (
+        <span data-testid="trace-answer-status">
+          answer <span className="trace-tab__id">{trace.answer_status.replace(/_/g, ' ')}</span>
+          {trace.truncated ? ' · cut off at the token limit' : ''}
+        </span>
+      )}
     </div>
   );
 }
@@ -204,6 +210,16 @@ function TraceTab({ trace }: TraceTabProps) {
         <div className="trace-tab__note">
           <p className="trace-tab__note-label mono">condensed query</p>
           <p className="trace-tab__note-body mono">{trace.condensed_question}</p>
+        </div>
+      )}
+
+      {(trace.dropped_history_messages ?? 0) > 0 && (
+        <div className="trace-tab__note" data-testid="trace-dropped-history">
+          <p className="trace-tab__note-label mono">history left out</p>
+          <p className="trace-tab__note-body">
+            {trace.dropped_history_messages} of the earliest history messages didn’t fit the
+            model’s context window and were left out of the prompt.
+          </p>
         </div>
       )}
 
