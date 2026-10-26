@@ -123,6 +123,17 @@ def build_export(
     return stream
 
 
+def _source_fields(meta: DocumentMetadata) -> dict[str, str]:
+    if meta.source_url is None:
+        return {}
+    fields = {"source_url": meta.source_url}
+    if meta.source_etag is not None:
+        fields["source_etag"] = meta.source_etag
+    if meta.source_last_modified is not None:
+        fields["source_last_modified"] = meta.source_last_modified
+    return fields
+
+
 def _write_archive(
     archive: zipfile.ZipFile,
     settings: AppSettings,
@@ -151,6 +162,9 @@ def _write_archive(
                 "chunking_fingerprints": sorted(meta.chunking_fingerprints),
                 "tags": list(meta.tags),
                 "original": f"originals/{filename}" if original else None,
+                # Where a URL-ingested document came from, so a restored copy can
+                # still be refreshed. Absent for uploads (older restores ignore it).
+                **_source_fields(meta),
             }
         )
     manifest = {

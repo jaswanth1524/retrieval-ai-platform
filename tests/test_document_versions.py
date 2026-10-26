@@ -78,3 +78,54 @@ def test_a_workspace_whose_documents_are_gone_deletes_despite_their_history(
     assert upload_and_wait(client, "p.txt", b"Intro\ntwo", headers=ws)["state"] == "done"
     assert client.delete("/documents/p.txt", headers=ws).status_code == 200
     assert client.delete("/workspaces/legal").status_code == 200
+
+
+def test_a_version_is_not_restored_while_the_document_is_indexing(client: TestClient) -> None:
+    from api.ingestion import ingest_sequencer
+
+    assert upload_and_wait(client, "p.txt", b"Intro\nfirst version")["state"] == "done"
+    assert upload_and_wait(client, "p.txt", b"Intro\nsecond version")["state"] == "done"
+    (version,) = client.get("/documents/p.txt/versions").json()["versions"]
+
+    ingest_sequencer.admit("p.txt")  # an upload of it is being indexed
+    try:
+        refused = client.post(f"/documents/p.txt/versions/{version['version']}/restore")
+    finally:
+        ingest_sequencer.release("p.txt")
+    assert refused.status_code == 409
+    assert "already being indexed" in refused.json()["detail"]
+
+
+def test_a_restored_version_of_a_fetched_document_can_still_be_refreshed(
+    client: TestClient,
+) -> None:
+    from api.documents import DocumentSource
+    from api.repository import VectorRepository
+
+    assert upload_and_wait(client, "p.txt", b"Intro\nfirst version")["state"] == "done"
+    assert upload_and_wait(client, "p.txt", b"Intro\nsecond version")["state"] == "done"
+    (version,) = client.get("/documents/p.txt/versions").json()["versions"]
+    seen: list[DocumentSource | None] = []
+    original = VectorRepository.document_metadata
+
+    def with_source(self: VectorRepository, settings: object, name: str) -> object:
+        meta = original(self, settings, name)  # type: ignore[arg-type]
+        return meta.__class__(**{**meta.__dict__, "source_url": "https://example.com/p.txt"})
+
+    import api.ingest_jobs as ingest_jobs
+
+    real_source_of = ingest_jobs.source_of
+
+    def recording(meta: object) -> DocumentSource | None:
+        found = real_source_of(meta)  # type: ignore[arg-type]
+        seen.append(found)
+        return found
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(VectorRepository, "document_metadata", with_source)
+        patch.setattr("api.routes.documents.source_of", recording)
+        restored = client.post(f"/documents/p.txt/versions/{version['version']}/restore")
+        assert restored.status_code == 202
+        assert wait_for_job(client, restored.json()["job_id"])["state"] == "done"
+    assert seen == [DocumentSource("https://example.com/p.txt")]
+    assert client.get("/documents").json()["source_urls"] == {"p.txt": "https://example.com/p.txt"}

@@ -42,7 +42,7 @@ def test_build_info_and_gauges_are_exported(api_context: ApiTestContext) -> None
     body = api_context.client.get("/metrics").text
 
     assert f'docrag_build_info{{version="{app_version()}"}} 1.0' in body
-    assert _value(body, "docrag_corpus_documents") == 1
+    assert _value(body, 'docrag_corpus_documents{workspace="default"}') == 1
     # Nothing is running or queued between requests.
     assert _value(body, "docrag_question_slots_in_use") == 0
     assert _value(body, "docrag_ingest_backlog_jobs") == 0

@@ -172,8 +172,10 @@ _SENTENCE_SPLIT_RE = re.compile(
 # For quoting only (citation spans), never for chunking: chunk text has a Markdown
 # heading flattened into the line ("…any time. ## Booking trips Book flights…"), and
 # with no capital after the period the chunker's rule saw one sentence, so a quote
-# carried the boilerplate before the heading with it.
-_SPAN_SPLIT_RE = re.compile(_SENTENCE_SPLIT_RE.pattern + r"|\s+(?=#{1,6}\s)")
+# carried the boilerplate before the heading with it. A line break ends a sentence too:
+# chunk text only keeps one between table rows (join_units), so a quote is one row, and
+# a bulleted answer is backfilled bullet by bullet.
+_SPAN_SPLIT_RE = re.compile(_SENTENCE_SPLIT_RE.pattern + r"|\s+(?=#{1,6}\s)|\n+")
 
 
 def sentence_spans(text: str) -> list[tuple[int, int]]:
@@ -209,6 +211,22 @@ class _Unit:
     # The spreadsheet row this unit is (part of), for table sections; else None.
     row: int | None = None
     row_label_prefix: str = ""
+    # A line of its own in the chunk text (DocumentSection.line_units).
+    own_line: bool = False
+
+
+def join_units(window: list[_Unit]) -> str:
+    """A window's text: units joined by a space, but a table row (a CSV/XLSX row, or a
+    Markdown table row) or a line-unit (JSON) starts on its own line, so a citation can
+    quote one row or fact."""
+
+    parts: list[str] = []
+    for index, unit in enumerate(window):
+        if index > 0:
+            own_line = unit.row is not None or unit.own_line or unit.text.startswith("|")
+            parts.append("\n" if own_line else " ")
+        parts.append(unit.text)
+    return "".join(parts)
 
 
 def _sentence_units(
@@ -235,6 +253,9 @@ def _sentence_units(
                     len(rows),
                 )
                 rows = [None] * len(sentences)
+        elif section.line_units:
+            sentences = section.text.split("\n")
+            rows = [None] * len(sentences)
         else:
             sentences = _SENTENCE_SPLIT_RE.split(section.text)
             rows = [None] * len(sentences)
@@ -253,6 +274,7 @@ def _sentence_units(
                         section=section.section,
                         row=row,
                         row_label_prefix=section.row_label_prefix,
+                        own_line=section.line_units,
                     )
                 )
     return units

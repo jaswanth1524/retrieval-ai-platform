@@ -220,3 +220,70 @@ def test_a_source_url_is_listed_without_its_query_string(
     # The refresh still asks for the URL as given.
     assert client.post("/documents/alpha.txt/refresh").status_code == 200
     assert "X-Amz-Signature=secret" in str(remote.requests[-1].url)
+
+
+def _url_backup_client(
+    tmp_path: Path, name: str, remote: Remote, monkeypatch: pytest.MonkeyPatch
+) -> TestClient:
+    from api.dependencies import get_raw_document_store
+    from api.raw_documents import RawDocumentStore
+
+    clear_dependency_caches()
+    raw = RawDocumentStore(str(tmp_path / name))
+    settings = make_settings(url_ingest_enabled=True)
+    monkeypatch.setattr(
+        "api.routes.documents.fetch_document",
+        functools.partial(
+            fetch_document, resolve=resolver({}), transport=transport(remote.handler)
+        ),
+    )
+    app = hermetic_app(settings, QdrantClient(":memory:"))
+    app.dependency_overrides[get_raw_document_store] = lambda: raw
+    return TestClient(app)
+
+
+def test_a_restored_url_document_can_still_be_refreshed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO, logger="api.audit")
+    remote = Remote()
+    url = "https://example.com/notes/alpha.txt"
+    with _url_backup_client(tmp_path, "old", remote, monkeypatch) as old:
+        accepted = old.post("/documents/from-url", json={"url": url})
+        assert wait_for_job(old, accepted.json()["job_id"])["state"] == "done"
+        backup = old.get("/export").content
+
+    with _url_backup_client(tmp_path, "new", remote, monkeypatch) as new:
+        imported = new.post(
+            "/import", files={"file": ("backup.zip", backup, "application/zip")}
+        ).json()
+        (job,) = imported["jobs"]
+        assert wait_for_job(new, job["job_id"])["state"] == "done"
+        assert new.get("/documents").json()["source_urls"] == {"alpha.txt": url}
+        # Unchanged at the source: the restored etag made it a conditional request.
+        assert new.post("/documents/alpha.txt/refresh").json() == {
+            "filename": "alpha.txt",
+            "unchanged": True,
+        }
+    clear_dependency_caches()
+
+    events = [record.getMessage().split()[0] for record in caplog.records]
+    assert "document.upload_from_url" in events
+    assert "corpus.export" in events
+
+
+def test_a_url_document_can_be_tagged(url_client: tuple[TestClient, Remote]) -> None:
+    client, _ = url_client
+    accepted = client.post(
+        "/documents/from-url",
+        json={"url": "https://example.com/notes/alpha.txt", "tags": ["web"]},
+    )
+    assert wait_for_job(client, accepted.json()["job_id"])["state"] == "done"
+    assert client.get("/documents").json()["tags"] == {"alpha.txt": ["web"]}
+    too_many = client.post(
+        "/documents/from-url",
+        json={"url": "https://example.com/notes/beta.txt", "tags": [f"t{n}" for n in range(21)]},
+    )
+    assert too_many.status_code == 422

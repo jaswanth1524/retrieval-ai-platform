@@ -147,6 +147,9 @@ def _narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
         "section": narrow.section,
         "exclude_filenames": list(narrow.exclude_filenames),
         "chunk_ids": list(narrow.chunk_ids),
+        "exclude_chunk_ids": list(narrow.exclude_chunk_ids),
+        "uploaded_after": narrow.uploaded_after,
+        "uploaded_before": narrow.uploaded_before,
     }
     return {key: value for key, value in record.items() if value not in (None, [])} or None
 
@@ -346,7 +349,7 @@ def _condense_skip_reason(question: str, settings: AppSettings) -> str | None:
     return None
 
 
-def _trace_status(status: str) -> TraceStatus:
+def trace_status(status: str) -> TraceStatus:
     """A finished answer's trace status: a model that said the sources don't answer it
     is "insufficient_context" too, not "ok" (the query log counts those as uncovered)."""
 
@@ -744,6 +747,9 @@ class RagPipeline:
         condense_note: str | None = None,
         citation_backfilled: bool = False,
         narrow: PassageFilter | None = None,
+        answer_status: str | None = None,
+        truncated: bool = False,
+        dropped_history_messages: int = 0,
     ) -> QueryTrace:
         """The trace of a question that ran to an answer (or to "insufficient context")."""
 
@@ -780,6 +786,9 @@ class RagPipeline:
             workspace=workspace_of(self._settings),
             usage=usage,
             cost_usd=usage_cost_usd(effective_settings, usage),
+            answer_status=answer_status,
+            truncated=truncated,
+            dropped_history_messages=dropped_history_messages,
         )
 
     def _truncate_history(
@@ -900,7 +909,11 @@ class RagPipeline:
         return sorted(tag for tag in stored if tag.casefold() in wanted) or list(tags)
 
     def _expand_context(
-        self, kept: Sequence[RerankedChunk], settings: AppSettings, for_generation: bool
+        self,
+        kept: Sequence[RerankedChunk],
+        settings: AppSettings,
+        for_generation: bool,
+        excluded: AbstractSet[str] = frozenset(),
     ) -> tuple[list[RerankedChunk], float]:
         """The kept passages with neighbour text for the prompt, and the time taken.
 
@@ -915,7 +928,8 @@ class RagPipeline:
         start = time.monotonic()
         limit = int(settings.max_context_chunks)
         expanded = [
-            *expand_with_neighbors(kept[:limit], self._repository, settings),
+            # A passage left out of the question doesn't come back as a neighbour.
+            *expand_with_neighbors(kept[:limit], self._repository, settings, excluded=excluded),
             *kept[limit:],
         ]
         return expanded, (time.monotonic() - start) * 1000
@@ -1057,7 +1071,10 @@ class RagPipeline:
         # picked, and the question was asked about these alone.
         picked_only = narrow is not None and bool(narrow.chunk_ids)
         expanded, context_expansion_ms = self._expand_context(
-            diverse_outcome.kept, effective_settings, for_generation and not picked_only
+            diverse_outcome.kept,
+            effective_settings,
+            for_generation and not picked_only,
+            excluded=frozenset(narrow.exclude_chunk_ids) if narrow is not None else frozenset(),
         )
 
         return RetrievalPhase(
@@ -1338,8 +1355,11 @@ class RagPipeline:
             )
             selected = fitted.context_chunks
 
-            slot = GenerationSlot(effective_settings)
-            slot.acquire()
+            # Nothing to answer from: the canned answer makes no LLM call, so it must not
+            # queue behind another question's generation at a local model.
+            if selected:
+                slot = GenerationSlot(effective_settings)
+                slot.acquire()
             generate_start = time.monotonic()
             reset_finish_reason()
             grounded = generate_grounded_answer(
@@ -1387,6 +1407,11 @@ class RagPipeline:
                 )
             raise
 
+        # The answer's usage: everything up to it (condense, expansion, the answer and
+        # its citation retry), as the stream's `done` reports it. Follow-up tokens are
+        # still counted in the token and cost metrics.
+        usage = usage_totals()
+        cost_usd = usage_cost_usd(effective_settings, usage)
         try:
             status = answer_status(grounded.answer, len(grounded.sources), len(selected))
             wants_followups = effective_settings.followups_enabled and status == "answered"
@@ -1404,8 +1429,6 @@ class RagPipeline:
         finally:
             if slot is not None:
                 slot.release()
-        usage = usage_totals()
-        cost_usd = usage_cost_usd(effective_settings, usage)
         if wants_followups:
             # The response waited for them (even when none came back), so the total does.
             timings = replace(timings, total_ms=(time.monotonic() - total_start) * 1000)
@@ -1420,7 +1443,7 @@ class RagPipeline:
                     narrow=(overrides or AnswerOverrides()).narrow,
                     question=question,
                     mode="sync",
-                    status=_trace_status(status),
+                    status=trace_status(status),
                     effective_settings=effective_settings,
                     filenames=filenames,
                     tags=tags,
@@ -1437,6 +1460,9 @@ class RagPipeline:
                     citation_retry_used=grounded.citation_retry_used,
                     citation_backfilled=grounded.citation_backfilled,
                     usage=usage,
+                    answer_status=status,
+                    truncated=truncated,
+                    dropped_history_messages=fitted.dropped_history_messages,
                 )
             )
         return replace(
@@ -1563,6 +1589,8 @@ class RagPipeline:
                 timings = self._phase_timings(
                     phase, total_start=total_start, condense_ms=condense_ms
                 )
+                # The condense and query-expansion calls were still made.
+                usage = usage_totals()
                 if trace_store is not None and trace_id is not None:
                     trace_store.add(
                         self._finished_trace(
@@ -1583,6 +1611,8 @@ class RagPipeline:
                             condensed_question=condensed_question,
                             condense_note=condense_note,
                             history_message_count=len(truncated_history),
+                            usage=usage,
+                            answer_status="no_context",
                         )
                     )
                 finalized = True
@@ -1594,6 +1624,7 @@ class RagPipeline:
                     "trace_id": trace_id,
                     "answer_status": "no_context",
                     "top_rerank_score": _top_rerank_score(phase),
+                    "usage": usage_dict(usage, usage_cost_usd(effective_settings, usage)),
                 }
                 return
 
@@ -1688,7 +1719,7 @@ class RagPipeline:
                         narrow=(overrides or AnswerOverrides()).narrow,
                         question=question,
                         mode="stream",
-                        status=_trace_status(status),
+                        status=trace_status(status),
                         effective_settings=effective_settings,
                         filenames=filenames,
                         tags=tags,
@@ -1709,6 +1740,9 @@ class RagPipeline:
                         citation_retry_used=citation_retry_used,
                         citation_backfilled=outcome.backfilled,
                         usage=usage,
+                        answer_status=status,
+                        truncated=truncated,
+                        dropped_history_messages=fitted.dropped_history_messages,
                     )
                 )
             finalized = True

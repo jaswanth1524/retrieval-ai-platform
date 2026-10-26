@@ -68,7 +68,8 @@ class PassageNarrowing(BaseModel):
     """Where in the documents to look, shared by POST /search and questions. Every field
     narrows the same hybrid search, fusion and rerank; none replaces them."""
 
-    # Passages starting on a page in this range (either end optional).
+    # Passages on a page in this range (either end optional): one that starts before
+    # page_min but runs onto it (a passage crossing a page break) counts too.
     page_min: int | None = Field(default=None, ge=1)
     page_max: int | None = Field(default=None, ge=1)
     # Passages under exactly this section label (as citations show it).
@@ -81,12 +82,23 @@ class PassageNarrowing(BaseModel):
     chunk_ids: list[RequestChunkId] | None = Field(
         default=None, min_length=1, max_length=REQUEST_CHUNK_IDS_MAX
     )
+    # Passages to leave out, by chunk id ("answer again without this source").
+    exclude_chunk_ids: list[RequestChunkId] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_CHUNK_IDS_MAX
+    )
+    # Documents uploaded in this range (Unix seconds, either end optional). Documents
+    # indexed before upload times were recorded have none and are left out by it.
+    uploaded_after: float | None = Field(default=None, ge=0)
+    uploaded_before: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _page_range_in_order(self) -> PassageNarrowing:
         if self.page_min is not None and self.page_max is not None:
             if self.page_min > self.page_max:
                 raise ValueError("page_min must not be greater than page_max.")
+        if self.uploaded_after is not None and self.uploaded_before is not None:
+            if self.uploaded_after > self.uploaded_before:
+                raise ValueError("uploaded_after must not be later than uploaded_before.")
         return self
 
 
@@ -246,6 +258,9 @@ class DocumentListResponse(BaseModel):
     # Indexed by an older chunker (or before the version was recorded) — re-indexing
     # them applies the current chunking.
     stale_filenames: list[str] = []
+    # Points left from more than one ingest, or fewer than the ingest meant to write (a
+    # write cut off part way): re-indexing from the original repairs them.
+    incomplete_filenames: list[str] = []
     # Have a stored original (RAW_DOCUMENT_DIR), so POST /documents/{f}/reindex works.
     reindexable_filenames: list[str] = []
     # Tagged documents only (PATCH /documents/{f}/tags); an untagged one is absent.
@@ -542,6 +557,13 @@ class TraceDetailResponse(BaseModel):
     # The X-Request-ID of the request that asked it, to find its log lines.
     request_id: str | None = None
     usage: UsageResponse | None = None
+    # The answer's status as the response gave it (answered, uncited,
+    # insufficient_context, no_context, ...); null on errors and older traces.
+    answer_status: str | None = None
+    # The answer stopped at the token limit.
+    truncated: bool = False
+    # History messages left out of the prompt to fit the context window.
+    dropped_history_messages: int = 0
 
 
 class HistoryMessageRequest(BaseModel):
@@ -630,6 +652,9 @@ class CitationResponse(BaseModel):
     spans: list[CitationSpanResponse] = []
     # The last page when the passage crosses a page break (it starts on `page`).
     page_end: int | None = None
+    # The cross-encoder's score for this passage, in [0, 1] (absent on answers cached
+    # before it was recorded).
+    rerank_score: float | None = None
 
 
 class QuestionResponse(BaseModel):
@@ -688,6 +713,8 @@ class UrlIngestRequest(BaseModel):
     # The stored name; else the server's Content-Disposition, else the URL's last path
     # segment (with an extension from the content type when it names no supported one).
     filename: RequestFilename | None = None
+    # Tags to give the document (replacing any it has).
+    tags: list[RequestTag] | None = Field(default=None, max_length=MAX_TAGS_PER_DOCUMENT)
 
 
 class SummaryRequest(BaseModel):
@@ -766,6 +793,9 @@ class SearchResultResponse(BaseModel):
     rerank_score: float
     # The last page when the passage crosses a page break (it starts on `page`).
     page_end: int | None = None
+    # The sentences that share the most words with the query (offsets into `text`),
+    # for highlighting; empty when none shares enough.
+    spans: list[CitationSpanResponse] = []
 
 
 class SearchTimingsResponse(BaseModel):

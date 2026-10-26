@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
+from collections.abc import Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -106,6 +107,8 @@ def expand_with_neighbors(
     chunks: Sequence[RerankedChunk],
     repository: VectorRepository,
     settings: AppSettings,
+    *,
+    excluded: AbstractSet[str] = frozenset(),
 ) -> list[RerankedChunk]:
     """Expand each reranked chunk's generation context with its immediate neighbors.
 
@@ -127,6 +130,9 @@ def expand_with_neighbors(
     the last that many characters before it and the first that many after it. The
     sentences right at the boundary are what resolve a chunk that starts or ends
     mid-thought; the far side of a neighbour mostly adds prefill.
+
+    ``excluded`` chunk ids (passages the question left out) never come back as
+    neighbour text.
     """
 
     radius = int(settings.context_neighbor_radius)
@@ -172,6 +178,8 @@ def expand_with_neighbors(
             payload = point.payload or {}
             ordinal = payload.get("chunk_ordinal")
             text = payload.get("text")
+            if payload.get("chunk_id") in excluded:
+                continue
             if isinstance(ordinal, int) and not isinstance(ordinal, bool) and text:
                 neighbor_text[(filename, ordinal)] = str(text)
 

@@ -188,3 +188,27 @@ def pptx_bytes(slides: list[dict[str, object]]) -> bytes:
     buffer = io.BytesIO()
     presentation.save(buffer)
     return buffer.getvalue()
+
+
+def odt_bytes(body_xml: str, *, extra_members: dict[str, bytes] | None = None) -> bytes:
+    """An OpenDocument text file whose ``office:text`` holds ``body_xml``."""
+
+    import zipfile
+
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<office:document-content"
+        ' xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+        ' xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"'
+        ' xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"'
+        ' office:version="1.3">'
+        f"<office:body><office:text>{body_xml}</office:text></office:body>"
+        "</office:document-content>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+        archive.writestr("content.xml", content)
+        for name, data in (extra_members or {}).items():
+            archive.writestr(name, data)
+    return buffer.getvalue()

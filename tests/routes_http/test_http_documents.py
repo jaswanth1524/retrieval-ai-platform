@@ -1122,3 +1122,79 @@ def test_reindex_all_keeps_going_past_an_original_deleted_or_a_job_that_fails_to
         response = client.post("/documents/reindex")
         assert response.status_code == 202
         assert response.json()["failed"] == ["a.txt"]
+
+
+def test_a_document_missing_some_of_its_points_is_listed_as_incomplete(
+    api_context: ApiTestContext,
+) -> None:
+    from qdrant_client import models
+
+    text = b"Intro\n" + " ".join(f"Sentence number {n} is here." for n in range(40)).encode()
+    assert upload_and_wait(api_context.client, "long.txt", text)["state"] == "done"
+    assert upload_and_wait(api_context.client, "short.txt", b"Intro\nalpha")["state"] == "done"
+    assert api_context.client.get("/documents").json()["incomplete_filenames"] == []
+
+    collection = api_context.settings.qdrant_collection
+    points, _ = api_context.qdrant.scroll(
+        collection,
+        scroll_filter=models.Filter(
+            must=[models.FieldCondition(key="filename", match=models.MatchValue(value="long.txt"))]
+        ),
+        limit=1,
+    )
+    assert api_context.qdrant.count(collection).count > 2
+    # A write cut off part way: one of its points never made it.
+    api_context.qdrant.delete(
+        collection, points_selector=models.PointIdsList(points=[points[0].id])
+    )
+    from api.corpus import bump_corpus_generation
+
+    bump_corpus_generation(["long.txt"], collection=collection)
+
+    assert api_context.client.get("/documents").json()["incomplete_filenames"] == ["long.txt"]
+
+
+def test_points_from_before_chunk_totals_are_never_called_incomplete() -> None:
+    from api.repository import _MetadataFold
+
+    fold = _MetadataFold()
+    for _ in range(3):
+        fold.add({"filename": "old.txt", "page": 1})
+    assert fold.result().incomplete is False
+
+    mixed = _MetadataFold()
+    mixed.add({"filename": "a.txt", "page": 1, "content_sha256": "h1", "document_chunks": 2})
+    mixed.add({"filename": "a.txt", "page": 1, "content_sha256": "h2", "document_chunks": 2})
+    assert mixed.result().incomplete is True
+
+
+def test_an_upload_can_be_tagged_and_bad_tags_are_refused_before_the_job(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+
+    accepted = client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha", "text/plain")},
+        data={"tags": ["HR", "policy", "hr"]},
+    )
+    assert accepted.status_code == 202
+    assert wait_for_job(client, accepted.json()["job_id"])["state"] == "done"
+    assert client.get("/documents").json()["tags"] == {"guide.txt": ["HR", "policy"]}
+
+    # The same bytes with new tags: re-indexed with them, not left as indexed.
+    again = client.post(
+        "/documents",
+        files={"file": ("guide.txt", b"Intro\nalpha", "text/plain")},
+        data={"tags": ["finance"]},
+    )
+    assert wait_for_job(client, again.json()["job_id"])["state"] == "done"
+    assert client.get("/documents").json()["tags"] == {"guide.txt": ["finance"]}
+
+    refused = client.post(
+        "/documents",
+        files={"file": ("other.txt", b"Intro\nbeta", "text/plain")},
+        data={"tags": ["x" * 200]},
+    )
+    assert refused.status_code == 400
+    assert "other.txt" not in client.get("/documents").json()["filenames"]

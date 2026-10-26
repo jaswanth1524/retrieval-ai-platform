@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from api.chunking import sentence_spans
 from api.citations import (
@@ -132,9 +132,57 @@ def test_a_flattened_markdown_heading_ends_the_sentence_before_it() -> None:
     )
     [spans] = spans_for("Receipts must be submitted in the expense tool within 30 days [1].", text)
 
+    # The heading's marker stays off the quote; a heading met mid-chunk (this chunk's
+    # section is "Leave") keeps its title, as nothing says where the title ends.
     assert [span.quote for span in spans] == [
-        "## Receipts Submit receipts in the expense tool within thirty days."
+        "Receipts Submit receipts in the expense tool within thirty days."
     ]
+    assert text[spans[0].start : spans[0].end] == spans[0].quote
+
+
+def _spans_with_section(answer: str, text: str, section: str) -> tuple[CitationSpan, ...]:
+    source = replace(chunk(text), section=section)
+    [cited] = attach_spans(answer, source_citations([source]), [source])
+    return cited.spans
+
+
+def test_the_chunks_own_heading_stays_off_the_quote() -> None:
+    text = "## Receipts Submit receipts in the expense tool within thirty days. Keep copies."
+    spans = _spans_with_section(
+        "Receipts go in the expense tool within 30 days [1].", text, "Receipts"
+    )
+    assert [span.quote for span in spans] == [
+        "Submit receipts in the expense tool within thirty days."
+    ]
+    assert text[spans[0].start : spans[0].end] == spans[0].quote
+
+
+def test_a_setext_heading_stays_off_the_quote() -> None:
+    text = "Receipts ======== Submit receipts in the expense tool within thirty days."
+    spans = _spans_with_section(
+        "Receipts go in the expense tool within 30 days [1].", text, "Receipts"
+    )
+    assert [span.quote for span in spans] == [
+        "Submit receipts in the expense tool within thirty days."
+    ]
+
+
+def test_a_sentence_starting_with_the_section_word_is_quoted_whole() -> None:
+    text = "Receipts are submitted in the expense tool within thirty days."
+    spans = _spans_with_section(
+        "Receipts go in the expense tool within 30 days [1].", text, "Receipts"
+    )
+    assert [span.quote for span in spans] == [text]
+
+
+def test_a_quote_never_joins_the_sentence_before_a_heading() -> None:
+    text = (
+        "Expense claims use the expense tool. ## Receipts Receipts use the expense tool "
+        "within thirty days."
+    )
+    [spans] = spans_for("Claims and receipts use the expense tool within 30 days [1].", text)
+    assert all("Expense claims use" not in span.quote or "##" not in span.quote for span in spans)
+    assert all("##" not in span.quote for span in spans)
 
 
 def test_numbers_match_whether_written_as_digits_or_words() -> None:
@@ -162,3 +210,39 @@ def test_spelled_numbers_become_digits() -> None:
         "2020",
         "0",
     ]
+
+
+def test_a_data_table_citation_quotes_its_row_not_the_whole_chunk() -> None:
+    """Table rows are joined by line breaks in the chunk text (chunking.join_units), so a
+    claim about one row of a CSV without full stops quotes that row. Measured on a
+    40-row CSV at the default chunk size: mean quote 1044 characters before, 55 after."""
+
+    from api.chunking import HeuristicTokenCounter
+    from api.documents import chunk_sections, parse_document_bytes
+    from tests.factories import make_test_settings
+
+    settings = make_test_settings()
+    rows = [f"person{i},team{i % 4},city{i % 7},{2010 + i % 9}" for i in range(40)]
+    csv = ("name,team,office,start\n" + "\n".join(rows)).encode()
+    chunks = chunk_sections(
+        parse_document_bytes("staff.csv", csv, settings), settings, HeuristicTokenCounter()
+    )
+    target = next(c for c in chunks if "name: person7;" in c.text)
+    assert "\nname: person8;" in target.text
+    [spans] = spans_for("person7 is on team3 in the city0 office, since 2017 [1].", target.text)
+
+    assert [span.quote for span in spans] == [
+        "name: person7; team: team3; office: city0; start: 2017"
+    ]
+
+
+def test_units_are_joined_by_spaces_and_rows_by_line_breaks() -> None:
+    from api.chunking import _Unit, join_units
+
+    window = [
+        _Unit("Intro text.", 2, 1, "S"),
+        _Unit("More text.", 2, 1, "S"),
+        _Unit("name: a", 2, 1, "S", row=2),
+        _Unit("| b | c |", 2, 1, "S"),
+    ]
+    assert join_units(window) == "Intro text. More text.\nname: a\n| b | c |"

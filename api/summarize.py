@@ -57,6 +57,7 @@ from api.pipeline import (
     replay_cached,
     timings_dict,
     trace_model_name,
+    trace_status,
     usage_cost,
     usage_dict,
     usage_tuple,
@@ -662,6 +663,8 @@ class DocumentSummarizer:
             usage: tuple[int, int] | None = None,
             citation_retry_used: bool = False,
             citation_backfilled: bool = False,
+            status_of_answer: str | None = None,
+            truncated: bool = False,
         ) -> None:
             if self._trace_store is None or trace_id is None:
                 return
@@ -696,6 +699,8 @@ class DocumentSummarizer:
                     cost_usd=usage_cost_usd(settings, usage),
                     citation_retry_used=citation_retry_used,
                     citation_backfilled=citation_backfilled,
+                    answer_status=status_of_answer,
+                    truncated=truncated,
                 )
             )
 
@@ -740,12 +745,15 @@ class DocumentSummarizer:
                     numbered_parts.append(numbered_part)
                 numbered.append((filename, numbered_parts))
             chunks_read = len(selected)
-            all_sources = source_citations(selected)
+            all_sources = source_citations(selected, scored=False)
 
             if not selected:
                 timings = _elapsed_timings(started, search_ms=read_ms)
                 store_trace(
-                    "insufficient_context", answer=INSUFFICIENT_CONTEXT_ANSWER, timings=timings
+                    "insufficient_context",
+                    answer=INSUFFICIENT_CONTEXT_ANSWER,
+                    timings=timings,
+                    status_of_answer="no_context",
                 )
                 finalized = True
                 yield {"type": "sources", "sources": [], "trace_id": trace_id}
@@ -829,7 +837,7 @@ class DocumentSummarizer:
             ):
                 yield {"type": "stage", "stage": "verifying_citations"}
             outcome, cited = finish_answer(
-                final_messages, answer, selected, self._generator, final_settings
+                final_messages, answer, selected, self._generator, final_settings, scored=False
             )
             answer = outcome.answer
             final_messages = list(outcome.prompt_messages)
@@ -842,14 +850,19 @@ class DocumentSummarizer:
                 citation_retry_ms=outcome.retry_ms,
                 first_token_ms=first_token_ms,
             )
+            status = answer_status(answer, len(cited), len(selected))
+            # A summary the documents couldn't support is "insufficient_context" in its
+            # trace too, so the query log lists it as uncovered.
             store_trace(
-                "ok",
+                trace_status(status),
                 answer=answer,
                 cited=[source.source_number for source in cited],
                 timings=timings,
                 usage=usage,
                 citation_retry_used=outcome.retry_used,
                 citation_backfilled=outcome.backfilled,
+                status_of_answer=status,
+                truncated=truncated,
             )
             finalized = True
             yield {
@@ -858,7 +871,7 @@ class DocumentSummarizer:
                 "sources": [asdict(source) for source in cited],
                 "timings": timings_dict(timings),
                 "trace_id": trace_id,
-                "answer_status": answer_status(answer, len(cited), len(selected)),
+                "answer_status": status,
                 "truncated": truncated,
                 "citation_backfilled": outcome.backfilled,
                 "chunks_read": chunks_read,

@@ -92,6 +92,8 @@ def test_question_endpoint_runs_grounded_pipeline(api_context: ApiTestContext) -
             "spans": [],
             # On one page: no last page.
             "page_end": None,
+            # The fake reranker's logit 1.0, normalized.
+            "rerank_score": pytest.approx(0.7310585786300049),
         }
     ]
     assert api_context.reranker.seen_documents == ["guide.txt › Intro\nIntro alpha beta"]

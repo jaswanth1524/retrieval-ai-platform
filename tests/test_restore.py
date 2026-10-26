@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from api import restore
+from api.documents import DocumentSource
 from api.export import MANIFEST_VERSION
 from api.feedback import Feedback
 from api.restore import BackupImportError, restore_backup
@@ -36,11 +37,18 @@ def _zip(documents: list[dict[str, Any]], members: dict[str, bytes]) -> io.Bytes
 class Recorder:
     def __init__(self) -> None:
         self.queued: list[tuple[str, bytes]] = []
+        self.sources: dict[str, DocumentSource | None] = {}
 
     def enqueue(
-        self, name: str, content: bytes, uploaded_at: float | None, tags: tuple[str, ...]
+        self,
+        name: str,
+        content: bytes,
+        uploaded_at: float | None,
+        tags: tuple[str, ...],
+        source: DocumentSource | None,
     ) -> DocumentJobAcceptedResponse:
         self.queued.append((name, content))
+        self.sources[name] = source
         return DocumentJobAcceptedResponse(job_id=f"job-{name}", filename=name, state="queued")
 
 
@@ -156,3 +164,34 @@ def test_a_name_listed_twice_in_the_manifest_is_queued_once() -> None:
 
     assert recorder.queued == [("a.txt", b"alpha")]
     assert outcome.skipped == ["a.txt"]
+
+
+def test_a_fetched_document_keeps_where_it_came_from() -> None:
+    documents = [
+        {
+            **_document("page.html"),
+            "source_url": "https://example.com/page",
+            "source_etag": '"v1"',
+            "source_last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+        },
+        # Not a URL the server could have fetched, and an older manifest's row.
+        {**_document("odd.html"), "source_url": "file:///etc/passwd"},
+        _document("plain.txt"),
+    ]
+    upload = _zip(
+        documents,
+        {
+            "originals/page.html": b"<p>a</p>",
+            "originals/odd.html": b"<p>b</p>",
+            "originals/plain.txt": b"c",
+        },
+    )
+    recorder = Recorder()
+    _restore(upload, recorder)
+    assert recorder.sources == {
+        "page.html": DocumentSource(
+            "https://example.com/page", '"v1"', "Mon, 01 Jan 2024 00:00:00 GMT"
+        ),
+        "odd.html": None,
+        "plain.txt": None,
+    }

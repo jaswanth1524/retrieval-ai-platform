@@ -765,3 +765,45 @@ def test_forgetting_one_collections_listing_keeps_the_others() -> None:
 
     assert set(repository_module._metadata_cache[client]) == {"docs"}
     assert "old" not in repository_module._metadata_scan_locks.get(client, {})
+
+
+def _narrowed_ids(narrow: Any) -> set[int]:
+    """Point ids a ``PassageFilter`` keeps, over a few hand-made points."""
+
+    from api.repository import _scope_filter
+
+    client = QdrantClient(":memory:")
+    client.create_collection("c", vectors_config=models.VectorParams(size=1, distance="Cosine"))
+    payloads = [
+        {"page": 1, "chunk_id": "a", "uploaded_at": 100.0},
+        # Starts on page 2 and runs onto page 3.
+        {"page": 2, "page_end": 3, "chunk_id": "b", "uploaded_at": 200.0},
+        {"page": 4, "chunk_id": "c", "uploaded_at": 300.0},
+        # Indexed before uploaded_at was recorded.
+        {"page": 5, "chunk_id": "d"},
+    ]
+    client.upsert(
+        "c",
+        points=[
+            models.PointStruct(id=index, vector=[1.0], payload=payload)
+            for index, payload in enumerate(payloads)
+        ],
+    )
+    points, _ = client.scroll("c", scroll_filter=_scope_filter(None, None, narrow), limit=10)
+    return {int(point.id) for point in points}
+
+
+def test_a_page_range_keeps_a_passage_running_onto_it() -> None:
+    from api.repository import PassageFilter
+
+    assert _narrowed_ids(PassageFilter(page_min=3, page_max=4)) == {1, 2}
+    assert _narrowed_ids(PassageFilter(page_min=3)) == {1, 2, 3}
+    assert _narrowed_ids(PassageFilter(page_max=2)) == {0, 1}
+
+
+def test_upload_dates_and_left_out_passages_narrow_the_search() -> None:
+    from api.repository import PassageFilter
+
+    assert _narrowed_ids(PassageFilter(uploaded_after=150.0)) == {1, 2}
+    assert _narrowed_ids(PassageFilter(uploaded_before=250.0)) == {0, 1}
+    assert _narrowed_ids(PassageFilter(exclude_chunk_ids=("b", "c"))) == {0, 3}

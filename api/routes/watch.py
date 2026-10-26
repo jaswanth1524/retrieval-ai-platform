@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
-from api.dependencies import require_api_key, require_full_key
+from api.audit import audit
+from api.dependencies import get_app_settings, require_api_key, require_full_key
 from api.schemas import WatchStatusResponse
+from api.settings import AppSettings
 from api.watch import FolderWatcher
 
 
@@ -32,8 +35,11 @@ def register(app: FastAPI) -> None:
         return WatchStatusResponse.model_validate(asdict(_watcher(request).status()))
 
     @app.post("/watch/scan", status_code=202, dependencies=[Depends(require_full_key)])
-    def watch_scan_now(request: Request) -> WatchStatusResponse:
+    def watch_scan_now(
+        request: Request, settings: Annotated[AppSettings, Depends(get_app_settings)]
+    ) -> WatchStatusResponse:
         watcher = _watcher(request)
         watcher.scan_now()
+        audit("watch.scan", workspace=settings.watch_workspace)
         # The status as of the previous pass: the new one runs on the watcher's thread.
         return WatchStatusResponse.model_validate(asdict(watcher.status()))

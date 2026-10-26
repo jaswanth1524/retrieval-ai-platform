@@ -65,6 +65,12 @@ _TYPE_EXTENSIONS = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.oasis.opendocument.text": ".odt",
+    "application/json": ".json",
+    "application/yaml": ".yaml",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/tiff": ".tiff",
 }
 
 Resolver = Callable[[str, int], list[str]]
@@ -104,6 +110,13 @@ class FetchedDocument:
 
 class BacklogFullError(Exception):
     """The ingest backlog has no room for a document this size (the route's 503)."""
+
+
+# Downloads for indexing at once, across POST /documents/from-url, refresh and the
+# scheduled refresh (URL_REFRESH_INTERVAL_MINUTES): each holds a thread for up to
+# URL_INGEST_TIMEOUT_SECONDS and up to MAX_UPLOAD_BYTES of memory.
+URL_FETCH_MAX_CONCURRENT = 4
+fetch_slots = threading.BoundedSemaphore(URL_FETCH_MAX_CONCURRENT)
 
 
 def resolve_host(host: str, port: int) -> list[str]:
@@ -393,7 +406,8 @@ def choose_filename(url: str, content_type: str, disposition: str | None, given:
     candidate = re.sub(r"[\x00-\x1f/\\]+", "_", candidate)
     if PurePosixPath(candidate).suffix.lower() not in SUPPORTED_EXTENSIONS:
         extension = _TYPE_EXTENSIONS.get(content_kind)
-        if extension is None:
+        # An image without the ocr extra installed: not a type this server indexes.
+        if extension is None or extension not in SUPPORTED_EXTENSIONS:
             raise UrlFetchError(
                 f"The URL returned '{content_kind or 'no content type'}', which DocRAG "
                 "can't index; name the file with a supported extension to override."

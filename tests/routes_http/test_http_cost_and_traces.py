@@ -17,7 +17,13 @@ from api.dependencies import clear_dependency_caches, get_generator, get_trace_s
 from api.llm import LiteLLMGenerator, model_prices, usage_cost_usd
 from api.trace_archive import TraceArchive
 from api.tracing import QueryTrace, TraceCandidate, TraceConfig, TraceStore, trace_from_json
-from tests.routes_http.support import hermetic_app, keyed_client, make_settings, upload_and_wait
+from tests.routes_http.support import (
+    hermetic_app,
+    keyed_client,
+    make_settings,
+    parse_sse_events,
+    upload_and_wait,
+)
 
 
 def test_cost_is_priced_for_listed_hosted_models_only() -> None:
@@ -206,3 +212,51 @@ def test_traces_export_needs_the_full_key_and_streams_json_lines(tmp_path: Path)
     assert "attachment" in response.headers["content-disposition"]
     rows = [json.loads(line) for line in response.text.splitlines()]
     assert [row["trace_id"] for row in rows] == [asked["trace_id"]]
+
+
+@pytest.mark.parametrize("path", ["/questions", "/questions/stream"])
+def test_usage_covers_the_answer_not_the_follow_ups_on_both_endpoints(path: str) -> None:
+    settings = make_settings(
+        llm_provider="openai",
+        openai_api_key="k",
+        openai_model="gpt-4o-mini",
+        citation_retry_enabled=False,
+        followups_enabled=True,
+    )
+    replies = [
+        _openai_reply("Alpha is documented [1].", 1000, 20),
+        _openai_reply("What else is in alpha?\nWho wrote alpha?", 500, 40),
+    ]
+
+    def completion_client(**kwargs: Any) -> Any:
+        reply = replies.pop(0)
+        if kwargs.get("stream"):
+            text = reply["choices"][0]["message"]["content"]
+            return iter(
+                [
+                    {"choices": [{"delta": {"content": text}, "finish_reason": None}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": reply["usage"]},
+                ]
+            )
+        return reply
+
+    clear_dependency_caches()
+    app = hermetic_app(settings, QdrantClient(":memory:"))
+    app.dependency_overrides[get_generator] = lambda: LiteLLMGenerator(settings, completion_client)
+    with TestClient(app) as client:
+        assert upload_and_wait(client, "guide.txt", b"Intro\nalpha beta")["state"] == "done"
+        response = client.post(path, json={"question": "What is alpha?"})
+        if path == "/questions":
+            body = response.json()
+        else:
+            body = next(
+                event for event in parse_sse_events(response.text) if event["type"] == "done"
+            )
+        trace = client.get(f"/traces/{body['trace_id']}").json()
+    clear_dependency_caches()
+
+    assert not replies  # the follow-ups were asked for
+    usage = body["usage"]
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (1000, 20)
+    assert trace["usage"] == usage
+    assert trace["answer_status"] == "answered"

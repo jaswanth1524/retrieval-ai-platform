@@ -225,13 +225,14 @@ def finish_answer(
     settings: AppSettings,
     *,
     weak_matches: bool = False,
+    scored: bool = True,
 ) -> tuple[CitationOutcome, list[SourceCitation]]:
     """Citations for a generated ``answer``: filtered to the sources it cites, added
     when it cites none (backfill, then the LLM retry; CITATION_RETRY_MODE), and each
     cited source's supporting span attached. Shared by both response modes, so what
     makes an answer cited can't drift between them."""
 
-    all_sources = source_citations(context_chunks)
+    all_sources = source_citations(context_chunks, scored=scored)
     outcome = finalize_citations(
         messages,
         answer,

@@ -512,6 +512,12 @@ class AppSettings(BaseSettings):
     url_ingest_enabled: bool = False
     url_ingest_allow_private: bool = False
     url_ingest_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    # Refresh URL-fetched documents in the background (api/url_refresh.py): each one
+    # whose last check is this many minutes old is fetched again conditionally (an
+    # unchanged page is a 304, nothing re-indexed), at most URL_REFRESH_BATCH per pass.
+    # 0 = off. Needs URL_INGEST_ENABLED.
+    url_refresh_interval_minutes: int = Field(default=0, ge=0, le=525_600)
+    url_refresh_batch: PositiveInt = 4
 
     summary_batch_chars: int = Field(default=9000, ge=1000, le=200_000)
     summary_max_batches: int = Field(default=8, ge=1, le=64)
@@ -615,6 +621,8 @@ class AppSettings(BaseSettings):
         if self.auto_reindex_stale and not self.raw_document_dir:
             # Re-indexing reads each document's stored original.
             log.warning("AUTO_REINDEX_STALE has no effect without RAW_DOCUMENT_DIR.")
+        if self.url_refresh_interval_minutes and not self.url_ingest_enabled:
+            log.warning("URL_REFRESH_INTERVAL_MINUTES has no effect without URL_INGEST_ENABLED.")
         return self
 
     @model_validator(mode="after")

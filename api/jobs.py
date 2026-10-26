@@ -138,6 +138,10 @@ class JobStore(Protocol):
 
     def list_active(self, workspace: str) -> list[IngestJob]: ...
 
+    def list_finished(
+        self, workspace: str, *, failed_only: bool = False, limit: int = 100
+    ) -> list[IngestJob]: ...
+
 
 class IngestJobStore:
     """Thread-safe in-memory store for background ingest job status."""
@@ -185,6 +189,22 @@ class IngestJobStore:
                 for job in self._jobs.values()
                 if job.workspace == workspace and job.state not in TERMINAL_STATES
             ]
+
+    def list_finished(
+        self, workspace: str, *, failed_only: bool = False, limit: int = 100
+    ) -> list[IngestJob]:
+        """``workspace``'s finished jobs still retained, newest first (copies): only the
+        failed ones with ``failed_only``."""
+
+        with self._lock:
+            jobs = [
+                replace(job)
+                for job in reversed(self._jobs.values())
+                if job.workspace == workspace
+                and job.state in TERMINAL_STATES
+                and (job.state == "failed" or not failed_only)
+            ]
+        return jobs[:limit]
 
     def _prune_finished_locked(self) -> None:
         """Evict oldest-first to stay within the cap, finished jobs first.
@@ -339,6 +359,20 @@ class SqliteIngestJobStore:
                 f"SELECT {_JOB_COLUMNS} FROM jobs WHERE workspace = ? "
                 f"AND state NOT IN ({terminal}) ORDER BY created_at_wall, rowid",
                 (workspace, *TERMINAL_STATES),
+            ).fetchall()
+        return [_row_to_job(row) for row in rows]
+
+    def list_finished(
+        self, workspace: str, *, failed_only: bool = False, limit: int = 100
+    ) -> list[IngestJob]:
+        states = ("failed",) if failed_only else tuple(TERMINAL_STATES)
+        placeholders = ", ".join("?" for _ in states)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE workspace = ? "
+                f"AND state IN ({placeholders}) ORDER BY created_at_wall DESC, rowid DESC "
+                "LIMIT ?",
+                (workspace, *states, limit),
             ).fetchall()
         return [_row_to_job(row) for row in rows]
 

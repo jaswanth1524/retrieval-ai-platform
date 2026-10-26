@@ -31,6 +31,32 @@ def test_both_job_stores_list_a_workspaces_active_jobs_oldest_first(tmp_path: Pa
         assert first.id in {job.id for job in store.list_active("")}
 
 
+def test_both_job_stores_list_finished_jobs_newest_first(tmp_path: Path) -> None:
+    import time
+
+    for store in (
+        IngestJobStore(max_retained=50),
+        SqliteIngestJobStore(str(tmp_path / "finished.sqlite3"), max_retained=50),
+    ):
+        names = ["a.txt", "b.txt", "c.txt", "d.txt"]
+        jobs = []
+        for offset, name in enumerate(names):
+            job = store.create(name)
+            # Distinct creation times, as real uploads have.
+            store.update(job.id, created_at_wall=time.time() + offset)
+            jobs.append(job)
+        store.update(jobs[0].id, state="done")
+        store.update(jobs[1].id, state="failed", error="Unreadable PDF.")
+        store.update(jobs[2].id, state="done")
+        other = store.create("legal.txt", workspace="legal")
+        store.update(other.id, state="failed")
+
+        assert [job.filename for job in store.list_finished("")] == ["c.txt", "b.txt", "a.txt"]
+        assert [job.filename for job in store.list_finished("", limit=1)] == ["c.txt"]
+        failed = store.list_finished("", failed_only=True)
+        assert [(job.filename, job.error) for job in failed] == [("b.txt", "Unreadable PDF.")]
+
+
 def test_the_jobs_route_lists_jobs_started_by_anyone(api_context: ApiTestContext) -> None:
     store = IngestJobStore(max_retained=50)
     queued = store.create("watched.txt")
@@ -44,6 +70,13 @@ def test_the_jobs_route_lists_jobs_started_by_anyone(api_context: ApiTestContext
     assert job["filename"] == "watched.txt" and job["state"] == "queued"
     assert job["created_at"] == queued.created_at_wall and job["unchanged"] is False
     assert api_context.client.get("/documents/jobs?state=done").status_code == 422
+    failed = store.create("broken.txt")
+    store.update(failed.id, state="failed", error="Empty document.")
+    listed = api_context.client.get("/documents/jobs?state=failed").json()["jobs"]
+    assert [(job["filename"], job["error"]) for job in listed] == [
+        ("broken.txt", "Empty document.")
+    ]
+    assert api_context.client.get("/documents/jobs?state=recent&limit=0").status_code == 422
 
 
 def _status() -> WatchStatus:

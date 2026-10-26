@@ -74,6 +74,9 @@ class DocumentSection:
     # holds ("<row_label_prefix>Rows 4-17"); ``section`` is used only without them.
     line_rows: tuple[int, ...] | None = None
     row_label_prefix: str = ""
+    # Each line of ``text`` is one unit, on its own line in the chunk text, with no row
+    # labels (a JSON document's ``path: value`` facts).
+    line_units: bool = False
 
 
 # Ligature characters, written out ("ﬁnance" never matched a search for "finance"), and

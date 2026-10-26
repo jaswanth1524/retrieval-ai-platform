@@ -152,6 +152,17 @@ class RawDocumentStore:
             result.append(StoredVersion(path.name, int(path.name) / 1e9, size))
         return result
 
+    def version_size(self, filename: str, version: str) -> int | None:
+        """One earlier version's size in bytes, or None when there is no such version."""
+
+        if not _VERSION_ID.fullmatch(version):
+            return None
+        try:
+            path = self._versions_dir(filename) / version
+            return path.stat().st_size if path.is_file() else None
+        except OSError:
+            return None
+
     def read_version(self, filename: str, version: str) -> bytes | None:
         """One earlier version's bytes, or None when there is no such version."""
 

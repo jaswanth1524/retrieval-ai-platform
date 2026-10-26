@@ -579,18 +579,18 @@
  ],
  "rows.csv": [
   {
-   "chunk_id": "2a0f91aeb6884341c2ee",
+   "chunk_id": "c5eb0f662d18054eb708",
    "page": 1,
    "section": "Rows 2-4",
-   "text_sha1": "c0e791cb00a10906"
+   "text_sha1": "94480ddfac157cff"
   }
  ],
  "rows_blank.csv": [
   {
-   "chunk_id": "7a93ca9713450d85cf02",
+   "chunk_id": "50b53d6c627d6c01843e",
    "page": 1,
    "section": "Rows 3-6",
-   "text_sha1": "1b46723d3a054707"
+   "text_sha1": "7c81cc799b3d8945"
   }
  ],
  "long_heading.md": [
@@ -673,10 +673,10 @@
  ],
  "budget.xlsx": [
   {
-   "chunk_id": "e18755dcae59f6c478f5",
+   "chunk_id": "fe80526b9219d1fa415e",
    "page": 1,
    "section": "Costs · Rows 2-4",
-   "text_sha1": "dc5bf0bc66afbe45"
+   "text_sha1": "7cb6806f7c8469bb"
   },
   {
    "chunk_id": "3461fdc6869bb049feb0",
@@ -703,6 +703,30 @@
    "page": 3,
    "section": "Slide 3",
    "text_sha1": "a50ce07cae3bdd41"
+  }
+ ],
+ "service.json": [
+  {
+   "chunk_id": "d86a710a975f046bcab6",
+   "page": 1,
+   "section": "service",
+   "text_sha1": "70a3ee6c372843de"
+  }
+ ],
+ "maths.py": [
+  {
+   "chunk_id": "44df1b850f6bb7e3d648",
+   "page": 1,
+   "section": "def add(a, b):",
+   "text_sha1": "849eb926a8c20464"
+  }
+ ],
+ "handbook.odt": [
+  {
+   "chunk_id": "7ad6de2bc476175a2763",
+   "page": 1,
+   "section": "Leave",
+   "text_sha1": "d48d35f851f1a49b"
   }
  ]
 }

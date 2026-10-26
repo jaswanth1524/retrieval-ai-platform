@@ -25,7 +25,7 @@ from api.chunking import HeuristicTokenCounter
 from api.documents import chunk_sections, parse_document_bytes
 from api.settings import AppSettings
 from tests.factories import make_test_settings
-from tests.samples import eml_bytes, epub_bytes, pdf_bytes, pptx_bytes, xlsx_bytes
+from tests.samples import eml_bytes, epub_bytes, odt_bytes, pdf_bytes, pptx_bytes, xlsx_bytes
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "chunks.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -101,6 +101,19 @@ def _documents() -> dict[str, bytes]:
             {"title": "Numbers", "table": [["Quarter", "Users"], ["Q1", "40"]]},
             {"body": ["A slide without a title."], "notes": "Say the date."},
         ]
+    )
+    documents["service.json"] = (
+        b'{"service": {"name": "billing", "owners": ["ada", "grace"]}, '
+        b'"contacts": [{"team": "search", "lead": "lin"}]}'
+    )
+    documents["maths.py"] = (
+        b"def add(a, b):\n    return a + b\n\n\ndef total(items):\n    return sum(items)\n"
+    )
+    documents["handbook.odt"] = odt_bytes(
+        '<text:h text:outline-level="1">Leave</text:h>'
+        "<text:p>Employees accrue twenty days of paid leave per year.</text:p>"
+        '<text:h text:outline-level="1">Travel</text:h>'
+        "<text:p>Book flights through the travel portal.</text:p>"
     )
     return documents
 

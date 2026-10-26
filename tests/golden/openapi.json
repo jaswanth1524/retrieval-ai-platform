@@ -40,6 +40,21 @@
       "contentMediaType": "application/octet-stream",
       "title": "File",
       "type": "string"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Tags to give the document (replacing any it has). Giving tags re-indexes the same bytes rather than leaving them as indexed.",
+      "title": "Tags"
      }
     },
     "required": [
@@ -73,6 +88,17 @@
        }
       ],
       "title": "Page End"
+     },
+     "rerank_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Score"
      },
      "section": {
       "title": "Section",
@@ -427,6 +453,14 @@
        "type": "string"
       },
       "title": "Filenames",
+      "type": "array"
+     },
+     "incomplete_filenames": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Incomplete Filenames",
       "type": "array"
      },
      "page_counts": {
@@ -1283,6 +1317,24 @@
       ],
       "title": "Chunk Ids"
      },
+     "exclude_chunk_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "maxItems": 100,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Exclude Chunk Ids"
+     },
      "exclude_filenames": {
       "anyOf": [
        {
@@ -1448,6 +1500,30 @@
       ],
       "title": "Tags"
      },
+     "uploaded_after": {
+      "anyOf": [
+       {
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Uploaded After"
+     },
+     "uploaded_before": {
+      "anyOf": [
+       {
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Uploaded Before"
+     },
      "use_cache": {
       "default": true,
       "title": "Use Cache",
@@ -1584,6 +1660,24 @@
       ],
       "title": "Chunk Ids"
      },
+     "exclude_chunk_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "maxItems": 100,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Exclude Chunk Ids"
+     },
      "exclude_filenames": {
       "anyOf": [
        {
@@ -1690,6 +1784,30 @@
        }
       ],
       "title": "Tags"
+     },
+     "uploaded_after": {
+      "anyOf": [
+       {
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Uploaded After"
+     },
+     "uploaded_before": {
+      "anyOf": [
+       {
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Uploaded Before"
      }
     },
     "required": [
@@ -1775,6 +1893,14 @@
      "section": {
       "title": "Section",
       "type": "string"
+     },
+     "spans": {
+      "default": [],
+      "items": {
+       "$ref": "#/components/schemas/CitationSpanResponse"
+      },
+      "title": "Spans",
+      "type": "array"
      },
      "text": {
       "title": "Text",
@@ -2285,6 +2411,17 @@
       ],
       "title": "Answer"
      },
+     "answer_status": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Status"
+     },
      "candidates": {
       "items": {
        "$ref": "#/components/schemas/TraceCandidateResponse"
@@ -2344,6 +2481,11 @@
      "created_at": {
       "title": "Created At",
       "type": "number"
+     },
+     "dropped_history_messages": {
+      "default": 0,
+      "title": "Dropped History Messages",
+      "type": "integer"
      },
      "error": {
       "anyOf": [
@@ -2427,6 +2569,11 @@
      "trace_id": {
       "title": "Trace Id",
       "type": "string"
+     },
+     "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
      },
      "usage": {
       "anyOf": [
@@ -2569,6 +2716,22 @@
        }
       ],
       "title": "Filename"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 128,
+         "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tags"
      },
      "url": {
       "maxLength": 2048,
@@ -3098,6 +3261,7 @@
   },
   "/documents/jobs": {
    "get": {
+    "description": "Queued and running jobs (``active``, oldest first), or finished ones still\nretained (``recent``, or only ``failed``, newest first) \u2014 a watcher's or an\nimport's failures, which no client polled.",
     "operationId": "list_document_jobs_documents_jobs_get",
     "parameters": [
      {
@@ -3105,10 +3269,26 @@
       "name": "state",
       "required": false,
       "schema": {
-       "const": "active",
        "default": "active",
+       "enum": [
+        "active",
+        "recent",
+        "failed"
+       ],
        "title": "State",
        "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 50,
+       "maximum": 500,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
       }
      },
      {
@@ -4033,6 +4213,9 @@
        }
       },
       "description": "Successful Response"
+     },
+     "409": {
+      "description": "The document is already being indexed, originals aren't kept (RAW_DOCUMENT_DIR), or the index was built for another embedding setup."
      },
      "422": {
       "content": {
