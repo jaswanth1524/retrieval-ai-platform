@@ -258,3 +258,25 @@ def test_a_report_is_one_escaped_page(tmp_path: Path) -> None:
     assert ragas_scores({"faithfulness": 0.9, "label": "x"}) == {"faithfulness": 0.9}
     with_base = render_report(load_run(run_path), title="T", base=load_run(run_path))
     assert "0 regressed" in with_base
+
+
+def test_latency_is_summarized_and_shown_but_never_judged(tmp_path: Path) -> None:
+    from eval.compare import render_report
+    from eval.harness import latency_summary
+
+    assert latency_summary([]) == {}
+    assert latency_summary([10.0, 30.0, 20.0, 400.0]) == {"p50": 20.0, "p95": 400.0, "mean": 115.0}
+
+    before = _retrieval(tmp_path / "a.json", {"q1": 1.0}, 1.0)
+    after = _retrieval(tmp_path / "b.json", {"q1": 1.0}, 1.0)
+    for path, p50 in ((before, 100.0), (after, 160.0)):
+        data = json.loads(path.read_text())
+        data["latency_ms"] = {"p50": p50, "p95": p50 * 2, "mean": p50}
+        data["per_question"][0]["latency_ms"] = {"total_ms": p50}
+        path.write_text(json.dumps(data))
+
+    diff = diff_runs(load_run(before), load_run(after))
+    assert not diff.regressed and not diff.improved
+    assert "  latency p50: 100 → 160 ms (+60)" in format_diff(diff)
+    page = render_report(load_run(after), title="t")
+    assert "<td>p50 (ms)</td><td>160</td>" in page
