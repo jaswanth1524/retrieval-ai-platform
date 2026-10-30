@@ -1018,6 +1018,14 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 13: LiteLLM 1.103.10 (at least 1.103, was 1.89.7), for GHSA-g5ff-637f-6q2m and
+  CVE-2026-114612. Both are in LiteLLM's proxy server, which DocRAG doesn't run (it calls
+  the SDK), but the audit gates on them. 1.103.10 is the newest release that still
+  accepts filelock 4: from 1.104 LiteLLM caps filelock<4, and filelock 3.x carries the
+  advisories fixed only in 4.2.1. It brings boto3/botocore in as required dependencies.
+  Checked live against Ollama: plain and streamed answers, finish reason, usage, the
+  unreachable-host message; and reasoning-model detection and prices from the bundled
+  table. **None.**
 - Pass 10: filelock 4.2.4 (was 3.29.4), for three advisories fixed in 4.2.1. It comes in
   through huggingface-hub (model downloads and the tokenizer) and datasets (the eval
   extra); nothing caps it, and DocRAG doesn't use it directly. Checked: a fresh model
