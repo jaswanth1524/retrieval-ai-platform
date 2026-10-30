@@ -820,6 +820,7 @@ def test_search_results_mark_the_sentences_matching_the_query(
 ) -> None:
     client = api_context.client
     doc = b"Intro\nThe office opens at nine. Parking passes are issued by reception."
+    doc += b" The floor plan and the office hours are posted."
     assert upload_and_wait(client, "office.txt", doc)["state"] == "done"
 
     results = client.post("/search", json={"query": "parking passes"}).json()["results"]
@@ -829,6 +830,54 @@ def test_search_results_mark_the_sentences_matching_the_query(
     for result in results:
         for span in result["spans"]:
             assert result["text"][span["start"] : span["end"]] == span["quote"]
+
+    # Searched as cleaned (ligatures in the query), so highlighted the same way.
+    ligature = client.post("/search", json={"query": "o\ufb03ce \ufb02oor hours"}).json()
+    marked = [s["quote"] for r in ligature["results"] for s in r["spans"]]
+    assert marked and all(quote.startswith("The floor plan and the office") for quote in marked)
+
+
+def test_a_search_from_a_passage_finds_others_and_leaves_it_out(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "a.txt", b"Intro\nalpha beta gamma")["state"] == "done"
+    assert upload_and_wait(client, "b.txt", b"Intro\nalpha delta")["state"] == "done"
+    seed = client.post("/search", json={"query": "alpha"}).json()["results"][0]
+
+    similar = client.post("/search", json={"like_chunk_id": seed["chunk_id"]})
+    assert similar.status_code == 200, similar.text
+    ids = [result["chunk_id"] for result in similar.json()["results"]]
+    assert ids and seed["chunk_id"] not in ids
+    # A passage search has no query words to mark.
+    assert all(result["spans"] == [] for result in similar.json()["results"])
+    # The request's narrowing still applies.
+    only = client.post(
+        "/search", json={"like_chunk_id": seed["chunk_id"], "filenames": [seed["filename"]]}
+    ).json()["results"]
+    assert all(result["filename"] == seed["filename"] for result in only)
+
+    missing = client.post("/search", json={"like_chunk_id": "nope"})
+    assert missing.status_code == 404
+    assert client.post("/search", json={}).status_code == 422
+    assert client.post("/search", json={"query": "   "}).status_code == 422
+
+
+def test_the_same_narrowing_in_another_order_is_the_same_cached_answer(
+    api_context: ApiTestContext,
+) -> None:
+    client = api_context.client
+    assert upload_and_wait(client, "a.txt", b"Intro\nalpha one")["state"] == "done"
+    assert upload_and_wait(client, "b.txt", b"Intro\nalpha two")["state"] == "done"
+    assert upload_and_wait(client, "c.txt", b"Intro\nalpha three")["state"] == "done"
+
+    first = client.post(
+        "/questions", json={"question": "alpha", "exclude_filenames": ["b.txt", "c.txt"]}
+    ).json()
+    again = client.post(
+        "/questions", json={"question": "alpha", "exclude_filenames": ["c.txt", "b.txt", "c.txt"]}
+    ).json()
+    assert first["cached"] is False and again["cached"] is True
 
 
 def test_upload_dates_narrow_questions_and_must_be_in_order(api_context: ApiTestContext) -> None:
@@ -854,3 +903,39 @@ def test_a_summary_cites_its_passages_without_a_rerank_score(api_context: ApiTes
     assert body["sources"] and all(source["rerank_score"] is None for source in body["sources"])
     answer = client.post("/questions", json={"question": "alpha"}).json()
     assert all(source["rerank_score"] is not None for source in answer["sources"])
+
+
+def test_a_preview_shows_how_a_file_would_be_indexed_without_indexing_it(
+    api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = api_context.client
+    markdown = b"# Leave\n\nAnnual leave is twenty days.\n\n# Travel\n\nBook ahead."
+
+    response = client.post("/documents/preview", files={"file": ("policy.md", markdown)})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["filename"] == "policy.md" and body["chunk_count"] >= 1
+    assert body["section_count"] >= 1 and body["page_count"] == 1
+    assert "Leave" in body["section_labels"]
+    assert any("twenty days" in chunk["text"] for chunk in body["first_chunks"])
+    # Nothing was indexed or queued.
+    assert client.get("/documents").json()["filenames"] == []
+
+    unsupported = client.post("/documents/preview", files={"file": ("tool.exe", b"MZ")})
+    assert unsupported.status_code == 400
+    empty = client.post("/documents/preview", files={"file": ("empty.txt", b"   ")})
+    assert empty.status_code == 400
+
+    import api.routes.documents as routes
+
+    taken = [
+        routes._preview_slots.acquire(blocking=False) for _ in range(routes.PREVIEW_MAX_CONCURRENT)
+    ]
+    try:
+        busy = client.post("/documents/preview", files={"file": ("policy.md", markdown)})
+        assert busy.status_code == 429 and busy.headers["Retry-After"] == "5"
+    finally:
+        for held in taken:
+            if held:
+                routes._preview_slots.release()

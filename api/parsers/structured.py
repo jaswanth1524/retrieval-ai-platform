@@ -56,6 +56,9 @@ def parse_json_document(filename: str, text: str) -> list[DocumentSection]:
         ) from exc
     except RecursionError as exc:
         raise DocumentParseError(f"'{filename}' is nested too deeply to read.") from exc
+    except ValueError as exc:
+        # Python's limit on integer digits (a number thousands of digits long).
+        raise DocumentParseError(f"'{filename}' holds a number too long to read.") from exc
 
     if isinstance(data, dict):
         items: list[tuple[str, Any]] = [(str(key), value) for key, value in data.items()]

@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
-from collections.abc import Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
-from api.repository import VectorRepository
+from api.repository import PassageFilter, VectorRepository
 from api.request_id import submit_in_context
 from api.reranking import RerankedChunk
 from api.settings import AppSettings
@@ -108,7 +107,7 @@ def expand_with_neighbors(
     repository: VectorRepository,
     settings: AppSettings,
     *,
-    excluded: AbstractSet[str] = frozenset(),
+    narrow: PassageFilter | None = None,
 ) -> list[RerankedChunk]:
     """Expand each reranked chunk's generation context with its immediate neighbors.
 
@@ -178,7 +177,9 @@ def expand_with_neighbors(
             payload = point.payload or {}
             ordinal = payload.get("chunk_ordinal")
             text = payload.get("text")
-            if payload.get("chunk_id") in excluded:
+            # Outside the question's narrowing (a page range, a section, a passage left
+            # out): not context for it, whoever's neighbour it is.
+            if narrow is not None and not narrow.admits_neighbour(payload):
                 continue
             if isinstance(ordinal, int) and not isinstance(ordinal, bool) and text:
                 neighbor_text[(filename, ordinal)] = str(text)

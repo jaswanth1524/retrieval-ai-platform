@@ -7,6 +7,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import StringConstraints
 
 from api.dependencies import (
     require_api_key,
@@ -84,12 +85,26 @@ def register(app: FastAPI) -> None:
         )
 
     @app.get("/traces", response_model=TraceListResponse, dependencies=[Depends(require_api_key)])
-    def list_traces(trace_store: TraceStoreDep, settings: SettingsDep) -> TraceListResponse:
+    def list_traces(
+        trace_store: TraceStoreDep,
+        settings: SettingsDep,
+        answer_status: Annotated[
+            list[Annotated[str, StringConstraints(max_length=40)]] | None,
+            Query(
+                max_length=10,
+                description="Only traces with one of these answer statuses (repeatable): "
+                "answered, uncited, insufficient_context, no_context.",
+            ),
+        ] = None,
+    ) -> TraceListResponse:
         # Only the request's workspace's (X-Workspace): a trace quotes its documents.
         return TraceListResponse(
             traces=[
-                trace_summary_response(trace)
-                for trace in trace_store.list_traces(workspace_of(settings))
+                trace_summary_response(summary)
+                for summary in trace_store.list_summaries(
+                    workspace_of(settings),
+                    frozenset(answer_status) if answer_status else None,
+                )
             ]
         )
 

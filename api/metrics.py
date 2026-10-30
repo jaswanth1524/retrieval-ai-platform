@@ -177,6 +177,15 @@ corpus_documents = Gauge(
 )
 
 
+def forget_workspace_metrics(workspace: str) -> None:
+    """Drop a deleted workspace's per-workspace series, or its last value stays exported."""
+
+    try:
+        corpus_documents.remove(workspace)
+    except KeyError:
+        pass  # never listed since the process started
+
+
 def observe_question_timings(timings: dict[str, float]) -> None:
     """Record one question's per-stage timings (input in milliseconds) as seconds."""
 

@@ -252,6 +252,49 @@ _STOPWORDS = frozenset(
     "their them then there these they this those to was we were what when where which "
     "who whom why will with would you your".split()
 )
+# The same for the other languages answers come in (es, de, fr, pt, it): their
+# articles, prepositions, conjunctions, pronouns and auxiliaries. Without them a
+# Spanish sentence and an unrelated source sentence shared "el", "de", "que" — enough
+# for a backfilled citation. Less the ones that are also everyday English words ("son",
+# "plus", "par", "no"…), so English answers match as before.
+_STOPWORDS_OTHER = frozenset(
+    word
+    for words in (
+        # Spanish
+        (
+            "el la los las un una unos unas lo le les de del al en con por para sin sobre "
+            "entre hasta desde y o u pero que qué como cómo es son está están ser fue ha "
+            "han hay se su sus este esta estos estas ese esa más muy también cuando donde "
+            "cada todo todos toda todas puede pueden debe"
+        ).split(),
+        # German
+        (
+            "der das den dem des ein eine einen einem einer eines und oder aber von zu zum "
+            "zur mit auf für im ins bei aus nach über unter ist sind war wird werden wurde "
+            "hat haben kann können muss müssen sie es er ihr ihre sich nicht kein keine "
+            "auch noch dass wenn wie jede jeder jedes alle"
+        ).split(),
+        # French
+        (
+            "le les une des du au aux et ou mais dans pour avec sans sur sous par entre est "
+            "sont été être avoir ont il elle ils elles se ce cette ces qui que dont ne pas "
+            "plus aussi chaque tout tous toute toutes peut doit leur leurs sa ses son"
+        ).split(),
+        # Portuguese
+        (
+            "o os um uma uns umas do da dos das no na nos nas ao aos em com por pela pelo "
+            "para sem sobre entre e ou mas que é são foi ser estar tem têm se seu sua seus "
+            "suas este esta esse essa mais muito também cada todo todos pode deve"
+        ).split(),
+        # Italian
+        (
+            "il lo gli i uno di da dei degli delle della dello nel nella nei sul sulla con "
+            "per tra fra ed ma che è sono essere ha hanno si suo sua suoi sue questo questa "
+            "quello quella più anche ogni tutto tutti può deve non"
+        ).split(),
+    )
+    for word in words
+) - {"son", "come", "also", "plus", "hay", "sin", "par", "todo", "war", "no", "on", "in"}
 # Answer sentences: after a sentence end, and at every line break (lists, headings).
 _ANSWER_SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+|\n+")
 _LEADING_MARKERS_RE = re.compile(r"(?:\s*" + _CITATION_RE.pattern + r")+")
@@ -321,7 +364,9 @@ def _content_words(text: str) -> set[str]:
     return {
         word
         for word in _words(text)
-        if word not in _STOPWORDS and (len(word) > 1 or word.isdigit())
+        if word not in _STOPWORDS
+        and word not in _STOPWORDS_OTHER
+        and (len(word) > 1 or word.isdigit())
     }
 
 
@@ -909,6 +954,11 @@ def _backfill(answer: str, texts: tuple[str, ...]) -> str | None:
                 coverage < BACKFILL_MIN_COVERAGE
                 or coverage * len(claim) < BACKFILL_MIN_SHARED_WORDS
             ):
+                continue
+            # At least one shared word that says something: a number or a word of four
+            # or more letters, not only short words a stopword list missed.
+            shared = claim & source_index.words(found[1], found[2])
+            if not any(word.isdigit() or len(word) >= 4 for word in shared):
                 continue
             if best is None or found[0][0] > best[0][0]:
                 best = (found[0], number)

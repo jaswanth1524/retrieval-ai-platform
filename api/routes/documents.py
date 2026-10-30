@@ -18,12 +18,14 @@ from fastapi.responses import FileResponse, Response
 from api.audit import audit
 from api.corpus import bump_corpus_generation
 from api.dependencies import (
+    get_url_refresh_state_store,
     require_api_key,
     require_full_key,
 )
 from api.documents import (
     DocumentNotFoundError,
     DocumentSource,
+    chunk_sections,
     normalize_tags,
     validate_upload_filename,
 )
@@ -42,13 +44,18 @@ from api.ingest_jobs import (
     refuse_near_duplicate_name,
     reindex_stale,
     require_raw_store,
+    retry_refusal,
     source_of,
     staleness,
     stored_filename,
+    unchanged_since_fetch,
 )
 from api.ingestion import filename_write_lock
 from api.jobs import IngestJob, JobNotFoundError, JobStore
 from api.metrics import corpus_documents
+from api.parse_isolation import parse_with_limit
+from api.raw_documents import RawDocumentStore
+from api.repository import DocumentMetadata, VectorRepository
 from api.restore import BackupImportError, restore_backup
 from api.routes.deps import (
     FeedbackStoreDep,
@@ -68,15 +75,21 @@ from api.schemas import (
     DocumentJobListResponse,
     DocumentJobStatusResponse,
     DocumentListResponse,
+    DocumentPreviewResponse,
     DocumentRefreshResponse,
+    DocumentRefreshSettingsRequest,
+    DocumentRefreshSettingsResponse,
     DocumentReindexAllResponse,
     DocumentTagsRequest,
     DocumentTagsResponse,
     DocumentVersionResponse,
     DocumentVersionsResponse,
     ImportResponse,
+    PreviewChunkResponse,
     UrlIngestRequest,
+    UrlRefreshStatusResponse,
 )
+from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
 from api.upload import read_upload_within_limit
 from api.url_fetch import (
@@ -86,6 +99,7 @@ from api.url_fetch import (
     fetch_slots,
     loggable_url,
 )
+from api.url_refresh import refresh_due
 from api.workspaces import document_key, workspace_of
 
 logger = logging.getLogger(__name__)
@@ -128,6 +142,8 @@ def _job_response(job: IngestJob) -> DocumentJobStatusResponse:
         cancelled=job.error == JOB_CANCELLED_ERROR,
         created_at=job.created_at_wall,
         unchanged=bool(result is not None and result.unchanged),
+        kind=job.kind,
+        retryable=job.state == "failed" and retry_refusal(job) is None,
     )
 
 
@@ -179,6 +195,7 @@ def list_documents(
     is_stale = staleness(settings, token_counter)
     stored_originals = raw_store.stored_names() if raw_store is not None else set()
     return DocumentListResponse(
+        url_refresh=_url_refresh_statuses(metadata, settings),
         filenames=sorted(metadata),
         chunk_counts={name: meta.chunk_count for name, meta in metadata.items()},
         page_counts={name: meta.page_count for name, meta in metadata.items()},
@@ -202,6 +219,31 @@ def list_documents(
             if meta.source_url
         },
     )
+
+
+def _url_refresh_statuses(
+    metadata: dict[str, DocumentMetadata], settings: AppSettings
+) -> dict[str, UrlRefreshStatusResponse]:
+    """Each fetched document's scheduled refresh: its interval, last check and when
+    it is next due (never, with the refresh off)."""
+
+    fetched = {name: meta for name, meta in metadata.items() if meta.source_url}
+    if not fetched:
+        return {}
+    running = bool(settings.url_refresh_interval_minutes and settings.url_ingest_enabled)
+    default_seconds = float(settings.url_refresh_interval_minutes) * 60.0
+    states = get_url_refresh_state_store().get_all(settings.qdrant_collection)
+    statuses = {}
+    for name, meta in fetched.items():
+        state = states.get(name)
+        statuses[name] = UrlRefreshStatusResponse(
+            refresh_minutes=meta.source_refresh_minutes,
+            last_checked=state.last_checked if state is not None else None,
+            last_outcome=state.last_outcome if state is not None else None,
+            failures=state.failures if state is not None else 0,
+            next_due=refresh_due(meta, state, default_seconds) if running else None,
+        )
+    return statuses
 
 
 @router.post(
@@ -273,6 +315,64 @@ async def upload_document(
     return accepted
 
 
+# At most this many previews parse at once (each holds a parse process and the file).
+PREVIEW_MAX_CONCURRENT = 2
+PREVIEW_FIRST_CHUNKS = 20
+PREVIEW_SECTION_LABELS = 100
+_preview_slots = threading.BoundedSemaphore(PREVIEW_MAX_CONCURRENT)
+
+
+# How a file would be indexed — its sections, passages and the first of them — without
+# indexing anything: to check a parser's take on a scanned PDF or a spreadsheet before
+# uploading. The parse runs as an upload's does (in a child process, PARSE_TIMEOUT_
+# SECONDS); nothing is embedded, stored or queued.
+@router.post(
+    "/documents/preview",
+    response_model=DocumentPreviewResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={
+        400: {"description": "An unsupported, unreadable or empty file."},
+        429: {"description": "Too many previews are running; try again in a moment."},
+    },
+)
+async def preview_document(
+    settings: SettingsDep,
+    token_counter: TokenCounterDep,
+    file: Annotated[UploadFile, File()],
+) -> DocumentPreviewResponse:
+    filename = validate_upload_filename(file.filename or "")
+    if not _preview_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many previews are running. Try again in a moment.",
+            headers={"Retry-After": "5"},
+        )
+    try:
+        content = await read_upload_within_limit(file, int(settings.max_upload_bytes))
+        sections = await run_in_threadpool(parse_with_limit, filename, content, settings)
+        chunks = await run_in_threadpool(chunk_sections, sections, settings, token_counter)
+    finally:
+        _preview_slots.release()
+    labels = list(dict.fromkeys(section.section for section in sections))
+    return DocumentPreviewResponse(
+        filename=filename,
+        section_count=len(sections),
+        chunk_count=len(chunks),
+        page_count=max((chunk.page_end or chunk.page for chunk in chunks), default=1),
+        section_labels=labels[:PREVIEW_SECTION_LABELS],
+        first_chunks=[
+            PreviewChunkResponse(
+                ordinal=chunk.ordinal,
+                page=chunk.page,
+                page_end=chunk.page_end,
+                section=chunk.section,
+                text=chunk.text,
+            )
+            for chunk in chunks[:PREVIEW_FIRST_CHUNKS]
+        ],
+    )
+
+
 # The server downloads the document (URL_INGEST_ENABLED, off by default) and it
 # takes the upload's path from there: same name checks, backlog, job and polling.
 # api/url_fetch.py guards against fetching private addresses (SSRF).
@@ -341,9 +441,12 @@ async def upload_document_from_url(
         content=fetched.content,
         raw_store=raw_store,
         # The URL asked for (not where a redirect went): what a refresh fetches again.
-        source=DocumentSource(request.url.strip(), fetched.etag, fetched.last_modified),
+        source=DocumentSource(
+            request.url.strip(), fetched.etag, fetched.last_modified, request.refresh_minutes
+        ),
         tags=given_tags,
         dedupe=True,
+        kind="url",
     )
     audit(
         "document.upload_from_url",
@@ -352,6 +455,7 @@ async def upload_document_from_url(
         url=loggable_url(request.url.strip()),
         size=len(fetched.content),
         job_id=accepted.job_id,
+        **({"tags": list(given_tags)} if given_tags else {}),
     )
     return accepted
 
@@ -423,8 +527,10 @@ def restore_document_version(
         content=content,
         raw_store=store,
         # An earlier version of a fetched document still came from that URL; a refresh
-        # brings the current one back.
-        source=source_of(meta) if meta is not None else None,
+        # brings the current one back — a full fetch, since the stored validators
+        # describe the version being replaced.
+        source=source_of(meta, validators=False) if meta is not None else None,
+        kind="restore",
     )
     audit(
         "document.version_restore",
@@ -489,7 +595,16 @@ async def refresh_document_from_url(
             media_type="application/json",
         )
     accepted = await run_in_threadpool(
-        enqueue_refreshed, name, meta.source_url, fetched, queue, raw_store
+        functools.partial(
+            enqueue_refreshed,
+            name,
+            meta.source_url,
+            fetched,
+            queue,
+            raw_store,
+            expected=meta,
+            repository=repository,
+        )
     )
     audit(
         "document.refresh", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
@@ -579,6 +694,7 @@ def reindex_document(
         precondition=original_still_stored(store, name),
         # A re-index is the same document: where it came from carries over.
         source=source_of(meta) if meta is not None else None,
+        kind="reindex",
     )
     audit(
         "document.reindex", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
@@ -645,6 +761,49 @@ def set_document_tags(
     return DocumentTagsResponse(filename=filename, tags=list(tags))
 
 
+# A fetched document's own refresh interval; payload-only, like tags.
+@router.patch(
+    "/documents/{filename}/refresh-settings",
+    response_model=DocumentRefreshSettingsResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No such document, or it wasn't fetched from a URL."}},
+)
+def set_document_refresh_settings(
+    filename: str,
+    request: DocumentRefreshSettingsRequest,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+) -> DocumentRefreshSettingsResponse:
+    filename = stored_filename(filename)
+    # Under the filename lock: a refresh or re-upload in flight writes the setting it
+    # read under the same lock, so it can't put back the one from before this.
+    with filename_write_lock(document_key(settings, filename)):
+        meta = repository.document_metadata(settings, filename)
+        if meta is None:
+            raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+        if not meta.source_url:
+            raise HTTPException(
+                status_code=404, detail=f"'{filename}' was uploaded, not fetched from a URL."
+            )
+        repository.set_source_details(
+            settings,
+            filename,
+            meta.source_etag,
+            meta.source_last_modified,
+            request.refresh_minutes,
+        )
+    bump_corpus_generation([filename], collection=settings.qdrant_collection)
+    audit(
+        "document.refresh_settings",
+        workspace=workspace_of(settings),
+        filename=filename,
+        refresh_minutes=request.refresh_minutes,
+    )
+    return DocumentRefreshSettingsResponse(
+        filename=filename, refresh_minutes=request.refresh_minutes
+    )
+
+
 # Guarded like its sibling document routes: the response carries the filename (and
 # on failure the error text), and the frontend polls this URL once a second during
 # every upload, so the job id lands in browser history and any intermediate proxy
@@ -681,6 +840,108 @@ def get_document_job(
     job_id: str, job_store: IngestJobStoreDep, settings: SettingsDep
 ) -> DocumentJobStatusResponse:
     return _job_status(job_store, job_id, workspace_of(settings))
+
+
+# Runs a failed job again as it was asked for: a URL fetched again, a re-index run
+# again from the stored original. A failed upload's bytes were never kept (an
+# original is stored only once indexing succeeds), so it needs the file sent again.
+@router.post(
+    "/documents/jobs/{job_id}/retry",
+    response_model=DocumentJobAcceptedResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={
+        404: {"description": "No such job (or another workspace's)."},
+        409: {
+            "description": "The job hasn't failed, can't be retried by the server (an "
+            "upload: send the file again), or its document is being indexed."
+        },
+    },
+)
+async def retry_document_job(
+    job_id: str,
+    job_store: IngestJobStoreDep,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    queue: IngestQueueDep,
+    raw_store: RawDocumentStoreDep,
+) -> DocumentJobAcceptedResponse:
+    workspace = workspace_of(settings)
+    job = job_store.get(job_id)
+    if job is None or job.workspace != workspace:
+        raise JobNotFoundError(f"No ingestion job found with id '{job_id}'.")
+    refusal = retry_refusal(job)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+    if job.filename in await run_in_threadpool(indexing_now, settings):
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{job.filename}' is being indexed; wait for that job to finish.",
+        )
+    if job.kind == "reindex":
+        accepted = await run_in_threadpool(
+            reindex_document, job.filename, repository, settings, queue, raw_store
+        )
+    else:
+        accepted = await _fetch_again(job, repository, settings, queue, raw_store)
+    audit(
+        "job.retry",
+        workspace=workspace,
+        job_id=job_id,
+        filename=job.filename,
+        new_job_id=accepted.job_id,
+    )
+    return accepted
+
+
+async def _fetch_again(
+    job: IngestJob,
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+) -> DocumentJobAcceptedResponse:
+    """A failed URL job's fetch, run again under the name it was stored under: the
+    whole document (no validators — the failure may have been after a 200)."""
+
+    if not settings.url_ingest_enabled:
+        raise HTTPException(status_code=409, detail="URL ingest is not enabled.")
+    assert job.source_url is not None
+    await run_in_threadpool(repository.ensure_writable, settings)
+    meta = await run_in_threadpool(repository.document_metadata, settings, job.filename)
+    fetched = await _fetch_for_ingest(
+        queue,
+        functools.partial(
+            fetch_document,
+            job.source_url,
+            settings,
+            filename=job.filename,
+            has_room=queue.backlog.has_room,
+        ),
+    )
+    return await run_in_threadpool(
+        functools.partial(
+            queue.enqueue,
+            filename=job.filename,
+            content=fetched.content,
+            raw_store=raw_store,
+            source=DocumentSource(
+                job.source_url,
+                fetched.etag,
+                fetched.last_modified,
+                meta.source_refresh_minutes if meta is not None else None,
+            ),
+            tags=job.tags,
+            dedupe=True,
+            kind="url",
+            # Changed or deleted meanwhile (as for a refresh): not replaced.
+            precondition=(
+                unchanged_since_fetch(repository, settings, job.filename, meta)
+                if meta is not None
+                else None
+            ),
+        )
+    )
 
 
 # Stops a queued job outright, or a running one at its next checkpoint — but only
@@ -922,6 +1183,7 @@ def import_backup(
             uploaded_at=uploaded_at,
             tags=tags,
             source=source,
+            kind="import",
         )
 
     # The last step of recovering from an embedding change (export, delete all,

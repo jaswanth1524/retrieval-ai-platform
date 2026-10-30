@@ -36,10 +36,12 @@ from api.schemas import (
     FEEDBACK_CITED_FILENAMES_MAX,
     FEEDBACK_EXCERPT_MAX_CHARS,
     MAX_QUESTION_CHARS,
+    MAX_REFRESH_MINUTES,
     REQUEST_FILENAME_MAX_CHARS,
     REQUEST_TRACE_ID_MAX_CHARS,
     DocumentJobAcceptedResponse,
 )
+from api.url_fetch import usable_validator
 from api.workspaces import WorkspaceClosingError
 
 logger = logging.getLogger(__name__)
@@ -259,7 +261,8 @@ def _restore_document(
 
 def _source(document: dict[str, Any]) -> DocumentSource | None:
     """Where a URL-ingested document came from, when the manifest says so plausibly:
-    an http(s) URL and string validators. Anything else restores it as an upload."""
+    an http(s) URL, with the validators only when they could be sent back (see
+    ``url_fetch.usable_validator``). Anything else restores it as an upload."""
 
     def text(key: str) -> str | None:
         value = document.get(key)
@@ -270,7 +273,17 @@ def _source(document: dict[str, Any]) -> DocumentSource | None:
     url = text("source_url")
     if url is None or not url.lower().startswith(("http://", "https://")):
         return None
-    return DocumentSource(url, text("source_etag"), text("source_last_modified"))
+    minutes = document.get("source_refresh_minutes")
+    return DocumentSource(
+        url,
+        usable_validator(document.get("source_etag")),
+        usable_validator(document.get("source_last_modified")),
+        minutes
+        if isinstance(minutes, int)
+        and not isinstance(minutes, bool)
+        and 0 <= minutes <= MAX_REFRESH_MINUTES
+        else None,
+    )
 
 
 def _uploaded_at(value: object) -> float | None:

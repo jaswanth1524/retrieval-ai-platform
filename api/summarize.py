@@ -479,6 +479,7 @@ class DocumentSummarizer:
         settings: AppSettings,
         should_stop: Callable[[], bool] | None,
         steps: int,
+        waits: list[float],
     ) -> Generator[StreamEvent, None, list[str]]:
         """Each part's notes, in part order, yielding a ``summarizing`` stage frame as
         each starts (one at a time) or finishes (several at once).
@@ -510,7 +511,7 @@ class DocumentSummarizer:
                 # One part at a time at a local model, each waiting its turn (and the
                 # place given back between parts, so a question isn't held up behind
                 # a whole long summary).
-                slot = yield from wait_for_model(settings, should_stop)
+                slot = yield from _timed_wait(settings, should_stop, waits)
                 try:
                     yield {"type": "stage", "stage": "summarizing", "step": step, "steps": steps}
                     texts.append(note(job))
@@ -770,6 +771,9 @@ class DocumentSummarizer:
                 return
 
             generate_start = time.monotonic()
+            # Time spent waiting for the local model (another request had it), left out
+            # of generate_ms as a question's is: queueing isn't generating.
+            waits: list[float] = []
             # Every call from here on (notes, the answer, a citation retry) is counted.
             begin_usage()
             part_total = sum(len(doc_parts) for _, doc_parts in numbered)
@@ -791,7 +795,11 @@ class DocumentSummarizer:
                 notes: list[tuple[str, int, int, str]] = []
                 for (filename, index, count, _), text in zip(
                     jobs,
-                    (yield from self._part_notes(task, jobs, settings, should_stop, part_total)),
+                    (
+                        yield from self._part_notes(
+                            task, jobs, settings, should_stop, part_total, waits
+                        )
+                    ),
                     strict=True,
                 ):
                     # Only a reply that is the marker: notes that merely mention it
@@ -811,7 +819,7 @@ class DocumentSummarizer:
                 update={"llm_max_tokens": int(settings.summary_max_tokens)}
             )
             # Held through the final call and its citation retry, like an answer's.
-            slot = yield from wait_for_model(final_settings, should_stop)
+            slot = yield from _timed_wait(final_settings, should_stop, waits)
             yield {
                 "type": "sources",
                 "sources": [asdict(source) for source in all_sources],
@@ -828,7 +836,7 @@ class DocumentSummarizer:
                 answer = "".join(parts_text).strip()
             else:
                 answer = self._generator.complete(final_messages, final_settings).strip()
-            generate_ms = (time.monotonic() - generate_start) * 1000
+            generate_ms = (time.monotonic() - generate_start - sum(waits)) * 1000
             if not answer:
                 raise GenerationError("Generation provider returned an empty answer.")
 
@@ -898,6 +906,18 @@ class DocumentSummarizer:
                     answer="".join(parts_text).strip() or None,
                     error="Stream closed before completion.",
                 )
+
+
+def _timed_wait(
+    settings: AppSettings, should_stop: Callable[[], bool] | None, waits: list[float]
+) -> Generator[StreamEvent, None, GenerationSlot]:
+    """``wait_for_model``, adding the seconds it took to ``waits``."""
+
+    start = time.monotonic()
+    try:
+        return (yield from wait_for_model(settings, should_stop))
+    finally:
+        waits.append(time.monotonic() - start)
 
 
 def _elapsed_timings(

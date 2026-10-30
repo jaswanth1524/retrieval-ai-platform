@@ -20,6 +20,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from api.audit import audit
 from api.ingest_jobs import IngestQueue, reindex_stale
 from api.jobs import JobStore
 from api.metrics import stale_documents
@@ -136,6 +137,14 @@ class StaleReindexer:
             )
             self._jobs.update(job.job_id for job in outcome.jobs)
             queued += len(outcome.jobs)
+            for job in outcome.jobs:
+                audit(
+                    "document.reindex",
+                    workspace=workspace_of(target.settings),
+                    filename=job.filename,
+                    job_id=job.job_id,
+                    scheduled=True,
+                )
             if outcome.jobs:
                 logger.info(
                     "Re-indexing %d stale document(s) in workspace %r (%d waiting).",

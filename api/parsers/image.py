@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import warnings
 from io import BytesIO
 
 from api.parsers.common import (
@@ -21,9 +22,11 @@ logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff"})
 
-# An image declaring more pixels than this is refused before it is decoded: a small
-# file can declare a huge canvas (a decompression bomb).
-MAX_IMAGE_PIXELS = 200_000_000
+# An image (or a TIFF frame) declaring more pixels than this is refused before it is
+# decoded: a small file can declare a huge canvas (a decompression bomb). Below
+# Pillow's own threshold (about 89M pixels warns, 179M refuses at open), so this
+# check, with its message, is the one that decides.
+MAX_IMAGE_PIXELS = 80_000_000
 
 
 def ocr_available() -> bool:
@@ -53,12 +56,21 @@ def parse_image_document(
 
     limits = settings if settings is not None else AppSettings.model_construct()
     max_pages = int(limits.max_ocr_pages)
+    too_big = DocumentParseError(
+        f"Image '{filename}' is over the {MAX_IMAGE_PIXELS // 1_000_000} megapixel limit."
+    )
     try:
-        image = Image.open(BytesIO(content))
+        with warnings.catch_warnings():
+            # Pillow's own bomb warning: the size check below says it better.
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            image = Image.open(BytesIO(content))
         width, height = image.size
+    except Image.DecompressionBombError as exc:
+        raise too_big from exc
     except Exception as exc:  # UnidentifiedImageError, a truncated header, ...
         raise DocumentParseError(f"Could not read image '{filename}'.") from exc
     if width * height > MAX_IMAGE_PIXELS:
+        image.close()
         raise DocumentParseError(
             f"Image '{filename}' is {width} x {height} pixels, over the "
             f"{MAX_IMAGE_PIXELS // 1_000_000} megapixel limit."
@@ -75,6 +87,18 @@ def parse_image_document(
                     max_pages,
                 )
                 break
+            # Each frame of a TIFF declares its own size; only the first was checked.
+            if frame.width * frame.height > MAX_IMAGE_PIXELS:
+                logger.warning(
+                    "Image %s: page %d is %d x %d pixels, over the %d megapixel limit; "
+                    "skipping it.",
+                    filename,
+                    number,
+                    frame.width,
+                    frame.height,
+                    MAX_IMAGE_PIXELS // 1_000_000,
+                )
+                continue
             try:
                 page = frame.convert("RGB")
                 pixels = page.width * page.height

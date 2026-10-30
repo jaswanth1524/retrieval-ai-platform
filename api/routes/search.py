@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 
 from api.citations import query_spans
 from api.dependencies import require_api_key
+from api.parsers.common import clean_text
 from api.pipeline import AnswerOverrides
 from api.routes.deps import QuestionSlotsDep, RagPipelineDep
 from api.routes.questions import passage_narrowing, question_slot
@@ -25,22 +26,46 @@ def register(app: FastAPI) -> None:
     # (RagPipeline.retrieve, which the eval harness also scores), so "find in my
     # documents" works even when the LLM is down. Read key allowed, like asking. It
     # takes a question slot: the rerank is the stage that bounds memory.
-    @app.post("/search", response_model=SearchResponse, dependencies=[Depends(require_api_key)])
+    @app.post(
+        "/search",
+        response_model=SearchResponse,
+        dependencies=[Depends(require_api_key)],
+        responses={404: {"description": "No passage has the like_chunk_id given."}},
+    )
     def search(
         request: SearchRequest, pipeline: RagPipelineDep, slots: QuestionSlotsDep
     ) -> SearchResponse:
         release = question_slot(slots, count_metric=False)
         try:
-            phase = pipeline.retrieve(
-                request.query,
-                AnswerOverrides(rerank_top_k=request.rerank_top_k),
-                filenames=request.filenames,
-                tags=request.tags,
-                for_generation=False,
-                narrow=passage_narrowing(request),
-            )
+            overrides = AnswerOverrides(rerank_top_k=request.rerank_top_k)
+            if request.like_chunk_id is not None:
+                similar = pipeline.retrieve_similar(
+                    request.like_chunk_id,
+                    overrides,
+                    filenames=request.filenames,
+                    tags=request.tags,
+                    narrow=passage_narrowing(request),
+                )
+                if similar is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"No passage with id '{request.like_chunk_id}'."
+                    )
+                phase = similar
+            else:
+                phase = pipeline.retrieve(
+                    request.query,
+                    overrides,
+                    filenames=request.filenames,
+                    tags=request.tags,
+                    for_generation=False,
+                    narrow=passage_narrowing(request),
+                )
         finally:
             release()
+        # Highlighted as it was searched: retrieval cleans the query first (ligatures,
+        # soft hyphens), so the raw one found the passage but marked nothing in it. A
+        # passage search has no query words to mark.
+        query_text = clean_text(request.query) if request.like_chunk_id is None else ""
         return SearchResponse(
             results=[
                 SearchResultResponse(
@@ -56,7 +81,7 @@ def register(app: FastAPI) -> None:
                     page_end=chunk.page_end,
                     spans=[
                         CitationSpanResponse(start=span.start, end=span.end, quote=span.quote)
-                        for span in query_spans(request.query, chunk.text, chunk.section)
+                        for span in query_spans(query_text, chunk.text, chunk.section)
                     ],
                 )
                 for rank, chunk in enumerate(phase.context_chunks, start=1)

@@ -20,6 +20,7 @@ from api.dependencies import (
     require_full_key,
 )
 from api.ingestion import ingest_sequencer
+from api.metrics import forget_workspace_metrics
 from api.qdrant_schema import forget_collection
 from api.raw_documents import VERSIONS_DIR, is_temp_file_name
 from api.repository import forget_metadata
@@ -46,9 +47,9 @@ def _require_enabled(settings: AppSettings) -> None:
         raise HTTPException(status_code=404, detail="Workspaces are not enabled on this server.")
 
 
-def _name(raw: str) -> str:
+def _name(raw: str, *, new: bool = False) -> str:
     try:
-        return validate_name(raw)
+        return validate_name(raw, new=new)
     except WorkspaceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -128,7 +129,7 @@ def register(app: FastAPI) -> None:
         repository: VectorRepositoryDep,
     ) -> WorkspaceResponse:
         _require_enabled(settings)
-        name = _name(request.name)
+        name = _name(request.name, new=True)
         existing = await run_in_threadpool(list_workspaces, client, settings.qdrant_collection)
         if name in existing:
             raise HTTPException(status_code=409, detail=f"Workspace '{name}' already exists.")
@@ -185,5 +186,6 @@ def register(app: FastAPI) -> None:
             _delete_if_empty(client, target, name)
         finally:
             ingest_sequencer.reopen(group)
+        forget_workspace_metrics(name)
         audit("workspace.delete", workspace=name)
         return WorkspaceResponse(name=name)

@@ -102,6 +102,46 @@ def test_an_odt_reads_headings_paragraphs_lists_and_tables_in_order() -> None:
     assert "Type: Annual; Days: 20" in sections[2].text
 
 
+def test_malformed_odt_counts_and_deep_nesting_are_read_safely() -> None:
+    spaces = '<text:p>a<text:s text:c="x"/>b<text:s text:c="2000000000"/>c</text:p>'
+    table = (
+        "<table:table><table:table-row>"
+        '<table:table-cell table:number-columns-repeated="many"><text:p>Only</text:p>'
+        "</table:table-cell></table:table-row></table:table>"
+    )
+    deep_inline = "<text:p>" + "<text:span>" * 2000 + "deep inline" + "</text:span>" * 2000
+    deep_inline += "</text:p>"
+    deep_blocks = "<text:section>" * 2000 + "<text:p>deep block</text:p>"
+    deep_blocks += "</text:section>" * 2000
+    sections = parse_document_bytes(
+        "crafted.odt", odt_bytes(spaces + table + deep_inline + deep_blocks)
+    )
+    text = " ".join(section.text for section in sections)
+    # A bad count is one space; a two-billion one is capped, not gigabytes of spaces.
+    assert "a b" in text and len(text) < 500
+    assert "Only" in text and "deep inline" in text and "deep block" in text
+
+
+def test_a_library_error_on_a_malformed_file_is_a_document_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api import documents
+
+    def broken(filename: str, content: bytes, settings: object = None) -> Any:
+        raise ValueError("invalid literal for int() with base 10: 'x'")
+
+    monkeypatch.setitem(documents.PARSERS, ".txt", broken)
+    # A DocumentError, so the job's error_type is "document" and the folder watcher
+    # stops retrying the file instead of retrying it forever.
+    with pytest.raises(DocumentParseError, match="Could not parse 'odd.txt'"):
+        parse_document_bytes("odd.txt", b"x")
+
+
+def test_a_json_number_too_long_to_read_is_named() -> None:
+    with pytest.raises(DocumentParseError, match="number too long"):
+        parse_document_bytes("big.json", b'{"n": 1' + b"1" * 5000 + b"}")
+
+
 def test_an_odt_declaring_a_dtd_is_refused() -> None:
     sneaky = odt_bytes("<text:p>x</text:p>", extra_members={"styles.xml": b"<!DOCTYPE x []><x/>"})
     with pytest.raises(DocumentParseError, match="DTD"):
@@ -165,9 +205,46 @@ def test_a_huge_image_is_scaled_down_and_a_bad_one_refused(
 
     with pytest.raises(DocumentParseError, match="Could not read image"):
         image_parser.parse_image_document("bad.png", b"not an image")
-    monkeypatch.setattr(image_parser, "MAX_IMAGE_PIXELS", 10)
-    with pytest.raises(DocumentParseError, match="megapixel"):
-        image_parser.parse_image_document("bomb.png", _image((40, 30)))
+
+
+def _png_header(width: int, height: int) -> bytes:
+    """A PNG that only declares its size: no pixel data, a few bytes on disk."""
+
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+
+
+def test_a_declared_huge_canvas_is_refused_with_its_size(fake_ocr: list[tuple[int, int]]) -> None:
+    # Over this app's limit but under Pillow's refusal: the app's check names the size.
+    with pytest.raises(DocumentParseError, match="10000 x 10000 pixels"):
+        image_parser.parse_image_document("bomb.png", _png_header(10_000, 10_000))
+    # Past Pillow's own refusal at open: still the limit, not "could not read".
+    with pytest.raises(DocumentParseError, match="megapixel limit"):
+        image_parser.parse_image_document("bomb.png", _png_header(20_000, 20_000))
+    assert fake_ocr == []
+
+
+def test_a_tiff_frame_over_the_limit_is_skipped_not_decoded(
+    fake_ocr: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    small, large = Image.new("RGB", (40, 30), "white"), Image.new("RGB", (100, 100), "white")
+    small.save(buffer, format="TIFF", save_all=True, append_images=[large, small])
+    monkeypatch.setattr(image_parser, "MAX_IMAGE_PIXELS", 5000)
+
+    sections = image_parser.parse_image_document("fax.tiff", buffer.getvalue())
+    assert [section.page for section in sections] == [1, 3]
+    assert fake_ocr == [(40, 30), (40, 30)]
 
 
 def test_without_the_ocr_extra_an_image_says_how_to_get_it(monkeypatch: pytest.MonkeyPatch) -> None:

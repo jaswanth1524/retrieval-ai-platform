@@ -698,8 +698,9 @@ def test_stored_tags_use_a_warm_listing_without_calling_qdrant(
 
 
 def test_search_hits_carry_only_the_fields_a_candidate_is_built_from() -> None:
-    """Search reads six payload fields; tags, sizes, stamps and fingerprints stay on
-    the server. Every field the candidate needs must still be there."""
+    """Search reads the fields a candidate is built from (and the upload time, for
+    RECENCY_BOOST_WEIGHT); tags, sizes and fingerprints stay on the server. Every field
+    the candidate needs must still be there."""
 
     from api.embeddings import EmbeddedText
     from api.retrieval import points_to_chunks
@@ -725,8 +726,10 @@ def test_search_hits_carry_only_the_fields_a_candidate_is_built_from() -> None:
             "chunk_id",
             "text",
             "chunk_ordinal",
+            "uploaded_at",
         }
         chunk = points_to_chunks(points)[0]
+        assert chunk.uploaded_at == 1.0
         assert (chunk.filename, chunk.page, chunk.section, chunk.chunk_id) == (
             "a.md",
             1,
@@ -807,3 +810,20 @@ def test_upload_dates_and_left_out_passages_narrow_the_search() -> None:
     assert _narrowed_ids(PassageFilter(uploaded_after=150.0)) == {1, 2}
     assert _narrowed_ids(PassageFilter(uploaded_before=250.0)) == {0, 1}
     assert _narrowed_ids(PassageFilter(exclude_chunk_ids=("b", "c"))) == {0, 3}
+
+
+def test_a_neighbour_is_admitted_only_inside_the_narrowing() -> None:
+    from api.repository import PassageFilter
+
+    pages = PassageFilter(page_min=5, page_max=5)
+    assert pages.admits_neighbour({"page": 5})
+    assert not pages.admits_neighbour({"page": 6})
+    assert not pages.admits_neighbour({"page": 4})
+    # A passage running from page 4 onto page 5 overlaps the range, as in the search.
+    assert pages.admits_neighbour({"page": 4, "page_end": 5})
+    # Nothing to judge it by (a neighbour is from the kept passage's own document, whose
+    # passages all carry a page if any do): admitted.
+    assert pages.admits_neighbour({"text": "no page"})
+    assert not PassageFilter(exclude_chunk_ids=("c1",)).admits_neighbour({"chunk_id": "c1"})
+    assert not PassageFilter(section="Leave").admits_neighbour({"section": "Travel"})
+    assert PassageFilter(section="Leave").admits_neighbour({"section": "Leave"})

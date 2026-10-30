@@ -233,3 +233,20 @@ def test_a_bulleted_answer_is_backfilled_one_bullet_at_a_time() -> None:
         "- Flights are booked at least fourteen days ahead [1]\n"
         "- The daily meal allowance abroad is sixty euros [2]"
     )
+
+
+def test_shared_function_words_in_other_languages_never_cite_a_source() -> None:
+    unrelated = chunk(1, "El edificio de la sede es que el horario de la oficina cambia.")
+    # Shares "el", "de", "la", "es", "que" with the source and nothing else.
+    answer = "El permiso de la madre es que el trabajo de la casa pesa."
+    assert backfill_citations(answer, [unrelated]) is None
+
+    vacation = chunk(1, "Los empleados tienen veinte días de vacaciones pagadas al año.")
+    answered = "Los empleados tienen veinte días de vacaciones pagadas."
+    assert backfill_citations(answered, [vacation]) == f"{answered[:-1]} [1]."
+
+
+def test_backfill_needs_a_shared_word_that_says_something() -> None:
+    # Three shared content words, none a number or longer than three letters.
+    source = chunk(1, "Ask HR via the web app or fax.")
+    assert backfill_citations("You ask HR via fax or web app.", [source]) is None

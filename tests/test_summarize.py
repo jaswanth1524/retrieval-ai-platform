@@ -643,9 +643,14 @@ def test_a_summary_waits_for_the_local_model_between_parts_and_says_so() -> None
     thread.start()
     assert waiting.wait(10)
     assert generator.calls == []
+    time.sleep(0.3)  # another request keeps the model a while
     holder.release()
     thread.join(10)
     assert events[-1]["type"] == "done"
+    timings = events[-1]["timings"]
+    # The wait is in the total, not in generate_ms: queueing isn't generating.
+    assert timings["total_ms"] >= 300
+    assert timings["generate_ms"] < timings["total_ms"] - 250
     after = GenerationSlot(settings)
     assert after.try_acquire()
     after.release()

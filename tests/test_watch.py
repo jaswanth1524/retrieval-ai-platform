@@ -592,3 +592,34 @@ def test_a_delete_that_fails_is_retried_and_the_others_still_happen(tmp_path: Pa
     assert folder.scan_once()["deleted"] == ["b.txt"]
     down.clear()
     assert folder.scan_once()["deleted"] == ["a.txt"]
+
+
+def test_include_and_exclude_patterns_pick_the_watched_files(tmp_path: Path) -> None:
+    from api.watch import PathFilter, glob_patterns
+
+    write(tmp_path / "policy.md", "# Policy")
+    write(tmp_path / "tool.py", "print(1)")
+    write(tmp_path / "config.yaml", "a: 1")
+    write(tmp_path / "drafts" / "next.md", "# Draft")
+    write(tmp_path / "node_modules" / "pkg" / "readme.md", "# Vendored")
+
+    excluded = PathFilter(exclude=glob_patterns("*.py, *.yaml ,drafts/*,node_modules"))
+    files, _, _ = scan_folder(tmp_path, max_bytes=1000, path_filter=excluded)
+    assert sorted(files) == ["policy.md"]
+    only_drafts = PathFilter(include=glob_patterns("drafts/*.md"))
+    files, _, _ = scan_folder(tmp_path, max_bytes=1000, path_filter=only_drafts)
+    assert sorted(files) == ["next.md"]
+    assert glob_patterns(" , ") == ()
+
+
+def test_an_excluded_file_is_never_deleted(tmp_path: Path) -> None:
+    write(tmp_path / "keep.md", "# Keep")
+    write(tmp_path / "tool.py", "print(1)")
+    # tool.py was indexed before the exclusion was set (by an earlier run, or by hand).
+    recorder = Recorder({"tool.py": 1.0})
+    folder = watcher(tmp_path, recorder, watch_delete_missing=True, watch_exclude="*.py")
+    folder.scan_once()
+    assert folder.scan_once()["indexed"] == ["keep.md"]
+    (tmp_path / "tool.py").unlink()
+    folder.scan_once()
+    assert "tool.py" in recorder.indexed and recorder.deleted == []

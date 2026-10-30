@@ -86,6 +86,9 @@ class TraceConfig:
     # The question's passage narrowing (page range, section, picked passages,
     # documents left out), only the parts given; None when it had none.
     narrowing: dict[str, Any] | None = None
+    # PASSAGES_ONLY sets the radius to 0, STRONG_MATCHES_ONLY the fallback count.
+    context_neighbor_radius: int | None = None
+    rerank_fallback_count: int | None = None
 
 
 @dataclass
@@ -140,6 +143,50 @@ class QueryTrace:
     dropped_history_messages: int = 0
 
 
+@dataclass(frozen=True)
+class TraceSummary:
+    """One trace as the list shows it: enough to pick and filter traces without
+    reading their prompts and candidates."""
+
+    trace_id: str
+    created_at: float
+    question: str
+    mode: str
+    status: str
+    llm_provider: str | None
+    total_ms: float | None
+    candidate_count: int
+    kept_count: int
+    answer_status: str | None
+    top_rerank_score: float | None
+
+
+def summarize_trace(trace: QueryTrace) -> TraceSummary:
+    scores = [c.rerank_score for c in trace.candidates if c.rerank_score is not None]
+    return TraceSummary(
+        trace_id=trace.trace_id,
+        created_at=trace.created_at,
+        question=trace.question,
+        mode=trace.mode,
+        status=trace.status,
+        llm_provider=trace.config.llm_provider if trace.config is not None else None,
+        total_ms=trace.timings.get("total_ms") if trace.timings is not None else None,
+        candidate_count=len(trace.candidates),
+        kept_count=sum(1 for candidate in trace.candidates if candidate.kept),
+        answer_status=trace_answer_status(trace),
+        top_rerank_score=max(scores) if scores else None,
+    )
+
+
+def trace_answer_status(trace: QueryTrace) -> str | None:
+    """The trace's answer status; for a trace from before it was recorded, what its
+    status says (an "insufficient_context" trace was one), else None."""
+
+    if trace.answer_status is not None:
+        return trace.answer_status
+    return "insufficient_context" if trace.status == "insufficient_context" else None
+
+
 class TraceSink(Protocol):
     """Minimal surface ``RagPipeline`` needs to record a trace."""
 
@@ -154,6 +201,10 @@ class TraceArchiveStore(Protocol):
     def get(self, trace_id: str) -> QueryTrace | None: ...
 
     def recent(self, workspace: str | None, limit: int) -> list[QueryTrace]: ...
+
+    def summaries(
+        self, workspace: str | None, limit: int, answer_statuses: AbstractSet[str] | None
+    ) -> list[TraceSummary]: ...
 
     def export_lines(self, workspace: str) -> Iterator[str]: ...
 
@@ -240,6 +291,31 @@ class TraceStore:
                 for trace in reversed(self._traces.values())
                 if workspace is None or trace.workspace == workspace
             ]
+
+    def list_summaries(
+        self,
+        workspace: str | None = None,
+        answer_statuses: AbstractSet[str] | None = None,
+    ) -> list[TraceSummary]:
+        """The trace list's rows, newest first: ``workspace``'s, and with
+        ``answer_statuses`` only traces with one of them. With an archive, its newest
+        ``max_retained`` matching ones, read from its summary columns (no prompts)."""
+
+        if self._archive is not None:
+            try:
+                return self._archive.summaries(workspace, self._max_retained, answer_statuses)
+            except Exception:  # noqa: BLE001 - fall back to what memory holds
+                logger.warning("Could not list traces from the archive.", exc_info=True)
+        with self._lock:
+            traces = [
+                trace
+                for trace in reversed(self._traces.values())
+                if workspace is None or trace.workspace == workspace
+            ]
+        summaries = [summarize_trace(trace) for trace in traces]
+        if answer_statuses is not None:
+            summaries = [s for s in summaries if s.answer_status in answer_statuses]
+        return summaries
 
     def export_lines(self, workspace: str) -> Iterator[str]:
         """``workspace``'s traces as JSON Lines, oldest first: every archived one, or

@@ -156,15 +156,20 @@ def summary_request(request: SummaryRequest) -> PipelineSummaryRequest:
 
 
 def passage_narrowing(request: PassageNarrowing) -> PassageFilter | None:
-    """A request's page/section/passage/exclusion narrowing, or None when it has none."""
+    """A request's page/section/passage/exclusion narrowing, or None when it has none.
+
+    Lists are sets here, sorted and deduplicated: the narrowing is part of the answer
+    cache and in-flight keys, and the same passages left out in another click order
+    missed both.
+    """
 
     narrow = PassageFilter(
         page_min=request.page_min,
         page_max=request.page_max,
         section=request.section,
-        exclude_filenames=tuple(request.exclude_filenames or ()),
-        chunk_ids=tuple(dict.fromkeys(request.chunk_ids or ())),
-        exclude_chunk_ids=tuple(dict.fromkeys(request.exclude_chunk_ids or ())),
+        exclude_filenames=tuple(sorted(set(request.exclude_filenames or ()))),
+        chunk_ids=tuple(sorted(set(request.chunk_ids or ()))),
+        exclude_chunk_ids=tuple(sorted(set(request.exclude_chunk_ids or ()))),
         uploaded_after=request.uploaded_after,
         uploaded_before=request.uploaded_before,
     )
@@ -182,6 +187,8 @@ def question_overrides(request: QuestionRequest) -> AnswerOverrides:
         answer_format=request.answer_format,
         answer_language=request.answer_language,
         narrow=passage_narrowing(request),
+        passages_only=request.passages_only,
+        strong_matches_only=request.strong_matches_only,
     )
 
 

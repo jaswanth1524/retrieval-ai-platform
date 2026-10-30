@@ -18,7 +18,7 @@ from api.schemas import (
     TraceSummaryResponse,
     UsageResponse,
 )
-from api.tracing import QueryTrace
+from api.tracing import QueryTrace, TraceSummary
 
 logger = logging.getLogger(__name__)
 
@@ -53,20 +53,10 @@ def content_chunk(payload: dict[str, object]) -> DocumentChunkResponse:
     )
 
 
-def trace_summary_response(trace: QueryTrace) -> TraceSummaryResponse:
-    """Build one row of the trace list from a stored trace."""
+def trace_summary_response(summary: TraceSummary) -> TraceSummaryResponse:
+    """One row of the trace list."""
 
-    return TraceSummaryResponse(
-        trace_id=trace.trace_id,
-        created_at=trace.created_at,
-        question=trace.question,
-        mode=trace.mode,
-        status=trace.status,
-        llm_provider=trace.config.llm_provider if trace.config is not None else None,
-        total_ms=trace.timings.get("total_ms") if trace.timings is not None else None,
-        candidate_count=len(trace.candidates),
-        kept_count=sum(1 for candidate in trace.candidates if candidate.kept),
-    )
+    return TraceSummaryResponse.model_validate(dataclasses.asdict(summary))
 
 
 def usage_response(
@@ -101,6 +91,8 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
                 answer_language=trace.config.answer_language,
                 narrowing=trace.config.narrowing,
                 llm_model=trace.config.llm_model,
+                context_neighbor_radius=trace.config.context_neighbor_radius,
+                rerank_fallback_count=trace.config.rerank_fallback_count,
             )
             if trace.config is not None
             else None

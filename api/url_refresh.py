@@ -8,12 +8,16 @@ again the way POST /documents/{f}/refresh does: conditionally, so an unchanged p
 a 304 and nothing is downloaded, and through the same fetch slots and backlog as the
 routes. At most URL_REFRESH_BATCH are fetched per pass.
 
-When a document was last checked is kept in memory, seeded from its upload time: after
-a restart every document counts as checked when it was last indexed.
+When each document was last checked, and how, is kept by a ``RefreshStateStore``
+(api/url_refresh_state.py): in memory, or in URL_REFRESH_STATE_PATH to survive a
+restart. A document never checked counts as checked when it was last indexed. A
+document can set its own interval (``refresh_minutes``; 0 = never), and a failing
+one waits twice as long after each failure, up to a day.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -22,19 +26,53 @@ from dataclasses import dataclass
 
 from api.audit import audit
 from api.ingest_jobs import IngestQueue, enqueue_refreshed, indexing_now
+from api.jobs import JobStore
 from api.metrics import url_refresh_total
 from api.qdrant_schema import CollectionSchemaError
 from api.raw_documents import RawDocumentStore
 from api.repository import DocumentMetadata, VectorRepository
 from api.settings import AppSettings
 from api.url_fetch import BacklogFullError, FetchedDocument, fetch_document, fetch_slots
+from api.url_refresh_state import MemoryRefreshStateStore, RefreshState, RefreshStateStore
 from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
 
 URL_REFRESH_PASS_SECONDS = 60.0
+# The longest a failing document waits between checks (unless its interval is longer).
+MAX_BACKOFF_SECONDS = 86_400.0
+_ACTIVE_STATES = frozenset({"queued", "parsing", "embedding"})
 
 Fetch = Callable[..., FetchedDocument]
+
+
+def refresh_interval_seconds(meta: DocumentMetadata, default_seconds: float) -> float | None:
+    """How often ``meta``'s document is checked: its own interval, else the server's;
+    None when it is never checked (its interval is 0, or the refresh is off)."""
+
+    minutes = meta.source_refresh_minutes
+    seconds = default_seconds if minutes is None else float(minutes) * 60.0
+    return seconds if seconds > 0 else None
+
+
+def refresh_due(
+    meta: DocumentMetadata, state: RefreshState | None, default_seconds: float
+) -> float | None:
+    """When ``meta``'s document is next checked (Unix seconds), or None for never.
+
+    From its last check when there was one, after a wait doubled for each failure in a
+    row (at most a day, or its interval when that is longer); from its upload otherwise.
+    """
+
+    interval = refresh_interval_seconds(meta, default_seconds)
+    if interval is None or not meta.source_url:
+        return None
+    if state is None:
+        return (meta.uploaded_at or 0.0) + interval
+    wait = interval
+    if state.failures > 0:
+        wait = min(interval * 2 ** min(state.failures, 20), max(MAX_BACKOFF_SECONDS, interval))
+    return state.last_checked + wait
 
 
 @dataclass(frozen=True)
@@ -58,6 +96,7 @@ class UrlRefresher:
         fetch: Fetch = fetch_document,
         clock: Callable[[], float] = time.time,
         interval: float = URL_REFRESH_PASS_SECONDS,
+        state: RefreshStateStore | None = None,
     ) -> None:
         self._every = float(settings.url_refresh_interval_minutes) * 60.0
         self._batch = int(settings.url_refresh_batch)
@@ -66,7 +105,9 @@ class UrlRefresher:
         self._fetch = fetch
         self._clock = clock
         self._interval = interval
-        self._checked: dict[tuple[str, str], float] = {}
+        self._state: RefreshStateStore = state if state is not None else MemoryRefreshStateStore()
+        # (job store, job id) of the refreshes it queued, until they finish.
+        self._jobs: set[tuple[JobStore, str]] = set()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -86,35 +127,78 @@ class UrlRefresher:
             except Exception:  # noqa: BLE001 - one failed pass must not end the loop
                 logger.exception("Background URL refresh pass failed.")
 
+    def _running(self) -> int:
+        """How many of the jobs this refresher queued are still queued or running."""
+
+        running = set()
+        for job_store, job_id in self._jobs:
+            job = job_store.get(job_id)
+            if job is not None and job.state in _ACTIVE_STATES:
+                running.add((job_store, job_id))
+        self._jobs = running
+        return len(running)
+
     def run_once(self) -> dict[str, int]:
-        """Check what is due in every workspace; how many of each outcome."""
+        """Check what is due in every workspace, earliest due first; how many of each
+        outcome.
+
+        At most URL_REFRESH_BATCH fetches a pass, and none while that many of its own
+        jobs are still indexing: a run of changed pages must not fill the backlog the
+        uploads share. The first fetch deferred (no backlog room or fetch slot) ends
+        the pass — the rest would be deferred for the same reason. The state of
+        documents (and workspaces) that are gone is dropped.
+        """
 
         outcomes = {"unchanged": 0, "queued": 0, "failed": 0, "deferred": 0}
         now = self._clock()
-        for target in self._targets():
-            if sum(outcomes.values()) - outcomes["deferred"] >= self._batch:
+        room = self._batch - self._running()
+        targets = list(self._targets())
+        self._state.forget_collections_except(
+            {target.settings.qdrant_collection for target in targets}
+        )
+        for target in targets:
+            if outcomes["deferred"] or sum(outcomes.values()) >= room:
                 break
             try:
                 metadata = self._repository.filename_metadata(target.settings)
             except CollectionSchemaError as exc:
                 logger.debug("Not refreshing workspace: %s", exc)
                 continue
-            busy = indexing_now(target.settings)
             collection = target.settings.qdrant_collection
-            for name, meta in sorted(metadata.items()):
-                if not meta.source_url or name in busy:
-                    continue
-                key = (collection, name)
-                last = self._checked.get(key, meta.uploaded_at or 0.0)
-                if now - last < self._every:
-                    continue
-                if sum(outcomes.values()) - outcomes["deferred"] >= self._batch:
+            states = self._state.get_all(collection)
+            self._state.forget(
+                collection,
+                [name for name in states if name not in metadata or not metadata[name].source_url],
+            )
+            busy = indexing_now(target.settings)
+            due: list[tuple[float, str, DocumentMetadata]] = []
+            for name, meta in metadata.items():
+                when = refresh_due(meta, states.get(name), self._every)
+                if when is not None and when <= now and name not in busy and meta.source_url:
+                    due.append((when, name, meta))
+            for _, name, meta in sorted(due):
+                if sum(outcomes.values()) >= room:
                     break
+                assert meta.source_url is not None
                 outcome = self._refresh(target, name, meta.source_url, meta)
                 outcomes[outcome] += 1
                 url_refresh_total.labels(outcome=outcome).inc()
-                if outcome != "deferred":
-                    self._checked[key] = now
+                if outcome == "deferred":
+                    break
+                previous = states.get(name)
+                failures = (
+                    (previous.failures if previous is not None else 0) + 1
+                    if outcome == "failed"
+                    else 0
+                )
+                checked = RefreshState(now, outcome, failures, 0.0)
+                self._state.record(
+                    collection,
+                    name,
+                    dataclasses.replace(
+                        checked, next_due=refresh_due(meta, checked, self._every) or 0.0
+                    ),
+                )
         return outcomes
 
     def _refresh(self, target: RefreshTarget, name: str, url: str, meta: DocumentMetadata) -> str:
@@ -139,10 +223,19 @@ class UrlRefresher:
         if fetched.not_modified:
             return "unchanged"
         try:
-            accepted = enqueue_refreshed(name, url, fetched, target.queue, target.raw_store)
+            accepted = enqueue_refreshed(
+                name,
+                url,
+                fetched,
+                target.queue,
+                target.raw_store,
+                expected=meta,
+                repository=self._repository,
+            )
         except Exception as exc:  # noqa: BLE001 - a full backlog, a closing workspace
             logger.warning("Scheduled refresh of %s could not be queued: %s", name, exc)
             return "deferred"
+        self._jobs.add((target.queue.job_store, accepted.job_id))
         audit(
             "document.refresh",
             workspace=workspace_of(target.settings),

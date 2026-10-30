@@ -7,7 +7,13 @@ from typing import Any
 import httpx
 import pytest
 
-from api.url_fetch import MAX_REDIRECTS, UrlFetchError, choose_filename, fetch_document
+from api.url_fetch import (
+    MAX_REDIRECTS,
+    UrlFetchError,
+    choose_filename,
+    fetch_document,
+    usable_validator,
+)
 from tests.factories import make_test_settings
 
 PUBLIC = "93.184.215.14"
@@ -704,6 +710,35 @@ def test_a_conditional_fetch_sends_the_validators_and_reads_a_304() -> None:
         fetch("https://example.com/a.txt", lambda request: httpx.Response(304))
 
 
+def test_validators_that_cannot_be_sent_back_are_not_kept_or_sent() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=b"Hello.",
+            headers=[
+                (b"content-type", b"text/plain"),
+                (b"etag", '"caf\xe9"'.encode("latin-1")),
+                (b"last-modified", b"Mon"),
+            ],
+        )
+
+    # A Latin-1 ETag would be sent back as If-None-Match, which httpx can't encode.
+    first = fetch("https://example.com/a.txt", handler)
+    assert (first.etag, first.last_modified) == (None, "Mon")
+    # One stored before this (or restored from a backup) is left out of the request.
+    again = fetch("https://example.com/a.txt", handler, etag='"caf\xe9"', last_modified="Mon")
+    assert "if-none-match" not in seen[-1].headers
+    assert seen[-1].headers["if-modified-since"] == "Mon"
+    assert again.content == b"Hello."
+
+    assert usable_validator('W/"abc"') == 'W/"abc"'
+    for unusable in ('"caf\xe9"', "a\r\nX-Injected: 1", "", "x" * 201, None, 7):
+        assert usable_validator(unusable) is None
+
+
 def test_broken_redirects_and_a_cut_off_body_are_clear_errors() -> None:
     with pytest.raises(UrlFetchError, match="redirected nowhere"):
         fetch("https://example.com/a.txt", lambda request: httpx.Response(302))
@@ -741,3 +776,110 @@ def test_the_servers_charset_outranks_the_pages_meta_charset() -> None:
     # Undeclared: left as sent.
     plain = fetch("https://example.com/a.txt", ok(b"Hello.", "text/plain"))
     assert plain.content == b"Hello."
+
+
+def test_a_fetched_documents_refresh_interval_is_set_listed_and_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from qdrant_client import QdrantClient
+
+    from api.dependencies import clear_dependency_caches
+    from tests.routes_http.support import hermetic_app, make_settings, upload_and_wait, wait_until
+
+    clear_dependency_caches()
+    app = hermetic_app(
+        make_settings(url_ingest_enabled=True, url_refresh_interval_minutes=60),
+        QdrantClient(":memory:"),
+    )
+    handler = lambda request: httpx.Response(  # noqa: E731
+        200, content=b"Intro\nFrom the web.", headers={"content-type": "text/plain"}
+    )
+    monkeypatch.setattr(
+        "api.routes.documents.fetch_document",
+        functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
+    )
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/documents/from-url",
+            json={"url": "https://example.com/page.txt", "refresh_minutes": 30},
+        )
+        assert accepted.status_code == 202, accepted.text
+        job = accepted.json()["job_id"]
+        wait_until(lambda: client.get(f"/documents/jobs/{job}").json()["state"] == "done")
+        listing = client.get("/documents").json()
+        status = listing["url_refresh"]["page.txt"]
+        assert status["refresh_minutes"] == 30 and status["failures"] == 0
+        assert status["last_checked"] is None
+        assert status["next_due"] == pytest.approx(listing["uploaded_ats"]["page.txt"] + 1800)
+
+        never = client.patch("/documents/page.txt/refresh-settings", json={"refresh_minutes": 0})
+        assert never.status_code == 200 and never.json()["refresh_minutes"] == 0
+        status = client.get("/documents").json()["url_refresh"]["page.txt"]
+        assert status["refresh_minutes"] == 0 and status["next_due"] is None
+        default = client.patch("/documents/page.txt/refresh-settings", json={})
+        assert default.json()["refresh_minutes"] is None
+        assert client.get("/documents").json()["url_refresh"]["page.txt"]["refresh_minutes"] is None
+
+        assert upload_and_wait(client, "upload.txt", b"Intro\nUploaded.")["state"] == "done"
+        uploaded = client.patch("/documents/upload.txt/refresh-settings", json={})
+        assert uploaded.status_code == 404
+        assert client.patch("/documents/nope.txt/refresh-settings", json={}).status_code == 404
+        too_long = client.patch(
+            "/documents/page.txt/refresh-settings", json={"refresh_minutes": 10**7}
+        )
+        assert too_long.status_code == 422
+        assert "upload.txt" not in client.get("/documents").json()["url_refresh"]
+    clear_dependency_caches()
+
+
+def test_a_failed_url_job_is_fetched_again_on_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+    from qdrant_client import QdrantClient
+
+    from api.dependencies import clear_dependency_caches
+    from tests.routes_http.support import hermetic_app, make_settings, upload_and_wait, wait_until
+
+    clear_dependency_caches()
+    app = hermetic_app(make_settings(url_ingest_enabled=True), QdrantClient(":memory:"))
+    serving = {"body": b""}  # empty first: the job fails ("no extractable text")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=serving["body"], headers={"content-type": "text/plain"})
+
+    monkeypatch.setattr(
+        "api.routes.documents.fetch_document",
+        functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
+    )
+
+    def finished(client: TestClient, job_id: str) -> dict[str, Any]:
+        wait_until(
+            lambda: client.get(f"/documents/jobs/{job_id}").json()["state"] in ("done", "failed")
+        )
+        return dict(client.get(f"/documents/jobs/{job_id}").json())
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/documents/from-url", json={"url": "https://example.com/page.txt", "tags": ["hr"]}
+        ).json()
+        failed = finished(client, accepted["job_id"])
+        assert failed["state"] == "failed"
+        assert failed["kind"] == "url" and failed["retryable"] is True
+
+        serving["body"] = b"Intro\nFixed at the source."
+        retried = client.post(f"/documents/jobs/{accepted['job_id']}/retry")
+        assert retried.status_code == 202, retried.text
+        assert finished(client, retried.json()["job_id"])["state"] == "done"
+        listing = client.get("/documents").json()
+        assert listing["tags"]["page.txt"] == ["hr"]
+        assert listing["source_urls"]["page.txt"] == "https://example.com/page.txt"
+
+        # A job that didn't fail, an upload (its bytes weren't kept), an unknown job.
+        again = client.post(f"/documents/jobs/{retried.json()['job_id']}/retry")
+        assert again.status_code == 409 and "Only a failed job" in again.json()["detail"]
+        upload = upload_and_wait(client, "empty.txt", b"")
+        assert upload["state"] == "failed" and upload["retryable"] is False
+        refused = client.post(f"/documents/jobs/{upload['job_id']}/retry")
+        assert refused.status_code == 409 and "upload the file again" in refused.json()["detail"]
+        assert client.post("/documents/jobs/nope/retry").status_code == 404
+    clear_dependency_caches()

@@ -139,6 +139,7 @@ class IngestService:
                 source_url=source.url if source else None,
                 source_etag=source.etag if source else None,
                 source_last_modified=source.last_modified if source else None,
+                source_refresh_minutes=source.refresh_minutes if source else None,
             )
             for chunk in chunks
         ]
@@ -202,9 +203,10 @@ class IngestService:
 
         Skipped only when re-indexing could change nothing: the indexed points are one
         complete ingest of these exact bytes (as many as it wrote, all agreeing), under
-        today's chunking (not stale), with no tags to set and the same source. Decided
-        under the filename lock, after the same sequencing check a write makes, so an
-        older upload still queued can't be left "unchanged" over a newer one.
+        today's chunking (not stale), with no tags to set and the same source URL (new
+        validators are stored in place). Decided under the filename lock, after the same
+        sequencing check a write makes, so an older upload still queued can't be left
+        "unchanged" over a newer one.
         ``on_indexed`` still runs (it records the upload as applied and stores the
         original, which may have been missing). A watched file that was only touched
         gets its new modification time, which is how the watcher knows the document is
@@ -232,14 +234,25 @@ class IngestService:
             counter_mode = mode if mode == "heuristic" else "hf"
             if meta.is_stale(chunking_fingerprint(settings), counter_mode):
                 return None
-            stored_source = (meta.source_url, meta.source_etag, meta.source_last_modified)
-            wanted_source = (
-                (source.url, source.etag, source.last_modified) if source else (None, None, None)
-            )
-            if stored_source != wanted_source:
+            if meta.source_url != (source.url if source else None):
                 return None
+            changed = False
+            # The same bytes under new validators (a dynamic page, a CDN that re-stamps)
+            # or another refresh interval: only those change, or every refresh would
+            # re-embed the document.
+            if source is not None and (
+                meta.source_etag,
+                meta.source_last_modified,
+                meta.source_refresh_minutes,
+            ) != (source.etag, source.last_modified, source.refresh_minutes):
+                self._repository.set_source_details(
+                    settings, name, source.etag, source.last_modified, source.refresh_minutes
+                )
+                changed = True
             if uploaded_at is not None and meta.uploaded_at != uploaded_at:
                 self._repository.set_uploaded_at(settings, name, uploaded_at)
+                changed = True
+            if changed:
                 bump_corpus_generation([name], collection=settings.qdrant_collection)
             if on_indexed is not None:
                 on_indexed()

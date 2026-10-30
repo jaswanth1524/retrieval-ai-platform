@@ -80,7 +80,11 @@ def is_guarded_path(path: str) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in GUARDED_PREFIXES)
 
 
-_REINDEX_OR_TAGS = re.compile(r"^/documents/[^/]+/(?:reindex|tags|refresh|versions/[^/]+/restore)$")
+_REINDEX_OR_TAGS = re.compile(
+    r"^/documents/[^/]+/(?:reindex|tags|refresh|refresh-settings|versions/[^/]+/restore)$"
+)
+
+_JOB_RETRY = re.compile(r"^/documents/jobs/[^/]+/retry$")
 
 
 def needs_full_key(method: str, path: str) -> bool:
@@ -97,13 +101,20 @@ def needs_full_key(method: str, path: str) -> bool:
         return True
     if method == "DELETE" and path.startswith("/documents/"):
         return True
-    if method == "POST" and path in ("/documents", "/documents/reindex", "/documents/from-url"):
+    if method == "POST" and path in (
+        "/documents",
+        "/documents/reindex",
+        "/documents/from-url",
+        "/documents/preview",
+    ):
+        return True
+    if method == "POST" and _JOB_RETRY.match(path) is not None:
         return True
     return method in ("POST", "PATCH") and _REINDEX_OR_TAGS.match(path) is not None
 
 
 def body_limit(method: str, path: str, settings: AppSettings) -> int:
-    if method == "POST" and path == "/documents":
+    if method == "POST" and path in ("/documents", "/documents/preview"):
         return int(settings.max_upload_bytes) + UPLOAD_OVERHEAD_BYTES
     if method == "POST" and path == "/import":
         return int(settings.max_import_bytes) + UPLOAD_OVERHEAD_BYTES

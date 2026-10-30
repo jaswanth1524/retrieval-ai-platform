@@ -27,6 +27,7 @@ from api.dependencies import (
     get_raw_document_store,
     get_reranker,
     get_token_counter,
+    get_url_refresh_state_store,
     shutdown_executors,
 )
 from api.embeddings import EmbeddedText
@@ -271,7 +272,9 @@ def watch_target(settings: AppSettings) -> AppSettings:
     if not settings.workspaces_enabled:
         raise RuntimeError("WATCH_WORKSPACE needs WORKSPACES_ENABLED=true.")
     try:
-        validate_name(name)
+        # Reserved names too: "default" here would make a workspace called "default",
+        # not use the default one (leave the setting empty for that).
+        validate_name(name, new=True)
     except WorkspaceError as exc:
         raise RuntimeError(f"WATCH_WORKSPACE: {exc}") from exc
     return settings_for(settings, name)
@@ -319,6 +322,7 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
             # A file only touched (or copied over with the same bytes) isn't re-embedded:
             # its document just takes the new mtime.
             dedupe=True,
+            kind="watch",
         )
         audit(
             "document.upload",
@@ -430,7 +434,7 @@ def start_url_refresher(settings: AppSettings) -> UrlRefresher:
                 found.append(target(workspace_settings, store))
         return found
 
-    refresher = UrlRefresher(settings, repository, targets)
+    refresher = UrlRefresher(settings, repository, targets, state=get_url_refresh_state_store())
     refresher.start()
     return refresher
 
