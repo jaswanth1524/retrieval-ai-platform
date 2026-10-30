@@ -222,10 +222,24 @@ describe('server activity', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel indexing watched.md' }));
     expect(cancel).toHaveBeenCalledWith('j1', undefined, '');
     expect(await screen.findByTestId('active-job-cancel-error')).toHaveTextContent('has to finish');
+    const details = screen.getByText('Recent failures').closest('details')!;
+    // Closed, nothing is read.
+    expect(api.listFinishedJobs).not.toHaveBeenCalled();
     await act(async () => {
-      fireEvent(screen.getByText('Recent failures').closest('details')!, new Event('toggle'));
+      details.open = true;
+      fireEvent(details, new Event('toggle'));
     });
     expect(await screen.findByTestId('failed-job')).toHaveTextContent('broken.pdf: Unreadable PDF.');
+    const reads = vi.mocked(api.listFinishedJobs).mock.calls.length;
+    // Read again each time it is opened.
+    await act(async () => {
+      details.open = false;
+      fireEvent(details, new Event('toggle'));
+      details.open = true;
+      fireEvent(details, new Event('toggle'));
+    });
+    await screen.findByTestId('failed-job');
+    expect(vi.mocked(api.listFinishedJobs).mock.calls.length).toBeGreaterThan(reads);
   });
 });
 

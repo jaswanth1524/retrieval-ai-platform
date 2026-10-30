@@ -147,6 +147,19 @@ export class MockApi {
   activeJobs: ({ job_id: string } & Record<string, unknown>)[] = [];
   /** GET /documents/jobs?state=failed|recent: finished jobs the server keeps. */
   finishedJobs: object[] = [];
+  /** Every POST /documents multipart body, as text (file and form fields). */
+  readonly uploadBodies: string[] = [];
+  /** Ids of failed jobs the page asked to retry (POST /documents/jobs/{id}/retry). */
+  readonly retriedJobs: string[] = [];
+  /** Files POST /documents/preview was sent (by name). */
+  readonly previews: string[] = [];
+  /** GET /documents source_urls and url_refresh (documents fetched by URL). */
+  sourceUrls: Record<string, string> = {};
+  urlRefresh: Record<string, object> = {};
+  /** Every PATCH /documents/{f}/refresh-settings, as "filename=minutes". */
+  readonly refreshSettings: string[] = [];
+  /** The answer_status filters GET /traces was asked with, one list per request. */
+  readonly traceQueries: string[][] = [];
   /** Ids of jobs started elsewhere that the page asked to cancel. */
   readonly cancelledOutsideJobs: string[] = [];
   /** GET /watch (needs config.watch_enabled); null answers 404. */
@@ -209,7 +222,14 @@ export class MockApi {
       return this.configured(route, 401, { detail: 'Missing or invalid API key.' });
     }
     if (path === '/access') return this.json(route, 200, { access: this.access });
-    if (path === '/traces') return this.json(route, 200, { traces: this.traces });
+    if (path === '/traces') {
+      const statuses = new URL(request.url()).searchParams.getAll('answer_status');
+      this.traceQueries.push(statuses);
+      const traces = this.traces as { answer_status?: string }[];
+      return this.json(route, 200, {
+        traces: statuses.length ? traces.filter((t) => statuses.includes(t.answer_status ?? '')) : traces,
+      });
+    }
     if (path === '/traces/export') {
       return route.fulfill({
         status: 200,
@@ -255,10 +275,26 @@ export class MockApi {
           this.documents.includes(name),
         ),
         tags: this.tags,
+        source_urls: this.sourceUrls,
+        url_refresh: this.urlRefresh,
+      });
+    }
+
+    if (path === '/documents/preview' && method === 'POST') {
+      const filename = /filename="([^"]+)"/.exec(request.postData() ?? '')?.[1] ?? 'upload.txt';
+      this.previews.push(filename);
+      return this.json(route, 200, {
+        filename,
+        section_count: 1,
+        chunk_count: 2,
+        page_count: 1,
+        section_labels: ['Overview'],
+        first_chunks: [{ ordinal: 1, page: 1, section: 'Overview', text: 'What the parser read.' }],
       });
     }
 
     if (path === '/documents' && method === 'POST') {
+      this.uploadBodies.push(request.postData() ?? '');
       const filename = /filename="([^"]+)"/.exec(request.postData() ?? '')?.[1] ?? 'upload.txt';
       if (this.uploadResponse) {
         const { status, body } = this.uploadResponse;
@@ -285,6 +321,15 @@ export class MockApi {
     if (path === '/watch' || path === '/watch/scan') {
       if (this.watchStatus === null) return this.configured(route, 404, { detail: 'No folder is watched.' });
       return this.json(route, path === '/watch' ? 200 : 202, this.watchStatus);
+    }
+    const retryRoute = /^\/documents\/jobs\/([^/]+)\/retry$/.exec(path);
+    if (retryRoute && method === 'POST') {
+      const jobId = decodeURIComponent(retryRoute[1]);
+      this.retriedJobs.push(jobId);
+      const failed = (this.finishedJobs as { job_id: string; filename: string }[]).find(
+        (job) => job.job_id === jobId,
+      );
+      return this.json(route, 202, this.startJob(failed?.filename ?? 'retried.txt'));
     }
     if (path.startsWith('/documents/jobs/')) {
       const jobId = path.slice('/documents/jobs/'.length);
@@ -343,7 +388,9 @@ export class MockApi {
       return this.json(route, 200, { filename, versions: this.versions[filename] ?? [] });
     }
 
-    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags|original))?$/.exec(path);
+    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags|original|refresh-settings))?$/.exec(
+      path,
+    );
     if (documentRoute) {
       const filename = decodeURIComponent(documentRoute[1]);
       const action = documentRoute[2];
@@ -390,6 +437,14 @@ export class MockApi {
         if (tags.length > 0) this.tags[filename] = tags;
         else delete this.tags[filename];
         return this.json(route, 200, { filename, tags });
+      }
+      if (action === 'refresh-settings' && method === 'PATCH') {
+        const { refresh_minutes: minutes } = JSON.parse(request.postData() ?? '{}') as {
+          refresh_minutes: number | null;
+        };
+        this.refreshSettings.push(`${filename}=${minutes}`);
+        this.urlRefresh[filename] = { ...(this.urlRefresh[filename] ?? {}), refresh_minutes: minutes };
+        return this.json(route, 200, { filename, refresh_minutes: minutes });
       }
       if (action === 'reindex' && method === 'POST') {
         return this.json(route, 202, this.startJob(filename));

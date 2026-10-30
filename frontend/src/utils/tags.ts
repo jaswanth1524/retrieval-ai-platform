@@ -1,5 +1,5 @@
 // api/documents.py's MAX_TAGS_PER_DOCUMENT and MAX_TAG_LENGTH.
-const MAX_TAGS_PER_DOCUMENT = 20;
+export const MAX_TAGS_PER_DOCUMENT = 20;
 const MAX_TAG_LENGTH = 40;
 
 /** "hr, Policy,  hr" as tags: trimmed, case-insensitively once each, at most 20, each

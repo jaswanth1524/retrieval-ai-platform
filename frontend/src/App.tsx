@@ -30,8 +30,10 @@ import type { RailPanel } from './components/IconRail';
 import type { InspectorTab } from './components/Inspector';
 import SourcePreview from './components/SourcePreview';
 import ToastRow from './components/ToastRow';
-import SearchPanel from './components/SearchPanel';
+import SearchPanel, { type SearchRequestFromElsewhere } from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
+import SavedPanel from './components/SavedPanel';
+import { ANSWER_FILTER_STATUSES, type AnswerFilter } from './utils/traceFilters';
 import FeedbackPanel from './components/FeedbackPanel';
 import UnansweredPanel from './components/UnansweredPanel';
 import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS, scopeNarrowing } from './hooks/chatPersistence';
@@ -60,9 +62,10 @@ import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
 import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
-import { chatToJson, chatToMarkdown, downloadFile } from './utils/exportChat';
+import { chatToJson, chatToMarkdown, downloadFile, savedAnswersToMarkdown } from './utils/exportChat';
 import { chatToHtml } from './utils/exportHtml';
 import { folderPickNote, pickFolderFiles } from './utils/folderFiles';
+import { QUERY_LOG_FETCH_LIMIT, mergeQueryLogs } from './utils/questions';
 import { initialProvider } from './utils/providers';
 import { readStored, writeStored } from './utils/safeStorage';
 import {
@@ -110,7 +113,7 @@ function App() {
   if (rail === 'search' && !searchOpened) setSearchOpened(true);
   const [searchResetKey, setSearchResetKey] = useState(0);
   // A search started from elsewhere (a "not found" answer's "Search the passages").
-  const [searchRequest, setSearchRequest] = useState<{ query: string; id: number } | null>(null);
+  const [searchRequest, setSearchRequest] = useState<SearchRequestFromElsewhere | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sources');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -161,6 +164,7 @@ function App() {
     cancel,
     clear: clearTurns,
     conversations,
+    savedAnswers,
     activeConversationId,
     newConversation: createConversation,
     switchConversation: selectConversation,
@@ -224,6 +228,7 @@ function App() {
     handleCancelUpload,
     handleReindex,
     handleRefreshFromUrl,
+    handleSetRefreshInterval,
     handleRestoreVersion,
     handleUploadFromUrl,
     handleReindexMany,
@@ -316,6 +321,11 @@ function App() {
     (filename: string) => void handleRefreshFromUrl(filename, workspace),
     [handleRefreshFromUrl, workspace],
   );
+  const setRefreshIntervalHere = useCallback(
+    (filename: string, minutes: number | null) =>
+      void handleSetRefreshInterval(filename, minutes, workspace),
+    [handleSetRefreshInterval, workspace],
+  );
   const restoreVersionHere = useCallback(
     (filename: string, version: string) => void handleRestoreVersion(filename, version, workspace),
     [handleRestoreVersion, workspace],
@@ -388,6 +398,14 @@ function App() {
       setScope((prev) => {
         const { uploadedAfter: _after, ...rest } = prev;
         return value !== undefined ? { ...rest, uploadedAfter: value } : rest;
+      }),
+    [setScope],
+  );
+  const setUploadedBefore = useCallback(
+    (value: number | undefined) =>
+      setScope((prev) => {
+        const { uploadedBefore: _before, ...rest } = prev;
+        return value !== undefined ? { ...rest, uploadedBefore: value } : rest;
       }),
     [setScope],
   );
@@ -518,6 +536,7 @@ function App() {
     async (signal) => (await api.listFeedback(500, signal)).feedback,
     noteAuthFailure,
     'Could not load feedback.',
+    workspace,
   );
 
   // The feedback panel needs feedback on and the full key (GET /feedback is operator data).
@@ -537,24 +556,36 @@ function App() {
     load: loadUnanswered,
   } = usePanelList<QueryLogEntryResponse>(
     rail === 'unanswered',
-    async (signal) => (await api.listQueryLog(500, signal)).queries,
+    // The latest asks, and the unanswered ones further back: the Unanswered view is
+    // the whole log's, not the last window's.
+    async (signal) => {
+      const [recent, uncovered] = await Promise.all([
+        api.listQueryLog(QUERY_LOG_FETCH_LIMIT, signal),
+        api.listQueryLog(QUERY_LOG_FETCH_LIMIT, signal, true),
+      ]);
+      return mergeQueryLogs(recent.queries, uncovered.queries);
+    },
     noteAuthFailure,
     'Could not load the asked questions.',
+    workspace,
   );
   const hiddenRailPanels = useMemo(
     () => hiddenPanels(feedbackPanelAvailable, unansweredPanelAvailable),
     [feedbackPanelAvailable, unansweredPanelAvailable],
   );
 
+  const [traceAnswerFilter, setTraceAnswerFilter] = useState<AnswerFilter>('any');
   const {
     items: traces,
     error: tracesError,
     load: loadTraces,
   } = usePanelList<TraceSummaryResponse>(
     rail === 'traces',
-    async (signal) => (await api.listTraces(signal)).traces,
+    async (signal) =>
+      (await api.listTraces(signal, ANSWER_FILTER_STATUSES[traceAnswerFilter])).traces,
     noteAuthFailure,
     'Could not load traces.',
+    `${workspace}\u0000${traceAnswerFilter}`,
   );
 
   // A trace row is a debugging artifact, so opening one implies Engineer mode — the
@@ -736,13 +767,20 @@ function App() {
       : '') +
     (scope.uploadedAfter !== undefined
       ? ` · since ${DATE_FORMATTER.format(scope.uploadedAfter * 1000)}`
+      : '') +
+    (scope.uploadedBefore !== undefined
+      ? ` · up to ${DATE_FORMATTER.format(scope.uploadedBefore * 1000)}`
       : '');
   // `task`: a summary or comparison (its own documents; the scope doesn't apply).
   const askQuestion = useCallback(
     (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => {
       const looking = narrowing ?? scopePages;
-      return ask(question, selectedProvider, advancedOptions, scopeFilenames, {
-        tags: selectedTags,
+      // Picked passages are the scope: the conversation's documents and tags are AND-ed
+      // with them on the server, so a passage from another document (the viewer's
+      // "Ask about this") found nothing.
+      const picked = Boolean(looking?.chunk_ids?.length) && !task;
+      return ask(question, selectedProvider, advancedOptions, picked ? undefined : scopeFilenames, {
+        tags: picked ? [] : selectedTags,
         modelLabel: currentModelLabel,
         ...(task ? { task } : {}),
         ...(looking && !task ? { narrowing: looking } : {}),
@@ -754,8 +792,9 @@ function App() {
   const regenerateQuestion = useCallback(
     (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => {
       const looking = narrowing ?? scopePages;
-      return ask(question, selectedProvider, advancedOptions, scopeFilenames, {
-        tags: selectedTags,
+      const picked = Boolean(looking?.chunk_ids?.length) && !task;
+      return ask(question, selectedProvider, advancedOptions, picked ? undefined : scopeFilenames, {
+        tags: picked ? [] : selectedTags,
         bypassCache: true,
         modelLabel: currentModelLabel,
         ...(task ? { task } : {}),
@@ -777,7 +816,7 @@ function App() {
     [ask, setScope, selectedProvider, advancedOptions, currentModelLabel],
   );
   // From the Search panel: the search's question over only the passages ticked there,
-  // in the open conversation (the scope still applies; they were found within it).
+  // in the open conversation (the passages are its scope; they were found within it).
   const askAboutPassages = useStableHandler((question: string, chunkIds: string[]) => {
     void askQuestion(question, undefined, { chunk_ids: chunkIds });
     if (panelCollapsed) setPanelDrawerOpen(false);
@@ -790,6 +829,13 @@ function App() {
   // ...or the passages a search finds for it, without asking the model again.
   const searchForPassages = useStableHandler((question: string) => {
     setSearchRequest({ query: question, id: Date.now() });
+    setRail('search');
+    if (panelCollapsed) setPanelDrawerOpen(true);
+  });
+  // ...or the passages most like one the viewer shows ("more like this").
+  const findSimilarPassages = useStableHandler((chunkId: string, label: string) => {
+    setSourceView(null);
+    setSearchRequest({ like: { chunkId, label }, id: Date.now() });
     setRail('search');
     if (panelCollapsed) setPanelDrawerOpen(true);
   });
@@ -1042,7 +1088,7 @@ function App() {
   });
   const moveBetweenAnswers = useStableHandler((step: 1 | -1) => {
     const answers = [
-      ...document.querySelectorAll<HTMLElement>('[data-testid="chat-message"][data-role="assistant"]'),
+      ...document.querySelectorAll<HTMLElement>('[role="article"][data-role="assistant"]'),
     ];
     if (answers.length === 0) return;
     const current = answers.findIndex((answer) => answer.contains(document.activeElement));
@@ -1060,9 +1106,25 @@ function App() {
     }
     if (!target) return;
     target.focus({ preventScroll: true });
-    target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    // The CSS reduced-motion rule doesn't reach a scripted smooth scroll.
+    const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    target.scrollIntoView({ block: 'start', behavior: still ? 'auto' : 'smooth' });
   });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const savedAnswersRef = useRef(savedAnswers);
+  savedAnswersRef.current = savedAnswers;
+  const exportSavedAnswers = useCallback(() => {
+    const items = savedAnswersRef.current;
+    if (items.length === 0) {
+      pushToast({ tone: 'warn', title: 'Nothing saved yet', body: 'Save an answer with ☆ first.' });
+      return;
+    }
+    downloadFile('docrag-saved-answers.md', 'text/markdown', savedAnswersToMarkdown(items));
+  }, [pushToast]);
+  const unsaveAnswer = useCallback(
+    (conversationId: string, turnId: string) => setTurnSaved(turnId, false, conversationId),
+    [setTurnSaved],
+  );
   const exportJson = useCallback(() => {
     if (turnsRef.current.length === 0) return;
     downloadFile(
@@ -1157,6 +1219,11 @@ function App() {
         setRail('traces');
         if (panelCollapsed) setPanelDrawerOpen(true);
       },
+      showSavedAnswers: () => {
+        setRail('saved');
+        if (panelCollapsed) setPanelDrawerOpen(true);
+      },
+      exportSavedAnswers,
       restoreBackup: () => restoreInputRef.current?.click(),
       downloadBackup,
       importConversation: () => importInputRef.current?.click(),
@@ -1255,6 +1322,7 @@ function App() {
     else if (rail === 'search') setSearchResetKey((key) => key + 1);
     else if (rail === 'feedback') loadFeedback();
     else if (rail === 'unanswered') loadUnanswered();
+    else if (rail === 'saved') exportSavedAnswers();
     else loadTraces();
   });
 
@@ -1384,10 +1452,12 @@ function App() {
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
             onRead={handleReadDocument}
             onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
+            canPreview={!readOnly}
             onSummarize={summarizeDocuments}
             onAskAbout={askAbout}
             summaryMaxDocuments={config?.summary_max_documents}
             onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? refreshHere : undefined}
+            onSetRefreshInterval={readOnly ? undefined : setRefreshIntervalHere}
             onRestoreVersion={
               config?.document_versions_enabled && !readOnly ? restoreVersionHere : undefined
             }
@@ -1403,6 +1473,7 @@ function App() {
               filenames={selectedFilenames}
               tags={selectedTags}
               narrowing={scopePages}
+              availableTags={availableTags}
               onOpenSource={handleOpenSource}
               resetKey={searchResetKey}
               request={searchRequest}
@@ -1417,6 +1488,8 @@ function App() {
             traces={traces}
             error={tracesError}
             onSelect={handleSelectTrace}
+            answerFilter={traceAnswerFilter}
+            onAnswerFilter={setTraceAnswerFilter}
             onExport={readOnly ? undefined : exportTraces}
             exporting={exportingTraces}
           />
@@ -1426,6 +1499,13 @@ function App() {
             feedback={feedbackItems}
             error={feedbackError}
             onSelectTrace={handleSelectTrace}
+          />
+        )}
+        {rail === 'saved' && (
+          <SavedPanel
+            answers={savedAnswers}
+            onOpen={switchConversationFromList}
+            onUnsave={unsaveAnswer}
           />
         )}
         {rail === 'unanswered' && (
@@ -1543,6 +1623,8 @@ function App() {
             onPageRangeChange={setPageRange}
             uploadedAfter={scope.uploadedAfter}
             onUploadedAfterChange={setUploadedAfter}
+            uploadedBefore={scope.uploadedBefore}
+            onUploadedBeforeChange={setUploadedBefore}
             onSelectedTagsChange={setSelectedTags}
             config={config}
             provider={selectedProvider}
@@ -1624,6 +1706,7 @@ function App() {
               highlights={sourceView.highlights}
               onClose={closeSourceView}
               onAskAboutPassage={summarizeDisabled ? undefined : askAboutViewedPassage}
+              onFindSimilar={findSimilarPassages}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
                   ? downloadViewedOriginal

@@ -22,6 +22,8 @@ export interface ConversationScope {
   pageMax?: number;
   /** Only documents uploaded since this time (Unix seconds). */
   uploadedAfter?: number;
+  /** Only documents uploaded up to this time (Unix seconds; the end of a chosen day). */
+  uploadedBefore?: number;
 }
 
 export const EMPTY_SCOPE: ConversationScope = { filenames: [], tags: [] };
@@ -421,12 +423,24 @@ export function compactForStorage(
   maxTurns: number,
   textTurns = PERSISTED_SOURCE_TEXT_TURNS,
 ): Conversation {
-  const turns = conversation.turns.slice(-maxTurns);
+  // The latest turns, and every saved answer with the question before it however far
+  // back: a saved answer is kept by choice, even where this is the only copy (no
+  // IndexedDB).
+  const all = conversation.turns;
+  const keep = new Set<number>();
+  for (let index = Math.max(0, all.length - maxTurns); index < all.length; index += 1) keep.add(index);
+  all.forEach((turn, index) => {
+    if (!turn.saved) return;
+    keep.add(index);
+    if (index > 0 && all[index - 1].role === 'user') keep.add(index - 1);
+  });
+  const turns = keep.size === all.length ? all : all.filter((_, index) => keep.has(index));
   const keepTextFrom = turns.length - textTurns;
   return {
     ...conversation,
     turns: turns.map((turn, index) =>
-      index >= keepTextFrom || turn.sources.every((source) => !source.text)
+      // A saved answer keeps its passages wherever it is: it was saved to be reread.
+      index >= keepTextFrom || turn.saved || turn.sources.every((source) => !source.text)
         ? turn
         : {
             ...turn,
@@ -439,8 +453,9 @@ export function compactForStorage(
 
 export type PersistOutcome = 'saved' | 'partial' | 'failed';
 
-/** The conversations localStorage's copy holds: the active one, the pinned ones and
- *  the most recently changed, LOCAL_STORAGE_MAX_CONVERSATIONS in all. A conversation
+/** The conversations localStorage's copy holds: the active one, the pinned ones, those
+ *  with a saved answer and the most recently changed, LOCAL_STORAGE_MAX_CONVERSATIONS in
+ *  all. A conversation
  *  left out is never read as deleted (only a tombstone deletes; see mergeConversations).
  *
  *  "Changed" includes a rename or a pin (``lastEdit``), not only a new turn: this copy
@@ -454,8 +469,13 @@ export function conversationsForLocalStorage(storage: ChatStorageV2): Conversati
   for (const conversation of sorted) {
     if (conversation.id === activeConversationId) kept.add(conversation.id);
   }
+  // Pinned ones, then ones holding a saved answer: both are kept by choice.
   for (const conversation of sorted) {
     if (conversation.pinned && kept.size < LOCAL_STORAGE_MAX_CONVERSATIONS) kept.add(conversation.id);
+  }
+  for (const conversation of sorted) {
+    if (kept.size >= LOCAL_STORAGE_MAX_CONVERSATIONS) break;
+    if (conversation.turns.some((turn) => turn.saved)) kept.add(conversation.id);
   }
   for (const conversation of sorted) {
     if (kept.size >= LOCAL_STORAGE_MAX_CONVERSATIONS) break;
@@ -773,14 +793,14 @@ export function sanitizeScope(value: unknown): ConversationScope | undefined {
   const pageMax = page(raw.pageMax);
   if (pageMin !== undefined && (pageMax === undefined || pageMin <= pageMax)) scope.pageMin = pageMin;
   if (pageMax !== undefined && (pageMin === undefined || pageMin <= pageMax)) scope.pageMax = pageMax;
-  if (
-    typeof raw.uploadedAfter === 'number' &&
-    Number.isFinite(raw.uploadedAfter) &&
-    raw.uploadedAfter >= 0 &&
-    raw.uploadedAfter <= MAX_TIMESTAMP_SECONDS
-  ) {
-    scope.uploadedAfter = raw.uploadedAfter;
-  }
+  const stamp = (item: unknown) =>
+    typeof item === 'number' && Number.isFinite(item) && item >= 0 && item <= MAX_TIMESTAMP_SECONDS
+      ? item
+      : undefined;
+  const after = stamp(raw.uploadedAfter);
+  const before = stamp(raw.uploadedBefore);
+  if (after !== undefined) scope.uploadedAfter = after;
+  if (before !== undefined) scope.uploadedBefore = before;
   return scope;
 }
 
@@ -795,7 +815,12 @@ export function scopeNarrowing(scope: ConversationScope): PassageNarrowing | und
     if (min !== undefined) narrowing.page_min = min;
     if (max !== undefined) narrowing.page_max = max;
   }
-  if (scope.uploadedAfter !== undefined) narrowing.uploaded_after = scope.uploadedAfter;
+  // In order, whichever end was set first (the server refuses after > before).
+  let after = scope.uploadedAfter;
+  let before = scope.uploadedBefore;
+  if (after !== undefined && before !== undefined && after > before) [after, before] = [before, after];
+  if (after !== undefined) narrowing.uploaded_after = after;
+  if (before !== undefined) narrowing.uploaded_before = before;
   return Object.keys(narrowing).length > 0 ? narrowing : undefined;
 }
 

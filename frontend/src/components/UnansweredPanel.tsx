@@ -1,7 +1,15 @@
 import { memo, useDeferredValue, useMemo, useState } from 'react';
 import type { QueryLogEntryResponse } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
-import { UNCOVERED, groupQuestions, normalized } from '../utils/questions';
+import { isoTime, toCsv } from '../utils/csv';
+import { downloadFile } from '../utils/exportChat';
+import {
+  QUERY_LOG_FETCH_LIMIT,
+  UNCOVERED,
+  groupQuestions,
+  normalized,
+  stillUnanswered,
+} from '../utils/questions';
 import './UnansweredPanel.css';
 
 interface UnansweredPanelProps {
@@ -28,7 +36,7 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
   const grouped = useMemo(() => groupQuestions(questions ?? []), [questions]);
   const shown = useMemo(() => {
     let rows = grouped;
-    if (view === 'unanswered') rows = rows.filter((row) => row.unanswered > 0);
+    if (view === 'unanswered') rows = rows.filter(stillUnanswered);
     if (view === 'repeated') {
       rows = rows.filter((row) => row.count > 1).sort((a, b) => b.count - a.count);
     }
@@ -44,16 +52,20 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
   }
   if (questions === null) return <p className="unanswered-panel__message">Loading…</p>;
 
-  const total = questions.length;
-  const missed = questions.filter((entry) => entry.status === UNCOVERED).length;
+  // The rate over the latest window only (older unanswered asks were fetched as well,
+  // for the Unanswered view; counting them would skew it).
+  const latest = questions.slice(0, QUERY_LOG_FETCH_LIMIT);
+  const total = latest.length;
+  const missed = latest.filter((entry) => entry.status === UNCOVERED).length;
   const answeredShare = total > 0 ? Math.round(((total - missed) / total) * 100) : 0;
+  const capped = questions.length >= QUERY_LOG_FETCH_LIMIT;
 
   return (
     <>
       <p className="unanswered-panel__summary mono" data-testid="questions-summary">
         {total === 0
           ? 'Nothing asked yet.'
-          : `${total} asked · ${answeredShare}% answered from the documents · ${missed} not`}
+          : `${capped ? `Last ${total}` : total} asked · ${answeredShare}% answered from the documents · ${missed} not`}
       </p>
       <div className="unanswered-panel__controls">
         <span role="group" aria-label="Show">
@@ -76,6 +88,34 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
             </button>
           ))}
         </span>
+        {shown.length > 0 && (
+          <button
+            type="button"
+            className="unanswered-panel__view"
+            onClick={() =>
+              downloadFile(
+                'docrag-questions.csv',
+                'text/csv',
+                toCsv(
+                  ['question', 'times_asked', 'times_not_answered', 'last_asked', 'last_status', 'best_match', 'mode'],
+                  shown.map((row) => [
+                    row.question,
+                    row.count,
+                    row.unanswered,
+                    isoTime(row.latest.created_at),
+                    row.latest.status,
+                    row.latest.top_score ?? '',
+                    row.latest.mode,
+                  ]),
+                ),
+              )
+            }
+            title="Download the questions shown as CSV"
+            data-testid="questions-export"
+          >
+            CSV
+          </button>
+        )}
         <input
           type="search"
           className="unanswered-panel__filter"
@@ -107,9 +147,9 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
               </span>
               <span className="unanswered-panel__meta mono">
                 {row.count > 1 && <span data-testid="questions-count">×{row.count}</span>}
-                {row.unanswered > 0 && view !== 'unanswered' && (
+                {row.unanswered > 0 && (view !== 'unanswered' || row.count > 1) && (
                   <span className="unanswered-panel__missed">
-                    {row.unanswered === row.count ? 'not answered' : `${row.unanswered} not answered`}
+                    {row.unanswered === row.count ? 'not answered' : `missed ${row.unanswered}×`}
                   </span>
                 )}
                 {row.latest.top_score !== null && (

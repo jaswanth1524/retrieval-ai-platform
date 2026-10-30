@@ -10,7 +10,9 @@ interface PanelList<T> {
 }
 
 /**
- * A rail panel's list (traces, feedback), loaded each time the panel opens.
+ * A rail panel's list (traces, feedback), loaded each time the panel opens, and again
+ * when ``reloadKey`` changes while it is open (the workspace: an open list otherwise
+ * kept showing the previous workspace's rows, whose traces then 404'd).
  *
  * One request at a time: a Refresh aborts the load still in flight, whose late answer
  * used to overwrite the newer one, and closing the panel aborts it too. A 401 goes to
@@ -21,6 +23,7 @@ export function usePanelList<T>(
   fetchItems: (signal: AbortSignal) => Promise<T[]>,
   onError: (err: unknown) => void,
   fallbackMessage: string,
+  reloadKey?: unknown,
 ): PanelList<T> {
   const [items, setItems] = useState<T[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -54,7 +57,7 @@ export function usePanelList<T>(
     if (!active) return;
     loadRef.current();
     return () => requestRef.current?.abort();
-  }, [active]);
+  }, [active, reloadKey]);
 
   return { items, error, load: loadRef.current };
 }

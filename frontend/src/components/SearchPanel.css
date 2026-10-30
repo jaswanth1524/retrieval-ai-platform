@@ -208,3 +208,29 @@
   color: inherit;
   border-radius: 2px;
 }
+
+/* "similar": passages like this one, beside each result. */
+.search-panel__similar {
+  flex-shrink: 0;
+  align-self: center;
+  margin-right: 6px;
+  border: 1px solid var(--rail-rule);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--rail-dim);
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.search-panel__similar:hover,
+.search-panel__similar:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+@media (pointer: coarse) {
+  .search-panel__similar {
+    min-height: 24px;
+  }
+}

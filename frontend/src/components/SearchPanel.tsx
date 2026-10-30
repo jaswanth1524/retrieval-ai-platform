@@ -5,7 +5,13 @@ import type { PassageNarrowing, SearchResultResponse } from '../api/types';
 import MarkedText from './MarkedText';
 import { snippetAround } from '../utils/snippet';
 import { toDateInput } from '../utils/dates';
-import { NO_FILTERS, type SearchFilters, positive, searchNarrowing } from '../utils/searchFilters';
+import {
+  NO_FILTERS,
+  type SearchFilters,
+  positive,
+  searchNarrowing,
+  searchTags,
+} from '../utils/searchFilters';
 import './SearchPanel.css';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
 import { pageLabel } from '../utils/pages';
@@ -17,18 +23,35 @@ interface SearchPanelProps {
   tags: string[];
   /** The conversation's page range (with exactly one document scoped) and upload date. */
   narrowing?: PassageNarrowing;
+  /** Every tag in use, for the tag filter. */
+  availableTags?: string[];
   /** Open the passage in the document viewer, its matching sentences marked. */
   onOpenSource: (filename: string, chunkId: string, highlights?: string[]) => void;
   /** Bumped by the panel's own action button to clear the search. */
   resetKey: number;
   onAuthFailure: (err: unknown) => boolean;
-  /** A search asked for from elsewhere (a "not found" answer): shown and run at once.
-   *  A new object (``id``) each time, so the same query can be asked for twice. */
-  request?: { query: string; id: number } | null;
+  /** A search asked for from elsewhere (a "not found" answer, or passages like one the
+   *  viewer shows): shown and run at once. A new object (``id``) each time, so the
+   *  same search can be asked for twice. */
+  request?: SearchRequestFromElsewhere | null;
   /** Ask the search's question over only the passages ticked here. */
   onAskAboutPassages?: (question: string, chunkIds: string[]) => void;
   /** Asking can't start now (booting, an answer streaming): the bar's button waits. */
   askDisabled?: boolean;
+}
+
+/** A query to search for, or a passage to find passages like. */
+export interface SearchRequestFromElsewhere {
+  query?: string;
+  like?: SimilarTo;
+  id: number;
+}
+
+/** The passage a "more like this" search starts from. */
+export interface SimilarTo {
+  chunkId: string;
+  /** How it is named while its results show ("handbook.pdf p.3"). */
+  label: string;
 }
 
 const SNIPPET_CHARS = 220;
@@ -44,6 +67,7 @@ function SearchPanel({
   filenames,
   tags,
   narrowing,
+  availableTags = [],
   onOpenSource,
   resetKey,
   onAuthFailure,
@@ -60,7 +84,13 @@ function SearchPanel({
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filters, setFilters] = useState<SearchFilters>(NO_FILTERS);
+  // The conversation scope the shown results were searched in: another conversation (or
+  // a scope change) leaves them describing documents that are no longer the scope.
+  const [searchedScope, setSearchedScope] = useState('');
+  // The passage the shown results are like (a "more like this" search), if they are.
+  const [like, setLike] = useState<SimilarTo | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
+  const scopeKey = JSON.stringify([filenames, tags, narrowing ?? null]);
   const setFilter = (name: keyof SearchFilters) => (value: string) =>
     setFilters((prev) => ({ ...prev, [name]: value }));
 
@@ -75,11 +105,12 @@ function SearchPanel({
     setError(null);
     setSearching(false);
     setFilters(NO_FILTERS);
+    setLike(null);
   }, [resetKey]);
 
-  const run = useStableHandler(async (text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
+  const run = useStableHandler(async (text: string, similarTo?: SimilarTo) => {
+    const trimmed = similarTo ? '' : text.trim();
+    if (!trimmed && !similarTo) return;
     // A newer search replaces one still running.
     controllerRef.current?.abort();
     const controller = new AbortController();
@@ -91,8 +122,9 @@ function SearchPanel({
       const response = await api.searchPassages(
         {
           query: trimmed,
+          ...(similarTo ? { like_chunk_id: similarTo.chunkId } : {}),
           ...(filenames.length > 0 ? { filenames } : {}),
-          ...(tags.length > 0 ? { tags } : {}),
+          ...(searchTags(filters, tags).length > 0 ? { tags: searchTags(filters, tags) } : {}),
           ...searchNarrowing(filters, narrowing),
           ...(count !== undefined ? { rerank_top_k: count } : {}),
         },
@@ -102,6 +134,8 @@ function SearchPanel({
       setResults(response.results);
       setPicked(new Set());
       setSearchedQuery(trimmed);
+      setLike(similarTo ?? null);
+      setSearchedScope(scopeKey);
       setWeak(response.weak_matches === true && response.results.length > 0);
     } catch (err) {
       if (controller.signal.aborted) return;
@@ -128,8 +162,14 @@ function SearchPanel({
 
   useEffect(() => {
     if (!request) return;
-    setQuery(request.query.slice(0, MAX_QUESTION_CHARS));
-    void run(request.query.slice(0, MAX_QUESTION_CHARS));
+    if (request.like) {
+      setQuery('');
+      void run('', request.like);
+      return;
+    }
+    const text = (request.query ?? '').slice(0, MAX_QUESTION_CHARS);
+    setQuery(text);
+    void run(text);
   }, [request, run]);
 
   const looking = searchNarrowing(filters, narrowing);
@@ -141,7 +181,9 @@ function SearchPanel({
     (looking.page_min !== undefined || looking.page_max !== undefined
       ? ` · p.${looking.page_min ?? 1}${looking.page_max !== undefined ? `–${looking.page_max}` : '+'}`
       : '') +
-    (looking.uploaded_after !== undefined ? ` · uploaded since ${toDateInput(looking.uploaded_after)}` : '');
+    (looking.uploaded_after !== undefined ? ` · uploaded since ${toDateInput(looking.uploaded_after)}` : '') +
+    (looking.uploaded_before !== undefined ? ` · up to ${toDateInput(looking.uploaded_before)}` : '') +
+    (filters.tag ? ` · #${filters.tag} only` : '');
 
   return (
     <>
@@ -222,6 +264,32 @@ function SearchPanel({
             />
           </label>
           <label>
+            <span>Uploaded up to</span>
+            <input
+              type="date"
+              value={filters.uploadedBefore}
+              onChange={(event) => setFilter('uploadedBefore')(event.target.value)}
+              data-testid="search-filter-uploaded-before"
+            />
+          </label>
+          {availableTags.length > 0 && (
+            <label>
+              <span>Tag</span>
+              <select
+                value={filters.tag}
+                onChange={(event) => setFilter('tag')(event.target.value)}
+                data-testid="search-filter-tag"
+              >
+                <option value="">{tags.length > 0 ? `the conversation's (#${tags.join(' #')})` : 'any'}</option>
+                {availableTags.map((tag) => (
+                  <option key={tag} value={tag}>
+                    #{tag}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label>
             <span>Results</span>
             <input
               type="number"
@@ -261,13 +329,23 @@ function SearchPanel({
       {results !== null && results.length === 0 && (
         <p className="search-panel__message">No passages matched.</p>
       )}
+      {like && results !== null && (
+        <p className="search-panel__message" data-testid="search-like">
+          Passages like {like.label}
+        </p>
+      )}
+      {results !== null && searchedScope !== scopeKey && (
+        <p className="search-panel__message" data-testid="search-stale">
+          These results are from another scope. Search again to look in this one.
+        </p>
+      )}
       {weak && results !== null && results.length > 0 && (
         <p className="search-panel__message" data-testid="search-weak">
           No strong matches. These are the closest passages — a fuller question usually finds
           better ones.
         </p>
       )}
-      {onAskAboutPassages && picked.size > 0 && (
+      {onAskAboutPassages && picked.size > 0 && searchedQuery && (
         <div className="search-panel__ask-bar" data-testid="search-ask-bar">
           <span className="mono">
             {picked.size} passage{picked.size === 1 ? '' : 's'} picked
@@ -339,13 +417,27 @@ function SearchPanel({
           </span>
           <span className="search-panel__snippet" dir="auto">
             <MarkedText
-              text={snippetAround(result.text, quotesOf(result), SNIPPET_CHARS)}
-              quotes={quotesOf(result)}
+              {...snippetAround(result.text, quotesOf(result), SNIPPET_CHARS)}
               className="search-panel__match"
               testId="search-match"
             />
           </span>
         </button>
+          <button
+            type="button"
+            className="search-panel__similar mono"
+            onClick={() =>
+              void run('', {
+                chunkId: result.chunk_id,
+                label: `${result.filename} ${pageLabel(result.page, result.page_end)}`,
+              })
+            }
+            aria-label={`Passages like passage ${result.rank} of ${result.filename}`}
+            title="Find passages like this one"
+            data-testid="search-similar"
+          >
+            similar
+          </button>
         </div>
       ))}
     </>

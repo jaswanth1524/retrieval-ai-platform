@@ -129,7 +129,10 @@ export interface ImportResponse {
 
 /** POST /search: the passages a question would be answered from, with no LLM involved. */
 export interface SearchRequest {
+  /** The query; may be empty when `like_chunk_id` is given. */
   query: string;
+  /** Search from this passage ("more like this") instead of the query. */
+  like_chunk_id?: string;
   filenames?: string[];
   tags?: string[];
   rerank_top_k?: number;
@@ -195,6 +198,10 @@ export interface QuestionOverrides {
   answerFormat?: AnswerFormat | null;
   /** A language name or "match"; null = the server's ANSWER_LANGUAGE. */
   answerLanguage?: string | null;
+  /** Answer from the matched passages alone, without their neighbouring text. */
+  passagesOnly?: boolean;
+  /** Say "not found" rather than answer from weak matches. */
+  strongMatchesOnly?: boolean;
 }
 
 export interface DocumentIngestResponse {
@@ -238,6 +245,10 @@ export interface DocumentJobStatusResponse {
   created_at?: number | null;
   /** Found the document already indexed from identical bytes; nothing re-embedded. */
   unchanged?: boolean;
+  /** What started it: upload, url, reindex, restore, import, watch. */
+  kind?: string;
+  /** Failed, and POST /documents/jobs/{id}/retry can run it again. */
+  retryable?: boolean;
 }
 
 /** GET /documents/jobs: queued and running jobs, whoever started them. */
@@ -269,6 +280,43 @@ export interface DocumentListResponse {
   tags?: Record<string, string[]>;
   /** Documents fetched by URL: where from (POST /documents/{f}/refresh fetches again). */
   source_urls?: Record<string, string>;
+  /** The scheduled refresh of each document fetched by URL. */
+  url_refresh?: Record<string, UrlRefreshStatusResponse>;
+}
+
+export interface UrlRefreshStatusResponse {
+  /** Its own interval in minutes (0 = never); null = the server's. */
+  refresh_minutes?: number | null;
+  last_checked?: number | null;
+  /** unchanged, queued or failed. */
+  last_outcome?: string | null;
+  failures?: number;
+  /** Unix seconds; null when it is never checked. */
+  next_due?: number | null;
+}
+
+/** PATCH /documents/{f}/refresh-settings */
+export interface DocumentRefreshSettingsResponse {
+  filename: string;
+  refresh_minutes: number | null;
+}
+
+/** POST /documents/preview: how a file would be indexed. */
+export interface PreviewChunkResponse {
+  ordinal: number;
+  page: number;
+  page_end?: number | null;
+  section: string;
+  text: string;
+}
+
+export interface DocumentPreviewResponse {
+  filename: string;
+  section_count: number;
+  chunk_count: number;
+  page_count: number;
+  section_labels: string[];
+  first_chunks: PreviewChunkResponse[];
 }
 
 export interface DocumentTagsResponse {
@@ -477,6 +525,10 @@ export interface TraceConfigResponse {
   narrowing?: Record<string, unknown> | null;
   /** The model the provider was asked for. */
   llm_model?: string | null;
+  /** Neighbouring passages added per side (0 = passages only). */
+  context_neighbor_radius?: number | null;
+  /** Closest passages used when none cleared the bar (0 = none). */
+  rerank_fallback_count?: number | null;
 }
 
 /** GET /query-log: one logged question (QUERY_LOG_ENABLED). */
@@ -529,6 +581,9 @@ export interface TraceSummaryResponse {
   total_ms: number | null;
   candidate_count: number;
   kept_count: number;
+  /** answered, uncited, insufficient_context, no_context (extensible). */
+  answer_status?: string | null;
+  top_rerank_score?: number | null;
 }
 
 export interface TraceListResponse {

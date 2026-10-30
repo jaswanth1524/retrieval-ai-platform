@@ -32,6 +32,7 @@ function documentsFrom(response: DocumentListResponse): Record<string, DocumentM
       reindexable: reindexable.has(filename),
       tags: response.tags?.[filename] ?? [],
       ...(response.source_urls?.[filename] ? { sourceUrl: response.source_urls[filename] } : {}),
+      ...(response.url_refresh?.[filename] ? { urlRefresh: response.url_refresh[filename] } : {}),
     };
   }
   return documents;
@@ -126,6 +127,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       listingSequence += 1;
       setIndexedFilenames([]);
       setDocuments({});
+      // Tags typed for the previous workspace's uploads would tag this one's.
+      setUploadTags([]);
       setUploads((prev) =>
         prev.some((item) => item.status === 'success')
           ? prev.filter((item) => item.status !== 'success')
@@ -425,6 +428,27 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest(workspace);
     };
 
+    // How often a fetched document is checked again (minutes; 0 never; null the server's).
+    const handleSetRefreshInterval = async (
+      filename: string,
+      minutes: number | null,
+      workspace = getWorkspace(),
+    ) => {
+      try {
+        await api.setRefreshInterval(filename, minutes, undefined, workspace);
+      } catch (err) {
+        if (!deps.current.onAuthFailure(err)) {
+          deps.current.pushToast({
+            tone: 'bad',
+            title: `Couldn't change how often ${filename} is checked`,
+            body: apiErrorMessage(err, 'Try again in a moment.'),
+          });
+        }
+        return;
+      }
+      await refreshDocuments();
+    };
+
     // Several documents chosen at once: started together and followed together, with
     // one listing refresh at the end — handleReindex per document refreshed the whole
     // listing once per document.
@@ -608,6 +632,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleReindex,
       handleRestoreVersion,
       handleRefreshFromUrl,
+      handleSetRefreshInterval,
       handleReindexMany,
       handleReindexAllStale,
       handleDeleteDocument,

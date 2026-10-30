@@ -7,7 +7,9 @@ import type {
   DocumentJobAcceptedResponse,
   DocumentJobListResponse,
   DocumentJobStatusResponse,
+  DocumentPreviewResponse,
   DocumentRefreshResponse,
+  DocumentRefreshSettingsResponse,
   DocumentListResponse,
   DocumentReindexAllResponse,
   DocumentTagsResponse,
@@ -306,7 +308,7 @@ function isTransientPollError(err: unknown): boolean {
   return err.statusCode === undefined || err.statusCode >= 500;
 }
 
-function questionRequestBody(
+export function questionRequestBody(
   question: string,
   llmProvider?: LlmProvider,
   overrides?: QuestionOverrides,
@@ -330,6 +332,8 @@ function questionRequestBody(
   if (answerFormat) body.answer_format = answerFormat;
   const answerLanguage = options?.answerLanguage ?? overrides?.answerLanguage;
   if (answerLanguage) body.answer_language = answerLanguage;
+  if (overrides?.passagesOnly) body.passages_only = true;
+  if (overrides?.strongMatchesOnly) body.strong_matches_only = true;
   return body;
 }
 
@@ -499,6 +503,19 @@ export const api = {
     });
   },
 
+  // How a file would be indexed (its sections and first passages), indexing nothing.
+  previewDocument: (file: File, signal?: AbortSignal, workspace?: string) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<DocumentPreviewResponse>('/documents/preview', {
+      method: 'POST',
+      body: form,
+      timeoutMs: uploadTimeoutMs(file.size),
+      signal,
+      workspace,
+    });
+  },
+
   // Workspaces besides the default (GET answers {enabled: false} when they are off).
   listWorkspaces: (signal?: AbortSignal) =>
     request<WorkspaceListResponse>('/workspaces', { signal }),
@@ -546,6 +563,35 @@ export const api = {
       signal,
       workspace,
     }),
+
+  // Runs a failed job again as it was asked for (a URL fetched again, a re-index);
+  // 409 for an upload, whose bytes weren't kept.
+  retryDocumentJob: (jobId: string, signal?: AbortSignal, workspace?: string) =>
+    request<DocumentJobAcceptedResponse>(`/documents/jobs/${encodeURIComponent(jobId)}/retry`, {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+      workspace,
+    }),
+
+  // How often a fetched document is checked again: minutes, 0 = never, null = the
+  // server's interval.
+  setRefreshInterval: (
+    filename: string,
+    refreshMinutes: number | null,
+    signal?: AbortSignal,
+    workspace?: string,
+  ) =>
+    request<DocumentRefreshSettingsResponse>(
+      `/documents/${encodeURIComponent(filename)}/refresh-settings`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_minutes: refreshMinutes }),
+        signal,
+        workspace,
+      },
+    ),
 
   // Re-indexes every document chunked by an older chunker that has a stored original.
   reindexStaleDocuments: (signal?: AbortSignal, workspace?: string) =>
@@ -647,8 +693,13 @@ export const api = {
     request<TraceDetailResponse>(`/traces/${encodeURIComponent(traceId)}`, { signal }),
 
   // Lists recent query traces (newest first) for the trace history browser.
-  listTraces: (signal?: AbortSignal) =>
-    request<TraceListResponse>('/traces', { signal }),
+  listTraces: (signal?: AbortSignal, answerStatuses: readonly string[] = []) =>
+    request<TraceListResponse>(
+      answerStatuses.length > 0
+        ? `/traces?${answerStatuses.map((status) => `answer_status=${encodeURIComponent(status)}`).join('&')}`
+        : '/traces',
+      { signal },
+    ),
 
   // Every trace of this workspace as JSON Lines (full key): all archived ones with
   // TRACE_STORE_PATH, else the ones the server still holds in memory.
@@ -661,8 +712,10 @@ export const api = {
 
   // Every logged question and summary, newest first (QUERY_LOG_ENABLED; full key; 404
   // when the log is off). The Asked questions panel picks the unanswered ones out.
-  listQueryLog: (limit = 500, signal?: AbortSignal) =>
-    request<QueryLogResponse>(`/query-log?limit=${limit}`, { signal }),
+  listQueryLog: (limit = 500, signal?: AbortSignal, uncovered = false) =>
+    request<QueryLogResponse>(`/query-log?limit=${limit}${uncovered ? '&uncovered=true' : ''}`, {
+      signal,
+    }),
 
   // Earlier originals of a document kept when it was replaced (RAW_DOCUMENT_VERSIONS).
   listDocumentVersions: (filename: string, signal?: AbortSignal, workspace?: string) =>

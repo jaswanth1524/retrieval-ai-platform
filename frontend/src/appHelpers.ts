@@ -27,6 +27,8 @@ export function loadPersistedOverrides(): QuestionOverrides {
       typeof parsed.answerLanguage === 'string' && isAnswerLanguage(parsed.answerLanguage)
         ? parsed.answerLanguage.trim()
         : null,
+    ...(parsed.passagesOnly === true ? { passagesOnly: true } : {}),
+    ...(parsed.strongMatchesOnly === true ? { strongMatchesOnly: true } : {}),
   };
 }
 
@@ -54,6 +56,8 @@ export function clampOverrides(
     llmTemperature: within(overrides.llmTemperature, config.llm_temperature_max, 0),
     answerFormat: overrides.answerFormat ?? null,
     answerLanguage: overrides.answerLanguage ?? null,
+    ...(overrides.passagesOnly ? { passagesOnly: true } : {}),
+    ...(overrides.strongMatchesOnly ? { strongMatchesOnly: true } : {}),
   };
 }
 
@@ -99,6 +103,7 @@ export const NO_SOURCES: CitationResponse[] = [];
 
 export const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
   chat: { title: 'Conversations', actionLabel: 'New' },
+  saved: { title: 'Saved answers', actionLabel: 'Export' },
   corpus: { title: 'Corpus', actionLabel: 'Upload' },
   search: { title: 'Search passages', actionLabel: 'Clear' },
   traces: { title: 'Traces', actionLabel: 'Refresh' },

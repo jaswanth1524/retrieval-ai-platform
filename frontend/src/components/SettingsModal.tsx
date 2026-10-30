@@ -314,6 +314,37 @@ function SettingsModal({
                 ? 'A language name (“German”), or “match” to answer in the question’s language.'
                 : 'A language name, or “match” for the question’s own. Empty uses the server’s setting.'}
             </p>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={Boolean(draftOverrides.passagesOnly)}
+                onChange={(event) =>
+                  setDraftOverrides({ ...draftOverrides, passagesOnly: event.target.checked })
+                }
+                disabled={disabled}
+                data-testid="settings-passages-only"
+              />
+              Matched passages only
+            </label>
+            <p className="settings__hint">
+              Leave out the text around each matched passage: stricter, for checking exactly
+              what a passage says.
+            </p>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={Boolean(draftOverrides.strongMatchesOnly)}
+                onChange={(event) =>
+                  setDraftOverrides({ ...draftOverrides, strongMatchesOnly: event.target.checked })
+                }
+                disabled={disabled}
+                data-testid="settings-strong-only"
+              />
+              Strong matches only
+            </label>
+            <p className="settings__hint">
+              Say “not found” rather than answer from passages that only match weakly.
+            </p>
           </section>
 
           <section className="settings__section">
