@@ -29,6 +29,8 @@ backend:
 	uv run python -m eval.harness validate eval/datasets/paraphrase_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/compare_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/mixed_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/recency_eval.jsonl
+	uv run python -m eval.make_mixed_corpus --check
 	req=$$(mktemp) && uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$$req" \
 		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req"; \
 		status=$$?; rm -f "$$req"; exit $$status

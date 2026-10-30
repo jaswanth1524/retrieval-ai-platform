@@ -113,6 +113,8 @@ jobs:
           uv run python -m eval.harness validate eval/datasets/paraphrase_eval.jsonl
           uv run python -m eval.harness validate eval/datasets/compare_eval.jsonl
           uv run python -m eval.harness validate eval/datasets/mixed_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/recency_eval.jsonl
+          uv run python -m eval.make_mixed_corpus --check
 
       - name: Audit runtime dependencies
         # Once: the lockfile is the same on every Python version.
@@ -213,13 +215,33 @@ jobs:
             --baseline eval/baselines/handbook_reranked.json --max-regression 0.06 \
             --output eval-results.json
 
+      # The same handbook as PDF, DOCX, HTML, ODT, PPTX and XLSX (eval/corpus_mixed):
+      # a parser change that loses text shows up here, broken down by format. Its
+      # baseline was measured on arm64; the same one-question allowance applies.
+      - name: Mixed-format retrieval eval vs baseline
+        env:
+          LITELLM_MODE: PRODUCTION
+          QDRANT_URL: http://127.0.0.1:6333
+          QDRANT_COLLECTION: eval_mixed
+          CHUNK_SIZE_TOKENS: "48"
+          CHUNK_OVERLAP_TOKENS: "8"
+          MIN_SECTION_WORDS: "0"
+        run: |
+          export FASTEMBED_CACHE_PATH="$HOME/.cache/fastembed"
+          uv run python -m eval.harness ingest eval/corpus_mixed
+          uv run python -m eval.harness retrieval eval/datasets/mixed_eval.jsonl \
+            --baseline eval/baselines/mixed_reranked.json --max-regression 0.06 \
+            --output eval-mixed-results.json
+
       - name: Upload eval results
         # Also on a regression: the numbers are what a baseline refresh is made from.
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: eval-results
-          path: eval-results.json
+          path: |
+            eval-results.json
+            eval-mixed-results.json
           if-no-files-found: ignore
           retention-days: 14
 

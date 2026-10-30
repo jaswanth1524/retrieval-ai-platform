@@ -1,0 +1,6 @@
+{"question": "How many days a week can employees work remotely?", "relevant_filenames": ["remote_work_guidelines.md"], "relevant_passages": ["up to three days a week"], "answer_contains": ["three days", "3 days"]}
+{"question": "Is a monitor provided for working from home?", "relevant_filenames": ["remote_work_guidelines.md"], "relevant_passages": ["a headset and a monitor for remote work"], "answer_contains": ["monitor"]}
+{"question": "What is the daily meal allowance when travelling abroad?", "relevant_filenames": ["travel_allowances.md"], "relevant_passages": ["The daily meal allowance for business travel abroad is forty euros"], "answer_contains": ["forty euros", "40 euros", "€40"]}
+{"question": "How much is mileage reimbursed per kilometre?", "relevant_filenames": ["travel_allowances.md"], "relevant_passages": ["0.30 euros per kilometre"], "answer_contains": ["0.30"]}
+{"question": "How often do passwords have to be changed?", "relevant_filenames": ["account_security_standard.md"], "relevant_passages": ["Passwords are not changed on a schedule"], "answer_contains": ["not changed on a schedule", "only when"]}
+{"question": "What is the minimum password length?", "relevant_filenames": ["account_security_standard.md"], "relevant_passages": ["at least fourteen characters long"], "answer_contains": ["fourteen", "14"]}

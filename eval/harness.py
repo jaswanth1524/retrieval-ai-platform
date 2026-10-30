@@ -29,6 +29,7 @@ collaborators as parameters so tests can inject in-memory fakes.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import platform
@@ -36,7 +37,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from api.documents import CHUNKER_VERSION, SUPPORTED_EXTENSIONS
@@ -372,6 +373,7 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
         "rerank_fallback_count": int(settings.rerank_fallback_count),
         # Trims the kept passages relative to the best one (0 = off).
         "rerank_relative_floor": float(settings.rerank_relative_floor),
+        "recency_boost_weight": float(settings.recency_boost_weight),
         "fused_top_n": int(settings.fused_top_n),
         "context_neighbor_radius": int(settings.context_neighbor_radius),
         # With a cap, adjacent passages are no longer dropped as duplicates of a kept one.
@@ -412,6 +414,8 @@ def run_retrieval_eval(
     chunk_rows: list[dict[str, float]] = []
     no_context_rows: list[dict[str, float]] = []
     latencies: list[float] = []
+    # Filename and chunk scores by the format of the files a question is labelled with.
+    by_format: dict[str, dict[str, list[dict[str, float]]]] = {}
     passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
     for index, example in enumerate(examples):
         ranked = rank_for_question(
@@ -436,15 +440,24 @@ def run_retrieval_eval(
             kept_nothing = not ranked.chunk_ids or ranked.below_min_score
             entry["no_context"] = kept_nothing
             no_context_rows.append({"no_context_rate": 1.0 if kept_nothing else 0.0})
+        formats = sorted(
+            {PurePosixPath(name).suffix.lower() or "(none)" for name in example.relevant_filenames}
+        )
+        if formats:
+            entry["formats"] = formats
         if example.relevant_filenames:
             file_scores = score_ranking(ranked.filenames, example.relevant_filenames, ks)
             entry["filename"] = file_scores
             filename_rows.append(file_scores)
+            for suffix in formats:
+                by_format.setdefault(suffix, {}).setdefault("filename", []).append(file_scores)
         relevant_chunks = example.relevant_chunk_ids | passage_ids.get(index, frozenset())
         if relevant_chunks:
             chunk_scores = score_ranking(ranked.chunk_ids, relevant_chunks, ks)
             entry["chunk"] = chunk_scores
             chunk_rows.append(chunk_scores)
+            for suffix in formats:
+                by_format.setdefault(suffix, {}).setdefault("chunk", []).append(chunk_scores)
         per_question.append(entry)
 
     levels = {"filename": aggregate(filename_rows), "chunk": aggregate(chunk_rows)}
@@ -452,7 +465,7 @@ def run_retrieval_eval(
         # Only with such questions, so a baseline from a dataset without them keeps its
         # shape.
         levels["unanswerable"] = aggregate(no_context_rows)
-    return {
+    result: dict[str, Any] = {
         "fingerprint": settings_fingerprint(collaborators.settings, arm),
         "k_values": list(ks),
         "question_count": len(examples),
@@ -461,6 +474,18 @@ def run_retrieval_eval(
         "latency_ms": latency_summary(latencies),
         "per_question": per_question,
     }
+    if len(by_format) > 1:
+        # A corpus of several formats (corpus_mixed): how each parser's documents rank.
+        # Beside "aggregate", not in it, so baselines keep their shape and aren't judged
+        # on it.
+        result["by_format"] = {
+            suffix: {
+                level: aggregate(rows) | {"questions": float(len(rows))}
+                for level, rows in sorted(levels_by.items())
+            }
+            for suffix, levels_by in sorted(by_format.items())
+        }
+    return result
 
 
 def latency_summary(values: Sequence[float]) -> dict[str, float]:
@@ -786,10 +811,35 @@ def ingest_directory(directory: Path, settings: AppSettings) -> int:
         settings,
         make_token_counter(settings.dense_embedding_model),
     )
+    stamps = upload_times(directory)
     for path in files:
-        outcome = service.ingest(path.name, path.read_bytes())
+        outcome = service.ingest(path.name, path.read_bytes(), uploaded_at=stamps.get(path.name))
         print(f"{outcome.filename}: {outcome.chunks_ingested} chunks")
     return 0
+
+
+# A corpus may say when each of its documents was uploaded (a dotfile, so it is never
+# ingested itself): {"policy.md": "2021-03-01", ...}. Documents it doesn't name are
+# stamped with the time they are ingested, as an upload is.
+UPLOAD_TIMES_FILE = ".uploaded_at.json"
+
+
+def upload_times(directory: Path) -> dict[str, float]:
+    """``directory``'s ``UPLOAD_TIMES_FILE`` as filename -> Unix seconds (UTC dates)."""
+
+    path = directory / UPLOAD_TIMES_FILE
+    if not path.is_file():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected an object of filename -> ISO date")
+    stamps: dict[str, float] = {}
+    for name, value in raw.items():
+        when = datetime.datetime.fromisoformat(str(value))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.UTC)
+        stamps[str(name)] = when.timestamp()
+    return stamps
 
 
 def _emit(results: dict[str, Any], output: Path | None) -> None:

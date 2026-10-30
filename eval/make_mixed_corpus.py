@@ -8,9 +8,11 @@ copies the rest, so ``eval/datasets/mixed_eval.jsonl`` (the handbook questions, 
 scores the parsers against the Markdown baseline.
 
     uv run python -m eval.make_mixed_corpus
+    uv run python -m eval.make_mixed_corpus --check   # CI: is the committed copy current?
 
 Regenerate it only when the handbook corpus changes; Office formats embed timestamps,
-so the bytes differ from run to run.
+so the bytes differ from run to run — ``--check`` therefore compares what the parsers
+read from each file (and the dataset), not the bytes.
 """
 
 from __future__ import annotations
@@ -263,7 +265,52 @@ def build(target: Path = TARGET) -> list[str]:
     return written
 
 
-def main() -> int:
+def parsed(path: Path) -> list[tuple[int, str, str]]:
+    """What indexing reads from ``path``: each section's page, label and text."""
+
+    from api.documents import parse_document_bytes
+
+    return [
+        (section.page, section.section, section.text)
+        for section in parse_document_bytes(path.name, path.read_bytes())
+    ]
+
+
+def drift(committed: Path = TARGET) -> list[str]:
+    """How the committed corpus and dataset differ from a fresh build, by what the
+    parsers read (empty when current)."""
+
+    import tempfile
+
+    problems: list[str] = []
+    with tempfile.TemporaryDirectory() as scratch:
+        fresh = Path(scratch) / "corpus_mixed"
+        names = build(fresh)
+        present = sorted(path.name for path in committed.iterdir() if path.is_file())
+        if sorted(names) != present:
+            problems.append(f"files: committed {present}, built {sorted(names)}")
+        for name in names:
+            if (committed / name).is_file() and parsed(committed / name) != parsed(fresh / name):
+                problems.append(f"{name}: the committed file reads differently from a fresh build")
+        dataset = Path(scratch) / "mixed_eval.jsonl"
+        build_dataset(EVAL / "datasets" / "handbook_eval.jsonl", dataset)
+        if dataset.read_text(encoding="utf-8") != (
+            EVAL / "datasets" / "mixed_eval.jsonl"
+        ).read_text(encoding="utf-8"):
+            problems.append("mixed_eval.jsonl: differs from the handbook questions renamed")
+    return problems
+
+
+def main(argv: list[str] | None = None) -> int:
+    if "--check" in (argv if argv is not None else sys.argv[1:]):
+        problems = drift()
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        if problems:
+            print("Regenerate with: uv run python -m eval.make_mixed_corpus", file=sys.stderr)
+            return 1
+        print("eval/corpus_mixed is current.")
+        return 0
     for name in build():
         print(name)
     count = build_dataset(

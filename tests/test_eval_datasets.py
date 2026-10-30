@@ -24,6 +24,7 @@ PAIRS = [
     ("paraphrase_eval.jsonl", "corpus_handbook"),
     ("compare_eval.jsonl", "corpus_handbook"),
     ("mixed_eval.jsonl", "corpus_mixed"),
+    ("recency_eval.jsonl", "corpus_recency"),
 ]
 
 
@@ -93,3 +94,21 @@ def test_the_mixed_corpus_is_the_handbook_in_other_formats() -> None:
     handbook_questions = load_retrieval_dataset(EVAL / "datasets" / "handbook_eval.jsonl")
     mixed_questions = load_retrieval_dataset(EVAL / "datasets" / "mixed_eval.jsonl")
     assert [e.question for e in mixed_questions] == [e.question for e in handbook_questions]
+
+
+def test_the_mixed_corpus_check_finds_a_file_that_reads_differently(tmp_path: Path) -> None:
+    import shutil
+
+    from eval.make_mixed_corpus import TARGET, drift
+
+    assert drift() == []
+    copy = tmp_path / "corpus_mixed"
+    shutil.copytree(TARGET, copy)
+    page = copy / "leave_policy.html"
+    page.write_text(page.read_text().replace("<p>", "<p>Edited by hand. ", 1))
+    (copy / "stray.md").write_text("# Stray")
+
+    problems = drift(copy)
+
+    assert any("leave_policy.html" in problem for problem in problems)
+    assert any(problem.startswith("files:") for problem in problems)

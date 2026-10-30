@@ -142,6 +142,39 @@ def test_run_retrieval_eval_scores_against_labels() -> None:
     assert results["aggregate"]["chunk"] == {}  # no chunk labels supplied
 
 
+def test_a_run_over_several_formats_is_broken_down_by_format() -> None:
+    from eval.harness import Collaborators, RetrievalExample
+
+    points = [_point("c1", "a.pdf"), _point("c2", "b.docx")]
+
+    class FakeCollaborators(Collaborators):
+        def __init__(self) -> None:  # bypass heavy real construction
+            self.settings = make_settings()
+            self.repository = FakeRepository(points)
+            self.embedding_provider = FakeEmbeddingProvider()
+            self.reranker = FakeReranker(["c1", "c2"])
+            self.generator = None  # type: ignore[assignment]
+
+    def example(question: str, filename: str) -> RetrievalExample:
+        return RetrievalExample(
+            question=question,
+            reference=None,
+            relevant_filenames=frozenset({filename}),
+            relevant_chunk_ids=frozenset(),
+        )
+
+    results = run_retrieval_eval(
+        [example("q1", "a.pdf"), example("q2", "b.docx")], FakeCollaborators(), ks=(1,)
+    )
+    assert results["by_format"][".pdf"]["filename"]["hit@1"] == 1.0
+    assert results["by_format"][".docx"]["filename"]["hit@1"] == 0.0
+    assert results["by_format"][".docx"]["filename"]["questions"] == 1.0
+    assert results["per_question"][0]["formats"] == [".pdf"]
+    # One format only: no breakdown (a single-format baseline keeps its shape).
+    single = run_retrieval_eval([example("q1", "a.pdf")], FakeCollaborators(), ks=(1,))
+    assert "by_format" not in single
+
+
 def test_load_retrieval_dataset_reads_jsonl(tmp_path: Path) -> None:
     path = tmp_path / "d.jsonl"
     path.write_text(
@@ -788,3 +821,16 @@ def test_main_runs_retrieval_and_answer_modes_with_their_options(
     bad.write_text("{oops\n", encoding="utf-8")
     assert harness.main(["retrieval", str(bad)]) == 2
     assert "Invalid JSON" in capsys.readouterr().err
+
+
+def test_a_corpus_can_say_when_its_documents_were_uploaded(tmp_path: Path) -> None:
+    from eval.harness import UPLOAD_TIMES_FILE, ingestible_files, upload_times
+
+    (tmp_path / "a.md").write_text("# A")
+    (tmp_path / UPLOAD_TIMES_FILE).write_text('{"a.md": "2021-03-01"}')
+
+    assert upload_times(tmp_path) == {"a.md": 1614556800.0}
+    # The manifest is a dotfile: never ingested itself.
+    files, _ = ingestible_files(tmp_path)
+    assert [path.name for path in files] == ["a.md"]
+    assert upload_times(tmp_path / "missing") == {}
