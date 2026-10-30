@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import zipfile
@@ -48,6 +49,51 @@ def corpus(tmp_path: Path) -> Path:
     (root / "image.bin").write_bytes(b"\x00\x01")
     (root / ".hidden.txt").write_text("not this")
     return root
+
+
+def test_ingest_filters_with_globs_and_tags_every_file(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    root = corpus(tmp_path)
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "readme.md").write_text("# Vendored")
+    (root / "tool.txt").write_text("Intro\nNot this one.")
+
+    files, _ = ingestible([root], {".txt", ".md"}, exclude=["node_modules", "tool.*"], include=())
+    assert sorted(p.name for p in files) == ["guide.txt", "notes.md"]
+    files, _ = ingestible([root], {".txt", ".md"}, include=["nested/*"])
+    assert [p.name for p in files] == ["notes.md"]
+
+    code, out = run(
+        client,
+        "ingest",
+        str(root),
+        "--exclude",
+        "node_modules",
+        "--exclude",
+        "tool.txt",
+        "--tag",
+        "hr",
+    )
+    assert code == 0, out
+    assert "2 indexed" in out
+    tags = client._json("GET", "/documents")["tags"]  # noqa: SLF001
+    assert tags == {"guide.txt": ["hr"], "notes.md": ["hr"]}
+
+
+def test_preview_shows_the_passages_and_indexes_nothing(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    path = tmp_path / "policy.md"
+    path.write_text("# Leave\n\nAnnual leave is twenty days.")
+
+    code, out = run(client, "preview", str(path))
+
+    assert code == 0, out
+    assert out.startswith("policy.md: ") and "twenty days" in out
+    code, out = run(client, "--json", "preview", str(path))
+    assert json.loads(out)["chunk_count"] >= 1
+    assert client._json("GET", "/documents")["filenames"] == []  # noqa: SLF001
 
 
 def test_ingest_walks_directories_and_reports_each_file(
@@ -1030,6 +1076,7 @@ class FakeServer:
                 "jobs": [{**job, "state": "embedding", "chunks_total": 10, "chunks_done": 4}]
             },
             ("DELETE", "/documents/jobs/j1"): {**job, "cancelled": True},
+            ("POST", "/documents/jobs/old/retry"): job,
             ("GET", "/workspaces"): {
                 "enabled": self.workspaces_enabled,
                 "workspaces": ["legal"] if self.workspaces_enabled else [],
@@ -1045,6 +1092,9 @@ class FakeServer:
             },
             ("POST", "/watch/scan"): {"folder": "/inbox"},
         }
+        if method == "PATCH" and path == "/documents/a.txt/refresh-settings":
+            sent = json.loads(request.content)
+            return httpx.Response(200, json={"filename": "a.txt", **sent})
         body = routes.get((method, path))
         if body is None:
             return httpx.Response(404, json={"detail": f"no route {method} {path}"})
@@ -1071,6 +1121,48 @@ def test_refresh_follows_a_job_or_says_unchanged() -> None:
     assert json.loads(out)["unchanged"] is True
     code, out = run(mock_client(FakeServer()), "refresh", "a.txt", "--json")
     assert json.loads(out)[0]["state"] == "done"
+
+
+def test_refresh_every_sets_how_often_a_document_is_checked() -> None:
+    server = FakeServer()
+    code, out = run(mock_client(server), "refresh", "a.txt", "--every", "30")
+    assert code == 0 and out.strip() == "a.txt: checked every 30 min"
+    assert server.log == ["PATCH /documents/a.txt/refresh-settings"]
+    code, out = run(mock_client(FakeServer()), "refresh", "a.txt", "--every", "never")
+    assert out.strip() == "a.txt: checked never"
+    code, out = run(mock_client(FakeServer()), "refresh", "a.txt", "--every", "default")
+    assert out.strip() == "a.txt: checked the server's interval"
+    with pytest.raises(SystemExit):
+        run(mock_client(FakeServer()), "refresh", "a.txt", "--every", "soon")
+
+
+def test_add_url_sends_tags_and_a_refresh_interval() -> None:
+    sent: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/documents/from-url":
+            sent.append(json.loads(request.content))
+            return httpx.Response(202, json={"job_id": "j1", "filename": "p.txt"})
+        return httpx.Response(200, json={"job_id": "j1", "filename": "p.txt", "state": "done"})
+
+    code, _ = run(
+        mock_client(handler),
+        "add-url",
+        "https://example.com/p.txt",
+        "--tag",
+        "hr",
+        "--refresh-minutes",
+        "0",
+    )
+    assert code == 0
+    assert sent == [{"url": "https://example.com/p.txt", "tags": ["hr"], "refresh_minutes": 0}]
+
+
+def test_jobs_retry_follows_the_new_job() -> None:
+    server = FakeServer()
+    code, out = run(mock_client(server), "jobs", "--retry", "old")
+    assert code == 0 and "ok    a.txt" in out
+    assert server.log[0] == "POST /documents/jobs/old/retry"
 
 
 def test_versions_lists_and_restores() -> None:
@@ -1169,6 +1261,8 @@ def test_ask_sends_the_narrowing_and_answer_style(client: DocragClient, tmp_path
         "bullets",
         "--language",
         "match",
+        "--passages-only",
+        "--strong-only",
     )
 
     assert code == 0, out
@@ -1180,9 +1274,22 @@ def test_ask_sends_the_narrowing_and_answer_style(client: DocragClient, tmp_path
             "exclude_filenames": ["notes.md"],
             "answer_format": "bullets",
             "answer_language": "match",
+            "passages_only": True,
+            "strong_matches_only": True,
         }
     ]
     assert json.loads(out)["sources"][0]["filename"] == "guide.txt"
+
+
+def test_search_from_a_passage(client: DocragClient, tmp_path: Path) -> None:
+    run(client, "ingest", str(corpus(tmp_path)))
+    first = json.loads(run(client, "--json", "search", "alpha")[1])[0]
+
+    code, out = run(client, "--json", "search", "--like", first["chunk_id"])
+
+    assert code == 0, out
+    assert first["chunk_id"] not in {item["chunk_id"] for item in json.loads(out)}
+    assert run(client, "search")[0] == 2
 
 
 def test_search_takes_the_same_narrowing_as_ask(client: DocragClient, tmp_path: Path) -> None:
@@ -1253,6 +1360,10 @@ def test_traces_feedback_original_and_failed_jobs(
 
         code, out = run(client, "traces")
         assert code == 0 and trace_id in out
+        code, out = run(client, "traces", "--status", "no_context")
+        assert code == 0 and trace_id not in out
+        code, out = run(client, "traces", "--status", "answered", "--status", "uncited")
+        assert code == 0 and trace_id in out
         code, out = run(client, "traces", "show", trace_id)
         assert code == 0 and out.startswith("alpha")
         code, _ = run(client, "traces", "export", str(tmp_path / "traces.jsonl"))
@@ -1288,3 +1399,20 @@ def test_traces_feedback_original_and_failed_jobs(
         client.close()
     clear_dependency_caches()
     capsys.readouterr()
+
+
+def test_an_upper_upload_date_includes_that_whole_day() -> None:
+    import datetime
+
+    from cli.__main__ import upload_time, upload_time_until
+    from cli.client import upload_bound
+
+    midnight = datetime.datetime(2024, 5, 31).timestamp()
+    assert upload_time("2024-05-31") == midnight
+    # A document uploaded at noon that day is "uploaded before 2024-05-31" for a person.
+    assert upload_time_until("2024-05-31") == midnight + 86_399
+    # A date-time is exactly that moment, either way.
+    noon = datetime.datetime(2024, 5, 31, 12, 0).timestamp()
+    assert upload_bound("2024-05-31T12:00", end_of_day=True) == noon
+    with pytest.raises(argparse.ArgumentTypeError):
+        upload_time_until("soon")

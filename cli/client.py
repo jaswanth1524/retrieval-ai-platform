@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,22 @@ def _detail(response: httpx.Response) -> str:
     if isinstance(detail, list):  # FastAPI validation errors
         return "; ".join(str(item.get("msg", item)) for item in detail if isinstance(item, dict))
     return str(detail) if detail else response.reason_phrase
+
+
+def upload_bound(value: str, *, end_of_day: bool = False) -> float:
+    """An upload-date bound as Unix seconds: an ISO date or date-time, local time when it
+    names no zone. A bare date as the upper bound means through that whole day (the
+    server's ``uploaded_before`` includes its value), as the web UI reads it: its
+    midnight would leave out every document uploaded that day. ValueError if it isn't
+    one."""
+
+    text = value.strip()
+    moment = datetime.datetime.fromisoformat(text)
+    try:
+        datetime.date.fromisoformat(text)
+    except ValueError:
+        return moment.timestamp()  # a date-time: exactly that moment
+    return moment.timestamp() + (86_399 if end_of_day else 0)
 
 
 def _retry_after(response: httpx.Response, default: float = 5.0) -> float:
@@ -260,10 +277,13 @@ class DocragClient:
         result: dict[str, Any] = _response_json(response)
         return result
 
-    def traces(self) -> list[dict[str, Any]]:
-        """Recent question traces, newest first (one line each)."""
+    def traces(self, statuses: Sequence[str] = ()) -> list[dict[str, Any]]:
+        """Recent question traces, newest first (one line each); with ``statuses``
+        only those answered that way (answered, uncited, insufficient_context,
+        no_context)."""
 
-        result: dict[str, Any] = self._json("GET", "/traces")
+        params = [("answer_status", status) for status in statuses]
+        result: dict[str, Any] = self._json("GET", "/traces", params=params or None)
         return list(result.get("traces", []))
 
     def trace(self, trace_id: str) -> dict[str, Any]:
@@ -445,9 +465,12 @@ class DocragClient:
 
     # -- changes -----------------------------------------------------------------------
 
-    def upload(self, path: Path, *, deadline: float | None = None) -> dict[str, Any]:
-        """Upload one file; waits out a full indexing queue (503) or a rate limit (429),
-        each with its Retry-After — but not past ``deadline`` (this client's clock)."""
+    def upload(
+        self, path: Path, *, deadline: float | None = None, tags: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        """Upload one file (with ``tags``); waits out a full indexing queue (503) or a
+        rate limit (429), each with its Retry-After — but not past ``deadline`` (this
+        client's clock)."""
 
         try:
             content = path.read_bytes()
@@ -458,6 +481,7 @@ class DocragClient:
                 response = self._http.post(
                     "/documents",
                     files={"file": (path.name, content, "application/octet-stream")},
+                    data={"tags": list(tags)} if tags else None,
                     headers=self._headers,
                 )
             except httpx.HTTPError as exc:
@@ -477,12 +501,24 @@ class DocragClient:
             return result
         raise DocragError("The indexing queue stayed full.")  # pragma: no cover
 
-    def upload_url(self, url: str, filename: str | None = None) -> dict[str, Any]:
-        """Have the server fetch and index ``url`` (URL_INGEST_ENABLED)."""
+    def upload_url(
+        self,
+        url: str,
+        filename: str | None = None,
+        *,
+        tags: Sequence[str] = (),
+        refresh_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        """Have the server fetch and index ``url`` (URL_INGEST_ENABLED), with ``tags``,
+        and checked again every ``refresh_minutes`` (0 = never; None = the server's)."""
 
         body: dict[str, Any] = {"url": url}
         if filename:
             body["filename"] = filename
+        if tags:
+            body["tags"] = list(tags)
+        if refresh_minutes is not None:
+            body["refresh_minutes"] = refresh_minutes
         result: dict[str, Any] = self._json(
             "POST", "/documents/from-url", json=body, attempts=BUSY_MAX_ATTEMPTS
         )
@@ -557,6 +593,7 @@ class DocragClient:
         window: int = INGEST_WINDOW,
         timeout: float | None = None,
         on_finished: Callable[[Path, dict[str, Any]], None] | None = None,
+        tags: Sequence[str] = (),
     ) -> dict[Path, dict[str, Any]]:
         """Upload ``paths`` and wait for them, at most ``window`` indexing at once (the
         server indexes those side by side); the next goes up as soon as one finishes.
@@ -582,7 +619,7 @@ class DocragClient:
             while queue and len(indexing) < window and not timed_out:
                 path = queue.pop(0)
                 try:
-                    indexing[self.upload(path, deadline=deadline)["job_id"]] = path
+                    indexing[self.upload(path, deadline=deadline, tags=tags)["job_id"]] = path
                 except DocragError as exc:
                     finish(path, {"state": "failed", "error": str(exc)})
             finished = 0
@@ -657,6 +694,16 @@ class DocragClient:
         result: dict[str, Any] = self._json("POST", f"/documents/{_quote(filename)}/refresh")
         return result
 
+    def set_refresh_interval(self, filename: str, minutes: int | None) -> dict[str, Any]:
+        """A fetched document's own refresh interval (0 = never, None = the server's)."""
+
+        result: dict[str, Any] = self._json(
+            "PATCH",
+            f"/documents/{_quote(filename)}/refresh-settings",
+            json={"refresh_minutes": minutes},
+        )
+        return result
+
     def versions(self, filename: str) -> list[dict[str, Any]]:
         """Earlier versions of a document's original, newest first."""
 
@@ -690,6 +737,30 @@ class DocragClient:
             "GET", "/documents/jobs", params={"state": state, "limit": limit}
         )
         return list(result.get("jobs", []))
+
+    def preview(self, path: Path) -> dict[str, Any]:
+        """How the server would index ``path`` (sections, passages), indexing nothing."""
+
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise DocragError(f"Cannot read {path}: {exc.strerror or exc}") from exc
+        try:
+            response = self._http.post(
+                "/documents/preview",
+                files={"file": (path.name, content, "application/octet-stream")},
+                headers=self._headers,
+            )
+        except httpx.HTTPError as exc:
+            raise self._unreachable(exc) from exc
+        result: dict[str, Any] = _response_json(response)
+        return result
+
+    def retry_job(self, job_id: str) -> dict[str, Any]:
+        """Run a failed job again (a URL fetched again, a re-index rerun): the new job."""
+
+        result: dict[str, Any] = self._json("POST", f"/documents/jobs/{_quote(job_id)}/retry")
+        return result
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         result: dict[str, Any] = self._json("DELETE", f"/documents/jobs/{_quote(job_id)}")
