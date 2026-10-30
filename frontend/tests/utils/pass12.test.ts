@@ -132,10 +132,26 @@ describe('small helpers', () => {
   it('cuts a long search result around its match', () => {
     const text = `${'filler '.repeat(60)}the parking passes are issued by reception${' tail'.repeat(60)}`;
     const snippet = snippetAround(text, ['parking passes are issued'], 120);
-    expect(snippet).toContain('parking passes are issued');
-    expect(snippet.startsWith('…')).toBe(true);
-    expect(snippet.length).toBeLessThanOrEqual(122);
-    expect(snippetAround('short', ['x'], 120)).toBe('short');
+    expect(snippet.text).toContain('parking passes are issued');
+    expect(snippet.quotes).toEqual(['parking passes are issued']);
+    expect(snippet.text.startsWith('…')).toBe(true);
+    expect(snippet.text.length).toBeLessThanOrEqual(122);
+    expect(snippetAround('short', ['x'], 120)).toEqual({ text: 'short', quotes: ['x'] });
+  });
+
+  it('still marks part of a matched sentence longer than the snippet', () => {
+    const sentence = `Parking ${'passes are issued daily '.repeat(12)}at reception.`;
+    const text = `${'filler '.repeat(40)}${sentence}${' tail'.repeat(40)}`;
+    const snippet = snippetAround(text, [sentence], 120);
+    expect(snippet.quotes).toHaveLength(1);
+    expect(snippet.quotes[0].startsWith('Parking passes')).toBe(true);
+    expect(snippet.text).toContain(snippet.quotes[0]);
+  });
+
+  it('never cuts an emoji in half', () => {
+    const text = `${'😀'.repeat(100)}`;
+    const snippet = snippetAround(text, [], 51);
+    expect(snippet.text.replace('…', '')).toMatch(/^(?:😀)+$/u);
   });
 
   it('builds a search narrowing from the panel filters over the conversation scope', () => {
@@ -145,6 +161,8 @@ describe('small helpers', () => {
       pageMin: '9',
       pageMax: '2',
       uploadedAfter: '',
+      uploadedBefore: '',
+      tag: '',
       count: '',
     };
     expect(searchNarrowing(filters, { uploaded_after: 50, page_min: 1 })).toEqual({

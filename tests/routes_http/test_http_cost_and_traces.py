@@ -16,7 +16,15 @@ from qdrant_client import QdrantClient
 from api.dependencies import clear_dependency_caches, get_generator, get_trace_store
 from api.llm import LiteLLMGenerator, model_prices, usage_cost_usd
 from api.trace_archive import TraceArchive
-from api.tracing import QueryTrace, TraceCandidate, TraceConfig, TraceStore, trace_from_json
+from api.tracing import (
+    QueryTrace,
+    TraceCandidate,
+    TraceConfig,
+    TraceStore,
+    TraceSummary,
+    trace_from_json,
+    trace_to_json,
+)
 from tests.routes_http.support import (
     hermetic_app,
     keyed_client,
@@ -161,6 +169,65 @@ def test_the_archive_is_trimmed_and_scoped_by_workspace(tmp_path: Path) -> None:
     assert [t.trace_id for t in archive.recent("team", 10)] == []
 
 
+@pytest.mark.parametrize("archived", [False, True])
+def test_the_trace_list_filters_by_answer_status(tmp_path: Path, archived: bool) -> None:
+    archive = TraceArchive(str(tmp_path / "traces.db"), max_rows=100) if archived else None
+    store = TraceStore(max_retained=10, archive=archive)
+    store.add(dataclasses.replace(_trace("answered", created_at=1.0), answer_status="answered"))
+    store.add(dataclasses.replace(_trace("missed", created_at=2.0), answer_status="no_context"))
+    # From before answer_status was recorded: its status still says it wasn't answered.
+    store.add(dataclasses.replace(_trace("old", created_at=3.0), status="insufficient_context"))
+
+    rows = store.list_summaries("")
+    assert [row.trace_id for row in rows] == ["old", "missed", "answered"]
+    assert rows[0].answer_status == "insufficient_context"
+    assert rows[2].top_rerank_score == 0.9 and rows[2].kept_count == 1
+    unanswered = store.list_summaries("", frozenset({"no_context", "insufficient_context"}))
+    assert [row.trace_id for row in unanswered] == ["old", "missed"]
+    assert store.list_summaries("", frozenset()) == []
+
+
+def test_an_older_archive_gets_its_list_columns_filled_in(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "traces.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, created_at REAL NOT NULL, "
+            "workspace TEXT NOT NULL DEFAULT '', body TEXT NOT NULL)"
+        )
+        trace = dataclasses.replace(_trace("t"), answer_status="uncited")
+        conn.execute(
+            "INSERT INTO traces VALUES (?, ?, ?, ?)",
+            ("t", trace.created_at, "", trace_to_json(trace)),
+        )
+        conn.execute("INSERT INTO traces VALUES ('bad', 1.0, '', 'not json')")
+
+    archive = TraceArchive(str(path), max_rows=100)
+    rows = {row.trace_id: row for row in archive.summaries("", 10, None)}
+    assert rows["t"].answer_status == "uncited" and rows["t"].question == "question t"
+    assert rows["t"].top_rerank_score == 0.9 and rows["t"].total_ms == 1.0
+    # An unreadable row still lists, blank, rather than failing the list.
+    assert rows["bad"].question == ""
+    assert [row.trace_id for row in archive.summaries("", 10, frozenset({"uncited"}))] == ["t"]
+
+
+def test_get_traces_takes_answer_statuses(tmp_path: Path) -> None:
+    store = TraceStore(max_retained=10)
+    store.add(dataclasses.replace(_trace("a", created_at=1.0), answer_status="answered"))
+    store.add(dataclasses.replace(_trace("u", created_at=2.0), answer_status="uncited"))
+    with keyed_client("full-key", {get_trace_store: lambda: store}) as client:
+        headers = {"X-API-Key": "full-key"}
+        body = client.get("/traces?answer_status=uncited", headers=headers).json()
+        assert [row["trace_id"] for row in body["traces"]] == ["u"]
+        assert body["traces"][0]["answer_status"] == "uncited"
+        both = client.get(
+            "/traces?answer_status=uncited&answer_status=answered", headers=headers
+        ).json()
+        assert len(both["traces"]) == 2
+        assert client.get("/traces", headers=headers).json()["traces"][0]["trace_id"] == "u"
+
+
 def test_a_row_from_another_version_still_reads(tmp_path: Path) -> None:
     data = dataclasses.asdict(_trace("t"))
     data["from_the_future"] = 1
@@ -182,6 +249,9 @@ def test_an_unwritable_archive_never_fails_the_answer() -> None:
         def recent(self, workspace: str | None, limit: int) -> list[QueryTrace]:
             raise OSError("disk full")
 
+        def summaries(self, *args: object) -> list[TraceSummary]:
+            raise OSError("disk full")
+
         def export_lines(self, workspace: str):  # type: ignore[no-untyped-def]
             yield from ()
 
@@ -190,6 +260,7 @@ def test_an_unwritable_archive_never_fails_the_answer() -> None:
     assert store.get("t") is not None
     assert store.get("missing") is None
     assert [trace.trace_id for trace in store.list_traces("")] == ["t"]
+    assert [summary.trace_id for summary in store.list_summaries("")] == ["t"]
 
 
 def test_traces_export_needs_the_full_key_and_streams_json_lines(tmp_path: Path) -> None:

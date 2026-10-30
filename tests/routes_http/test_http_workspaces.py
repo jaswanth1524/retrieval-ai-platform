@@ -70,6 +70,9 @@ def test_a_workspace_is_created_listed_and_named_in_config(ws: Workspaces) -> No
     assert client.post("/workspaces", json={"name": "legal"}, headers=FULL).status_code == 201
     assert client.post("/workspaces", json={"name": "legal"}, headers=FULL).status_code == 409
     assert client.post("/workspaces", json={"name": "Bad Name"}, headers=FULL).status_code == 400
+    # What every client calls the default workspace: one by that name couldn't be reached.
+    reserved = client.post("/workspaces", json={"name": "default"}, headers=FULL)
+    assert reserved.status_code == 400 and "reserved" in reserved.json()["detail"]
     read_only = client.post("/workspaces", json={"name": "x"}, headers={"X-API-Key": "read-key"})
     assert read_only.status_code == 403
     assert client.get("/workspaces", headers=FULL).json()["workspaces"] == ["legal"]
@@ -140,7 +143,11 @@ def test_only_an_empty_workspace_can_be_deleted(ws: Workspaces) -> None:
 
     assert client.delete("/workspaces/legal", headers=FULL).status_code == 409
     client.delete("/documents/guide.txt", headers=LEGAL)
+    listing(client, LEGAL)  # exports docrag_corpus_documents{workspace="legal"}
+    assert 'docrag_corpus_documents{workspace="legal"}' in client.get("/metrics", headers=FULL).text
     assert client.delete("/workspaces/legal", headers=FULL).status_code == 200
+    # Its series goes with it, or the last count stayed exported for good.
+    assert 'workspace="legal"' not in client.get("/metrics", headers=FULL).text
     assert client.get("/workspaces", headers=FULL).json()["workspaces"] == []
     assert client.get("/documents", headers=LEGAL).status_code == 404
     assert client.delete("/workspaces/legal", headers=FULL).status_code == 404

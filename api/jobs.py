@@ -65,6 +65,15 @@ class IngestJob:
     # is the file itself (unparseable, unsupported, empty), which sending it again won't
     # change; the rest are the server's state at the time.
     error_type: str | None = None
+    # What started it — upload, url (from-url or a refresh), reindex, restore (a
+    # version), import, watch — and what it was given, so a failed one can be retried
+    # (POST /documents/jobs/{id}/retry) as it was asked for.
+    kind: str = "upload"
+    source_url: str | None = None
+    tags: tuple[str, ...] | None = None
+
+
+JOB_KINDS = ("upload", "url", "reindex", "restore", "import", "watch")
 
 
 class IngestBacklog:
@@ -130,7 +139,15 @@ class IngestBacklog:
 class JobStore(Protocol):
     """Minimal surface ``api.ingest_jobs`` needs to track background ingest jobs."""
 
-    def create(self, filename: str, workspace: str = "") -> IngestJob: ...
+    def create(
+        self,
+        filename: str,
+        workspace: str = "",
+        *,
+        kind: str = "upload",
+        source_url: str | None = None,
+        tags: tuple[str, ...] | None = None,
+    ) -> IngestJob: ...
 
     def get(self, job_id: str) -> IngestJob | None: ...
 
@@ -154,8 +171,23 @@ class IngestJobStore:
         self._lock = Lock()
         self._jobs: OrderedDict[str, IngestJob] = OrderedDict()
 
-    def create(self, filename: str, workspace: str = "") -> IngestJob:
-        job = IngestJob(id=str(uuid.uuid4()), filename=filename, workspace=workspace)
+    def create(
+        self,
+        filename: str,
+        workspace: str = "",
+        *,
+        kind: str = "upload",
+        source_url: str | None = None,
+        tags: tuple[str, ...] | None = None,
+    ) -> IngestJob:
+        job = IngestJob(
+            id=str(uuid.uuid4()),
+            filename=filename,
+            workspace=workspace,
+            kind=kind,
+            source_url=source_url,
+            tags=tags,
+        )
         with self._lock:
             self._jobs[job.id] = job
             self._prune_finished_locked()
@@ -240,7 +272,7 @@ class IngestJobStore:
 
 _JOB_COLUMNS = (
     "id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall, "
-    "workspace, error_type"
+    "workspace, error_type, kind, source_url, tags_json"
 )
 
 
@@ -256,7 +288,11 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         created_at_wall,
         workspace,
         error_type,
+        kind,
+        source_url,
+        tags_json,
     ) = row
+    tags = json.loads(tags_json) if tags_json else None
     return IngestJob(
         id=str(job_id),
         filename=str(filename),
@@ -268,6 +304,9 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         created_at_wall=float(created_at_wall),
         workspace=str(workspace),
         error_type=None if error_type is None else str(error_type),
+        kind=str(kind or "upload"),
+        source_url=None if source_url is None else str(source_url),
+        tags=tuple(str(tag) for tag in tags) if isinstance(tags, list) else None,
     )
 
 
@@ -311,6 +350,13 @@ class SqliteIngestJobStore:
                 conn.execute("ALTER TABLE jobs ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
             if "error_type" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN error_type TEXT")
+            # Older rows read as uploads: the one kind a retry never re-runs by itself.
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'upload'")
+            if "source_url" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
+            if "tags_json" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN tags_json TEXT")
             # Only this process runs jobs (one uvicorn worker), so anything still
             # non-terminal at startup belonged to a process that died mid-ingest. Left
             # as-is, a client polling it would wait forever.
@@ -323,13 +369,28 @@ class SqliteIngestJobStore:
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_transaction(self._path)
 
-    def create(self, filename: str, workspace: str = "") -> IngestJob:
-        job = IngestJob(id=str(uuid.uuid4()), filename=filename, workspace=workspace)
+    def create(
+        self,
+        filename: str,
+        workspace: str = "",
+        *,
+        kind: str = "upload",
+        source_url: str | None = None,
+        tags: tuple[str, ...] | None = None,
+    ) -> IngestJob:
+        job = IngestJob(
+            id=str(uuid.uuid4()),
+            filename=filename,
+            workspace=workspace,
+            kind=kind,
+            source_url=source_url,
+            tags=tags,
+        )
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, filename, state, chunks_total, chunks_done, "
-                "error, result_json, created_at_wall, workspace) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "error, result_json, created_at_wall, workspace, kind, source_url, tags_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job.id,
                     job.filename,
@@ -340,6 +401,9 @@ class SqliteIngestJobStore:
                     None,
                     job.created_at_wall,
                     job.workspace,
+                    job.kind,
+                    job.source_url,
+                    json.dumps(list(tags)) if tags is not None else None,
                 ),
             )
             self._prune_finished_locked(conn)

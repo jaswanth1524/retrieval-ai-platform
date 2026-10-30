@@ -46,6 +46,24 @@ _SKIPPED = frozenset(
         f"{_OFFICE}forms",
     }
 )
+# A run of spaces (``text:s``) is at most this long: the count is an attribute, so a
+# few bytes could ask for gigabytes of spaces the zip-size check never sees.
+_MAX_SPACE_RUN = 100
+# Repeated cells with text are written out at most this many times.
+_MAX_REPEATED_CELLS = 64
+# Elements nested deeper than this are read as plain text, not walked further: a
+# crafted file nests far past Python's recursion limit.
+_MAX_DEPTH = 64
+
+
+def _count(element: ElementTree.Element, attribute: str, cap: int) -> int:
+    """A repeat count from ``attribute``, 1 when it is missing or not a number, at most
+    ``cap``."""
+
+    try:
+        return max(1, min(int(element.get(attribute, "1") or 1), cap))
+    except ValueError:
+        return 1
 
 
 def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
@@ -86,8 +104,13 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
                 )
             )
 
-    def visit(element: ElementTree.Element) -> None:
+    def visit(element: ElementTree.Element, depth: int = 0) -> None:
         nonlocal label, buffer
+        if depth > _MAX_DEPTH:
+            text = normalize_text(" ".join(element.itertext()))
+            if text:
+                buffer.append(text)
+            return
         for child in element:
             if child.tag in _SKIPPED:
                 continue
@@ -104,7 +127,7 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
             elif child.tag == f"{_TABLE}table":
                 buffer.extend(_table_rows(child))
             elif child.tag in _BLOCK_CONTAINERS:
-                visit(child)
+                visit(child, depth + 1)
 
     visit(body)
     flush()
@@ -113,13 +136,15 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
     return sections
 
 
-def _inline_text(element: ElementTree.Element) -> str:
+def _inline_text(element: ElementTree.Element, depth: int = 0) -> str:
     """A paragraph's text with ODF's whitespace elements written out."""
 
+    if depth > _MAX_DEPTH:
+        return " ".join(element.itertext())
     parts: list[str] = [element.text or ""]
     for child in element:
         if child.tag == f"{_TEXT}s":
-            parts.append(" " * int(child.get(f"{_TEXT}c", "1") or 1))
+            parts.append(" " * _count(child, f"{_TEXT}c", _MAX_SPACE_RUN))
         elif child.tag == f"{_TEXT}tab":
             parts.append("\t")
         elif child.tag == f"{_TEXT}line-break":
@@ -127,7 +152,7 @@ def _inline_text(element: ElementTree.Element) -> str:
         elif child.tag in (f"{_TEXT}tracked-changes", f"{_OFFICE}annotation"):
             pass
         else:
-            parts.append(_inline_text(child))
+            parts.append(_inline_text(child, depth + 1))
         parts.append(child.tail or "")
     return "".join(parts)
 
@@ -152,8 +177,8 @@ def _table_rows(table: ElementTree.Element) -> list[str]:
             text = _cell_text(cell) if cell.tag == f"{_TABLE}table-cell" else ""
             # A repeated empty cell (a sheet-like table's padding) is one cell, not
             # thousands: only cells with text are repeated.
-            repeat = int(cell.get(f"{_TABLE}number-columns-repeated", "1") or 1)
-            cells.extend([text] * (min(repeat, 64) if text else 1))
+            repeat = _count(cell, f"{_TABLE}number-columns-repeated", _MAX_REPEATED_CELLS)
+            cells.extend([text] * (repeat if text else 1))
         if any(cells):
             rows.append(cells)
     if len(rows) < 2:

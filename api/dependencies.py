@@ -38,6 +38,11 @@ from api.settings import AppSettings
 from api.summarize import DocumentSummarizer
 from api.trace_archive import TraceArchive
 from api.tracing import TraceSink, TraceStore
+from api.url_refresh_state import (
+    MemoryRefreshStateStore,
+    RefreshStateStore,
+    SqliteRefreshStateStore,
+)
 from api.workspaces import (
     WORKSPACE_HEADER,
     WorkspaceError,
@@ -454,6 +459,18 @@ def get_query_log_store() -> QueryLogStore | None:
     return QueryLogStore(settings.query_log_path, int(settings.query_log_max_rows))
 
 
+@lru_cache
+def get_url_refresh_state_store() -> RefreshStateStore:
+    """When each fetched document was last checked by the scheduled refresh: in
+    URL_REFRESH_STATE_PATH when set, else in memory. Shared by the refresher and the
+    document listing."""
+
+    settings = get_app_settings()
+    if settings.url_refresh_state_path:
+        return SqliteRefreshStateStore(settings.url_refresh_state_path)
+    return MemoryRefreshStateStore()
+
+
 def _trace_sink(
     settings: AppSettings, trace_store: TraceStore, query_log: QueryLogStore | None
 ) -> TraceSink | None:
@@ -526,6 +543,7 @@ def clear_dependency_caches() -> None:
     _workspace_raw_store.cache_clear()
     get_feedback_store.cache_clear()
     get_query_log_store.cache_clear()
+    get_url_refresh_state_store.cache_clear()
     get_ingest_executor.cache_clear()
     get_ingest_backlog.cache_clear()
     get_trace_store.cache_clear()

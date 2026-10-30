@@ -123,14 +123,16 @@ def build_export(
     return stream
 
 
-def _source_fields(meta: DocumentMetadata) -> dict[str, str]:
+def _source_fields(meta: DocumentMetadata) -> dict[str, str | int]:
     if meta.source_url is None:
         return {}
-    fields = {"source_url": meta.source_url}
+    fields: dict[str, str | int] = {"source_url": meta.source_url}
     if meta.source_etag is not None:
         fields["source_etag"] = meta.source_etag
     if meta.source_last_modified is not None:
         fields["source_last_modified"] = meta.source_last_modified
+    if meta.source_refresh_minutes is not None:
+        fields["source_refresh_minutes"] = meta.source_refresh_minutes
     return fields
 
 

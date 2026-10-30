@@ -66,6 +66,24 @@ export function chatToMarkdown(turns: ChatTurn[], title?: string): string {
   return title ? `# ${title}\n\n${body}` : body;
 }
 
+/** Saved answers as one Markdown file: each with its question, conversation, sources
+ *  and the quotes they rest on. */
+export function savedAnswersToMarkdown(
+  items: { conversationTitle: string; question: string | null; turn: ChatTurn }[],
+): string {
+  const blocks = items.map(({ conversationTitle, question, turn }) =>
+    [
+      `## ${question ?? 'Answer'}`,
+      `_${conversationTitle} · ${DATE_TIME_FORMATTER.format(turn.timestamp)}_`,
+      turn.content,
+      citationLinesWithQuotes(turn.sources),
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+  );
+  return `# Saved answers\n\n${blocks.join('\n\n---\n\n')}`;
+}
+
 export function chatToJson(turns: ChatTurn[]): string {
   return JSON.stringify(turns, null, 2);
 }

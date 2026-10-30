@@ -73,6 +73,8 @@ class RunDiff:
     # Latency (ms) before and after, when both runs recorded it: shown, never judged —
     # it depends on the machine and its load.
     latency: list[tuple[str, float, float]] = field(default_factory=list)
+    # Per-format metrics that moved (a run over several formats; informational).
+    by_format: list[tuple[str, float, float]] = field(default_factory=list)
 
 
 def _retrieval_change(before: dict[str, Any], after: dict[str, Any]) -> tuple[int, list[str]]:
@@ -145,6 +147,9 @@ def diff_runs(before: Run, after: Run) -> RunDiff:
                 if isinstance(value, int | float) and isinstance(other, int | float):
                     if value != other:
                         result.aggregates.append((f"{level} {metric}", float(value), float(other)))
+        for name, value, other in _format_metrics(before.data, after.data):
+            if value != other:
+                result.by_format.append((name, value, other))
         old_latency = before.data.get("latency_ms") or {}
         new_latency = after.data.get("latency_ms") or {}
         for name in ("p50", "p95", "mean"):
@@ -152,6 +157,23 @@ def diff_runs(before: Run, after: Run) -> RunDiff:
             if isinstance(a, int | float) and isinstance(b, int | float):
                 result.latency.append((name, float(a), float(b)))
     return result
+
+
+def _format_metrics(before: Any, after: Any) -> list[tuple[str, float, float]]:
+    """("<format> <level> <metric>", before, after) for every per-format metric both runs
+    recorded."""
+
+    rows = []
+    old, new = before.get("by_format") or {}, after.get("by_format") or {}
+    for suffix in sorted(set(old) & set(new)):
+        for level in sorted(set(old[suffix]) & set(new[suffix])):
+            for metric in sorted(old[suffix][level]):
+                if metric == "questions":
+                    continue
+                value, other = old[suffix][level].get(metric), new[suffix][level].get(metric)
+                if isinstance(value, int | float) and isinstance(other, int | float):
+                    rows.append((f"{suffix} {level} {metric}", float(value), float(other)))
+    return rows
 
 
 def format_diff(diff: RunDiff) -> str:
@@ -164,6 +186,8 @@ def format_diff(diff: RunDiff) -> str:
     for question in diff.only_after:
         lines.append(f"? only in the second run: {question}")
     for name, before, after in diff.aggregates:
+        lines.append(f"  {name}: {before:.3f} → {after:.3f} ({after - before:+.3f})")
+    for name, before, after in diff.by_format:
         lines.append(f"  {name}: {before:.3f} → {after:.3f} ({after - before:+.3f})")
     for name, before, after in diff.latency:
         lines.append(f"  latency {name}: {before:.0f} → {after:.0f} ms ({after - before:+.0f})")
@@ -239,6 +263,26 @@ def render_report(
             if isinstance(value, int | float)
         ]
         parts.append("<h2>Aggregates</h2>" + _table(["level", "metric", "value"], aggregate_rows))
+        by_format = run.data.get("by_format") or {}
+        if by_format:
+            format_rows = [
+                [
+                    suffix,
+                    level,
+                    str(int(scores.get("questions", 0))),
+                    " ".join(
+                        f"{metric}={value:.2f}"
+                        for metric, value in sorted(scores.items())
+                        if metric != "questions" and isinstance(value, int | float)
+                    ),
+                ]
+                for suffix, levels in sorted(by_format.items())
+                for level, scores in sorted(levels.items())
+            ]
+            parts.append(
+                "<h2>By format</h2>"
+                + _table(["format", "level", "questions", "metrics"], format_rows)
+            )
         question_rows = []
         for row in run.data["per_question"]:
             cells = [str(row.get("question", ""))]

@@ -41,6 +41,8 @@ from api.context_expansion import _map_concurrently as _map_concurrently
 from api.context_expansion import _strip_overlap as _strip_overlap
 from api.context_expansion import expand_with_neighbors as expand_with_neighbors
 from api.diversity import select_diverse
+from api.documents import contextual_text
+from api.embeddings import EmbeddedText
 from api.errors import public_error_message
 from api.generation import (
     INSUFFICIENT_CONTEXT_ANSWER,
@@ -134,6 +136,11 @@ class AnswerOverrides:
     # Narrows retrieval to a page range, a section, picked passages, or away from some
     # documents — on every search leg (rewrite, raw follow-up, expansion variants).
     narrow: PassageFilter | None = None
+    # Stricter answers; each only takes something away. passages_only: no neighbouring
+    # text in the prompt (context_neighbor_radius 0). strong_matches_only: no answer
+    # from below-the-bar passages (rerank_fallback_count 0).
+    passages_only: bool = False
+    strong_matches_only: bool = False
 
 
 def _narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
@@ -459,11 +466,25 @@ class _PassageSelection:
 
 
 def _select_passages(
-    outcome: RerankOutcome, settings: AppSettings, *, for_generation: bool
+    outcome: RerankOutcome,
+    settings: AppSettings,
+    *,
+    for_generation: bool,
+    picked_only: bool = False,
 ) -> _PassageSelection:
     """The reranked passages kept for the prompt (or a search): near-duplicates dropped,
-    the closest ones kept when none clears the floor, and the relative cut applied."""
+    the closest ones kept when none clears the floor, and the relative cut applied.
 
+    With ``picked_only`` (a question about passages the user picked, ``chunk_ids``)
+    every picked passage is kept, best first: the user chose them, and the context isn't
+    neighbour-expanded, so a picked passage next to another was lost for good when the
+    diversity filter dropped it as a neighbour, as was one under the score floor.
+    """
+
+    if picked_only:
+        return _PassageSelection(
+            RerankOutcome(scored=outcome.scored, kept=list(outcome.scored)), set(), False, set()
+        )
     # A chunk next to a kept one is dropped on the promise that neighbour expansion
     # puts its text back — true only when expansion brings the whole neighbour.
     # With CONTEXT_NEIGHBOR_MAX_CHARS capping it, a well-scored passage was lost.
@@ -504,8 +525,37 @@ def _select_passages(
             outcome.scored,
             float(settings.rerank_relative_floor),
         )
-        diverse_outcome = RerankOutcome(scored=diverse_outcome.scored, kept=trimmed)
+        diverse_outcome = RerankOutcome(
+            scored=diverse_outcome.scored,
+            kept=recency_ordered(trimmed, float(settings.recency_boost_weight)),
+        )
     return _PassageSelection(diverse_outcome, diversity_dropped, below_min_score, relative_cut_ids)
+
+
+# How far back the recency boost looks: a document this much older than the newest kept
+# one gets none of it. A fixed span, not the kept passages' own: documents uploaded
+# seconds apart (a folder indexed in one go) must not be told apart by it.
+RECENCY_HORIZON_SECONDS = 365 * 24 * 3600.0
+
+
+def recency_ordered(chunks: Sequence[RerankedChunk], weight: float) -> list[RerankedChunk]:
+    """``chunks`` ordered by rerank score plus ``weight`` x how recent each one's document
+    is — 1 for the newest kept, falling to 0 a year (``RECENCY_HORIZON_SECONDS``) before
+    it — RECENCY_BOOST_WEIGHT. The same passages, only reordered; unchanged when the
+    weight is 0 or none is dated."""
+
+    stamps = [chunk.uploaded_at for chunk in chunks if chunk.uploaded_at is not None]
+    if weight <= 0 or len(stamps) < 2:
+        return list(chunks)
+    newest = max(stamps)
+
+    def boosted(chunk: RerankedChunk) -> float:
+        if chunk.uploaded_at is None:
+            return chunk.rerank_score
+        age = newest - chunk.uploaded_at
+        return chunk.rerank_score + weight * max(0.0, 1.0 - age / RECENCY_HORIZON_SECONDS)
+
+    return sorted(chunks, key=boosted, reverse=True)
 
 
 class QuestionAbandoned(Exception):
@@ -632,6 +682,10 @@ class RagPipeline:
             }.items()
             if value is not None
         }
+        if overrides.passages_only:
+            update["context_neighbor_radius"] = 0
+        if overrides.strong_matches_only:
+            update["rerank_fallback_count"] = 0
         return settings.model_copy(update=update) if update else settings
 
     def _trace_config(
@@ -655,6 +709,8 @@ class RagPipeline:
             answer_language=effective_settings.answer_language,
             narrowing=_narrowing_record(narrow),
             llm_model=trace_model_name(effective_settings),
+            context_neighbor_radius=int(effective_settings.context_neighbor_radius),
+            rerank_fallback_count=int(effective_settings.rerank_fallback_count),
         )
 
     def _phase_timings(
@@ -913,7 +969,7 @@ class RagPipeline:
         kept: Sequence[RerankedChunk],
         settings: AppSettings,
         for_generation: bool,
-        excluded: AbstractSet[str] = frozenset(),
+        narrow: PassageFilter | None = None,
     ) -> tuple[list[RerankedChunk], float]:
         """The kept passages with neighbour text for the prompt, and the time taken.
 
@@ -928,8 +984,9 @@ class RagPipeline:
         start = time.monotonic()
         limit = int(settings.max_context_chunks)
         expanded = [
-            # A passage left out of the question doesn't come back as a neighbour.
-            *expand_with_neighbors(kept[:limit], self._repository, settings, excluded=excluded),
+            # Neighbours stay inside the question's narrowing: a passage left out, or one
+            # outside its pages or section, doesn't come back as neighbour text.
+            *expand_with_neighbors(kept[:limit], self._repository, settings, narrow=narrow),
             *kept[limit:],
         ]
         return expanded, (time.monotonic() - start) * 1000
@@ -951,13 +1008,19 @@ class RagPipeline:
         tags: Sequence[str] | None,
         tag_variants: Future[list[str]] | None,
         narrow: PassageFilter | None,
+        seed: EmbeddedText | None = None,
     ) -> tuple[list[RetrievedChunk], float, float]:
         """Every query embedded and hybrid-searched side by side, the result lists
-        RRF-fused when there are several; the candidates, embed_ms and search_ms."""
+        RRF-fused when there are several; the candidates, embed_ms and search_ms.
+        With ``seed`` (a stored passage's own vectors) that is the one query, as is."""
 
         embed_start = time.monotonic()
-        query_embeddings = _map_concurrently(
-            lambda query: embed_query(query, self._embedding_provider), queries
+        query_embeddings = (
+            [seed]
+            if seed is not None
+            else _map_concurrently(
+                lambda query: embed_query(query, self._embedding_provider), queries
+            )
         )
         embed_ms = (time.monotonic() - embed_start) * 1000
         check_dense_dimension(len(query_embeddings[0].dense), settings)
@@ -998,6 +1061,7 @@ class RagPipeline:
         narrow: PassageFilter | None = None,
         also_search: str | None = None,
         expansion: tuple[list[str], float] | None = None,
+        seed: EmbeddedText | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
 
@@ -1049,7 +1113,7 @@ class RagPipeline:
             queries.insert(1, extra_query)
 
         candidates, embed_ms, search_ms = self._search(
-            queries, effective_settings, filenames, tags, tag_variants, narrow
+            queries, effective_settings, filenames, tags, tag_variants, narrow, seed
         )
         if should_stop is not None and should_stop():
             raise QuestionAbandoned
@@ -1061,20 +1125,21 @@ class RagPipeline:
             reranker=self._reranker,
             settings=effective_settings,
         )
-        selection = _select_passages(outcome, effective_settings, for_generation=for_generation)
+        # Picked passages (chunk_ids) are the context exactly: their neighbours were not
+        # picked, and the question was asked about these alone.
+        picked_only = for_generation and narrow is not None and bool(narrow.chunk_ids)
+        selection = _select_passages(
+            outcome, effective_settings, for_generation=for_generation, picked_only=picked_only
+        )
         diverse_outcome = selection.outcome
         rerank_ms = (time.monotonic() - rerank_start) * 1000
         # Read on this thread right after the call: the reranker keeps it per thread.
         rerank_wait_ms = float(getattr(self._reranker, "last_wait_ms", 0.0))
-
-        # Picked passages (chunk_ids) are the context exactly: their neighbours were not
-        # picked, and the question was asked about these alone.
-        picked_only = narrow is not None and bool(narrow.chunk_ids)
         expanded, context_expansion_ms = self._expand_context(
             diverse_outcome.kept,
             effective_settings,
             for_generation and not picked_only,
-            excluded=frozenset(narrow.exclude_chunk_ids) if narrow is not None else frozenset(),
+            narrow=narrow,
         )
 
         return RetrievalPhase(
@@ -1120,6 +1185,44 @@ class RagPipeline:
             for_generation=for_generation,
             narrow=narrow,
             also_search=also_search,
+        )
+
+    def retrieve_similar(
+        self,
+        chunk_id: str,
+        overrides: AnswerOverrides | None = None,
+        filenames: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
+        *,
+        narrow: PassageFilter | None = None,
+    ) -> RetrievalPhase | None:
+        """``POST /search`` from a passage ("more like this"), or None when no passage
+        has ``chunk_id``.
+
+        The same hybrid search, RRF and rerank as a search: both legs are queried with
+        the passage's stored dense and sparse vectors, and the cross-encoder scores
+        each candidate against the passage as it was embedded. The passage itself is
+        left out; the request's narrowing still applies.
+        """
+
+        effective_settings = self._effective_settings(overrides or AnswerOverrides())
+        seed = self._repository.seed_passage(effective_settings, chunk_id)
+        if seed is None:
+            return None
+        without_seed = dataclasses.replace(
+            narrow or PassageFilter(),
+            exclude_chunk_ids=tuple(
+                sorted({*(narrow.exclude_chunk_ids if narrow else ()), chunk_id})
+            ),
+        )
+        return self._retrieve_and_rerank(
+            contextual_text(seed.filename, seed.section, seed.text),
+            effective_settings,
+            filenames,
+            tags,
+            for_generation=False,
+            narrow=without_seed,
+            seed=seed.embedding,
         )
 
     def _cache_key(

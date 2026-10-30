@@ -339,6 +339,10 @@ async def test_search_leaves_out_a_passage_and_reads_upload_dates(server: MCPSer
         await server.call_tool("search_passages", {"query": "alpha", "uploaded_after": "soon"})
     )
     assert "uploaded_after must be an ISO date" in bad
+    similar = text_of(await server.call_tool("search_passages", {"like_chunk_id": chunk_id}))
+    assert chunk_id not in similar
+    neither = text_of(await server.call_tool("search_passages", {}))
+    assert "Give a query, or like_chunk_id" in neither
 
 
 @pytest.mark.asyncio

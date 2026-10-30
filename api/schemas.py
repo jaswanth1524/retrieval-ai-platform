@@ -55,6 +55,8 @@ FEEDBACK_CITED_FILENAMES_MAX = 50
 FEEDBACK_CITATION_NUMBER_MAX = 1000
 # Passages a question or search may be narrowed to (picked in the Search panel). Chunk
 # ids are 20 hex characters (documents.build_chunk_id).
+# A URL document's own refresh interval is at most a year (in minutes).
+MAX_REFRESH_MINUTES = 525_600
 REQUEST_CHUNK_IDS_MAX = 100
 REQUEST_CHUNK_ID_MAX_CHARS = 64
 RequestFilename = Annotated[str, StringConstraints(max_length=REQUEST_FILENAME_MAX_CHARS)]
@@ -235,6 +237,11 @@ class DocumentJobStatusResponse(BaseModel):
     # True for a job that found the document already indexed from identical bytes and
     # left it as it was (state "done", nothing re-embedded).
     unchanged: bool = False
+    # What started it: upload, url, reindex, restore, import or watch (extensible).
+    kind: str = "upload"
+    # A failed job POST /documents/jobs/{id}/retry can run again (a URL fetch, a
+    # re-index); the others need the file sent again.
+    retryable: bool = False
 
 
 class DocumentJobListResponse(BaseModel):
@@ -268,6 +275,24 @@ class DocumentListResponse(BaseModel):
     # Documents fetched by URL (POST /documents/from-url): where from, without its query
     # string (POST /documents/{f}/refresh uses the full one). Uploads are absent.
     source_urls: dict[str, str] = {}
+    # The scheduled refresh of each document fetched by URL.
+    url_refresh: dict[str, UrlRefreshStatusResponse] = {}
+
+
+class UrlRefreshStatusResponse(BaseModel):
+    """A fetched document's scheduled refresh (URL_REFRESH_INTERVAL_MINUTES)."""
+
+    # Its own interval in minutes (0 = never); null = the server's.
+    refresh_minutes: int | None = None
+    # The last scheduled check, when there was one since the state was kept.
+    last_checked: float | None = None
+    # unchanged, queued or failed.
+    last_outcome: str | None = None
+    # Failed checks in a row (each one doubles the wait, up to a day).
+    failures: int = 0
+    # When it is next checked; null when it never is (the refresh is off, or its own
+    # interval is 0).
+    next_due: float | None = None
 
 
 class DocumentVersionResponse(BaseModel):
@@ -451,6 +476,10 @@ class TraceConfigResponse(BaseModel):
     narrowing: dict[str, Any] | None = None
     # The model the provider was asked for (LiteLLM's name).
     llm_model: str | None = None
+    # Neighbouring passages added per side (0: the matched passages only) and how many
+    # closest passages are used when none clears the bar (0: none).
+    context_neighbor_radius: int | None = None
+    rerank_fallback_count: int | None = None
 
 
 class TraceCandidateResponse(BaseModel):
@@ -485,6 +514,11 @@ class TraceSummaryResponse(BaseModel):
     total_ms: float | None
     candidate_count: int
     kept_count: int
+    # citations.answer_status ("answered", "uncited", "insufficient_context",
+    # "no_context", ...); None on errors and on traces from before it was recorded.
+    answer_status: str | None = None
+    # The best cross-encoder score among its candidates (how well anything matched).
+    top_rerank_score: float | None = None
 
 
 class TraceListResponse(BaseModel):
@@ -607,6 +641,11 @@ class QuestionRequest(PassageNarrowing):
     # This answer's layout and language, over ANSWER_FORMAT / ANSWER_LANGUAGE.
     answer_format: AnswerFormat | None = None
     answer_language: str | None = Field(default=None, max_length=40)
+    # Stricter answers, for checking what the documents say: only the matched passages
+    # in the prompt (no neighbouring text), and no answer from weak matches (nothing
+    # cleared the relevance bar: "not found", rather than the closest passages).
+    passages_only: bool = False
+    strong_matches_only: bool = False
 
     @field_validator("answer_language", mode="after")
     @classmethod
@@ -715,6 +754,45 @@ class UrlIngestRequest(BaseModel):
     filename: RequestFilename | None = None
     # Tags to give the document (replacing any it has).
     tags: list[RequestTag] | None = Field(default=None, max_length=MAX_TAGS_PER_DOCUMENT)
+    # How often the scheduled refresh checks it (URL_REFRESH_INTERVAL_MINUTES must be on),
+    # in minutes: omitted = the server's interval, 0 = never.
+    refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
+
+
+class PreviewChunkResponse(BaseModel):
+    """One passage a file would be indexed as."""
+
+    ordinal: int
+    page: int
+    page_end: int | None = None
+    section: str
+    text: str
+
+
+class DocumentPreviewResponse(BaseModel):
+    """How a file would be indexed (POST /documents/preview), without indexing it."""
+
+    filename: str
+    section_count: int
+    chunk_count: int
+    # The highest page number (1 for formats without pages).
+    page_count: int
+    # The distinct section labels, in order (at most 100).
+    section_labels: list[str]
+    # The first passages, in order (at most 20).
+    first_chunks: list[PreviewChunkResponse]
+
+
+class DocumentRefreshSettingsRequest(BaseModel):
+    """A fetched document's own refresh interval (PATCH /documents/{f}/refresh-settings):
+    minutes between scheduled checks, 0 = never, null = the server's interval."""
+
+    refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
+
+
+class DocumentRefreshSettingsResponse(BaseModel):
+    filename: str
+    refresh_minutes: int | None
 
 
 class SummaryRequest(BaseModel):
@@ -765,9 +843,14 @@ class AccessResponse(BaseModel):
 
 
 class SearchRequest(PassageNarrowing):
-    """Retrieval without an answer: the passages a question would be answered from."""
+    """Retrieval without an answer: the passages a question would be answered from, or
+    (``like_chunk_id``) the passages most like a stored one."""
 
-    query: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+    query: str = Field(default="", max_length=MAX_QUESTION_CHARS)
+    # Search from this passage instead of a query: its own stored vectors drive both
+    # search legs and the reranker scores against its text; it is left out of the
+    # results. 404 when no passage has the id.
+    like_chunk_id: RequestChunkId | None = None
     filenames: list[RequestFilename] | None = Field(
         default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
     )
@@ -776,6 +859,12 @@ class SearchRequest(PassageNarrowing):
     )
     # How many reranked passages to return; capped by the server's fused_top_n (400).
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
+
+    @model_validator(mode="after")
+    def _query_or_passage(self) -> SearchRequest:
+        if not self.query.strip() and self.like_chunk_id is None:
+            raise ValueError("Give a query, or like_chunk_id to search from a passage.")
+        return self
 
 
 class SearchResultResponse(BaseModel):

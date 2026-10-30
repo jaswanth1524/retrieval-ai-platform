@@ -3,6 +3,7 @@ import ConfirmInline from '../ConfirmInline';
 import TagEditor from './TagEditor';
 import VersionHistory from './VersionHistory';
 import { extensionOf } from './cardHelpers';
+import { REFRESH_CHOICES, refreshSummary } from '../../utils/urlRefresh';
 import type { DocCard } from './types';
 
 interface DocumentCardProps {
@@ -31,10 +32,19 @@ interface DocumentCardProps {
   onSetTags?: (filename: string, tags: string[]) => Promise<void>;
   /** Fetch a URL-ingested document again (URL ingest on, full key). */
   onRefreshFromUrl?: (filename: string) => void;
+  onSetRefreshInterval?: (filename: string, minutes: number | null) => void;
   /** Put an earlier original back (RAW_DOCUMENT_VERSIONS on, full key). */
   onRestoreVersion?: (filename: string, version: string) => void;
   /** The workspace the card is shown in, for the versions request. */
   workspace?: string;
+}
+
+/** The interval choices, with the document's own when it isn't one of them. */
+function refreshOptions(current: number | null | undefined) {
+  if (current == null || REFRESH_CHOICES.some((choice) => choice.minutes === current)) {
+    return REFRESH_CHOICES;
+  }
+  return [...REFRESH_CHOICES, { label: `every ${current} min`, minutes: current }];
 }
 
 /** The source's host, for a short link label ("example.com"). */
@@ -71,6 +81,7 @@ const DocumentCard = memo(function DocumentCard({
   onDismissUpload,
   onSetTags,
   onRefreshFromUrl,
+  onSetRefreshInterval,
   onRestoreVersion,
   workspace,
 }: DocumentCardProps) {
@@ -273,6 +284,32 @@ const DocumentCard = memo(function DocumentCard({
               >
                 refresh
               </button>
+            )}
+            {onSetRefreshInterval && (
+              <select
+                className="corpus-panel__refresh-every"
+                value={String(card.urlRefresh?.refresh_minutes ?? '')}
+                onChange={(event) =>
+                  onSetRefreshInterval(
+                    card.filename,
+                    event.target.value === '' ? null : Number(event.target.value),
+                  )
+                }
+                disabled={disabled}
+                aria-label={`How often ${card.filename} is checked at its source`}
+                data-testid="corpus-refresh-every"
+              >
+                {refreshOptions(card.urlRefresh?.refresh_minutes).map((choice) => (
+                  <option key={choice.label} value={choice.minutes === null ? '' : String(choice.minutes)}>
+                    {choice.label}
+                  </option>
+                ))}
+              </select>
+            )}
+            {card.urlRefresh && refreshSummary(card.urlRefresh) && (
+              <span className="corpus-panel__refresh-state" data-testid="corpus-refresh-state">
+                {refreshSummary(card.urlRefresh)}
+              </span>
             )}
           </span>
         )}

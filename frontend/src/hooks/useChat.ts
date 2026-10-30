@@ -187,6 +187,8 @@ export interface UseChatResult {
   persistError: boolean;
   persistPartial: boolean;
   conversations: ConversationSummary[];
+  /** Every saved answer across the conversations, newest first. */
+  savedAnswers: SavedAnswer[];
   activeConversationId: string | null;
   // The active conversation's search scope.
   scope: ConversationScope;
@@ -251,7 +253,8 @@ export interface UseChatResult {
   allConversationsJson: () => string;
   /** Mark (or, after a failed send, unmark) one cited source of a turn not relevant. */
   setSourceIrrelevant: (turnId: string, sourceNumber: number, marked: boolean) => void;
-  setTurnSaved: (turnId: string, saved: boolean) => void;
+  /** Save (or unsave) an answer of ``conversationId`` (the open one when omitted). */
+  setTurnSaved: (turnId: string, saved: boolean, conversationId?: string) => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
@@ -268,9 +271,42 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
 
 const NO_TURNS: ChatTurn[] = [];
 
-function savedSummary(turns: readonly ChatTurn[]): { savedCount?: number; firstSavedTurnId?: string } {
-  const saved = turns.filter((turn) => turn.saved);
-  return saved.length > 0 ? { savedCount: saved.length, firstSavedTurnId: saved[0].id } : {};
+/** A saved answer and where it is (the Saved answers panel). */
+export interface SavedAnswer {
+  conversationId: string;
+  conversationTitle: string;
+  turn: ChatTurn;
+  /** The question it answered (the user turn before it), if there is one. */
+  question: string | null;
+}
+
+interface TurnCounts {
+  turnCount: number;
+  savedCount?: number;
+  firstSavedTurnId?: string;
+}
+
+// Per turns array: only the conversation being answered gets a new one per streamed
+// frame, so every other conversation's counts are reused instead of recounted.
+const turnCountsCache = new WeakMap<readonly ChatTurn[], TurnCounts>();
+
+function turnCounts(turns: readonly ChatTurn[]): TurnCounts {
+  const cached = turnCountsCache.get(turns);
+  if (cached) return cached;
+  let turnCount = 0;
+  let savedCount = 0;
+  let firstSavedTurnId: string | undefined;
+  for (const turn of turns) {
+    if (turn.role === 'user') turnCount += 1;
+    if (turn.saved) {
+      savedCount += 1;
+      firstSavedTurnId ??= turn.id;
+    }
+  }
+  const counts: TurnCounts =
+    savedCount > 0 ? { turnCount, savedCount, firstSavedTurnId } : { turnCount };
+  turnCountsCache.set(turns, counts);
+  return counts;
 }
 
 /** Times a question refused with 429 is asked again on its own. */
@@ -734,9 +770,19 @@ export function useChat(): UseChatResult {
       // Passages the question was asked about (or without) stay with it when it is
       // edited; otherwise the conversation's scope applies, as for any new question.
       const asked = source.turns[index].narrowing;
+      // Picked passages are the whole scope, as when they were first asked about.
+      const picked = Boolean(asked?.chunk_ids?.length);
       const editedOptions =
-        asked?.chunk_ids || asked?.exclude_chunk_ids ? { ...options, narrowing: asked } : options;
-      const prior = source.turns.slice(0, index);
+        asked?.chunk_ids || asked?.exclude_chunk_ids
+          ? { ...options, narrowing: asked, ...(picked ? { tags: [] } : {}) }
+          : options;
+      // The copy's earlier answers aren't saved again: a saved one stays saved where it
+      // was, rather than listed once per edit.
+      const prior = source.turns.slice(0, index).map((turn) => {
+        if (!turn.saved) return turn;
+        const { saved: _saved, ...rest } = turn;
+        return rest;
+      });
       const now = Date.now();
       const fork: Conversation = {
         id: newId(),
@@ -754,7 +800,15 @@ export function useChat(): UseChatResult {
         activeConversationId: fork.id,
         conversations: capConversations([fork, ...prev.conversations], fork.id),
       }));
-      await runAsk(fork.id, question, buildHistory(prior), provider, overrides, filenames, editedOptions);
+      await runAsk(
+        fork.id,
+        question,
+        buildHistory(prior),
+        provider,
+        overrides,
+        picked ? undefined : filenames,
+        editedOptions,
+      );
     },
     [runAsk],
   );
@@ -799,7 +853,8 @@ export function useChat(): UseChatResult {
         changed = true;
         // The page range and upload date stay; a page range only while its one
         // document does.
-        const { pageMin, pageMax, uploadedAfter } = conversation.scope ?? EMPTY_SCOPE;
+        const { pageMin, pageMax, uploadedAfter, uploadedBefore } =
+          conversation.scope ?? EMPTY_SCOPE;
         const pagesStay = kept.length === filenames.length;
         return {
           ...conversation,
@@ -809,6 +864,7 @@ export function useChat(): UseChatResult {
             ...(pagesStay && pageMin !== undefined ? { pageMin } : {}),
             ...(pagesStay && pageMax !== undefined ? { pageMax } : {}),
             ...(uploadedAfter !== undefined ? { uploadedAfter } : {}),
+            ...(uploadedBefore !== undefined ? { uploadedBefore } : {}),
           },
           editedAt: Date.now(),
         };
@@ -914,23 +970,29 @@ export function useChat(): UseChatResult {
     [],
   );
 
-  const setTurnSaved = useCallback((turnId: string, saved: boolean) => {
-    setStorage((prev) => ({
-      ...prev,
-      conversations: prev.conversations.map((conversation) =>
-        conversation.turns.some((turn) => turn.id === turnId)
-          ? {
-              ...conversation,
-              turns: conversation.turns.map((turn) => {
-                if (turn.id !== turnId) return turn;
-                const { saved: _previous, ...rest } = turn;
-                return saved ? { ...rest, saved: true } : rest;
-              }),
-              editedAt: Date.now(),
-            }
-          : conversation,
-      ),
-    }));
+  const setTurnSaved = useCallback((turnId: string, saved: boolean, conversationId?: string) => {
+    // One conversation's turn: an edited question's copy shares the earlier turns' ids
+    // (follow-ups, feedback and the in-flight answer key on them), so matching the id
+    // alone saved the answer in both and listed it twice.
+    setStorage((prev) => {
+      const target = conversationId ?? prev.activeConversationId;
+      return {
+        ...prev,
+        conversations: prev.conversations.map((conversation) =>
+          conversation.id === target && conversation.turns.some((turn) => turn.id === turnId)
+            ? {
+                ...conversation,
+                turns: conversation.turns.map((turn) => {
+                  if (turn.id !== turnId) return turn;
+                  const { saved: _previous, ...rest } = turn;
+                  return saved ? { ...rest, saved: true } : rest;
+                }),
+                editedAt: Date.now(),
+              }
+            : conversation,
+        ),
+      };
+    });
   }, []);
 
   const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
@@ -952,6 +1014,43 @@ export function useChat(): UseChatResult {
     }));
   }, []);
 
+  const savedAnswersRef = useRef<SavedAnswer[]>([]);
+  const savedAnswers = useMemo(() => {
+    const found: SavedAnswer[] = [];
+    for (const conversation of conversations) {
+      // The cached counts skip every conversation with nothing saved, unwalked.
+      if (!turnCounts(conversation.turns).savedCount) continue;
+      conversation.turns.forEach((turn, index) => {
+        if (!turn.saved) return;
+        const asked = conversation.turns
+          .slice(0, index)
+          .reverse()
+          .find((earlier) => earlier.role === 'user');
+        found.push({
+          conversationId: conversation.id,
+          conversationTitle: conversation.title,
+          turn,
+          question: asked?.content ?? null,
+        });
+      });
+    }
+    found.sort((a, b) => b.turn.timestamp - a.turn.timestamp);
+    const previous = savedAnswersRef.current;
+    // The same list (a streamed frame changed something else): the same array.
+    if (
+      previous.length === found.length &&
+      previous.every(
+        (item, index) =>
+          item.turn === found[index].turn &&
+          item.conversationTitle === found[index].conversationTitle,
+      )
+    ) {
+      return previous;
+    }
+    savedAnswersRef.current = found;
+    return found;
+  }, [conversations]);
+
   // Keeps the previous array when nothing the list shows changed: `conversations` is a
   // new array on every streamed frame, and a new summaries array re-rendered the list.
   const summariesRef = useRef<ConversationSummary[]>([]);
@@ -960,12 +1059,11 @@ export function useChat(): UseChatResult {
       id: conversation.id,
       title: conversation.title,
       updatedAt: conversation.updatedAt,
-      turnCount: conversation.turns.filter((turn) => turn.role === 'user').length,
       ...(conversation.pinned ? { pinned: true } : {}),
       ...(conversation.workspace && conversation.turns.length > 0
         ? { workspace: conversation.workspace }
         : {}),
-      ...savedSummary(conversation.turns),
+      ...turnCounts(conversation.turns),
     }));
     const prev = summariesRef.current;
     const same =
@@ -1006,6 +1104,7 @@ export function useChat(): UseChatResult {
     persistError,
     persistPartial,
     conversations: summaries,
+    savedAnswers,
     activeConversationId: activeConversation?.id ?? null,
     ask,
     cancel,

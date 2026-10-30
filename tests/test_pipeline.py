@@ -2798,6 +2798,151 @@ def test_picked_passages_are_answered_without_their_neighbours() -> None:
     assert phase.context_chunks[0].expanded_text is None
 
 
+@pytest.mark.parametrize("low_scores", [False, True])
+def test_adjacent_picked_passages_are_both_answered_from(low_scores: bool) -> None:
+    """Two picked passages next to each other: the diversity filter used to drop the
+    second as the first's neighbour, and (with no neighbour expansion for picks) its
+    text never reached the prompt. Nor does the score floor decide what was picked."""
+
+    from api.repository import PassageFilter
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=20)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    text = " ".join(f"Sentence {i} talks about alpha topic {i}." for i in range(12)).encode()
+    IngestService(repository, OnePerText(), settings).ingest("guide.txt", b"Intro\n" + text)
+    by_ordinal = {
+        int(chunk["chunk_ordinal"]): str(chunk["chunk_id"])
+        for chunk in repository.chunks_for_filename(settings, "guide.txt")
+    }
+    picked = (by_ordinal[4], by_ordinal[5])
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker() if low_scores else FakeReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+    )
+
+    phase = pipeline.retrieve("alpha", narrow=PassageFilter(chunk_ids=picked))
+
+    assert sorted(chunk.chunk_id for chunk in phase.context_chunks) == sorted(picked)
+    assert phase.below_min_score is False
+
+
+def test_neighbour_text_stays_inside_a_section_narrowing() -> None:
+    from api.repository import PassageFilter
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=60, min_section_words=5)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    leave = " ".join(f"Annual leave rule {i} applies to every employee." for i in range(4))
+    travel = " ".join(f"Travel needs approval from a manager, step {i}." for i in range(4))
+    document = f"# Leave\n\n{leave}\n\n# Travel\n\n{travel}".encode()
+    IngestService(repository, OnePerText(), settings).ingest("policy.md", document)
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Twenty [1]."),
+        settings=settings,
+    )
+    sections = {
+        int(chunk["chunk_ordinal"]): chunk["section"]
+        for chunk in repository.chunks_for_filename(settings, "policy.md")
+    }
+    assert set(sections.values()) == {"Leave", "Travel"}
+
+    # The last Leave passage's next neighbour is the first Travel one.
+    phase = pipeline.retrieve("leave", narrow=PassageFilter(section="Leave"))
+
+    assert phase.context_chunks
+    for chunk in phase.context_chunks:
+        assert chunk.section == "Leave"
+        assert "Travel needs approval" not in (chunk.expanded_text or "")
+
+
+def test_a_similar_passages_search_queries_with_the_passages_own_vectors() -> None:
+    class NoQueries:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            raise AssertionError("a passage search embeds no query")
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(chunk_size_tokens=20)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    text = " ".join(f"Sentence {i} talks about alpha topic {i}." for i in range(12)).encode()
+    IngestService(repository, OnePerText(), settings).ingest("guide.txt", b"Intro\n" + text)
+    seed = repository.chunks_for_filename(settings, "guide.txt")[0]
+    reranker = FakeReranker()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=NoQueries(),
+        reranker=reranker,
+        generator=FakeGenerator("unused"),
+        settings=settings,
+    )
+    phase = pipeline.retrieve_similar(str(seed["chunk_id"]))
+
+    assert phase is not None
+    assert seed["chunk_id"] not in {chunk.chunk_id for chunk in phase.context_chunks}
+    # Scored against the passage as it was embedded: its file and section, then text.
+    assert reranker.seen_queries[0].startswith("guide.txt › ")
+    assert pipeline.retrieve_similar("no-such-passage") is None
+
+
+def test_stricter_answers_leave_out_neighbours_and_weak_matches() -> None:
+    from api.answer_cache import AnswerCache
+    from api.pipeline import AnswerOverrides
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(context_neighbor_radius=1, chunk_size_tokens=20)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    text = " ".join(f"Sentence {i} talks about alpha topic {i}." for i in range(12)).encode()
+    IngestService(repository, OnePerText(), settings).ingest("guide.txt", b"Intro\n" + text)
+    traces = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+        answer_cache=AnswerCache(10, 600),
+        trace_store=traces,
+    )
+    assert any(c.expanded_text for c in pipeline.retrieve("alpha").context_chunks)
+    strict = AnswerOverrides(passages_only=True)
+    assert not any(c.expanded_text for c in pipeline.retrieve("alpha", strict).context_chunks)
+
+    assert not pipeline.answer("alpha").cached
+    # Another answer, not the unrestricted one's cache entry.
+    assert not pipeline.answer("alpha", strict).cached
+    assert traces.traces[-1].config is not None
+    assert traces.traces[-1].config.context_neighbor_radius == 0
+
+    weak = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=LowScoringReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+    )
+    assert weak.answer("alpha").weak_matches is True
+    refused = weak.answer("alpha", AnswerOverrides(strong_matches_only=True))
+    assert refused.answer_status == "no_context" and refused.weak_matches is False
+
+
 def test_a_sync_question_with_nothing_to_answer_from_never_waits_for_the_model() -> None:
     """The canned "not enough information" answer makes no LLM call, so it must not
     queue behind another question's generation at a local model."""
@@ -2913,3 +3058,35 @@ def test_a_left_out_passage_is_neither_a_source_nor_a_neighbour() -> None:
     # Not answered from the unnarrowed question's cache entry.
     assert not pipeline.answer("alpha").cached
     assert not pipeline.answer("alpha", AnswerOverrides(narrow=narrow)).cached
+
+
+def test_the_recency_boost_reorders_kept_passages_and_drops_none() -> None:
+    from api.pipeline import RECENCY_HORIZON_SECONDS, recency_ordered
+    from api.reranking import RerankedChunk
+
+    def chunk(chunk_id: str, score: float, uploaded_at: float | None) -> RerankedChunk:
+        return RerankedChunk(
+            point_id=chunk_id,
+            filename=f"{chunk_id}.md",
+            page=1,
+            section="",
+            chunk_id=chunk_id,
+            text="t",
+            retrieval_score=0.1,
+            rerank_score=score,
+            uploaded_at=uploaded_at,
+        )
+
+    year = RECENCY_HORIZON_SECONDS
+    old = chunk("old", 0.80, 0.0)
+    new = chunk("new", 0.75, 2 * year)
+    undated = chunk("undated", 0.78, None)
+
+    def order(weight: float) -> list[str]:
+        return [c.chunk_id for c in recency_ordered([old, undated, new], weight)]
+
+    assert order(0.0) == ["old", "undated", "new"]
+    assert order(0.1) == ["new", "old", "undated"]
+    # Uploaded seconds apart (one folder indexed in one go): told apart by score alone.
+    close = [chunk("a", 0.80, 1000.0), chunk("b", 0.79, 1005.0)]
+    assert [c.chunk_id for c in recency_ordered(close, 0.5)] == ["a", "b"]

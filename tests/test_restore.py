@@ -173,10 +173,19 @@ def test_a_fetched_document_keeps_where_it_came_from() -> None:
             "source_url": "https://example.com/page",
             "source_etag": '"v1"',
             "source_last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            "source_refresh_minutes": 30,
         },
         # Not a URL the server could have fetched, and an older manifest's row.
         {**_document("odd.html"), "source_url": "file:///etc/passwd"},
         _document("plain.txt"),
+        # A validator no request could carry (non-ASCII): the URL is kept, it isn't.
+        {
+            **_document("latin.html"),
+            "source_url": "https://example.com/latin",
+            "source_etag": '"caf\xe9"',
+            # Not a number of minutes the API takes: left out.
+            "source_refresh_minutes": -5,
+        },
     ]
     upload = _zip(
         documents,
@@ -184,14 +193,38 @@ def test_a_fetched_document_keeps_where_it_came_from() -> None:
             "originals/page.html": b"<p>a</p>",
             "originals/odd.html": b"<p>b</p>",
             "originals/plain.txt": b"c",
+            "originals/latin.html": b"<p>d</p>",
         },
     )
     recorder = Recorder()
     _restore(upload, recorder)
     assert recorder.sources == {
         "page.html": DocumentSource(
-            "https://example.com/page", '"v1"', "Mon, 01 Jan 2024 00:00:00 GMT"
+            "https://example.com/page", '"v1"', "Mon, 01 Jan 2024 00:00:00 GMT", 30
         ),
         "odd.html": None,
         "plain.txt": None,
+        "latin.html": DocumentSource("https://example.com/latin"),
     }
+
+
+def test_the_manifest_writes_a_fetched_documents_source_and_refresh_interval() -> None:
+    from api.export import _source_fields
+    from api.repository import DocumentMetadata
+
+    meta = DocumentMetadata(
+        chunk_count=1,
+        page_count=1,
+        byte_size=1,
+        uploaded_at=1.0,
+        chunker_version=9,
+        source_url="https://example.com/page",
+        source_etag='"v1"',
+        source_refresh_minutes=0,
+    )
+    assert _source_fields(meta) == {
+        "source_url": "https://example.com/page",
+        "source_etag": '"v1"',
+        "source_refresh_minutes": 0,
+    }
+    assert _source_fields(DocumentMetadata(1, 1, 1, 1.0, 9)) == {}

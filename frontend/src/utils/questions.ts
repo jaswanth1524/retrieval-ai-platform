@@ -2,6 +2,8 @@ import type { QueryLogEntryResponse } from '../api/types';
 
 // The query log's status for "the documents didn't answer it" (api/query_log.py).
 export const UNCOVERED = 'insufficient_context';
+// The most GET /query-log returns (QUERY_LOG_LIST_MAX).
+export const QUERY_LOG_FETCH_LIMIT = 1000;
 
 /** The same question asked several times: one row, with how often and when last. */
 export interface AskedQuestion {
@@ -11,6 +13,12 @@ export interface AskedQuestion {
   latest: QueryLogEntryResponse;
   /** How many of its asks the documents didn't answer. */
   unanswered: number;
+}
+
+/** Not answered the last time it was asked: a question missed once and answered since
+ *  (a document was added) no longer shows what the corpus is missing. */
+export function stillUnanswered(row: AskedQuestion): boolean {
+  return row.latest.status === UNCOVERED;
 }
 
 export function normalized(question: string): string {
@@ -32,4 +40,21 @@ export function groupQuestions(entries: readonly QueryLogEntryResponse[]): Asked
     }
   }
   return [...groups.values()];
+}
+
+function entryKey(entry: QueryLogEntryResponse): string {
+  return `${entry.created_at}\u0000${entry.trace_id ?? ''}\u0000${entry.question}`;
+}
+
+/** The latest ``recent`` asks plus older unanswered ones (``uncovered``), newest first,
+ *  each once. Every ask in the recent window that wasn't answered is in both lists, and
+ *  every extra one from ``uncovered`` is older than the whole window — so the first
+ *  ``recent.length`` entries are exactly ``recent``. */
+export function mergeQueryLogs(
+  recent: readonly QueryLogEntryResponse[],
+  uncovered: readonly QueryLogEntryResponse[],
+): QueryLogEntryResponse[] {
+  const seen = new Set(recent.map(entryKey));
+  const older = uncovered.filter((entry) => !seen.has(entryKey(entry)));
+  return [...recent, ...older].sort((a, b) => b.created_at - a.created_at);
 }

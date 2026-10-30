@@ -51,13 +51,24 @@ class WorkspaceError(ValueError):
     """An unusable workspace name, or workspaces are off (a 400)."""
 
 
-def validate_name(name: str) -> str:
+# What clients (the CLI, MCP, the UI's picker) call the default workspace; a workspace
+# created under it could never be reached from them, and its metric and audit labels
+# would read as the default one's.
+RESERVED_NAMES = frozenset({"default"})
+
+
+def validate_name(name: str, *, new: bool = False) -> str:
+    """``name`` stripped, or a ``WorkspaceError``. With ``new`` (creating one), the
+    reserved names are refused too; one that already exists can still be used."""
+
     name = name.strip()
     if not _NAME_RE.match(name):
         raise WorkspaceError(
             "A workspace name is 1-32 lowercase letters, digits or hyphens, starting and "
             "ending with a letter or digit."
         )
+    if new and name in RESERVED_NAMES:
+        raise WorkspaceError(f"'{name}' is reserved for the default workspace.")
     return name
 
 

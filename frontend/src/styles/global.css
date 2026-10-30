@@ -101,6 +101,14 @@ body {
   input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']) {
     font-size: max(16px, 1em) !important;
   }
+
+  /* Small inline actions a finger has to hit (WCAG 2.5.8: at least 24 px). */
+  .document-viewer__ask,
+  .corpus-panel__job-cancel,
+  .conversation-list__filter {
+    min-height: 24px;
+    min-width: 24px;
+  }
 }
 
 @keyframes dr-in {

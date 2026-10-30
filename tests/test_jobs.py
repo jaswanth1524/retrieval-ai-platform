@@ -363,3 +363,33 @@ def test_sqlite_jobs_keep_their_error_type_and_older_files_gain_the_column(
     store.update(job.id, state="failed", error="Could not parse", error_type="document")
     reopened = SqliteIngestJobStore(path=str(path), max_retained=50).get(job.id)
     assert reopened is not None and reopened.error_type == "document"
+
+
+def test_jobs_keep_what_started_them_and_older_files_read_as_uploads(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "jobs.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, filename TEXT NOT NULL, state TEXT NOT "
+            "NULL, chunks_total INTEGER NOT NULL, chunks_done INTEGER NOT NULL, error TEXT, "
+            "result_json TEXT, created_at_wall REAL NOT NULL, workspace TEXT NOT NULL "
+            "DEFAULT '', error_type TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO jobs VALUES ('old', 'a.pdf', 'failed', 1, 1, 'x', NULL, 1.0, '', NULL)"
+        )
+    store = SqliteIngestJobStore(path=str(path), max_retained=50)
+    old = store.get("old")
+    assert old is not None and (old.kind, old.source_url, old.tags) == ("upload", None, None)
+
+    job = store.create("p.html", kind="url", source_url="https://example.com/p", tags=("hr",))
+    reopened = SqliteIngestJobStore(path=str(path), max_retained=50).get(job.id)
+    assert reopened is not None
+    assert (reopened.kind, reopened.source_url, reopened.tags) == (
+        "url",
+        "https://example.com/p",
+        ("hr",),
+    )
+    memory = IngestJobStore(max_retained=10).create("r.txt", kind="reindex")
+    assert memory.kind == "reindex" and memory.tags is None

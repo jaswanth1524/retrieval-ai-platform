@@ -13,12 +13,19 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager
 from pathlib import Path
 from threading import Lock
 
 from api.sqlite_store import enable_wal, sqlite_transaction
-from api.tracing import QueryTrace, trace_from_json, trace_to_json
+from api.tracing import (
+    QueryTrace,
+    TraceSummary,
+    summarize_trace,
+    trace_from_json,
+    trace_to_json,
+)
 
 _CREATE_TABLE = """
     CREATE TABLE IF NOT EXISTS traces (
@@ -30,6 +37,28 @@ _CREATE_TABLE = """
 """
 # Rows read per query while exporting: the download streams, it isn't built in memory.
 _EXPORT_PAGE_ROWS = 200
+# The trace list's columns, beside the body: listing parsed every body (prompts and
+# candidates included) only to show a dozen fields, and couldn't filter on them.
+_SUMMARY_COLUMNS = (
+    ("question", "TEXT NOT NULL DEFAULT ''"),
+    ("mode", "TEXT NOT NULL DEFAULT ''"),
+    ("status", "TEXT NOT NULL DEFAULT ''"),
+    ("llm_provider", "TEXT"),
+    ("total_ms", "REAL"),
+    ("candidate_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("kept_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("answer_status", "TEXT"),
+    ("top_rerank_score", "REAL"),
+    # 0 on rows written before these columns existed, until they are filled in.
+    ("summarized", "INTEGER NOT NULL DEFAULT 0"),
+)
+_SUMMARY_FIELDS = tuple(name for name, _ in _SUMMARY_COLUMNS if name != "summarized")
+# Rows backfilled per transaction when an older archive is opened.
+_BACKFILL_ROWS = 500
+
+
+def _summary_values(summary: TraceSummary) -> tuple[object, ...]:
+    return tuple(getattr(summary, name) for name in _SUMMARY_FIELDS)
 
 
 class TraceArchive:
@@ -49,17 +78,54 @@ class TraceArchive:
                 "CREATE INDEX IF NOT EXISTS traces_workspace_created_at "
                 "ON traces (workspace, created_at)"
             )
+            present = {row[1] for row in conn.execute("PRAGMA table_info(traces)")}
+            for name, declaration in _SUMMARY_COLUMNS:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE traces ADD COLUMN {name} {declaration}")
+        self._backfill_summaries()
+
+    def _backfill_summaries(self) -> None:
+        """Fill the summary columns of rows an older version wrote (once; a batch per
+        transaction, so a big archive doesn't hold one long write lock)."""
+
+        while True:
+            with self._lock, self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT rowid, body FROM traces WHERE summarized = 0 LIMIT ?",
+                    (_BACKFILL_ROWS,),
+                ).fetchall()
+                if not rows:
+                    return
+                for rowid, body in rows:
+                    try:
+                        values = _summary_values(summarize_trace(trace_from_json(body)))
+                    except Exception:  # noqa: BLE001 - an unreadable row lists as blank
+                        conn.execute("UPDATE traces SET summarized = 1 WHERE rowid = ?", (rowid,))
+                        continue
+                    assignments = ", ".join(f"{name} = ?" for name in _SUMMARY_FIELDS)
+                    conn.execute(
+                        f"UPDATE traces SET {assignments}, summarized = 1 WHERE rowid = ?",
+                        (*values, rowid),
+                    )
 
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_transaction(self._path)
 
     def add(self, trace: QueryTrace) -> None:
         body = trace_to_json(trace)
+        columns = ", ".join(_SUMMARY_FIELDS)
+        marks = ", ".join("?" for _ in _SUMMARY_FIELDS)
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, created_at, workspace, body) "
-                "VALUES (?, ?, ?, ?)",
-                (trace.trace_id, trace.created_at, trace.workspace, body),
+                f"INSERT OR REPLACE INTO traces (trace_id, created_at, workspace, body, "
+                f"{columns}, summarized) VALUES (?, ?, ?, ?, {marks}, 1)",
+                (
+                    trace.trace_id,
+                    trace.created_at,
+                    trace.workspace,
+                    body,
+                    *_summary_values(summarize_trace(trace)),
+                ),
             )
             self._added += 1
             # Trimmed every so often, not on each insert (a count per question).
@@ -84,6 +150,38 @@ class TraceArchive:
                 (*params, limit),
             ).fetchall()
         return [trace_from_json(row[0]) for row in rows]
+
+    def summaries(
+        self, workspace: str | None, limit: int, answer_statuses: AbstractSet[str] | None
+    ) -> list[TraceSummary]:
+        """The newest ``limit`` traces' list rows (only ``workspace``'s when given; only
+        those with one of ``answer_statuses`` when given), newest first."""
+
+        conditions: list[str] = []
+        params: list[object] = []
+        if workspace is not None:
+            conditions.append("workspace = ?")
+            params.append(workspace)
+        if answer_statuses is not None:
+            if not answer_statuses:
+                return []
+            conditions.append(f"answer_status IN ({', '.join('?' for _ in answer_statuses)})")
+            params.extend(sorted(answer_statuses))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT trace_id, created_at, {', '.join(_SUMMARY_FIELDS)} FROM traces "
+                f"{where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [
+            TraceSummary(
+                trace_id=row[0],
+                created_at=row[1],
+                **dict(zip(_SUMMARY_FIELDS, row[2:], strict=True)),
+            )
+            for row in rows
+        ]
 
     def export_lines(self, workspace: str) -> Iterator[str]:
         """``workspace``'s traces as JSON lines, oldest first, a page at a time."""

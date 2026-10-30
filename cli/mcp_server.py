@@ -17,7 +17,6 @@ changes the corpus.
 from __future__ import annotations
 
 import asyncio
-import datetime
 import re
 import threading
 from collections.abc import Callable
@@ -33,6 +32,7 @@ from cli.client import (
     StreamResult,
     grounding_notes,
     trim_history,
+    upload_bound,
 )
 
 # A passage shown to the model is cut here: a search returns up to a dozen of them.
@@ -120,11 +120,11 @@ def format_passages(results: list[dict[str, Any]], weak: bool = False) -> str:
     return "\n\n".join(blocks)
 
 
-def _timestamp(value: str | None, name: str) -> float | None:
+def _timestamp(value: str | None, name: str, *, end_of_day: bool = False) -> float | None:
     if value is None or not value.strip():
         return None
     try:
-        return datetime.datetime.fromisoformat(value.strip()).timestamp()
+        return upload_bound(value, end_of_day=end_of_day)
     except ValueError:
         raise DocragError(f"{name} must be an ISO date (2024-05-31), not {value!r}.") from None
 
@@ -147,7 +147,7 @@ def narrowing(
         "exclude_filenames": exclude_filenames,
         "exclude_chunk_ids": exclude_chunk_ids,
         "uploaded_after": _timestamp(uploaded_after, "uploaded_after"),
-        "uploaded_before": _timestamp(uploaded_before, "uploaded_before"),
+        "uploaded_before": _timestamp(uploaded_before, "uploaded_before", end_of_day=True),
     }
 
 
@@ -220,7 +220,7 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
 
     @server.tool(annotations=_READ_ONLY)
     async def search_passages(
-        query: str,
+        query: str = "",
         filenames: list[str] | None = None,
         top_k: int | None = None,
         tags: list[str] | None = None,
@@ -232,8 +232,11 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         uploaded_after: str | None = None,
         uploaded_before: str | None = None,
         workspace: str | None = None,
+        like_chunk_id: str | None = None,
     ) -> str:
-        """Find the passages that best match a query (hybrid search + rerank, no LLM).
+        """Find the passages that best match a query (hybrid search + rerank, no LLM),
+        or with like_chunk_id (a passage's chunk_id, from a citation or an earlier
+        search) the passages most like that one, instead of a query.
 
         filenames limits the search to those documents, tags to documents with one of
         those tags; top_k caps the results. page_min/page_max/section/exclude_filenames/
@@ -241,6 +244,8 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         dates, "2024-05-31") keep documents uploaded in that range."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            if not query.strip() and not like_chunk_id:
+                raise DocragError("Give a query, or like_chunk_id to search from a passage.")
             options = narrowing(
                 page_min,
                 page_max,
@@ -250,6 +255,8 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
                 uploaded_after,
                 uploaded_before,
             )
+            if like_chunk_id:
+                options["like_chunk_id"] = like_chunk_id
             response = client.search_response(query, filenames, top_k, tags, options)
             return format_passages(
                 response.get("results", []), weak=bool(response.get("weak_matches"))
@@ -273,6 +280,8 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         uploaded_after: str | None = None,
         uploaded_before: str | None = None,
         workspace: str | None = None,
+        passages_only: bool = False,
+        strong_matches_only: bool = False,
     ) -> str:
         """Answer a question from the indexed documents, with numbered citations and the
         exact quotes they rest on.
@@ -284,7 +293,9 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
         cover the question. page_min/page_max/section/exclude_filenames/exclude_chunk_ids
         narrow where to look, uploaded_after/uploaded_before (ISO dates) to documents
         uploaded in that range; answer_format ("bullets", "table", "brief") and
-        answer_language ("German", or "match" the question) shape the answer."""
+        answer_language ("German", or "match" the question) shape the answer.
+        passages_only answers from the matched passages alone (no neighbouring text);
+        strong_matches_only says not found rather than answer from weak matches."""
 
         # Trimmed to what the server takes (an agent often passes whole earlier answers).
         turns = trim_history(list(history or []))
@@ -302,6 +313,8 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
                 ),
                 "answer_format": answer_format,
                 "answer_language": answer_language,
+                "passages_only": passages_only or None,
+                "strong_matches_only": strong_matches_only or None,
             }
             return format_answer(
                 client.ask(

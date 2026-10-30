@@ -1202,6 +1202,57 @@ describe('useChat feature pack', () => {
     expect(result.current.turns.map((turn) => turn.content)).toEqual(['First question', 'First answer.']);
   });
 
+  it('saves an answer in its own conversation only, not in an edited copy', async () => {
+    answeringStream('First answer.');
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('First question');
+      await result.current.ask('Second question');
+    });
+    const originalId = result.current.activeConversationId!;
+    const answerId = result.current.turns[1].id;
+    act(() => result.current.setTurnSaved(answerId, true));
+    const secondQuestion = result.current.turns[2].id;
+
+    await act(async () => {
+      await result.current.editAndResend(secondQuestion, 'Second, edited');
+    });
+    // The copy shares the answer's id but not its saved mark.
+    expect(result.current.turns[1].id).toBe(answerId);
+    expect(result.current.turns[1].saved).toBeUndefined();
+    act(() => result.current.setTurnSaved(answerId, true));
+    act(() => result.current.setTurnSaved(answerId, false));
+    const listed = result.current.conversations.filter((c) => c.savedCount);
+    expect(listed.map((c) => c.id)).toEqual([originalId]);
+    act(() => result.current.switchConversation(originalId));
+    expect(result.current.turns[1].saved).toBe(true);
+  });
+
+  it('edits a question about picked passages without the conversation scope', async () => {
+    answeringStream('Answer.');
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('About these', undefined, undefined, ['a.pdf'], {
+        tags: ['hr'],
+        narrowing: { chunk_ids: ['c1', 'c2'] },
+      });
+    });
+    await act(async () => {
+      await result.current.editAndResend(
+        result.current.turns[0].id,
+        'About these, edited',
+        undefined,
+        undefined,
+        ['a.pdf'],
+        { tags: ['hr'] },
+      );
+    });
+    const call = askQuestionStreamMock.mock.calls[1];
+    expect(call[3]).toBeUndefined();
+    expect(call[7]?.tags).toEqual([]);
+    expect(call[7]?.narrowing?.chunk_ids).toEqual(['c1', 'c2']);
+  });
+
   it('marks a stopped partial answer and leaves it out of the next history', async () => {
     askQuestionStreamMock.mockImplementation(
       (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers, signal?: AbortSignal) =>

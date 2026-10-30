@@ -331,18 +331,27 @@ def _pinned_request(
 _MAX_VALIDATOR_CHARS = 200
 
 
-def _header_value(value: str | None) -> str | None:
-    if not value or len(value) > _MAX_VALIDATOR_CHARS:
+def usable_validator(value: object) -> str | None:
+    """An ETag or Last-Modified worth keeping and sending back, or None.
+
+    Only printable ASCII: it is sent back as a request header, which httpx encodes as
+    ASCII — a server's Latin-1 ETag (or a backup's) made every later refresh of the
+    document fail before it was sent.
+    """
+
+    if not isinstance(value, str) or not value or len(value) > _MAX_VALIDATOR_CHARS:
+        return None
+    if not all(" " <= character <= "~" for character in value):
         return None
     return value
 
 
 def _conditional_headers(etag: str | None, last_modified: str | None) -> dict[str, str] | None:
     headers = {}
-    if etag:
-        headers["If-None-Match"] = etag
-    if last_modified:
-        headers["If-Modified-Since"] = last_modified
+    if usable_validator(etag):
+        headers["If-None-Match"] = str(etag)
+    if usable_validator(last_modified):
+        headers["If-Modified-Since"] = str(last_modified)
     return headers or None
 
 
@@ -512,8 +521,9 @@ def _fetch(
                         filename or "",
                         b"",
                         current,
-                        etag=response.headers.get("etag") or conditional.get("If-None-Match"),
-                        last_modified=response.headers.get("last-modified")
+                        etag=usable_validator(response.headers.get("etag"))
+                        or conditional.get("If-None-Match"),
+                        last_modified=usable_validator(response.headers.get("last-modified"))
                         or conditional.get("If-Modified-Since"),
                         not_modified=True,
                     )
@@ -552,8 +562,8 @@ def _fetch(
                     body,
                     current,
                     remote_named=remote_named,
-                    etag=_header_value(response.headers.get("etag")),
-                    last_modified=_header_value(response.headers.get("last-modified")),
+                    etag=usable_validator(response.headers.get("etag")),
+                    last_modified=usable_validator(response.headers.get("last-modified")),
                 )
             finally:
                 response.close()

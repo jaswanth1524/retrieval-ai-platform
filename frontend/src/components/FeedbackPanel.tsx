@@ -1,6 +1,8 @@
 import { memo, useState } from 'react';
 import type { FeedbackItemResponse, FeedbackKind, FeedbackRating } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
+import { isoTime, toCsv } from '../utils/csv';
+import { downloadFile } from '../utils/exportChat';
 import './FeedbackPanel.css';
 
 interface FeedbackPanelProps {
@@ -33,6 +35,26 @@ function matchesKind(item: FeedbackItemResponse, kind: KindFilter): boolean {
   if (kind === 'all') return true;
   if (kind === 'citation') return item.citation_source_number !== null;
   return item.citation_source_number === null && (item.kind ?? 'question') === kind;
+}
+
+function exportFeedback(rows: FeedbackItemResponse[]) {
+  downloadFile(
+    'docrag-feedback.csv',
+    'text/csv',
+    toCsv(
+      ['created_at', 'rating', 'kind', 'source', 'question', 'answer_excerpt', 'cited_files', 'trace_id'],
+      rows.map((item) => [
+        isoTime(item.created_at),
+        item.rating,
+        item.kind ?? 'question',
+        item.citation_source_number ?? '',
+        item.question,
+        item.answer_excerpt,
+        item.cited_filenames.join('; '),
+        item.trace_id ?? '',
+      ]),
+    ),
+  );
 }
 
 /** Recorded answer ratings (GET /feedback), newest first — thumbs-down rows are the
@@ -84,6 +106,17 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
       </select>
       <p className="feedback-panel__summary mono">
         {feedback.length} rating{feedback.length === 1 ? '' : 's'} · {downCount} down
+        {rows.length > 0 && (
+          <button
+            type="button"
+            className="feedback-panel__filter"
+            onClick={() => exportFeedback(rows)}
+            title="Download the ratings shown as CSV"
+            data-testid="feedback-export"
+          >
+            CSV
+          </button>
+        )}
       </p>
       {rows.length === 0 && <p className="feedback-panel__message">No ratings here yet.</p>}
       {rows.map((item) => {

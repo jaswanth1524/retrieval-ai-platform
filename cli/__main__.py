@@ -25,7 +25,7 @@ documents, did), 2 bad arguments, 3 (``ask --strict``) the documents don't answe
 from __future__ import annotations
 
 import argparse
-import datetime
+import fnmatch
 import json
 import os
 import re
@@ -45,6 +45,7 @@ from cli.client import (
     StreamResult,
     grounding_notes,
     trim_history,
+    upload_bound,
 )
 from cli.completion import completion_script
 from cli.config import Profile, ProfileError, load_profile, resolve
@@ -53,10 +54,28 @@ from cli.config import Profile, ProfileError, load_profile, resolve
 EXIT_NOT_ANSWERED = 3
 
 
-def ingestible(paths: Sequence[Path], extensions: set[str]) -> tuple[list[Path], list[Path]]:
+def _matches(relative: str, patterns: Sequence[str]) -> bool:
+    """A pattern without "/" matches the file name, one with "/" the path under the
+    directory given (as the server's WATCH_INCLUDE / WATCH_EXCLUDE do)."""
+
+    name = relative.rsplit("/", 1)[-1]
+    return any(
+        fnmatch.fnmatchcase(relative if "/" in pattern else name, pattern) for pattern in patterns
+    )
+
+
+def ingestible(
+    paths: Sequence[Path],
+    extensions: set[str],
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+) -> tuple[list[Path], list[Path]]:
     """Files to upload under ``paths`` (directories walked recursively, sorted) and the
     ones skipped for an unsupported type. Dotfiles and dot-directories inside a walked
-    directory are ignored; a file named on the command line is always considered."""
+    directory are ignored; a file named on the command line is always considered.
+    ``include`` / ``exclude`` glob patterns choose files (left out silently), and an
+    excluded directory name leaves its whole tree out."""
 
     found: list[Path] = []
     skipped: list[Path] = []
@@ -67,10 +86,19 @@ def ingestible(paths: Sequence[Path], extensions: set[str]) -> tuple[list[Path],
                 for p in path.rglob("*")
                 if p.is_file()
                 and not any(part.startswith(".") for part in p.relative_to(path).parts)
+                and not any(
+                    _matches("/".join(p.relative_to(path).parts[: depth + 1]), exclude)
+                    for depth in range(len(p.relative_to(path).parts) - 1)
+                )
             )
+            relative = {p: p.relative_to(path).as_posix() for p in candidates}
         else:
             candidates = [path]
+            relative = {path: path.name}
         for candidate in candidates:
+            where = relative[candidate]
+            if (include and not _matches(where, include)) or _matches(where, exclude):
+                continue
             if candidate.suffix.lower() in extensions:
                 found.append(candidate)
             else:
@@ -271,7 +299,9 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     config = client.config()
     extensions = {ext.lower() for ext in config.get("supported_extensions", [])}
     max_bytes = config.get("max_upload_bytes")
-    files, unsupported = ingestible(paths, extensions)
+    files, unsupported = ingestible(
+        paths, extensions, include=args.include or (), exclude=args.exclude or ()
+    )
     text = None if args.json else out
     skipped: list[dict[str, str]] = []
     failed: list[dict[str, str]] = []
@@ -316,7 +346,9 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         if text:
             print(f"ok    {path} → {status.get('filename')} ({chunks} chunks)", file=text)
 
-    statuses = client.index_files(uploads, timeout=_wait_limit(args), on_finished=finished)
+    statuses = client.index_files(
+        uploads, timeout=_wait_limit(args), on_finished=finished, tags=args.tag or ()
+    )
     for path, status in statuses.items():
         if status.get("state") not in FINISHED_JOB_STATES:
             fail(path, _job_error(status))
@@ -328,7 +360,9 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
 
 
 def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    job = client.upload_url(args.source_url, args.name)
+    job = client.upload_url(
+        args.source_url, args.name, tags=args.tag or (), refresh_minutes=args.refresh_minutes
+    )
     status = client.wait_for_jobs([job["job_id"]], timeout=_wait_limit(args))[job["job_id"]]
     succeeded = status.get("state") == "done"
     if args.json:
@@ -343,6 +377,8 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
 
 
 ANSWER_FORMATS = ("default", "bullets", "table", "brief")
+# An option left out (``refresh --every``, whose None means "the server's interval").
+_NOT_GIVEN: Any = object()
 
 
 def narrowing_options(args: argparse.Namespace) -> dict[str, Any]:
@@ -366,19 +402,26 @@ def question_options(args: argparse.Namespace) -> dict[str, Any]:
         **narrowing_options(args),
         "answer_format": args.answer_format,
         "answer_language": args.language,
+        # Sent only when asked for (None is left out of the request).
+        "passages_only": args.passages_only or None,
+        "strong_matches_only": args.strong_only or None,
     }
 
 
-def upload_time(value: str) -> float:
+def upload_time(value: str, *, end_of_day: bool = False) -> float:
     """An ``--uploaded-after/--before`` value: an ISO date or date-time (local time when
-    it names no zone), as Unix seconds."""
+    it names no zone), as Unix seconds; ``--uploaded-before DATE`` includes that day."""
 
     try:
-        return datetime.datetime.fromisoformat(value.strip()).timestamp()
+        return upload_bound(value, end_of_day=end_of_day)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"{value!r} is not a date (2024-05-31) or date-time (2024-05-31T14:00)."
         ) from None
+
+
+def upload_time_until(value: str) -> float:
+    return upload_time(value, end_of_day=True)
 
 
 def _narrowing_flags(parser: argparse.ArgumentParser) -> None:
@@ -396,7 +439,10 @@ def _narrowing_flags(parser: argparse.ArgumentParser) -> None:
         "--uploaded-after", type=upload_time, metavar="DATE", help="Documents uploaded since."
     )
     parser.add_argument(
-        "--uploaded-before", type=upload_time, metavar="DATE", help="Documents uploaded before."
+        "--uploaded-before",
+        type=upload_time_until,
+        metavar="DATE",
+        help="Documents uploaded up to (and on) this date.",
     )
 
 
@@ -407,6 +453,16 @@ def _question_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--language", help='Answer in this language ("German"), or "match" the question.'
+    )
+    parser.add_argument(
+        "--passages-only",
+        action="store_true",
+        help="Answer from the matched passages alone, without their neighbouring text.",
+    )
+    parser.add_argument(
+        "--strong-only",
+        action="store_true",
+        help="Say not found rather than answer from weak matches.",
     )
 
 
@@ -620,12 +676,18 @@ def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -
 
 
 def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if not (args.query or "").strip() and not args.like:
+        print("search needs a query, or --like CHUNK_ID", file=sys.stderr)
+        return 2
+    options = narrowing_options(args)
+    if args.like:
+        options["like_chunk_id"] = args.like
     response = client.search_response(
-        args.query,
+        args.query or "",
         filenames=args.file or None,
         top_k=args.top_k,
         tags=args.tag or None,
-        options=narrowing_options(args),
+        options=options,
     )
     results: list[dict[str, Any]] = response.get("results", [])
     if args.json:
@@ -751,7 +813,40 @@ def cmd_reindex(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     return _follow(client, [client.reindex(args.file)], args, out)
 
 
+def refresh_every(value: str) -> int | None:
+    """``refresh --every``: minutes, ``never`` (0) or ``default`` (the server's)."""
+
+    if value == "default":
+        return None
+    if value == "never":
+        return 0
+    try:
+        minutes = int(value)
+    except ValueError:
+        minutes = -1
+    if minutes < 0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a number of minutes, 'never' or 'default'."
+        )
+    return minutes
+
+
 def cmd_refresh(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.every is not _NOT_GIVEN:
+        result = client.set_refresh_interval(args.file, args.every)
+        if args.json:
+            print(json.dumps(result), file=out)
+        else:
+            minutes = result.get("refresh_minutes")
+            said = (
+                "the server's interval"
+                if minutes is None
+                else "never"
+                if minutes == 0
+                else f"every {minutes} min"
+            )
+            print(f"{args.file}: checked {said}", file=out)
+        return 0
     result = client.refresh(args.file)
     if result.get("unchanged") and "job_id" not in result:
         if args.json:
@@ -787,7 +882,30 @@ def cmd_queries(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     return 0
 
 
+def cmd_preview(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    path = Path(args.file)
+    preview = client.preview(path)
+    if args.json:
+        print(json.dumps(preview), file=out)
+        return 0
+    print(
+        f"{preview['filename']}: {preview['chunk_count']} passages in "
+        f"{preview['section_count']} sections, {preview['page_count']} page(s)",
+        file=out,
+    )
+    for chunk in preview.get("first_chunks", [])[: args.count]:
+        text = " ".join(str(chunk.get("text", "")).split())
+        print(
+            f"\n#{chunk.get('ordinal')} p.{chunk.get('page')} · {chunk.get('section')}\n"
+            f"   {text[:240]}",
+            file=out,
+        )
+    return 0
+
+
 def cmd_jobs(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.retry:
+        return _follow(client, [client.retry_job(args.retry)], args, out)
     if args.cancel:
         status = client.cancel_job(args.cancel)
         if args.json:
@@ -820,6 +938,8 @@ def cmd_jobs(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
         line = f"{job.get('job_id')}  {job.get('state')}{progress}  {job.get('filename')}"
         if job.get("error"):
             line += f"\n    {job['error']}"
+            if job.get("retryable"):
+                line += f"\n    retry: docrag jobs --retry {job.get('job_id')}"
         print(line, file=out)
     return 0
 
@@ -854,15 +974,16 @@ def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         if trace.get("answer"):
             print(f"\n{trace['answer']}", file=out)
         return 0
-    traces = client.traces()
+    traces = client.traces(args.status or ())
     if args.json:
         print(json.dumps(traces), file=out)
         return 0
     for trace in traces:
         total = trace.get("total_ms")
         took = f"{total / 1000:.1f}s" if isinstance(total, int | float) else "-"
+        status = trace.get("answer_status") or trace.get("status") or ""
         print(
-            f"{trace.get('trace_id')}  {trace.get('status'):20} {took:>6}  {trace.get('question')}",
+            f"{trace.get('trace_id')}  {status:20} {took:>6}  {trace.get('question')}",
             file=out,
         )
     return 0
@@ -1037,12 +1158,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = command("ingest", "Upload files or whole directories and wait.")
     ingest.add_argument("paths", nargs="+")
+    ingest.add_argument("--tag", action="append", help="Tag every file (repeatable).")
+    ingest.add_argument(
+        "--include",
+        action="append",
+        metavar="GLOB",
+        help='Only files matching ("*.pdf", or "drafts/*" under a directory given).',
+    )
+    ingest.add_argument(
+        "--exclude",
+        action="append",
+        metavar="GLOB",
+        help='Leave matching files (or directories, by name) out ("*.py", "node_modules").',
+    )
     wait_flag(ingest)
 
     add_url = command("add-url", "Have the server fetch and index a URL.")
     # Not `url`: that is the server's address (--url), which this would overwrite.
     add_url.add_argument("source_url", metavar="url")
     add_url.add_argument("--name", help="Stored filename (with a supported extension).")
+    add_url.add_argument("--tag", action="append", help="Tag it (repeatable).")
+    add_url.add_argument(
+        "--refresh-minutes",
+        type=int,
+        metavar="MINUTES",
+        help="Check it again this often (0 = never; default: the server's interval).",
+    )
     wait_flag(add_url)
 
     ask = command("ask", "Ask a question (streamed).")
@@ -1079,7 +1220,10 @@ def build_parser() -> argparse.ArgumentParser:
     summarize.add_argument("--quiet", action="store_true")
 
     search = command("search", "Ranked passages, no LLM.")
-    search.add_argument("query")
+    search.add_argument("query", nargs="?", default="")
+    search.add_argument(
+        "--like", metavar="CHUNK_ID", help="Passages most like this one (instead of a query)."
+    )
     search.add_argument("--file", action="append")
     search.add_argument("--tag", action="append")
     search.add_argument("--top-k", type=int)
@@ -1107,6 +1251,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh = command("refresh", "Fetch a URL-ingested document again.")
     refresh.add_argument("file")
+    refresh.add_argument(
+        "--every",
+        type=refresh_every,
+        default=_NOT_GIVEN,
+        metavar="MINUTES|never|default",
+        help="Set how often it is checked instead of fetching it now.",
+    )
     wait_flag(refresh)
 
     versions = command("versions", "A document's earlier originals (RAW_DOCUMENT_VERSIONS).")
@@ -1118,8 +1269,16 @@ def build_parser() -> argparse.ArgumentParser:
     queries.add_argument("--uncovered", action="store_true", help="Only unanswered ones.")
     queries.add_argument("--limit", type=int, default=50)
 
+    preview = command("preview", "How a file would be indexed, without indexing it.")
+    preview.add_argument("file")
+    preview.add_argument("--count", type=int, default=5, help="Passages to show (max 20).")
+
     jobs = command("jobs", "Indexing jobs running now (or finished ones).")
     jobs.add_argument("--cancel", metavar="JOB_ID", help="Cancel this job.")
+    jobs.add_argument(
+        "--retry", metavar="JOB_ID", help="Run this failed job again (a URL, a re-index)."
+    )
+    wait_flag(jobs)
     jobs.add_argument("--recent", action="store_true", help="Finished jobs, newest first.")
     jobs.add_argument("--failed", action="store_true", help="Only failed jobs, newest first.")
     jobs.add_argument("--limit", type=int, default=50)
@@ -1127,6 +1286,12 @@ def build_parser() -> argparse.ArgumentParser:
     traces = command("traces", "Recent question traces: list, show one, or export.")
     traces.add_argument("action", nargs="?", choices=("list", "show", "export"), default="list")
     traces.add_argument("target", nargs="?", help="The trace id (show) or file (export).")
+    traces.add_argument(
+        "--status",
+        action="append",
+        choices=("answered", "uncited", "insufficient_context", "no_context"),
+        help="Only traces answered this way (repeatable).",
+    )
 
     feedback = command("feedback", "Recorded answer ratings (FEEDBACK_ENABLED, full key).")
     feedback.add_argument("--limit", type=int, default=50)
@@ -1159,6 +1324,7 @@ COMMANDS = {
     "chat": cmd_chat,
     "summarize": cmd_summarize,
     "search": cmd_search,
+    "preview": cmd_preview,
     "read": cmd_read,
     "delete": cmd_delete,
     "tags": cmd_tags,

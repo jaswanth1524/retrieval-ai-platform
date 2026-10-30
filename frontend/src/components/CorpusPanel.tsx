@@ -17,7 +17,8 @@ import DocumentCard from './corpus/DocumentCard';
 import { corpusTotals } from './corpus/cardHelpers';
 import { droppedEntries, filesUnder, folderPickNote, hasFolder, pickFolderFiles } from '../utils/folderFiles';
 import UrlIngestForm from './corpus/UrlIngestForm';
-import { parseUploadTags } from '../utils/tags';
+import FilePreview from './corpus/FilePreview';
+import { MAX_TAGS_PER_DOCUMENT, parseUploadTags } from '../utils/tags';
 import type { DocCard, DocumentMeta, UploadItem } from './corpus/types';
 import './CorpusPanel.css';
 
@@ -67,6 +68,8 @@ interface CorpusPanelProps {
   summaryMaxDocuments?: number;
   /** Fetch a URL-ingested document again; absent when URL ingest is off. */
   onRefreshFromUrl?: (filename: string) => void;
+  /** Set how often a fetched document is checked again (null = the server's). */
+  onSetRefreshInterval?: (filename: string, minutes: number | null) => void;
   /** Put an earlier original back (RAW_DOCUMENT_VERSIONS on, full key). */
   onRestoreVersion?: (filename: string, version: string) => void;
   /** The workspace the panel shows (for per-card requests). */
@@ -76,6 +79,8 @@ interface CorpusPanelProps {
   summarizeDisabled?: boolean;
   /** Index a document the server fetches from a URL; absent when that is off. */
   onUploadFromUrl?: (url: string) => void;
+  /** Offer "Preview a file…" (POST /documents/preview, full key). */
+  canPreview?: boolean;
 }
 
 // 'listed': the order the corpus arrives in (the server's listing, then this session's
@@ -88,8 +93,6 @@ const SORT_LABELS: Record<SortKey, string> = {
   largest: 'Largest',
 };
 const SORT_STORAGE_KEY = 'docrag-corpus-sort';
-// api/documents.py's MAX_TAGS_PER_DOCUMENT: a bulk "add tag" past it is refused there.
-const MAX_TAGS_PER_DOCUMENT = 20;
 
 /** The tags given to new uploads, typed as a comma-separated list; applied on blur or
  *  Enter, so a half-typed tag isn't sent with a drop made meanwhile. */
@@ -167,10 +170,12 @@ function CorpusPanel({
   onAskAbout,
   summaryMaxDocuments,
   onRefreshFromUrl,
+  onSetRefreshInterval,
   onRestoreVersion,
   workspace,
   summarizeDisabled = false,
   onUploadFromUrl,
+  canPreview = false,
   uploadTags,
   onUploadTagsChange,
 }: CorpusPanelProps) {
@@ -326,6 +331,7 @@ function CorpusPanel({
           bytes: meta?.bytes,
           uploadedAt: meta?.uploadedAt,
           sourceUrl: meta?.sourceUrl,
+          urlRefresh: meta?.urlRefresh,
         };
       });
   }, [filenames, documents, inFlightKey, onReindex]);
@@ -514,6 +520,13 @@ function CorpusPanel({
           >
             Upload a folder…
           </button>
+          {canPreview && (
+            <FilePreview
+              accept={acceptedExtensions(supportedExtensions)}
+              workspace={workspace ?? ''}
+              disabled={submitting}
+            />
+          )}
           <input
             ref={folderInputRef}
             type="file"
@@ -730,6 +743,7 @@ function CorpusPanel({
             onDismissUpload={onDismissUpload}
             onSetTags={onSetTags}
             onRefreshFromUrl={onRefreshFromUrl}
+            onSetRefreshInterval={onSetRefreshInterval}
             onRestoreVersion={onRestoreVersion}
             workspace={workspace}
           />

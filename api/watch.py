@@ -23,6 +23,7 @@ different subfolders are one document, so the second is skipped with a warning.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 import stat
@@ -122,7 +123,42 @@ class FolderScan(NamedTuple):
     incomplete: bool
 
 
-def scan_folder(root: Path, max_bytes: int) -> FolderScan:
+def glob_patterns(value: str) -> tuple[str, ...]:
+    """WATCH_INCLUDE / WATCH_EXCLUDE as patterns (comma-separated, blanks dropped)."""
+
+    return tuple(pattern.strip() for pattern in value.split(",") if pattern.strip())
+
+
+@dataclass(frozen=True)
+class PathFilter:
+    """Which files under the folder are watched (WATCH_INCLUDE / WATCH_EXCLUDE).
+
+    A pattern without "/" matches a file (or directory) name, one with "/" the path
+    relative to the folder, both case-sensitively as on a Linux disk.
+    """
+
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+
+    @staticmethod
+    def _matches(relative: str, patterns: tuple[str, ...]) -> bool:
+        name = relative.rsplit("/", 1)[-1]
+        return any(
+            fnmatch.fnmatchcase(relative if "/" in pattern else name, pattern)
+            for pattern in patterns
+        )
+
+    def keeps_file(self, relative: str) -> bool:
+        if self.include and not self._matches(relative, self.include):
+            return False
+        return not self._matches(relative, self.exclude)
+
+    def keeps_directory(self, relative: str) -> bool:
+        # Only exclusions prune a directory: an include pattern names files.
+        return not self._matches(relative, self.exclude)
+
+
+def scan_folder(root: Path, max_bytes: int, path_filter: PathFilter | None = None) -> FolderScan:
     """Supported regular files under ``root`` by stored name, and the problems found
     (duplicate names, unusable names, links and special files, files over the upload
     limit).
@@ -143,10 +179,18 @@ def scan_folder(root: Path, max_bytes: int) -> FolderScan:
 
     # followlinks stays False: a linked directory is not descended into, for the same
     # reason linked files are skipped below.
+    keep = path_filter or PathFilter()
     for directory, subdirectories, filenames in os.walk(root, onerror=unreadable_directory):
-        subdirectories[:] = sorted(d for d in subdirectories if not d.startswith("."))
+        under = Path(directory).relative_to(root).as_posix()
+        prefix = "" if under == "." else f"{under}/"
+        subdirectories[:] = sorted(
+            d for d in subdirectories if not d.startswith(".") and keep.keeps_directory(prefix + d)
+        )
         for name in sorted(filenames):
             if name.startswith(".") or Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            # Left out by WATCH_INCLUDE / WATCH_EXCLUDE: not seen at all, so never deleted.
+            if not keep.keeps_file(prefix + name):
                 continue
             path = Path(directory) / name
             try:
@@ -212,6 +256,9 @@ class FolderWatcher:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._root = Path(settings.watch_dir)
+        self._filter = PathFilter(
+            glob_patterns(settings.watch_include), glob_patterns(settings.watch_exclude)
+        )
         self._interval = float(settings.watch_interval_seconds)
         self._delete_missing = bool(settings.watch_delete_missing)
         self._max_bytes = int(settings.max_upload_bytes)
@@ -280,7 +327,7 @@ class FolderWatcher:
             self._record_status(0, [f"{self._root}: not a directory"], done)
             return done
         self._check_jobs(done)
-        scan = scan_folder(self._root, self._max_bytes)
+        scan = scan_folder(self._root, self._max_bytes, self._filter)
         files = scan.files
         for problem in scan.problems:
             if problem not in self._reported:  # once, not every interval

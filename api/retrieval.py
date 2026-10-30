@@ -49,6 +49,8 @@ class RetrievedChunk:
     chunk_ordinal: int | None = None
     # The chunk's last page when it crosses a page break (DocumentChunk.page_end).
     page_end: int | None = None
+    # When its document was uploaded (Unix seconds); None when not stamped.
+    uploaded_at: float | None = None
 
 
 def points_to_chunks(points: Sequence[models.ScoredPoint]) -> list[RetrievedChunk]:
@@ -107,7 +109,15 @@ def scored_point_to_chunk(point: models.ScoredPoint) -> RetrievedChunk:
         score=float(point.score),
         chunk_ordinal=payload_optional_int(payload, "chunk_ordinal"),
         page_end=payload_optional_int(payload, "page_end"),
+        uploaded_at=_payload_optional_float(payload, "uploaded_at"),
     )
+
+
+def _payload_optional_float(payload: dict[str, object], key: str) -> float | None:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 def payload_string(payload: dict[str, object], key: str) -> str:

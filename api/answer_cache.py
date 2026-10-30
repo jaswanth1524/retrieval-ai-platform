@@ -74,6 +74,9 @@ def answer_cache_key(
         float(settings.llm_temperature),
         settings.answer_language,
         settings.answer_format,
+        # PASSAGES_ONLY / STRONG_MATCHES_ONLY: a stricter answer is another answer.
+        int(settings.context_neighbor_radius),
+        int(settings.rerank_fallback_count),
         narrow,
         corpus_generation(settings.qdrant_collection),
     )

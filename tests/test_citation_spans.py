@@ -246,3 +246,37 @@ def test_units_are_joined_by_spaces_and_rows_by_line_breaks() -> None:
         _Unit("| b | c |", 2, 1, "S"),
     ]
     assert join_units(window) == "Intro text. More text.\nname: a\n| b | c |"
+
+
+def test_query_spans_mark_the_best_sentences_in_text_order() -> None:
+    from api.citations import MAX_QUERY_SPANS, query_spans
+
+    text = (
+        "Parking is free. Passes for parking are issued at reception. "
+        "Reception issues parking passes and visitor passes daily. The cafe opens at nine."
+    )
+    spans = query_spans("parking passes reception", text)
+    assert len(spans) == MAX_QUERY_SPANS == 2
+    assert [span.quote for span in spans] == [
+        "Passes for parking are issued at reception.",
+        "Reception issues parking passes and visitor passes daily.",
+    ]
+    assert all(text[span.start : span.end] == span.quote for span in spans)
+    # One word is enough for a one- or two-word query; stopwords alone never are.
+    assert [span.quote for span in query_spans("cafe", text)] == ["The cafe opens at nine."]
+    assert query_spans("the of and", text) == ()
+
+
+def test_past_heading_moves_only_past_the_chunks_own_heading() -> None:
+    from api.citations import _past_heading
+
+    text = "## Leave\nAnnual leave is twenty days."
+    assert text[_past_heading(text, 0, len(text), "Leave") :] == "Annual leave is twenty days."
+    # A label that only starts a longer word is not the heading.
+    other = "Leaves fall in autumn."
+    assert _past_heading(other, 0, len(other), "Leave") == 0
+    # A span that is nothing but the heading keeps its title rather than becoming empty.
+    bare = "## Leave"
+    assert bare[_past_heading(bare, 0, len(bare), "Leave") :] == "Leave"
+    setext = "Leave\n=====\nAnnual leave is twenty days."
+    assert setext[_past_heading(setext, 0, len(setext), "Leave") :].startswith("Annual")

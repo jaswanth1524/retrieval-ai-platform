@@ -21,6 +21,8 @@ interface DocumentViewerProps {
   highlights?: string[];
   /** Ask a question about one passage only (absent while asking can't start). */
   onAskAboutPassage?: (question: string, chunkId: string) => void;
+  /** Search for the passages most like one ("more like this"). */
+  onFindSimilar?: (chunkId: string, label: string) => void;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -66,9 +68,21 @@ function DocumentViewer({
   canPreviewOriginal = false,
   highlights,
   onAskAboutPassage,
+  onFindSimilar,
 }: DocumentViewerProps) {
   // The passage whose question box is open, and what is typed in it.
   const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
+  // The passage whose ask box Escape closed: focus goes back to its "Ask about this"
+  // button, rather than to the page body with the box gone.
+  const askClosedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const chunkId = askClosedRef.current;
+    if (asking !== null || chunkId === null) return;
+    askClosedRef.current = null;
+    document
+      .querySelector<HTMLElement>(`[data-chunk-id="${CSS.escape(chunkId)}"] [data-testid="viewer-ask"]`)
+      ?.focus();
+  }, [asking]);
   // Both keyed by filename, so pointing the open viewer at another document shows its
   // passages straight away, in the same render, with nothing of the previous original.
   const [modeFor, setModeFor] = useState<{ filename: string; mode: ViewerMode }>({
@@ -416,6 +430,22 @@ function DocumentViewer({
                       Ask about this
                     </button>
                   )}
+                  {onFindSimilar && (
+                    <button
+                      type="button"
+                      className="document-viewer__ask"
+                      onClick={() =>
+                        onFindSimilar(
+                          chunk.chunk_id,
+                          `${filename} ${pageLabel(chunk.page, chunk.page_end)}`,
+                        )
+                      }
+                      aria-label={`Passages like this one (${pageLabel(chunk.page, chunk.page_end)})`}
+                      data-testid="viewer-similar"
+                    >
+                      Similar
+                    </button>
+                  )}
                 </div>
                 {onAskAboutPassage && asking?.chunkId === chunk.chunk_id && (
                   <form
@@ -438,6 +468,7 @@ function DocumentViewer({
                       onKeyDown={(event) => {
                         if (event.key === 'Escape') {
                           event.stopPropagation();
+                          askClosedRef.current = chunk.chunk_id;
                           setAsking(null);
                         }
                       }}

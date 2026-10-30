@@ -34,6 +34,20 @@
     "title": "Body_import_backup_import_post",
     "type": "object"
    },
+   "Body_preview_document_documents_preview_post": {
+    "properties": {
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_preview_document_documents_preview_post",
+    "type": "object"
+   },
    "Body_upload_document_documents_post": {
     "properties": {
      "file": {
@@ -392,6 +406,11 @@
       "title": "Job Id",
       "type": "string"
      },
+     "kind": {
+      "default": "upload",
+      "title": "Kind",
+      "type": "string"
+     },
      "result": {
       "anyOf": [
        {
@@ -401,6 +420,11 @@
         "type": "null"
        }
       ]
+     },
+     "retryable": {
+      "default": false,
+      "title": "Retryable",
+      "type": "boolean"
      },
      "state": {
       "enum": [
@@ -513,12 +537,65 @@
       "default": {},
       "title": "Uploaded Ats",
       "type": "object"
+     },
+     "url_refresh": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/UrlRefreshStatusResponse"
+      },
+      "default": {},
+      "title": "Url Refresh",
+      "type": "object"
      }
     },
     "required": [
      "filenames"
     ],
     "title": "DocumentListResponse",
+    "type": "object"
+   },
+   "DocumentPreviewResponse": {
+    "description": "How a file would be indexed (POST /documents/preview), without indexing it.",
+    "properties": {
+     "chunk_count": {
+      "title": "Chunk Count",
+      "type": "integer"
+     },
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "first_chunks": {
+      "items": {
+       "$ref": "#/components/schemas/PreviewChunkResponse"
+      },
+      "title": "First Chunks",
+      "type": "array"
+     },
+     "page_count": {
+      "title": "Page Count",
+      "type": "integer"
+     },
+     "section_count": {
+      "title": "Section Count",
+      "type": "integer"
+     },
+     "section_labels": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Section Labels",
+      "type": "array"
+     }
+    },
+    "required": [
+     "filename",
+     "section_count",
+     "chunk_count",
+     "page_count",
+     "section_labels",
+     "first_chunks"
+    ],
+    "title": "DocumentPreviewResponse",
     "type": "object"
    },
    "DocumentRefreshResponse": {
@@ -538,6 +615,51 @@
      "filename"
     ],
     "title": "DocumentRefreshResponse",
+    "type": "object"
+   },
+   "DocumentRefreshSettingsRequest": {
+    "description": "A fetched document's own refresh interval (PATCH /documents/{f}/refresh-settings):\nminutes between scheduled checks, 0 = never, null = the server's interval.",
+    "properties": {
+     "refresh_minutes": {
+      "anyOf": [
+       {
+        "maximum": 525600.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Refresh Minutes"
+     }
+    },
+    "title": "DocumentRefreshSettingsRequest",
+    "type": "object"
+   },
+   "DocumentRefreshSettingsResponse": {
+    "properties": {
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "refresh_minutes": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Refresh Minutes"
+     }
+    },
+    "required": [
+     "filename",
+     "refresh_minutes"
+    ],
+    "title": "DocumentRefreshSettingsResponse",
     "type": "object"
    },
    "DocumentReindexAllResponse": {
@@ -966,6 +1088,46 @@
      "feedback_skipped"
     ],
     "title": "ImportResponse",
+    "type": "object"
+   },
+   "PreviewChunkResponse": {
+    "description": "One passage a file would be indexed as.",
+    "properties": {
+     "ordinal": {
+      "title": "Ordinal",
+      "type": "integer"
+     },
+     "page": {
+      "title": "Page",
+      "type": "integer"
+     },
+     "page_end": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page End"
+     },
+     "section": {
+      "title": "Section",
+      "type": "string"
+     },
+     "text": {
+      "title": "Text",
+      "type": "string"
+     }
+    },
+    "required": [
+     "ordinal",
+     "page",
+     "section",
+     "text"
+    ],
+    "title": "PreviewChunkResponse",
     "type": "object"
    },
    "PromptMessageResponse": {
@@ -1451,6 +1613,11 @@
       ],
       "title": "Page Min"
      },
+     "passages_only": {
+      "default": false,
+      "title": "Passages Only",
+      "type": "boolean"
+     },
      "question": {
       "maxLength": 4000,
       "minLength": 1,
@@ -1482,6 +1649,11 @@
        }
       ],
       "title": "Section"
+     },
+     "strong_matches_only": {
+      "default": false,
+      "title": "Strong Matches Only",
+      "type": "boolean"
      },
      "tags": {
       "anyOf": [
@@ -1640,7 +1812,7 @@
     "type": "object"
    },
    "SearchRequest": {
-    "description": "Retrieval without an answer: the passages a question would be answered from.",
+    "description": "Retrieval without an answer: the passages a question would be answered from, or\n(``like_chunk_id``) the passages most like a stored one.",
     "properties": {
      "chunk_ids": {
       "anyOf": [
@@ -1712,6 +1884,19 @@
       ],
       "title": "Filenames"
      },
+     "like_chunk_id": {
+      "anyOf": [
+       {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Like Chunk Id"
+     },
      "page_max": {
       "anyOf": [
        {
@@ -1737,8 +1922,8 @@
       "title": "Page Min"
      },
      "query": {
+      "default": "",
       "maxLength": 4000,
-      "minLength": 1,
       "title": "Query",
       "type": "string"
      },
@@ -1810,9 +1995,6 @@
       "title": "Uploaded Before"
      }
     },
-    "required": [
-     "query"
-    ],
     "title": "SearchRequest",
     "type": "object"
    },
@@ -2298,6 +2480,17 @@
       "title": "Answer Language",
       "type": "string"
      },
+     "context_neighbor_radius": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Context Neighbor Radius"
+     },
      "filenames": {
       "anyOf": [
        {
@@ -2350,6 +2543,17 @@
        }
       ],
       "title": "Narrowing"
+     },
+     "rerank_fallback_count": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Fallback Count"
      },
      "rerank_min_score": {
       "title": "Rerank Min Score",
@@ -2628,6 +2832,17 @@
    "TraceSummaryResponse": {
     "description": "One row of the trace list \u2014 enough to pick a trace without fetching it.",
     "properties": {
+     "answer_status": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Status"
+     },
      "candidate_count": {
       "title": "Candidate Count",
       "type": "integer"
@@ -2671,6 +2886,17 @@
       ],
       "title": "Status",
       "type": "string"
+     },
+     "top_rerank_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Rerank Score"
      },
      "total_ms": {
       "anyOf": [
@@ -2717,6 +2943,19 @@
       ],
       "title": "Filename"
      },
+     "refresh_minutes": {
+      "anyOf": [
+       {
+        "maximum": 525600.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Refresh Minutes"
+     },
      "tags": {
       "anyOf": [
        {
@@ -2744,6 +2983,62 @@
      "url"
     ],
     "title": "UrlIngestRequest",
+    "type": "object"
+   },
+   "UrlRefreshStatusResponse": {
+    "description": "A fetched document's scheduled refresh (URL_REFRESH_INTERVAL_MINUTES).",
+    "properties": {
+     "failures": {
+      "default": 0,
+      "title": "Failures",
+      "type": "integer"
+     },
+     "last_checked": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Last Checked"
+     },
+     "last_outcome": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Last Outcome"
+     },
+     "next_due": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Next Due"
+     },
+     "refresh_minutes": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Refresh Minutes"
+     }
+    },
+    "title": "UrlRefreshStatusResponse",
     "type": "object"
    },
    "UsageResponse": {
@@ -3489,6 +3784,161 @@
     "summary": "Get Document Job"
    }
   },
+  "/documents/jobs/{job_id}/retry": {
+   "post": {
+    "operationId": "retry_document_job_documents_jobs__job_id__retry_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such job (or another workspace's)."
+     },
+     "409": {
+      "description": "The job hasn't failed, can't be retried by the server (an upload: send the file again), or its document is being indexed."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Retry Document Job"
+   }
+  },
+  "/documents/preview": {
+   "post": {
+    "operationId": "preview_document_documents_preview_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_preview_document_documents_preview_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentPreviewResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "An unsupported, unreadable or empty file."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     },
+     "429": {
+      "description": "Too many previews are running; try again in a moment."
+     }
+    },
+    "summary": "Preview Document"
+   }
+  },
   "/documents/reindex": {
    "post": {
     "operationId": "reindex_stale_documents_documents_reindex_post",
@@ -3920,6 +4370,90 @@
      }
     },
     "summary": "Refresh Document From Url"
+   }
+  },
+  "/documents/{filename}/refresh-settings": {
+   "patch": {
+    "operationId": "set_document_refresh_settings_documents__filename__refresh_settings_patch",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "filename",
+      "required": true,
+      "schema": {
+       "title": "Filename",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/DocumentRefreshSettingsRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentRefreshSettingsResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such document, or it wasn't fetched from a URL."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Set Document Refresh Settings"
    }
   },
   "/documents/{filename}/reindex": {
@@ -5014,6 +5548,9 @@
       },
       "description": "Successful Response"
      },
+     "404": {
+      "description": "No passage has the like_chunk_id given."
+     },
      "422": {
       "content": {
        "application/json": {
@@ -5032,6 +5569,29 @@
    "get": {
     "operationId": "list_traces_traces_get",
     "parameters": [
+     {
+      "description": "Only traces with one of these answer statuses (repeatable): answered, uncited, insufficient_context, no_context.",
+      "in": "query",
+      "name": "answer_status",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "items": {
+          "maxLength": 40,
+          "type": "string"
+         },
+         "maxItems": 10,
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Only traces with one of these answer statuses (repeatable): answered, uncited, insufficient_context, no_context.",
+       "title": "Answer Status"
+      }
+     },
      {
       "in": "header",
       "name": "X-API-Key",

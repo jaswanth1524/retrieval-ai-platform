@@ -280,3 +280,23 @@ def test_latency_is_summarized_and_shown_but_never_judged(tmp_path: Path) -> Non
     assert "  latency p50: 100 → 160 ms (+60)" in format_diff(diff)
     page = render_report(load_run(after), title="t")
     assert "<td>p50 (ms)</td><td>160</td>" in page
+
+
+def test_per_format_metrics_are_reported_and_diffed(tmp_path: Path) -> None:
+    from eval.compare import render_report
+
+    before = _retrieval(tmp_path / "a.json", {"q1": 1.0}, 1.0)
+    after = _retrieval(tmp_path / "b.json", {"q1": 1.0}, 1.0)
+    for path, hit in ((before, 1.0), (after, 0.5)):
+        data = json.loads(path.read_text())
+        data["by_format"] = {
+            ".pdf": {"filename": {"hit@1": hit, "questions": 2.0}},
+            ".docx": {"filename": {"hit@1": 1.0, "questions": 1.0}},
+        }
+        path.write_text(json.dumps(data))
+
+    diff = diff_runs(load_run(before), load_run(after))
+    assert diff.by_format == [(".pdf filename hit@1", 1.0, 0.5)]
+    assert "  .pdf filename hit@1: 1.000 → 0.500 (-0.500)" in format_diff(diff)
+    page = render_report(load_run(after), title="t")
+    assert "<h2>By format</h2>" in page and "<td>.docx</td>" in page

@@ -280,6 +280,9 @@ class DocumentSource:
     url: str
     etag: str | None = None
     last_modified: str | None = None
+    # How often the scheduled refresh checks it, in minutes: None = the server's
+    # URL_REFRESH_INTERVAL_MINUTES, 0 = never.
+    refresh_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +334,7 @@ class DocumentChunk:
     source_url: str | None = None
     source_etag: str | None = None
     source_last_modified: str | None = None
+    source_refresh_minutes: int | None = None
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
@@ -346,6 +350,7 @@ class DocumentChunk:
     PAYLOAD_SOURCE_URL_KEY: ClassVar[str] = "source_url"
     PAYLOAD_SOURCE_ETAG_KEY: ClassVar[str] = "source_etag"
     PAYLOAD_SOURCE_LAST_MODIFIED_KEY: ClassVar[str] = "source_last_modified"
+    PAYLOAD_SOURCE_REFRESH_MINUTES_KEY: ClassVar[str] = "source_refresh_minutes"
 
     def to_payload(self) -> dict[str, str | int | float | list[str]]:
         """Return the Qdrant payload shape needed for grounded citations."""
@@ -379,6 +384,7 @@ class DocumentChunk:
             (self.PAYLOAD_SOURCE_URL_KEY, self.source_url),
             (self.PAYLOAD_SOURCE_ETAG_KEY, self.source_etag),
             (self.PAYLOAD_SOURCE_LAST_MODIFIED_KEY, self.source_last_modified),
+            (self.PAYLOAD_SOURCE_REFRESH_MINUTES_KEY, self.source_refresh_minutes),
         ):
             if value is not None:
                 payload[key] = value
@@ -396,9 +402,20 @@ def parse_document_bytes(
 
     safe_filename = validate_upload_filename(filename)
     suffix = PurePosixPath(safe_filename).suffix.lower()
+    try:
+        parsed = PARSERS[suffix](safe_filename, content, settings)
+    except DocumentError:
+        raise
+    except (ValueError, RecursionError, MemoryError) as exc:
+        # A malformed file tripping a library (a bad number in an attribute, nesting
+        # past the recursion limit, a declared size too large to allocate) is this
+        # document's fault: a "document" error, which the folder watcher gives up on,
+        # rather than an "unexpected" one it retries forever.
+        logger.warning("Could not parse %s: %r", safe_filename, exc)
+        raise DocumentParseError(f"Could not parse '{safe_filename}'.") from exc
     sections = [
         replace(section, text=clean_text(section.text), section=clean_text(section.section))
-        for section in PARSERS[suffix](safe_filename, content, settings)
+        for section in parsed
     ]
     kept = [section for section in sections if section.text.strip()]
     if not kept:

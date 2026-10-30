@@ -153,6 +153,11 @@ class AppSettings(BaseSettings):
     # any reranker's scale, and only ever trims the prompt — never turns an answer into
     # a refusal. A low-scoring sixth passage is ~1k tokens of prompt to read.
     rerank_relative_floor: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Favour newer documents among the passages kept for an answer: each is ordered by
+    # its rerank score plus this times how recent its document is (1 for the newest kept,
+    # 0 for one a year or more older). Nothing is added or dropped, and RRF is
+    # untouched; the order decides which passages reach the prompt first. 0 = off.
+    recency_boost_weight: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Checked at startup (case-insensitive): a typo used to boot fine and then fail
     # every question with a 400 that blamed the client.
@@ -508,6 +513,13 @@ class AppSettings(BaseSettings):
     # WATCH_MAX_RETRIES times; then it waits until the file changes. 0 = never retried.
     watch_max_retries: int = Field(default=3, ge=0, le=100)
     watch_retry_max_seconds: float = Field(default=3600.0, ge=2.0, le=604_800.0)
+    # Which files under WATCH_DIR are watched: comma-separated glob patterns. One with
+    # no "/" matches a file name ("*.py"), one with a "/" the path under WATCH_DIR
+    # ("drafts/*"). With WATCH_INCLUDE set only matching files are; WATCH_EXCLUDE
+    # leaves matching files (and directories, by name) out. An excluded file is never
+    # deleted by WATCH_DELETE_MISSING. Empty = every supported file.
+    watch_include: str = Field(default="", max_length=4000)
+    watch_exclude: str = Field(default="", max_length=4000)
 
     url_ingest_enabled: bool = False
     url_ingest_allow_private: bool = False
@@ -518,6 +530,9 @@ class AppSettings(BaseSettings):
     # 0 = off. Needs URL_INGEST_ENABLED.
     url_refresh_interval_minutes: int = Field(default=0, ge=0, le=525_600)
     url_refresh_batch: PositiveInt = 4
+    # Where the scheduled refresh keeps when each document was last checked (a sqlite
+    # file), so a restart doesn't make every document due at once. Empty = in memory.
+    url_refresh_state_path: str = ""
 
     summary_batch_chars: int = Field(default=9000, ge=1000, le=200_000)
     summary_max_batches: int = Field(default=8, ge=1, le=64)

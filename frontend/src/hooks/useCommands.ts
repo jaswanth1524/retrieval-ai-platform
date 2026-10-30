@@ -47,6 +47,8 @@ export interface CommandActions {
   exportMarkdown: () => void;
   exportJson: () => void;
   browseTraces: () => void;
+  showSavedAnswers: () => void;
+  exportSavedAnswers: () => void;
   searchPassages: () => void;
   restoreBackup: () => void;
   downloadBackup: () => void;
@@ -235,6 +237,18 @@ export function useCommands(
         glyph: '◔',
         label: 'Browse traces',
         run: () => run.current.browseTraces(),
+      },
+      {
+        id: 'saved-answers',
+        glyph: '☆',
+        label: 'Saved answers',
+        run: () => run.current.showSavedAnswers(),
+      },
+      {
+        id: 'export-saved-answers',
+        glyph: '↓',
+        label: 'Export saved answers (Markdown)',
+        run: () => run.current.exportSavedAnswers(),
       },
       ...(readOnly
         ? []

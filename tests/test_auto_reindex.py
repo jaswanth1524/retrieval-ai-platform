@@ -76,7 +76,7 @@ def _stale(repository: VectorRepository, settings: AppSettings) -> list[str]:
 
 
 def test_stale_documents_are_reindexed_a_batch_at_a_time(
-    tmp_path: Path, executor: ThreadPoolExecutor
+    tmp_path: Path, executor: ThreadPoolExecutor, caplog: pytest.LogCaptureFixture
 ) -> None:
     repository, settings, store, jobs, names = _setup(tmp_path, executor)
     # A chunk-setting change makes every document stale.
@@ -84,7 +84,14 @@ def test_stale_documents_are_reindexed_a_batch_at_a_time(
     assert _stale(repository, current) == names
     reindexer = _reindexer(repository, current, store, jobs, executor)
 
+    caplog.set_level(logging.INFO, logger="api.audit")
     assert reindexer.run_once() == 2
+    # Each background re-index leaves the audit line a user's re-index does, marked.
+    audited = [r.audit for r in caplog.records if r.name == "api.audit"]  # type: ignore[attr-defined]
+    assert [(a["event"], a["filename"], a["scheduled"]) for a in audited] == [
+        ("document.reindex", "a.txt", True),
+        ("document.reindex", "b.txt", True),
+    ]
     # Its own two jobs are still counted until they finish: nothing more is queued.
     wait_until(lambda: len(_stale(repository, current)) == 1)
     assert reindexer.run_once() == 1

@@ -1,7 +1,14 @@
 import { memo } from 'react';
 import './IconRail.css';
 
-export type RailPanel = 'chat' | 'corpus' | 'search' | 'traces' | 'feedback' | 'unanswered';
+export type RailPanel =
+  | 'chat'
+  | 'saved'
+  | 'corpus'
+  | 'search'
+  | 'traces'
+  | 'feedback'
+  | 'unanswered';
 
 interface RailItem {
   key: RailPanel;
@@ -11,6 +18,7 @@ interface RailItem {
 
 const RAIL_ITEMS: RailItem[] = [
   { key: 'chat', glyph: '☰', label: 'Conversations' },
+  { key: 'saved', glyph: '☆', label: 'Saved answers' },
   { key: 'corpus', glyph: '▤', label: 'Corpus' },
   { key: 'search', glyph: '⌕', label: 'Search passages' },
   { key: 'traces', glyph: '◔', label: 'Traces' },

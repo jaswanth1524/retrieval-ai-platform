@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Literal
@@ -92,11 +92,25 @@ SEARCH_PAYLOAD_FIELDS = [
     "chunk_id",
     "text",
     "chunk_ordinal",
+    # RECENCY_BOOST_WEIGHT orders kept passages by it.
+    "uploaded_at",
 ]
 # Neighbour expansion reads only these.
-NEIGHBOR_PAYLOAD_FIELDS = ["chunk_ordinal", "text", "chunk_id"]
+NEIGHBOR_PAYLOAD_FIELDS = ["chunk_ordinal", "text", "chunk_id", "page", "page_end", "section"]
 # Distinct tags one facet call returns before stored_tags falls back to a full scan.
 TAG_FACET_LIMIT = 1000
+
+
+@dataclass(frozen=True)
+class SeedPassage:
+    """A stored passage a similar-passages search starts from: its own vectors are
+    the query (both legs, so the search stays hybrid)."""
+
+    chunk_id: str
+    filename: str
+    section: str
+    text: str
+    embedding: EmbeddedText
 
 
 @dataclass(frozen=True)
@@ -128,6 +142,8 @@ class DocumentMetadata:
     source_url: str | None = None
     source_etag: str | None = None
     source_last_modified: str | None = None
+    # A fetched document's own refresh interval (None: the server's; 0: never).
+    source_refresh_minutes: int | None = None
     # Points from more than one ingest, or fewer than the ingest that wrote them meant
     # to write: a write cut off part way (a killed container) or a failed clean-up of
     # the previous version's points. Never set for points from before those fields.
@@ -172,7 +188,7 @@ class _MetadataFold:
         # None stands for a point without one.
         self.hashes: set[str | None] = set()
         self.totals: set[int | None] = set()
-        self.source: tuple[str, str | None, str | None] | None = None
+        self.source: tuple[str, str | None, str | None, int | None] | None = None
 
     def add(self, payload: dict[str, Any]) -> None:
         self.count += 1
@@ -207,14 +223,18 @@ class _MetadataFold:
         if isinstance(url, str) and self.source is None:
             etag = payload.get("source_etag")
             modified = payload.get("source_last_modified")
+            minutes = payload.get("source_refresh_minutes")
             self.source = (
                 url,
                 etag if isinstance(etag, str) else None,
                 modified if isinstance(modified, str) else None,
+                minutes if isinstance(minutes, int) and not isinstance(minutes, bool) else None,
             )
 
     def result(self) -> DocumentMetadata:
-        url, etag, modified = self.source if self.source is not None else (None, None, None)
+        url, etag, modified, minutes = (
+            self.source if self.source is not None else (None, None, None, None)
+        )
         return DocumentMetadata(
             chunk_count=self.count,
             page_count=self.max_page,
@@ -229,6 +249,7 @@ class _MetadataFold:
             source_url=url,
             source_etag=etag,
             source_last_modified=modified,
+            source_refresh_minutes=minutes,
             incomplete=self._incomplete(),
         )
 
@@ -504,6 +525,42 @@ class VectorRepository:
         ordinal = points[0].payload.get("chunk_ordinal") if points and points[0].payload else None
         return ordinal if isinstance(ordinal, int) and not isinstance(ordinal, bool) else None
 
+    def seed_passage(self, settings: AppSettings, chunk_id: str) -> SeedPassage | None:
+        """One stored passage with its dense and sparse vectors (a "more like this"
+        search starts from it), or None when no passage has that id."""
+
+        self.ensure_ready(settings)
+        dense_name = settings.qdrant_dense_vector_name
+        sparse_name = settings.qdrant_sparse_vector_name
+        points, _ = self._call(
+            settings,
+            "scroll",
+            collection_name=settings.qdrant_collection,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(key="chunk_id", match=models.MatchValue(value=chunk_id))
+                ]
+            ),
+            with_payload=["filename", "section", "text"],
+            with_vectors=[dense_name, sparse_name],
+            limit=1,
+        )
+        if not points:
+            return None
+        payload = points[0].payload or {}
+        vectors = points[0].vector if isinstance(points[0].vector, dict) else {}
+        dense = vectors.get(dense_name)
+        sparse = vectors.get(sparse_name)
+        if not isinstance(dense, list) or not isinstance(sparse, models.SparseVector):
+            return None
+        return SeedPassage(
+            chunk_id=chunk_id,
+            filename=str(payload.get("filename") or ""),
+            section=str(payload.get("section") or ""),
+            text=str(payload.get("text") or ""),
+            embedding=EmbeddedText(dense=[float(value) for value in dense], sparse=sparse),
+        )
+
     def chunks_in_ordinal_range(
         self, settings: AppSettings, filename: str, start: int, end: int
     ) -> list[dict[str, object]]:
@@ -665,6 +722,7 @@ class VectorRepository:
                 "source_url",
                 "source_etag",
                 "source_last_modified",
+                "source_refresh_minutes",
             ],
         ):
             if not point.payload:
@@ -692,6 +750,32 @@ class VectorRepository:
         stored = points[0].payload.get("content_sha256") if points and points[0].payload else None
         return stored if isinstance(stored, str) else None
 
+    def content_identity(
+        self, settings: AppSettings, filename: str
+    ) -> tuple[str | None, str | None] | None:
+        """(content hash, source URL) one point of ``filename`` carries (one point read),
+        or None when it isn't indexed: what a refresh checks before it writes."""
+
+        self.ensure_ready(settings, strict=False)
+        points, _ = self._call(
+            settings,
+            "scroll",
+            collection_name=settings.qdrant_collection,
+            scroll_filter=_single_filename_filter(filename),
+            with_payload=["content_sha256", "source_url"],
+            with_vectors=False,
+            limit=1,
+        )
+        if not points:
+            return None
+        payload = points[0].payload or {}
+        digest = payload.get("content_sha256")
+        url = payload.get("source_url")
+        return (
+            digest if isinstance(digest, str) else None,
+            url if isinstance(url, str) else None,
+        )
+
     def document_metadata(self, settings: AppSettings, filename: str) -> DocumentMetadata | None:
         """One document's metadata, read now (not from the cached listing), or None
         when it isn't indexed. For decisions made under its filename lock."""
@@ -711,6 +795,46 @@ class VectorRepository:
             points=_single_filename_filter(filename),
             wait=True,
         )
+
+    def set_source_details(
+        self,
+        settings: AppSettings,
+        filename: str,
+        etag: str | None,
+        last_modified: str | None,
+        refresh_minutes: int | None,
+    ) -> None:
+        """Replace the ETag, Last-Modified and refresh interval every point of
+        ``filename`` carries (the same bytes refreshed under new validators, or its
+        refresh setting changed): payload only, nothing re-embedded. A None value is
+        removed. Caller holds its filename lock."""
+
+        self.ensure_ready(settings)
+        values: dict[str, object] = {
+            "source_etag": etag,
+            "source_last_modified": last_modified,
+            "source_refresh_minutes": refresh_minutes,
+        }
+        kept = {key: value for key, value in values.items() if value is not None}
+        dropped = [key for key, value in values.items() if value is None]
+        if kept:
+            self._call(
+                settings,
+                "set_payload",
+                collection_name=settings.qdrant_collection,
+                payload=kept,
+                points=_single_filename_filter(filename),
+                wait=True,
+            )
+        if dropped:
+            self._call(
+                settings,
+                "delete_payload",
+                collection_name=settings.qdrant_collection,
+                keys=dropped,
+                points=_single_filename_filter(filename),
+                wait=True,
+            )
 
     def uploaded_at_for_filename(self, settings: AppSettings, filename: str) -> float | None:
         """The stored upload time of an indexed document (one point read), or None."""
@@ -982,6 +1106,26 @@ class PassageFilter:
     # Documents uploaded in this range (Unix seconds).
     uploaded_after: float | None = None
     uploaded_before: float | None = None
+
+    def admits_neighbour(self, payload: Mapping[str, Any]) -> bool:
+        """Whether a neighbouring passage of a kept one (same document, so the same
+        filename, tags and upload time) is inside this narrowing: neighbour text is
+        prompt context, and a page or section narrowing that let the next page in let
+        the model cite page 5 for a fact from page 6."""
+
+        if payload.get("chunk_id") in self.exclude_chunk_ids:
+            return False
+        if self.section is not None and payload.get("section") != self.section:
+            return False
+        page = payload.get("page")
+        if isinstance(page, int) and not isinstance(page, bool):
+            end = payload.get("page_end")
+            last = end if isinstance(end, int) and not isinstance(end, bool) else page
+            if self.page_min is not None and max(page, last) < self.page_min:
+                return False
+            if self.page_max is not None and page > self.page_max:
+                return False
+        return True
 
 
 def _scope_filter(

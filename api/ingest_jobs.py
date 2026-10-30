@@ -31,7 +31,7 @@ from api.ingestion import (
     filename_write_lock,
     ingest_sequencer,
 )
-from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobStore
+from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, IngestJob, JobStore
 from api.metrics import (
     NO_ERROR_TYPE,
     ingest_chunks_total,
@@ -326,6 +326,7 @@ class IngestQueue:
         tags: tuple[str, ...] | None = None,
         source: DocumentSource | None = None,
         dedupe: bool = False,
+        kind: str = "upload",
     ) -> DocumentJobAcceptedResponse:
         """``enqueue_ingest`` with this queue's collaborators."""
 
@@ -342,6 +343,7 @@ class IngestQueue:
             tags=tags,
             source=source,
             dedupe=dedupe,
+            kind=kind,
         )
 
 
@@ -359,8 +361,12 @@ def enqueue_ingest(
     tags: tuple[str, ...] | None = None,
     source: DocumentSource | None = None,
     dedupe: bool = False,
+    kind: str = "upload",
 ) -> DocumentJobAcceptedResponse:
     """Admit ``content`` against the backlog, create its job, and start it. Blocking.
+
+    ``kind`` (``jobs.JOB_KINDS``) says what started it, recorded on the job with the
+    source URL and tags, for a retry.
 
     Shared by upload and re-index so both get the same backlog 503, the same
     shutting-down handling, and the same done-callback that frees the bytes.
@@ -381,7 +387,13 @@ def enqueue_ingest(
         ingest_sequencer.release(key)
 
     try:
-        job = job_store.create(filename, workspace_of(ingest_service.settings))
+        job = job_store.create(
+            filename,
+            workspace_of(ingest_service.settings),
+            kind=kind,
+            source_url=source.url if source is not None else None,
+            tags=tags,
+        )
     except BaseException:
         release()
         raise
@@ -519,32 +531,105 @@ def staleness(settings: AppSettings, token_counter: object) -> Callable[[Documen
     return lambda meta: meta.is_stale(fingerprint, counter_mode)
 
 
+def unchanged_since_fetch(
+    repository: VectorRepository, settings: AppSettings, name: str, expected: DocumentMetadata
+) -> Callable[[], None]:
+    """A refresh precondition: the document is still the one the refresh started from.
+
+    A fetch takes up to URL_INGEST_TIMEOUT_SECONDS before its job is even admitted, so
+    a delete, an upload or a version restore can land in between — and the refresh,
+    admitted after them, would bring the deleted document back or overwrite the newer
+    version with the URL's. Checked under the filename lock, like every precondition.
+    """
+
+    def check() -> None:
+        identity = repository.content_identity(settings, name)
+        same = identity is not None and identity[1] == expected.source_url
+        if same and expected.content_sha256 is not None:
+            same = identity is not None and identity[0] == expected.content_sha256
+        if not same:
+            raise IngestionError(
+                f"'{name}' was changed or deleted while its refresh was being fetched; "
+                "nothing was refreshed."
+            )
+
+    return check
+
+
 def enqueue_refreshed(
     name: str,
     source_url: str,
     fetched: FetchedDocument,
     queue: IngestQueue,
     raw_store: RawDocumentStore | None,
+    *,
+    expected: DocumentMetadata,
+    repository: VectorRepository,
 ) -> DocumentJobAcceptedResponse:
     """Index what a refresh of ``name`` fetched (the route's and the scheduled
     refresh's): its tags carry over, as on any re-upload, unchanged bytes are left
-    alone, and the server's new validators are kept for the next conditional fetch."""
+    alone, and the server's new validators are kept for the next conditional fetch.
+    ``expected`` is the document as it was before the fetch; anything else by the time
+    the job writes refuses it (``unchanged_since_fetch``)."""
 
+    settings = queue.ingest_service.settings
     return queue.enqueue(
         filename=name,
         content=fetched.content,
         raw_store=raw_store,
-        source=DocumentSource(source_url, fetched.etag, fetched.last_modified),
+        source=DocumentSource(
+            source_url, fetched.etag, fetched.last_modified, expected.source_refresh_minutes
+        ),
         dedupe=True,
+        precondition=unchanged_since_fetch(repository, settings, name, expected),
+        kind="url",
     )
 
 
-def source_of(meta: DocumentMetadata) -> DocumentSource | None:
-    """Where a URL-fetched document came from, carried over by a re-index."""
+# Why a failed job of each kind can't be retried by the server, as the 409 says it.
+_NOT_RETRYABLE = {
+    "upload": "Its bytes weren't kept (an original is stored only once indexing "
+    "succeeds); upload the file again.",
+    "import": "Its bytes weren't kept; import the backup again.",
+    "watch": "The folder watcher sends the file again when it changes.",
+    "restore": "Restore that version again.",
+}
+
+
+def retry_refusal(job: IngestJob) -> str | None:
+    """Why ``job`` can't be retried (POST /documents/jobs/{id}/retry), or None when it
+    can: a failed fetch from a URL (fetched again) or a failed re-index (run again from
+    the stored original) — unless the original itself is what failed to parse."""
+
+    if job.state != "failed":
+        return f"Only a failed job can be retried; this one is {job.state}."
+    if job.kind == "url":
+        return None if job.source_url else "It has no URL to fetch again."
+    if job.kind == "reindex":
+        if job.error_type == "document":
+            return "The stored original itself couldn't be read; upload a corrected file instead."
+        return None
+    return _NOT_RETRYABLE.get(job.kind, "This job can't be retried.")
+
+
+def source_of(meta: DocumentMetadata, *, validators: bool = True) -> DocumentSource | None:
+    """Where a URL-fetched document came from, carried over by a re-index.
+
+    Without ``validators`` only the URL: a version restore puts back older bytes than
+    the ones the stored ETag describes, and sending it would make the next refresh a
+    304 that keeps the old version for good.
+    """
 
     if not meta.source_url:
         return None
-    return DocumentSource(meta.source_url, meta.source_etag, meta.source_last_modified)
+    if not validators:
+        return DocumentSource(meta.source_url, refresh_minutes=meta.source_refresh_minutes)
+    return DocumentSource(
+        meta.source_url,
+        meta.source_etag,
+        meta.source_last_modified,
+        meta.source_refresh_minutes,
+    )
 
 
 @dataclass(frozen=True)
@@ -611,6 +696,7 @@ def reindex_stale(
                     uploaded_at=meta.uploaded_at,
                     precondition=original_still_stored(store, name),
                     source=source_of(meta),
+                    kind="reindex",
                 )
             )
         except HTTPException as exc:

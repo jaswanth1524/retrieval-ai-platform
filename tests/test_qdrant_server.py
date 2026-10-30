@@ -379,3 +379,31 @@ def test_pages_upload_dates_and_left_out_passages_filter_on_the_server(
     assert found(PassageFilter(exclude_chunk_ids=("c1",))) == {"c2", "c3"}
     schema = client.get_collection(settings.qdrant_collection).payload_schema or {}
     assert {"page_end", "uploaded_at"} <= set(schema)
+
+
+def test_a_passages_own_vectors_are_read_back_to_search_from(
+    server: tuple[QdrantClient, AppSettings],
+) -> None:
+    """``seed_passage`` reads both named vectors on both transports (a sparse vector
+    comes back as a SparseVector over gRPC as well as REST)."""
+
+    client, settings = server
+    repository = VectorRepository(client)
+    chunks = [chunk("c1", "alpha one"), chunk("c2", "alpha two")]
+    ingest_chunks(
+        repository,
+        settings,
+        chunks,
+        StaticEmbeddingProvider(
+            [embedding([1.0, 0.0, 0.0], [10], [1.0]), embedding([0.9, 0.1, 0.0], [10], [0.5])]
+        ),
+    )
+
+    seed = repository.seed_passage(settings, "c1")
+
+    assert seed is not None and seed.text == "alpha one"
+    assert list(seed.embedding.sparse.indices) == [10]
+    assert len(seed.embedding.dense) == 3
+    points = repository.hybrid_search(settings, seed.embedding)
+    assert {str(point.payload["chunk_id"]) for point in points if point.payload} == {"c1", "c2"}
+    assert repository.seed_passage(settings, "missing") is None

@@ -18,3 +18,10 @@ export function fromDateInput(value: string): number | undefined {
   const time = date.getTime();
   return Number.isNaN(time) ? undefined : time / 1000;
 }
+
+/** An <input type="date"> value as Unix seconds at the end of that local day (an
+ *  "up to and including" bound), or undefined when it is empty or not a date. */
+export function endOfDayFromDateInput(value: string): number | undefined {
+  const start = fromDateInput(value);
+  return start === undefined ? undefined : start + 86_399;
+}

@@ -31,6 +31,8 @@ function actions(): CommandActions {
     exportMarkdown: vi.fn(),
     exportJson: vi.fn(),
     browseTraces: vi.fn(),
+    showSavedAnswers: vi.fn(),
+    exportSavedAnswers: vi.fn(),
     searchPassages: vi.fn(),
     restoreBackup: vi.fn(),
     downloadBackup: vi.fn(),

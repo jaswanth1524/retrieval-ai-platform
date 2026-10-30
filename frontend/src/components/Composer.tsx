@@ -8,7 +8,7 @@ import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
 import { MAX_QUESTION_CHARS, MAX_SCOPE_FILENAMES } from '../utils/limits';
 import { isProviderAllowed, isProviderUsable } from '../utils/providers';
-import { fromDateInput, toDateInput } from '../utils/dates';
+import { endOfDayFromDateInput, fromDateInput, toDateInput } from '../utils/dates';
 
 // The most tags and files one question may be scoped to (api/schemas.py's
 // MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
@@ -50,6 +50,9 @@ interface ComposerProps {
   /** Only documents uploaded since this time (Unix seconds). */
   uploadedAfter?: number;
   onUploadedAfterChange?: (value: number | undefined) => void;
+  /** Only documents uploaded up to the end of a day (Unix seconds). */
+  uploadedBefore?: number;
+  onUploadedBeforeChange?: (value: number | undefined) => void;
 }
 
 function pageInput(value: string): number | undefined {
@@ -89,6 +92,8 @@ function Composer({
   onPageRangeChange,
   uploadedAfter,
   onUploadedAfterChange,
+  uploadedBefore,
+  onUploadedBeforeChange,
 }: ComposerProps) {
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
@@ -450,6 +455,19 @@ function Composer({
                       value={toDateInput(uploadedAfter)}
                       onChange={(event) => onUploadedAfterChange(fromDateInput(event.target.value))}
                       data-testid="scope-uploaded-after"
+                    />
+                  </label>
+                )}
+                {onUploadedBeforeChange && (
+                  <label className="composer__popover-pages" data-testid="scope-uploaded-up-to">
+                    <span>Uploaded up to</span>
+                    <input
+                      type="date"
+                      value={toDateInput(uploadedBefore)}
+                      onChange={(event) =>
+                        onUploadedBeforeChange(endOfDayFromDateInput(event.target.value))
+                      }
+                      data-testid="scope-uploaded-before"
                     />
                   </label>
                 )}

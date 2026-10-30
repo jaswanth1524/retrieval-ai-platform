@@ -1,5 +1,9 @@
 // Corpus types shared by the panel, its cards and useCorpus.
-import type { DocumentIngestResponse, IngestJobState } from '../../api/types';
+import type {
+  DocumentIngestResponse,
+  IngestJobState,
+  UrlRefreshStatusResponse,
+} from '../../api/types';
 
 // Structural details of UploadItem below.
 export type UploadItemStatus = 'uploading' | 'success' | 'error';
@@ -52,6 +56,8 @@ export interface DocumentMeta {
   tags: string[];
   /** Where a document fetched by URL came from (absent for uploads). */
   sourceUrl?: string;
+  /** Its scheduled refresh (fetched documents only). */
+  urlRefresh?: UrlRefreshStatusResponse;
 }
 
 
@@ -75,4 +81,5 @@ export interface DocCard {
   bytes?: number;
   uploadedAt?: number;
   sourceUrl?: string;
+  urlRefresh?: UrlRefreshStatusResponse;
 }
