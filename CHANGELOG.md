@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11), then a fixes-and-features pass (pass 12). **Re-index:
+(pass 11), then two fixes-and-features passes (passes 12 and 13). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,48 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 13: a refresh from a URL (scheduled or `POST /documents/{f}/refresh`) checks,
+  just before it writes, that the document is still the one it started from: a delete,
+  an upload or a version restore that landed during the fetch is no longer undone or
+  overwritten (the job fails as "changed or deleted while its refresh was being
+  fetched"). **None.**
+- Pass 13: restoring an earlier version of a fetched document keeps its URL but not its
+  ETag/Last-Modified, so the next refresh fetches the page in full rather than getting a
+  304 and keeping the restored version for good. **None.**
+- Pass 13: the same bytes refreshed under a new ETag or Last-Modified (a dynamic page, a
+  CDN re-stamping it) only update the stored validators; the document was re-embedded on
+  every refresh. **None.**
+- Pass 13: the scheduled refresh queues nothing while `URL_REFRESH_BATCH` of its own jobs
+  are still indexing, checks the earliest due documents first, and counts one deferral
+  per pass in `docrag_url_refresh_total` (it counted one per due document). A failing
+  document waits twice as long after each failure, up to a day. **None.**
+- Pass 13: `default` can no longer be created as a workspace name (every client calls
+  the default workspace that), and `WATCH_WORKSPACE=default` stops startup with a note to
+  leave it empty. An existing workspace of that name still works. **None.**
+- Pass 13: a deleted workspace's `docrag_corpus_documents` series is removed. **None.**
+- Pass 13: a question about picked passages (`chunk_ids`) keeps every passage picked, best
+  first: two adjacent ones were deduplicated as neighbours and the second never reached
+  the prompt, and one under the score floor was dropped. **None.**
+- Pass 13: neighbouring text added to a passage stays inside the question's page range,
+  section and left-out passages; the next page's text could be cited as this page's.
+  **None.**
+- Pass 13: citation backfill and quote spans ignore Spanish, German, French, Portuguese
+  and Italian function words, and backfill needs one shared word of four or more
+  letters (or a number): "el", "de", "que" were enough to cite an unrelated source.
+  Measured on qwen2.5 answers: English spans and backfill identical; multilingual, one
+  correct backfill gained and one lost. **None.**
+- Pass 13: the answer cache and in-flight keys treat passage lists (`chunk_ids`,
+  `exclude_chunk_ids`, `exclude_filenames`) as sets: the same ones in another order were
+  another answer. **None.**
+- Pass 13: a summary's `generate_ms` no longer includes the time it waited for the local
+  model (`OLLAMA_MAX_PARALLEL`). **None.**
+- Pass 13 (UI): "Ask about this" in the viewer, asking about passages picked in Search,
+  and retrying or editing such a question send the passages as the whole scope; the
+  conversation's documents and tags were AND-ed with them, so a passage of another
+  document found nothing. **None.**
+- Pass 13 (UI): the Asked questions panel's Unanswered view lists questions not answered
+  the last time they were asked, and reads the unanswered ones from the whole query log,
+  not only the latest 500 asks. **None.**
 - Pass 12: a question's page range (`page_min`/`page_max`, on questions and
   `POST /search`) matches a passage that runs onto the range from an earlier page, not
   only one that starts in it (`page_end` is now an indexed payload field). **None.**
@@ -159,6 +201,67 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 13: trace list filters — `GET /traces?answer_status=` (repeatable) and
+  `answer_status`/`top_rerank_score` on each row. With `TRACE_STORE_PATH` the archive
+  keeps the list's columns beside each trace (an older file is filled in once at
+  startup), so the list no longer parses every prompt. UI: the Traces panel's "answers"
+  filter; CLI: `docrag traces --status`. **None.**
+- Pass 13: "more like this" — `POST /search` with `like_chunk_id` (the query may then be
+  empty): the passage's own stored dense and sparse vectors drive both search legs, RRF
+  as usual, and the reranker scores each candidate against the passage; the passage is
+  left out, the narrowing applies. UI: "similar" on Search results and "Similar" in the
+  document viewer; CLI `docrag search --like`; MCP `search_passages(like_chunk_id=)`.
+  **None.**
+- Pass 13: stricter answers per question — `passages_only` (no neighbouring text in the
+  prompt) and `strong_matches_only` (no answer from weak matches; "not found" instead).
+  Both only take something away; they are in the cache key and the trace
+  (`context_neighbor_radius`, `rerank_fallback_count`). UI: Settings → Answers; CLI
+  `--passages-only`/`--strong-only`; MCP `ask`. **None.**
+- Pass 13: scheduled-refresh state that survives a restart — `URL_REFRESH_STATE_PATH` (a
+  sqlite file; empty = in memory, as before), with backoff for failing documents.
+  `GET /documents` lists `url_refresh` (last check, outcome, failures, next due) for
+  each fetched document. **None.**
+- Pass 13: a fetched document's own refresh interval — `refresh_minutes` on
+  `POST /documents/from-url` and `PATCH /documents/{f}/refresh-settings` (minutes, 0 =
+  never, null = the server's), payload-only, kept by re-index and backups. UI: a "how
+  often" menu and a "checked … · next in …" line on the card; CLI `add-url
+  --refresh-minutes`, `refresh FILE --every`. **None.**
+- Pass 13: `POST /documents/jobs/{id}/retry` runs a failed job again as it was asked for:
+  a URL fetched again (its tags kept), a re-index run again from the stored original.
+  An upload's bytes are never kept, so it is a 409 that says to send the file again.
+  Jobs record `kind` (upload, url, reindex, restore, import, watch); job status has
+  `kind` and `retryable`. UI: Retry in the corpus panel's recent jobs (which can now show
+  finished ones too, and show without a watched folder); CLI `docrag jobs --retry`.
+  **None.**
+- Pass 13: `WATCH_INCLUDE` / `WATCH_EXCLUDE` — glob patterns for which files under
+  `WATCH_DIR` are watched (a name, "*.py", or a path, "drafts/*"; an excluded directory
+  name leaves its tree out). Excluded files are never deleted. Pass 12 added code and
+  config files to the supported types; a folder that holds code can leave them out with
+  `WATCH_EXCLUDE=*.py,*.js,*.ts,*.json,*.yaml`. CLI: `docrag ingest --include/--exclude`
+  and `--tag`; `add-url --tag`. **None.**
+- Pass 13: `POST /documents/preview` — how a file would be indexed (sections, passages,
+  pages and the first 20 passages), parsed as an upload is and indexing nothing; at most
+  two at once (429). UI "Preview a file…", CLI `docrag preview`. **None.**
+- Pass 13: `RECENCY_BOOST_WEIGHT` (0 = off) orders the passages kept for an answer by
+  rerank score plus the weight times how recent the document is (1 for the newest kept,
+  0 a year or more older); nothing is added or dropped and fusion is untouched. Measured
+  on a new set of superseded policies (`eval/corpus_recency`, `recency_eval.jsonl`):
+  newest-version hit@1 0.50 → 0.67 at 0.1–0.2, 0.83 at 0.5, 1.00 at 1.0; the handbook,
+  paraphrase, follow-up, compare, unanswerable and mixed sets were identical at every
+  weight — but their documents were all uploaded within seconds, so the boost had
+  nothing to act on there. Off by default: turn it on only where newer documents
+  supersede older ones. **None.**
+- Pass 13 (UI): a Saved answers panel (☆ on the rail, and in ⌘K) listing every saved
+  answer across conversations, to open, unsave, filter or export as Markdown; "uploaded
+  up to" in the composer's scope and in Search's filters, and a tag filter in Search;
+  CSV export of the Asked questions and Feedback panels (cells that would start a
+  spreadsheet formula are prefixed with '). **None.**
+- Pass 13 (eval): retrieval runs over several formats break their scores down by format
+  (`by_format`, beside the aggregates; shown by `harness report` and `harness diff`).
+  CI runs the mixed-format set against its baseline, and `python -m
+  eval.make_mixed_corpus --check` (CI, `make check`) tells when the committed corpus
+  reads differently from a fresh build. A corpus can stamp upload dates with a
+  `.uploaded_at.json`. **None.**
 - Pass 12: questions and `POST /search` take `exclude_chunk_ids` (leave passages out; a
   left-out passage doesn't come back as another's neighbour text) and
   `uploaded_after`/`uploaded_before` (Unix seconds; `uploaded_at` is now an indexed
@@ -549,6 +652,36 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 13: a non-ASCII ETag (from a server, or a backup's manifest) made every refresh of
+  that document fail before it was sent (a 500 on the manual refresh); validators that
+  can't be sent back are no longer kept or sent. **None.**
+- Pass 13: malformed ODT files — a non-numeric repeat count, a space run of two billion,
+  nesting past the recursion limit — no longer crash the parse or exhaust memory. An
+  image is refused below Pillow's own bomb threshold with its size named, and each TIFF
+  page is size-checked before it is decoded. A JSON number too long to read is a clear
+  error. **None.**
+- Pass 13: a malformed file that trips a parsing library (a bad number, deep nesting, a
+  huge declared size) fails as a document error, so the folder watcher stops retrying it
+  instead of retrying it on every pass. **None.**
+- Pass 13: search highlights work for a query with ligatures (it is highlighted as it was
+  searched). **None.**
+- Pass 13 (CLI, MCP): `--uploaded-before 2024-05-31` (and MCP's `uploaded_before`) means
+  through that day, as the web UI's "uploaded up to" does; it was that day's midnight,
+  which left out everything uploaded on it. A date-time is still exactly that moment.
+  **None.**
+- Pass 13: the background re-index (`AUTO_REINDEX_STALE`) writes a `document.reindex`
+  audit line (with `scheduled`), and the add-from-URL audit line names its tags.
+  **None.**
+- Pass 13 (UI): saving an answer no longer saves it in an edited copy of its
+  conversation as well; conversations holding a saved answer, and the saved answers'
+  passages, are kept in the browser's local copies. The corpus panel's job and watcher
+  polls pause while the tab is hidden; the Traces, Asked questions and Feedback lists
+  reload when the workspace changes; upload tags are cleared with it; Search marks
+  results from another scope; the Search page filter no longer mixes its range with the
+  conversation's; a long matched sentence is still marked in its snippet, and a snippet
+  never splits an emoji. Light-theme contrast of the corpus panel's small controls,
+  24 px tap targets, reduced motion for j/k, and focus back on "Ask about this" after
+  Escape. **None.**
 - Pass 12: a summary the documents couldn't support is traced as
   `insufficient_context` (it was always "ok"), so the query log lists it as unanswered.
 - Pass 12: a `/questions` answer with nothing to answer from no longer waits for another
