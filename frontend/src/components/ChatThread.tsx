@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CitationResponse } from '../api/types';
 import type { StageTiming } from '../hooks/useChat';
+import type { SourceChange } from '../utils/citationFreshness';
 import { STREAMING_STAGE_LABELS } from '../utils/stages';
 import ChatMessage, { type AskAgain, type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
@@ -53,6 +54,8 @@ interface ChatThreadProps {
   onSearchPassages?: (question: string) => void;
   /** Save or unsave an answer. */
   onToggleSaved?: (turnId: string, saved: boolean) => void;
+  /** Whether a cited document was deleted or uploaded again after an answer. */
+  sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
 }
 
 // How close to the bottom still counts as "following along". Wide enough to survive
@@ -132,6 +135,7 @@ function ChatThread({
   onAskEverywhere,
   onSearchPassages,
   onToggleSaved,
+  sourceChangeOf,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
@@ -365,6 +369,7 @@ function ChatThread({
             onCitationHover={onCitationHover}
             onCitationLeave={onCitationLeave}
             onToggleSaved={onToggleSaved}
+            sourceChangeOf={sourceChangeOf}
             answerNumber={answerNumbers[index] || undefined}
           />
         ))}

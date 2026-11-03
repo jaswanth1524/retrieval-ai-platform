@@ -270,3 +270,59 @@
   background: transparent;
   color: inherit;
 }
+
+/* Saved scopes, under "All documents". */
+.composer__presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.composer__preset {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+}
+
+.composer__preset-apply,
+.composer__preset-delete,
+.composer__preset-save {
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.composer__preset-delete {
+  padding: 2px 6px;
+  color: var(--muted);
+}
+
+.composer__preset-save {
+  border: 1px dashed var(--rule);
+  border-radius: 999px;
+}
+
+.composer__preset-save:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.composer__preset-form {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+}
+
+.composer__preset-form input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.85rem;
+}

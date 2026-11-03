@@ -1,6 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
+import { SCOPE_PRESET_NAME_MAX_CHARS, type ScopePreset } from '../utils/scopePresets';
 import './Composer.css';
 import { isImeComposing } from '../utils/keyboard';
 import { enterAddsNewline } from '../utils/platform';
@@ -53,6 +54,12 @@ interface ComposerProps {
   /** Only documents uploaded up to the end of a day (Unix seconds). */
   uploadedBefore?: number;
   onUploadedBeforeChange?: (value: number | undefined) => void;
+  /** Saved scopes of this workspace: picked to set the scope again. */
+  scopePresets?: ScopePreset[];
+  onApplyScopePreset?: (preset: ScopePreset) => void;
+  /** Save the current scope under a name. */
+  onSaveScopePreset?: (name: string) => void;
+  onDeleteScopePreset?: (name: string) => void;
 }
 
 function pageInput(value: string): number | undefined {
@@ -94,7 +101,19 @@ function Composer({
   onUploadedAfterChange,
   uploadedBefore,
   onUploadedBeforeChange,
+  scopePresets = [],
+  onApplyScopePreset,
+  onSaveScopePreset,
+  onDeleteScopePreset,
 }: ComposerProps) {
+  const [presetName, setPresetName] = useState<string | null>(null);
+  const scopeNarrows =
+    selectedFilenames.length > 0 ||
+    selectedTags.length > 0 ||
+    pageRange?.min !== undefined ||
+    pageRange?.max !== undefined ||
+    uploadedAfter !== undefined ||
+    uploadedBefore !== undefined;
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
   // long question pasted from elsewhere lost its end without a word.
@@ -374,6 +393,76 @@ function Composer({
                   />
                   <span>All documents</span>
                 </label>
+                {onApplyScopePreset && (scopePresets.length > 0 || onSaveScopePreset) && (
+                  <div className="composer__presets" role="group" aria-label="Saved scopes">
+                    {scopePresets.map((preset) => (
+                      <span key={preset.name} className="composer__preset" data-testid="scope-preset">
+                        <button
+                          type="button"
+                          className="composer__preset-apply"
+                          onClick={() => onApplyScopePreset(preset)}
+                          title="Search these documents"
+                        >
+                          {preset.name}
+                        </button>
+                        {onDeleteScopePreset && (
+                          <button
+                            type="button"
+                            className="composer__preset-delete"
+                            onClick={() => onDeleteScopePreset(preset.name)}
+                            aria-label={`Delete the saved scope ${preset.name}`}
+                            data-testid="scope-preset-delete"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </span>
+                    ))}
+                    {onSaveScopePreset &&
+                      (presetName === null ? (
+                        <button
+                          type="button"
+                          className="composer__preset-save"
+                          onClick={() => setPresetName('')}
+                          disabled={!scopeNarrows}
+                          title={scopeNarrows ? 'Save this scope to pick it again' : 'Choose documents, tags, pages or dates first'}
+                          data-testid="scope-preset-save"
+                        >
+                          Save scope as…
+                        </button>
+                      ) : (
+                        <form
+                          className="composer__preset-form"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            if (!presetName.trim()) return;
+                            onSaveScopePreset(presetName);
+                            setPresetName(null);
+                          }}
+                        >
+                          <input
+                            type="text"
+                            value={presetName}
+                            maxLength={SCOPE_PRESET_NAME_MAX_CHARS}
+                            onChange={(event) => setPresetName(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Escape') {
+                                event.stopPropagation();
+                                setPresetName(null);
+                              }
+                            }}
+                            placeholder="Name"
+                            aria-label="Name for this scope"
+                            autoFocus
+                            data-testid="scope-preset-name"
+                          />
+                          <button type="submit" disabled={!presetName.trim()} data-testid="scope-preset-confirm">
+                            Save
+                          </button>
+                        </form>
+                      ))}
+                  </div>
+                )}
                 {indexedFilenames.length > 5 && (
                   <input
                     type="search"

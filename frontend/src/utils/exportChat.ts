@@ -1,5 +1,6 @@
 import type { CitationResponse } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
+import { toCsv } from './csv';
 import { pageLabel } from './pages';
 
 export const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -88,6 +89,12 @@ export function chatToJson(turns: ChatTurn[]): string {
   return JSON.stringify(turns, null, 2);
 }
 
+/** A download's file name from free text (a conversation title): anything but word
+ *  characters, dots and dashes becomes a dash. */
+export function safeFilename(name: string): string {
+  return name.replace(/[^\w.-]+/g, '-');
+}
+
 export function downloadFile(filename: string, mimeType: string, content: string | Blob): void {
   const blob = content instanceof Blob ? content : new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -103,4 +110,38 @@ export function downloadFile(filename: string, mimeType: string, content: string
   // Not revoked at once: Safari can still be reading a large file (a corpus backup)
   // when the click returns. FileSaver.js waits 40 s for the same reason.
   setTimeout(() => URL.revokeObjectURL(url), 40_000);
+}
+
+/** Every source cited in a conversation, one row each, for a spreadsheet: which answer
+ *  (and question) cited it, and where it is — filename, page, section, chunk id — with
+ *  the sentence it quotes, when citation spans found one. */
+export function citedSourcesCsv(turns: ChatTurn[], title: string | undefined): string {
+  const rows: unknown[][] = [];
+  let answerNumber = 0;
+  let question = '';
+  for (const turn of turns) {
+    if (turn.role === 'user') {
+      question = turn.content;
+      continue;
+    }
+    if (turn.role !== 'assistant' || !turn.content) continue;
+    answerNumber += 1;
+    for (const source of turn.sources) {
+      rows.push([
+        title ?? '',
+        question,
+        answerNumber,
+        source.source_number,
+        source.filename,
+        pageLabel(source.page, source.page_end),
+        source.section,
+        source.chunk_id,
+        source.spans?.map((span) => span.quote).join(' … ') ?? '',
+      ]);
+    }
+  }
+  return toCsv(
+    ['conversation', 'question', 'answer', 'source', 'filename', 'page', 'section', 'chunk_id', 'quote'],
+    rows,
+  );
 }

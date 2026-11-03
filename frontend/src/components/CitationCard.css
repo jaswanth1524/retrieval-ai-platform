@@ -68,3 +68,10 @@
 .citation-card__score {
   color: var(--dim);
 }
+
+/* The document was deleted or uploaded again after the answer: the quote may be gone. */
+.citation-card__changed {
+  font-size: 0.72rem;
+  color: var(--warn);
+  white-space: nowrap;
+}

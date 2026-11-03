@@ -141,8 +141,8 @@ describe('saved answers panel', () => {
     render(
       <SavedPanel
         answers={[
-          { conversationId: 'c1', conversationTitle: 'Leave', turn: answer('t1', 'Twenty days.', 2), question: 'How long?' },
-          { conversationId: 'c2', conversationTitle: 'Travel', turn: answer('t2', 'Economy.', 1), question: 'Which class?' },
+          { conversationId: 'c1', conversationTitle: 'Leave', workspace: '', turn: answer('t1', 'Twenty days.', 2), question: 'How long?' },
+          { conversationId: 'c2', conversationTitle: 'Travel', workspace: '', turn: answer('t2', 'Economy.', 1), question: 'Which class?' },
         ]}
         onOpen={onOpen}
         onUnsave={onUnsave}

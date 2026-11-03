@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DragEvent, RefObject } from 'react';
+import type { SavedAnswer } from '../hooks/useChat';
 import { useStableHandler } from '../hooks/useStableHandler';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { readStored, writeStored } from '../utils/safeStorage';
@@ -72,6 +73,9 @@ interface CorpusPanelProps {
   onSetRefreshInterval?: (filename: string, minutes: number | null) => void;
   /** Put an earlier original back (RAW_DOCUMENT_VERSIONS on, full key). */
   onRestoreVersion?: (filename: string, version: string) => void;
+  findAnswersCiting?: (filename: string) => SavedAnswer[];
+  queryLogEnabled?: boolean;
+  onOpenAnswer?: (conversationId: string, turnId: string) => void;
   /** The workspace the panel shows (for per-card requests). */
   workspace?: string;
   /** Summaries can't be asked right now (booting, the key was refused): the buttons
@@ -172,6 +176,9 @@ function CorpusPanel({
   onRefreshFromUrl,
   onSetRefreshInterval,
   onRestoreVersion,
+  findAnswersCiting,
+  queryLogEnabled,
+  onOpenAnswer,
   workspace,
   summarizeDisabled = false,
   onUploadFromUrl,
@@ -317,6 +324,8 @@ function CorpusPanel({
         const isStale = canReindex && ((meta?.stale ?? false) || isIncomplete);
         if (isIncomplete) parts.push('incomplete — re-index');
         else if (isStale) parts.push('older chunking');
+        // Both copies are searched, and citations split between them.
+        if (meta?.sameAs?.length) parts.push(`same content as ${meta.sameAs.join(', ')}`);
         return {
           key: `doc:${filename}`,
           filename,
@@ -745,6 +754,9 @@ function CorpusPanel({
             onRefreshFromUrl={onRefreshFromUrl}
             onSetRefreshInterval={onSetRefreshInterval}
             onRestoreVersion={onRestoreVersion}
+            findAnswersCiting={findAnswersCiting}
+            queryLogEnabled={queryLogEnabled}
+            onOpenAnswer={onOpenAnswer}
             workspace={workspace}
           />
         ))}

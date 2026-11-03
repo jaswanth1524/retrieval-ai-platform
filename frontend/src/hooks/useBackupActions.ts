@@ -96,6 +96,8 @@ export function useBackupActions({
         `${result.missing_originals.length} had no stored original in the backup`,
       result.rejected.length > 0 && `${result.rejected.length} couldn't be used`,
       result.feedback_imported > 0 && `${result.feedback_imported} ratings restored`,
+      (result.versions_restored ?? 0) > 0 &&
+        `${result.versions_restored} earlier version${result.versions_restored === 1 ? '' : 's'} put back`,
     ].filter(Boolean);
     pushToast({
       tone: result.deferred.length + result.rejected.length > 0 ? 'warn' : 'good',

@@ -26,6 +26,8 @@ export type QuestionStreamEvent =
       weak_matches?: boolean;
       truncated?: boolean;
       citation_backfilled?: boolean;
+      /** Picked passages the prompt had no room for (absent from older servers). */
+      passages_left_out?: number;
       chunks_read?: number;
       chunks_total?: number;
       usage?: UsageResponse | null;

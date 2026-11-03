@@ -28,6 +28,18 @@ export interface ConversationScope {
 
 export const EMPTY_SCOPE: ConversationScope = { filenames: [], tags: [] };
 
+/** A scope that narrows nothing: no files, tags, pages or dates. */
+export function isEmptyScope(scope: ConversationScope): boolean {
+  return (
+    scope.filenames.length === 0 &&
+    scope.tags.length === 0 &&
+    scope.pageMin === undefined &&
+    scope.pageMax === undefined &&
+    scope.uploadedAfter === undefined &&
+    scope.uploadedBefore === undefined
+  );
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -315,6 +327,14 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   const followups = cleanFollowups(turn.followups);
   if (followups.length > 0) sanitized.followups = followups;
   if (turn.saved === true && turn.role === 'assistant') sanitized.saved = true;
+  if (
+    typeof turn.passagesLeftOut === 'number' &&
+    Number.isInteger(turn.passagesLeftOut) &&
+    turn.passagesLeftOut > 0 &&
+    turn.passagesLeftOut <= 1000
+  ) {
+    sanitized.passagesLeftOut = turn.passagesLeftOut;
+  }
   if (Array.isArray(turn.irrelevantSources)) {
     const numbers = turn.irrelevantSources.filter(
       (value): value is number => Number.isInteger(value) && value >= 1 && value <= 1000,
@@ -724,6 +744,32 @@ export function parseConversations(value: unknown): Conversation[] | null {
 
 /** ``storage`` without conversation ``id``, with a tombstone at ``at`` so another tab's
  *  copy of it doesn't bring it back on its next save. */
+/** ``storage`` with turn ``turnId`` replaced by ``change(turn)``: in conversation
+ *  ``conversationId``, or in every conversation holding it when that is undefined (an
+ *  edited question's copy shares the earlier turns' ids). Each conversation changed is
+ *  stamped edited at ``now``, so other tabs keep the change. */
+export function updateTurn(
+  storage: ChatStorageV2,
+  conversationId: string | undefined,
+  turnId: string,
+  change: (turn: ChatTurn) => ChatTurn,
+  now: number,
+): ChatStorageV2 {
+  return {
+    ...storage,
+    conversations: storage.conversations.map((conversation) =>
+      (conversationId === undefined || conversation.id === conversationId) &&
+      conversation.turns.some((turn) => turn.id === turnId)
+        ? {
+            ...conversation,
+            turns: conversation.turns.map((turn) => (turn.id === turnId ? change(turn) : turn)),
+            editedAt: now,
+          }
+        : conversation,
+    ),
+  };
+}
+
 export function withoutConversation(
   storage: ChatStorageV2,
   id: string,

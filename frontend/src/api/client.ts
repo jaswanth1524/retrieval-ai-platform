@@ -26,7 +26,9 @@ import type {
   PassageNarrowing,
   PublicConfigResponse,
   QueryLogResponse,
+  QueryRecheckResponse,
   ReadinessResponse,
+  ScoreReportResponse,
   UsageResponse,
   WatchStatusResponse,
   DocumentTask,
@@ -36,6 +38,7 @@ import type {
   WorkspaceListResponse,
   TimingsResponse,
   TraceDetailResponse,
+  TraceDiffResponse,
   TraceListResponse,
 } from './types';
 import { readStored, writeStored } from '../utils/safeStorage';
@@ -409,6 +412,8 @@ export interface QuestionStreamHandlers {
       truncated?: boolean;
       /** The model cited nothing; the citations were matched to its sentences. */
       autoCited?: boolean;
+      /** Picked passages the answer went without (no room in the prompt). */
+      passagesLeftOut?: number;
       /** Summaries only: passages read, of the passages the documents hold. */
       coverage?: SummaryCoverage;
       /** Tokens the provider reported for this answer; absent when it reported none. */
@@ -610,7 +615,9 @@ export const api = {
   // The whole-corpus backup zip (manifest, stored originals, feedback). Needs the full
   // API key when one is set. Returns the file and the name the server suggested.
   exportCorpus: async (signal?: AbortSignal): Promise<{ blob: Blob; filename: string }> => {
-    const { response, blob } = await downloadBlob('/export', signal);
+    // With each document's kept earlier versions, when the server keeps any
+    // (RAW_DOCUMENT_VERSIONS): a restore puts the history back too.
+    const { response, blob } = await downloadBlob('/export?include_versions=true', signal);
     const disposition = response.headers.get('Content-Disposition') ?? '';
     const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'docrag-export.zip';
     return { blob, filename };
@@ -711,11 +718,34 @@ export const api = {
   },
 
   // Every logged question and summary, newest first (QUERY_LOG_ENABLED; full key; 404
-  // when the log is off). The Asked questions panel picks the unanswered ones out.
-  listQueryLog: (limit = 500, signal?: AbortSignal, uncovered = false) =>
-    request<QueryLogResponse>(`/query-log?limit=${limit}${uncovered ? '&uncovered=true' : ''}`, {
+  // when the log is off). The Asked questions panel picks the unanswered ones out;
+  // `filename` keeps those drawn from one document.
+  listQueryLog: (limit = 500, signal?: AbortSignal, uncovered = false, filename?: string) =>
+    request<QueryLogResponse>(
+      `/query-log?limit=${limit}${uncovered ? '&uncovered=true' : ''}${
+        filename ? `&filename=${encodeURIComponent(filename)}` : ''
+      }`,
+      { signal },
+    ),
+
+  // The latest unanswered questions searched again now (retrieval only, no LLM call).
+  recheckUnanswered: (limit = 20, signal?: AbortSignal) =>
+    request<QueryRecheckResponse>(`/query-log/recheck?limit=${limit}`, {
+      method: 'POST',
       signal,
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
     }),
+
+  // Best rerank scores of answered against unanswered traced questions.
+  scoreReport: (signal?: AbortSignal) =>
+    request<ScoreReportResponse>('/traces/score-report', { signal }),
+
+  // What differs between two traces: settings, and candidates that moved.
+  diffTraces: (traceId: string, otherId: string, signal?: AbortSignal) =>
+    request<TraceDiffResponse>(
+      `/traces/${encodeURIComponent(traceId)}/diff/${encodeURIComponent(otherId)}`,
+      { signal },
+    ),
 
   // Earlier originals of a document kept when it was replaced (RAW_DOCUMENT_VERSIONS).
   listDocumentVersions: (filename: string, signal?: AbortSignal, workspace?: string) =>
@@ -806,7 +836,7 @@ export const api = {
     const limit = deadline(STREAM_IDLE_TIMEOUT_MS, signal);
     const resetIdleTimeout = limit.reset;
     let sawDone = false;
-    const workspace = getWorkspace();
+    const workspace = options?.workspace ?? getWorkspace();
 
     try {
       let response: Response;
@@ -872,6 +902,9 @@ export const api = {
                   topRerankScore: event.top_rerank_score,
                   ...(event.weak_matches === true ? { weakMatches: true } : {}),
                   ...(event.citation_backfilled === true ? { autoCited: true } : {}),
+                  ...(typeof event.passages_left_out === 'number' && event.passages_left_out > 0
+                    ? { passagesLeftOut: event.passages_left_out }
+                    : {}),
                   truncated: event.truncated,
                   ...(event.usage ? { usage: event.usage } : {}),
                   ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'

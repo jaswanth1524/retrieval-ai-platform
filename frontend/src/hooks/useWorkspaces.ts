@@ -162,6 +162,11 @@ export function useWorkspaces({
     notify,
   ]);
 
+  // Read after the awaits below: the one captured when a create or delete started may
+  // be stale by the time the request returns (it closes over the active conversation).
+  const chooseWorkspaceRef = useRef(chooseWorkspace);
+  chooseWorkspaceRef.current = chooseWorkspace;
+
   const createWorkspace = useCallback(
     async (name: string) => {
       try {
@@ -175,9 +180,9 @@ export function useWorkspaces({
       // from the list, the picker showed "Default" while questions went to it.
       setWorkspaces((prev) => (prev.includes(name) ? prev : [...prev, name]));
       await loadWorkspaces();
-      chooseWorkspace(name);
+      chooseWorkspaceRef.current(name);
     },
-    [loadWorkspaces, chooseWorkspace, noteAuthFailure],
+    [loadWorkspaces, noteAuthFailure],
   );
 
   // Only an empty workspace can be deleted (the server says 409 otherwise).
@@ -190,10 +195,10 @@ export function useWorkspaces({
         throw new Error(apiErrorMessage(err, 'The workspace was not deleted.'));
       }
       setWorkspaces((prev) => prev.filter((candidate) => candidate !== name));
-      chooseWorkspace('');
+      chooseWorkspaceRef.current('');
       await loadWorkspaces();
     },
-    [loadWorkspaces, chooseWorkspace, noteAuthFailure],
+    [loadWorkspaces, noteAuthFailure],
   );
 
   return {

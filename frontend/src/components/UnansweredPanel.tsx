@@ -1,5 +1,6 @@
 import { memo, useDeferredValue, useMemo, useState } from 'react';
-import type { QueryLogEntryResponse } from '../api/types';
+import { api, apiErrorMessage } from '../api/client';
+import type { QueryLogEntryResponse, QueryRecheckResponse } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { isoTime, toCsv } from '../utils/csv';
 import { downloadFile } from '../utils/exportChat';
@@ -31,6 +32,17 @@ type View = 'unanswered' | 'all' | 'repeated';
  *  searched or traced from here. Needs QUERY_LOG_ENABLED and the full key. */
 function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: UnansweredPanelProps) {
   const [view, setView] = useState<View>('unanswered');
+  // POST /query-log/recheck: the unanswered ones searched again (after an upload).
+  const [recheck, setRecheck] = useState<
+    { running: true } | { result: QueryRecheckResponse } | { error: string } | null
+  >(null);
+  const runRecheck = () => {
+    setRecheck({ running: true });
+    api.recheckUnanswered().then(
+      (result) => setRecheck({ result }),
+      (err) => setRecheck({ error: apiErrorMessage(err, 'Could not search them again.') }),
+    );
+  };
   const [filter, setFilter] = useState('');
   const needle = normalized(useDeferredValue(filter));
   const grouped = useMemo(() => groupQuestions(questions ?? []), [questions]);
@@ -116,6 +128,16 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
             CSV
           </button>
         )}
+        <button
+          type="button"
+          className="unanswered-panel__view"
+          onClick={runRecheck}
+          disabled={recheck !== null && 'running' in recheck}
+          title="Search the latest unanswered questions again, against the documents as they are now (no answer is written)"
+          data-testid="questions-recheck"
+        >
+          {recheck !== null && 'running' in recheck ? 'Re-checking…' : 'Re-check'}
+        </button>
         <input
           type="search"
           className="unanswered-panel__filter"
@@ -126,6 +148,34 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
           data-testid="questions-filter"
         />
       </div>
+      {recheck !== null && 'error' in recheck && (
+        <p className="unanswered-panel__message" role="alert">
+          {recheck.error}
+        </p>
+      )}
+      {recheck !== null && 'result' in recheck && (
+        <div className="unanswered-panel__recheck" data-testid="questions-recheck-result" role="status">
+          <p>
+            {recheck.result.checked === 0
+              ? 'No unanswered question to search again.'
+              : `${recheck.result.covered_now} of ${recheck.result.checked} now find a passage above the bar.`}
+          </p>
+          {recheck.result.items.some((item) => item.covered_now) && (
+            <ul>
+              {recheck.result.items
+                .filter((item) => item.covered_now)
+                .map((item) => (
+                  <li key={item.question} data-testid="questions-recheck-covered">
+                    <button type="button" onClick={() => onAsk(item.question)} title="Ask it again">
+                      {item.question}
+                    </button>
+                    {item.top_filename && <span className="mono"> · {item.top_filename}</span>}
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
+      )}
       {shown.length === 0 ? (
         <p className="unanswered-panel__message">
           {view === 'unanswered' && !needle

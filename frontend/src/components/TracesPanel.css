@@ -114,3 +114,57 @@
   opacity: 0.5;
   cursor: progress;
 }
+
+/* The score report and a two-trace comparison, above the list. In the rail's colours,
+   like the rest of the panel: a light card here left its text the rail's light colour. */
+.trace-tools {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--rail-rule);
+  border-radius: 8px;
+  color: var(--rail-text);
+  font-size: 0.82rem;
+}
+
+.trace-tools__head {
+  display: flex;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.trace-tools__head button {
+  background: none;
+  border: 0;
+  color: var(--rail-dim);
+  cursor: pointer;
+}
+
+.trace-tools__bar-row {
+  display: grid;
+  grid-template-columns: 3.2em 1fr 1fr 3.5em;
+  gap: 4px;
+  align-items: center;
+  font-size: 0.75rem;
+}
+
+.trace-tools__bar {
+  height: 8px;
+  border-radius: 2px;
+  min-width: 1px;
+}
+
+.trace-tools__bar--yes {
+  background: var(--good);
+}
+
+.trace-tools__bar--no {
+  background: var(--bad);
+}
+
+.trace-tools__note {
+  color: var(--rail-dim);
+}
+
+.traces-panel__row--picked {
+  outline: 2px solid var(--accent);
+}

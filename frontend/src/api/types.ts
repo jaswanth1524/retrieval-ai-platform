@@ -20,6 +20,18 @@ export interface ReadinessResponse {
    *  background retry loads it; "fallback" is the tokenizer's heuristic. Empty when
    *  warmup is off; absent on older servers. */
   models?: Record<string, 'ok' | 'failed' | 'fallback'>;
+  /** With BACKUP_DIR: the last scheduled backup (null until one has run). */
+  last_backup?: BackupStatusResponse | null;
+}
+
+/** The last scheduled backup written or attempted. */
+export interface BackupStatusResponse {
+  /** Unix seconds. */
+  at: number;
+  workspace: string;
+  ok: boolean;
+  file?: string | null;
+  error?: string | null;
 }
 
 /** Tokens the provider reported for an answer's LLM calls. */
@@ -125,6 +137,8 @@ export interface ImportResponse {
   rejected: string[];
   feedback_imported: number;
   feedback_skipped: number;
+  /** Earlier versions put back (a backup with versions; absent from older servers). */
+  versions_restored?: number;
 }
 
 /** POST /search: the passages a question would be answered from, with no LLM involved. */
@@ -211,6 +225,11 @@ export interface DocumentIngestResponse {
   collection_name: string;
   /** Already indexed from identical bytes: left as it was. */
   unchanged?: boolean;
+  /** Passages whose stored vectors were kept, and passages of the previous version removed. */
+  chunks_reused?: number;
+  chunks_removed?: number;
+  /** Another indexed document with exactly these bytes (both are kept). */
+  duplicate_of?: string | null;
 }
 
 export type IngestJobState = 'queued' | 'parsing' | 'embedding' | 'done' | 'failed';
@@ -282,6 +301,8 @@ export interface DocumentListResponse {
   source_urls?: Record<string, string>;
   /** The scheduled refresh of each document fetched by URL. */
   url_refresh?: Record<string, UrlRefreshStatusResponse>;
+  /** Documents holding exactly the same bytes under different names. */
+  duplicate_groups?: string[][];
 }
 
 export interface UrlRefreshStatusResponse {
@@ -485,6 +506,9 @@ export interface QuestionOptions {
   bypassCache?: boolean;
   /** Client-only, never sent: the model asked, recorded on the answer it produces. */
   modelLabel?: string;
+  /** Client-only (the X-Workspace header, not the body): the workspace to ask in, when
+   *  it must not follow a later switch ("" = the default). Else the current one. */
+  workspace?: string;
 }
 
 export type TraceStatus = 'ok' | 'insufficient_context' | 'error';
@@ -539,6 +563,8 @@ export interface QueryLogEntryResponse {
   top_score: number | null;
   mode: string;
   trace_id: string | null;
+  /** The documents the answer was drawn from (empty on rows logged before this). */
+  filenames?: string[];
 }
 
 export interface QueryLogResponse {
@@ -624,4 +650,64 @@ export interface TraceDetailResponse {
   truncated?: boolean;
   /** History messages left out of the prompt to fit the context window. */
   dropped_history_messages?: number;
+}
+
+/** GET /traces/score-report: best rerank scores of answered against unanswered questions. */
+export interface ScoreReportResponse {
+  current_min_score: number;
+  /** answered[i] counts scores in [bin_edges[i], bin_edges[i + 1]). */
+  bin_edges: number[];
+  answered: number[];
+  unanswered: number[];
+  answered_count: number;
+  unanswered_count: number;
+  suggested_min_score?: number | null;
+  note: string;
+  would_change?: number;
+}
+
+export interface TraceSettingChangeResponse {
+  name: string;
+  a?: unknown;
+  b?: unknown;
+}
+
+export interface TraceCandidateChangeResponse {
+  point_id: string;
+  filename: string;
+  page: number;
+  chunk_id: string;
+  rank_a?: number | null;
+  rank_b?: number | null;
+  score_a?: number | null;
+  score_b?: number | null;
+  selected_a?: boolean;
+  selected_b?: boolean;
+  drop_reason_a?: string | null;
+  drop_reason_b?: string | null;
+}
+
+/** GET /traces/{a}/diff/{b} */
+export interface TraceDiffResponse {
+  question_a: string;
+  question_b: string;
+  same_answer: boolean;
+  settings: TraceSettingChangeResponse[];
+  candidates: TraceCandidateChangeResponse[];
+}
+
+export interface QueryRecheckItemResponse {
+  question: string;
+  status: string;
+  covered_now: boolean;
+  top_score?: number | null;
+  top_filename?: string | null;
+  top_chunk_id?: string | null;
+}
+
+/** POST /query-log/recheck */
+export interface QueryRecheckResponse {
+  checked: number;
+  covered_now: number;
+  items: QueryRecheckItemResponse[];
 }

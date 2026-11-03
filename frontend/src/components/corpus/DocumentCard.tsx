@@ -1,7 +1,9 @@
 import { memo, useState } from 'react';
 import ConfirmInline from '../ConfirmInline';
 import TagEditor from './TagEditor';
+import DocumentUsage from './DocumentUsage';
 import VersionHistory from './VersionHistory';
+import type { SavedAnswer } from '../../hooks/useChat';
 import { extensionOf } from './cardHelpers';
 import { REFRESH_CHOICES, refreshSummary } from '../../utils/urlRefresh';
 import type { DocCard } from './types';
@@ -37,6 +39,11 @@ interface DocumentCardProps {
   onRestoreVersion?: (filename: string, version: string) => void;
   /** The workspace the card is shown in, for the versions request. */
   workspace?: string;
+  /** Answers in this browser's conversations citing a document (read when opened). */
+  findAnswersCiting?: (filename: string) => SavedAnswer[];
+  /** QUERY_LOG_ENABLED with the full key: the server's logged questions are asked too. */
+  queryLogEnabled?: boolean;
+  onOpenAnswer?: (conversationId: string, turnId: string) => void;
 }
 
 /** The interval choices, with the document's own when it isn't one of them. */
@@ -84,8 +91,13 @@ const DocumentCard = memo(function DocumentCard({
   onSetRefreshInterval,
   onRestoreVersion,
   workspace,
+  findAnswersCiting,
+  queryLogEnabled = false,
+  onOpenAnswer,
 }: DocumentCardProps) {
   const [showVersions, setShowVersions] = useState(false);
+  // Read when opened: the answers citing it, as they were then.
+  const [usage, setUsage] = useState<SavedAnswer[] | null>(null);
   return (
     <article
       className={`corpus-panel__card${selected ? ' corpus-panel__card--selected' : ''}`}
@@ -163,6 +175,19 @@ const DocumentCard = memo(function DocumentCard({
                 title="Download the uploaded file"
               >
                 ⇱
+              </button>
+            )}
+            {card.status === 'indexed' && findAnswersCiting && onOpenAnswer && (
+              <button
+                type="button"
+                className="corpus-panel__read"
+                onClick={() => setUsage((open) => (open ? null : findAnswersCiting(card.filename)))}
+                aria-expanded={usage !== null}
+                aria-label={`Questions that cited ${card.filename}`}
+                title="Questions that cited this document"
+                data-testid="corpus-usage-toggle"
+              >
+                ❝
               </button>
             )}
             {card.hasOriginal && onRestoreVersion && (
@@ -333,6 +358,15 @@ const DocumentCard = memo(function DocumentCard({
           disabled={disabled}
           onRestore={onRestoreVersion}
           onClose={() => setShowVersions(false)}
+        />
+      )}
+      {usage !== null && card.status === 'indexed' && onOpenAnswer && (
+        <DocumentUsage
+          filename={card.filename}
+          answers={usage}
+          queryLog={queryLogEnabled}
+          onOpenAnswer={onOpenAnswer}
+          onClose={() => setUsage(null)}
         />
       )}
       {card.status === 'indexed' && onSetTags && (

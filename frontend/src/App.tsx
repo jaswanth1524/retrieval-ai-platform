@@ -1,16 +1,6 @@
 import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, apiErrorMessage } from './api/client';
-import type {
-  CitationResponse,
-  DocumentTask,
-  PassageNarrowing,
-  FeedbackItemResponse,
-  QueryLogEntryResponse,
-  LlmProvider,
-  PublicConfigResponse,
-  QuestionOverrides,
-  TraceSummaryResponse,
-} from './api/types';
+import type { LlmProvider, PublicConfigResponse, QuestionOverrides } from './api/types';
 import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
@@ -18,7 +8,6 @@ import type { FeedbackPayload } from './components/ChatMessage';
 import Composer from './components/Composer';
 import { NEW_CONVERSATION_DRAFT, pruneDrafts } from './utils/drafts';
 import { QUESTION_INPUT_ID } from './utils/id';
-import { MAX_SCOPE_FILENAMES } from './utils/limits';
 import ContextPanel from './components/ContextPanel';
 import ConversationList from './components/ConversationList';
 import CorpusPanel from './components/CorpusPanel';
@@ -33,14 +22,12 @@ import ToastRow from './components/ToastRow';
 import SearchPanel, { type SearchRequestFromElsewhere } from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import SavedPanel from './components/SavedPanel';
-import { ANSWER_FILTER_STATUSES, type AnswerFilter } from './utils/traceFilters';
 import FeedbackPanel from './components/FeedbackPanel';
 import UnansweredPanel from './components/UnansweredPanel';
-import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS, scopeNarrowing } from './hooks/chatPersistence';
-import { DATE_FORMATTER } from './utils/dates';
+import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
 import { useChat } from './hooks/useChat';
+import { useScopePresets } from './hooks/useScopePresets';
 import { useStableHandler } from './hooks/useStableHandler';
-import { prefetchCitationContent } from './utils/contentPrefetch';
 import { useCommands } from './hooks/useCommands';
 import { useServerHealth } from './hooks/useServerHealth';
 import ServerNotices from './components/ServerNotices';
@@ -52,7 +39,13 @@ import {
   WATCHED_CORPUS_POLL_MS,
   useCorpusAutoRefresh,
 } from './hooks/useCorpusAutoRefresh';
-import { usePanelList } from './hooks/usePanelList';
+import { useAskActions } from './hooks/useAskActions';
+import { useCitationPreview } from './hooks/useCitationPreview';
+import { useConversationExports } from './hooks/useConversationExports';
+import { useConversationScope } from './hooks/useConversationScope';
+import { useInspectorTarget } from './hooks/useInspectorTarget';
+import { useRailLists } from './hooks/useRailLists';
+import { useThemePreference } from './hooks/useThemePreference';
 import { useAppBoot } from './hooks/useAppBoot';
 import { useWorkspaces } from './hooks/useWorkspaces';
 import { useBackupActions } from './hooks/useBackupActions';
@@ -62,10 +55,10 @@ import { useResponsiveLayout } from './hooks/useResponsiveLayout';
 import { useToasts } from './hooks/useToasts';
 import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
-import { chatToJson, chatToMarkdown, downloadFile, savedAnswersToMarkdown } from './utils/exportChat';
-import { chatToHtml } from './utils/exportHtml';
+import { sourceChange } from './utils/citationFreshness';
+import { copyText } from './utils/clipboard';
+import { withCitationFootnotes } from './utils/exportChat';
 import { folderPickNote, pickFolderFiles } from './utils/folderFiles';
-import { QUERY_LOG_FETCH_LIMIT, mergeQueryLogs } from './utils/questions';
 import { initialProvider } from './utils/providers';
 import { readStored, writeStored } from './utils/safeStorage';
 import {
@@ -78,11 +71,9 @@ import {
   ADVANCED_OPTIONS_STORAGE_KEY,
   MODE_STORAGE_KEY,
   PROVIDER_STORAGE_KEY,
-  THEME_STORAGE_KEY,
   loadPersistedOverrides,
   clampOverrides,
   loadPersistedMode,
-  CITATION_PREFETCH_DWELL_MS,
   WEAK_SUPPORT_MARGIN,
   canPreviewOriginal,
   hiddenPanels,
@@ -90,8 +81,6 @@ import {
   PANEL_META,
   notFoundSourcesMessage,
   parseConversationFile,
-  scopeForAskAbout,
-  scopeLabel,
 } from './appHelpers';
 
 // Dialogs and the inspector render only on demand, so they load on demand too: the
@@ -104,9 +93,7 @@ const SettingsModal = lazy(() => import('./components/SettingsModal'));
 function App() {
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [advancedOptions, setAdvancedOptions] = useState<QuestionOverrides>(loadPersistedOverrides);
-  const [theme, setTheme] = useState<'dark' | 'light'>(
-    () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
-  );
+  const { theme, toggleTheme } = useThemePreference();
   const [mode, setModeState] = useState<ChatMode>(loadPersistedMode);
   const [rail, setRail] = useState<RailPanel>('chat');
   const [searchOpened, setSearchOpened] = useState(false);
@@ -139,11 +126,14 @@ function App() {
   // Narrow screens only: whether the context panel's drawer is showing. On wider screens
   // the panel is a grid column and this is ignored.
   const [panelDrawerOpen, setPanelDrawerOpen] = useState(false);
-  // Which turn the inspector is describing. null follows the newest assistant turn,
-  // so the panel keeps up with the conversation on its own; clicking a trace row pins
-  // it to that specific turn instead.
-  const [pinnedTraceId, setPinnedTraceId] = useState<string | null>(null);
-  const [hoveredCitation, setHoveredCitation] = useState<CitationResponse | null>(null);
+  // Show a rail panel, opening the drawer it is in on a narrow screen: setting the rail
+  // alone left dropped files' progress, rejections and Retry in a closed drawer.
+  const showPanel = useStableHandler((panel: RailPanel) => {
+    setRail(panel);
+    if (panelCollapsed) setPanelDrawerOpen(true);
+  });
+  const { hoveredCitation, setHoveredCitation, handleCitationHover, handleCitationLeave } =
+    useCitationPreview();
   // Source document viewer: which document/chunk a clicked citation opens (null = closed).
   // chunkId null: opened from the corpus panel's Read, at the document's first passage.
   // highlights: the passages a citation rests on, marked in the cited chunk.
@@ -165,6 +155,7 @@ function App() {
     clear: clearTurns,
     conversations,
     savedAnswers,
+    answersCiting,
     activeConversationId,
     newConversation: createConversation,
     switchConversation: selectConversation,
@@ -213,6 +204,9 @@ function App() {
   // An answer can stream into one conversation while another is open. The open one shows
   // its progress (and offers Stop) only when it is the one being answered.
   const streamingHere = pending && streamingConversationId === activeConversationId;
+  // Which turn the inspector is describing (see useInspectorTarget).
+  const { setPinnedTraceId, inspectedTurn, inspectedTraceId, inspectedTraceReady } =
+    useInspectorTarget(turns, streamingHere);
   const {
     uploads,
     indexedFilenames,
@@ -302,6 +296,8 @@ function App() {
     // panel's selection, keyed below), a viewer of its file, its search results.
     onSwitched: () => {
       resetForWorkspace();
+      // A trace pinned in the inspector belongs to the previous workspace.
+      setPinnedTraceId(null);
       setSourceView(null);
       setSearchResetKey((key) => key + 1);
     },
@@ -309,34 +305,28 @@ function App() {
   // The corpus panel's changes go to the workspace it was showing when they started: a
   // bulk delete or tag loop keeps these for its whole run (the panel is keyed by
   // workspace), so a switch halfway doesn't send the rest to the next workspace.
-  const deleteDocumentHere = useCallback(
-    (filename: string) => handleDeleteDocument(filename, workspace),
-    [handleDeleteDocument, workspace],
-  );
-  const setTagsHere = useCallback(
-    (filename: string, tags: string[]) => handleSetTags(filename, tags, workspace),
-    [handleSetTags, workspace],
-  );
-  const refreshHere = useCallback(
-    (filename: string) => void handleRefreshFromUrl(filename, workspace),
-    [handleRefreshFromUrl, workspace],
-  );
-  const setRefreshIntervalHere = useCallback(
-    (filename: string, minutes: number | null) =>
-      void handleSetRefreshInterval(filename, minutes, workspace),
-    [handleSetRefreshInterval, workspace],
-  );
-  const restoreVersionHere = useCallback(
-    (filename: string, version: string) => void handleRestoreVersion(filename, version, workspace),
-    [handleRestoreVersion, workspace],
-  );
-  const reindexHere = useCallback(
-    (filename: string) => void handleReindex(filename, workspace),
-    [handleReindex, workspace],
-  );
-  const reindexManyHere = useCallback(
-    (filenames: string[]) => void handleReindexMany(filenames, workspace),
-    [handleReindexMany, workspace],
+  const here = useMemo(
+    () => ({
+      deleteDocument: (filename: string) => handleDeleteDocument(filename, workspace),
+      setTags: (filename: string, tags: string[]) => handleSetTags(filename, tags, workspace),
+      refresh: (filename: string) => void handleRefreshFromUrl(filename, workspace),
+      setRefreshInterval: (filename: string, minutes: number | null) =>
+        void handleSetRefreshInterval(filename, minutes, workspace),
+      restoreVersion: (filename: string, version: string) =>
+        void handleRestoreVersion(filename, version, workspace),
+      reindex: (filename: string) => void handleReindex(filename, workspace),
+      reindexMany: (filenames: string[]) => void handleReindexMany(filenames, workspace),
+    }),
+    [
+      handleDeleteDocument,
+      handleSetTags,
+      handleRefreshFromUrl,
+      handleSetRefreshInterval,
+      handleRestoreVersion,
+      handleReindex,
+      handleReindexMany,
+      workspace,
+    ],
   );
   // Each upload card is shown in its own workspace: one still indexing (or failed) in
   // another keeps going there, and is back on the way back.
@@ -362,55 +352,24 @@ function App() {
       dismissToast,
       noteAuthFailure,
       onRestoreQueued: async (jobs, restoredTo) => {
-        setRail('corpus');
+        showPanel('corpus');
         await trackJobs(jobs, restoredTo);
       },
     });
   // The search scope belongs to the active conversation (see useChat).
-  const selectedFilenames = scope.filenames;
-  const selectedTags = scope.tags;
-  const setSelectedFilenames = useCallback(
-    (filenames: string[]) => setScope((prev) => ({ ...prev, filenames })),
-    [setScope],
-  );
-  const setSelectedTags = useCallback(
-    (tags: string[]) => setScope((prev) => ({ ...prev, tags })),
-    [setScope],
-  );
-  const pageRange = useMemo(
-    () => ({ min: scope.pageMin, max: scope.pageMax }),
-    [scope.pageMin, scope.pageMax],
-  );
-  const setPageRange = useCallback(
-    (range: { min?: number; max?: number }) =>
-      setScope((prev) => {
-        const { pageMin: _min, pageMax: _max, ...rest } = prev;
-        return {
-          ...rest,
-          ...(range.min !== undefined ? { pageMin: range.min } : {}),
-          ...(range.max !== undefined ? { pageMax: range.max } : {}),
-        };
-      }),
-    [setScope],
-  );
-  const setUploadedAfter = useCallback(
-    (value: number | undefined) =>
-      setScope((prev) => {
-        const { uploadedAfter: _after, ...rest } = prev;
-        return value !== undefined ? { ...rest, uploadedAfter: value } : rest;
-      }),
-    [setScope],
-  );
-  const setUploadedBefore = useCallback(
-    (value: number | undefined) =>
-      setScope((prev) => {
-        const { uploadedBefore: _before, ...rest } = prev;
-        return value !== undefined ? { ...rest, uploadedBefore: value } : rest;
-      }),
-    [setScope],
-  );
-  // The scope's page range (while exactly one document is scoped) and upload date.
-  const scopePages = useMemo(() => scopeNarrowing(scope), [scope]);
+  const {
+    selectedFilenames,
+    selectedTags,
+    setSelectedFilenames,
+    setSelectedTags,
+    pageRange,
+    setPageRange,
+    setUploadedAfter,
+    setUploadedBefore,
+    scopePages,
+    scopeFilenames,
+    currentScopeLabel,
+  } = useConversationScope(scope, setScope, indexedFilenames);
 
   // A pinned trace belongs to one conversation's turns, so anything that replaces the
   // turns array has to release it. Otherwise inspectedTurn's lookup finds nothing, the
@@ -425,12 +384,12 @@ function App() {
     setPinnedTraceId(null);
     setHoveredCitation(null);
     clearTurns();
-  }, [clearTurns]);
+  }, [clearTurns, setPinnedTraceId, setHoveredCitation]);
   const newConversation = useCallback(() => {
     setPinnedTraceId(null);
     setHoveredCitation(null);
     createConversation();
-  }, [createConversation]);
+  }, [createConversation, setPinnedTraceId, setHoveredCitation]);
   const switchConversation = useCallback(
     (id: string) => {
       setPinnedTraceId(null);
@@ -439,7 +398,7 @@ function App() {
       // list's highlight and the drawer closing shouldn't wait for all of them.
       startTransition(() => selectConversation(id));
     },
-    [selectConversation],
+    [selectConversation, setPinnedTraceId, setHoveredCitation],
   );
   const deleteConversation = useCallback(
     (id: string) => {
@@ -447,7 +406,7 @@ function App() {
       setHoveredCitation(null);
       removeConversation(id);
     },
-    [removeConversation],
+    [removeConversation, setPinnedTraceId, setHoveredCitation],
   );
   // A conversation search hit names the turn it matched: the thread scrolls to it.
   const [focusTurn, setFocusTurn] = useState<{ turnId: string } | null>(null);
@@ -482,38 +441,6 @@ function App() {
     writeStored(MODE_STORAGE_KEY, next);
   }, []);
 
-  // Until a theme is picked the page follows the OS — live, not only at load: switching
-  // the OS to dark at sunset left an open tab light. A pick made in another tab applies
-  // here too (each tab used to keep its own).
-  useEffect(() => {
-    const apply = (next: 'dark' | 'light') => {
-      setTheme(next);
-      document.documentElement.dataset.theme = next;
-    };
-    const media = window.matchMedia?.('(prefers-color-scheme: light)');
-    const onSystemChange = (event: MediaQueryListEvent) => {
-      if (readStored(THEME_STORAGE_KEY) === null) apply(event.matches ? 'light' : 'dark');
-    };
-    const onStorage = (event: StorageEvent) => {
-      if (event.key !== THEME_STORAGE_KEY) return;
-      if (event.newValue === 'light' || event.newValue === 'dark') apply(event.newValue);
-      else if (event.newValue === null && media) apply(media.matches ? 'light' : 'dark');
-    };
-    media?.addEventListener?.('change', onSystemChange);
-    window.addEventListener('storage', onStorage);
-    return () => {
-      media?.removeEventListener?.('change', onSystemChange);
-      window.removeEventListener('storage', onStorage);
-    };
-  }, []);
-
-  const toggleTheme = useStableHandler(() => {
-    const next = theme === 'dark' ? 'light' : 'dark';
-    setTheme(next);
-    document.documentElement.dataset.theme = next;
-    writeStored(THEME_STORAGE_KEY, next);
-  });
-
   // The markdown renderer is its own chunk; fetch it once the first paint is done, so
   // it is there before the first answer is.
   useEffect(() => {
@@ -527,17 +454,18 @@ function App() {
   }, []);
 
   const {
-    items: feedbackItems,
-    error: feedbackError,
-    load: loadFeedback,
-  } = usePanelList<FeedbackItemResponse>(
-    rail === 'feedback',
-    // The server's cap (FEEDBACK_LIST_MAX_LIMIT): the panel filters what it holds.
-    async (signal) => (await api.listFeedback(500, signal)).feedback,
-    noteAuthFailure,
-    'Could not load feedback.',
-    workspace,
-  );
+    feedbackItems,
+    feedbackError,
+    loadFeedback,
+    unanswered,
+    unansweredError,
+    loadUnanswered,
+    traces,
+    tracesError,
+    loadTraces,
+    traceAnswerFilter,
+    setTraceAnswerFilter,
+  } = useRailLists(rail, workspace, noteAuthFailure);
 
   // The feedback panel needs feedback on and the full key (GET /feedback is operator data).
   const feedbackPanelAvailable = Boolean(config?.feedback_enabled) && !readOnly;
@@ -550,42 +478,9 @@ function App() {
   useEffect(() => {
     if (rail === 'unanswered' && !unansweredPanelAvailable) setRail('chat');
   }, [rail, unansweredPanelAvailable]);
-  const {
-    items: unanswered,
-    error: unansweredError,
-    load: loadUnanswered,
-  } = usePanelList<QueryLogEntryResponse>(
-    rail === 'unanswered',
-    // The latest asks, and the unanswered ones further back: the Unanswered view is
-    // the whole log's, not the last window's.
-    async (signal) => {
-      const [recent, uncovered] = await Promise.all([
-        api.listQueryLog(QUERY_LOG_FETCH_LIMIT, signal),
-        api.listQueryLog(QUERY_LOG_FETCH_LIMIT, signal, true),
-      ]);
-      return mergeQueryLogs(recent.queries, uncovered.queries);
-    },
-    noteAuthFailure,
-    'Could not load the asked questions.',
-    workspace,
-  );
   const hiddenRailPanels = useMemo(
     () => hiddenPanels(feedbackPanelAvailable, unansweredPanelAvailable),
     [feedbackPanelAvailable, unansweredPanelAvailable],
-  );
-
-  const [traceAnswerFilter, setTraceAnswerFilter] = useState<AnswerFilter>('any');
-  const {
-    items: traces,
-    error: tracesError,
-    load: loadTraces,
-  } = usePanelList<TraceSummaryResponse>(
-    rail === 'traces',
-    async (signal) =>
-      (await api.listTraces(signal, ANSWER_FILTER_STATUSES[traceAnswerFilter])).traces,
-    noteAuthFailure,
-    'Could not load traces.',
-    `${workspace}\u0000${traceAnswerFilter}`,
   );
 
   // A trace row is a debugging artifact, so opening one implies Engineer mode — the
@@ -639,7 +534,7 @@ function App() {
       });
     }
     if (accepted.length > 0) {
-      setRail('corpus');
+      showPanel('corpus');
       void handleUpload(accepted);
     }
   });
@@ -657,7 +552,7 @@ function App() {
       });
     }
     if (accepted.length > 0) {
-      setRail('corpus');
+      showPanel('corpus');
       void handleUpload(accepted);
     }
   }, uploadFolder);
@@ -726,106 +621,6 @@ function App() {
           : config.openai_model
     : undefined;
 
-  // The turn the inspector describes: the one pinned by a trace-row click, else the
-  // most recent assistant turn so the panel tracks the conversation without a click.
-  // A pin this conversation doesn't hold describes no turn here: falling back to the
-  // latest answer showed that answer's trace instead of the row that was clicked.
-  const inspectedTurn = pinnedTraceId
-    ? turns.find((turn) => turn.traceId === pinnedTraceId)
-    : [...turns].reverse().find((turn) => turn.role === 'assistant');
-  // A pinned trace from the trace browser may belong to a turn this conversation never
-  // held (another session, or one since cleared) — fall back to the id itself so the
-  // Retrieval and Trace tabs can still fetch and render it.
-  const inspectedTraceId = inspectedTurn?.traceId ?? pinnedTraceId;
-  // The server sends trace_id in the `sources` SSE event, before generation even
-  // starts (so a mid-stream failure can still be linked to a trace) — but only writes
-  // the trace itself once the turn reaches its terminal event, which is also the
-  // moment `timings` gets set (see useChat's onDone handler). Fetching in that gap
-  // 404s; a trace pinned from the trace browser is never mid-stream, so it defaults
-  // ready. Found via a real ~19s Ollama generation — a mocked instant SSE stream can't
-  // reproduce the gap this guards against.
-  // Only the in-flight turn can be in that gap. A turn that ended without `done`
-  // (cancelled, or failed mid-stream) never gets timings, but the server still wrote an
-  // error trace for it — gating on timings alone left its Inspector stuck forever.
-  const inspectedTurnInFlight =
-    streamingHere && inspectedTurn !== undefined && inspectedTurn.id === turns[turns.length - 1]?.id;
-  const inspectedTraceReady = inspectedTurn
-    ? inspectedTurn.timings !== null || !inspectedTurnInFlight
-    : true;
-
-  // Shared by both the input box and a Retry click on a failed turn — retry always
-  // uses the CURRENT provider/overrides/scope, not whatever was selected when the
-  // original question failed. No selection = search the whole corpus (undefined).
-  // useCallback (not a plain const) because this is passed down as ChatMessage's
-  // onRetry prop through ChatThread — an unstable reference here would defeat
-  // React.memo(ChatMessage) and reintroduce a full-list re-render on every SSE delta.
-  const scopeFilenames = selectedFilenames.length > 0 ? selectedFilenames : undefined;
-  const currentScopeLabel =
-    scopeLabel(indexedFilenames, selectedFilenames, selectedTags) +
-    (scopePages && (scopePages.page_min !== undefined || scopePages.page_max !== undefined)
-      ? ` · p.${scopePages.page_min ?? 1}${scopePages.page_max !== undefined ? `–${scopePages.page_max}` : '+'}`
-      : '') +
-    (scope.uploadedAfter !== undefined
-      ? ` · since ${DATE_FORMATTER.format(scope.uploadedAfter * 1000)}`
-      : '') +
-    (scope.uploadedBefore !== undefined
-      ? ` · up to ${DATE_FORMATTER.format(scope.uploadedBefore * 1000)}`
-      : '');
-  // `task`: a summary or comparison (its own documents; the scope doesn't apply).
-  const askQuestion = useCallback(
-    (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => {
-      const looking = narrowing ?? scopePages;
-      // Picked passages are the scope: the conversation's documents and tags are AND-ed
-      // with them on the server, so a passage from another document (the viewer's
-      // "Ask about this") found nothing.
-      const picked = Boolean(looking?.chunk_ids?.length) && !task;
-      return ask(question, selectedProvider, advancedOptions, picked ? undefined : scopeFilenames, {
-        tags: picked ? [] : selectedTags,
-        modelLabel: currentModelLabel,
-        ...(task ? { task } : {}),
-        ...(looking && !task ? { narrowing: looking } : {}),
-      });
-    },
-    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel, scopePages],
-  );
-  // Regenerate must produce a new answer, not the cached copy of the one on screen.
-  const regenerateQuestion = useCallback(
-    (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => {
-      const looking = narrowing ?? scopePages;
-      const picked = Boolean(looking?.chunk_ids?.length) && !task;
-      return ask(question, selectedProvider, advancedOptions, picked ? undefined : scopeFilenames, {
-        tags: picked ? [] : selectedTags,
-        bypassCache: true,
-        modelLabel: currentModelLabel,
-        ...(task ? { task } : {}),
-        ...(looking && !task ? { narrowing: looking } : {}),
-      });
-    },
-    [ask, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel, scopePages],
-  );
-  // A "not found" answer asked within some documents: the same question over all of
-  // them, with the conversation's scope cleared so the next question searches them too.
-  const askEverywhere = useCallback(
-    (question: string) => {
-      setScope({ filenames: [], tags: [] });
-      return ask(question, selectedProvider, advancedOptions, undefined, {
-        tags: [],
-        modelLabel: currentModelLabel,
-      });
-    },
-    [ask, setScope, selectedProvider, advancedOptions, currentModelLabel],
-  );
-  // From the Search panel: the search's question over only the passages ticked there,
-  // in the open conversation (the passages are its scope; they were found within it).
-  const askAboutPassages = useStableHandler((question: string, chunkIds: string[]) => {
-    void askQuestion(question, undefined, { chunk_ids: chunkIds });
-    if (panelCollapsed) setPanelDrawerOpen(false);
-  });
-  // A question about one passage, from the document viewer: asked over it alone.
-  const askAboutViewedPassage = useStableHandler((question: string, chunkId: string) => {
-    setSourceView(null);
-    askAboutPassages(question, [chunkId]);
-  });
   // ...or the passages a search finds for it, without asking the model again.
   const searchForPassages = useStableHandler((question: string) => {
     setSearchRequest({ query: question, id: Date.now() });
@@ -842,63 +637,38 @@ function App() {
   // Like the composer's Send: not before the app has booted, nor with a refused key —
   // and not while any answer streams (one question at a time; it would be ignored).
   const summarizeDisabled = booting || apiStatus === 'unauthorized' || pending;
-  // One document summarized, or two compared, as a turn in the open conversation.
-  // Stable: every memoized document card receives it, and it used to change with the
-  // scope and the provider (askQuestion's), re-rendering all of them.
-  // Opens the focus dialog first ("deadlines", "what changed"); it runs on Enter.
-  const [summaryFilenames, setSummaryFilenames] = useState<string[] | null>(null);
-  const summarizeDocuments = useStableHandler((filenames: string[]) => {
-    if (summarizeDisabled || filenames.length === 0) return;
-    setSummaryFilenames([...new Set(filenames)]);
-  });
-  const runSummary = useStableHandler((filenames: string[], instruction?: string) => {
-    setSummaryFilenames(null);
-    if (summarizeDisabled) return;
-    const mode: DocumentTask['mode'] =
-      filenames.length === 1 ? 'summarize' : filenames.length === 2 ? 'compare' : 'brief';
-    const task: DocumentTask = { mode, filenames, ...(instruction ? { instruction } : {}) };
-    const label =
-      mode === 'compare'
-        ? `Compare ${filenames[0]} and ${filenames[1]}`
-        : mode === 'brief'
-          ? `Brief on ${filenames.length} documents: ${filenames.join(', ')}`
-          : `Summarize ${filenames[0]}`;
-    const shown = instruction ? `${label} — focus: ${instruction}` : label;
-    // On a narrow screen the corpus panel is a drawer over the conversation.
-    setPanelDrawerOpen(false);
-    void askQuestion(shown, task);
-  });
-  // "Ask about these": the open conversation's scope becomes those documents, and the
-  // question box takes focus. Before, the composer's scope popover was the only way.
-  const askAbout = useStableHandler((filenames: string[]) => {
-    const { filenames: scoped, selected } = scopeForAskAbout(filenames);
-    setScope({ filenames: scoped, tags: [] });
-    setPanelDrawerOpen(false);
-    pushToast(
-      scoped.length < selected
-        ? {
-            tone: 'warn',
-            title: `Asking about the first ${scoped.length} of ${selected} documents`,
-            body: `A question can be limited to at most ${MAX_SCOPE_FILENAMES} documents; ask without a selection to search them all.`,
-          }
-        : {
-            tone: 'good',
-            title:
-              scoped.length === 1 ? `Asking about ${scoped[0]}` : `Asking about ${scoped.length} documents`,
-          },
-    );
-    window.requestAnimationFrame(() => document.getElementById(QUESTION_INPUT_ID)?.focus());
-  });
-  const editQuestion = useCallback(
-    (turnId: string, question: string) => {
-      setPinnedTraceId(null);
-      return editAndResend(turnId, question, selectedProvider, advancedOptions, scopeFilenames, {
-        tags: selectedTags,
-        modelLabel: currentModelLabel,
-        ...(scopePages ? { narrowing: scopePages } : {}),
-      });
+  const {
+    askQuestion,
+    regenerateQuestion,
+    askEverywhere,
+    askAboutPassages,
+    askAboutViewedPassage,
+    summaryFilenames,
+    setSummaryFilenames,
+    summarizeDocuments,
+    runSummary,
+    askAbout,
+    editQuestion,
+  } = useAskActions(
+    {
+      provider: selectedProvider,
+      overrides: advancedOptions,
+      scopeFilenames,
+      selectedTags,
+      scopePages,
+      modelLabel: currentModelLabel,
     },
-    [editAndResend, selectedProvider, advancedOptions, scopeFilenames, selectedTags, currentModelLabel, scopePages],
+    {
+      ask,
+      editAndResend,
+      setScope,
+      pushToast,
+      panelCollapsed,
+      setPanelDrawerOpen,
+      closeSourceView: () => setSourceView(null),
+      setPinnedTraceId,
+      summarizeDisabled,
+    },
   );
 
   // Same reasoning as askQuestion above — passed to both ChatThread and Inspector.
@@ -912,35 +682,6 @@ function App() {
     // On a narrow screen the panel is a drawer over the viewer's opener.
     setPanelDrawerOpen(false);
   }, []);
-  // A citation's viewer page is fetched once the pointer (or focus) rests on it a
-  // moment: tabbing through an answer used to request a 61-chunk page per tab stop.
-  const prefetchTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => () => clearTimeout(prefetchTimerRef.current), []);
-  const handleCitationLeave = useCallback(() => {
-    clearTimeout(prefetchTimerRef.current);
-    setHoveredCitation(null);
-  }, []);
-  // Escape dismisses the preview (WCAG 1.4.13: content shown on hover or focus can be
-  // dismissed without moving the pointer or focus).
-  useEffect(() => {
-    if (!hoveredCitation) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setHoveredCitation(null);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [hoveredCitation]);
-  // A pointer or focus on a citation usually precedes a click on it: the viewer's code
-  // and its first page start loading now, so the click opens it without waiting.
-  const handleCitationHover = useCallback((citation: CitationResponse) => {
-    setHoveredCitation(citation);
-    clearTimeout(prefetchTimerRef.current);
-    prefetchTimerRef.current = setTimeout(() => {
-      void import('./components/DocumentViewer');
-      prefetchCitationContent(citation.filename, citation.chunk_id);
-    }, CITATION_PREFETCH_DWELL_MS);
-  }, []);
-
   // Shown at once (ChatMessage's feedbackGiven); taken back if it couldn't be sent, so
   // the buttons don't claim a rating the server never recorded and it can be retried.
   const handleFeedback = useCallback((payload: FeedbackPayload) => {
@@ -999,52 +740,26 @@ function App() {
     if (!persistPartial) dismissToast('persist-partial');
   }, [persistError, persistPartial, pushToast, dismissToast]);
 
-  // Read when clicked or exported rather than closed over: the header's Export and the
-  // palette keep one identity while an answer streams in.
-  const turnsRef = useRef(turns);
-  turnsRef.current = turns;
-  const conversationTitleRef = useRef(activeConversation?.title);
-  conversationTitleRef.current = activeConversation?.title;
-
-  const exportMarkdown = useCallback(() => {
-    if (turnsRef.current.length === 0) return;
-    downloadFile(
-      `docrag-${conversationTitleRef.current ?? 'chat'}.md`.replace(/[^\w.-]+/g, '-'),
-      'text/markdown',
-      chatToMarkdown(turnsRef.current, conversationTitleRef.current),
-    );
-  }, []);
-  const exportHtml = useStableHandler(() => {
-    if (turnsRef.current.length === 0) return;
-    const title = conversationTitleRef.current ?? 'DocRAG conversation';
-    void chatToHtml(turnsRef.current, title).then(
-      (html) => downloadFile(`docrag-${title}.html`.replace(/[^\w.-]+/g, '-'), 'text/html', html),
-      () => pushToast({ tone: 'bad', title: 'Could not export the conversation' }),
-    );
-  });
-  // Every trace of this workspace as JSON Lines: what the server holds (all of them
-  // with TRACE_STORE_PATH), for offline analysis or turning into eval rows.
-  const [exportingTraces, setExportingTraces] = useState(false);
-  const exportTraces = useStableHandler(() => {
-    if (exportingTraces) return;
-    setExportingTraces(true);
-    api
-      .exportTraces()
-      .then(({ blob, filename }) => downloadFile(filename, 'application/x-ndjson', blob))
-      .catch((err) => {
-        if (!noteAuthFailure(err)) {
-          pushToast({ tone: 'bad', title: 'Could not export the traces', body: apiErrorMessage(err, 'Try again.') });
-        }
-      })
-      .finally(() => setExportingTraces(false));
-  });
+  const {
+    exportMarkdown,
+    exportHtml,
+    exportJson,
+    exportTraces,
+    exportingTraces,
+    exportAllConversations,
+    exportSavedAnswers,
+    exportCitedSources,
+  } = useConversationExports(
+    turns,
+    activeConversation?.title,
+    savedAnswers,
+    allConversationsJson,
+    pushToast,
+    noteAuthFailure,
+  );
   // The print stylesheet (global.css) leaves only the conversation on the page.
   const printConversation = useStableHandler(() => window.print());
 
-  const exportAllConversations = useCallback(() => {
-    const stamp = new Date().toISOString().slice(0, 10);
-    downloadFile(`docrag-conversations-${stamp}.json`, 'application/json', allConversationsJson());
-  }, [allConversationsJson]);
   const copyLastAnswer = useStableHandler(() => {
     const answer = [...turns].reverse().find((turn) => turn.role === 'assistant' && turn.content);
     if (!answer) return;
@@ -1054,14 +769,9 @@ function App() {
           ? { tone: 'good', title: 'Answer copied' }
           : { tone: 'warn', title: "Couldn't copy", body: 'Use the copy button on the answer.' },
       );
-    if (!navigator.clipboard) {
-      done(false);
-      return;
-    }
-    navigator.clipboard.writeText(answer.content).then(
-      () => done(true),
-      () => done(false),
-    );
+    // As the answer's own Copy button does: with its sources as footnotes (the [n]
+    // markers dangled), and on plain HTTP too.
+    void copyText(withCitationFootnotes(answer.content, answer.sources)).then(done);
   });
   // The conversation list's order (pinned first, its filters and search applied) while
   // it is shown: ] and [ walk what the reader sees. Else pinned first, by recent use.
@@ -1085,6 +795,21 @@ function App() {
     const nextIndex = index < 0 ? (step === 1 ? 0 : order.length - 1) : (index + step + order.length) % order.length;
     const next = order[nextIndex];
     if (next && next !== activeConversationId) switchConversation(next);
+  });
+  // 1-9: that source of the answer that has focus (j/k move it), else of the latest.
+  const openAnswerSource = useStableHandler((number: number) => {
+    const answers = turns.filter((turn) => turn.role === 'assistant' && turn.content);
+    const focusedId = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>(
+      '[role="article"][data-role="assistant"]',
+    )?.dataset.turnId;
+    const answer = answers.find((turn) => turn.id === focusedId) ?? answers[answers.length - 1];
+    const source = answer?.sources.find((candidate) => candidate.source_number === number);
+    if (!source) return;
+    handleOpenSource(
+      source.filename,
+      source.chunk_id,
+      source.spans?.length ? source.spans.map((span) => span.quote) : undefined,
+    );
   });
   const moveBetweenAnswers = useStableHandler((step: 1 | -1) => {
     const answers = [
@@ -1111,29 +836,10 @@ function App() {
     target.scrollIntoView({ block: 'start', behavior: still ? 'auto' : 'smooth' });
   });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  const savedAnswersRef = useRef(savedAnswers);
-  savedAnswersRef.current = savedAnswers;
-  const exportSavedAnswers = useCallback(() => {
-    const items = savedAnswersRef.current;
-    if (items.length === 0) {
-      pushToast({ tone: 'warn', title: 'Nothing saved yet', body: 'Save an answer with ☆ first.' });
-      return;
-    }
-    downloadFile('docrag-saved-answers.md', 'text/markdown', savedAnswersToMarkdown(items));
-  }, [pushToast]);
   const unsaveAnswer = useCallback(
     (conversationId: string, turnId: string) => setTurnSaved(turnId, false, conversationId),
     [setTurnSaved],
   );
-  const exportJson = useCallback(() => {
-    if (turnsRef.current.length === 0) return;
-    downloadFile(
-      `docrag-${conversationTitleRef.current ?? 'chat'}.json`.replace(/[^\w.-]+/g, '-'),
-      'application/json',
-      chatToJson(turnsRef.current),
-    );
-  }, []);
-
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   // Settings needs /config to render. Opened before it arrived, the flag sat set with
   // nothing shown — every ⌘ shortcut then thought a dialog was open — and the modal
@@ -1150,15 +856,30 @@ function App() {
   const importInputRef = useRef<HTMLInputElement>(null);
 
   const startUpload = useStableHandler(() => {
-    setRail('corpus');
     // On a narrow screen the panel is a closed drawer: the picked files were staged
     // out of sight, still waiting on an Upload click nobody could see.
-    if (panelCollapsed) setPanelDrawerOpen(true);
+    showPanel('corpus');
     // The panel has to render before its hidden file input can be clicked.
     requestAnimationFrame(() => corpusBrowseInputRef.current?.click());
   });
   // Example questions for an empty conversation: about the newest documents, which the
   // user most likely means to ask about. A click puts one in the composer to edit.
+  const {
+    presets: scopePresets,
+    savePreset: saveScopePreset,
+    deletePreset: deleteScopePreset,
+    applyPreset: applyScopePreset,
+  } = useScopePresets(workspace, indexedFilenames, corpusChecked && !listingFailed, setScope);
+  const saveCurrentScope = useCallback(
+    (name: string) => saveScopePreset(name, scope),
+    [saveScopePreset, scope],
+  );
+  // A cited document deleted or uploaded again after the answer: flagged on its card.
+  const sourceChangeOf = useCallback(
+    (filename: string, answeredAtMs: number) =>
+      sourceChange(filename, answeredAtMs, documents, corpusChecked && !listingFailed),
+    [documents, corpusChecked, listingFailed],
+  );
   const suggestions = useMemo(() => {
     const newest = [...indexedFilenames]
       .sort((a, b) => (documents[b]?.uploadedAt ?? 0) - (documents[a]?.uploadedAt ?? 0))
@@ -1235,6 +956,8 @@ function App() {
       exportAllConversations,
       cycleConversation,
       moveBetweenAnswers,
+      exportCitedSources,
+      openAnswerSource,
       showShortcuts: () => {
         setPaletteOpen(false);
         setShortcutsOpen(true);
@@ -1262,7 +985,8 @@ function App() {
         window.confirm(
           `This file has ${valid} conversations and the history has room for ${room} ` +
             `(it keeps ${MAX_CONVERSATIONS}).\n\nOK: remove up to ${valid - room} of the ` +
-            'least recently used conversations (never pinned ones) to import them all.\n' +
+            'least recently used conversations (never pinned ones, nor ones with saved answers) ' +
+            'to import them all.\n' +
             `Cancel: import only the ${room} that fit.`,
         );
       ({ imported: count, skipped, removed } = importConversations(items, { makeRoom }));
@@ -1432,7 +1156,7 @@ function App() {
             onUpload={handleUpload}
             uploadTags={uploadTags}
             onUploadTagsChange={readOnly ? undefined : setUploadTags}
-            onDelete={deleteDocumentHere}
+            onDelete={here.deleteDocument}
             maxUploadBytes={config?.max_upload_bytes}
             supportedExtensions={config?.supported_extensions}
             // Only while this conversation's answer streams: an answer in another
@@ -1442,12 +1166,12 @@ function App() {
             onRetryUpload={handleRetryUpload}
             onDismissUpload={handleDismissUpload}
             onCancelUpload={readOnly ? undefined : handleCancelUpload}
-            onReindex={config?.raw_documents_enabled && !readOnly ? reindexHere : undefined}
-            onReindexMany={config?.raw_documents_enabled && !readOnly ? reindexManyHere : undefined}
+            onReindex={config?.raw_documents_enabled && !readOnly ? here.reindex : undefined}
+            onReindexMany={config?.raw_documents_enabled && !readOnly ? here.reindexMany : undefined}
             onReindexAllStale={
               config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
             }
-            onSetTags={readOnly ? undefined : setTagsHere}
+            onSetTags={readOnly ? undefined : here.setTags}
             readOnly={readOnly}
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
             onRead={handleReadDocument}
@@ -1456,13 +1180,16 @@ function App() {
             onSummarize={summarizeDocuments}
             onAskAbout={askAbout}
             summaryMaxDocuments={config?.summary_max_documents}
-            onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? refreshHere : undefined}
-            onSetRefreshInterval={readOnly ? undefined : setRefreshIntervalHere}
+            onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? here.refresh : undefined}
+            onSetRefreshInterval={readOnly ? undefined : here.setRefreshInterval}
             onRestoreVersion={
-              config?.document_versions_enabled && !readOnly ? restoreVersionHere : undefined
+              config?.document_versions_enabled && !readOnly ? here.restoreVersion : undefined
             }
             workspace={workspace}
             summarizeDisabled={summarizeDisabled}
+            findAnswersCiting={answersCiting}
+            queryLogEnabled={Boolean(config?.query_log_enabled) && !readOnly}
+            onOpenAnswer={switchConversationFromList}
           />
         )}
         {/* Kept once opened, hidden while another panel shows: its query and results
@@ -1506,6 +1233,8 @@ function App() {
             answers={savedAnswers}
             onOpen={switchConversationFromList}
             onUnsave={unsaveAnswer}
+            sourceChangeOf={sourceChangeOf}
+            workspace={workspace}
           />
         )}
         {rail === 'unanswered' && (
@@ -1568,6 +1297,13 @@ function App() {
               onAskEverywhere={askEverywhere}
               onSearchPassages={searchForPassages}
               onToggleSaved={setTurnSaved}
+              // Only once the listing is this conversation's workspace's (it switches
+              // to it on opening): another's documents would all read "deleted".
+              sourceChangeOf={
+                conversationWorkspace === null || conversationWorkspace === workspace
+                  ? sourceChangeOf
+                  : undefined
+              }
               engineerMode={mode === 'engineer'}
               currentModelLabel={currentModelLabel}
               onRetry={askQuestion}
@@ -1625,6 +1361,10 @@ function App() {
             onUploadedAfterChange={setUploadedAfter}
             uploadedBefore={scope.uploadedBefore}
             onUploadedBeforeChange={setUploadedBefore}
+            scopePresets={scopePresets}
+            onApplyScopePreset={applyScopePreset}
+            onSaveScopePreset={saveCurrentScope}
+            onDeleteScopePreset={deleteScopePreset}
             onSelectedTagsChange={setSelectedTags}
             config={config}
             provider={selectedProvider}

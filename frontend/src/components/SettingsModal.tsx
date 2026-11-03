@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { getApiKey, setApiKey } from '../api/client';
 import type { PublicConfigResponse, QuestionOverrides, ReadinessResponse } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
+import { formatRelativeTime } from '../utils/relativeTime';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
 import { ANSWER_FORMATS, EMPTY_OVERRIDES, isAnswerFormat, isAnswerLanguage } from '../utils/overrides';
@@ -444,6 +445,17 @@ function SettingsModal({
                         <td className="mono">{state}</td>
                       </tr>
                     ))}
+                    {readiness.last_backup && (
+                      <tr data-testid="settings-last-backup">
+                        <td>Last backup ({readiness.last_backup.workspace})</td>
+                        <td className="mono">
+                          {formatRelativeTime(readiness.last_backup.at * 1000)}
+                          {readiness.last_backup.ok
+                            ? ` · ${readiness.last_backup.file ?? 'written'}`
+                            : ` · failed: ${readiness.last_backup.error ?? 'see the server log'}`}
+                        </td>
+                      </tr>
+                    )}
                   </>
                 )}
                 {SYSTEM_FIELDS.map(([label, key]) => (

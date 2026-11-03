@@ -1108,7 +1108,8 @@ describe('useChat feature pack', () => {
 
     const call = askQuestionStreamMock.mock.calls[0];
     expect(call[3]).toEqual(['a.pdf']);
-    expect(call[7]).toEqual({ tags: ['legal'], bypassCache: true });
+    // The workspace rides along too ("" = the default), so a retry stays in it.
+    expect(call[7]).toEqual({ tags: ['legal'], bypassCache: true, workspace: '' });
     expect(result.current.turns[1]).toMatchObject({ content: 'From cache.', cached: true });
   });
 

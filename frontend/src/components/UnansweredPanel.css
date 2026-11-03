@@ -106,3 +106,33 @@
 .unanswered-panel__missed {
   color: var(--bad);
 }
+
+/* A saved answer whose sources were deleted or uploaded again since. */
+.saved-panel__changed {
+  color: var(--warn);
+}
+
+/* What a re-check found: the questions the documents now cover, each one click from
+   being asked again. */
+.unanswered-panel__recheck {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  font-size: 0.82rem;
+}
+
+.unanswered-panel__recheck ul {
+  margin: 4px 0 0;
+  padding-left: 16px;
+}
+
+.unanswered-panel__recheck button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-align: start;
+}
