@@ -1091,6 +1091,40 @@ class FakeServer:
                 "problems": ["z.bin: unsupported"],
             },
             ("POST", "/watch/scan"): {"folder": "/inbox"},
+            ("GET", "/traces/score-report"): {
+                "current_min_score": 0.15,
+                "bin_edges": [0.0, 0.5, 1.0],
+                "answered": [0, 3],
+                "unanswered": [2, 0],
+                "answered_count": 3,
+                "unanswered_count": 2,
+                "suggested_min_score": 0.3,
+                "note": "Check a few first.",
+                "would_change": 1,
+            },
+            ("GET", "/traces/t1/diff/t2"): {
+                "question_a": "q",
+                "question_b": "q",
+                "same_answer": False,
+                "settings": [{"name": "rerank_top_k", "a": 3, "b": 5}],
+                "candidates": [
+                    {
+                        "filename": "a.txt",
+                        "page": 2,
+                        "rank_a": 1,
+                        "rank_b": 4,
+                        "drop_reason_b": "below_min_score",
+                    }
+                ],
+            },
+            ("POST", "/query-log/recheck"): {
+                "checked": 2,
+                "covered_now": 1,
+                "items": [
+                    {"question": "Gym?", "covered_now": True, "top_filename": "gym.txt"},
+                    {"question": "Parking?", "covered_now": False},
+                ],
+            },
         }
         if method == "PATCH" and path == "/documents/a.txt/refresh-settings":
             sent = json.loads(request.content)
@@ -1416,3 +1450,21 @@ def test_an_upper_upload_date_includes_that_whole_day() -> None:
     assert upload_bound("2024-05-31T12:00", end_of_day=True) == noon
     with pytest.raises(argparse.ArgumentTypeError):
         upload_time_until("soon")
+
+
+def test_the_score_report_trace_diff_and_recheck_commands() -> None:
+    code, out = run(mock_client(FakeServer()), "traces", "report")
+    assert code == 0
+    assert "suggested RERANK_MIN_SCORE=0.3 (1 traced question(s) decided differently)" in out
+    assert "0.50-1.00  +++" in out and "0.00-0.50  --" in out
+
+    code, out = run(mock_client(FakeServer()), "traces", "diff", "t1", "t2")
+    assert code == 0
+    assert "same answer: no" in out and "rerank_top_k: 3 -> 5" in out
+    assert "a.txt p.2: rank 1 -> 4  below_min_score" in out
+    assert run(mock_client(FakeServer()), "traces", "diff", "t1")[0] == 2
+
+    code, out = run(mock_client(FakeServer()), "queries", "--recheck")
+    assert code == 0
+    assert "1 of 2 unanswered questions now find a passage" in out
+    assert "covered    Gym?  (gym.txt)" in out

@@ -871,6 +871,21 @@ def cmd_versions(client: DocragClient, args: argparse.Namespace, out: TextIO) ->
 
 
 def cmd_queries(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.recheck:
+        report = client.recheck_unanswered(limit=min(args.limit, 100))
+        if args.json:
+            print(json.dumps(report), file=out)
+            return 0
+        print(
+            f"{report['covered_now']} of {report['checked']} unanswered questions now find "
+            "a passage above the bar:",
+            file=out,
+        )
+        for item in report.get("items", []):
+            mark = "covered" if item.get("covered_now") else "still not"
+            where = f"  ({item['top_filename']})" if item.get("top_filename") else ""
+            print(f"  {mark:9}  {item.get('question')}{where}", file=out)
+        return 0
     rows = client.query_log(limit=args.limit, uncovered=args.uncovered)
     if args.json:
         print(json.dumps(rows), file=out)
@@ -945,6 +960,52 @@ def cmd_jobs(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
 
 
 def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.action == "report":
+        report = client.score_report()
+        if args.json:
+            print(json.dumps(report), file=out)
+            return 0
+        print(
+            f"answered {report['answered_count']}, not answered {report['unanswered_count']}; "
+            f"RERANK_MIN_SCORE now {report['current_min_score']:g}",
+            file=out,
+        )
+        edges = report["bin_edges"]
+        for index, (yes, no) in enumerate(
+            zip(report["answered"], report["unanswered"], strict=True)
+        ):
+            if yes or no:
+                print(
+                    f"  {edges[index]:.2f}-{edges[index + 1]:.2f}  {'+' * yes}{'-' * no}", file=out
+                )
+        suggested = report.get("suggested_min_score")
+        if suggested is not None:
+            print(
+                f"suggested RERANK_MIN_SCORE={suggested:g} "
+                f"({report['would_change']} traced question(s) decided differently)",
+                file=out,
+            )
+        print(report["note"], file=out)
+        return 0
+    if args.action == "diff":
+        if not args.target or not args.other:
+            print("traces diff needs two trace ids", file=sys.stderr)
+            return 2
+        diff = client.trace_diff(args.target, args.other)
+        if args.json:
+            print(json.dumps(diff), file=out)
+            return 0
+        print(f"same answer: {'yes' if diff['same_answer'] else 'no'}", file=out)
+        for change in diff.get("settings", []):
+            print(f"  {change['name']}: {change['a']!r} -> {change['b']!r}", file=out)
+        for change in diff.get("candidates", []):
+            print(
+                f"  {change['filename']} p.{change['page']}: rank {change.get('rank_a')} -> "
+                f"{change.get('rank_b')}"
+                f"{'  ' + str(change['drop_reason_b']) if change.get('drop_reason_b') else ''}",
+                file=out,
+            )
+        return 0
     if args.action == "export":
         if not args.target:
             print("traces export needs a file to write", file=sys.stderr)
@@ -1268,6 +1329,11 @@ def build_parser() -> argparse.ArgumentParser:
     queries = command("queries", "What was asked (QUERY_LOG_ENABLED, full key).")
     queries.add_argument("--uncovered", action="store_true", help="Only unanswered ones.")
     queries.add_argument("--limit", type=int, default=50)
+    queries.add_argument(
+        "--recheck",
+        action="store_true",
+        help="Search the latest unanswered ones again now (no LLM call; at most 100).",
+    )
 
     preview = command("preview", "How a file would be indexed, without indexing it.")
     preview.add_argument("file")
@@ -1283,9 +1349,17 @@ def build_parser() -> argparse.ArgumentParser:
     jobs.add_argument("--failed", action="store_true", help="Only failed jobs, newest first.")
     jobs.add_argument("--limit", type=int, default=50)
 
-    traces = command("traces", "Recent question traces: list, show one, or export.")
-    traces.add_argument("action", nargs="?", choices=("list", "show", "export"), default="list")
-    traces.add_argument("target", nargs="?", help="The trace id (show) or file (export).")
+    traces = command(
+        "traces", "Recent question traces: list, show, compare two, score report, or export."
+    )
+    traces.add_argument(
+        "action",
+        nargs="?",
+        choices=("list", "show", "diff", "report", "export"),
+        default="list",
+    )
+    traces.add_argument("target", nargs="?", help="The trace id (show, diff) or file (export).")
+    traces.add_argument("other", nargs="?", help="diff: the second trace id.")
     traces.add_argument(
         "--status",
         action="append",
