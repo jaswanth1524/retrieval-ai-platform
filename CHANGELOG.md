@@ -1116,6 +1116,12 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 14: pypdf 6.21.4 (at least 6.21.4, was 6.21.2), for CVE-2026-119203 to
+  CVE-2026-119209: crafted PDFs could loop forever or use large amounts of memory
+  (a missing trailer, cloned dictionaries, shared page resources, cross-reference
+  streams, page labels, a wrong page count in an encrypted file). Uploads are untrusted
+  input, so these applied. PDF text extraction is unchanged on the golden documents.
+  **None.**
 - Pass 13: LiteLLM 1.103.10 (at least 1.103, was 1.89.7), for GHSA-g5ff-637f-6q2m and
   CVE-2026-114612. Both are in LiteLLM's proxy server, which DocRAG doesn't run (it calls
   the SDK), but the audit gates on them. 1.103.10 is the newest release that still
