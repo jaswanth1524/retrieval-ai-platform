@@ -3090,3 +3090,70 @@ def test_the_recency_boost_reorders_kept_passages_and_drops_none() -> None:
     # Uploaded seconds apart (one folder indexed in one go): told apart by score alone.
     close = [chunk("a", 0.80, 1000.0), chunk("b", 0.79, 1005.0)]
     assert [c.chunk_id for c in recency_ordered(close, 0.5)] == ["a", "b"]
+
+
+def test_an_odd_history_cap_never_leaves_an_answer_first() -> None:
+    settings = make_settings(conversation_max_history_messages=3)
+    client = QdrantClient(":memory:")
+    repository = VectorRepository(client)
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+    trace_store = ListTraceStore()
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=SequencedGenerator(["condensed query", "Alpha is documented [1]."]),
+        settings=settings,
+        trace_store=trace_store,
+    )
+
+    pipeline.answer("alpha", history=history)
+
+    prompt = trace_store.traces[0].prompt_messages
+    assert prompt is not None
+    # [system, user turn 2, assistant reply 2, user question]: "reply 1" went with turn 1.
+    assert [message["role"] for message in prompt] == ["system", "user", "assistant", "user"]
+    assert {"role": "assistant", "content": "reply 1"} not in prompt
+
+
+def test_picked_passages_past_the_context_limit_are_reported_left_out() -> None:
+    from api.pipeline import AnswerOverrides
+    from api.repository import PassageFilter
+
+    class OnePerText:
+        def embed_texts(self, texts: Sequence[str]) -> list[EmbeddedText]:
+            return [make_embedding(1.0) for _ in texts]
+
+    settings = make_settings(chunk_size_tokens=20, max_context_chunks=2, rerank_top_k=2)
+    repository = VectorRepository(QdrantClient(":memory:"))
+    text = " ".join(f"Sentence {i} talks about alpha topic {i}." for i in range(12)).encode()
+    IngestService(repository, OnePerText(), settings).ingest("guide.txt", b"Intro\n" + text)
+    picked = tuple(
+        str(chunk["chunk_id"]) for chunk in repository.chunks_for_filename(settings, "guide.txt")
+    )[:5]
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+    )
+    overrides = AnswerOverrides(narrow=PassageFilter(chunk_ids=picked))
+
+    answered = pipeline.answer("alpha", overrides)
+    streamed = [
+        event for event in pipeline.answer_stream("alpha", overrides) if event["type"] == "done"
+    ]
+
+    assert answered.passages_left_out == 3
+    assert streamed[0]["passages_left_out"] == 3
+    # Nothing picked: nothing reported.
+    assert pipeline.answer("alpha").passages_left_out == 0

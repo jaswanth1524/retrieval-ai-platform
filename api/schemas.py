@@ -113,6 +113,16 @@ class HealthResponse(BaseModel):
     version: str = ""
 
 
+class BackupStatusResponse(BaseModel):
+    """The last scheduled backup written or attempted (BACKUP_DIR)."""
+
+    at: float
+    workspace: str
+    ok: bool
+    file: str | None = None
+    error: str | None = None
+
+
 class ReadinessResponse(BaseModel):
     """Readiness check response — unlike /health, this probes real dependencies."""
 
@@ -132,6 +142,9 @@ class ReadinessResponse(BaseModel):
     # background retry loads it; makes `status` degraded) or "fallback" (the tokenizer
     # fell back to the heuristic counter; never degraded). Empty when warmup is off.
     models: dict[str, Literal["ok", "failed", "fallback"]] = Field(default_factory=dict)
+    # With BACKUP_DIR: the last scheduled backup (null until one has run). A failed one
+    # doesn't make `status` degraded: questions still work.
+    last_backup: BackupStatusResponse | None = None
 
 
 class PublicConfigResponse(BaseModel):
@@ -210,6 +223,14 @@ class DocumentIngestResponse(BaseModel):
     # The document was already indexed from these exact bytes, with current chunking
     # settings: nothing was parsed, embedded or written.
     unchanged: bool = False
+    # Of chunks_ingested, how many kept their stored vectors (same text, same
+    # chunking: not embedded again), and how many chunks of the previous version were
+    # removed. 0 for a first upload.
+    chunks_reused: int = 0
+    chunks_removed: int = 0
+    # Another indexed document in this workspace with exactly these bytes. Information
+    # only: both are kept (and both are searched).
+    duplicate_of: str | None = None
 
 
 class DocumentJobAcceptedResponse(BaseModel):
@@ -277,6 +298,9 @@ class DocumentListResponse(BaseModel):
     source_urls: dict[str, str] = {}
     # The scheduled refresh of each document fetched by URL.
     url_refresh: dict[str, UrlRefreshStatusResponse] = {}
+    # Documents holding exactly the same bytes under different names (each group in
+    # name order). Both copies are searched, and citations split between them.
+    duplicate_groups: list[list[str]] = []
 
 
 class UrlRefreshStatusResponse(BaseModel):
@@ -527,6 +551,75 @@ class TraceListResponse(BaseModel):
     traces: list[TraceSummaryResponse]
 
 
+class ScoreReportResponse(BaseModel):
+    """GET /traces/score-report: the best rerank score of each traced question, for
+    questions answered against questions not answered, and a suggested
+    RERANK_MIN_SCORE when there are enough of both."""
+
+    current_min_score: float
+    # SCORE_BINS + 1 edges over [0, 1]; answered[i] counts scores in [edge i, edge i+1).
+    bin_edges: list[float]
+    answered: list[int]
+    unanswered: list[int]
+    answered_count: int
+    unanswered_count: int
+    suggested_min_score: float | None = None
+    note: str
+    # Traced questions whose best score lies between the current and the suggested bar.
+    would_change: int = 0
+
+
+class TraceSettingChangeResponse(BaseModel):
+    name: str
+    a: Any = None
+    b: Any = None
+
+
+class TraceCandidateChangeResponse(BaseModel):
+    point_id: str
+    filename: str
+    page: int
+    chunk_id: str
+    rank_a: int | None = None
+    rank_b: int | None = None
+    score_a: float | None = None
+    score_b: float | None = None
+    selected_a: bool = False
+    selected_b: bool = False
+    drop_reason_a: str | None = None
+    drop_reason_b: str | None = None
+
+
+class TraceDiffResponse(BaseModel):
+    """GET /traces/{a}/diff/{b}: the settings that differ and the candidates whose
+    rank, selection or drop reason moved between two traces."""
+
+    question_a: str
+    question_b: str
+    same_answer: bool
+    settings: list[TraceSettingChangeResponse]
+    candidates: list[TraceCandidateChangeResponse]
+
+
+class QueryRecheckItemResponse(BaseModel):
+    question: str
+    status: str
+    # Some passage now clears RERANK_MIN_SCORE (searched over the whole workspace).
+    covered_now: bool
+    top_score: float | None = None
+    top_filename: str | None = None
+    top_chunk_id: str | None = None
+
+
+class QueryRecheckResponse(BaseModel):
+    """POST /query-log/recheck: the latest questions that went unanswered, searched
+    again (retrieval only, no LLM call) against the documents as they are now."""
+
+    checked: int
+    covered_now: int
+    items: list[QueryRecheckItemResponse]
+
+
 class QueryLogEntryResponse(BaseModel):
     """One logged question or summary (QUERY_LOG_ENABLED)."""
 
@@ -539,6 +632,8 @@ class QueryLogEntryResponse(BaseModel):
     top_score: float | None = None
     mode: str
     trace_id: str | None = None
+    # The documents the answer was drawn from (empty for rows logged before this).
+    filenames: list[str] = []
 
 
 class QueryLogResponse(BaseModel):
@@ -723,6 +818,9 @@ class QuestionResponse(BaseModel):
     # sources (CITATION_RETRY_MODE), so check them ("auto-cited" in the UI).
     citation_backfilled: bool = False
     # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.
+    # Picked passages (chunk_ids) the prompt had no room for: past max_context_chunks,
+    # past the reranker's candidates, or cut to fit the context window.
+    passages_left_out: int = 0
     followups: list[str] = []
     # None when the provider reported no usage, and on a cache hit.
     usage: UsageResponse | None = None
@@ -917,6 +1015,9 @@ class ImportResponse(BaseModel):
     rejected: list[str]
     feedback_imported: int
     feedback_skipped: int
+    # Earlier versions of the restored documents put back (a backup exported with
+    # include_versions, restored where RAW_DOCUMENT_VERSIONS keeps versions).
+    versions_restored: int = 0
 
 
 class WatchRetry(BaseModel):

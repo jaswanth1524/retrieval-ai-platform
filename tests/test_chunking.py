@@ -114,3 +114,76 @@ def test_every_chunk_of_unspaced_cjk_fits_the_budget() -> None:
     prefix = len("zh.txt › 正文\n")
     assert all(len(chunk.text) + prefix <= 60 for chunk in chunks)
     assert "".join(chunk.text for chunk in chunks) == text
+
+
+def _split_long_word_before(word: str, budget: int, token_counter) -> list[tuple[str, int]]:  # type: ignore[no-untyped-def]
+    """The pass-13 implementation, kept here as the reference for ordinary words."""
+
+    pieces: list[tuple[str, int]] = []
+    rest = word
+    while rest:
+        total = token_counter.count(rest)
+        if total <= budget:
+            pieces.append((rest, total))
+            break
+        length = max(1, len(rest) * budget // total)
+        piece_tokens = token_counter.count(rest[:length])
+        while length > 1 and piece_tokens > budget:
+            length = max(1, length * budget // max(piece_tokens, 1) - 1)
+            piece_tokens = token_counter.count(rest[:length])
+        pieces.append((rest[:length], piece_tokens))
+        rest = rest[length:]
+    return pieces
+
+
+class _ThirdsCounter:
+    """A subword-like counter: a token per three characters, and counts what it read."""
+
+    def __init__(self) -> None:
+        self.read = 0
+
+    def count(self, text: str) -> int:
+        self.read += len(text)
+        return -(-len(text) // 3)
+
+
+def test_long_words_within_the_window_split_exactly_as_before() -> None:
+    import base64
+    import random
+
+    from api.chunking import _SPLIT_WINDOW_CHARS_PER_TOKEN, _split_long_word
+
+    generator = random.Random(14)
+    for budget in (5, 32, 250):
+        for _ in range(30):
+            size = generator.randint(budget, budget * _SPLIT_WINDOW_CHARS_PER_TOKEN)
+            word = base64.b64encode(generator.randbytes(size))[:size].decode()
+            for counter in (HeuristicTokenCounter(), _ThirdsCounter()):
+                assert _split_long_word(word, budget, counter) == _split_long_word_before(
+                    word, budget, counter
+                )
+
+
+def test_a_multi_megabyte_run_is_split_in_linear_time() -> None:
+    import base64
+    import random
+
+    from api.chunking import _split_long_word
+
+    class CountingHeuristic(HeuristicTokenCounter):
+        def __init__(self) -> None:
+            self.read = 0
+
+        def count(self, text: str) -> int:
+            self.read += len(text)
+            return super().count(text)
+
+    word = base64.b64encode(random.Random(1).randbytes(4_000_000)).decode()  # ~5.3 MB
+    # The work is bounded, not timed (a timed test fails on a loaded machine): the
+    # whole remainder used to be re-read for every piece — thousands of times the
+    # input, where now each piece reads at most a few windows.
+    for counter in (_ThirdsCounter(), CountingHeuristic()):
+        pieces = _split_long_word(word, 250, counter)
+        assert "".join(piece for piece, _ in pieces) == word
+        assert all(tokens <= 250 for _, tokens in pieces)
+        assert counter.read < 100 * len(word)

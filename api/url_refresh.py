@@ -12,21 +12,26 @@ When each document was last checked, and how, is kept by a ``RefreshStateStore``
 (api/url_refresh_state.py): in memory, or in URL_REFRESH_STATE_PATH to survive a
 restart. A document never checked counts as checked when it was last indexed. A
 document can set its own interval (``refresh_minutes``; 0 = never), and a failing
-one waits twice as long after each failure, up to a day.
+one waits twice as long after each failure, up to a day. A changed page whose new
+version can't be indexed (its job fails as a document error) counts as a failure too:
+otherwise it was downloaded and parsed again at every interval, each time adding a
+failed job.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import logging
-import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from api.audit import audit
-from api.ingest_jobs import IngestQueue, enqueue_refreshed, indexing_now
-from api.jobs import JobStore
+from api.background import BackgroundLoop, OwnedJobs
+from api.document_names import indexing_now
+from api.document_ops import enqueue_refreshed
+from api.ingest_jobs import IngestQueue
+from api.jobs import IngestJob
 from api.metrics import url_refresh_total
 from api.qdrant_schema import CollectionSchemaError
 from api.raw_documents import RawDocumentStore
@@ -41,7 +46,6 @@ logger = logging.getLogger(__name__)
 URL_REFRESH_PASS_SECONDS = 60.0
 # The longest a failing document waits between checks (unless its interval is longer).
 MAX_BACKOFF_SECONDS = 86_400.0
-_ACTIVE_STATES = frozenset({"queued", "parsing", "embedding"})
 
 Fetch = Callable[..., FetchedDocument]
 
@@ -84,7 +88,7 @@ class RefreshTarget:
     queue: IngestQueue
 
 
-class UrlRefresher:
+class UrlRefresher(BackgroundLoop):
     """The background loop; ``run_once`` is one pass (tests call it directly)."""
 
     def __init__(
@@ -104,39 +108,42 @@ class UrlRefresher:
         self._targets = targets
         self._fetch = fetch
         self._clock = clock
-        self._interval = interval
+        super().__init__(
+            "docrag-url-refresh",
+            interval,
+            "Background URL refresh pass failed.",
+            logger,
+            first_pass_delayed=True,
+        )
         self._state: RefreshStateStore = state if state is not None else MemoryRefreshStateStore()
-        # (job store, job id) of the refreshes it queued, until they finish.
-        self._jobs: set[tuple[JobStore, str]] = set()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        # The refreshes it queued, until they finish, with what to record when one
+        # fails: (collection, filename, metadata).
+        self._jobs: OwnedJobs[tuple[str, str, DocumentMetadata]] = OwnedJobs()
 
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="docrag-url-refresh", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval):
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - one failed pass must not end the loop
-                logger.exception("Background URL refresh pass failed.")
+    def run_pass(self) -> dict[str, int]:
+        return self.run_once()
 
     def _running(self) -> int:
-        """How many of the jobs this refresher queued are still queued or running."""
+        """How many of the jobs this refresher queued are still queued or running; one
+        that failed as a document error is recorded as a failed check."""
 
-        running = set()
-        for job_store, job_id in self._jobs:
-            job = job_store.get(job_id)
-            if job is not None and job.state in _ACTIVE_STATES:
-                running.add((job_store, job_id))
-        self._jobs = running
-        return len(running)
+        def finished(queued: tuple[str, str, DocumentMetadata], job: IngestJob) -> None:
+            if job.state == "failed" and job.error_type == "document":
+                self._record_failed_job(*queued)
+
+        return self._jobs.running(finished)
+
+    def _record_failed_job(self, collection: str, name: str, meta: DocumentMetadata) -> None:
+        previous = self._state.get_all(collection).get(name)
+        if previous is None:
+            return  # forgotten since (the document is gone)
+        checked = RefreshState(previous.last_checked, "failed", previous.failures + 1, 0.0)
+        self._state.record(
+            collection,
+            name,
+            dataclasses.replace(checked, next_due=refresh_due(meta, checked, self._every) or 0.0),
+        )
+        url_refresh_total.labels(outcome="failed").inc()
 
     def run_once(self) -> dict[str, int]:
         """Check what is due in every workspace, earliest due first; how many of each
@@ -235,7 +242,11 @@ class UrlRefresher:
         except Exception as exc:  # noqa: BLE001 - a full backlog, a closing workspace
             logger.warning("Scheduled refresh of %s could not be queued: %s", name, exc)
             return "deferred"
-        self._jobs.add((target.queue.job_store, accepted.job_id))
+        self._jobs.add(
+            target.queue.job_store,
+            accepted.job_id,
+            (target.settings.qdrant_collection, name, meta),
+        )
         audit(
             "document.refresh",
             workspace=workspace_of(target.settings),

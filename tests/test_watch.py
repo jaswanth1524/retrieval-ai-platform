@@ -623,3 +623,71 @@ def test_an_excluded_file_is_never_deleted(tmp_path: Path) -> None:
     (tmp_path / "tool.py").unlink()
     folder.scan_once()
     assert "tool.py" in recorder.indexed and recorder.deleted == []
+
+
+def test_a_file_deleted_while_the_api_was_down_is_deleted_after_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import api.main as main
+
+    clear_dependency_caches()
+    folder = tmp_path / "watched"
+    write(folder / "guide.txt", "Intro\nAlpha is first.", mtime=time.time() - 60)
+    write(folder / "keep.txt", "Intro\nKeep me.", mtime=time.time() - 60)
+    settings = make_settings(
+        watch_dir=str(folder), watch_interval_seconds=2, watch_delete_missing=True
+    )
+    qdrant = QdrantClient(":memory:")
+    monkeypatch.setattr(main, "get_qdrant_client", lambda: qdrant)
+    monkeypatch.setattr(main, "get_embedding_provider", lambda: FakeEmbeddingProvider())
+    monkeypatch.setattr(main, "get_token_counter", lambda: HeuristicTokenCounter())
+    monkeypatch.setattr(main, "get_raw_document_store", lambda: None)
+    repository = VectorRepository(qdrant)
+
+    def indexed() -> dict[str, object]:
+        for _ in range(20):
+            try:
+                return {
+                    name: meta.watched_from
+                    for name, meta in repository.filename_metadata(settings).items()
+                }
+            except IndexError:  # the local client racing the watcher thread
+                time.sleep(0.05)
+        raise AssertionError("the local Qdrant read kept racing the watcher")
+
+    running = main.start_folder_watcher(settings)
+    try:
+        wait_until(lambda: sorted(indexed()) == ["guide.txt", "keep.txt"], timeout=20)
+    finally:
+        running.stop()
+    # Each document says which folder it is kept in step with.
+    assert set(indexed().values()) == {str(folder.resolve())}
+
+    (folder / "guide.txt").unlink()  # while "the API is down"
+    restarted = main.start_folder_watcher(settings)
+    try:
+        wait_until(lambda: sorted(indexed()) == ["keep.txt"], timeout=20)
+    finally:
+        restarted.stop()
+        clear_dependency_caches()
+
+
+def test_documents_owned_from_an_earlier_run_follow_the_stand_down_rules(
+    tmp_path: Path,
+) -> None:
+    recorder = Recorder({"old.txt": 1.0, "uploaded.txt": 1.0})
+    settings = make_settings(watch_dir=str(tmp_path), watch_delete_missing=True)
+    folder = FolderWatcher(
+        settings,
+        lambda: dict(recorder.indexed),
+        recorder.enqueue,
+        recorder.delete,
+        list_owned=lambda: {"old.txt"} & set(recorder.indexed),
+    )
+
+    # An empty folder (a dropped mount?) deletes nothing, owned or not.
+    assert folder.scan_once()["deleted"] == []
+    write(tmp_path / "a.txt", "A")
+    # Once it lists files: only what this folder indexed goes, never an upload.
+    assert folder.scan_once()["deleted"] == ["old.txt"]
+    assert recorder.deleted == ["old.txt"]

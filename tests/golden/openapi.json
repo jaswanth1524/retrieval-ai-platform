@@ -291,9 +291,30 @@
       "title": "Chunks Ingested",
       "type": "integer"
      },
+     "chunks_removed": {
+      "default": 0,
+      "title": "Chunks Removed",
+      "type": "integer"
+     },
+     "chunks_reused": {
+      "default": 0,
+      "title": "Chunks Reused",
+      "type": "integer"
+     },
      "collection_name": {
       "title": "Collection Name",
       "type": "string"
+     },
+     "duplicate_of": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Duplicate Of"
      },
      "filename": {
       "title": "Filename",
@@ -471,6 +492,17 @@
       "default": {},
       "title": "Chunk Counts",
       "type": "object"
+     },
+     "duplicate_groups": {
+      "default": [],
+      "items": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "title": "Duplicate Groups",
+      "type": "array"
      },
      "filenames": {
       "items": {
@@ -1076,6 +1108,11 @@
       },
       "title": "Skipped",
       "type": "array"
+     },
+     "versions_restored": {
+      "default": 0,
+      "title": "Versions Restored",
+      "type": "integer"
      }
     },
     "required": [
@@ -1369,6 +1406,14 @@
       "title": "Created At",
       "type": "number"
      },
+     "filenames": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Filenames",
+      "type": "array"
+     },
      "mode": {
       "title": "Mode",
       "type": "string"
@@ -1427,6 +1472,89 @@
      "queries"
     ],
     "title": "QueryLogResponse",
+    "type": "object"
+   },
+   "QueryRecheckItemResponse": {
+    "properties": {
+     "covered_now": {
+      "title": "Covered Now",
+      "type": "boolean"
+     },
+     "question": {
+      "title": "Question",
+      "type": "string"
+     },
+     "status": {
+      "title": "Status",
+      "type": "string"
+     },
+     "top_chunk_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Chunk Id"
+     },
+     "top_filename": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Filename"
+     },
+     "top_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Score"
+     }
+    },
+    "required": [
+     "question",
+     "status",
+     "covered_now"
+    ],
+    "title": "QueryRecheckItemResponse",
+    "type": "object"
+   },
+   "QueryRecheckResponse": {
+    "description": "POST /query-log/recheck: the latest questions that went unanswered, searched\nagain (retrieval only, no LLM call) against the documents as they are now.",
+    "properties": {
+     "checked": {
+      "title": "Checked",
+      "type": "integer"
+     },
+     "covered_now": {
+      "title": "Covered Now",
+      "type": "integer"
+     },
+     "items": {
+      "items": {
+       "$ref": "#/components/schemas/QueryRecheckItemResponse"
+      },
+      "title": "Items",
+      "type": "array"
+     }
+    },
+    "required": [
+     "checked",
+     "covered_now",
+     "items"
+    ],
+    "title": "QueryRecheckResponse",
     "type": "object"
    },
    "QuestionRequest": {
@@ -1744,6 +1872,11 @@
       "title": "Followups",
       "type": "array"
      },
+     "passages_left_out": {
+      "default": 0,
+      "title": "Passages Left Out",
+      "type": "integer"
+     },
      "sources": {
       "items": {
        "$ref": "#/components/schemas/CitationResponse"
@@ -1809,6 +1942,75 @@
      "sources"
     ],
     "title": "QuestionResponse",
+    "type": "object"
+   },
+   "ScoreReportResponse": {
+    "description": "GET /traces/score-report: the best rerank score of each traced question, for\nquestions answered against questions not answered, and a suggested\nRERANK_MIN_SCORE when there are enough of both.",
+    "properties": {
+     "answered": {
+      "items": {
+       "type": "integer"
+      },
+      "title": "Answered",
+      "type": "array"
+     },
+     "answered_count": {
+      "title": "Answered Count",
+      "type": "integer"
+     },
+     "bin_edges": {
+      "items": {
+       "type": "number"
+      },
+      "title": "Bin Edges",
+      "type": "array"
+     },
+     "current_min_score": {
+      "title": "Current Min Score",
+      "type": "number"
+     },
+     "note": {
+      "title": "Note",
+      "type": "string"
+     },
+     "suggested_min_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Suggested Min Score"
+     },
+     "unanswered": {
+      "items": {
+       "type": "integer"
+      },
+      "title": "Unanswered",
+      "type": "array"
+     },
+     "unanswered_count": {
+      "title": "Unanswered Count",
+      "type": "integer"
+     },
+     "would_change": {
+      "default": 0,
+      "title": "Would Change",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "current_min_score",
+     "bin_edges",
+     "answered",
+     "unanswered",
+     "answered_count",
+     "unanswered_count",
+     "note"
+    ],
+    "title": "ScoreReportResponse",
     "type": "object"
    },
    "SearchRequest": {
@@ -2249,6 +2451,11 @@
       "title": "Followups",
       "type": "array"
      },
+     "passages_left_out": {
+      "default": 0,
+      "title": "Passages Left Out",
+      "type": "integer"
+     },
      "sources": {
       "items": {
        "$ref": "#/components/schemas/CitationResponse"
@@ -2378,6 +2585,110 @@
      "total_ms"
     ],
     "title": "TimingsResponse",
+    "type": "object"
+   },
+   "TraceCandidateChangeResponse": {
+    "properties": {
+     "chunk_id": {
+      "title": "Chunk Id",
+      "type": "string"
+     },
+     "drop_reason_a": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Drop Reason A"
+     },
+     "drop_reason_b": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Drop Reason B"
+     },
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "page": {
+      "title": "Page",
+      "type": "integer"
+     },
+     "point_id": {
+      "title": "Point Id",
+      "type": "string"
+     },
+     "rank_a": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rank A"
+     },
+     "rank_b": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rank B"
+     },
+     "score_a": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Score A"
+     },
+     "score_b": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Score B"
+     },
+     "selected_a": {
+      "default": false,
+      "title": "Selected A",
+      "type": "boolean"
+     },
+     "selected_b": {
+      "default": false,
+      "title": "Selected B",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "point_id",
+     "filename",
+     "page",
+     "chunk_id"
+    ],
+    "title": "TraceCandidateChangeResponse",
     "type": "object"
    },
    "TraceCandidateResponse": {
@@ -2812,6 +3123,46 @@
     "title": "TraceDetailResponse",
     "type": "object"
    },
+   "TraceDiffResponse": {
+    "description": "GET /traces/{a}/diff/{b}: the settings that differ and the candidates whose\nrank, selection or drop reason moved between two traces.",
+    "properties": {
+     "candidates": {
+      "items": {
+       "$ref": "#/components/schemas/TraceCandidateChangeResponse"
+      },
+      "title": "Candidates",
+      "type": "array"
+     },
+     "question_a": {
+      "title": "Question A",
+      "type": "string"
+     },
+     "question_b": {
+      "title": "Question B",
+      "type": "string"
+     },
+     "same_answer": {
+      "title": "Same Answer",
+      "type": "boolean"
+     },
+     "settings": {
+      "items": {
+       "$ref": "#/components/schemas/TraceSettingChangeResponse"
+      },
+      "title": "Settings",
+      "type": "array"
+     }
+    },
+    "required": [
+     "question_a",
+     "question_b",
+     "same_answer",
+     "settings",
+     "candidates"
+    ],
+    "title": "TraceDiffResponse",
+    "type": "object"
+   },
    "TraceListResponse": {
     "description": "Recent query traces, newest first.",
     "properties": {
@@ -2827,6 +3178,25 @@
      "traces"
     ],
     "title": "TraceListResponse",
+    "type": "object"
+   },
+   "TraceSettingChangeResponse": {
+    "properties": {
+     "a": {
+      "title": "A"
+     },
+     "b": {
+      "title": "B"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "title": "TraceSettingChangeResponse",
     "type": "object"
    },
    "TraceSummaryResponse": {
@@ -4358,6 +4728,9 @@
      "404": {
       "description": "No such document, it wasn't fetched by URL, or URL ingest is off."
      },
+     "409": {
+      "description": "The document is being indexed."
+     },
      "422": {
       "content": {
        "application/json": {
@@ -4770,6 +5143,18 @@
     "operationId": "export_corpus_export_get",
     "parameters": [
      {
+      "description": "Also include each document's kept earlier originals (RAW_DOCUMENT_VERSIONS), which an import puts back.",
+      "in": "query",
+      "name": "include_versions",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "Also include each document's kept earlier originals (RAW_DOCUMENT_VERSIONS), which an import puts back.",
+       "title": "Include Versions",
+       "type": "boolean"
+      }
+     },
+     {
       "in": "header",
       "name": "X-API-Key",
       "required": false,
@@ -5146,6 +5531,23 @@
       }
      },
      {
+      "in": "query",
+      "name": "filename",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Filename"
+      }
+     },
+     {
       "in": "header",
       "name": "X-API-Key",
       "required": false,
@@ -5204,6 +5606,89 @@
      }
     },
     "summary": "List Query Log"
+   }
+  },
+  "/query-log/recheck": {
+   "post": {
+    "operationId": "recheck_query_log_query_log_recheck_post",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 20,
+       "maximum": 100,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/QueryRecheckResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "The query log is off (QUERY_LOG_ENABLED)."
+     },
+     "409": {
+      "description": "A re-check is already running."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     },
+     "429": {
+      "description": "Every question slot is busy."
+     }
+    },
+    "summary": "Recheck Query Log"
    }
   },
   "/questions": {
@@ -5708,6 +6193,68 @@
     "summary": "Export Traces"
    }
   },
+  "/traces/score-report": {
+   "get": {
+    "operationId": "trace_score_report_traces_score_report_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ScoreReportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Trace Score Report"
+   }
+  },
   "/traces/{trace_id}": {
    "get": {
     "operationId": "get_trace_traces__trace_id__get",
@@ -5777,6 +6324,86 @@
      }
     },
     "summary": "Get Trace"
+   }
+  },
+  "/traces/{trace_id}/diff/{other_id}": {
+   "get": {
+    "operationId": "diff_traces_traces__trace_id__diff__other_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "trace_id",
+      "required": true,
+      "schema": {
+       "title": "Trace Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "other_id",
+      "required": true,
+      "schema": {
+       "title": "Other Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TraceDiffResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Diff Traces"
    }
   },
   "/watch": {

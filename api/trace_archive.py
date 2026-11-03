@@ -140,6 +140,12 @@ class TraceArchive:
             row = conn.execute("SELECT body FROM traces WHERE trace_id = ?", (trace_id,)).fetchone()
         return trace_from_json(row[0]) if row is not None else None
 
+    def delete_workspace(self, workspace: str) -> int:
+        """Remove every archived trace of ``workspace`` (deleted)."""
+
+        with self._lock, self._connect() as conn:
+            return conn.execute("DELETE FROM traces WHERE workspace = ?", (workspace,)).rowcount
+
     def recent(self, workspace: str | None, limit: int) -> list[QueryTrace]:
         """The newest ``limit`` traces (only ``workspace``'s when given), newest first."""
 

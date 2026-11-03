@@ -5,23 +5,32 @@ chunk settings, every document is "older chunking" until someone clicks re-index
 and then again for whatever the full backlog deferred. With this on, a background pass
 every ``interval`` seconds queues the stale documents of the default workspace and every
 other one through the same path as ``POST /documents/reindex``
-(``ingest_jobs.reindex_stale``), keeping at most ``AUTO_REINDEX_BATCH`` of its own jobs
+(``document_ops.reindex_stale``), keeping at most ``AUTO_REINDEX_BATCH`` of its own jobs
 queued or running so uploads still get through. It needs the stored originals
 (RAW_DOCUMENT_DIR).
 
 A workspace whose index was built for another embedding setup is skipped (re-indexing
 can't write to it); one being deleted refuses the jobs, which the next pass retries.
+
+A document whose re-index failed isn't queued again at once: the pass walks the stale
+documents in name order, so the first few failing for good (an original that no longer
+parses) took every place in the batch, pass after pass, and the rest never ran. One the
+file itself failed ("document" error) waits until its original changes; any other
+failure is retried after a backoff (``FAILURE_BACKOFF_SECONDS`` doubling, at most
+``MAX_FAILURE_BACKOFF_SECONDS``), or at once when the original changes.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from api.audit import audit
-from api.ingest_jobs import IngestQueue, reindex_stale
+from api.background import BackgroundLoop, OwnedJobs
+from api.document_ops import reindex_stale
+from api.ingest_jobs import IngestQueue
 from api.jobs import JobStore
 from api.metrics import stale_documents
 from api.qdrant_schema import CollectionSchemaError
@@ -33,7 +42,24 @@ from api.workspaces import workspace_of
 logger = logging.getLogger(__name__)
 
 AUTO_REINDEX_INTERVAL_SECONDS = 60.0
-_ACTIVE_STATES = frozenset({"queued", "parsing", "embedding"})
+FAILURE_BACKOFF_SECONDS = 3600.0
+MAX_FAILURE_BACKOFF_SECONDS = 86400.0
+
+
+@dataclass(frozen=True)
+class _QueuedJob:
+    workspace: str
+    filename: str
+    # The original's (size, mtime) when queued: a failure counts against that file only.
+    original: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class _Failure:
+    original: tuple[int, int] | None
+    failures: int
+    # Retry no sooner than this (time.monotonic); None = not until the original changes.
+    retry_at: float | None
 
 
 @dataclass(frozen=True)
@@ -45,7 +71,7 @@ class ReindexTarget:
     queue: IngestQueue
 
 
-class StaleReindexer:
+class StaleReindexer(BackgroundLoop):
     """The background loop; ``run_once`` is one pass (tests call it directly)."""
 
     def __init__(
@@ -57,28 +83,22 @@ class StaleReindexer:
         token_counter: object,
         *,
         interval: float = AUTO_REINDEX_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._batch = int(settings.auto_reindex_batch)
         self._repository = repository
         self._targets = targets
         self._job_store = job_store
         self._token_counter = token_counter
-        self._interval = interval
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._jobs: set[str] = set()
+        super().__init__(
+            "docrag-auto-reindex", interval, "Background re-index pass failed.", logger
+        )
+        self._clock = clock
+        self._jobs: OwnedJobs[_QueuedJob] = OwnedJobs()
+        self._failures: dict[tuple[str, str], _Failure] = {}
         self._skipped: set[str] = set()
 
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="docrag-auto-reindex", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
+    def before_first_pass(self) -> None:
         # Staleness compares each point's token counter with the one in use now; asked
         # before the tokenizer has loaded, every HF-counted document could look stale.
         count = getattr(self._token_counter, "count", None)
@@ -87,22 +107,56 @@ class StaleReindexer:
                 count("warmup")
             except Exception:  # noqa: BLE001 - the counter falls back on its own
                 logger.debug("Token counter warmup failed.", exc_info=True)
-        while not self._stop.is_set():
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - one failed pass must not end the loop
-                logger.exception("Background re-index pass failed.")
-            if self._stop.wait(self._interval):
-                return
+
+    def run_pass(self) -> int:
+        return self.run_once()
 
     def _running(self) -> int:
-        running = set()
-        for job_id in self._jobs:
-            job = self._job_store.get(job_id)
-            if job is not None and job.state in _ACTIVE_STATES:
-                running.add(job_id)
-        self._jobs = running
-        return len(running)
+        """How many of its own jobs are still queued or running, noting how the
+        finished ones ended."""
+
+        return self._jobs.running(
+            lambda queued, job: self._note_outcome(queued, job.state, job.error_type, job.error)
+        )
+
+    def _note_outcome(
+        self, queued: _QueuedJob, state: str, error_type: str | None, error: str | None
+    ) -> None:
+        key = (queued.workspace, queued.filename)
+        if state != "failed" or error_type == "cancelled":
+            self._failures.pop(key, None)
+            return
+        previous = self._failures.get(key)
+        failures = (
+            1
+            if previous is None or previous.original != queued.original
+            else (previous.failures + 1)
+        )
+        if error_type == "document":
+            retry_at = None
+            logger.warning(
+                "Not re-indexing %r (workspace %r) again until its original changes: %s",
+                queued.filename,
+                queued.workspace or "default",
+                error,
+            )
+        else:
+            delay = min(FAILURE_BACKOFF_SECONDS * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_SECONDS)
+            retry_at = self._clock() + delay
+        self._failures[key] = _Failure(queued.original, failures, retry_at)
+
+    def _held_back(self, workspace: str, raw_store: RawDocumentStore) -> Callable[[str], bool]:
+        def skip(filename: str) -> bool:
+            failure = self._failures.get((workspace, filename))
+            if failure is None:
+                return False
+            if raw_store.identity(filename) != failure.original:
+                # A new original: whatever failed before may work now.
+                del self._failures[(workspace, filename)]
+                return False
+            return failure.retry_at is None or self._clock() < failure.retry_at
+
+        return skip
 
     def run_once(self) -> int:
         """Queue what fits of every workspace's stale documents; the jobs queued."""
@@ -122,6 +176,7 @@ class StaleReindexer:
                     target.raw_store,
                     self._token_counter,
                     limit=max(room, 0),
+                    skip=self._held_back(workspace_of(target.settings), target.raw_store),
                 )
             except CollectionSchemaError as exc:
                 if name not in self._skipped:
@@ -134,8 +189,18 @@ class StaleReindexer:
                 + len(outcome.deferred)
                 + len(outcome.in_progress)
                 + len(outcome.failed)
+                + len(outcome.skipped)
             )
-            self._jobs.update(job.job_id for job in outcome.jobs)
+            for job in outcome.jobs:
+                self._jobs.add(
+                    self._job_store,
+                    job.job_id,
+                    _QueuedJob(
+                        workspace_of(target.settings),
+                        job.filename,
+                        target.raw_store.identity(job.filename),
+                    ),
+                )
             queued += len(outcome.jobs)
             for job in outcome.jobs:
                 audit(

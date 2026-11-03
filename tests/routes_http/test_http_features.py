@@ -927,7 +927,7 @@ def test_a_preview_shows_how_a_file_would_be_indexed_without_indexing_it(
     empty = client.post("/documents/preview", files={"file": ("empty.txt", b"   ")})
     assert empty.status_code == 400
 
-    import api.routes.documents as routes
+    import api.routes.documents_write as routes
 
     taken = [
         routes._preview_slots.acquire(blocking=False) for _ in range(routes.PREVIEW_MAX_CONCURRENT)

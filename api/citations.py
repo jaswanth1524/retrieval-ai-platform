@@ -24,8 +24,8 @@ from api.prompting import (
     CHARS_PER_TOKEN_ESTIMATE,
     clip_text,
     clip_to_weight,
+    effective_prompt_budget,
     estimate_prompt_tokens,
-    prompt_token_budget,
 )
 from api.reranking import RerankedChunk
 from api.settings import AppSettings
@@ -743,7 +743,8 @@ _MIN_RETRY_ANSWER_TOKENS = 64
 def retry_messages(
     prompt_messages: Sequence[ChatMessage], first_answer: str, settings: AppSettings
 ) -> list[ChatMessage] | None:
-    """The retry's continuation of the grounded prompt, fitted to the context window.
+    """The retry's continuation of the grounded prompt, fitted to the context window
+    and PROMPT_TOKEN_BUDGET (``effective_prompt_budget``), as the first prompt was.
 
     The prompt was fitted with room for one answer; the retry adds that answer and a
     reminder on top, which could run past the window, and a local model then silently
@@ -761,7 +762,7 @@ def retry_messages(
         ]
 
     messages = build(prompt_messages, first_answer)
-    budget = prompt_token_budget(settings)
+    budget = effective_prompt_budget(settings)
     if budget is None or estimate_prompt_tokens(messages) <= budget:
         return messages
     head = (

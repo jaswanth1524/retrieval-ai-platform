@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import shutil
+from collections.abc import Callable
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -16,17 +18,25 @@ from api.corpus import bump_corpus_generation
 from api.dependencies import (
     clear_workspace_raw_stores,
     get_app_settings,
+    get_feedback_store,
+    get_ingest_job_store,
+    get_query_log_store,
+    get_trace_store,
     require_api_key,
     require_full_key,
 )
+from api.feedback import FeedbackStore
 from api.ingestion import ingest_sequencer
+from api.jobs import JobStore
 from api.metrics import forget_workspace_metrics
 from api.qdrant_schema import forget_collection
+from api.query_log import QueryLogStore
 from api.raw_documents import VERSIONS_DIR, is_temp_file_name
 from api.repository import forget_metadata
 from api.routes.deps import QdrantClientDep, VectorRepositoryDep
 from api.schemas import WorkspaceCreateRequest, WorkspaceListResponse, WorkspaceResponse
 from api.settings import AppSettings
+from api.tracing import TraceStore
 from api.workspaces import (
     MAX_WORKSPACES,
     WorkspaceError,
@@ -37,6 +47,8 @@ from api.workspaces import (
     validate_name,
     workspace_exists,
 )
+
+logger = logging.getLogger(__name__)
 
 # The app's own settings, never a workspace's: these routes manage workspaces by name.
 BaseSettingsDep = Annotated[AppSettings, Depends(get_app_settings)]
@@ -100,6 +112,35 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
     clear_workspace_raw_stores()
 
 
+def _forget_rows(
+    name: str,
+    feedback: FeedbackStore | None,
+    query_log: QueryLogStore | None,
+    traces: TraceStore,
+    jobs: JobStore,
+) -> dict[str, int]:
+    """Remove a deleted workspace's rows from every store keyed by workspace, so one
+    created again under its name starts empty (its ratings, asked questions, traces and
+    job history would otherwise come back, and its next backup would carry the
+    feedback). Best effort: the workspace is already gone, so a failure is logged."""
+
+    removed: dict[str, int] = {}
+    stores: list[tuple[str, Callable[[str], int] | None]] = [
+        ("feedback", feedback.delete_workspace if feedback is not None else None),
+        ("queries", query_log.delete_workspace if query_log is not None else None),
+        ("traces", traces.delete_workspace),
+        ("jobs", jobs.delete_finished),
+    ]
+    for label, delete in stores:
+        if delete is None:
+            continue
+        try:
+            removed[label] = delete(name)
+        except Exception:  # noqa: BLE001 - one store's failure must not hide the others
+            logger.exception("Could not remove workspace %r's %s.", name, label)
+    return removed
+
+
 def register(app: FastAPI) -> None:
     """Register the workspace routes."""
 
@@ -152,7 +193,13 @@ def register(app: FastAPI) -> None:
         responses={409: {"description": "The workspace still holds documents or originals."}},
     )
     def delete_workspace(
-        name: str, settings: BaseSettingsDep, client: QdrantClientDep
+        name: str,
+        settings: BaseSettingsDep,
+        client: QdrantClientDep,
+        feedback: Annotated[FeedbackStore | None, Depends(get_feedback_store)],
+        query_log: Annotated[QueryLogStore | None, Depends(get_query_log_store)],
+        traces: Annotated[TraceStore, Depends(get_trace_store)],
+        jobs: Annotated[JobStore, Depends(get_ingest_job_store)],
     ) -> WorkspaceResponse:
         _require_enabled(settings)
         name = _name(name)
@@ -187,5 +234,6 @@ def register(app: FastAPI) -> None:
         finally:
             ingest_sequencer.reopen(group)
         forget_workspace_metrics(name)
-        audit("workspace.delete", workspace=name)
+        removed = _forget_rows(name, feedback, query_log, traces, jobs)
+        audit("workspace.delete", workspace=name, **{f"{k}_removed": v for k, v in removed.items()})
         return WorkspaceResponse(name=name)

@@ -26,7 +26,7 @@ from api.summarize import (
     task_description,
 )
 from api.tracing import QueryTrace
-from tests.factories import make_test_settings
+from tests.factories import make_test_settings, wait_until
 
 
 def _payload(filename: str, ordinal: int, text: str, page: int = 1) -> dict[str, object]:
@@ -751,3 +751,114 @@ def test_an_identical_summary_waits_for_the_running_one() -> None:
     done = next(event for event in rest if event["type"] == "done")
     assert done["cached"] is True and done["chunks_read"] == 1
     assert len(generator.calls) == 1
+
+
+def test_openai_compatible_parts_run_one_at_a_time_too() -> None:
+    generator = SlowNotes()
+    settings = _settings(
+        llm_provider="openai_compatible",
+        openai_compatible_base_url="http://127.0.0.1:8080/v1",
+        openai_compatible_model="local",
+        summary_batch_chars=3000,
+        summary_parallel_parts=4,
+    )
+    request = SummaryRequest(mode="summarize", filenames=("long.txt",))
+    list(_summarizer(_long_document(3), generator, settings).summarize_stream(request))
+    assert generator.peak == 1
+
+
+class BlockedNotes(ScriptedGenerator):
+    """Parts that hang until released, counting how many were started."""
+
+    def __init__(self) -> None:
+        super().__init__(answer="All of it [1].")
+        self.release = threading.Event()
+        self.started = 0
+        self.lock = threading.Lock()
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        if "Excerpts from" not in messages[-1]["content"]:
+            return super().complete(messages, settings)
+        with self.lock:
+            self.started += 1
+        self.release.wait(10)
+        return "Notes [1]."
+
+
+def test_a_reader_leaving_a_parallel_summary_frees_it_without_waiting_for_the_parts() -> None:
+    generator = BlockedNotes()
+    settings = _settings(
+        llm_provider="openai",
+        openai_api_key="k",
+        summary_batch_chars=3000,
+        summary_parallel_parts=2,
+    )
+    traces = Traces()
+    summarizer = _summarizer(_long_document(4), generator, settings, trace_store=traces)
+    left = threading.Event()
+    finished = threading.Event()
+
+    def read() -> None:
+        for _ in summarizer.summarize_stream(
+            SummaryRequest(mode="summarize", filenames=("long.txt",)), should_stop=left.is_set
+        ):
+            pass
+        finished.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        wait_until(lambda: generator.started == 2)  # two parts running, two waiting
+        left.set()
+        # Ended while both running parts are still blocked in their calls.
+        assert finished.wait(5)  # while the running parts stay blocked (10 s)
+        assert traces.traces[-1].error == "Stream closed before completion."
+    finally:
+        generator.release.set()
+        reader.join(5)
+    time.sleep(0.2)
+    assert generator.started == 2  # the parts not started never were
+
+
+def test_a_summary_with_an_unconfigured_provider_leaves_an_error_trace() -> None:
+    from api.answer_cache import AnswerCache
+    from api.llm import GenerationConfigError, completion_model_and_kwargs
+
+    class Configured(ScriptedGenerator):
+        """Checks its provider's configuration first, as LiteLLMGenerator does."""
+
+        def _reply(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+            completion_model_and_kwargs(settings)
+            return super()._reply(messages, settings)
+
+    repository = FakeRepository({"a.txt": [_payload("a.txt", 1, "Alpha.")]})
+    traces = Traces()
+    summarizer = _summarizer(
+        repository,
+        Configured(),
+        _settings(llm_provider="openai", openai_api_key=""),
+        trace_store=traces,
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=600),
+    )
+
+    try:
+        events = list(
+            summarizer.summarize_stream(SummaryRequest(mode="summarize", filenames=("a.txt",)))
+        )
+    except GenerationConfigError:
+        events = []
+
+    assert not any(event["type"] == "done" for event in events)
+    # Failing while the cache key was built left no trace of the request at all.
+    assert traces.traces and traces.traces[-1].status == "error"
+    assert "OPENAI_API_KEY" in (traces.traces[-1].error or "")
+
+
+def test_sources_are_numbered_once_across_documents_and_parts() -> None:
+    from api.summarize import number_sources
+
+    a1, a2, b1 = _chunk(1, 10), _chunk(2, 10), _chunk(3, 10)
+    selected, numbered = number_sources([("a.txt", [[a1], [a2]]), ("b.txt", [[b1]])])
+
+    assert selected == [a1, a2, b1]
+    assert numbered == [("a.txt", [[(1, a1)], [(2, a2)]]), ("b.txt", [[(3, b1)]])]

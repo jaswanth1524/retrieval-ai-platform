@@ -119,7 +119,7 @@ def url_client(
     remote = Remote()
     settings = make_settings(url_ingest_enabled=True)
     monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
+        "api.routes.documents_write.fetch_document",
         functools.partial(
             fetch_document, resolve=resolver({}), transport=transport(remote.handler)
         ),
@@ -232,7 +232,7 @@ def _url_backup_client(
     raw = RawDocumentStore(str(tmp_path / name))
     settings = make_settings(url_ingest_enabled=True)
     monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
+        "api.routes.documents_write.fetch_document",
         functools.partial(
             fetch_document, resolve=resolver({}), transport=transport(remote.handler)
         ),
@@ -287,3 +287,19 @@ def test_a_url_document_can_be_tagged(url_client: tuple[TestClient, Remote]) -> 
         json={"url": "https://example.com/notes/beta.txt", "tags": [f"t{n}" for n in range(21)]},
     )
     assert too_many.status_code == 422
+
+
+def test_refresh_is_409_while_the_document_is_being_indexed(
+    url_client: tuple[TestClient, Remote], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, remote = url_client
+    accepted = client.post("/documents/from-url", json={"url": "https://example.com/alpha.txt"})
+    assert wait_for_job(client, accepted.json()["job_id"])["state"] == "done"
+    asked = len(remote.requests)
+    monkeypatch.setattr("api.routes.documents_write.indexing_now", lambda settings: {"alpha.txt"})
+
+    response = client.post("/documents/alpha.txt/refresh")
+
+    assert response.status_code == 409
+    assert "being indexed" in response.json()["detail"]
+    assert len(remote.requests) == asked  # nothing fetched

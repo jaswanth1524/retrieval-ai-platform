@@ -43,6 +43,9 @@ def test_document_upload_ingests_chunks(api_context: ApiTestContext) -> None:
         "chunks_ingested": 1,
         "collection_name": "api_documents",
         "unchanged": False,
+        "chunks_reused": 0,
+        "chunks_removed": 0,
+        "duplicate_of": None,
     }
     records, _ = api_context.qdrant.scroll(
         collection_name="api_documents",
@@ -229,7 +232,10 @@ def test_a_job_that_crashed_outside_its_own_handling_is_failed_not_left_running(
 
     from concurrent.futures import Future
 
-    from api.ingest_jobs import UNRECORDED_OUTCOME_ERROR, finish_ingest_future
+    from api.ingest_jobs import (
+        UNRECORDED_OUTCOME_ERROR,
+        finish_ingest_future,
+    )
     from api.jobs import IngestJobStore
 
     job_store = IngestJobStore(max_retained=10)
@@ -260,7 +266,7 @@ def test_an_upload_is_refused_before_it_is_read_when_the_backlog_is_full(
     async def must_not_read(*_: object, **__: object) -> bytes:
         raise AssertionError("the upload was read into memory")
 
-    monkeypatch.setattr("api.routes.documents.read_upload_within_limit", must_not_read)
+    monkeypatch.setattr("api.routes.documents_write.read_upload_within_limit", must_not_read)
     response = api_context.client.post(
         "/documents", files={"file": ("guide.txt", b"Intro\nalpha beta", "text/plain")}
     )
@@ -996,7 +1002,7 @@ def test_document_content_pages_around_a_chunk_or_by_ordinal_range(
 def test_unpaged_document_content_is_capped_but_reports_the_real_total(
     api_context: ApiTestContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("api.routes.documents.CONTENT_UNPAGED_MAX_CHUNKS", 3)
+    monkeypatch.setattr("api.routes.documents_read.CONTENT_UNPAGED_MAX_CHUNKS", 3)
     client = api_context.client
     body = "\n\n".join(
         f"Section {i}\n" + " ".join(f"word{i}x{j}" for j in range(30)) for i in range(8)
@@ -1114,7 +1120,7 @@ def test_reindex_all_keeps_going_past_an_original_deleted_or_a_job_that_fails_to
         real_enqueue = routes.enqueue_ingest
 
         def failing(**kwargs: object):  # type: ignore[no-untyped-def]
-            if kwargs["filename"] == "a.txt":
+            if kwargs["request"].filename == "a.txt":  # type: ignore[attr-defined]
                 raise RuntimeError("job store unavailable")
             return real_enqueue(**kwargs)  # type: ignore[arg-type]
 
@@ -1198,3 +1204,21 @@ def test_an_upload_can_be_tagged_and_bad_tags_are_refused_before_the_job(
     )
     assert refused.status_code == 400
     assert "other.txt" not in client.get("/documents").json()["filenames"]
+
+
+def test_an_orphaned_original_that_cannot_be_removed_is_a_named_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from api.raw_documents import RawDocumentStore
+
+    (tmp_path / "orphan.txt").write_bytes(b"leftover")
+
+    def locked(self: RawDocumentStore, filename: str) -> bool:
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(RawDocumentStore, "delete", locked)
+    with raw_storage_client(tmp_path, monkeypatch) as client:
+        response = client.delete("/documents/orphan.txt")
+
+    assert response.status_code == 500
+    assert "RAW_DOCUMENT_DIR is writable" in response.json()["detail"]

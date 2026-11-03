@@ -423,6 +423,17 @@ def clear_workspace_raw_stores() -> None:
     _workspace_raw_store.cache_clear()
 
 
+def raw_store_for(settings: AppSettings) -> RawDocumentStore | None:
+    """The originals store of ``settings``' workspace, outside a request (the background
+    workers): the app's own for the default workspace, the cached one for any other;
+    None when originals aren't kept."""
+
+    base = get_raw_document_store()
+    if base is None or not workspace_of(settings):
+        return base
+    return _workspace_raw_store(settings.raw_document_dir)
+
+
 def get_request_raw_store(
     base: Annotated[RawDocumentStore | None, Depends(get_raw_document_store)],
     settings: Annotated[AppSettings, Depends(get_request_settings)],

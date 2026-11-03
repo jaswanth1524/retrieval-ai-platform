@@ -228,3 +228,24 @@ def test_the_manifest_writes_a_fetched_documents_source_and_refresh_interval() -
         "source_refresh_minutes": 0,
     }
     assert _source_fields(DocumentMetadata(1, 1, 1, 1.0, 9)) == {}
+
+
+def test_json_nested_past_the_parsers_depth_is_a_bad_row_or_manifest_not_a_500() -> None:
+    deep = "[" * 100_000 + "]" * 100_000
+    lines = [_feedback_line(0), deep + "\n", _feedback_line(1)]
+    sink = FeedbackSink()
+
+    outcome = _restore(
+        _zip([], {"feedback.jsonl": "".join(lines).encode()}), Recorder(), feedback_store=sink
+    )
+
+    # The rows on both sides of the nested line are kept; nothing is listed as damaged.
+    assert [row.id for row in sink.rows] == ["row-0", "row-1"]
+    assert outcome.rejected == []
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("manifest.json", deep)
+    buffer.seek(0)
+    with pytest.raises(restore.BackupImportError, match="not a DocRAG backup manifest"):
+        _restore(buffer, Recorder())

@@ -119,9 +119,9 @@ def test_a_restored_version_of_a_fetched_document_can_still_be_refreshed(
             }
         )
 
-    import api.ingest_jobs as ingest_jobs
+    import api.document_ops as document_ops
 
-    real_source_of = ingest_jobs.source_of
+    real_source_of = document_ops.source_of
 
     def recording(meta: object, **options: bool) -> DocumentSource | None:
         found = real_source_of(meta, **options)  # type: ignore[arg-type]
@@ -130,7 +130,7 @@ def test_a_restored_version_of_a_fetched_document_can_still_be_refreshed(
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(VectorRepository, "document_metadata", with_source)
-        patch.setattr("api.routes.documents.source_of", recording)
+        patch.setattr("api.routes.documents_write.source_of", recording)
         restored = client.post(f"/documents/p.txt/versions/{version['version']}/restore")
         assert restored.status_code == 202
         assert wait_for_job(client, restored.json()["job_id"])["state"] == "done"
@@ -175,3 +175,49 @@ def test_a_failed_reindex_is_run_again_on_retry_and_a_restore_is_not(
     from api.request_guard import needs_full_key
 
     assert needs_full_key("POST", f"/documents/jobs/{job['job_id']}/retry")
+
+
+def test_a_backup_with_versions_puts_them_back_on_import(client: TestClient) -> None:
+    import io
+    import json
+    import zipfile
+
+    for text in (b"Intro\nfirst version", b"Intro\nsecond version", b"Intro\nthird version"):
+        assert upload_and_wait(client, "p.txt", text)["state"] == "done"
+    versions = [v["version"] for v in client.get("/documents/p.txt/versions").json()["versions"]]
+    assert len(versions) == 2
+
+    plain = client.get("/export")
+    with zipfile.ZipFile(io.BytesIO(plain.content)) as archive:
+        assert not [name for name in archive.namelist() if name.startswith("versions/")]
+    backup = client.get("/export?include_versions=true")
+    with zipfile.ZipFile(io.BytesIO(backup.content)) as archive:
+        (entry,) = json.loads(archive.read("manifest.json"))["documents"]
+        assert entry["versions"] == versions
+        assert archive.read(f"versions/p.txt/{versions[-1]}") == b"Intro\nfirst version"
+
+    assert client.delete("/documents/p.txt").status_code == 200
+    assert client.get("/documents/p.txt/versions").json()["versions"] == []
+    imported = client.post(
+        "/import", files={"file": ("backup.zip", backup.content, "application/zip")}
+    ).json()
+    assert imported["versions_restored"] == 2
+    assert wait_for_job(client, imported["jobs"][0]["job_id"])["state"] == "done"
+
+    assert [v["version"] for v in client.get("/documents/p.txt/versions").json()["versions"]] == (
+        versions
+    )
+    restored = client.post(f"/documents/p.txt/versions/{versions[-1]}/restore")
+    assert wait_for_job(client, restored.json()["job_id"])["state"] == "done"
+    text = " ".join(c["text"] for c in client.get("/documents/p.txt/content").json()["chunks"])
+    assert "first version" in text
+
+
+def test_versions_are_not_put_back_where_none_are_kept(tmp_path: Path) -> None:
+    store = RawDocumentStore(str(tmp_path), 0)
+    assert store.add_version("a.txt", "123", b"old") is False
+    keeping = RawDocumentStore(str(tmp_path / "k"), 1)
+    assert keeping.add_version("a.txt", "100", b"older") is True
+    assert keeping.add_version("a.txt", "200", b"old") is True
+    assert [v.version for v in keeping.versions("a.txt")] == ["200"]  # the newest one only
+    assert keeping.add_version("a.txt", "../x", b"bad") is False

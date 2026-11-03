@@ -28,7 +28,10 @@ from api.dependencies import (
 from api.documents import EmptyDocumentError
 from api.errors import question_error_type
 from api.generation import GenerationConfigError, GenerationError
-from api.ingest_jobs import ingest_error_type, job_error_message
+from api.ingest_jobs import (
+    ingest_error_type,
+    job_error_message,
+)
 from api.ingestion import IngestionError
 from api.jobs import IngestBacklog
 from api.main import create_app

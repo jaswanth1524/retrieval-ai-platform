@@ -54,7 +54,6 @@ from api.generation import (
     SourceCitation,
     StageTimings,
     answer_messages,
-    citation_from_dict,
     completion_model_and_kwargs,
     finish_answer,
     fit_prompt_to_context_window,
@@ -78,6 +77,7 @@ from api.llm import (
 )
 from api.metrics import answer_inflight_joins_total
 from api.prompting import (
+    FittedPrompt,
     clip_text,
     condense_question_detailed,
     estimate_prompt_tokens,
@@ -265,6 +265,8 @@ class DoneEvent(TypedDict):
     truncated: NotRequired[bool]
     # The answer's citations were added by matching it to the sources (backfill).
     citation_backfilled: NotRequired[bool]
+    # Picked passages (chunk_ids) the prompt had no room for (GroundedAnswer).
+    passages_left_out: NotRequired[int]
     usage: NotRequired[dict[str, int] | None]
     # Summaries only: passages read, of the passages the documents hold. Fewer than
     # the total when a long document was read at evenly spaced passages.
@@ -313,6 +315,16 @@ def _without_unanswered_exchanges(history: list[ChatMessage]) -> list[ChatMessag
             continue
         kept.append(message)
     return kept
+
+
+def _from_first_question(history: list[ChatMessage]) -> list[ChatMessage]:
+    """``history`` from its first user message on."""
+
+    start = next(
+        (index for index, message in enumerate(history) if message["role"] == "user"),
+        len(history),
+    )
+    return history[start:]
 
 
 # Only whether an earlier answer cites anything matters, so ranges are clamped small.
@@ -404,6 +416,7 @@ def replay_cached(hit: CachedAnswer, started: float, **done_fields: Any) -> Iter
         "answer_status": hit.answer_status,
         "truncated": hit.truncated,
         "citation_backfilled": hit.citation_backfilled,
+        "passages_left_out": hit.passages_left_out,
         **done_fields,
     }
     yield cast(DoneEvent, done)
@@ -633,6 +646,69 @@ def drain[T](events: Generator[StreamEvent, None, T]) -> T:
             return cast(T, stop.value)
 
 
+def _picked_left_out(narrow: PassageFilter | None, selected: Sequence[RerankedChunk]) -> int:
+    """How many picked passages (``chunk_ids``) the prompt went without: the reranker
+    scores at most RERANK_CANDIDATES, only MAX_CONTEXT_CHUNKS reach the prompt, and the
+    window may cut more. Said in the answer, not left to the trace alone."""
+
+    if narrow is None or not narrow.chunk_ids:
+        return 0
+    return len(set(narrow.chunk_ids) - {chunk.chunk_id for chunk in selected})
+
+
+def check_rerank_top_k(rerank_top_k: int | None, settings: AppSettings) -> None:
+    """A per-request ``rerank_top_k`` past the server's ``fused_top_n`` is refused: the
+    reranker can't keep more than fusion hands it. The question routes ask before taking
+    a slot, so the stream refuses with a 400 too, not an error frame after its 200."""
+
+    if rerank_top_k is not None and rerank_top_k > int(settings.fused_top_n):
+        raise RetrievalConfigError(
+            f"rerank_top_k ({rerank_top_k}) cannot exceed the server's "
+            f"fused_top_n ({settings.fused_top_n})."
+        )
+
+
+@dataclass
+class AnswerRun:
+    """One question being answered: what it was asked with, and what its steps found,
+    so the error and closed-early traces can be recorded from wherever it stops."""
+
+    question: str
+    overrides: AnswerOverrides
+    filenames: Sequence[str] | None
+    tags: Sequence[str] | None
+    mode: TraceMode
+    trace_id: str | None
+    started: float
+    # Set as the steps run; an error before then leaves them as they are.
+    settings: AppSettings | None = None
+    history: list[ChatMessage] = field(default_factory=list)
+    condensed_question: str | None = None
+    condense_note: str | None = None
+    # The answer streamed so far (kept on the trace of a stream that broke off).
+    parts: list[str] = field(default_factory=list)
+    # The stream's model slot, held from generation through follow-ups.
+    slot: GenerationSlot | None = None
+    # A trace has been stored (finished, no context, or an error): the closed-early
+    # trace is for a stream that ends with none of those.
+    finalized: bool = False
+
+    @property
+    def narrow(self) -> PassageFilter | None:
+        return self.overrides.narrow
+
+
+@dataclass(frozen=True)
+class _Streamed:
+    """What the stream's generation step hands to its finish step."""
+
+    messages: list[ChatMessage]
+    sources: list[SourceCitation]
+    answer: str
+    generate_ms: float
+    first_token_ms: float
+
+
 class RagPipeline:
     """Composes retrieval, reranking, and generation behind a single call."""
 
@@ -662,13 +738,7 @@ class RagPipeline:
         """Fold per-request overrides into a settings copy without mutating the base."""
 
         settings = self._settings
-        if overrides.rerank_top_k is not None and overrides.rerank_top_k > int(
-            settings.fused_top_n
-        ):
-            raise RetrievalConfigError(
-                f"rerank_top_k ({overrides.rerank_top_k}) cannot exceed the server's "
-                f"fused_top_n ({settings.fused_top_n})."
-            )
+        check_rerank_top_k(overrides.rerank_top_k, settings)
 
         update: dict[str, Any] = {
             key: value
@@ -863,6 +933,10 @@ class RagPipeline:
             return []
         cap = int(effective_settings.conversation_max_history_messages)
         kept = _without_unanswered_exchanges(list(history)[-cap:] if cap > 0 else [])
+        # An odd cap (or a client's odd-length history) could leave an answer first,
+        # with its question cut away: the model read an answer to nothing, and
+        # Anthropic's API refuses a conversation that doesn't open with the user.
+        kept = _from_first_question(kept)
         return [
             {
                 "role": "assistant",
@@ -1085,8 +1159,8 @@ class RagPipeline:
         if not normalized_query:
             raise RetrievalError("Query text is required.")
         self._repository.ensure_ready(effective_settings)
-        # Looked up alongside query expansion and embedding, which don't depend on it;
-        # only the search below needs the stored spellings.
+        # Looked up alongside embedding (and, for a sync answer, query expansion), which
+        # don't depend on it; only the search below needs the stored spellings.
         tag_variants = (
             submit_in_context(
                 _TAG_LOOKUP_EXECUTOR,
@@ -1274,36 +1348,11 @@ class RagPipeline:
                 elif joined is not None:
                     lead = joined
             if hit is not None:
-                return GroundedAnswer(
-                    answer=hit.answer,
-                    sources=list(hit.sources),
-                    timings=_cached_timings(started),
-                    trace_id=hit.trace_id,
-                    cached=True,
-                    answer_status=hit.answer_status,
-                    top_rerank_score=hit.top_rerank_score,
-                    weak_matches=hit.weak_matches,
-                    truncated=hit.truncated,
-                    citation_backfilled=hit.citation_backfilled,
-                    followups=list(hit.followups),
-                )
+                return hit.as_grounded(_cached_timings(started))
         try:
             grounded = self._answer_uncached(question, overrides, filenames, history, tags)
             if key is not None and self._answer_cache is not None:
-                self._answer_cache.put(
-                    key,
-                    CachedAnswer(
-                        grounded.answer,
-                        tuple(grounded.sources),
-                        grounded.trace_id,
-                        grounded.answer_status,
-                        grounded.top_rerank_score,
-                        grounded.truncated,
-                        weak_matches=grounded.weak_matches,
-                        citation_backfilled=grounded.citation_backfilled,
-                        followups=tuple(grounded.followups),
-                    ),
-                )
+                self._answer_cache.put(key, CachedAnswer.from_grounded(grounded))
         finally:
             # After the store, so followers find the answer; on a failure they find
             # none and each asks itself.
@@ -1362,20 +1411,7 @@ class RagPipeline:
         def store(followups: Sequence[str]) -> None:
             if key is None or done is None or self._answer_cache is None:
                 return
-            self._answer_cache.put(
-                key,
-                CachedAnswer(
-                    done["answer"],
-                    tuple(citation_from_dict(source) for source in done["sources"]),
-                    done["trace_id"],
-                    done.get("answer_status", "answered"),
-                    done.get("top_rerank_score"),
-                    done.get("truncated", False),
-                    weak_matches=done.get("weak_matches", False),
-                    citation_backfilled=done.get("citation_backfilled", False),
-                    followups=tuple(followups),
-                ),
-            )
+            self._answer_cache.put(key, CachedAnswer.from_done(done, followups))
 
         try:
             for event in events:
@@ -1399,6 +1435,52 @@ class RagPipeline:
             events.close()
             finish_lead()
 
+    def _store_error_trace(self, run: AnswerRun, error: str) -> None:
+        """Record ``run`` as failed (or abandoned), with the answer streamed so far."""
+
+        if self._trace_store is None or run.trace_id is None:
+            return
+        self._trace_store.add(
+            self._error_trace(
+                trace_id=run.trace_id,
+                narrow=run.narrow,
+                question=run.question,
+                mode=run.mode,
+                effective_settings=run.settings,
+                filenames=run.filenames,
+                tags=run.tags,
+                error=error,
+                answer="".join(run.parts).strip() or None,
+                condensed_question=run.condensed_question,
+                condense_note=run.condense_note,
+                history_message_count=len(run.history),
+            )
+        )
+
+    def _store_finished_trace(
+        self, run: AnswerRun, settings: AppSettings, phase: RetrievalPhase, **fields: Any
+    ) -> None:
+        """Record ``run`` as finished; ``fields`` are what only this outcome has."""
+
+        if self._trace_store is None or run.trace_id is None:
+            return
+        self._trace_store.add(
+            self._finished_trace(
+                trace_id=run.trace_id,
+                narrow=run.narrow,
+                question=run.question,
+                mode=run.mode,
+                effective_settings=settings,
+                filenames=run.filenames,
+                tags=run.tags,
+                phase=phase,
+                condensed_question=run.condensed_question,
+                condense_note=run.condense_note,
+                history_message_count=len(run.history),
+                **fields,
+            )
+        )
+
     def _answer_uncached(
         self,
         question: str,
@@ -1409,24 +1491,17 @@ class RagPipeline:
     ) -> GroundedAnswer:
         """Retrieve, rerank, and generate a grounded, cited answer.
 
-        ``overrides`` are folded into a single ``model_copy`` of the shared settings —
-        the singleton is never mutated, so concurrent requests with different
-        overrides stay isolated. Only ``llm_provider``, ``rerank_top_k``,
-        ``max_context_chunks``, and ``llm_temperature`` can vary per request; the
-        dense/sparse retrieval limits, ``fused_top_n``, and ``rrf_k`` always come from
-        the base settings (embeddings and hybrid fusion stay fixed regardless).
-        ``filenames``, when given, restricts retrieval to those documents. ``history``,
-        when given, drives one extra condense call that rewrites ``question`` into a
-        standalone retrieval query — the server itself stores no conversation state.
+        ``overrides`` are folded into a single ``model_copy`` of the shared settings
+        (``_effective_settings``) — the singleton is never mutated, so concurrent
+        requests with different overrides stay isolated. The dense/sparse retrieval
+        limits, ``fused_top_n``, and ``rrf_k`` always come from the base settings
+        (embeddings and hybrid fusion stay fixed regardless). ``filenames``, when given,
+        restricts retrieval to those documents. ``history``, when given, drives one
+        extra condense call that rewrites ``question`` into a standalone retrieval
+        query — the server itself stores no conversation state.
         """
 
-        total_start = time.monotonic()
-        trace_store = self._trace_store
-        trace_id = str(uuid.uuid4()) if trace_store is not None else None
-        effective_settings: AppSettings | None = None
-        condensed_question: str | None = None
-        condense_note: str | None = None
-        truncated_history: list[ChatMessage] = []
+        run = self._start_run(question, overrides, filenames, tags, "sync")
         # Held from the answer through its citation retry and follow-ups, as the stream
         # does, so another question's call can't slip in between them at a local model.
         slot: GenerationSlot | None = None
@@ -1435,27 +1510,20 @@ class RagPipeline:
         begin_usage()
 
         try:
-            effective_settings = self._effective_settings(overrides or AnswerOverrides())
-            truncated_history = self._truncate_history(history, effective_settings)
-            retrieval_query, condense_ms, condensed_question, condense_note = self._condense_query(
-                question, truncated_history, effective_settings
+            effective_settings = run.settings = self._effective_settings(run.overrides)
+            run.history = self._truncate_history(history, effective_settings)
+            retrieval_query, condense_ms, run.condensed_question, run.condense_note = (
+                self._condense_query(question, run.history, effective_settings)
             )
             phase = self._retrieve_and_rerank(
                 retrieval_query,
                 effective_settings,
                 filenames,
                 tags,
-                narrow=(overrides or AnswerOverrides()).narrow,
-                also_search=question if condensed_question else None,
+                narrow=run.narrow,
+                also_search=question if run.condensed_question else None,
             )
-            prompt_question = _with_interpretation(question.strip(), condensed_question)
-            fitted = fit_prompt_to_context_window(
-                prompt_question,
-                phase.context_chunks[: int(effective_settings.max_context_chunks)],
-                _clip_earlier_answers(truncated_history, effective_settings),
-                effective_settings,
-                weak_matches=phase.below_min_score,
-            )
+            prompt_question, fitted = self._fit_prompt(run, effective_settings, phase)
             selected = fitted.context_chunks
 
             # Nothing to answer from: the canned answer makes no LLM call, so it must not
@@ -1481,7 +1549,7 @@ class RagPipeline:
             truncated = stopped_at_token_limit()
             timings = self._phase_timings(
                 phase,
-                total_start=total_start,
+                total_start=run.started,
                 condense_ms=condense_ms,
                 generate_ms=generate_ms,
                 citation_retry_ms=grounded.citation_retry_ms,
@@ -1489,25 +1557,9 @@ class RagPipeline:
         except Exception as exc:
             if slot is not None:
                 slot.release()
-            if trace_store is not None and trace_id is not None:
-                trace_store.add(
-                    self._error_trace(
-                        trace_id=trace_id,
-                        narrow=(overrides or AnswerOverrides()).narrow,
-                        question=question,
-                        mode="sync",
-                        effective_settings=effective_settings,
-                        filenames=filenames,
-                        tags=tags,
-                        # Traces are readable with the read-only key: the same rule
-                        # as a response body, so no internal detail.
-                        error=public_error_message(exc),
-                        answer=None,
-                        condensed_question=condensed_question,
-                        condense_note=condense_note,
-                        history_message_count=len(truncated_history),
-                    )
-                )
+            # Traces are readable with the read-only key: the same rule as a response
+            # body, so no internal detail.
+            self._store_error_trace(run, public_error_message(exc))
             raise
 
         # The answer's usage: everything up to it (condense, expansion, the answer and
@@ -1534,52 +1586,76 @@ class RagPipeline:
                 slot.release()
         if wants_followups:
             # The response waited for them (even when none came back), so the total does.
-            timings = replace(timings, total_ms=(time.monotonic() - total_start) * 1000)
-        if trace_store is not None and trace_id is not None:
-            # Captured from generation, not rebuilt here. A second
-            # build_grounded_messages call would agree today but is a re-derivation that
-            # can drift, and it could never reproduce the citation-retry continuation
-            # that actually produced the answer when grounded.citation_retry_used is set.
-            trace_store.add(
-                self._finished_trace(
-                    trace_id=trace_id,
-                    narrow=(overrides or AnswerOverrides()).narrow,
-                    question=question,
-                    mode="sync",
-                    status=trace_status(status),
-                    effective_settings=effective_settings,
-                    filenames=filenames,
-                    tags=tags,
-                    phase=phase,
-                    selected=selected,
-                    context_budget_dropped_ids=fitted.dropped_point_ids,
-                    prompt_messages=grounded.prompt_messages or None,
-                    answer=grounded.answer,
-                    cited_source_numbers=[source.source_number for source in grounded.sources],
-                    timings=timings,
-                    condensed_question=condensed_question,
-                    condense_note=condense_note,
-                    history_message_count=len(truncated_history),
-                    citation_retry_used=grounded.citation_retry_used,
-                    citation_backfilled=grounded.citation_backfilled,
-                    usage=usage,
-                    answer_status=status,
-                    truncated=truncated,
-                    dropped_history_messages=fitted.dropped_history_messages,
-                )
-            )
+            timings = replace(timings, total_ms=(time.monotonic() - run.started) * 1000)
+        # The prompt is the one captured from generation, not rebuilt here: a second
+        # build_grounded_messages call would agree today but is a re-derivation that
+        # can drift, and it could never reproduce the citation-retry continuation that
+        # actually produced the answer when grounded.citation_retry_used is set.
+        self._store_finished_trace(
+            run,
+            effective_settings,
+            phase,
+            status=trace_status(status),
+            selected=selected,
+            context_budget_dropped_ids=fitted.dropped_point_ids,
+            prompt_messages=grounded.prompt_messages or None,
+            answer=grounded.answer,
+            cited_source_numbers=[source.source_number for source in grounded.sources],
+            timings=timings,
+            citation_retry_used=grounded.citation_retry_used,
+            citation_backfilled=grounded.citation_backfilled,
+            usage=usage,
+            answer_status=status,
+            truncated=truncated,
+            dropped_history_messages=fitted.dropped_history_messages,
+        )
         return replace(
             grounded,
             timings=timings,
-            trace_id=trace_id,
+            trace_id=run.trace_id,
             answer_status=status,
             top_rerank_score=_top_rerank_score(phase),
             weak_matches=phase.below_min_score,
             truncated=truncated,
+            passages_left_out=_picked_left_out(run.narrow, selected),
             followups=followups,
             usage=usage,
             cost_usd=cost_usd,
         )
+
+    def _start_run(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        mode: TraceMode,
+    ) -> AnswerRun:
+        return AnswerRun(
+            question=question,
+            overrides=overrides or AnswerOverrides(),
+            filenames=filenames,
+            tags=tags,
+            mode=mode,
+            trace_id=str(uuid.uuid4()) if self._trace_store is not None else None,
+            started=time.monotonic(),
+        )
+
+    def _fit_prompt(
+        self, run: AnswerRun, settings: AppSettings, phase: RetrievalPhase
+    ) -> tuple[str, FittedPrompt]:
+        """The question as the answering prompt puts it, and what of the passages and
+        history fits the window."""
+
+        prompt_question = _with_interpretation(run.question.strip(), run.condensed_question)
+        fitted = fit_prompt_to_context_window(
+            prompt_question,
+            phase.context_chunks[: int(settings.max_context_chunks)],
+            _clip_earlier_answers(run.history, settings),
+            settings,
+            weak_matches=phase.below_min_score,
+        )
+        return prompt_question, fitted
 
     def _answer_stream_uncached(
         self,
@@ -1596,301 +1672,291 @@ class RagPipeline:
         the UI can render citations while the answer is still generating. ``done``
         carries the final answer, the citation-filtered source list, and timings.
         ``history``, when given, drives the same condense step as ``answer``.
+
+        In three steps — ``_stream_retrieve`` (condense, expansion, retrieval),
+        ``_stream_generate`` (the streamed answer), ``_stream_finish`` (citations, the
+        trace, ``done``, follow-ups) — sharing one ``AnswerRun``. Only this method
+        records a trace for an error or an early end, and releases the model slot.
         """
 
-        total_start = time.monotonic()
-        trace_store = self._trace_store
-        trace_id = str(uuid.uuid4()) if trace_store is not None else None
-        effective_settings: AppSettings | None = None
-        parts: list[str] = []
-        condensed_question: str | None = None
-        condense_note: str | None = None
-        truncated_history: list[ChatMessage] = []
-        slot: GenerationSlot | None = None
-        # Set the moment a trace has been stored (success, insufficient-context, or a
-        # caught error below) — the `finally` clause uses this to detect the one case
-        # none of those cover: the client disconnecting (GeneratorExit, a BaseException
-        # that `except Exception` never sees) before any of them ran.
-        finalized = False
-
-        def _store_error_trace(error: str) -> None:
-            if trace_store is None or trace_id is None:
-                return
-            trace_store.add(
-                self._error_trace(
-                    trace_id=trace_id,
-                    narrow=(overrides or AnswerOverrides()).narrow,
-                    question=question,
-                    mode="stream",
-                    effective_settings=effective_settings,
-                    filenames=filenames,
-                    tags=tags,
-                    error=error,
-                    answer="".join(parts).strip() or None,
-                    condensed_question=condensed_question,
-                    condense_note=condense_note,
-                    history_message_count=len(truncated_history),
-                )
-            )
-
+        run = self._start_run(question, overrides, filenames, tags, "stream")
         try:
             # Everything this answer calls the LLM for, from the condense on (the
             # follow-ups come after `done` and aren't in its usage).
             begin_usage()
-            effective_settings = self._effective_settings(overrides or AnswerOverrides())
-            truncated_history = self._truncate_history(history, effective_settings)
-            # Announced before the call, and only when it will actually happen — an
-            # unconditional frame would report a stage that never ran for the majority
-            # of questions, which is worse than no frame. The rewrite is an LLM call:
-            # it waits its turn at a local model like the answer does (announced, and
-            # given up if the reader leaves), and gives the place back for retrieval.
-            condense_slot: GenerationSlot | None = None
-            try:
-                if self._will_condense(question, truncated_history, effective_settings):
-                    condense_slot = yield from wait_for_model(effective_settings, should_stop)
-                    yield {"type": "stage", "stage": "condensing"}
-                retrieval_query, condense_ms, condensed_question, condense_note = (
-                    self._condense_query(question, truncated_history, effective_settings)
-                )
-            finally:
-                if condense_slot is not None:
-                    condense_slot.release()
-            # Query expansion (opt-in) is an LLM call too: it waits its turn at a local
-            # model like the condense call, and gives the place back for retrieval.
-            expansion: tuple[list[str], float] | None = None
-            if effective_settings.query_expansion_enabled and retrieval_query.strip():
-                expansion_slot = yield from wait_for_model(effective_settings, should_stop)
-                try:
-                    yield {"type": "stage", "stage": "searching"}
-                    expansion = self._expand_query(retrieval_query, effective_settings)
-                finally:
-                    expansion_slot.release()
-            else:
-                yield {"type": "stage", "stage": "searching"}
-            phase = self._retrieve_and_rerank(
-                retrieval_query,
-                effective_settings,
-                filenames,
-                tags,
-                should_stop,
-                narrow=(overrides or AnswerOverrides()).narrow,
-                also_search=question if condensed_question else None,
-                expansion=expansion,
-            )
-            prompt_question = _with_interpretation(question.strip(), condensed_question)
-            fitted = fit_prompt_to_context_window(
-                prompt_question,
-                phase.context_chunks[: int(effective_settings.max_context_chunks)],
-                _clip_earlier_answers(truncated_history, effective_settings),
-                effective_settings,
-                weak_matches=phase.below_min_score,
-            )
-            selected = fitted.context_chunks
-
-            if not selected:
-                yield {"type": "sources", "sources": [], "trace_id": trace_id}
-                timings = self._phase_timings(
-                    phase, total_start=total_start, condense_ms=condense_ms
-                )
-                # The condense and query-expansion calls were still made.
-                usage = usage_totals()
-                if trace_store is not None and trace_id is not None:
-                    trace_store.add(
-                        self._finished_trace(
-                            trace_id=trace_id,
-                            narrow=(overrides or AnswerOverrides()).narrow,
-                            question=question,
-                            mode="stream",
-                            status="insufficient_context",
-                            effective_settings=effective_settings,
-                            filenames=filenames,
-                            tags=tags,
-                            phase=phase,
-                            selected=[],
-                            prompt_messages=None,
-                            answer=INSUFFICIENT_CONTEXT_ANSWER,
-                            cited_source_numbers=[],
-                            timings=timings,
-                            condensed_question=condensed_question,
-                            condense_note=condense_note,
-                            history_message_count=len(truncated_history),
-                            usage=usage,
-                            answer_status="no_context",
-                        )
-                    )
-                finalized = True
-                yield {
-                    "type": "done",
-                    "answer": INSUFFICIENT_CONTEXT_ANSWER,
-                    "sources": [],
-                    "timings": timings_dict(timings),
-                    "trace_id": trace_id,
-                    "answer_status": "no_context",
-                    "top_rerank_score": _top_rerank_score(phase),
-                    "usage": usage_dict(usage, usage_cost_usd(effective_settings, usage)),
-                }
+            retrieved = yield from self._stream_retrieve(run, history, should_stop)
+            settings, phase, condense_ms, prompt_question, fitted = retrieved
+            if not fitted.context_chunks:
+                yield from self._stream_no_context(run, settings, phase, condense_ms)
                 return
-
-            all_sources = source_citations(selected)
-            yield {
-                "type": "sources",
-                "sources": [_citation_dict(source) for source in all_sources],
-                "trace_id": trace_id,
-            }
-
-            messages = answer_messages(
-                prompt_question,
-                selected,
-                fitted.history or None,
-                effective_settings,
-                weak_matches=phase.below_min_score,
+            generated = yield from self._stream_generate(
+                run, settings, phase, prompt_question, fitted, should_stop
             )
-            if should_stop is not None and should_stop():
+            if generated is None:
                 return  # the finally below records the trace as closed early
-            # Held until the answer, its citation retry and follow-ups are done, so
-            # another question's call can't slip in between them; released below.
-            # Waiting inside Ollama ran this request's timeout; waiting here doesn't.
-            slot = yield from wait_for_model(effective_settings, should_stop)
-            reading: StageEvent = {
-                "type": "stage",
-                "stage": "reading",
-                "prompt_tokens": estimate_prompt_tokens(messages),
-            }
-            eta_ms = expected_prefill_ms(messages, effective_settings)
-            if eta_ms is not None:
-                reading["eta_ms"] = round(eta_ms)
-            yield reading
-            generate_start = time.monotonic()
-            first_token_ms = 0.0
-            reset_finish_reason()
-            for delta in self._generator.stream(messages, effective_settings):
-                if not parts:
-                    first_token_ms = (time.monotonic() - total_start) * 1000
-                parts.append(delta)
-                yield {"type": "delta", "text": delta}
-            generate_ms = (time.monotonic() - generate_start) * 1000
-
-            answer = "".join(parts).strip()
-            if not answer:
-                raise GenerationError("Generation provider returned an empty answer.")
-
-            # Streaming can't retry before the deltas already sent, and buffering would
-            # destroy the streaming UX for the common case. Instead, if the streamed
-            # answer carries no citations, run one non-streaming retry and swap the
-            # corrected answer/sources into the `done` event — the frontend replaces the
-            # streamed content with `done.answer`, so it snaps to the cited version.
-            # finalize_citations is the same helper generate_grounded_answer (sync path)
-            # uses, so the retry-trigger condition can't drift between response modes.
-            # The retry is a whole unstreamed generation after the last delta; without
-            # this frame the UI sits on its streaming label with nothing moving.
-            if will_call_llm_for_citations(
-                answer,
-                all_sources,
-                effective_settings,
-                weak_matches=phase.below_min_score,
-                context_chunks=selected,
-            ):
-                yield {"type": "stage", "stage": "verifying_citations"}
-            # Spans only now: the sources frame went out before there was an answer.
-            outcome, cited = finish_answer(
-                messages,
-                answer,
-                selected,
-                self._generator,
-                effective_settings,
-                weak_matches=phase.below_min_score,
+            yield from self._stream_finish(
+                run, settings, phase, fitted, condense_ms, generated, should_stop
             )
-            answer = outcome.answer
-            # The last call made the answer: the citation retry's when it fired.
-            truncated = stopped_at_token_limit()
-            usage = usage_totals()
-            citation_retry_used = outcome.retry_used
-
-            timings = self._phase_timings(
-                phase,
-                total_start=total_start,
-                condense_ms=condense_ms,
-                generate_ms=generate_ms,
-                citation_retry_ms=outcome.retry_ms,
-                first_token_ms=first_token_ms,
-            )
-            status = answer_status(answer, len(cited), len(selected))
-            if trace_store is not None and trace_id is not None:
-                trace_store.add(
-                    self._finished_trace(
-                        trace_id=trace_id,
-                        narrow=(overrides or AnswerOverrides()).narrow,
-                        question=question,
-                        mode="stream",
-                        status=trace_status(status),
-                        effective_settings=effective_settings,
-                        filenames=filenames,
-                        tags=tags,
-                        phase=phase,
-                        selected=selected,
-                        context_budget_dropped_ids=fitted.dropped_point_ids,
-                        # outcome.prompt_messages, not the `messages` that were streamed:
-                        # when the citation retry fired, the streamed answer was replaced
-                        # by the retry's, and the retry's continuation is what produced
-                        # the text stored just below.
-                        prompt_messages=list(outcome.prompt_messages),
-                        answer=answer,
-                        cited_source_numbers=[source.source_number for source in cited],
-                        timings=timings,
-                        condensed_question=condensed_question,
-                        condense_note=condense_note,
-                        history_message_count=len(truncated_history),
-                        citation_retry_used=citation_retry_used,
-                        citation_backfilled=outcome.backfilled,
-                        usage=usage,
-                        answer_status=status,
-                        truncated=truncated,
-                        dropped_history_messages=fitted.dropped_history_messages,
-                    )
-                )
-            finalized = True
-            yield {
-                "type": "done",
-                "answer": answer,
-                "sources": [_citation_dict(source) for source in cited],
-                "timings": timings_dict(timings),
-                "trace_id": trace_id,
-                "answer_status": status,
-                "top_rerank_score": _top_rerank_score(phase),
-                "weak_matches": phase.below_min_score,
-                "truncated": truncated,
-                "citation_backfilled": outcome.backfilled,
-                "usage": usage_dict(usage, usage_cost_usd(effective_settings, usage)),
-            }
-            if (
-                effective_settings.followups_enabled
-                and status == "answered"
-                and not (should_stop is not None and should_stop())
-            ):
-                followups = generate_followups(
-                    question.strip(),
-                    answer,
-                    _cited_chunks(cited, selected),
-                    self._generator,
-                    effective_settings,
-                )
-                if followups:
-                    yield {"type": "followups", "questions": followups}
         except QuestionAbandoned:
             return  # the finally below records the trace as closed early
         except Exception as exc:
-            if not finalized:
-                _store_error_trace(public_error_message(exc))
-                finalized = True
+            if not run.finalized:
+                self._store_error_trace(run, public_error_message(exc))
+                run.finalized = True
             raise
         finally:
-            if not finalized:
+            if not run.finalized:
                 # Reached via GeneratorExit (the client disconnected, or the generator
                 # was otherwise closed mid-stream without completing or raising an
                 # `Exception`) — `finally` re-raises it automatically once this block
                 # returns, so no explicit `raise` is needed here — or via an early
                 # return once `should_stop` reported the client gone.
-                _store_error_trace("Stream closed before completion.")
-                finalized = True
-            if slot is not None:
-                slot.release()
+                self._store_error_trace(run, "Stream closed before completion.")
+                run.finalized = True
+            if run.slot is not None:
+                run.slot.release()
+
+    def _stream_retrieve(
+        self,
+        run: AnswerRun,
+        history: Sequence[ChatMessage] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> Generator[StreamEvent, None, tuple[AppSettings, RetrievalPhase, float, str, FittedPrompt]]:
+        """Settings, history, the condense call, opt-in query expansion and retrieval,
+        with their stage frames; what the answer is written from."""
+
+        effective_settings = run.settings = self._effective_settings(run.overrides)
+        run.history = self._truncate_history(history, effective_settings)
+        # Announced before the call, and only when it will actually happen — an
+        # unconditional frame would report a stage that never ran for the majority of
+        # questions, which is worse than no frame. The rewrite is an LLM call: it waits
+        # its turn at a local model like the answer does (announced, and given up if
+        # the reader leaves), and gives the place back for retrieval.
+        condense_slot: GenerationSlot | None = None
+        try:
+            if self._will_condense(run.question, run.history, effective_settings):
+                condense_slot = yield from wait_for_model(effective_settings, should_stop)
+                yield {"type": "stage", "stage": "condensing"}
+            retrieval_query, condense_ms, run.condensed_question, run.condense_note = (
+                self._condense_query(run.question, run.history, effective_settings)
+            )
+        finally:
+            if condense_slot is not None:
+                condense_slot.release()
+        # Query expansion (opt-in) is an LLM call too: it waits its turn at a local
+        # model like the condense call, and gives the place back for retrieval.
+        expansion: tuple[list[str], float] | None = None
+        if effective_settings.query_expansion_enabled and retrieval_query.strip():
+            expansion_slot = yield from wait_for_model(effective_settings, should_stop)
+            try:
+                yield {"type": "stage", "stage": "searching"}
+                expansion = self._expand_query(retrieval_query, effective_settings)
+            finally:
+                expansion_slot.release()
+        else:
+            yield {"type": "stage", "stage": "searching"}
+        phase = self._retrieve_and_rerank(
+            retrieval_query,
+            effective_settings,
+            run.filenames,
+            run.tags,
+            should_stop,
+            narrow=run.narrow,
+            also_search=run.question if run.condensed_question else None,
+            expansion=expansion,
+        )
+        prompt_question, fitted = self._fit_prompt(run, effective_settings, phase)
+        return effective_settings, phase, condense_ms, prompt_question, fitted
+
+    def _stream_no_context(
+        self, run: AnswerRun, settings: AppSettings, phase: RetrievalPhase, condense_ms: float
+    ) -> Iterator[StreamEvent]:
+        """Nothing to answer from: the canned answer, with no LLM call."""
+
+        yield {"type": "sources", "sources": [], "trace_id": run.trace_id}
+        timings = self._phase_timings(phase, total_start=run.started, condense_ms=condense_ms)
+        # The condense and query-expansion calls were still made.
+        usage = usage_totals()
+        self._store_finished_trace(
+            run,
+            settings,
+            phase,
+            status="insufficient_context",
+            selected=[],
+            prompt_messages=None,
+            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            cited_source_numbers=[],
+            timings=timings,
+            usage=usage,
+            answer_status="no_context",
+        )
+        run.finalized = True
+        yield {
+            "type": "done",
+            "answer": INSUFFICIENT_CONTEXT_ANSWER,
+            "sources": [],
+            "timings": timings_dict(timings),
+            "trace_id": run.trace_id,
+            "answer_status": "no_context",
+            "top_rerank_score": _top_rerank_score(phase),
+            "passages_left_out": _picked_left_out(run.narrow, []),
+            "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
+        }
+
+    def _stream_generate(
+        self,
+        run: AnswerRun,
+        settings: AppSettings,
+        phase: RetrievalPhase,
+        prompt_question: str,
+        fitted: FittedPrompt,
+        should_stop: Callable[[], bool] | None,
+    ) -> Generator[StreamEvent, None, _Streamed | None]:
+        """The sources frame, the wait for the model, and the streamed answer; None when
+        the reader left before generation."""
+
+        selected = fitted.context_chunks
+        all_sources = source_citations(selected)
+        yield {
+            "type": "sources",
+            "sources": [_citation_dict(source) for source in all_sources],
+            "trace_id": run.trace_id,
+        }
+        messages = answer_messages(
+            prompt_question,
+            selected,
+            fitted.history or None,
+            settings,
+            weak_matches=phase.below_min_score,
+        )
+        if should_stop is not None and should_stop():
+            return None
+        # Held until the answer, its citation retry and follow-ups are done, so another
+        # question's call can't slip in between them; released by the caller.
+        # Waiting inside Ollama ran this request's timeout; waiting here doesn't.
+        run.slot = yield from wait_for_model(settings, should_stop)
+        reading: StageEvent = {
+            "type": "stage",
+            "stage": "reading",
+            "prompt_tokens": estimate_prompt_tokens(messages),
+        }
+        eta_ms = expected_prefill_ms(messages, settings)
+        if eta_ms is not None:
+            reading["eta_ms"] = round(eta_ms)
+        yield reading
+        generate_start = time.monotonic()
+        first_token_ms = 0.0
+        reset_finish_reason()
+        for delta in self._generator.stream(messages, settings):
+            if not run.parts:
+                first_token_ms = (time.monotonic() - run.started) * 1000
+            run.parts.append(delta)
+            yield {"type": "delta", "text": delta}
+        generate_ms = (time.monotonic() - generate_start) * 1000
+        answer = "".join(run.parts).strip()
+        if not answer:
+            raise GenerationError("Generation provider returned an empty answer.")
+        return _Streamed(messages, all_sources, answer, generate_ms, first_token_ms)
+
+    def _stream_finish(
+        self,
+        run: AnswerRun,
+        settings: AppSettings,
+        phase: RetrievalPhase,
+        fitted: FittedPrompt,
+        condense_ms: float,
+        generated: _Streamed,
+        should_stop: Callable[[], bool] | None,
+    ) -> Iterator[StreamEvent]:
+        """Citations (retry or backfill), the trace, ``done``, then any follow-ups."""
+
+        selected = fitted.context_chunks
+        # Streaming can't retry before the deltas already sent, and buffering would
+        # destroy the streaming UX for the common case. Instead, if the streamed answer
+        # carries no citations, run one non-streaming retry and swap the corrected
+        # answer/sources into the `done` event — the frontend replaces the streamed
+        # content with `done.answer`, so it snaps to the cited version.
+        # finalize_citations is the same helper generate_grounded_answer (sync path)
+        # uses, so the retry-trigger condition can't drift between response modes.
+        # The retry is a whole unstreamed generation after the last delta; without
+        # this frame the UI sits on its streaming label with nothing moving.
+        if will_call_llm_for_citations(
+            generated.answer,
+            generated.sources,
+            settings,
+            weak_matches=phase.below_min_score,
+            context_chunks=selected,
+        ):
+            yield {"type": "stage", "stage": "verifying_citations"}
+        # Spans only now: the sources frame went out before there was an answer.
+        outcome, cited = finish_answer(
+            generated.messages,
+            generated.answer,
+            selected,
+            self._generator,
+            settings,
+            weak_matches=phase.below_min_score,
+        )
+        answer = outcome.answer
+        # The last call made the answer: the citation retry's when it fired.
+        truncated = stopped_at_token_limit()
+        usage = usage_totals()
+        timings = self._phase_timings(
+            phase,
+            total_start=run.started,
+            condense_ms=condense_ms,
+            generate_ms=generated.generate_ms,
+            citation_retry_ms=outcome.retry_ms,
+            first_token_ms=generated.first_token_ms,
+        )
+        status = answer_status(answer, len(cited), len(selected))
+        self._store_finished_trace(
+            run,
+            settings,
+            phase,
+            status=trace_status(status),
+            selected=selected,
+            context_budget_dropped_ids=fitted.dropped_point_ids,
+            # outcome.prompt_messages, not the `messages` that were streamed: when the
+            # citation retry fired, the streamed answer was replaced by the retry's, and
+            # the retry's continuation is what produced the text stored just below.
+            prompt_messages=list(outcome.prompt_messages),
+            answer=answer,
+            cited_source_numbers=[source.source_number for source in cited],
+            timings=timings,
+            citation_retry_used=outcome.retry_used,
+            citation_backfilled=outcome.backfilled,
+            usage=usage,
+            answer_status=status,
+            truncated=truncated,
+            dropped_history_messages=fitted.dropped_history_messages,
+        )
+        run.finalized = True
+        yield {
+            "type": "done",
+            "answer": answer,
+            "sources": [_citation_dict(source) for source in cited],
+            "timings": timings_dict(timings),
+            "trace_id": run.trace_id,
+            "answer_status": status,
+            "top_rerank_score": _top_rerank_score(phase),
+            "weak_matches": phase.below_min_score,
+            "truncated": truncated,
+            "citation_backfilled": outcome.backfilled,
+            "passages_left_out": _picked_left_out(run.narrow, selected),
+            "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
+        }
+        if (
+            settings.followups_enabled
+            and status == "answered"
+            and not (should_stop is not None and should_stop())
+        ):
+            followups = generate_followups(
+                run.question.strip(),
+                answer,
+                _cited_chunks(cited, selected),
+                self._generator,
+                settings,
+            )
+            if followups:
+                yield {"type": "followups", "questions": followups}

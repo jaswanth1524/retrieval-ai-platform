@@ -36,13 +36,14 @@ from typing import NamedTuple
 
 from fastapi import HTTPException
 
+from api.background import BackgroundLoop
+from api.document_names import FilenameConflictError
 from api.documents import (
     SUPPORTED_EXTENSIONS,
     DocumentError,
     DocumentNotFoundError,
     validate_upload_filename,
 )
-from api.ingest_jobs import FilenameConflictError
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,10 @@ ListIndexed = Callable[[], dict[str, float | None]]  # filename -> uploaded_at
 # when the file is refused.
 Enqueue = Callable[[str, bytes, float], "str | None"]
 Delete = Callable[[str], None]
+# The indexed documents this folder indexed (in any run): the ones it may delete when
+# their file is gone, though this run never saw the file (it went while the API was
+# down).
+ListOwned = Callable[[], set[str]]
 
 
 class WatchedJob(NamedTuple):
@@ -242,7 +247,7 @@ def read_regular_file(path: Path, max_bytes: int) -> bytes:
     return content
 
 
-class FolderWatcher:
+class FolderWatcher(BackgroundLoop):
     """Keeps one workspace's index in step with one folder (the settings it is given
     point at that workspace)."""
 
@@ -254,8 +259,11 @@ class FolderWatcher:
         delete: Delete,
         job_lookup: JobLookup | None = None,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        list_owned: ListOwned | None = None,
     ) -> None:
         self._root = Path(settings.watch_dir)
+        self._list_owned = list_owned
         self._filter = PathFilter(
             glob_patterns(settings.watch_include), glob_patterns(settings.watch_exclude)
         )
@@ -282,7 +290,8 @@ class FolderWatcher:
         # Each file's (size, mtime) in the previous pass: a file is read only once it
         # is the same in two passes in a row, one interval apart.
         self._previous: dict[str, tuple[int, float]] = {}
-        # Names this watcher has seen in the folder: the only ones it may delete.
+        # Names this watcher has seen in the folder, or indexed from it in an earlier
+        # run (``list_owned``): the only ones it may delete.
         self._seen: set[str] = set()
         self._reported: set[str] = set()
         # Why the last pass held deletions back, if it did: said once when it starts,
@@ -290,10 +299,13 @@ class FolderWatcher:
         self._standing_down: str | None = None
         self._status_lock = threading.Lock()
         self._status = WatchStatus(str(self._root), None, 0, [], [], [], [])
-        self._stop = threading.Event()
-        # Set by scan_now (POST /watch/scan) to run the next pass at once.
-        self._wake = threading.Event()
-        self._thread: threading.Thread | None = None
+        super().__init__(
+            "docrag-watch",
+            self._interval,
+            "Watched folder: a scan failed; trying again next interval.",
+            logger,
+            join_timeout=10,
+        )
 
     def _is_current(self, indexed: dict[str, float | None], name: str, mtime: float) -> bool:
         """Whether the indexed document is this exact version of the file.
@@ -383,6 +395,7 @@ class FolderWatcher:
                 self._pending[name] = (signature, job_id)
             done["indexed"].append(name)
         if self._delete_missing:
+            self._seen |= self._owned()
             self._delete_removed(files, indexed, scan.incomplete, done)
         if any(done[kind] for kind in ("indexed", "deleted", "deferred", "gave_up")):
             logger.info(
@@ -395,6 +408,15 @@ class FolderWatcher:
             )
         self._record_status(len(files), scan.problems, done)
         return done
+
+    def _owned(self) -> set[str]:
+        if self._list_owned is None:
+            return set()
+        try:
+            return self._list_owned()
+        except Exception:  # noqa: BLE001 - only means fewer deletions this pass
+            logger.warning("Watched folder: could not list its documents.", exc_info=True)
+            return set()
 
     def _check_jobs(self, done: dict[str, list[str]]) -> None:
         """Settle the jobs sent in earlier passes: a finished one is done with; a failed
@@ -479,9 +501,9 @@ class FolderWatcher:
             return self._status
 
     def scan_now(self) -> None:
-        """Run the next pass now rather than at the end of the interval."""
+        """Run the next pass now rather than at the end of the interval (POST /watch/scan)."""
 
-        self._wake.set()
+        self.wake()
 
     def _delete_removed(
         self,
@@ -547,22 +569,9 @@ class FolderWatcher:
             self._standing_down = reason
             logger.warning(message, *args)
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self.scan_once()
-            except Exception:  # noqa: BLE001 - the watcher must outlive one bad pass
-                logger.exception("Watched folder: a scan failed; trying again next interval.")
-            self._wake.wait(self._interval)
-            self._wake.clear()
+    def run_pass(self) -> dict[str, list[str]]:
+        return self.scan_once()
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="docrag-watch", daemon=True)
-        self._thread.start()
+        super().start()
         logger.info("Watching %s every %gs.", self._root, self._interval)
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10)

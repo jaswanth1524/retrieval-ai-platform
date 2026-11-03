@@ -207,15 +207,28 @@ def _known_context_window(model: str) -> int:
     return int(window) if isinstance(window, int) and window > 0 else 0
 
 
-def prompt_token_budget(settings: AppSettings) -> int | None:
-    """Tokens a prompt may take and still leave room for the answer, or None when the
-    window is unknown (nothing is fitted then)."""
+def window_token_budget(settings: AppSettings) -> int | None:
+    """Tokens a prompt may take and still leave the model's window room for the answer,
+    or None when the window is unknown."""
 
     window = context_window_tokens(settings)
     if window <= 0:
         return None
     model, _ = completion_model_and_kwargs(settings)
     return window - effective_max_tokens(settings, model) - _CONTEXT_WINDOW_MARGIN_TOKENS
+
+
+def effective_prompt_budget(settings: AppSettings) -> int | None:
+    """The most a prompt may take: what the window leaves (``window_token_budget``),
+    capped by PROMPT_TOKEN_BUDGET when that is set; None when neither applies (nothing
+    is fitted then). Every prompt an answer sends is held to it — the answer's and the
+    citation retry's."""
+
+    budget = window_token_budget(settings)
+    configured = int(settings.prompt_token_budget)
+    if configured > 0:
+        budget = configured if budget is None else min(budget, configured)
+    return budget
 
 
 # Chinese, Japanese and Korean characters: about one token each under the common
@@ -288,10 +301,7 @@ def fit_prompt_to_context_window(
 
     chunks = list(context_chunks)
     kept_history = list(history or [])
-    budget = prompt_token_budget(settings)
-    configured = int(settings.prompt_token_budget)
-    if configured > 0:
-        budget = configured if budget is None else min(budget, configured)
+    budget = effective_prompt_budget(settings)
     if budget is None:
         return FittedPrompt(chunks, kept_history)
     dropped: list[str] = []
@@ -318,8 +328,13 @@ def fit_prompt_to_context_window(
         if len(chunks) > 1:
             dropped.append(chunks.pop().point_id)
         elif kept_history:
+            # The oldest exchange as a whole: an answer left first, its question
+            # gone, reads as an answer to nothing (and Anthropic refuses it).
             kept_history.pop(0)
             dropped_history += 1
+            while kept_history and kept_history[0]["role"] != "user":
+                kept_history.pop(0)
+                dropped_history += 1
         else:
             # One chunk and no history still don't fit: send it anyway rather than
             # answer from nothing; the operator's window is simply too small.
@@ -440,7 +455,15 @@ def condense_question_detailed(
     generator: ChatGenerator,
     settings: AppSettings,
 ) -> CondensedQuery:
-    """``condense_question`` with the reason a rewrite was not used as returned."""
+    """Rewrite a follow-up question into a standalone retrieval query, with the reason a
+    rewrite was not used when it wasn't.
+
+    Deterministic (temperature 0) regardless of the caller's own temperature override —
+    this is a mechanical rewrite, not a creative generation. The text is "" (rather than
+    an exception) when the provider returns an empty response or something that is not
+    a rewrite, so the caller's own fallback-to-raw-question logic handles every failure
+    mode the same way.
+    """
 
     messages = build_condense_messages(question, history)
     condense_settings = settings.model_copy(
@@ -456,24 +479,6 @@ def condense_question_detailed(
     if stopped_at_token_limit():
         return CondensedQuery("", "rejected: hit condense_max_tokens")
     return clean_condensed_query(output, question)
-
-
-def condense_question(
-    question: str,
-    history: Sequence[ChatMessage],
-    generator: ChatGenerator,
-    settings: AppSettings,
-) -> str:
-    """Rewrite a follow-up question into a standalone retrieval query.
-
-    Deterministic (temperature 0) regardless of the caller's own temperature
-    override — this is a mechanical rewrite, not a creative generation. Returns ""
-    (rather than raising) when the provider returns an empty response or something that
-    is not a rewrite, so the caller's own fallback-to-raw-question logic handles every
-    failure mode the same way.
-    """
-
-    return condense_question_detailed(question, history, generator, settings).text
 
 
 def format_context_chunk(index: int, chunk: RerankedChunk) -> str:
@@ -803,7 +808,7 @@ def generate_query_variants(
     """Generate up to ``count`` alternative query phrasings for multi-query retrieval.
 
     Best-effort: any provider error or empty output returns ``[]`` so retrieval falls
-    back to the single original query (mirrors ``condense_question``'s contract).
+    back to the single original query (mirrors ``condense_question_detailed``'s contract).
     Deterministic-ish temperature 0.3 for mild variation.
     """
 

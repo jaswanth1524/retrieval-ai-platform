@@ -95,7 +95,7 @@ def needs_full_key(method: str, path: str) -> bool:
         path == "/feedback" and method == "GET"
     ):
         return True
-    if method == "POST" and path in ("/import", "/watch/scan"):
+    if method == "POST" and path in ("/import", "/watch/scan", "/query-log/recheck"):
         return True
     if method in ("POST", "DELETE") and (path == "/workspaces" or path.startswith("/workspaces/")):
         return True

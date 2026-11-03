@@ -206,3 +206,21 @@ def test_build_trace_candidates_names_a_kept_chunk_cut_by_max_context_chunks() -
     assert by_id["b"].kept is True
     assert by_id["b"].selected_for_context is False
     assert by_id["b"].drop_reason == "context_limit"
+
+
+def test_a_deleted_workspaces_traces_are_removed_from_memory_and_the_archive(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    from dataclasses import replace
+
+    from api.trace_archive import TraceArchive
+
+    archive = TraceArchive(str(tmp_path / "traces.db"), max_rows=100)
+    store = TraceStore(max_retained=10, archive=archive)
+    store.add(replace(_trace("legal-1"), workspace="legal"))
+    store.add(_trace("default-1"))
+
+    assert store.delete_workspace("legal") == 1
+    assert store.get("legal-1") is None
+    assert [summary.trace_id for summary in store.list_summaries("legal")] == []
+    assert [summary.trace_id for summary in store.list_summaries("")] == ["default-1"]
