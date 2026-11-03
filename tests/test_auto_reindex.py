@@ -67,7 +67,7 @@ def _reindexer(
 
 
 def _stale(repository: VectorRepository, settings: AppSettings) -> list[str]:
-    from api.ingest_jobs import staleness
+    from api.document_ops import staleness
 
     is_stale = staleness(settings, HeuristicTokenCounter())
     return sorted(
@@ -175,3 +175,68 @@ def test_an_incomplete_document_is_repaired_from_its_original(
     assert reindexer.run_once() == 1
     wait_until(lambda: not repository.filename_metadata(settings)["long.txt"].incomplete)
     assert repository.filename_metadata(settings)["long.txt"].chunk_count == whole
+
+
+def test_documents_that_fail_for_good_wait_for_a_new_original(
+    tmp_path: Path, executor: ThreadPoolExecutor, caplog: pytest.LogCaptureFixture
+) -> None:
+    repository, settings, store, jobs, _ = _setup(tmp_path, executor)
+    # The first two (by name) can no longer be parsed: binary bytes under a .txt name.
+    for name in ("a.txt", "b.txt"):
+        store.save(name, b"\x00\x01\x02\x03" * 64)
+    current = settings.model_copy(update={"chunk_size_tokens": 30, "auto_reindex_batch": 2})
+    reindexer = _reindexer(repository, current, store, jobs, executor)
+    caplog.set_level(logging.WARNING, logger="api.auto_reindex")
+
+    assert reindexer.run_once() == 2
+    wait_until(lambda: reindexer._running() == 0)  # noqa: SLF001
+    # They failed as documents: passed over, so c.txt gets its turn instead of
+    # a.txt and b.txt being queued again every pass.
+    assert reindexer.run_once() == 1
+    wait_until(lambda: _stale(repository, current) == ["a.txt", "b.txt"])
+    assert reindexer.run_once() == 0
+    assert sum("until its original changes" in r.getMessage() for r in caplog.records) == 2
+
+    store.save("a.txt", b"Intro\na.txt alpha beta gamma, readable again")
+    assert reindexer.run_once() == 1
+    wait_until(lambda: _stale(repository, current) == ["b.txt"])
+
+
+def test_other_failures_are_retried_after_a_growing_backoff(tmp_path: Path) -> None:
+    from api.auto_reindex import (
+        FAILURE_BACKOFF_SECONDS,
+        MAX_FAILURE_BACKOFF_SECONDS,
+        _QueuedJob,
+    )
+
+    now = [1000.0]
+    store = RawDocumentStore(str(tmp_path), 0)
+    store.save("a.txt", b"Intro\nalpha")
+    reindexer = StaleReindexer(
+        make_settings(raw_document_dir=str(tmp_path)),
+        VectorRepository(QdrantClient(":memory:")),
+        list,
+        IngestJobStore(10),
+        HeuristicTokenCounter(),
+        clock=lambda: now[0],
+    )
+    queued = _QueuedJob("", "a.txt", store.identity("a.txt"))
+    skip = reindexer._held_back("", store)  # noqa: SLF001
+
+    reindexer._note_outcome(queued, "failed", "server", "Qdrant went away")  # noqa: SLF001
+    assert skip("a.txt")
+    now[0] += FAILURE_BACKOFF_SECONDS
+    assert not skip("a.txt")
+    reindexer._note_outcome(queued, "failed", "server", "again")  # noqa: SLF001
+    now[0] += FAILURE_BACKOFF_SECONDS
+    assert skip("a.txt")  # twice as long the second time
+    now[0] += FAILURE_BACKOFF_SECONDS
+    assert not skip("a.txt")
+    for _ in range(10):
+        reindexer._note_outcome(queued, "failed", "server", "again")  # noqa: SLF001
+    now[0] += MAX_FAILURE_BACKOFF_SECONDS
+    assert not skip("a.txt")  # capped
+    # A cancelled job or a success forgets the failures.
+    reindexer._note_outcome(queued, "failed", "server", "again")  # noqa: SLF001
+    reindexer._note_outcome(queued, "done", None, None)  # noqa: SLF001
+    assert not skip("a.txt")

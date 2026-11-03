@@ -3,6 +3,7 @@ import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/clien
 import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
 import type { DocumentMeta, UploadItem } from '../components/CorpusPanel';
 import { newId } from '../utils/id';
+import { ingestNote } from '../utils/ingestNotes';
 import { createLimiter } from '../utils/pool';
 import type { ToastInput } from './useToasts';
 
@@ -20,6 +21,10 @@ function documentsFrom(response: DocumentListResponse): Record<string, DocumentM
   const stale = new Set(response.stale_filenames ?? []);
   const incomplete = new Set(response.incomplete_filenames ?? []);
   const reindexable = new Set(response.reindexable_filenames ?? []);
+  const sameAs = new Map<string, string[]>();
+  for (const group of response.duplicate_groups ?? []) {
+    for (const name of group) sameAs.set(name, group.filter((other) => other !== name));
+  }
   const documents: Record<string, DocumentMeta> = {};
   for (const filename of response.filenames) {
     documents[filename] = {
@@ -33,6 +38,7 @@ function documentsFrom(response: DocumentListResponse): Record<string, DocumentM
       tags: response.tags?.[filename] ?? [],
       ...(response.source_urls?.[filename] ? { sourceUrl: response.source_urls[filename] } : {}),
       ...(response.url_refresh?.[filename] ? { urlRefresh: response.url_refresh[filename] } : {}),
+      ...(sameAs.get(filename)?.length ? { sameAs: sameAs.get(filename) } : {}),
     };
   }
   return documents;
@@ -262,6 +268,14 @@ export function useCorpus(callbacks: CorpusCallbacks) {
           ),
         );
         const indexedName = status.result?.filename;
+        const note = ingestNote(status.result);
+        if (note && indexedName) {
+          deps.current.pushToast({
+            tone: status.result?.duplicate_of ? 'warn' : 'good',
+            title: `${indexedName} indexed`,
+            body: note,
+          });
+        }
         // Indexed in a workspace no longer in use: the list here is another one's.
         if (indexedName && isCurrent(workspace)) {
           // Dedupe by name — re-uploading the same filename replaces its chunks
@@ -446,7 +460,9 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         }
         return;
       }
-      await refreshDocuments();
+      // The change was made; a listing that fails now is only a stale card (called
+      // with void, a rejection here went unhandled).
+      await refreshDocuments().catch((err: unknown) => deps.current.onAuthFailure(err));
     };
 
     // Several documents chosen at once: started together and followed together, with

@@ -43,6 +43,10 @@ class DocumentIngestOutcome:
     collection_name: str
     # Already indexed from these exact bytes: nothing was parsed, embedded or written.
     unchanged: bool = False
+    chunks_reused: int = 0
+    chunks_removed: int = 0
+    # Another indexed document with these exact bytes (information only: both stay).
+    duplicate_of: str | None = None
 
 
 class IngestService:
@@ -54,8 +58,13 @@ class IngestService:
         embedding_provider: IngestEmbeddingProvider,
         settings: AppSettings,
         token_counter: TokenCounter | None = None,
+        *,
+        watched_from: str | None = None,
     ) -> None:
         self._repository = repository
+        # The folder watcher's own service stamps what it indexes with its folder
+        # (DocumentChunk.watched_from); every other ingest carries the stored one over.
+        self._watched_from = watched_from
         self._embedding_provider = embedding_provider
         self._settings = settings
         # Default to the heuristic (no model fetch) so direct constructions in tests
@@ -171,6 +180,7 @@ class IngestService:
                 carry_tags=True,
                 before_first_write=start_writing,
                 tags=tags,
+                watched_from=self._watched_from,
             )
         finally:
             # Even a failed ingest may have written points; cached answers could
@@ -187,7 +197,21 @@ class IngestService:
             sections_parsed=len(sections),
             chunks_ingested=result.points_count,
             collection_name=result.collection_name,
+            chunks_reused=result.chunks_reused,
+            chunks_removed=result.chunks_removed,
+            duplicate_of=self._same_bytes_as(sections[0].filename, digest),
         )
+
+    def _same_bytes_as(self, filename: str, digest: str) -> str | None:
+        """Another indexed document whose bytes are these, or None. One point read, not
+        the listing (which it would fill, and a listing read here is one more per
+        upload). Best effort: a lookup that fails only means nothing is said."""
+
+        try:
+            return self._repository.other_with_content(self._settings, digest, filename)
+        except Exception:  # noqa: BLE001 - informational; the ingest has succeeded
+            logger.debug("Could not look for a duplicate of %s.", filename, exc_info=True)
+            return None
 
     def _leave_unchanged(
         self,
@@ -252,6 +276,10 @@ class IngestService:
             if uploaded_at is not None and meta.uploaded_at != uploaded_at:
                 self._repository.set_uploaded_at(settings, name, uploaded_at)
                 changed = True
+            # A document uploaded first, then found in the watched folder unchanged:
+            # the watcher owns it from now on (and may delete it when the file goes).
+            if self._watched_from is not None and meta.watched_from != self._watched_from:
+                self._repository.set_watched_from(settings, name, self._watched_from)
             if changed:
                 bump_corpus_generation([name], collection=settings.qdrant_collection)
             if on_indexed is not None:
@@ -263,4 +291,5 @@ class IngestService:
             chunks_ingested=meta.chunk_count,
             collection_name=settings.qdrant_collection,
             unchanged=True,
+            duplicate_of=self._same_bytes_as(name, digest),
         )

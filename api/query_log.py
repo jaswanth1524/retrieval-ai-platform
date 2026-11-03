@@ -14,6 +14,7 @@ question is logged however it was asked (sync, streamed, a summary).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
@@ -32,7 +33,8 @@ _CREATE_TABLE = """
         status TEXT NOT NULL,
         top_score REAL,
         mode TEXT NOT NULL,
-        trace_id TEXT
+        trace_id TEXT,
+        filenames_json TEXT
     )
 """
 # A status that means the documents didn't answer it.
@@ -51,6 +53,10 @@ class LoggedQuery:
     top_score: float | None
     mode: str
     trace_id: str | None
+    # The documents its answer was drawn from (the passages put in its prompt; a
+    # summary's documents), for answered questions only: what "questions that cited
+    # this document" counts.
+    filenames: tuple[str, ...] = ()
 
 
 class QueryLogStore:
@@ -66,6 +72,10 @@ class QueryLogStore:
         enable_wal(path)
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE)
+            # A log from before documents were recorded: its rows name none.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(queries)")}
+            if "filenames_json" not in columns:
+                conn.execute("ALTER TABLE queries ADD COLUMN filenames_json TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS queries_workspace_created_at "
                 "ON queries (workspace, created_at)"
@@ -78,7 +88,7 @@ class QueryLogStore:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO queries (created_at, workspace, question, status, top_score, "
-                "mode, trace_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "mode, trace_id, filenames_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     query.created_at,
                     query.workspace,
@@ -87,6 +97,7 @@ class QueryLogStore:
                     query.top_score,
                     query.mode,
                     query.trace_id,
+                    json.dumps(list(query.filenames)),
                 ),
             )
             self._added += 1
@@ -98,17 +109,38 @@ class QueryLogStore:
                     (self._max_rows,),
                 )
 
-    def recent(self, workspace: str, *, limit: int, uncovered: bool = False) -> list[LoggedQuery]:
-        """``workspace``'s logged questions, newest first."""
+    def delete_workspace(self, workspace: str) -> int:
+        """Remove every row of ``workspace`` (deleted), so one created again under its
+        name starts with an empty log."""
+
+        with self._lock, self._connect() as conn:
+            return conn.execute("DELETE FROM queries WHERE workspace = ?", (workspace,)).rowcount
+
+    def recent(
+        self,
+        workspace: str,
+        *,
+        limit: int,
+        uncovered: bool = False,
+        filename: str | None = None,
+    ) -> list[LoggedQuery]:
+        """``workspace``'s logged questions, newest first: only unanswered ones with
+        ``uncovered``, only those drawn from ``filename`` when it is given."""
 
         where = "workspace = ?"
         params: list[object] = [workspace]
         if uncovered:
             where += f" AND status IN ({', '.join('?' for _ in UNCOVERED_STATUSES)})"
             params.extend(UNCOVERED_STATUSES)
+        if filename is not None:
+            # The name as it appears inside the JSON list: an exact element, not a
+            # substring of a longer name.
+            where += " AND instr(filenames_json, ?) > 0"
+            params.append(json.dumps(filename))
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT created_at, workspace, question, status, top_score, mode, trace_id "
+                "SELECT created_at, workspace, question, status, top_score, mode, trace_id, "
+                "filenames_json "
                 f"FROM queries WHERE {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
@@ -121,6 +153,7 @@ class QueryLogStore:
                 top_score=None if row[4] is None else float(row[4]),
                 mode=str(row[5]),
                 trace_id=None if row[6] is None else str(row[6]),
+                filenames=_filenames(row[7]),
             )
             for row in rows
         ]
@@ -130,6 +163,13 @@ def logged_query(trace: QueryTrace) -> LoggedQuery:
     """What the log keeps of a trace: no prompt, answer or candidates."""
 
     scores = [c.rerank_score for c in trace.candidates if c.rerank_score is not None]
+    # Only an answer counts as drawn from its documents: one that declined ("not in the
+    # documents") read the closest passages and used none of them.
+    drawn_from: dict[str, None] = {}
+    if trace.status == "ok":
+        drawn_from = dict.fromkeys(c.filename for c in trace.candidates if c.selected_for_context)
+        if not drawn_from and trace.config is not None and trace.config.filenames and not scores:
+            drawn_from = dict.fromkeys(trace.config.filenames)  # a summary: its documents
     return LoggedQuery(
         created_at=trace.created_at,
         workspace=trace.workspace,
@@ -138,7 +178,16 @@ def logged_query(trace: QueryTrace) -> LoggedQuery:
         top_score=max(scores) if scores else None,
         mode=trace.mode,
         trace_id=trace.trace_id,
+        filenames=tuple(drawn_from),
     )
+
+
+def _filenames(value: object) -> tuple[str, ...]:
+    try:
+        names = json.loads(value) if isinstance(value, str) else []
+    except ValueError:
+        return ()
+    return tuple(name for name in names if isinstance(name, str)) if isinstance(names, list) else ()
 
 
 class QueryLogSink:

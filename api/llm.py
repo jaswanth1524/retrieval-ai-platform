@@ -323,6 +323,13 @@ def _provider(settings: AppSettings) -> str:
     return settings.llm_provider.lower().strip()
 
 
+def is_local_provider(settings: AppSettings) -> bool:
+    """Ollama or an OpenAI-compatible server: a local model, generating one request at a
+    time (or a few), where a request sent alongside others just waits its turn."""
+
+    return _provider(settings) in _LOCAL_PROVIDERS
+
+
 def _rate_key(settings: AppSettings) -> tuple[str, str]:
     provider = _provider(settings)
     model = (

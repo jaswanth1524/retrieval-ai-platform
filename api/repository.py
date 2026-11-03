@@ -144,6 +144,8 @@ class DocumentMetadata:
     source_last_modified: str | None = None
     # A fetched document's own refresh interval (None: the server's; 0: never).
     source_refresh_minutes: int | None = None
+    # The watched folder that indexed it (DocumentChunk.watched_from), any point's.
+    watched_from: str | None = None
     # Points from more than one ingest, or fewer than the ingest that wrote them meant
     # to write: a write cut off part way (a killed container) or a failed clean-up of
     # the previous version's points. Never set for points from before those fields.
@@ -189,6 +191,7 @@ class _MetadataFold:
         self.hashes: set[str | None] = set()
         self.totals: set[int | None] = set()
         self.source: tuple[str, str | None, str | None, int | None] | None = None
+        self.watched_from: str | None = None
 
     def add(self, payload: dict[str, Any]) -> None:
         self.count += 1
@@ -219,6 +222,9 @@ class _MetadataFold:
         self.hashes.add(digest if isinstance(digest, str) else None)
         total = payload.get("document_chunks")
         self.totals.add(total if isinstance(total, int) and not isinstance(total, bool) else None)
+        watched = payload.get("watched_from")
+        if isinstance(watched, str) and self.watched_from is None:
+            self.watched_from = watched
         url = payload.get("source_url")
         if isinstance(url, str) and self.source is None:
             etag = payload.get("source_etag")
@@ -250,6 +256,7 @@ class _MetadataFold:
             source_etag=etag,
             source_last_modified=modified,
             source_refresh_minutes=minutes,
+            watched_from=self.watched_from,
             incomplete=self._incomplete(),
         )
 
@@ -723,6 +730,7 @@ class VectorRepository:
                 "source_etag",
                 "source_last_modified",
                 "source_refresh_minutes",
+                "watched_from",
             ],
         ):
             if not point.payload:
@@ -749,6 +757,32 @@ class VectorRepository:
         )
         stored = points[0].payload.get("content_sha256") if points and points[0].payload else None
         return stored if isinstance(stored, str) else None
+
+    def other_with_content(self, settings: AppSettings, digest: str, filename: str) -> str | None:
+        """Another document (not ``filename``) one of whose points carries ``digest``
+        (one point read, by the content-hash index), or None."""
+
+        self.ensure_ready(settings, strict=False)
+        points, _ = self._call(
+            settings,
+            "scroll",
+            collection_name=settings.qdrant_collection,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="content_sha256", match=models.MatchValue(value=digest)
+                    )
+                ],
+                must_not=[
+                    models.FieldCondition(key="filename", match=models.MatchValue(value=filename))
+                ],
+            ),
+            with_payload=["filename"],
+            with_vectors=False,
+            limit=1,
+        )
+        name = points[0].payload.get("filename") if points and points[0].payload else None
+        return name if isinstance(name, str) else None
 
     def content_identity(
         self, settings: AppSettings, filename: str
@@ -891,20 +925,45 @@ class VectorRepository:
     def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]:
         """The tags stored on an indexed document (one point read), or ``()``."""
 
+        return self.carried_details(settings, filename)[0]
+
+    def carried_details(
+        self, settings: AppSettings, filename: str
+    ) -> tuple[tuple[str, ...], str | None]:
+        """What a new version of an indexed document keeps from the one it replaces
+        (one point read): its tags (or ``()``) and the watched folder it came from."""
+
         self.ensure_ready(settings, strict=False)
         points, _ = self._call(
             settings,
             "scroll",
             collection_name=settings.qdrant_collection,
             scroll_filter=_single_filename_filter(filename),
-            with_payload=["tags"],
+            with_payload=["tags", "watched_from"],
             with_vectors=False,
             limit=1,
         )
-        stored = points[0].payload.get("tags") if points and points[0].payload else None
-        if not isinstance(stored, list):
-            return ()
-        return tuple(tag for tag in stored if isinstance(tag, str))
+        payload = points[0].payload if points and points[0].payload else {}
+        stored = payload.get("tags")
+        tags = (
+            tuple(tag for tag in stored if isinstance(tag, str)) if isinstance(stored, list) else ()
+        )
+        watched = payload.get("watched_from")
+        return tags, watched if isinstance(watched, str) else None
+
+    def set_watched_from(self, settings: AppSettings, filename: str, folder: str) -> None:
+        """Mark every point of ``filename`` as kept in step with ``folder`` (payload
+        only). Caller holds its filename lock."""
+
+        self.ensure_ready(settings)
+        self._call(
+            settings,
+            "set_payload",
+            collection_name=settings.qdrant_collection,
+            payload={"watched_from": folder},
+            points=_single_filename_filter(filename),
+            wait=True,
+        )
 
     def set_tags(self, settings: AppSettings, filename: str, tags: Sequence[str]) -> None:
         """Replace a document's tags on every one of its points. Payload-only: no re-embed."""

@@ -393,3 +393,21 @@ def test_jobs_keep_what_started_them_and_older_files_read_as_uploads(tmp_path: P
     )
     memory = IngestJobStore(max_retained=10).create("r.txt", kind="reindex")
     assert memory.kind == "reindex" and memory.tags is None
+
+
+def test_a_deleted_workspaces_finished_jobs_are_forgotten(tmp_path: Path) -> None:
+    for store in (
+        IngestJobStore(max_retained=10),
+        SqliteIngestJobStore(path=str(tmp_path / "jobs.db"), max_retained=10),
+    ):
+        done = store.create("a.txt", "legal")
+        store.update(done.id, state="done")
+        running = store.create("b.txt", "legal")
+        kept = store.create("c.txt", "")
+        store.update(kept.id, state="done")
+
+        assert store.delete_finished("legal") == 1
+        assert store.get(done.id) is None
+        # Running work is never dropped (the delete route refuses while there is any).
+        assert store.get(running.id) is not None
+        assert store.get(kept.id) is not None

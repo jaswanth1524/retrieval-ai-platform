@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11), then two fixes-and-features passes (passes 12 and 13). **Re-index:
+(pass 11), then three fixes-and-features passes (passes 12, 13 and 14). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,54 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 14: a document fetched from a URL is downloaded with only gzip allowed, decoded
+  here with its size counted after decoding: a few kilobytes of chained gzip used to
+  expand to gigabytes inside the API before the upload limit was checked. Any other
+  content coding (brotli, zstd, deflate, gzip twice) is refused with a 400. **None.**
+- Pass 14: one very long run of characters with no spaces (a base64 value in a JSON
+  file, say) is split into passages in linear time; it used to re-read the whole rest
+  of the run for every passage, holding an ingest worker for minutes. Ordinary words
+  split exactly as before; a run longer than 32 × the chunk budget may split at
+  slightly different points. **None.**
+- Pass 14: the background re-index (`AUTO_REINDEX_STALE`) remembers a document whose
+  re-index failed: one whose original no longer parses waits until the original
+  changes, other failures are tried again after 1 h, doubling up to a day. The first
+  few failing documents used to take the whole batch every pass, so the rest never
+  ran. **None.**
+- Pass 14: a scheduled refresh whose new version can't be indexed counts as a failure
+  and backs off, instead of being downloaded, parsed and failed again every interval.
+  **None.**
+- Pass 14: deleting a workspace also removes its feedback, logged questions, traces and
+  finished jobs, so one created again under the same name starts empty (its next backup
+  carried the old ratings). **None.**
+- Pass 14: documents the watched folder indexed carry its path (payload
+  `watched_from`), so with `WATCH_DELETE_MISSING` a file deleted while the API was down
+  is removed after the restart; the usual guards still hold (nothing is deleted while
+  the folder lists no files or can't be read). Documents indexed before this are marked
+  the next time the watcher sees their file. **None.**
+- Pass 14: a summary whose reader leaves gives up its slot within half a second, and
+  its parts not yet started never run (it used to wait for every part in flight). An
+  `openai_compatible` server gets summary parts one at a time, as Ollama does. **None.**
+- Pass 14: the conversation history sent with a question always starts with a question:
+  an odd history cap, or the window fitter dropping the oldest message, could leave an
+  answer with no question before it (which Anthropic's API refuses). **None.**
+- Pass 14: the citation retry is held to `PROMPT_TOKEN_BUDGET` too, as the first prompt
+  was. **None.**
+- Pass 14: `/questions/stream` refuses a `rerank_top_k` above `fused_top_n` with a 400
+  before streaming, as `/questions` does (it was an error frame after the 200). **None.**
+- Pass 14: answers to questions about named documents (no tags) stay cached while other
+  documents are added, changed or removed; only a change to one of those documents (or
+  one the change log can't name) drops them. Measured: 20 file-scoped questions asked
+  again after each of 5 unrelated uploads were cache hits 100 times of 100 (0 before),
+  every answer identical, and a change to the asked-about document was never served
+  from the cache. Summaries follow the same rule. Whole-corpus and tag-scoped questions
+  are dropped on any change, as before. **None.**
+- Pass 14 (UI): "Export all conversations" keeps each conversation's dates, so importing
+  it no longer marks every one as used just now; making room for an import never
+  removes a conversation holding saved answers; a busy-server retry asks in the
+  workspace the question was asked in; a new chat over an empty one clears its date and
+  page limits too; on a phone, a dropped file, folder or restore opens the corpus
+  drawer. **None.**
 - Pass 13: a refresh from a URL (scheduled or `POST /documents/{f}/refresh`) checks,
   just before it writes, that the document is still the one it started from: a delete,
   an upload or a version restore that landed during the fetch is no longer undone or
@@ -201,6 +249,43 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 14: relevance tuning — `GET /traces/score-report` (read key) sets each traced
+  question's best rerank score, answered against not answered, as a histogram, and
+  suggests a `RERANK_MIN_SCORE` midway across the gap once there are at least 20 of
+  each; `GET /traces/{a}/diff/{b}` lists the settings that differ and the candidates
+  whose rank, selection or drop reason moved between two traces; `POST
+  /query-log/recheck` (full key) searches the latest unanswered logged questions again,
+  retrieval only, and says which now find a passage above the bar. CLI `docrag traces
+  report|diff A B`, `docrag queries --recheck`.
+- Pass 14: scheduled backups — `BACKUP_DIR` (empty = off), `BACKUP_INTERVAL_HOURS` (24),
+  `BACKUP_KEEP` (7): the `/export` zip of every workspace written to
+  `BACKUP_DIR/<workspace>/docrag-<time>.zip`, the newest few kept, never alongside a
+  running `/export`; `/health/ready` reports `last_backup`.
+- Pass 14: backups can carry each document's kept earlier originals
+  (`RAW_DOCUMENT_VERSIONS`): `GET /export?include_versions=true` (the UI's "Download a
+  backup" and every scheduled backup ask for them) writes `versions/<file>/<id>` and
+  lists the ids in the manifest; `/import` puts them back under the same ids where
+  versions are kept (`versions_restored` in its response). Older backups and older
+  servers ignore both; the manifest version is unchanged.
+- Pass 14: `REQUEUE_INTERRUPTED_JOBS` (on): with the sqlite job store, a re-index or URL
+  fetch a restart cut off is started again once at startup, as its Retry would
+  (audited `job.retry` with `scheduled`).
+- Pass 14: a finished job says what it changed — `chunks_reused` (vectors kept),
+  `chunks_removed` (previous version's chunks) — and `duplicate_of` when another indexed
+  document has exactly the same bytes; `GET /documents` lists `duplicate_groups`.
+- Pass 14: an answer about picked passages says how many it had no room for
+  (`passages_left_out` on `done` and `QuestionResponse`; a note under the answer).
+- Pass 14 (UI): a citation whose document was deleted, or uploaded again after the
+  answer, says so on its card and in Saved answers (only for the workspace being
+  listed); "Export cited sources (CSV)" in ⌘K; keys 1–9 open that source of the focused
+  (or latest) answer; named scope presets in the composer's scope popover (per
+  workspace, at most 20); "Questions that cited this" on each document card (this
+  browser's answers, plus the query log's count when it is on); the Traces panel's
+  score report and "compare…" of two traces; Re-check in the Asked questions panel;
+  "same content as …" on duplicate documents; a note after an upload or refresh saying
+  what it kept, removed or duplicated; the last scheduled backup in Settings.
+- Pass 14: the query log records the documents each answer was drawn from;
+  `GET /query-log?filename=` lists the questions that drew on one document.
 - Pass 13: trace list filters — `GET /traces?answer_status=` (repeatable) and
   `answer_status`/`top_rerank_score` on each row. With `TRACE_STORE_PATH` the archive
   keeps the list's columns beside each trace (an older file is filled in once at
@@ -652,6 +737,19 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 14: `POST /documents/{f}/refresh` is a 409 while the document is being indexed
+  (a second click fetched again and queued a job that could only fail). **None.**
+- Pass 14: deleting an orphaned original that can't be removed is a 500 naming
+  `RAW_DOCUMENT_DIR`, not an unhandled error. **None.**
+- Pass 14: a backup whose manifest or feedback is nested deeper than the JSON parser
+  allows is a bad manifest (400) or one skipped row; it was a 500, or every later
+  feedback row dropped. **None.**
+- Pass 14: a summary with a misconfigured provider leaves an error trace. **None.**
+- Pass 14 (UI): scope pruning waits for the stored history to load (it could make the
+  short localStorage copy win over IndexedDB's full one); the palette's "Copy answer"
+  carries the source footnotes and works on plain HTTP; the inspector forgets a pinned
+  trace on a workspace switch; Tab from outside an open dialog goes back into it; an
+  error is announced once, not again each time its conversation is reopened.
 - Pass 13: a non-ASCII ETag (from a server, or a backup's manifest) made every refresh of
   that document fail before it was sent (a 500 on the manual refresh); validators that
   can't be sent back are no longer kept or sent. **None.**
@@ -1018,6 +1116,12 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 14: pypdf 6.21.4 (at least 6.21.4, was 6.21.2), for CVE-2026-119203 to
+  CVE-2026-119209: crafted PDFs could loop forever or use large amounts of memory
+  (a missing trailer, cloned dictionaries, shared page resources, cross-reference
+  streams, page labels, a wrong page count in an encrypted file). Uploads are untrusted
+  input, so these applied. PDF text extraction is unchanged on the golden documents.
+  **None.**
 - Pass 13: LiteLLM 1.103.10 (at least 1.103, was 1.89.7), for GHSA-g5ff-637f-6q2m and
   CVE-2026-114612. Both are in LiteLLM's proxy server, which DocRAG doesn't run (it calls
   the SDK), but the audit gates on them. 1.103.10 is the newest release that still
@@ -1111,6 +1215,22 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   many it found.
 
 ### Development
+- Pass 14: code moved, behaviour unchanged (checked with a before/after capture of 30
+  answer and summary scenarios, and an unchanged OpenAPI document):
+  `api/routes/documents.py` is split into `documents_read`, `documents_write`,
+  `documents_jobs` and `backup` routers (`documents_common` holds their helpers);
+  `api/ingest_jobs.py` keeps the job runtime (`IngestRequest` replaces a dozen repeated
+  parameters), with `api/document_ops.py` (re-index, refresh, delete, retry rules) and
+  `api/document_names.py` (stored names, near-duplicates, names in flight);
+  `api/background.py` (`BackgroundLoop`, `OwnedJobs`) is the loop the watcher, the
+  stale re-indexer, the URL refresher and the scheduled backup share; the streamed
+  answer is three steps around one `AnswerRun`; `CachedAnswer.from_grounded` /
+  `from_done` / `as_grounded` are the one way answers are cached and served; the
+  frontend's `App.tsx` hands scope, asking, exports, the inspector target, the citation
+  preview, the theme and the rail lists to hooks of their own. Tests check that every
+  `CachedAnswer` field survives each way it is cached and that every `AnswerOverrides`
+  field changes the cache key. `prompting.condense_question` is gone
+  (`condense_question_detailed(...).text`).
 - Pass 7: `tests/test_frontend_contract.py` checks that every field the frontend's API
   types read exists in the OpenAPI schema. CI loads the embedding and reranker models
   inside the hardened compose container (read-only filesystem, dropped capabilities)

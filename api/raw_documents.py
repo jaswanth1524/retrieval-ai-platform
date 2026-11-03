@@ -174,6 +174,38 @@ class RawDocumentStore:
         except OSError:
             return None
 
+    def open_version(self, filename: str, version: str) -> BinaryIO | None:
+        """An open handle on one earlier version, or None when there is no such version
+        (for a backup: read while it is written, never whole into memory)."""
+
+        if not _VERSION_ID.fullmatch(version):
+            return None
+        try:
+            return (self._versions_dir(filename) / version).open("rb")
+        except OSError:
+            return None
+
+    def add_version(self, filename: str, version: str, content: bytes) -> bool:
+        """Put an earlier version back (a restored backup's), under its own id, keeping
+        only the newest ``keep_versions``; whether it was kept. Nothing is kept when
+        versions aren't (RAW_DOCUMENT_VERSIONS 0) or the id isn't one this store makes."""
+
+        if self._keep_versions <= 0 or not _VERSION_ID.fullmatch(version):
+            return False
+        directory = self._versions_dir(filename)
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".restore-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+            os.replace(temp_path, directory / version)
+        except BaseException:
+            Path(temp_path).unlink(missing_ok=True)
+            raise
+        for old in self._version_paths(filename)[self._keep_versions :]:
+            old.unlink(missing_ok=True)
+        return (directory / version).is_file()
+
     def read(self, filename: str) -> bytes | None:
         """The stored original's bytes, or None when none is stored — including one
         deleted (or made unreadable) since the caller checked for it."""
@@ -197,7 +229,7 @@ class RawDocumentStore:
 
         For the document listing, which used to stat each document's path in turn.
         Exact names: with originals stored, uploads that differ only by case or
-        Unicode form are refused (``ingest_jobs.refuse_near_duplicate_name``), so a
+        Unicode form are refused (``document_names.refuse_near_duplicate_name``), so a
         document's original is stored under its own name.
         """
 
@@ -226,6 +258,19 @@ class RawDocumentStore:
             return path.stat().st_size
         except OSError:
             return None
+
+    def identity(self, filename: str) -> tuple[int, int] | None:
+        """(size, mtime in ns) of the stored original, or None when none is stored: what
+        tells a replaced original from the one a job already failed on."""
+
+        path = self.path(filename)
+        if path is None:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
 
     def open(self, filename: str) -> BinaryIO | None:
         """An open handle on the stored original, or None when none is stored.

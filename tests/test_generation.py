@@ -18,7 +18,6 @@ from api.generation import (
     build_condense_messages,
     build_grounded_messages,
     completion_model_and_kwargs,
-    condense_question,
     effective_max_tokens,
     extract_completion_text,
     finalize_citations,
@@ -32,6 +31,7 @@ from api.generation import (
 from api.prompting import (
     CONDENSE_ASSISTANT_CHARS,
     clean_condensed_query,
+    condense_question_detailed,
     estimate_prompt_tokens,
     with_answer_language,
 )
@@ -219,7 +219,9 @@ def test_condense_question_forwards_temperature_zero_and_condense_max_tokens() -
     generator = FakeGenerator("What is the second document about?")
     history: list[ChatMessage] = [{"role": "user", "content": "Tell me about doc A and doc B."}]
 
-    result = condense_question("What about the second one?", history, generator, settings)
+    result = condense_question_detailed(
+        "What about the second one?", history, generator, settings
+    ).text
 
     assert result == "What is the second document about?"
     assert generator.settings.llm_temperature == 0.0
@@ -231,7 +233,9 @@ def test_condense_question_strips_surrounding_quotes_and_whitespace() -> None:
     generator = FakeGenerator('  "What is the second document about?"  ')
     history: list[ChatMessage] = [{"role": "user", "content": "Tell me about doc A and doc B."}]
 
-    result = condense_question("What about the second one?", history, generator, settings)
+    result = condense_question_detailed(
+        "What about the second one?", history, generator, settings
+    ).text
 
     assert result == "What is the second document about?"
 
@@ -241,7 +245,7 @@ def test_condense_question_returns_empty_string_for_empty_response() -> None:
     generator = FakeGenerator("   ")
     history: list[ChatMessage] = [{"role": "user", "content": "Tell me about doc A."}]
 
-    result = condense_question("What about it?", history, generator, settings)
+    result = condense_question_detailed("What about it?", history, generator, settings).text
 
     assert result == ""
 
@@ -1778,3 +1782,41 @@ def test_the_weak_match_instruction_is_counted_when_fitting_the_prompt() -> None
     weak = fit_prompt_to_context_window("q", chunks, None, settings, weak_matches=True)
     assert len(plain.context_chunks) == 3
     assert len(weak.context_chunks) < 3
+
+
+def test_the_citation_retry_is_held_to_prompt_token_budget_too() -> None:
+    chunks = [make_chunk("c1", "context text")]
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "earlier " * 200},
+        {"role": "assistant", "content": "reply " * 200},
+    ]
+    prompt = build_grounded_messages("q", chunks, history)
+    base = estimate_prompt_tokens(build_grounded_messages("q", chunks))
+    # No known window (Ollama's own choice), but an operator budget: the retry fits it.
+    settings = make_settings(prompt_token_budget=base + 64 + 200)
+
+    sent = retry_messages(prompt, "no citation here", settings)
+
+    assert sent is not None
+    assert all(message not in sent for message in history)
+    assert estimate_prompt_tokens(sent) <= base + 64 + 200
+
+
+def test_the_fitted_history_never_starts_with_an_answer() -> None:
+    from api.generation import fit_prompt_to_context_window
+
+    chunks = [make_chunk("c1", "context text")]
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "first " * 50},
+        {"role": "assistant", "content": "first answer " * 50},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    whole = estimate_prompt_tokens(build_grounded_messages("q", chunks, history))
+    # Room for all but the first question: its answer must go with it.
+    settings = make_settings(prompt_token_budget=whole - 60)
+
+    fitted = fit_prompt_to_context_window("q", chunks, history, settings)
+
+    assert fitted.history == history[2:]
+    assert fitted.dropped_history_messages == 2

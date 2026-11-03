@@ -57,7 +57,9 @@ class WriteRepository(Protocol):
 
     def delete_by_ids(self, settings: AppSettings, point_ids: Sequence[str]) -> None: ...
 
-    def tags_for_filename(self, settings: AppSettings, filename: str) -> tuple[str, ...]: ...
+    def carried_details(
+        self, settings: AppSettings, filename: str
+    ) -> tuple[tuple[str, ...], str | None]: ...
 
 
 class VectorLookup(Protocol):
@@ -75,6 +77,10 @@ class IngestResult:
 
     collection_name: str
     points_count: int
+    # Points whose stored vectors were kept (same text, same chunking), and points of
+    # the previous version removed: what a re-upload or refresh actually changed.
+    chunks_reused: int = 0
+    chunks_removed: int = 0
 
 
 # Serializes every read-modify-write of one filename's points. The ingest executor runs
@@ -258,6 +264,7 @@ def ingest_chunks(
     carry_tags: bool = False,
     before_first_write: Callable[[], None] | None = None,
     tags: tuple[str, ...] | None = None,
+    watched_from: str | None = None,
 ) -> IngestResult:
     """Embed chunks locally and index them, replacing any prior points for the file.
 
@@ -287,6 +294,8 @@ def ingest_chunks(
     same lock ``PATCH /documents/{filename}/tags`` takes — read any earlier and a tag
     change landing while this ingest embedded or queued was overwritten by the old
     tags. ``tags``, when given, sets the tags outright instead (a restore from a backup).
+    The watched folder a document came from (``DocumentChunk.watched_from``) is carried
+    the same way, unless ``watched_from`` names it (the folder watcher's own ingests).
 
     ``before_first_write`` runs once, right before the first batch is upserted, and
     aborts the ingest by raising — the last point where nothing has changed yet (job
@@ -333,13 +342,19 @@ def ingest_chunks(
         if precondition is not None:
             precondition()
 
+        carried = (
+            {filename: repository.carried_details(settings, filename) for filename in filenames}
+            if carry_tags
+            else {}
+        )
         if tags is not None:
             chunks = [replace(chunk, tags=tags) for chunk in chunks]
         elif carry_tags:
-            current_tags = {
-                filename: repository.tags_for_filename(settings, filename) for filename in filenames
-            }
-            chunks = [replace(chunk, tags=current_tags[chunk.filename]) for chunk in chunks]
+            chunks = [replace(chunk, tags=carried[chunk.filename][0]) for chunk in chunks]
+        if watched_from is not None:
+            chunks = [replace(chunk, watched_from=watched_from) for chunk in chunks]
+        elif carry_tags:
+            chunks = [replace(chunk, watched_from=carried[chunk.filename][1]) for chunk in chunks]
 
         # Snapshot each filename's currently-indexed point IDs *before* upserting —
         # this is what "stale" gets computed against once the new points are written.
@@ -373,6 +388,8 @@ def ingest_chunks(
         return IngestResult(
             collection_name=settings.qdrant_collection,
             points_count=total,
+            chunks_reused=len(reused),
+            chunks_removed=len(stale_ids),
         )
 
 

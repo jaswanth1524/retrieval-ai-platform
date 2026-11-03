@@ -15,7 +15,9 @@ be fetched and indexed for anyone with the key to read back (SSRF). So:
   internal one;
 - redirects are followed by hand, each hop checked the same way, at most
   ``MAX_REDIRECTS``;
-- the body is read in pieces and abandoned past ``MAX_UPLOAD_BYTES``;
+- the body is read in pieces and abandoned past ``MAX_UPLOAD_BYTES`` — counted after
+  decoding: only gzip is asked for and decoded here, with the output capped, since a
+  few kilobytes of chained gzip expand to gigabytes inside one decode call;
 - the whole fetch — name lookups, connects, redirects and the body — has one deadline,
   ``URL_INGEST_TIMEOUT_SECONDS``, so a slow resolver or a server dribbling bytes can't
   hold it open: when it passes, the connection is shut down under whatever read was
@@ -35,6 +37,7 @@ import re
 import socket
 import threading
 import time
+import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -51,6 +54,9 @@ from api.settings import AppSettings
 MAX_REDIRECTS = 3
 MAX_URL_CHARS = 2048
 _USER_AGENT = "DocRAG-url-ingest"
+# The only content coding asked for: decoded here with the output capped (httpx's own
+# decoders have no output limit, and it chains as many as a server lists).
+_GZIP_CODINGS = frozenset({"gzip", "x-gzip"})
 
 # What a response's type means when its URL names no supported file.
 _TYPE_EXTENSIONS = {
@@ -321,6 +327,7 @@ def _pinned_request(
             "Host": host_header,
             "User-Agent": _USER_AGENT,
             "Accept": "*/*",
+            "Accept-Encoding": "gzip",
         },
         extensions={"sni_hostname": host, **({"trace": trace} if trace else {})},
         timeout=httpx.Timeout(timeout),
@@ -609,19 +616,56 @@ def _connect(
     raise UrlFetchError(f"Could not fetch from '{host}'.")  # pragma: no cover - never empty
 
 
+def _content_codings(response: httpx.Response) -> list[str]:
+    """The response's content codings, outermost last; identity left out."""
+
+    value = response.headers.get("content-encoding", "")
+    return [
+        coding
+        for coding in (part.strip().lower() for part in value.split(","))
+        if coding and coding != "identity"
+    ]
+
+
 def _read_body(
     response: httpx.Response, limit: int, host: str, remaining: Callable[[str], float]
 ) -> bytes:
-    """The body, abandoned past ``limit`` bytes or the deadline. A connection that
-    breaks or stalls mid-body is the URL's failure (a 400 naming it), not a 500."""
+    """The body, decoded, abandoned past ``limit`` bytes or the deadline. A connection
+    that breaks or stalls mid-body is the URL's failure (a 400 naming it), not a 500.
 
+    The raw bytes are read and a gzip body is decoded here, each step asked for at most
+    one byte past what is left of ``limit``: the limit holds for what the body expands
+    to, not for what was sent. Any other coding, or gzip applied twice, is refused.
+    """
+
+    too_large = f"The document is larger than {limit} bytes."
+    if response.is_stream_consumed:
+        # Only an injected transport (tests) hands over a body httpx already read and
+        # decoded; a network response is always still a stream here.
+        if len(response.content) > limit:
+            raise UrlFetchError(too_large)
+        return response.content
+    codings = _content_codings(response)
+    if codings and (len(codings) > 1 or codings[0] not in _GZIP_CODINGS):
+        raise UrlFetchError(
+            f"'{host}' sent the document with an unsupported Content-Encoding "
+            f"({', '.join(codings)}); nothing was fetched."
+        )
+    decoder = zlib.decompressobj(wbits=31) if codings else None
     body = bytearray()
     try:
-        for piece in response.iter_bytes():
-            body.extend(piece)
+        for piece in response.iter_raw():
+            if decoder is None:
+                body.extend(piece)
+            else:
+                body.extend(decoder.decompress(piece, limit - len(body) + 1))
+                if decoder.unconsumed_tail:
+                    raise UrlFetchError(too_large)
             if len(body) > limit:
-                raise UrlFetchError(f"The document is larger than {limit} bytes.")
+                raise UrlFetchError(too_large)
             remaining(host)
+    except zlib.error as exc:
+        raise UrlFetchError(f"The gzip body from '{host}' could not be decoded.") from exc
     except httpx.TimeoutException as exc:
         raise UrlFetchError(f"'{host}' did not finish within URL_INGEST_TIMEOUT_SECONDS.") from exc
     except httpx.HTTPError as exc:

@@ -77,3 +77,19 @@ test('the upload shortcut opens the corpus drawer, so the picked files are visib
   await expect(drawer.getByText('notes.md')).toBeVisible();
   await expect(drawer.getByTestId('upload-button')).toBeVisible();
 });
+
+test('a file dropped on a phone opens the corpus drawer so its upload is in view', async ({ page }) => {
+  const transfer = await page.evaluateHandle(() => {
+    const data = new DataTransfer();
+    data.items.add(new File(['# Dropped'], 'dropped.md', { type: 'text/markdown' }));
+    return data;
+  });
+  const thread = page.locator('.app-main');
+  await thread.dispatchEvent('dragenter', { dataTransfer: transfer });
+  await thread.dispatchEvent('dragover', { dataTransfer: transfer });
+  await thread.dispatchEvent('drop', { dataTransfer: transfer });
+
+  const drawer = page.getByRole('dialog', { name: 'Corpus' });
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByTestId('corpus-panel-item').filter({ hasText: 'dropped.md' })).toBeVisible();
+});

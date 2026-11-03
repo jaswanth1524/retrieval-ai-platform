@@ -212,7 +212,7 @@ def test_the_route_is_off_by_default_and_indexes_when_on(monkeypatch: pytest.Mon
     off = make_settings(api_key="full-key", api_read_key="read-key")
     app = hermetic_app(off, QdrantClient(":memory:"))
     monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
+        "api.routes.documents_write.fetch_document",
         functools.partial(
             fetch_document,
             resolve=resolver({}),
@@ -416,7 +416,7 @@ def test_the_route_limits_fetches_and_checks_the_backlog_first(
         return httpx.Response(200, content=b"Intro\nAlpha.", headers={"content-type": "text/plain"})
 
     monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
+        "api.routes.documents_write.fetch_document",
         functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
     )
     body = {"url": "https://example.com/alpha.txt?token=secret"}
@@ -432,7 +432,7 @@ def test_the_route_limits_fetches_and_checks_the_backlog_first(
         assert nearly_full.try_reserve(900)
         app.dependency_overrides[get_ingest_backlog] = lambda: nearly_full
         monkeypatch.setattr(
-            "api.routes.documents.fetch_document",
+            "api.routes.documents_write.fetch_document",
             functools.partial(
                 fetch_document,
                 resolve=resolver({}),
@@ -450,13 +450,13 @@ def test_the_route_limits_fetches_and_checks_the_backlog_first(
         assert nearly_full.pending_bytes == 900  # nothing was queued
         del app.dependency_overrides[get_ingest_backlog]
         monkeypatch.setattr(
-            "api.routes.documents.fetch_document",
+            "api.routes.documents_write.fetch_document",
             functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
         )
 
         busy = threading.BoundedSemaphore(1)
         busy.acquire()
-        monkeypatch.setattr("api.routes.documents._url_fetch_slots", busy)
+        monkeypatch.setattr("api.routes.documents_common._url_fetch_slots", busy)
         limited = client.post("/documents/from-url", json=body)
         assert limited.status_code == 429 and "Too many URL fetches" in limited.json()["detail"]
         assert limited.headers["retry-after"] == "5" and fetched == []
@@ -659,7 +659,7 @@ def test_the_route_refuses_a_server_chosen_name_that_is_already_indexed(
         return httpx.Response(200, content=b"Intro\nFrom the web.", headers=headers)
 
     monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
+        "api.routes.documents_write.fetch_document",
         functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
     )
 
@@ -796,7 +796,7 @@ def test_a_fetched_documents_refresh_interval_is_set_listed_and_changed(
         200, content=b"Intro\nFrom the web.", headers={"content-type": "text/plain"}
     )
     monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
+        "api.routes.documents_write.fetch_document",
         functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
     )
     with TestClient(app) as client:
@@ -847,10 +847,10 @@ def test_a_failed_url_job_is_fetched_again_on_retry(monkeypatch: pytest.MonkeyPa
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=serving["body"], headers={"content-type": "text/plain"})
 
-    monkeypatch.setattr(
-        "api.routes.documents.fetch_document",
-        functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler)),
-    )
+    fake = functools.partial(fetch_document, resolve=resolver({}), transport=transport(handler))
+    # Added through the write routes, fetched again by the job routes' retry.
+    monkeypatch.setattr("api.routes.documents_write.fetch_document", fake)
+    monkeypatch.setattr("api.routes.documents_jobs.fetch_document", fake)
 
     def finished(client: TestClient, job_id: str) -> dict[str, Any]:
         wait_until(
@@ -883,3 +883,84 @@ def test_a_failed_url_job_is_fetched_again_on_retry(monkeypatch: pytest.MonkeyPa
         assert refused.status_code == 409 and "upload the file again" in refused.json()["detail"]
         assert client.post("/documents/jobs/nope/retry").status_code == 404
     clear_dependency_caches()
+
+
+def _gzipped(data: bytes) -> bytes:
+    import gzip
+
+    return gzip.compress(data, compresslevel=9)
+
+
+class _Streamed(httpx.SyncByteStream):
+    """A body still to be read, in pieces, as from the network (httpx reads a
+    ``content=`` body at once, decoding it with its own decoders)."""
+
+    def __init__(self, data: bytes, piece: int = 4096) -> None:
+        self._data = data
+        self._piece = piece
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        for start in range(0, len(self._data), self._piece):
+            yield self._data[start : start + self._piece]
+
+
+def _coded(body: bytes, coding: str, content_type: str = "text/plain") -> Any:
+    return lambda request: httpx.Response(
+        200,
+        stream=_Streamed(body),
+        headers={"content-type": content_type, "content-encoding": coding},
+    )
+
+
+def test_a_gzip_body_is_asked_for_and_decoded_within_the_limit() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("accept-encoding", ""))
+        return _coded(_gzipped(b"# Title\nHello."), "gzip", "text/markdown")(request)
+
+    fetched = fetch("https://example.com/a.md", handler)
+
+    assert fetched.content == b"# Title\nHello."
+    assert seen == ["gzip"]
+
+
+def test_a_body_that_expands_past_the_limit_is_abandoned_while_decoding() -> None:
+    settings = make_test_settings(url_ingest_enabled=True, max_upload_bytes=1000)
+    # ~10 MB of zeros sent as ~10 KB: refused once the decoded output passes 1 KB,
+    # before most of it was even read.
+    bomb = _gzipped(b"\0" * 10_000_000)
+    read: list[int] = []
+
+    class Counted(httpx.SyncByteStream):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for start in range(0, len(bomb), 1024):
+                read.append(start)
+                yield bomb[start : start + 1024]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=Counted(),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+
+    with pytest.raises(UrlFetchError, match="larger than 1000"):
+        fetch("https://example.com/a.txt", handler, settings=settings)
+    assert len(read) == 1  # the first kilobyte already decoded past the limit
+
+
+@pytest.mark.parametrize("coding", ["gzip, gzip", "br", "deflate", "zstd"])
+def test_codings_other_than_one_gzip_are_refused(coding: str) -> None:
+    body = _gzipped(_gzipped(b"x")) if coding == "gzip, gzip" else b"x"
+    handler = _coded(body, coding)
+
+    with pytest.raises(UrlFetchError, match="unsupported Content-Encoding"):
+        fetch("https://example.com/a.txt", handler)
+
+
+def test_a_broken_gzip_body_is_a_clear_error_and_identity_is_plain() -> None:
+    with pytest.raises(UrlFetchError, match="could not be decoded"):
+        fetch("https://example.com/a.txt", _coded(b"not gzip", "gzip"))
+
+    assert fetch("https://example.com/a.txt", _coded(b"plain", "identity")).content == b"plain"

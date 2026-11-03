@@ -15,9 +15,9 @@ from api.admission import QuestionSlots, Release, SlotKind
 from api.dependencies import (
     require_api_key,
 )
+from api.document_names import stored_filename
 from api.errors import public_error_message, question_error_type
 from api.generation import GenerationConfigError
-from api.ingest_jobs import stored_filename
 from api.llm import completion_model_and_kwargs
 from api.metrics import (
     NO_ERROR_TYPE,
@@ -28,7 +28,7 @@ from api.metrics import (
     questions_total,
     summaries_total,
 )
-from api.pipeline import AnswerOverrides, timings_dict
+from api.pipeline import AnswerOverrides, check_rerank_top_k, timings_dict
 from api.repository import PassageFilter
 from api.routes.deps import (
     DocumentSummarizerDep,
@@ -205,6 +205,7 @@ def register(app: FastAPI) -> None:
         settings: SettingsDep,
     ) -> QuestionResponse:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
+        check_rerank_top_k(request.rerank_top_k, settings)
         release = question_slot(slots)
         try:
             grounded = pipeline.answer(
@@ -243,6 +244,7 @@ def register(app: FastAPI) -> None:
             weak_matches=grounded.weak_matches,
             truncated=grounded.truncated,
             citation_backfilled=grounded.citation_backfilled,
+            passages_left_out=grounded.passages_left_out,
             followups=grounded.followups,
             usage=usage_response(grounded.usage, grounded.cost_usd),
         )
@@ -255,6 +257,7 @@ def register(app: FastAPI) -> None:
         settings: SettingsDep,
     ) -> ClosingStreamingResponse:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
+        check_rerank_top_k(request.rerank_top_k, settings)
         # Taken here, before the 200 is committed, so a full server can still say 429.
         lease = StreamLease(question_slot(slots))
         stop = threading.Event()

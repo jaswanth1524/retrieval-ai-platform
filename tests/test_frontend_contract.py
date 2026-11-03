@@ -43,6 +43,7 @@ def test_frontend_types_use_only_fields_the_api_schema_has() -> None:
 
 
 USE_CHAT = ROOT / "frontend" / "src" / "hooks" / "useChat.ts"
+HISTORY = ROOT / "frontend" / "src" / "utils" / "history.ts"
 
 
 def _server_stages() -> set[str]:
@@ -72,7 +73,7 @@ def test_every_stage_the_server_sends_is_named_by_the_ui_and_the_cli() -> None:
 def test_the_cli_keeps_history_to_the_ui_s_limits() -> None:
     from cli import client
 
-    source = USE_CHAT.read_text(encoding="utf-8")
+    source = HISTORY.read_text(encoding="utf-8")
     for ts_name, value in (
         ("HISTORY_MAX_MESSAGES", client.HISTORY_MAX_MESSAGES),
         ("HISTORY_CHAR_BUDGET", client.HISTORY_CHAR_BUDGET),

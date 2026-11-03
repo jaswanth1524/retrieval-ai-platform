@@ -335,6 +335,10 @@ class DocumentChunk:
     source_etag: str | None = None
     source_last_modified: str | None = None
     source_refresh_minutes: int | None = None
+    # The watched folder (WATCH_DIR, resolved) a document is kept in step with: how the
+    # watcher knows, after a restart, which documents are its own to delete when their
+    # file is gone. Carried over by re-uploads and re-indexes, as tags are.
+    watched_from: str | None = None
 
     PAYLOAD_TEXT_KEY: ClassVar[str] = "text"
     PAYLOAD_ORDINAL_KEY: ClassVar[str] = "chunk_ordinal"
@@ -351,6 +355,7 @@ class DocumentChunk:
     PAYLOAD_SOURCE_ETAG_KEY: ClassVar[str] = "source_etag"
     PAYLOAD_SOURCE_LAST_MODIFIED_KEY: ClassVar[str] = "source_last_modified"
     PAYLOAD_SOURCE_REFRESH_MINUTES_KEY: ClassVar[str] = "source_refresh_minutes"
+    PAYLOAD_WATCHED_FROM_KEY: ClassVar[str] = "watched_from"
 
     def to_payload(self) -> dict[str, str | int | float | list[str]]:
         """Return the Qdrant payload shape needed for grounded citations."""
@@ -385,6 +390,7 @@ class DocumentChunk:
             (self.PAYLOAD_SOURCE_ETAG_KEY, self.source_etag),
             (self.PAYLOAD_SOURCE_LAST_MODIFIED_KEY, self.source_last_modified),
             (self.PAYLOAD_SOURCE_REFRESH_MINUTES_KEY, self.source_refresh_minutes),
+            (self.PAYLOAD_WATCHED_FROM_KEY, self.watched_from),
         ):
             if value is not None:
                 payload[key] = value

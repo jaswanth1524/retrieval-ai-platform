@@ -170,6 +170,17 @@ export class MockApi {
   versions: Record<string, object[]> = {};
   /** Every POST /documents/{f}/versions/{v}/restore, as "filename@version". */
   readonly restoredVersions: string[] = [];
+  /** GET /documents uploaded_ats (Unix seconds) and duplicate_groups. */
+  uploadedAts: Record<string, number> = {};
+  duplicateGroups: string[][] = [];
+  /** GET /traces/score-report and GET /traces/{a}/diff/{b} answers. */
+  scoreReport: object | null = null;
+  traceDiff: object | null = null;
+  /** The filename each GET /query-log?filename= was asked for. */
+  readonly queryLogFilenames: string[] = [];
+  /** POST /query-log/recheck's answer; how many times it was asked. */
+  recheck: object = { checked: 0, covered_now: 0, items: [] };
+  rechecks = 0;
   /** In-flight ingest jobs by id: the file each one indexes, how often it was polled and
    *  whether it was cancelled. Every job walks `jobSteps` on its own, so a bulk re-index
    *  runs several at once. */
@@ -240,7 +251,39 @@ export class MockApi {
     }
     if (path === '/query-log') {
       if (!this.config.query_log_enabled) return this.configured(route, 404, { detail: 'The query log is not enabled.' });
+      const filename = new URL(request.url()).searchParams.get('filename');
+      if (filename !== null) {
+        this.queryLogFilenames.push(filename);
+        const rows = this.unanswered as { filenames?: string[] }[];
+        return this.json(route, 200, { queries: rows.filter((row) => row.filenames?.includes(filename)) });
+      }
       return this.json(route, 200, { queries: this.unanswered });
+    }
+    if (path === '/query-log/recheck' && method === 'POST') {
+      this.rechecks += 1;
+      return this.json(route, 200, this.recheck);
+    }
+    if (path === '/traces/score-report') {
+      return this.json(route, 200, this.scoreReport ?? {
+        current_min_score: 0.15,
+        bin_edges: Array.from({ length: 21 }, (_, index) => index / 20),
+        answered: Array(20).fill(0),
+        unanswered: Array(20).fill(0),
+        answered_count: 0,
+        unanswered_count: 0,
+        suggested_min_score: null,
+        note: 'Needs at least 20 answered and 20 unanswered questions with scores.',
+        would_change: 0,
+      });
+    }
+    if (/^\/traces\/[^/]+\/diff\/[^/]+$/.test(path)) {
+      return this.json(route, 200, this.traceDiff ?? {
+        question_a: '',
+        question_b: '',
+        same_answer: true,
+        settings: [],
+        candidates: [],
+      });
     }
     if (path.startsWith('/traces/')) {
       return this.json(route, 200, {
@@ -277,6 +320,8 @@ export class MockApi {
         tags: this.tags,
         source_urls: this.sourceUrls,
         url_refresh: this.urlRefresh,
+        uploaded_ats: this.uploadedAts,
+        duplicate_groups: this.duplicateGroups,
       });
     }
 

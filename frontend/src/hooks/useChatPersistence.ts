@@ -34,7 +34,12 @@ export function useChatPersistence(
   setStorage: Dispatch<SetStateAction<ChatStorageV2>>,
   pending: boolean,
   { storageRef, streamingTurnIdRef, streamingConversationIdRef, bufferedDeltaRef }: StreamingRefs,
-): { persistError: boolean; persistPartial: boolean; historyReady: boolean } {
+): {
+  persistError: boolean;
+  persistPartial: boolean;
+  historyReady: boolean;
+  historyLoaded: boolean;
+} {
   // True when the last persist attempt failed even after the reduced-payload retry
   // below — the session is memory-only from that point on until a write succeeds.
   const [persistError, setPersistError] = useState(false);
@@ -267,5 +272,8 @@ export function useChatPersistence(
     // Not after a failed read: what is loaded is only localStorage's partial copy, and
     // App prunes drafts against it (a draft of a conversation only IndexedDB holds).
     historyReady: chatStoreReady && !chatStoreUnreadable,
+    // The IndexedDB read has finished, however it went: what is in ``storage`` is all
+    // this session will load.
+    historyLoaded: chatStoreReady,
   };
 }

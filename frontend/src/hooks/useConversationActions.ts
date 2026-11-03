@@ -5,6 +5,7 @@ import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
 import {
   EMPTY_SCOPE,
+  isEmptyScope,
   MAX_CONVERSATIONS,
   MAX_PINNED_CONVERSATIONS,
   TITLE_MAX_CHARS,
@@ -108,6 +109,8 @@ export function useConversationActions(
             .filter(
               (conversation) =>
                 !conversation.pinned &&
+                // Saved answers are kept, as the history cap keeps them.
+                !conversation.turns.some((turn) => turn.saved) &&
                 conversation.id !== current.activeConversationId &&
                 conversation.id !== streamingConversationIdRef.current,
             )
@@ -145,7 +148,8 @@ export function useConversationActions(
       // first question of what the user had just asked to be a fresh conversation.
       const active = prev.conversations.find((c) => c.id === prev.activeConversationId);
       if (active && active.turns.length === 0) {
-        if (!active.scope?.filenames.length && !active.scope?.tags.length) return prev;
+        // Any of it: dates and a page range narrowed the "fresh" chat too.
+        if (!active.scope || isEmptyScope(active.scope)) return prev;
         return {
           ...prev,
           conversations: prev.conversations.map((c) =>

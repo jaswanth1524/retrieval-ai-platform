@@ -92,6 +92,8 @@ def build_export(
     repository: VectorRepository,
     raw_store: RawDocumentStore | None,
     feedback_store: FeedbackStore | None,
+    *,
+    include_versions: bool = False,
 ) -> ExportStream:
     """The export zip as a stream of blocks, written while it is sent.
 
@@ -115,7 +117,15 @@ def build_export(
 
     def write_archive(writer: _QueueWriter) -> None:
         with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            _write_archive(archive, settings, metadata, raw_store, feedback_store, first_feedback)
+            _write_archive(
+                archive,
+                settings,
+                metadata,
+                raw_store,
+                feedback_store,
+                first_feedback,
+                include_versions=include_versions,
+            )
         writer.flush()
 
     stream = _stream(write_archive)
@@ -143,6 +153,8 @@ def _write_archive(
     raw_store: RawDocumentStore | None,
     feedback_store: FeedbackStore | None,
     first_feedback: tuple[list[Feedback], FeedbackCursor | None] | None,
+    *,
+    include_versions: bool = False,
 ) -> None:
     documents = []
     for filename, meta in sorted(metadata.items()):
@@ -153,6 +165,11 @@ def _write_archive(
         if handle is not None:
             with handle:
                 _write_member(archive, f"originals/{filename}", handle)
+        versions = (
+            _write_versions(archive, raw_store, filename)
+            if include_versions and original and raw_store is not None
+            else []
+        )
         documents.append(
             {
                 "filename": filename,
@@ -167,6 +184,10 @@ def _write_archive(
                 # Where a URL-ingested document came from, so a restored copy can
                 # still be refreshed. Absent for uploads (older restores ignore it).
                 **_source_fields(meta),
+                # Its earlier originals (RAW_DOCUMENT_VERSIONS), newest first, as
+                # `versions/<filename>/<id>`; only when asked for (older restores
+                # ignore both).
+                **({"versions": versions} if versions else {}),
             }
         )
     manifest = {
@@ -199,6 +220,23 @@ def _write_archive(
             page, cursor = feedback_store.rows_oldest_first(
                 cursor, _FEEDBACK_PAGE, workspace_of(settings)
             )
+
+
+def _write_versions(
+    archive: zipfile.ZipFile, raw_store: RawDocumentStore, filename: str
+) -> list[str]:
+    """Write ``filename``'s kept earlier versions; the ids written (one gone meanwhile
+    is left out)."""
+
+    written: list[str] = []
+    for version in raw_store.versions(filename):
+        handle = raw_store.open_version(filename, version.version)
+        if handle is None:
+            continue
+        with handle:
+            _write_member(archive, f"versions/{filename}/{version.version}", handle)
+        written.append(version.version)
+    return written
 
 
 def _feedback_line(row: Feedback) -> str:

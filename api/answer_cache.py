@@ -16,12 +16,19 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Event, Lock
+from typing import Any
 
-from api.corpus import corpus_generation
-from api.generation import SourceCitation, completion_model_and_kwargs
+from api.citations import citation_from_dict
+from api.corpus import changed_since, corpus_generation
+from api.generation import (
+    GroundedAnswer,
+    SourceCitation,
+    StageTimings,
+    completion_model_and_kwargs,
+)
 from api.settings import AppSettings
 
 
@@ -37,12 +44,113 @@ class CachedAnswer:
     truncated: bool = False
     weak_matches: bool = False
     citation_backfilled: bool = False
+    passages_left_out: int = 0
     # Summaries only: (passages read, passages in the documents).
     coverage: tuple[int, int] | None = None
     followups: tuple[str, ...] = ()
 
+    # The three ways an answer is stored and served — from the sync answer, from the
+    # stream's (or a summary's) `done` frame, and back as a sync answer — in one place,
+    # so a field added to one can't be left out of another.
+
+    @classmethod
+    def from_grounded(cls, grounded: GroundedAnswer) -> CachedAnswer:
+        return cls(
+            grounded.answer,
+            tuple(grounded.sources),
+            grounded.trace_id,
+            grounded.answer_status,
+            grounded.top_rerank_score,
+            grounded.truncated,
+            weak_matches=grounded.weak_matches,
+            citation_backfilled=grounded.citation_backfilled,
+            passages_left_out=grounded.passages_left_out,
+            followups=tuple(grounded.followups),
+        )
+
+    @classmethod
+    def from_done(cls, done: Mapping[str, Any], followups: Sequence[str] = ()) -> CachedAnswer:
+        """From a ``done`` frame; a summary's (it has ``chunks_read``) keeps its coverage."""
+
+        summary = "chunks_read" in done or "chunks_total" in done
+        return cls(
+            done["answer"],
+            tuple(citation_from_dict(source) for source in done["sources"]),
+            done["trace_id"],
+            done.get("answer_status", "answered"),
+            None if summary else done.get("top_rerank_score"),
+            done.get("truncated", False),
+            weak_matches=done.get("weak_matches", False),
+            citation_backfilled=done.get("citation_backfilled", False),
+            passages_left_out=done.get("passages_left_out", 0),
+            coverage=(done.get("chunks_read", 0), done.get("chunks_total", 0)) if summary else None,
+            followups=tuple(followups),
+        )
+
+    def as_grounded(self, timings: StageTimings) -> GroundedAnswer:
+        """The sync answer this entry serves, marked cached."""
+
+        return GroundedAnswer(
+            answer=self.answer,
+            sources=list(self.sources),
+            timings=timings,
+            trace_id=self.trace_id,
+            cached=True,
+            answer_status=self.answer_status,
+            top_rerank_score=self.top_rerank_score,
+            weak_matches=self.weak_matches,
+            truncated=self.truncated,
+            citation_backfilled=self.citation_backfilled,
+            passages_left_out=self.passages_left_out,
+            followups=list(self.followups),
+        )
+
 
 CacheKey = tuple[object, ...]
+
+
+class ScopedGeneration:
+    """The corpus generation in the key of an answer drawn from named documents only.
+
+    Equal (and hashed) by collection and documents alone, so a lookup finds the entry
+    whatever has changed since; ``AnswerCache.get`` then serves it only if none of
+    those documents changed after ``generation`` — read when the question was asked,
+    before retrieval — so an upload elsewhere in the corpus (a watched folder, a URL
+    refresh) no longer empties every scoped entry. When the change log can't say
+    (``changed_since`` is None), it is a miss.
+    """
+
+    def __init__(self, collection: str, filenames: frozenset[str], generation: int) -> None:
+        self.collection = collection
+        self.filenames = filenames
+        self.generation = generation
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, ScopedGeneration)
+            and self.collection == other.collection
+            and self.filenames == other.filenames
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.collection, self.filenames))
+
+    def unchanged(self) -> bool:
+        changed = changed_since(self.generation, self.collection)
+        return changed is not None and not (changed & self.filenames)
+
+
+def corpus_state(
+    settings: AppSettings, filenames: Sequence[str] | None, tags: Sequence[str] | None = None
+) -> int | ScopedGeneration:
+    """The part of a cache key that says which corpus an answer was drawn from: for
+    named documents only (no tags, which any upload could match), a
+    ``ScopedGeneration``; else the collection's generation, which every change moves."""
+
+    collection = settings.qdrant_collection
+    if filenames and not tags:
+        return ScopedGeneration(collection, frozenset(filenames), corpus_generation(collection))
+    return corpus_generation(collection)
 
 
 def answer_cache_key(
@@ -78,7 +186,7 @@ def answer_cache_key(
         int(settings.context_neighbor_radius),
         int(settings.rerank_fallback_count),
         narrow,
-        corpus_generation(settings.qdrant_collection),
+        corpus_state(settings, filenames, tags),
     )
 
 
@@ -134,7 +242,9 @@ class AnswerCache:
         self._ttl = ttl_seconds
         self._clock = clock
         self._lock = Lock()
-        self._entries: OrderedDict[CacheKey, tuple[float, CachedAnswer]] = OrderedDict()
+        self._entries: OrderedDict[
+            CacheKey, tuple[float, CachedAnswer, ScopedGeneration | None]
+        ] = OrderedDict()
         # Shared with the cache: a follower replays the leader's cached answer.
         self.inflight = InflightRuns()
 
@@ -143,17 +253,22 @@ class AnswerCache:
             entry = self._entries.get(key)
             if entry is None:
                 return None
-            stored_at, value = entry
-            if self._clock() - stored_at > self._ttl:
+            stored_at, value, scope = entry
+            if self._clock() - stored_at > self._ttl or (
+                scope is not None and not scope.unchanged()
+            ):
                 del self._entries[key]
                 return None
             self._entries.move_to_end(key)
             return value
 
     def put(self, key: CacheKey, value: CachedAnswer) -> None:
+        scope = key[-1] if key and isinstance(key[-1], ScopedGeneration) else None
         with self._lock:
-            self._entries[key] = (self._clock(), value)
-            self._entries.move_to_end(key)
+            # Replaced, not updated: a dict keeps the first key object, whose generation
+            # would then describe an older answer.
+            self._entries.pop(key, None)
+            self._entries[key] = (self._clock(), value, scope)
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
 

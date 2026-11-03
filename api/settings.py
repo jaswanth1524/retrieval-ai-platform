@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Literal
 
-from pydantic import Field, PositiveInt, field_validator, model_validator
+from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The schema's cap on documents per summary request (api/schemas.py imports it).
@@ -318,6 +318,15 @@ class AppSettings(BaseSettings):
     # still get through. Off by default.
     auto_reindex_stale: bool = False
     auto_reindex_batch: PositiveInt = 4
+    # With JOB_STORE_BACKEND=sqlite: a re-index or URL fetch a restart cut off is started
+    # again (once) at startup, as POST /documents/jobs/{id}/retry would.
+    requeue_interrupted_jobs: bool = True
+    # Scheduled backups (api/scheduled_backup.py): the /export zip of every workspace
+    # written to BACKUP_DIR/<workspace>/ every BACKUP_INTERVAL_HOURS, the newest
+    # BACKUP_KEEP of each kept. Empty = off.
+    backup_dir: str = ""
+    backup_interval_hours: PositiveFloat = 24
+    backup_keep: PositiveInt = 7
     # Upload bytes allowed to sit queued or in progress at once. Every accepted upload
     # holds its full content in memory until its ingest job finishes, and the executor
     # queue itself is unbounded — past this budget uploads get 503 + Retry-After

@@ -1,5 +1,6 @@
 import { memo, useDeferredValue, useMemo, useState } from 'react';
 import type { SavedAnswer } from '../hooks/useChat';
+import { SOURCE_CHANGE_HINTS, type SourceChange } from '../utils/citationFreshness';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { normalized } from '../utils/questions';
 import { sliceWhole } from '../utils/text';
@@ -10,6 +11,32 @@ interface SavedPanelProps {
   /** Open the conversation at that answer. */
   onOpen: (conversationId: string, turnId: string) => void;
   onUnsave: (conversationId: string, turnId: string) => void;
+  /** Whether a cited document was deleted or uploaded again after an answer. */
+  sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
+  /** The workspace whose documents ``sourceChangeOf`` knows: another's answers are
+   *  never checked against them (each of their sources would read "deleted"). */
+  workspace?: string;
+}
+
+/** The answer's sources that changed since it was saved, said in one line. */
+function changedSources(
+  item: SavedAnswer,
+  sourceChangeOf: SavedPanelProps['sourceChangeOf'],
+  workspace: string,
+): string | null {
+  if (!sourceChangeOf || item.workspace !== workspace) return null;
+  const deleted: string[] = [];
+  const changed: string[] = [];
+  for (const filename of new Set(item.turn.sources.map((source) => source.filename))) {
+    const change = sourceChangeOf(filename, item.turn.timestamp);
+    if (change === 'deleted') deleted.push(filename);
+    else if (change === 'changed') changed.push(filename);
+  }
+  const parts = [
+    ...(changed.length ? [`changed since: ${changed.join(', ')}`] : []),
+    ...(deleted.length ? [`deleted: ${deleted.join(', ')}`] : []),
+  ];
+  return parts.length ? parts.join(' · ') : null;
 }
 
 // How much of an answer a row shows.
@@ -22,7 +49,7 @@ function excerpt(content: string): string {
 
 /** Every saved answer (★ on an answer), across the conversations: found again here
  *  rather than by remembering which conversation it was in. */
-function SavedPanel({ answers, onOpen, onUnsave }: SavedPanelProps) {
+function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' }: SavedPanelProps) {
   const [filter, setFilter] = useState('');
   const needle = normalized(useDeferredValue(filter));
   const shown = useMemo(
@@ -69,6 +96,18 @@ function SavedPanel({ answers, onOpen, onUnsave }: SavedPanelProps) {
               <span className="unanswered-panel__meta" dir="auto">
                 {excerpt(item.turn.content)}
               </span>
+              {(() => {
+                const note = changedSources(item, sourceChangeOf, workspace);
+                return note ? (
+                  <span
+                    className="unanswered-panel__meta saved-panel__changed"
+                    title={SOURCE_CHANGE_HINTS.changed}
+                    data-testid="saved-changed"
+                  >
+                    Sources {note}
+                  </span>
+                ) : null;
+              })()}
               <span className="unanswered-panel__meta mono">
                 <span>{item.conversationTitle}</span>
                 <span className="unanswered-panel__spacer" />

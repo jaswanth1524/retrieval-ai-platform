@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header
@@ -25,6 +26,7 @@ from api.schemas import (
     REQUEST_RERANK_TOP_K_MAX,
     REQUEST_TEMPERATURE_MAX,
     AccessResponse,
+    BackupStatusResponse,
     HealthResponse,
     PublicConfigResponse,
     ReadinessResponse,
@@ -83,6 +85,12 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
     )
 
 
+def _last_backup(app: FastAPI) -> BackupStatusResponse | None:
+    backup = getattr(app.state, "backup", None)
+    last = getattr(backup, "last", None)
+    return BackupStatusResponse(**dataclasses.asdict(last)) if last is not None else None
+
+
 def register(app: FastAPI) -> None:
     """Register health, readiness, metrics and config routes."""
 
@@ -135,6 +143,7 @@ def register(app: FastAPI) -> None:
             index_detail=index_detail,
             originals_kept=bool(settings.raw_document_dir),
             models=health.states() if health is not None else {},
+            last_backup=_last_backup(app),
         )
         status_code = 200 if ready else 503
         return JSONResponse(status_code=status_code, content=body.model_dump())

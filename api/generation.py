@@ -50,7 +50,6 @@ from api.prompting import (
     build_condense_messages,
     build_expansion_messages,
     build_grounded_messages,
-    condense_question,
     context_window_tokens,
     estimate_prompt_tokens,
     fit_prompt_to_context_window,
@@ -91,7 +90,6 @@ __all__ = [
     "cited_numbers",
     "cited_sources",
     "completion_model_and_kwargs",
-    "condense_question",
     "context_window_tokens",
     "effective_max_tokens",
     "estimate_prompt_tokens",
@@ -187,6 +185,9 @@ class GroundedAnswer:
     # The answer cited nothing and citations were added by matching its sentences to
     # the sources (citations.backfill_citations), not by the model.
     citation_backfilled: bool = False
+    # Passages the question picked (chunk_ids) that the prompt had no room for: past
+    # max_context_chunks (or the reranker's candidates), or cut to fit the window.
+    passages_left_out: int = 0
     # Wall-clock of that retry's LLM call, 0.0 when it didn't fire. Carried out so the
     # pipeline can subtract it from the block it measures as generate_ms — the retry
     # happens inside generate_grounded_answer, but it is not generation.

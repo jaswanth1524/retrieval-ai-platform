@@ -68,6 +68,10 @@ export interface CommandActions {
   showShortcuts?: () => void;
   /** Move to the next (1) or previous (-1) answer in the thread. */
   moveBetweenAnswers?: (step: 1 | -1) => void;
+  /** Every source the conversation's answers cite, as CSV. */
+  exportCitedSources?: () => void;
+  /** Open source ``number`` (1-9) of the focused answer, else the latest one. */
+  openAnswerSource?: (number: number) => void;
 }
 
 interface PaletteControls {
@@ -189,6 +193,13 @@ export function useCommands(
         label: 'Export conversation as JSON',
         run: () => run.current.exportJson(),
         disabled: !hasTurns,
+      },
+      {
+        id: 'export-sources',
+        glyph: '⇩',
+        label: 'Export cited sources (CSV)',
+        run: () => run.current.exportCitedSources?.(),
+        disabled: !hasAnswer,
       },
       {
         id: 'print',
@@ -372,7 +383,7 @@ export function useCommands(
     };
     // Keys with no modifier, only while nothing editable has focus (they are text there):
     // ? the shortcut list, ] and [ the next and previous conversation, j and k the next
-    // and previous answer.
+    // and previous answer, 1-9 a source of the focused answer.
     const plainKey = (event: KeyboardEvent) => {
       if (event.repeat || paletteRef.current.otherDialogOpen) return;
       if (isEditable(event.target)) return;
@@ -387,6 +398,9 @@ export function useCommands(
       } else if ((event.key === 'j' || event.key === 'k') && !event.shiftKey) {
         event.preventDefault();
         actions.moveBetweenAnswers?.(event.key === 'j' ? 1 : -1);
+      } else if (/^[1-9]$/.test(event.key) && actions.openAnswerSource) {
+        event.preventDefault();
+        actions.openAnswerSource(Number(event.key));
       }
     };
     document.addEventListener('keydown', onKeyDown);
@@ -412,5 +426,6 @@ export const PLAIN_KEYS: Array<[keys: string, what: string]> = [
   ['?', 'This list'],
   [']  [', 'Next / previous conversation'],
   ['j  k', 'Next / previous answer'],
+  ['1 – 9', "Open that source of the focused (or latest) answer"],
   ['Esc', 'Stop the answer, or close a dialog'],
 ];

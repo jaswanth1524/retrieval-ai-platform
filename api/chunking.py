@@ -346,13 +346,32 @@ def _split_oversized(
     return pieces
 
 
+# A long run is measured this many characters per budget token at a time, not whole: a
+# token is rarely more than a few characters, so the window holds several pieces, and
+# measuring the whole remainder for every piece made a multi-megabyte base64 value
+# quadratic (minutes of tokenizer work holding an ingest worker).
+_SPLIT_WINDOW_CHARS_PER_TOKEN = 32
+
+
 def _split_long_word(word: str, budget: int, token_counter: TokenCounter) -> list[tuple[str, int]]:
-    """Cut one over-budget run of characters into pieces of at most ``budget`` tokens."""
+    """Cut one over-budget run of characters into pieces of at most ``budget`` tokens.
+
+    The rest of the run is measured whole while it fits the window (every ordinary
+    word, so their pieces are what they always were); past that, the window stands in
+    for it, doubled while it doesn't yet exceed the budget.
+    """
 
     pieces: list[tuple[str, int]] = []
-    rest = word
-    while rest:
+    window = max(budget, 1) * _SPLIT_WINDOW_CHARS_PER_TOKEN
+    start = 0
+    while start < len(word):
+        end = min(len(word), start + window)
+        rest = word[start:end]
         total = token_counter.count(rest)
+        while total <= budget and end < len(word):
+            end = min(len(word), start + 2 * (end - start))
+            rest = word[start:end]
+            total = token_counter.count(rest)
         if total <= budget:
             pieces.append((rest, total))
             break
@@ -364,7 +383,7 @@ def _split_long_word(word: str, budget: int, token_counter: TokenCounter) -> lis
             length = max(1, length * budget // max(piece_tokens, 1) - 1)
             piece_tokens = token_counter.count(rest[:length])
         pieces.append((rest[:length], piece_tokens))
-        rest = rest[length:]
+        start += length
     return pieces
 
 

@@ -208,6 +208,8 @@ class TraceArchiveStore(Protocol):
 
     def export_lines(self, workspace: str) -> Iterator[str]: ...
 
+    def delete_workspace(self, workspace: str) -> int: ...
+
 
 def trace_to_json(trace: QueryTrace) -> str:
     return json.dumps(dataclasses.asdict(trace), ensure_ascii=False)
@@ -275,6 +277,21 @@ class TraceStore:
         except Exception:  # noqa: BLE001 - an unreadable archive is a miss
             logger.warning("Could not read trace %s from the archive.", trace_id, exc_info=True)
             return None
+
+    def delete_workspace(self, workspace: str) -> int:
+        """Forget ``workspace``'s traces (it was deleted), in memory and archived; how
+        many were held in memory."""
+
+        with self._lock:
+            gone = [key for key, trace in self._traces.items() if trace.workspace == workspace]
+            for key in gone:
+                del self._traces[key]
+        if self._archive is not None:
+            try:
+                self._archive.delete_workspace(workspace)
+            except Exception:  # noqa: BLE001 - logged; the workspace is gone regardless
+                logger.warning("Could not remove workspace %r's archived traces.", workspace)
+        return len(gone)
 
     def list_traces(self, workspace: str | None = None) -> list[QueryTrace]:
         """Return the retained traces, newest first; only ``workspace``'s when given.

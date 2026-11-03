@@ -73,10 +73,13 @@ export function useDialog<T extends HTMLElement = HTMLDivElement>(
       const last = items[items.length - 1];
       const active = document.activeElement;
 
-      if (event.shiftKey && (active === first || !containerRef.current.contains(active))) {
+      // Focus outside the dialog (a click on its blank space leaves it on <body>) is
+      // brought back in either way: Tab to the first item, Shift+Tab to the last.
+      const outside = !containerRef.current.contains(active);
+      if (event.shiftKey && (active === first || outside)) {
         event.preventDefault();
         last.focus();
-      } else if (!event.shiftKey && active === last) {
+      } else if (!event.shiftKey && (active === last || outside)) {
         event.preventDefault();
         first.focus();
       }

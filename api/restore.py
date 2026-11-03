@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import math
+import re
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -73,12 +74,20 @@ class ImportOutcome:
     rejected: list[str] = field(default_factory=list)
     feedback_imported: int = 0
     feedback_skipped: int = 0
+    # Earlier versions of restored documents put back (a backup taken with them).
+    versions_restored: int = 0
 
 
 Enqueue = Callable[
     [str, bytes, float | None, tuple[str, ...], DocumentSource | None],
     DocumentJobAcceptedResponse,
 ]
+
+# (filename, version id, bytes) -> whether the version was kept: RawDocumentStore.add_version.
+KeepVersion = Callable[[str, str, bytes], bool]
+# A manifest listing more versions of one document than this is not one we wrote.
+_VERSIONS_PER_DOCUMENT_MAX = 100
+_VERSION_ID_RE = re.compile(r"\d{1,20}")
 
 # A source string longer than this isn't one the server stored (MAX_URL_CHARS, or a
 # response header's value): the document is restored without it.
@@ -125,6 +134,7 @@ def restore_backup(
     enqueue: Enqueue,
     feedback_store: FeedbackStore | None,
     workspace: str = "",
+    keep_version: KeepVersion | None = None,
 ) -> ImportOutcome:
     try:
         archive = zipfile.ZipFile(upload)
@@ -147,6 +157,7 @@ def restore_backup(
                 max_original_bytes=max_original_bytes,
                 has_room=has_room,
                 enqueue=enqueue,
+                keep_version=keep_version,
             )
         if feedback_store is not None and "feedback.jsonl" in members:
             try:
@@ -170,7 +181,7 @@ def _manifest(archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo]) -> 
         raise BackupImportError("manifest.json in the archive is damaged or encrypted.") from None
     try:
         manifest = json.loads(raw) if raw is not None else None
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: nested past the parser's depth
         manifest = None
     if not isinstance(manifest, dict) or not isinstance(manifest.get("documents"), list):
         raise BackupImportError("manifest.json is not a DocRAG backup manifest.")
@@ -192,6 +203,7 @@ def _restore_document(
     max_original_bytes: int,
     has_room: Callable[[int], bool],
     enqueue: Enqueue,
+    keep_version: KeepVersion | None = None,
 ) -> None:
     if not isinstance(document, dict) or not isinstance(document.get("filename"), str):
         return
@@ -246,6 +258,10 @@ def _restore_document(
         )
         # A manifest that lists the name twice queues it once.
         existing_filenames.add(filename)
+        if keep_version is not None:
+            _restore_versions(
+                archive, members, document, filename, outcome, max_original_bytes, keep_version
+            )
     except WorkspaceClosingError:
         # The workspace is being deleted: that delete either goes through, and the
         # workspace is gone, or doesn't, and the document comes in on the next try.
@@ -257,6 +273,42 @@ def _restore_document(
         outcome.deferred.append(filename)
     except DocumentError:
         outcome.rejected.append(filename)
+
+
+def _restore_versions(
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    document: dict[str, Any],
+    filename: str,
+    outcome: ImportOutcome,
+    max_bytes: int,
+    keep_version: KeepVersion,
+) -> None:
+    """Put back the earlier versions the manifest lists for a document just queued.
+    A damaged or oversized one is skipped (and the version is simply not there); the
+    store keeps no more than RAW_DOCUMENT_VERSIONS of them."""
+
+    listed = document.get("versions")
+    if not isinstance(listed, list):
+        return
+    for version in listed[:_VERSIONS_PER_DOCUMENT_MAX]:
+        if not isinstance(version, str) or not _VERSION_ID_RE.fullmatch(version):
+            continue
+        info = members.get(f"versions/{filename}/{version}")
+        if info is None:
+            continue
+        try:
+            content = _read_capped(archive, info, max_bytes)
+        except _UnreadableMemberError:
+            content = None
+        if content is None:
+            logger.warning("Skipped a damaged version of %s in the backup.", filename)
+            continue
+        try:
+            if keep_version(filename, version, content):
+                outcome.versions_restored += 1
+        except OSError:
+            logger.warning("Could not put back a version of %s.", filename, exc_info=True)
 
 
 def _source(document: dict[str, Any]) -> DocumentSource | None:
@@ -417,5 +469,7 @@ def _feedback_row(line: str) -> Feedback | None:
             created_at=created_at,
             kind=kind,
         )
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):
+        # RecursionError: a line nested past the parser's depth is one bad row; as a
+        # RuntimeError it read as a damaged member, dropping every row after it.
         return None

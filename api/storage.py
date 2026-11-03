@@ -26,6 +26,8 @@ def enabled_store_directories(settings: AppSettings) -> list[tuple[str, Path]]:
         directories.append(("QUERY_LOG_PATH", Path(settings.query_log_path).parent))
     if settings.url_refresh_interval_minutes and settings.url_refresh_state_path:
         directories.append(("URL_REFRESH_STATE_PATH", Path(settings.url_refresh_state_path).parent))
+    if settings.backup_dir:
+        directories.append(("BACKUP_DIR", Path(settings.backup_dir)))
     if settings.trace_enabled and settings.trace_store_path:
         directories.append(("TRACE_STORE_PATH", Path(settings.trace_store_path).parent))
     return directories

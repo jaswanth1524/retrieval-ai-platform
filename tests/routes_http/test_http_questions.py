@@ -214,6 +214,12 @@ def test_question_endpoint_rejects_rerank_top_k_above_fused_top_n(
 
     assert response.status_code == 400
     assert "fused_top_n" in response.json()["detail"]
+    # The stream refuses it the same way, before its 200 (not an error frame after).
+    streamed = api_context.client.post(
+        "/questions/stream", json={"question": "alpha", "rerank_top_k": 45}
+    )
+    assert streamed.status_code == 400
+    assert "fused_top_n" in streamed.json()["detail"]
 
 
 def test_question_endpoint_accepts_valid_overrides_and_limits_sources(

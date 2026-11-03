@@ -290,6 +290,19 @@ class DocragClient:
         result: dict[str, Any] = self._json("GET", f"/traces/{_quote(trace_id)}")
         return result
 
+    def score_report(self) -> dict[str, Any]:
+        """Best rerank scores of answered against unanswered questions, and a suggested
+        RERANK_MIN_SCORE when there are enough of both."""
+
+        result: dict[str, Any] = self._json("GET", "/traces/score-report")
+        return result
+
+    def trace_diff(self, trace_id: str, other_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json(
+            "GET", f"/traces/{_quote(trace_id)}/diff/{_quote(other_id)}"
+        )
+        return result
+
     def feedback(self, limit: int = 100) -> list[dict[str, Any]]:
         """Recorded answer ratings, newest first (FEEDBACK_ENABLED, full key)."""
 
@@ -722,6 +735,12 @@ class DocragClient:
             params["uncovered"] = "true"
         result: dict[str, Any] = self._json("GET", "/query-log", params=params)
         return list(result.get("queries", []))
+
+    def recheck_unanswered(self, limit: int = 20) -> dict[str, Any]:
+        """The latest unanswered logged questions searched again now (no LLM call)."""
+
+        result: dict[str, Any] = self._json("POST", "/query-log/recheck", params={"limit": limit})
+        return result
 
     def active_jobs(self) -> list[dict[str, Any]]:
         """Queued and running indexing jobs, whoever started them."""

@@ -459,3 +459,32 @@ def test_feedback_lists_backs_up_and_restores_per_workspace(ws: Workspaces) -> N
     assert restored.json()["feedback_imported"] == 1
     assert questions(archive_headers) == ["legal q"]
     assert questions(FULL) == ["default q"]
+
+
+def test_a_workspace_created_again_inherits_nothing_from_the_deleted_one(
+    ws: Workspaces,
+) -> None:
+    client = ws.client
+    client.post("/workspaces", json={"name": "legal"}, headers=FULL)
+    upload_and_wait(client, "guide.txt", b"Intro\nDefault alpha.", headers=FULL)
+    accepted = client.post(
+        "/documents", files={"file": ("guide.txt", b"Intro\nLegal alpha.")}, headers=LEGAL
+    )
+    assert wait_for_job(client, accepted.json()["job_id"], headers=LEGAL)["state"] == "done"
+    client.post("/questions", json={"question": "alpha"}, headers=LEGAL)
+    client.post("/questions", json={"question": "alpha"}, headers=FULL)
+    rating = {"question": "q", "answer_excerpt": "a", "cited_filenames": [], "rating": "up"}
+    assert client.post("/feedback", json=rating, headers=LEGAL).status_code == 201
+    assert client.post("/feedback", json=rating, headers=FULL).status_code == 201
+
+    assert client.delete("/documents/guide.txt", headers=LEGAL).status_code == 200
+    assert client.delete("/workspaces/legal", headers=FULL).status_code == 200
+    assert client.post("/workspaces", json={"name": "legal"}, headers=FULL).status_code == 201
+
+    assert client.get("/traces", headers=LEGAL).json()["traces"] == []
+    assert client.get("/feedback", headers=LEGAL).json()["feedback"] == []
+    assert client.get("/documents/jobs?state=recent", headers=LEGAL).json()["jobs"] == []
+    # The default workspace keeps its own.
+    assert len(client.get("/traces", headers=FULL).json()["traces"]) == 1
+    assert len(client.get("/feedback", headers=FULL).json()["feedback"]) == 1
+    assert client.get("/documents/jobs?state=recent", headers=FULL).json()["jobs"]

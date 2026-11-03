@@ -2,6 +2,7 @@ import { memo, useState } from 'react';
 import type { TraceSummaryResponse } from '../api/types';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { ANSWER_FILTER_STATUSES, type AnswerFilter } from '../utils/traceFilters';
+import { ScoreReportView, TraceDiffView } from './TraceTools';
 import './TracesPanel.css';
 
 interface TracesPanelProps {
@@ -41,6 +42,9 @@ function TracesPanel({
 }: TracesPanelProps) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
+  const [showReport, setShowReport] = useState(false);
+  // Compare mode: the next two rows clicked are compared instead of opened.
+  const [comparing, setComparing] = useState<string[] | null>(null);
   const filterControl = onAnswerFilter && (
     <label className="traces-panel__problems mono">
       answers
@@ -102,6 +106,26 @@ function TracesPanel({
           errors &amp; no context only
         </label>
         {filterControl}
+        <button
+          type="button"
+          className="traces-panel__export mono"
+          onClick={() => setShowReport((open) => !open)}
+          aria-expanded={showReport}
+          title="Best match scores of answered against unanswered questions, and a suggested bar"
+          data-testid="traces-score-report"
+        >
+          score report
+        </button>
+        <button
+          type="button"
+          className="traces-panel__export mono"
+          onClick={() => setComparing((current) => (current ? null : []))}
+          aria-pressed={comparing !== null}
+          title="Pick two traces to see what differs between them"
+          data-testid="traces-compare"
+        >
+          {comparing === null ? 'compare…' : comparing.length === 0 ? 'pick two…' : 'pick one more…'}
+        </button>
         {onExport && (
           <button
             type="button"
@@ -115,6 +139,10 @@ function TracesPanel({
           </button>
         )}
       </div>
+      {showReport && <ScoreReportView onClose={() => setShowReport(false)} />}
+      {comparing?.length === 2 && (
+        <TraceDiffView a={comparing[0]} b={comparing[1]} onClose={() => setComparing(null)} />
+      )}
       {shown.length === 0 && (
         <p className="traces-panel__message">No traces match.</p>
       )}
@@ -122,8 +150,14 @@ function TracesPanel({
         <button
           key={trace.trace_id}
           type="button"
-          className="traces-panel__row"
-          onClick={() => onSelect(trace.trace_id)}
+          className={`traces-panel__row${comparing?.includes(trace.trace_id) ? ' traces-panel__row--picked' : ''}`}
+          onClick={() => {
+            if (comparing === null) onSelect(trace.trace_id);
+            else if (comparing.length < 2 && !comparing.includes(trace.trace_id)) {
+              setComparing([...comparing, trace.trace_id]);
+            }
+          }}
+          aria-pressed={comparing !== null ? comparing.includes(trace.trace_id) : undefined}
           data-testid="traces-panel-row"
         >
           <span className="traces-panel__query">{trace.question}</span>

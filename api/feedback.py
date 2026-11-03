@@ -263,6 +263,13 @@ class FeedbackStore:
         page = [_feedback(row[1:]) for row in rows]
         return page, ((rows[-1][8], rows[-1][0]) if rows else None)
 
+    def delete_workspace(self, workspace: str) -> int:
+        """Remove every row of ``workspace`` (deleted): a workspace created again under
+        its name must not inherit its ratings, nor carry them into its backups."""
+
+        with self._lock, self._connect() as conn:
+            return conn.execute("DELETE FROM feedback WHERE workspace = ?", (workspace,)).rowcount
+
     def list_recent(self, limit: int = 100, workspace: str | None = None) -> list[Feedback]:
         """Return the most recent feedback, newest first by when it was given (a row
         restored from a backup keeps its original time); only ``workspace``'s when it is

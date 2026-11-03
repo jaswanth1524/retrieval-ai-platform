@@ -58,6 +58,8 @@ export interface DocumentMeta {
   sourceUrl?: string;
   /** Its scheduled refresh (fetched documents only). */
   urlRefresh?: UrlRefreshStatusResponse;
+  /** Other indexed documents with exactly the same bytes. */
+  sameAs?: string[];
 }
 
 

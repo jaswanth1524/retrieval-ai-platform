@@ -28,6 +28,8 @@ PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
     # to an existing collection in place at startup (ensure_payload_indexes).
     ("page_end", models.PayloadSchemaType.INTEGER),
     ("uploaded_at", models.PayloadSchemaType.FLOAT),
+    # The duplicate check after an ingest (another document with the same bytes).
+    ("content_sha256", models.PayloadSchemaType.KEYWORD),
 )
 
 

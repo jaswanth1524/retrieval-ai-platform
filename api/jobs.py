@@ -159,6 +159,8 @@ class JobStore(Protocol):
         self, workspace: str, *, failed_only: bool = False, limit: int = 100
     ) -> list[IngestJob]: ...
 
+    def delete_finished(self, workspace: str) -> int: ...
+
 
 class IngestJobStore:
     """Thread-safe in-memory store for background ingest job status."""
@@ -237,6 +239,20 @@ class IngestJobStore:
                 and (job.state == "failed" or not failed_only)
             ]
         return jobs[:limit]
+
+    def delete_finished(self, workspace: str) -> int:
+        """Forget ``workspace``'s finished jobs (it was deleted): a workspace created
+        again under its name must not list them as its history."""
+
+        with self._lock:
+            gone = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.workspace == workspace and job.state in TERMINAL_STATES
+            ]
+            for job_id in gone:
+                del self._jobs[job_id]
+        return len(gone)
 
     def _prune_finished_locked(self) -> None:
         """Evict oldest-first to stay within the cap, finished jobs first.
@@ -361,6 +377,16 @@ class SqliteIngestJobStore:
             # non-terminal at startup belonged to a process that died mid-ingest. Left
             # as-is, a client polling it would wait forever.
             terminal = ", ".join("?" for _ in TERMINAL_STATES)
+            # Remembered, so the jobs that can be started again are
+            # (REQUEUE_INTERRUPTED_JOBS, main.requeue_interrupted_jobs).
+            self.interrupted_at_open: tuple[str, ...] = tuple(
+                str(row[0])
+                for row in conn.execute(
+                    f"SELECT id FROM jobs WHERE state NOT IN ({terminal}) "
+                    "ORDER BY created_at_wall, rowid",
+                    tuple(TERMINAL_STATES),
+                )
+            )
             conn.execute(
                 f"UPDATE jobs SET state = 'failed', error = ? WHERE state NOT IN ({terminal})",
                 (INTERRUPTED_JOB_ERROR, *TERMINAL_STATES),
@@ -439,6 +465,14 @@ class SqliteIngestJobStore:
                 (workspace, *states, limit),
             ).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    def delete_finished(self, workspace: str) -> int:
+        terminal = ", ".join("?" for _ in TERMINAL_STATES)
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                f"DELETE FROM jobs WHERE workspace = ? AND state IN ({terminal})",
+                (workspace, *TERMINAL_STATES),
+            ).rowcount
 
     def update(self, job_id: str, **fields: object) -> None:
         with self._lock, self._connect() as conn:

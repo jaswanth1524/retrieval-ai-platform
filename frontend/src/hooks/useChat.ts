@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/client';
+import type { QuestionStreamHandlers } from '../api/client';
 import type {
   FeedbackRating,
   HistoryMessage,
@@ -9,7 +10,6 @@ import type {
 } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
-import { sliceWhole } from '../utils/text';
 import { useChatPersistence } from './useChatPersistence';
 import { useConversationActions } from './useConversationActions';
 import type { ImportItem } from './useConversationActions';
@@ -25,6 +25,7 @@ import {
   deriveTitle,
   loadStorage,
   searchConversations as searchStoredConversations,
+  updateTurn,
   withoutConversation,
 } from './chatPersistence';
 import type {
@@ -44,99 +45,10 @@ export type {
   ConversationSummary,
 } from './chatPersistence';
 
-// Mirrors the server's own REQUEST_HISTORY_MAX_MESSAGES cap (api/schemas.py) — kept
-// in sync so a client-side trim never silently disagrees with what the server would
-// accept anyway. The char budget is a client-only practical guard against crowding
-// a small local model's context window; the server has its own count-based backstop.
-const HISTORY_MAX_MESSAGES = 12;
-const HISTORY_CHAR_BUDGET = 8000;
-// Mirrors the server's REQUEST_HISTORY_MESSAGE_MAX_CHARS (api/schemas.py) per-message
-// cap. Without this, one assistant answer over 4000 chars survives the total-budget
-// trim below (it's the only message so far) and the server 422s the whole request.
-const HISTORY_MESSAGE_MAX_CHARS = 4000;
-// How far back from the cap a whitespace break is still worth taking. A hard cut lands
-// mid-word and can sever a trailing qualifier or negation, which reads to the model as
-// something the speaker never said; backing up to the last space avoids that. Bounded
-// because text with no whitespace in its tail (a base64 blob, unspaced CJK) would
-// otherwise back off arbitrarily far — past this, a clean cut beats a short message.
-// A summary or comparison answer sent back as history: its gist is what a follow-up
-// ("what does it say about deadlines?") needs, and at the full 4000 characters one
-// summary took half of HISTORY_CHAR_BUDGET from the exchanges before it.
-const SUMMARY_HISTORY_MAX_CHARS = 1500;
-
-/** Truncate to HISTORY_MESSAGE_MAX_CHARS, preferring a nearby whitespace boundary.
- *
- * The result is always <= HISTORY_MESSAGE_MAX_CHARS: the ellipsis has to fit inside the
- * server's per-message limit too, so the budget it occupies is reserved up front rather
- * than appended after a full-width cut (which would land one char over and 422). */
-function truncateForHistory(content: string, maxChars = HISTORY_MESSAGE_MAX_CHARS): string {
-  if (content.length <= maxChars) return content;
-  const ELLIPSIS = '…';
-  const budget = maxChars - ELLIPSIS.length;
-  const hardCut = sliceWhole(content, budget);
-  const lastBreak = hardCut.lastIndexOf(' ');
-  const backoff = Math.floor(maxChars * 0.12);
-  const cut = lastBreak >= budget - backoff ? hardCut.slice(0, lastBreak) : hardCut;
-  // The marker is for the model's benefit: without it a truncated answer looks complete,
-  // so it may treat a severed sentence as the speaker's final word.
-  return `${cut.trimEnd()}${ELLIPSIS}`;
-}
-
-function isCompleteAnswer(turn: ChatTurn | undefined): boolean {
-  return (
-    turn?.role === 'assistant' &&
-    turn.content.trim().length > 0 &&
-    // A stopped answer is a fragment; sent back as history it reads to the model as
-    // what it actually concluded. Same for one cut short by a failed connection.
-    !turn.stopped &&
-    !turn.incomplete &&
-    // "Not enough information" answered nothing: sent back, the server's rewrite of the
-    // next question folded the refusal into the search and the model refused again.
-    !turn.notFound
-  );
-}
-
-/** Build bounded conversation history from prior turns: only answered questions and
- * their answers (a question that failed, was stopped or is being asked again has no
- * answer, and sent alone it read to the model as two questions in a row), most recent
- * first up to HISTORY_MAX_MESSAGES, each truncated to HISTORY_MESSAGE_MAX_CHARS, then
- * trimmed to a total char budget (dropping the oldest first), restored to
- * chronological order. */
-export function buildHistory(turns: ChatTurn[]): HistoryMessage[] {
-  const candidates = turns
-    .filter((turn, index): turn is ChatTurn & { role: 'user' | 'assistant' } =>
-      turn.role === 'user'
-        ? turn.content.trim().length > 0 && isCompleteAnswer(turns[index + 1])
-        : isCompleteAnswer(turn) && turns[index - 1]?.role === 'user',
-    )
-    .slice(-HISTORY_MAX_MESSAGES);
-
-  const withinBudget: HistoryMessage[] = [];
-  let charsUsed = 0;
-  for (let i = candidates.length - 1; i >= 0; i -= 1) {
-    const turn = candidates[i];
-    const isSummary = turn.role === 'assistant' && Boolean(candidates[i - 1]?.task);
-    const content = truncateForHistory(turn.content, isSummary ? SUMMARY_HISTORY_MAX_CHARS : undefined);
-    charsUsed += content.length;
-    if (charsUsed > HISTORY_CHAR_BUDGET && withinBudget.length > 0) break;
-    withinBudget.unshift({ role: candidates[i].role, content });
-  }
-  // The count cap can split a pair: history never opens on an answer to a question
-  // it doesn't carry.
-  if (withinBudget[0]?.role === 'assistant') withinBudget.shift();
-  return withinBudget;
-}
-
-/** History for asking ``question`` again (Retry, Regenerate): the exchange it repeats is
- *  left out, or the model saw the question twice, the second time already answered. */
-export function historyForQuestion(turns: ChatTurn[], question: string): HistoryMessage[] {
-  const history = buildHistory(turns);
-  const last = history.length - 2;
-  if (last >= 0 && history[last].role === 'user' && history[last].content === question) {
-    return history.slice(0, last);
-  }
-  return history;
-}
+// History sent with a question lives in utils/history; re-exported for the components
+// and tests that import it from here.
+import { buildHistory, historyForQuestion } from '../utils/history';
+export { buildHistory, historyForQuestion };
 
 // Server stage labels mapped to what the reader sees. Anything the server sends that
 // isn't listed here falls back to the generic label, so a new backend stage can never
@@ -189,6 +101,8 @@ export interface UseChatResult {
   conversations: ConversationSummary[];
   /** Every saved answer across the conversations, newest first. */
   savedAnswers: SavedAnswer[];
+  /** Every answer in this browser's conversations citing ``filename``, newest first. */
+  answersCiting: (filename: string) => SavedAnswer[];
   activeConversationId: string | null;
   // The active conversation's search scope.
   scope: ConversationScope;
@@ -275,6 +189,8 @@ const NO_TURNS: ChatTurn[] = [];
 export interface SavedAnswer {
   conversationId: string;
   conversationTitle: string;
+  /** The workspace its conversation asked in ("" = the default). */
+  workspace: string;
   turn: ChatTurn;
   /** The question it answered (the user turn before it), if there is one. */
   question: string | null;
@@ -323,7 +239,7 @@ export function busyRetrySeconds(err: unknown, attempt: number): number | null {
 
 /** Waits ``seconds``, calling ``onTick`` with the seconds left each second; ends early
  *  (resolving) when ``signal`` aborts. */
-function countDown(
+export function countDown(
   seconds: number,
   signal: AbortSignal,
   onTick: (left: number) => void,
@@ -343,6 +259,87 @@ function countDown(
     };
     signal.addEventListener('abort', done);
   });
+}
+
+/** ``send()``, asked again after a busy refusal (429: every question slot taken, or the
+ *  rate limit), up to BUSY_RETRY_ATTEMPTS times: ``onWait`` hears each second of the
+ *  wait, ``onResume`` that it is asking again. ``signal`` aborting ends the wait and
+ *  rethrows the refusal; any other error is rethrown at once. */
+export async function withBusyRetry(
+  send: () => Promise<void>,
+  signal: AbortSignal,
+  onWait: (left: number) => void,
+  onResume: () => void,
+): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await send();
+      return;
+    } catch (err) {
+      const waitSeconds = busyRetrySeconds(err, attempt);
+      if (waitSeconds === null || signal.aborted) throw err;
+      await countDown(waitSeconds, signal, onWait);
+      if (signal.aborted) throw err;
+      onResume();
+    }
+  }
+}
+
+type DoneArgs = Parameters<NonNullable<QuestionStreamHandlers['onDone']>>;
+
+/** The answer ``turn`` becomes at the stream's `done` frame. */
+export function answeredTurn(
+  turn: ChatTurn,
+  answer: DoneArgs[0],
+  sources: DoneArgs[1],
+  timings: DoneArgs[2],
+  traceId: DoneArgs[3],
+  cached: DoneArgs[4],
+  grounding: DoneArgs[5],
+): ChatTurn {
+  const status = grounding?.answerStatus;
+  const notFound = status === 'insufficient_context' || status === 'no_context';
+  return {
+    ...turn,
+    content: answer,
+    sources,
+    // The passages it was given, kept when it found nothing in them, so the reader can
+    // see what was looked at (text dropped: CitationCard opens the passage by chunk id).
+    ...(notFound && turn.sources.length > 0 && sources.length === 0
+      ? {
+          contextSources: turn.sources.map(({ spans: _spans, ...source }) => ({
+            ...source,
+            text: '',
+          })),
+        }
+      : {}),
+    ...(grounding?.autoCited ? { autoCited: true } : {}),
+    ...(grounding?.passagesLeftOut ? { passagesLeftOut: grounding.passagesLeftOut } : {}),
+    timings,
+    traceId,
+    ...(cached ? { cached: true } : {}),
+    ...(notFound ? { notFound: true } : {}),
+    ...(status === 'uncited' ? { uncited: true } : {}),
+    ...(grounding?.weakMatches ? { weakMatch: true } : {}),
+    ...(grounding?.truncated ? { truncated: true } : {}),
+    ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
+      ? { coverage: grounding.coverage }
+      : {}),
+    ...(typeof grounding?.topRerankScore === 'number'
+      ? { topRerankScore: grounding.topRerankScore }
+      : {}),
+    ...(grounding?.usage
+      ? {
+          usage: {
+            prompt: grounding.usage.prompt_tokens,
+            completion: grounding.usage.completion_tokens,
+            ...(typeof grounding.usage.cost_usd === 'number'
+              ? { costUsd: grounding.usage.cost_usd }
+              : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 interface TrailingStream {
@@ -391,7 +388,7 @@ export function useChat(): UseChatResult {
   // applied once per animation frame, and a hidden tab runs no frames).
   const streamingConversationIdRef = useRef<string | null>(null);
   const bufferedDeltaRef = useRef('');
-  const { persistError, persistPartial, historyReady } = useChatPersistence(storage, setStorage, pending, {
+  const { persistError, persistPartial, historyReady, historyLoaded } = useChatPersistence(storage, setStorage, pending, {
     storageRef,
     streamingTurnIdRef,
     streamingConversationIdRef,
@@ -587,9 +584,9 @@ export function useChat(): UseChatResult {
       // waited out with a countdown and asked again, up to BUSY_RETRY_ATTEMPTS times,
       // instead of an error turn telling the user to do exactly that by hand. Stop
       // cancels the wait.
-      for (let attempt = 1; ; attempt += 1) {
-        try {
-          await api.askQuestionStream(
+      await withBusyRetry(
+        () =>
+          api.askQuestionStream(
             question,
             provider,
             overrides,
@@ -630,49 +627,9 @@ export function useChat(): UseChatResult {
               },
               onDone: (answer, sources, timings, traceId, cached, grounding) => {
                 flushDelta();
-                const status = grounding?.answerStatus;
-                const notFound = status === 'insufficient_context' || status === 'no_context';
-                updateAssistantTurn((turn) => ({
-                  ...turn,
-                  content: answer,
-                  sources,
-                  // The passages it was given, kept when it found nothing in them, so
-                  // the reader can see what was looked at (text dropped: CitationCard
-                  // opens the passage by chunk id).
-                  ...(notFound && turn.sources.length > 0 && sources.length === 0
-                    ? {
-                        contextSources: turn.sources.map(({ spans: _spans, ...source }) => ({
-                          ...source,
-                          text: '',
-                        })),
-                      }
-                    : {}),
-                  ...(grounding?.autoCited ? { autoCited: true } : {}),
-                  timings,
-                  traceId,
-                  ...(cached ? { cached: true } : {}),
-                  ...(notFound ? { notFound: true } : {}),
-                  ...(status === 'uncited' ? { uncited: true } : {}),
-                  ...(grounding?.weakMatches ? { weakMatch: true } : {}),
-                  ...(grounding?.truncated ? { truncated: true } : {}),
-                  ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
-                    ? { coverage: grounding.coverage }
-                    : {}),
-                  ...(typeof grounding?.topRerankScore === 'number'
-                    ? { topRerankScore: grounding.topRerankScore }
-                    : {}),
-                  ...(grounding?.usage
-                    ? {
-                        usage: {
-                          prompt: grounding.usage.prompt_tokens,
-                          completion: grounding.usage.completion_tokens,
-                          ...(typeof grounding.usage.cost_usd === 'number'
-                            ? { costUsd: grounding.usage.cost_usd }
-                            : {}),
-                        },
-                      }
-                    : {}),
-                }));
+                updateAssistantTurn((turn) =>
+                  answeredTurn(turn, answer, sources, timings, traceId, cached, grounding),
+                );
                 finish();
                 // Still open for follow-ups; aborted on unmount or by a newer question here.
                 trailing = { conversationId, controller };
@@ -680,19 +637,14 @@ export function useChat(): UseChatResult {
               },
             },
             controller.signal,
-            options,
-          );
-          break;
-        } catch (err) {
-          const waitSeconds = busyRetrySeconds(err, attempt);
-          if (waitSeconds === null || controller.signal.aborted) throw err;
-          await countDown(waitSeconds, controller.signal, (left) =>
-            setStage(`server busy — asking again in ${left}s…`),
-          );
-          if (controller.signal.aborted) throw err;
-          setStage(DEFAULT_STAGE_LABEL);
-        }
-      }
+            // The workspace it was asked in: a retry after a 429 countdown went to
+            // whichever one the reader had switched to meanwhile.
+            { ...options, workspace },
+          ),
+        controller.signal,
+        (left) => setStage(`server busy — asking again in ${left}s…`),
+        () => setStage(DEFAULT_STAGE_LABEL),
+      );
     } catch (err) {
       flushDelta();
       // A user-initiated Stop aborts `controller`; a timeout aborts askQuestionStream's
@@ -873,8 +825,19 @@ export function useChat(): UseChatResult {
     });
   }, []);
 
+  // A listing that lands before the stored history has loaded is held, not applied:
+  // pruning then stamped edits on the compact localStorage copies, which then won the
+  // merge with IndexedDB's full ones (older turns and passage text lost).
+  const historyLoadedRef = useRef(historyLoaded);
+  historyLoadedRef.current = historyLoaded;
+  const heldPruneRef = useRef<[string[], string[] | undefined] | null>(null);
+
   const pruneScopes = useCallback(
     (indexedFilenames: string[], indexedTags?: string[]) => {
+      if (!historyLoadedRef.current) {
+        heldPruneRef.current = [indexedFilenames, indexedTags];
+        return;
+      }
       const indexed = new Set(indexedFilenames);
       // A tag no document carries filtered every question down to nothing, while the
       // header still named it and the popover (which lists tags in use) couldn't untick
@@ -887,6 +850,13 @@ export function useChat(): UseChatResult {
     },
     [keepInScopes],
   );
+
+  useEffect(() => {
+    if (!historyLoaded || heldPruneRef.current === null) return;
+    const [indexedFilenames, indexedTags] = heldPruneRef.current;
+    heldPruneRef.current = null;
+    pruneScopes(indexedFilenames, indexedTags);
+  }, [historyLoaded, pruneScopes]);
 
   const removeFromScopes = useCallback(
     (filenames: string[], workspace?: string) => {
@@ -938,7 +908,14 @@ export function useChat(): UseChatResult {
           docrag_conversations: storageRef.current.conversations
             .filter((conversation) => conversation.turns.length > 0)
             .sort(byRecentUse)
-            .map((conversation) => ({ title: conversation.title, turns: conversation.turns })),
+            // With its dates: an import keeps them (importConversations), and without
+            // them every imported conversation read as used just now.
+            .map((conversation) => ({
+              title: conversation.title,
+              createdAt: conversation.createdAt,
+              updatedAt: conversation.updatedAt,
+              turns: conversation.turns,
+            })),
         },
         null,
         2,
@@ -948,24 +925,20 @@ export function useChat(): UseChatResult {
 
   const setSourceIrrelevant = useCallback(
     (turnId: string, sourceNumber: number, marked: boolean) => {
-      setStorage((prev) => ({
-        ...prev,
-        conversations: prev.conversations.map((conversation) =>
-          conversation.turns.some((turn) => turn.id === turnId)
-            ? {
-                ...conversation,
-                turns: conversation.turns.map((turn) => {
-                  if (turn.id !== turnId) return turn;
-                  const others = (turn.irrelevantSources ?? []).filter((n) => n !== sourceNumber);
-                  const next = marked ? [...others, sourceNumber] : others;
-                  const { irrelevantSources: _previous, ...rest } = turn;
-                  return next.length > 0 ? { ...rest, irrelevantSources: next } : rest;
-                }),
-                editedAt: Date.now(),
-              }
-            : conversation,
+      setStorage((prev) =>
+        updateTurn(
+          prev,
+          undefined,
+          turnId,
+          (turn) => {
+            const others = (turn.irrelevantSources ?? []).filter((n) => n !== sourceNumber);
+            const next = marked ? [...others, sourceNumber] : others;
+            const { irrelevantSources: _previous, ...rest } = turn;
+            return next.length > 0 ? { ...rest, irrelevantSources: next } : rest;
+          },
+          Date.now(),
         ),
-      }));
+      );
     },
     [],
   );
@@ -974,44 +947,26 @@ export function useChat(): UseChatResult {
     // One conversation's turn: an edited question's copy shares the earlier turns' ids
     // (follow-ups, feedback and the in-flight answer key on them), so matching the id
     // alone saved the answer in both and listed it twice.
-    setStorage((prev) => {
-      const target = conversationId ?? prev.activeConversationId;
-      return {
-        ...prev,
-        conversations: prev.conversations.map((conversation) =>
-          conversation.id === target && conversation.turns.some((turn) => turn.id === turnId)
-            ? {
-                ...conversation,
-                turns: conversation.turns.map((turn) => {
-                  if (turn.id !== turnId) return turn;
-                  const { saved: _previous, ...rest } = turn;
-                  return saved ? { ...rest, saved: true } : rest;
-                }),
-                editedAt: Date.now(),
-              }
-            : conversation,
-        ),
-      };
-    });
+    setStorage((prev) =>
+      updateTurn(
+        prev,
+        conversationId ?? prev.activeConversationId ?? '',
+        turnId,
+        (turn) => {
+          const { saved: _previous, ...rest } = turn;
+          return saved ? { ...rest, saved: true } : rest;
+        },
+        Date.now(),
+      ),
+    );
   }, []);
 
   const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
     // Stored on the turn, so a rating survives a reload or a conversation switch and
     // the buttons can't send a duplicate row for the same answer.
-    setStorage((prev) => ({
-      ...prev,
-      conversations: prev.conversations.map((conversation) =>
-        conversation.turns.some((turn) => turn.id === turnId)
-          ? {
-              ...conversation,
-              turns: conversation.turns.map((turn) =>
-                turn.id === turnId ? { ...turn, feedback: rating } : turn,
-              ),
-              editedAt: Date.now(),
-            }
-          : conversation,
-      ),
-    }));
+    setStorage((prev) =>
+      updateTurn(prev, undefined, turnId, (turn) => ({ ...turn, feedback: rating }), Date.now()),
+    );
   }, []);
 
   const savedAnswersRef = useRef<SavedAnswer[]>([]);
@@ -1029,6 +984,7 @@ export function useChat(): UseChatResult {
         found.push({
           conversationId: conversation.id,
           conversationTitle: conversation.title,
+          workspace: conversation.workspace ?? '',
           turn,
           question: asked?.content ?? null,
         });
@@ -1050,6 +1006,31 @@ export function useChat(): UseChatResult {
     savedAnswersRef.current = found;
     return found;
   }, [conversations]);
+
+  // Read when asked (a card's "Questions that cited this"), not kept up to date: it walks
+  // every turn of every conversation.
+  const answersCiting = useCallback((filename: string) => {
+    const found: SavedAnswer[] = [];
+    for (const conversation of storageRef.current.conversations) {
+      conversation.turns.forEach((turn, index) => {
+        if (turn.role !== 'assistant' || !turn.sources.some((source) => source.filename === filename)) {
+          return;
+        }
+        const asked = conversation.turns
+          .slice(0, index)
+          .reverse()
+          .find((earlier) => earlier.role === 'user');
+        found.push({
+          conversationId: conversation.id,
+          conversationTitle: conversation.title,
+          workspace: conversation.workspace ?? '',
+          turn,
+          question: asked?.content ?? null,
+        });
+      });
+    }
+    return found.sort((a, b) => b.turn.timestamp - a.turn.timestamp);
+  }, []);
 
   // Keeps the previous array when nothing the list shows changed: `conversations` is a
   // new array on every streamed frame, and a new summaries array re-rendered the list.
@@ -1105,6 +1086,7 @@ export function useChat(): UseChatResult {
     persistPartial,
     conversations: summaries,
     savedAnswers,
+    answersCiting,
     activeConversationId: activeConversation?.id ?? null,
     ask,
     cancel,

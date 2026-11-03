@@ -10,6 +10,8 @@ import type {
   SummaryCoverage,
   TimingsResponse,
 } from '../api/types';
+import type { SourceChange } from '../utils/citationFreshness';
+import { copyText } from '../utils/clipboard';
 import { formatTurnTime, withCitationFootnotes } from '../utils/exportChat';
 import { citationNumberFromHref, linkCitations } from '../utils/citations';
 import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
@@ -88,6 +90,17 @@ function InlineCitation({
 // Error turns created before this page load are history, not news: announcing each one
 // as an alert on every conversation switch or reload read out stale failures.
 const SESSION_STARTED_AT = Date.now();
+// Error turns already announced this session: the thread remounts per conversation, and
+// switching back re-announced every error in it.
+const announcedErrors = new Set<string>();
+
+/** Whether an error turn mounting now should be announced (once, and only if new). */
+function announceOnce(turn: ChatTurn): boolean {
+  if (turn.role !== 'error' || turn.timestamp < SESSION_STARTED_AT) return false;
+  if (announcedErrors.has(turn.id)) return false;
+  announcedErrors.add(turn.id);
+  return true;
+}
 
 export interface FeedbackPayload {
   turnId: string;
@@ -160,6 +173,9 @@ export interface ChatTurn {
   // The model cited nothing; its citations were added by matching its sentences to the
   // sources (the server's CITATION_RETRY_MODE).
   autoCited?: boolean;
+  // Picked passages ("Ask about these") the answer went without: more than the
+  // prompt had room for.
+  passagesLeftOut?: number;
   // Asked within some documents or tags, not the whole corpus.
   scoped?: boolean;
 }
@@ -216,6 +232,8 @@ interface ChatMessageProps {
   onAnnounce?: (message: string) => void;
   /** Save or unsave this answer. */
   onToggleSaved?: (turnId: string, saved: boolean) => void;
+  /** Whether a cited document was deleted or uploaded again after this answer. */
+  sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
   /** This turn's position among the conversation's answers (1-based), for its label. */
   answerNumber?: number;
 }
@@ -242,6 +260,13 @@ function groundingNotes(turn: ChatTurn): string[] {
     );
   }
   if (turn.truncated) notes.push('The model reached its output limit and stopped mid-answer.');
+  if (turn.passagesLeftOut) {
+    const count = turn.passagesLeftOut;
+    notes.push(
+      `${count} of the passages you picked ${count === 1 ? "wasn't" : "weren't"} read: ` +
+        'more than one answer has room for. Ask about fewer at a time.',
+    );
+  }
   return notes;
 }
 
@@ -295,6 +320,7 @@ function ChatMessage({
   onSearchPassages,
   onAnnounce,
   onToggleSaved,
+  sourceChangeOf,
   answerNumber,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
@@ -337,33 +363,6 @@ function ChatMessage({
     });
   };
 
-  /** Copy without the async Clipboard API, which browsers gate behind a secure context.
-   *
-   *  DocRAG is self-hosted, so plain HTTP on a LAN address is a first-class deployment
-   *  — and there `navigator.clipboard` is undefined. Hiding the button there (what used
-   *  to happen) removed the feature from exactly the users the project targets. */
-  const legacyCopy = (text: string): boolean => {
-    const area = document.createElement('textarea');
-    area.value = text;
-    // Keep it out of view and off the tab order, but still selectable.
-    area.setAttribute('readonly', '');
-    area.style.position = 'fixed';
-    area.style.top = '-9999px';
-    // select() moves focus to the throwaway field; once it was removed, focus fell to
-    // <body> and a keyboard user lost their place. It goes back to the Copy button.
-    const previous = document.activeElement;
-    document.body.appendChild(area);
-    area.select();
-    try {
-      return document.execCommand('copy');
-    } catch {
-      return false;
-    } finally {
-      document.body.removeChild(area);
-      if (previous instanceof HTMLElement) previous.focus();
-    }
-  };
-
   const settle = (ok: boolean) => {
     clearTimeout(copyTimerRef.current);
     // The label change alone wasn't announced: it is the only sign the copy worked.
@@ -377,6 +376,7 @@ function ChatMessage({
     }
   };
 
+  const [alerting] = useState(() => announceOnce(turn));
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(turn.content);
   // A cancelled edit hands focus back to ✎: the editor unmounting dropped it to <body>.
@@ -402,17 +402,7 @@ function ChatMessage({
   const handleCopy = () => {
     // The answer's [n] markers would dangle without their sources, so the copy carries
     // them as footnotes — the same lines the Markdown export writes.
-    const text = withCitationFootnotes(turn.content, turn.sources);
-    if (navigator.clipboard) {
-      navigator.clipboard.writeText(text).then(
-        () => settle(true),
-        // Even in a secure context the write can be denied by permissions policy;
-        // fall back rather than reporting failure outright.
-        () => settle(legacyCopy(text)),
-      );
-      return;
-    }
-    settle(legacyCopy(text));
+    void copyText(withCitationFootnotes(turn.content, turn.sources)).then(settle);
   };
 
   const showSkeleton = streamStage !== undefined && turn.content === '';
@@ -815,6 +805,7 @@ function ChatMessage({
                     }
                     markedNotRelevant={turn.irrelevantSources?.includes(source.source_number)}
                     score={source.rerank_score}
+                    change={sourceChangeOf?.(source.filename, turn.timestamp)}
                     onAskWithout={
                       regenerateQuestion && onRetry && !regenerateTask && !streamStage && !turn.incomplete
                         ? () =>
@@ -871,7 +862,7 @@ function ChatMessage({
           </span>
           <div
             className="chat-message__error"
-            role={turn.timestamp >= SESSION_STARTED_AT ? 'alert' : undefined}
+            role={alerting ? 'alert' : undefined}
           >
             {turn.content}
             {turn.question && onRetry && (

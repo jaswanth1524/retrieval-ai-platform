@@ -107,7 +107,7 @@ def test_a_client_leaving_a_stream_stops_generation_and_frees_the_slot(
 
 
 def test_only_one_export_streams_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from api.routes import documents as document_routes
+    from api.routes import backup as document_routes
 
     # Held as if another export were mid-stream.
     assert document_routes._export_running.acquire(blocking=False)

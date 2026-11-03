@@ -130,8 +130,8 @@ def expand_with_neighbors(
     sentences right at the boundary are what resolve a chunk that starts or ends
     mid-thought; the far side of a neighbour mostly adds prefill.
 
-    ``excluded`` chunk ids (passages the question left out) never come back as
-    neighbour text.
+    With ``narrow`` (the question's page range, section or left-out passages), a
+    neighbour outside it never comes back as context (``PassageFilter.admits_neighbour``).
     """
 
     radius = int(settings.context_neighbor_radius)

@@ -393,3 +393,39 @@ def test_the_check_times_survive_a_restart_in_the_state_file(
     }
     UrlRefresher(settings, repository, lambda: [], state=SqliteRefreshStateStore(path)).run_once()
     assert SqliteRefreshStateStore(path).get_all(settings.qdrant_collection) == {}
+
+
+def test_a_page_that_changes_into_something_unreadable_backs_off(
+    executor: ThreadPoolExecutor,
+) -> None:
+    from api.url_refresh_state import MemoryRefreshStateStore
+
+    repository, settings, remote, _, clock, jobs = _setup(executor, url_refresh_batch=10)
+    service = IngestService(repository, FakeEmbeddingProvider(), settings, HeuristicTokenCounter())
+    queue = IngestQueue(jobs, executor, IngestBacklog(10_000_000), service)
+    state = MemoryRefreshStateStore()
+    refresher = UrlRefresher(
+        settings,
+        repository,
+        lambda: [RefreshTarget(settings, None, queue)],
+        fetch=remote,
+        clock=clock,
+        state=state,
+    )
+    url = "https://example.com/a.txt"
+    remote.pages[url] = (b"\x00\x01\x02\x03" * 64, '"v2"')  # fetched, then fails to parse
+    hour = 60 * 60.0
+    clock.now = 1000.0 + hour + 60
+
+    assert refresher.run_once()["queued"] == 1
+    wait_until(lambda: refresher._running() == 0)  # noqa: SLF001
+    assert state.get_all(settings.qdrant_collection)["a.txt"].failures == 1
+    assert state.get_all(settings.qdrant_collection)["a.txt"].last_outcome == "failed"
+    # Not fetched (and parsed, and failed) again an hour later: twice the interval.
+    asked = len(remote.asked)
+    clock.now += hour
+    refresher.run_once()
+    assert ("https://example.com/a.txt", '"v1"') not in remote.asked[asked:]
+    clock.now += hour
+    refresher.run_once()
+    assert ("https://example.com/a.txt", '"v1"') in remote.asked[asked:]

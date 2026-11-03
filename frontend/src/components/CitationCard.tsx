@@ -1,4 +1,5 @@
 import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
+import { SOURCE_CHANGE_HINTS, SOURCE_CHANGE_LABELS, type SourceChange } from '../utils/citationFreshness';
 import { pageLabel } from '../utils/pages';
 import './CitationCard.css';
 
@@ -20,6 +21,8 @@ interface CitationCardProps {
   onAskWithout?: () => void;
   /** Asking can't start now (an answer is streaming). */
   askDisabled?: boolean;
+  /** The document was deleted or uploaded again since the answer. */
+  change?: SourceChange | null;
 }
 
 function CitationCard({
@@ -36,6 +39,7 @@ function CitationCard({
   score,
   onAskWithout,
   askDisabled = false,
+  change = null,
 }: CitationCardProps) {
   const trigger = usePreviewTrigger({ onOpen, onHoverStart, onHoverEnd });
   const card = (
@@ -61,6 +65,15 @@ function CitationCard({
           </span>
         )}
       </span>
+      {change && (
+        <span
+          className="citation-card__changed"
+          title={SOURCE_CHANGE_HINTS[change]}
+          data-testid="citation-changed"
+        >
+          {SOURCE_CHANGE_LABELS[change]}
+        </span>
+      )}
     </button>
   );
   if (!onNotRelevant && !markedNotRelevant && !onAskWithout) return card;

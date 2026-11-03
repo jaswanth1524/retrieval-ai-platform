@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -17,9 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.audit import audit
 from api.auto_reindex import ReindexTarget, StaleReindexer
+from api.chunking import TokenCounter
 from api.dependencies import (
     get_app_settings,
     get_embedding_provider,
+    get_feedback_store,
     get_ingest_backlog,
     get_ingest_executor,
     get_ingest_job_store,
@@ -28,17 +32,19 @@ from api.dependencies import (
     get_reranker,
     get_token_counter,
     get_url_refresh_state_store,
+    raw_store_for,
     shutdown_executors,
 )
+from api.document_names import (
+    known_filenames,
+    refuse_near_duplicate_name,
+)
+from api.document_ops import delete_indexed_document, enqueue_refetched, retry_refusal
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
     IngestQueue,
-    delete_indexed_document,
-    enqueue_ingest,
-    known_filenames,
-    refuse_near_duplicate_name,
 )
 from api.ingest_service import IngestService
 from api.llm import GenerationConfigError, completion_model_and_kwargs
@@ -50,6 +56,7 @@ from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.request_guard import RequestGuardMiddleware
 from api.request_id import RequestIdMiddleware
+from api.routes import backup as backup_routes
 from api.routes import documents as documents_routes
 from api.routes import feedback as feedback_routes
 from api.routes import ops as ops_routes
@@ -58,10 +65,13 @@ from api.routes import search as search_routes
 from api.routes import traces as traces_routes
 from api.routes import watch as watch_routes
 from api.routes import workspaces as workspaces_routes
+from api.routes.documents_write import reindex_document
+from api.scheduled_backup import BackupTarget, ScheduledBackup
 from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
 from api.storage import check_writable_storage
+from api.url_fetch import fetch_document, fetch_slots
 from api.url_refresh import RefreshTarget, UrlRefresher
 from api.version import app_version
 from api.watch import FolderWatcher, WatchedJob
@@ -296,11 +306,25 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
         if raw_store is not None and target.raw_document_dir:
             raw_store = RawDocumentStore(target.raw_document_dir, int(target.raw_document_versions))
     settings = target
-    service = IngestService(repository, get_embedding_provider(), settings, get_token_counter())
+    folder = str(Path(settings.watch_dir).resolve())
+    service = IngestService(
+        repository,
+        get_embedding_provider(),
+        settings,
+        get_token_counter(),
+        watched_from=folder,
+    )
 
     def list_indexed() -> dict[str, float | None]:
         metadata = repository.filename_metadata(settings)
         return {name: meta.uploaded_at for name, meta in metadata.items()}
+
+    def list_owned() -> set[str]:
+        # Indexed from this folder in an earlier run: still the watcher's to delete
+        # when the file is gone, though this run hasn't seen it (deleted while the
+        # API was down).
+        metadata = repository.filename_metadata(settings)
+        return {name for name, meta in metadata.items() if meta.watched_from == folder}
 
     def enqueue(filename: str, content: bytes, mtime: float) -> str:
         if raw_store is not None:
@@ -308,11 +332,10 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
             # overwrite each other's original on a case-insensitive disk. The
             # FilenameConflictError is logged by the watcher and the file skipped.
             refuse_near_duplicate_name(filename, known_filenames(repository, settings))
-        accepted = enqueue_ingest(
-            job_store=get_ingest_job_store(),
-            executor=get_ingest_executor(),
-            backlog=get_ingest_backlog(),
-            ingest_service=service,
+        queue = IngestQueue(
+            get_ingest_job_store(), get_ingest_executor(), get_ingest_backlog(), service
+        )
+        accepted = queue.enqueue(
             filename=filename,
             content=content,
             raw_store=raw_store,
@@ -349,9 +372,131 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
     def delete(filename: str) -> None:
         delete_indexed_document(repository, settings, raw_store, filename)
 
-    watcher = FolderWatcher(settings, list_indexed, enqueue, delete, job_lookup)
+    watcher = FolderWatcher(
+        settings, list_indexed, enqueue, delete, job_lookup, list_owned=list_owned
+    )
     watcher.start()
     return watcher
+
+
+@dataclass(frozen=True)
+class WorkspaceTarget:
+    """One workspace a background worker goes over: its settings, its originals store
+    (None when originals aren't kept) and an ingest queue for its documents."""
+
+    settings: AppSettings
+    raw_store: RawDocumentStore | None
+    queue: IngestQueue
+
+
+def workspace_target(
+    settings: AppSettings, repository: VectorRepository, token_counter: TokenCounter
+) -> WorkspaceTarget:
+    """What a background worker needs to index into ``settings``' workspace."""
+
+    service = IngestService(repository, get_embedding_provider(), settings, token_counter)
+    queue = IngestQueue(
+        get_ingest_job_store(), get_ingest_executor(), get_ingest_backlog(), service
+    )
+    return WorkspaceTarget(settings, raw_store_for(settings), queue)
+
+
+def workspace_targets(
+    settings: AppSettings, repository: VectorRepository, token_counter: TokenCounter
+) -> Callable[[], list[WorkspaceTarget]]:
+    """The default workspace and every other one (with WORKSPACES_ENABLED), listed again
+    on each call: what the stale re-indexer and the URL refresher go over each pass.
+    Originals stores are the cached ones requests use, not a new store per pass."""
+
+    def targets() -> list[WorkspaceTarget]:
+        found = [workspace_target(settings, repository, token_counter)]
+        if settings.workspaces_enabled:
+            for name in list_workspaces(get_qdrant_client(), settings.qdrant_collection):
+                found.append(
+                    workspace_target(settings_for(settings, name), repository, token_counter)
+                )
+        return found
+
+    return targets
+
+
+def start_scheduled_backup(settings: AppSettings) -> ScheduledBackup:
+    """Start BACKUP_DIR's backups (api/scheduled_backup.py) of every workspace."""
+
+    repository = VectorRepository(get_qdrant_client())
+    every_workspace = workspace_targets(settings, repository, get_token_counter())
+
+    def targets() -> list[BackupTarget]:
+        return [BackupTarget(target.settings, target.raw_store) for target in every_workspace()]
+
+    backup = ScheduledBackup(
+        settings, repository, targets, get_feedback_store(), backup_routes._export_running
+    )
+    backup.start()
+    return backup
+
+
+def requeue_interrupted_jobs(settings: AppSettings) -> list[str]:
+    """Start again, once, each re-index and URL fetch the last restart cut off
+    (REQUEUE_INTERRUPTED_JOBS; the sqlite job store remembers which they were): the new
+    jobs' ids. Uploads, imports and version restores can't be (their bytes weren't
+    kept); a job that can't be queued now is logged and left failed, for its Retry."""
+
+    interrupted = getattr(get_ingest_job_store(), "interrupted_at_open", ())
+    if not interrupted:
+        return []
+    store = get_ingest_job_store()
+    repository = VectorRepository(get_qdrant_client())
+    token_counter = get_token_counter()
+    started: list[str] = []
+    for job_id in interrupted:
+        job = store.get(job_id)
+        if job is None or job.kind not in ("reindex", "url") or retry_refusal(job) is not None:
+            continue
+        workspace_settings = settings_for(settings, job.workspace) if job.workspace else settings
+        target = workspace_target(workspace_settings, repository, token_counter)
+        try:
+            if job.kind == "reindex":
+                accepted = reindex_document(
+                    job.filename, repository, workspace_settings, target.queue, target.raw_store
+                )
+            else:
+                if not settings.url_ingest_enabled or job.source_url is None:
+                    continue
+                meta = repository.document_metadata(workspace_settings, job.filename)
+                with fetch_slots:
+                    fetched = fetch_document(
+                        job.source_url,
+                        workspace_settings,
+                        filename=job.filename,
+                        has_room=target.queue.backlog.has_room,
+                    )
+                accepted = enqueue_refetched(
+                    job,
+                    repository,
+                    workspace_settings,
+                    target.queue,
+                    target.raw_store,
+                    fetched,
+                    meta,
+                )
+        except Exception as exc:  # noqa: BLE001 - one job's failure must not stop the rest
+            logger.warning(
+                "Could not start the interrupted %s of %r again: %s", job.kind, job.filename, exc
+            )
+            continue
+        audit(
+            "job.retry",
+            workspace=job.workspace,
+            job_id=job.id,
+            filename=job.filename,
+            new_job_id=accepted.job_id,
+            scheduled=True,
+        )
+        started.append(accepted.job_id)
+    if started:
+        logger.info("Started %d job(s) a restart had cut off again.", len(started))
+    return started
 
 
 def start_stale_reindexer(settings: AppSettings) -> StaleReindexer | None:
@@ -360,39 +505,16 @@ def start_stale_reindexer(settings: AppSettings) -> StaleReindexer | None:
 
     if get_raw_document_store() is None:
         return None
-    client = get_qdrant_client()
-    repository = VectorRepository(client)
+    repository = VectorRepository(get_qdrant_client())
     token_counter = get_token_counter()
-
-    def target(workspace_settings: AppSettings, raw_store: RawDocumentStore) -> ReindexTarget:
-        service = IngestService(
-            repository, get_embedding_provider(), workspace_settings, token_counter
-        )
-        queue = IngestQueue(
-            get_ingest_job_store(), get_ingest_executor(), get_ingest_backlog(), service
-        )
-        return ReindexTarget(workspace_settings, raw_store, queue)
+    every_workspace = workspace_targets(settings, repository, token_counter)
 
     def targets() -> list[ReindexTarget]:
-        base_store = get_raw_document_store()
-        if base_store is None:
-            return []
-        found = [target(settings, base_store)]
-        if settings.workspaces_enabled:
-            for name in list_workspaces(client, settings.qdrant_collection):
-                workspace_settings = settings_for(settings, name)
-                if not workspace_settings.raw_document_dir:
-                    continue
-                found.append(
-                    target(
-                        workspace_settings,
-                        RawDocumentStore(
-                            workspace_settings.raw_document_dir,
-                            int(workspace_settings.raw_document_versions),
-                        ),
-                    )
-                )
-        return found
+        return [
+            ReindexTarget(target.settings, target.raw_store, target.queue)
+            for target in every_workspace()
+            if target.raw_store is not None
+        ]
 
     reindexer = StaleReindexer(settings, repository, targets, get_ingest_job_store(), token_counter)
     reindexer.start()
@@ -403,36 +525,14 @@ def start_url_refresher(settings: AppSettings) -> UrlRefresher:
     """Start URL_REFRESH_INTERVAL_MINUTES's background passes (api/url_refresh.py) over
     the default workspace and every other one."""
 
-    client = get_qdrant_client()
-    repository = VectorRepository(client)
-    token_counter = get_token_counter()
-
-    def target(
-        workspace_settings: AppSettings, raw_store: RawDocumentStore | None
-    ) -> RefreshTarget:
-        service = IngestService(
-            repository, get_embedding_provider(), workspace_settings, token_counter
-        )
-        queue = IngestQueue(
-            get_ingest_job_store(), get_ingest_executor(), get_ingest_backlog(), service
-        )
-        return RefreshTarget(workspace_settings, raw_store, queue)
+    repository = VectorRepository(get_qdrant_client())
+    every_workspace = workspace_targets(settings, repository, get_token_counter())
 
     def targets() -> list[RefreshTarget]:
-        found = [target(settings, get_raw_document_store())]
-        if settings.workspaces_enabled:
-            for name in list_workspaces(client, settings.qdrant_collection):
-                workspace_settings = settings_for(settings, name)
-                store = (
-                    RawDocumentStore(
-                        workspace_settings.raw_document_dir,
-                        int(workspace_settings.raw_document_versions),
-                    )
-                    if workspace_settings.raw_document_dir
-                    else None
-                )
-                found.append(target(workspace_settings, store))
-        return found
+        return [
+            RefreshTarget(target.settings, target.raw_store, target.queue)
+            for target in every_workspace()
+        ]
 
     refresher = UrlRefresher(settings, repository, targets, state=get_url_refresh_state_store())
     refresher.start()
@@ -453,15 +553,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     watcher = None
     reindexer = None
     refresher = None
+    backup = None
     try:
         watcher = start_folder_watcher(settings) if settings.watch_dir else None
         # For GET /watch and POST /watch/scan.
         app.state.watcher = watcher
         reindexer = start_stale_reindexer(settings) if settings.auto_reindex_stale else None
+        if settings.requeue_interrupted_jobs:
+            # On its own thread: a URL fetch can take its whole timeout, and startup
+            # must not wait for it.
+            threading.Thread(
+                target=requeue_interrupted_jobs,
+                args=(settings,),
+                name="docrag-requeue",
+                daemon=True,
+            ).start()
         if settings.url_refresh_interval_minutes and settings.url_ingest_enabled:
             refresher = start_url_refresher(settings)
+        backup = start_scheduled_backup(settings) if settings.backup_dir else None
+        # For GET /health/ready's last_backup.
+        app.state.backup = backup
         yield
     finally:
+        if backup is not None:
+            backup.stop()
         if refresher is not None:
             refresher.stop()
         if reindexer is not None:
