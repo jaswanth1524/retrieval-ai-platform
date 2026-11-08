@@ -303,6 +303,14 @@ class DocragClient:
         )
         return result
 
+    def rerun_trace(self, trace_id: str, overrides: dict[str, Any]) -> dict[str, Any]:
+        """A traced question searched again under other ranking settings (no LLM call)."""
+
+        result: dict[str, Any] = self._json(
+            "POST", f"/traces/{_quote(trace_id)}/rerun", json=overrides
+        )
+        return result
+
     def feedback(self, limit: int = 100) -> list[dict[str, Any]]:
         """Recorded answer ratings, newest first (FEEDBACK_ENABLED, full key)."""
 
@@ -406,7 +414,14 @@ class DocragClient:
         on_delta: Callable[[str], None] | None = None,
         on_stage: Callable[[dict[str, Any]], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        *,
+        page_min: int | None = None,
+        page_max: int | None = None,
+        section: str | None = None,
     ) -> StreamResult:
+        """One document summarized (only ``page_min``-``page_max`` or ``section`` of it
+        when given), two compared, or one brief across more."""
+
         body: dict[str, Any] = {
             # One document: a summary; two: a comparison; more: one brief across them.
             "mode": {1: "summarize", 2: "compare"}.get(len(filenames), "brief"),
@@ -416,6 +431,9 @@ class DocragClient:
             body["instruction"] = instruction
         if provider:
             body["llm_provider"] = provider
+        for key, value in (("page_min", page_min), ("page_max", page_max), ("section", section)):
+            if value is not None:
+                body[key] = value
         return self._stream("/questions/summary/stream", body, on_delta, on_stage, should_stop)
 
     def _stream(
@@ -513,6 +531,46 @@ class DocragClient:
             result: dict[str, Any] = _response_json(response)
             return result
         raise DocragError("The indexing queue stayed full.")  # pragma: no cover
+
+    def add_sitemap(
+        self,
+        url: str,
+        *,
+        tags: Sequence[str] = (),
+        refresh_minutes: int | None = None,
+        max_pages: int | None = None,
+        same_host: bool = True,
+    ) -> dict[str, Any]:
+        """Have the server add the pages a sitemap or feed lists (fetched and queued in
+        the background; the pages it is adding are returned)."""
+
+        body: dict[str, Any] = {"url": url, "same_host": same_host}
+        if tags:
+            body["tags"] = list(tags)
+        if refresh_minutes is not None:
+            body["refresh_minutes"] = refresh_minutes
+        if max_pages is not None:
+            body["max_pages"] = max_pages
+        result: dict[str, Any] = self._json(
+            "POST", "/documents/from-sitemap", json=body, attempts=BUSY_MAX_ATTEMPTS
+        )
+        return result
+
+    def upload_archive(self, path: Path, *, tags: Sequence[str] = ()) -> dict[str, Any]:
+        """A zip of documents, each indexed as its own (POST /documents/archive)."""
+
+        try:
+            handle = path.open("rb")
+        except OSError as exc:
+            raise DocragError(f"Cannot read {path}: {exc.strerror or exc}") from exc
+        with handle:
+            result: dict[str, Any] = self._json(
+                "POST",
+                "/documents/archive",
+                files={"file": (path.name, handle, "application/zip")},
+                data={"tags": list(tags)} if tags else None,
+            )
+        return result
 
     def upload_url(
         self,
@@ -775,6 +833,12 @@ class DocragClient:
         result: dict[str, Any] = _response_json(response)
         return result
 
+    def job(self, job_id: str) -> dict[str, Any]:
+        """One indexing job's status (``GET /documents/jobs/{id}``)."""
+
+        result: dict[str, Any] = self._json("GET", f"/documents/jobs/{_quote(job_id)}")
+        return result
+
     def retry_job(self, job_id: str) -> dict[str, Any]:
         """Run a failed job again (a URL fetched again, a re-index rerun): the new job."""
 
@@ -867,6 +931,45 @@ class DocragClient:
             result: dict[str, Any] = self._json(
                 "POST", "/import", files={"file": (archive.name, handle, "application/zip")}
             )
+        return result
+
+    # -- stored backups and the consistency report (full key) -------------------------
+
+    def backups(self) -> dict[str, Any]:
+        """``GET /backups``: this workspace's scheduled backups, newest first."""
+
+        result: dict[str, Any] = self._json("GET", "/backups")
+        return result
+
+    def run_backup(self) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("POST", "/backups/run")
+        return result
+
+    def verify_backup(self, archive: Path) -> dict[str, Any]:
+        """A backup zip read through by the server without restoring anything."""
+
+        try:
+            handle = archive.open("rb")
+        except OSError as exc:
+            raise DocragError(f"Cannot read {archive}: {exc.strerror or exc}") from exc
+        with handle:
+            result: dict[str, Any] = self._json(
+                "POST", "/backups/verify", files={"file": (archive.name, handle, "application/zip")}
+            )
+        return result
+
+    def verify_stored_backup(self, name: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("POST", f"/backups/{_quote(name)}/verify")
+        return result
+
+    def restore_stored_backup(self, name: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("POST", f"/backups/{_quote(name)}/restore")
+        return result
+
+    def consistency(self) -> dict[str, Any]:
+        """``GET /admin/consistency``: how the index and stored originals agree."""
+
+        result: dict[str, Any] = self._json("GET", "/admin/consistency")
         return result
 
 

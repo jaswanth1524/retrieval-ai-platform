@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -129,6 +130,11 @@ def _print_sources(result: StreamResult, out: TextIO) -> None:
     read, total = result.done.get("chunks_read"), result.done.get("chunks_total")
     if isinstance(read, int) and isinstance(total, int) and read < total:
         print(f"\n(read {read} of {total} passages, evenly spaced)", file=out)
+    skipped, cut = result.done.get("parts_skipped"), result.done.get("notes_truncated")
+    if isinstance(skipped, int) and skipped > 0:
+        print(f"\n({skipped} part(s) left out: the model failed on them twice)", file=out)
+    if isinstance(cut, int) and cut > 0:
+        print(f"\n(notes on {cut} part(s) stopped at the token limit)", file=out)
     for note in grounding_notes(result.done):
         print(f"\n({note})", file=out)
     if result.followups:
@@ -287,6 +293,14 @@ def _job_error(status: dict[str, Any]) -> str:
     return f"still {state} when the wait ended; it goes on on the server"
 
 
+def _section_suffix(change: dict[str, Any]) -> str:
+    """ " · <section>" for a changed passage, so two on one page read apart (older
+    servers send no section)."""
+
+    section = change.get("section")
+    return f" · {section}" if section else ""
+
+
 def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     """Upload and follow several files at a time (``DocragClient.index_files``): the
     server indexes them side by side instead of one file after another."""
@@ -296,6 +310,8 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     if missing:
         print(f"error: not found: {', '.join(map(str, missing))}", file=sys.stderr)
         return 2
+    archives = [p for p in paths if p.is_file() and p.suffix.lower() == ".zip"]
+    paths = [p for p in paths if p not in archives]
     config = client.config()
     extensions = {ext.lower() for ext in config.get("supported_extensions", [])}
     max_bytes = config.get("max_upload_bytes")
@@ -352,6 +368,25 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     for path, status in statuses.items():
         if status.get("state") not in FINISHED_JOB_STATES:
             fail(path, _job_error(status))
+    # A zip named on the command line: the server indexes each document in it.
+    for archive in archives:
+        report = client.upload_archive(archive, tags=args.tag or ())
+        for item in report.get("skipped", []):
+            skip(Path(f"{archive}:{item.get('name')}"), str(item.get("reason")))
+        for name in report.get("deferred", []):
+            fail(Path(f"{archive}:{name}"), "the indexing queue was full; ingest the zip again")
+        member = {
+            job["job_id"]: Path(f"{archive}:{job.get('filename', '')}")
+            for job in report.get("jobs", [])
+        }
+        waited = client.wait_for_jobs(
+            list(member),
+            timeout=_wait_limit(args),
+            on_finished=functools.partial(_finished_member, member, finished),
+        )
+        for job_id, status in waited.items():
+            if status.get("state") not in FINISHED_JOB_STATES:
+                fail(member[job_id], _job_error(status))
     if args.json:
         print(json.dumps({"indexed": indexed, "failed": failed, "skipped": skipped}), file=out)
     else:
@@ -359,7 +394,35 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     return 1 if failed else 0
 
 
+def _finished_member(
+    member: dict[str, Path],
+    finished: Callable[[Path, dict[str, Any]], None],
+    job_id: str,
+    status: dict[str, Any],
+) -> None:
+    finished(member[job_id], status)
+
+
 def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.sitemap:
+        added = client.add_sitemap(
+            args.source_url,
+            tags=args.tag or (),
+            refresh_minutes=args.refresh_minutes,
+            max_pages=args.max_pages,
+            same_host=not args.any_host,
+        )
+        if args.json:
+            print(json.dumps(added), file=out)
+            return 0
+        for url in added.get("urls", []):
+            print(f"queue {url}", file=out)
+        print(
+            f"{len(added.get('urls', []))} page(s) being added in the background "
+            f"({added.get('left_out', 0)} left out); `docrag jobs` shows them",
+            file=out,
+        )
+        return 0
     job = client.upload_url(
         args.source_url, args.name, tags=args.tag or (), refresh_minutes=args.refresh_minutes
     )
@@ -666,6 +729,9 @@ def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -
             instruction=args.focus,
             provider=args.provider,
             on_stage=None if args.json or args.quiet else reporter.stage,
+            page_min=args.page_min,
+            page_max=args.page_max,
+            section=args.section,
         )
     if args.json:
         print(json.dumps(result.done), file=out)
@@ -1000,7 +1066,44 @@ def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             print(f"  {change['name']}: {change['a']!r} -> {change['b']!r}", file=out)
         for change in diff.get("candidates", []):
             print(
-                f"  {change['filename']} p.{change['page']}: rank {change.get('rank_a')} -> "
+                f"  {change['filename']} p.{change['page']}{_section_suffix(change)}: "
+                f"rank {change.get('rank_a')} -> "
+                f"{change.get('rank_b')}"
+                f"{'  ' + str(change['drop_reason_b']) if change.get('drop_reason_b') else ''}",
+                file=out,
+            )
+        return 0
+    if args.action == "rerun":
+        if not args.target:
+            print("traces rerun needs a trace id", file=sys.stderr)
+            return 2
+        overrides = {
+            name: value
+            for name, value in (
+                ("rerank_min_score", args.min_score),
+                ("rerank_top_k", args.top_k),
+                ("rerank_relative_floor", args.relative_floor),
+                ("recency_boost_weight", args.recency),
+            )
+            if value is not None
+        }
+        result = client.rerun_trace(args.target, overrides)
+        if args.json:
+            print(json.dumps(result), file=out)
+            return 0
+        verdict = (
+            "weak matches only"
+            if result.get("weak_matches")
+            else ("would answer" if result.get("would_answer") else "nothing found")
+        )
+        print(
+            f"{result.get('query')}\n  {verdict} with {overrides or 'the server settings'}",
+            file=out,
+        )
+        for change in result.get("diff", {}).get("candidates", []):
+            print(
+                f"  {change['filename']} p.{change['page']}{_section_suffix(change)}: "
+                f"rank {change.get('rank_a')} -> "
                 f"{change.get('rank_b')}"
                 f"{'  ' + str(change['drop_reason_b']) if change.get('drop_reason_b') else ''}",
                 file=out,
@@ -1114,6 +1217,117 @@ def cmd_watch(client: DocragClient, args: argparse.Namespace, out: TextIO) -> in
     for problem in status.get("problems", []):
         print(f"skip    {problem}", file=out)
     return 0
+
+
+def human_size(size: int) -> str:
+    """A byte count as KB/MB/GB, one decimal."""
+
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"  # pragma: no cover - the loop always returns
+
+
+def _print_check(check: dict[str, Any], out: TextIO) -> None:
+    print(
+        f"{'ok' if check.get('ok') else 'DAMAGED'}: {check.get('documents', 0)} documents, "
+        f"{check.get('originals', 0)} originals ({check.get('originals_missing', 0)} missing), "
+        f"{check.get('versions', 0)} earlier versions, "
+        f"feedback {'included' if check.get('feedback') else 'none'}",
+        file=out,
+    )
+    for problem in check.get("problems", []):
+        print(f"  {problem}", file=out)
+
+
+def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """BACKUP_DIR's backups: list, run one now, verify one (stored, or a local file the
+    server reads through), restore one. Exits 1 when a verified backup is damaged."""
+
+    if args.action == "list":
+        listing = client.backups()
+        if args.json:
+            print(json.dumps(listing), file=out)
+            return 0
+        print(
+            f"every {listing.get('interval_hours')} h, newest {listing.get('keep')} kept",
+            file=out,
+        )
+        for backup in listing.get("backups", []):
+            verified = {True: "verified", False: "DAMAGED", None: "not checked"}[
+                backup.get("verified")
+            ]
+            print(
+                f"{backup.get('name')}  {human_size(int(backup.get('size', 0)))}  {verified}",
+                file=out,
+            )
+        return 0
+    if args.action == "run":
+        result = client.run_backup()
+        if args.json:
+            print(json.dumps(result), file=out)
+        else:
+            print(
+                f"backup of {result.get('workspace')} started; `docrag backup list` shows it",
+                file=out,
+            )
+        return 0
+    if not args.target:
+        raise DocragError(f"`docrag backup {args.action}` needs a backup name or file.")
+    if args.action == "verify":
+        local = Path(args.target)
+        check = (
+            client.verify_backup(local)
+            if local.is_file()
+            else client.verify_stored_backup(args.target)
+        )
+        if args.json:
+            print(json.dumps(check), file=out)
+        else:
+            _print_check(check, out)
+        return 0 if check.get("ok") else 1
+    report = client.restore_stored_backup(args.target)
+    if args.json:
+        print(json.dumps(report), file=out)
+    else:
+        print(
+            f"{len(report.get('jobs', []))} documents queued, "
+            f"{len(report.get('skipped', []))} already indexed, "
+            f"{len(report.get('deferred', []))} deferred",
+            file=out,
+        )
+    return 0
+
+
+def cmd_check(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """The consistency report; exits 1 when it found problems (nothing is changed)."""
+
+    report = client.consistency()
+    if args.json:
+        print(json.dumps(report), file=out)
+        return 1 if report.get("problems") else 0
+    print(
+        f"{report.get('documents', 0)} documents, "
+        f"{report.get('problems', 0)} problem(s)"
+        + ("" if report.get("originals_kept") else " (originals aren't kept)"),
+        file=out,
+    )
+    sections = [
+        ("originals_without_document", "original, no document"),
+        ("documents_without_original", "document, no original"),
+        ("versions_without_document", "earlier versions, no document"),
+        ("incomplete", "incomplete (re-index repairs it)"),
+        ("stale", "stale (re-index recommended)"),
+        ("in_flight", "being indexed now"),
+    ]
+    for key, label in sections:
+        for name in report.get(key, []):
+            print(f"{label}: {name}", file=out)
+    for group in report.get("duplicate_groups", []):
+        print(f"same bytes: {', '.join(group)}", file=out)
+    return 1 if report.get("problems") else 0
 
 
 def cmd_export(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -1245,6 +1459,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MINUTES",
         help="Check it again this often (0 = never; default: the server's interval).",
     )
+    add_url.add_argument(
+        "--sitemap",
+        action="store_true",
+        help="The URL is a sitemap, sitemap index, RSS or Atom feed: add the pages it lists.",
+    )
+    add_url.add_argument("--max-pages", type=int, help="--sitemap: at most this many pages.")
+    add_url.add_argument(
+        "--any-host", action="store_true", help="--sitemap: pages on other hosts too."
+    )
     wait_flag(add_url)
 
     ask = command("ask", "Ask a question (streamed).")
@@ -1277,6 +1500,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     summarize.add_argument("files", nargs="+")
     summarize.add_argument("--focus", help="What to concentrate on.")
+    summarize.add_argument("--page-min", type=int, help="One document: from this page.")
+    summarize.add_argument("--page-max", type=int, help="One document: up to this page.")
+    summarize.add_argument("--section", help="One document: only this section (exact label).")
     summarize.add_argument("--provider")
     summarize.add_argument("--quiet", action="store_true")
 
@@ -1350,12 +1576,14 @@ def build_parser() -> argparse.ArgumentParser:
     jobs.add_argument("--limit", type=int, default=50)
 
     traces = command(
-        "traces", "Recent question traces: list, show, compare two, score report, or export."
+        "traces",
+        "Recent question traces: list, show, compare two, score report, export, or run one "
+        "again under other ranking settings.",
     )
     traces.add_argument(
         "action",
         nargs="?",
-        choices=("list", "show", "diff", "report", "export"),
+        choices=("list", "show", "diff", "report", "export", "rerun"),
         default="list",
     )
     traces.add_argument("target", nargs="?", help="The trace id (show, diff) or file (export).")
@@ -1366,6 +1594,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("answered", "uncited", "insufficient_context", "no_context"),
         help="Only traces answered this way (repeatable).",
     )
+    traces.add_argument("--min-score", type=float, help="rerun: RERANK_MIN_SCORE to try.")
+    traces.add_argument("--top-k", type=int, help="rerun: RERANK_TOP_K to try.")
+    traces.add_argument("--relative-floor", type=float, help="rerun: RERANK_RELATIVE_FLOOR to try.")
+    traces.add_argument("--recency", type=float, help="rerun: RECENCY_BOOST_WEIGHT to try.")
 
     feedback = command("feedback", "Recorded answer ratings (FEEDBACK_ENABLED, full key).")
     feedback.add_argument("--limit", type=int, default=50)
@@ -1381,6 +1613,13 @@ def build_parser() -> argparse.ArgumentParser:
     watch = command("watch", "The watched folder's status (WATCH_DIR).")
     watch.add_argument("--scan", action="store_true", help="Start a pass now (full key).")
 
+    backup = command("backup", "Scheduled backups in BACKUP_DIR (full key).")
+    backup.add_argument("action", choices=["list", "run", "verify", "restore"])
+    backup.add_argument(
+        "target", nargs="?", help="A backup's name (from list), or a local zip to verify."
+    )
+    command("check", "How the index and stored originals agree (full key; report only).")
+
     export = command("export", "Download a backup zip (full key).")
     export.add_argument("output")
     restore = command("import", "Restore a backup zip and wait for it.")
@@ -1391,6 +1630,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {
     "status": cmd_status,
+    "backup": cmd_backup,
+    "check": cmd_check,
     "documents": cmd_documents,
     "ingest": cmd_ingest,
     "add-url": cmd_add_url,

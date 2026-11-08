@@ -11,13 +11,17 @@ default one; ``list_workspaces`` shows which exist.
 
 Every tool goes through the REST API (``cli.client``), so the server's key, read-only
 key, rate limit and question slots apply; the read-only key is enough, since no tool
-changes the corpus.
+changes the corpus — unless the server is started with ``--allow-writes`` (or
+``DOCRAG_MCP_ALLOW_WRITES=1``), which adds ``add_url``, ``reindex``, ``retry_job`` and
+``job_status``: those need the full key, and let an agent add to the corpus.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import sys
 import threading
 from collections.abc import Callable
 from typing import Any, Literal
@@ -45,6 +49,9 @@ _READ_TOTAL_CHARS = 24_000
 _READ_PASSAGE_CHARS = 4_000
 # None of the tools change the corpus; "open world" is false — they only read DocRAG.
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+# The --allow-writes tools: they add to the corpus (never delete from it).
+_WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+_FETCHES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
 
 INSTRUCTIONS = (
     "DocRAG answers questions from the user's own indexed documents, with citations. "
@@ -155,8 +162,11 @@ def narrowing(
 WORKSPACE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
 
 
-def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> MCPServer:
-    """The MCP server; ``client_factory`` makes the REST client (tests pass a fake)."""
+def build_server(
+    client_factory: Callable[[], DocragClient] = DocragClient, *, allow_writes: bool = False
+) -> MCPServer:
+    """The MCP server; ``client_factory`` makes the REST client (tests pass a fake).
+    ``allow_writes`` adds the tools that add to the corpus (see the module docstring)."""
 
     server: MCPServer = MCPServer(name="docrag", instructions=INSTRUCTIONS)
 
@@ -421,11 +431,81 @@ def build_server(client_factory: Callable[[], DocragClient] = DocragClient) -> M
 
         return await call(work)
 
+    if allow_writes:
+        _add_write_tools(server, call)
     return server
 
 
+Call = Callable[..., Any]
+
+
+def _add_write_tools(server: MCPServer, call: Call) -> None:
+    """``add_url``, ``reindex``, ``retry_job``, ``job_status`` (--allow-writes)."""
+
+    def accepted(job: dict[str, Any]) -> str:
+        return (
+            f"Queued {job.get('filename')} as job {job.get('job_id')}; "
+            "job_status says when it is indexed."
+        )
+
+    @server.tool(annotations=_FETCHES)
+    async def add_url(
+        url: str,
+        filename: str | None = None,
+        tags: list[str] | None = None,
+        workspace: str | None = None,
+    ) -> str:
+        """Have DocRAG fetch a web page or file and index it (URL_INGEST_ENABLED on the
+        server; the full key). filename names it; tags tag it."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            return accepted(client.upload_url(url, filename, tags=tags or ()))
+
+        result: str = await call(work, workspace)
+        return result
+
+    @server.tool(annotations=_WRITES)
+    async def reindex(filename: str, workspace: str | None = None) -> str:
+        """Re-index a document from its stored original (RAW_DOCUMENT_DIR), e.g. after
+        a chunking change marked it stale."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            return accepted(client.reindex(filename))
+
+        result: str = await call(work, workspace)
+        return result
+
+    @server.tool(annotations=_WRITES)
+    async def retry_job(job_id: str, workspace: str | None = None) -> str:
+        """Run a failed indexing job again (a URL fetched again, a re-index rerun)."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            return accepted(client.retry_job(job_id))
+
+        result: str = await call(work, workspace)
+        return result
+
+    @server.tool(annotations=_READ_ONLY)
+    async def job_status(job_id: str, workspace: str | None = None) -> str:
+        """An indexing job's state (queued, parsing, embedding, done, failed)."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            job = client.job(job_id)
+            state = job.get("state")
+            detail = f": {job.get('error')}" if job.get("error") else ""
+            done, total = job.get("chunks_done"), job.get("chunks_total")
+            progress = f" ({done}/{total} passages)" if total else ""
+            return f"{job.get('filename')}: {state}{progress}{detail}"
+
+        result: str = await call(work, workspace)
+        return result
+
+
 def main() -> None:
-    build_server().run("stdio")
+    allow_writes = "--allow-writes" in sys.argv[1:] or os.environ.get(
+        "DOCRAG_MCP_ALLOW_WRITES", ""
+    ).strip().lower() in ("1", "true", "yes")
+    build_server(allow_writes=allow_writes).run("stdio")
 
 
 if __name__ == "__main__":
