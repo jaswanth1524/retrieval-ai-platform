@@ -37,6 +37,7 @@ from typing import NamedTuple
 from fastapi import HTTPException
 
 from api.background import BackgroundLoop
+from api.backoff import doubled_wait
 from api.document_names import FilenameConflictError
 from api.documents import (
     SUPPORTED_EXTENSIONS,
@@ -113,6 +114,50 @@ class WatchStatus:
     deferred: list[str]
     retrying: list[WatchRetryStatus]
     gave_up: list[str]
+
+
+@dataclass(frozen=True)
+class WatchFolder:
+    """One watched folder and the workspace it indexes into ("" = the default)."""
+
+    path: str
+    workspace: str
+
+
+def watch_folders(settings: AppSettings) -> list[WatchFolder]:
+    """WATCH_DIR (into WATCH_WORKSPACE) and every WATCH_DIRS entry, in that order.
+    ``RuntimeError`` (startup stops, naming the setting) for an entry without a path,
+    the same folder twice, or a folder inside another — two watchers would index (and
+    delete) the same files."""
+
+    folders: list[WatchFolder] = []
+    if settings.watch_dir:
+        folders.append(WatchFolder(settings.watch_dir, settings.watch_workspace.strip()))
+    for entry in settings.watch_dirs.split(";"):
+        if not entry.strip():
+            continue
+        path, _, workspace = entry.partition("=>")
+        if not path.strip():
+            raise RuntimeError(f"WATCH_DIRS: an entry has no folder ({entry.strip()!r}).")
+        folders.append(WatchFolder(path.strip(), workspace.strip()))
+    resolved = [Path(folder.path).resolve() for folder in folders]
+    for index, first in enumerate(resolved):
+        for second in resolved[index + 1 :]:
+            if first == second or first in second.parents or second in first.parents:
+                raise RuntimeError(
+                    f"WATCH_DIRS: {first} and {second} overlap; each folder can be "
+                    "watched once, and not inside another watched one."
+                )
+    return folders
+
+
+def watched_workspaces(settings: AppSettings) -> set[str]:
+    """The workspaces watched folders index into ("" for the default)."""
+
+    try:
+        return {folder.workspace for folder in watch_folders(settings)}
+    except RuntimeError:
+        return set()
 
 
 class UnreadableFileError(DocumentError):
@@ -263,6 +308,8 @@ class FolderWatcher(BackgroundLoop):
         list_owned: ListOwned | None = None,
     ) -> None:
         self._root = Path(settings.watch_dir)
+        # The workspace it indexes into, as configured ("" = the default).
+        self.workspace = settings.watch_workspace.strip()
         self._list_owned = list_owned
         self._filter = PathFilter(
             glob_patterns(settings.watch_include), glob_patterns(settings.watch_exclude)
@@ -352,7 +399,10 @@ class FolderWatcher(BackgroundLoop):
             self._seen.add(name)
             signature = (state.size, state.mtime)
             self._previous[name] = signature
-            if self._is_current(indexed, name, state.mtime) or self._sent.get(name) == signature:
+            if self._is_current(indexed, name, state.mtime):
+                self._retry.pop(name, None)  # indexed after all (a job evicted unseen)
+                continue
+            if self._sent.get(name) == signature:
                 continue
             if self._gave_up.get(name) == signature:
                 continue
@@ -427,10 +477,14 @@ class FolderWatcher(BackgroundLoop):
         for name, (signature, job_id) in list(self._pending.items()):
             job = self._job_lookup(job_id)
             if job is None:
-                # The job store let it go: whether the document is current decides.
+                # The job store let it go before this pass saw how it ended: counted as
+                # a failed attempt, so a file that keeps failing (and whose jobs keep
+                # being evicted) still backs off and is given up on. A document that
+                # did index is current, which the scan checks first.
                 del self._pending[name]
                 if self._sent.get(name) == signature:
                     del self._sent[name]
+                self._schedule_retry(name, signature, "its job was no longer listed", done)
                 continue
             if job.state == "done":
                 del self._pending[name]
@@ -466,7 +520,7 @@ class FolderWatcher(BackgroundLoop):
             )
             self._give_up(name, signature, done)
             return
-        delay = min(self._interval * 2 ** (attempts - 1), self._retry_max_seconds)
+        delay = doubled_wait(self._interval, attempts - 1, self._retry_max_seconds)
         self._retry[name] = _Retry(signature, attempts, self._clock() + delay, error)
 
     def _give_up(self, name: str, signature: tuple[int, float], done: dict[str, list[str]]) -> None:

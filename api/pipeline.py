@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
@@ -74,6 +74,7 @@ from api.llm import (
     stopped_at_token_limit,
     usage_cost_usd,
     usage_totals,
+    was_degraded,
 )
 from api.metrics import answer_inflight_joins_total
 from api.prompting import (
@@ -84,7 +85,7 @@ from api.prompting import (
     one_line,
 )
 from api.qdrant_schema import check_dense_dimension
-from api.repository import PassageFilter, VectorRepository, reciprocal_rank_fusion
+from api.repository import LegRanks, PassageFilter, VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
 from api.reranking import (
     RerankedChunk,
@@ -143,7 +144,7 @@ class AnswerOverrides:
     strong_matches_only: bool = False
 
 
-def _narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
+def narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
     """A question's passage narrowing as the trace shows it (only the parts set)."""
 
     if narrow is None:
@@ -159,6 +160,18 @@ def _narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
         "uploaded_before": narrow.uploaded_before,
     }
     return {key: value for key, value in record.items() if value not in (None, [])} or None
+
+
+def _filter_from_record(record: Mapping[str, Any]) -> PassageFilter:
+    """The ``PassageFilter`` a trace's narrowing record (``narrowing_record``) came
+    from."""
+
+    fields: dict[str, Any] = {
+        key: tuple(value) if isinstance(value, list) else value
+        for key, value in record.items()
+        if key in PassageFilter.__dataclass_fields__
+    }
+    return PassageFilter(**fields)
 
 
 @dataclass(frozen=True)
@@ -188,6 +201,8 @@ class RetrievalPhase:
     # Search only: nothing cleared rerank_min_score, so context_chunks are the closest
     # passages instead (see _retrieve_and_rerank).
     below_min_score: bool = False
+    # Point id -> [dense rank, sparse rank] (repository.LegRanks), for the trace.
+    leg_ranks: dict[str, list[int | None]] = field(default_factory=dict)
 
 
 class SourcesEvent(TypedDict):
@@ -272,6 +287,10 @@ class DoneEvent(TypedDict):
     # the total when a long document was read at evenly spaced passages.
     chunks_read: NotRequired[int]
     chunks_total: NotRequired[int]
+    # Summaries only: parts left out after their call failed twice, and parts whose
+    # notes stopped at the token limit (the summary may miss what they held).
+    parts_skipped: NotRequired[int]
+    notes_truncated: NotRequired[int]
 
 
 StreamEvent = StageEvent | SourcesEvent | DeltaEvent | DoneEvent | FollowupsEvent
@@ -635,6 +654,72 @@ def lead_or_join(
         answer_inflight_joins_total.labels(outcome="ran").inc()
 
 
+def cached_run(
+    cache: AnswerCache | None,
+    key: CacheKey | None,
+    *,
+    use_cache: bool,
+    should_stop: Callable[[], bool] | None,
+    replay: Callable[[CachedAnswer], Iterator[StreamEvent]],
+    run: Callable[[], Generator[StreamEvent]],
+    keep: Callable[[DoneEvent], bool] = lambda done: True,
+) -> Iterator[StreamEvent]:
+    """A run through the answer cache, for answers and summaries alike: a hit replayed
+    (``replay``), or the identical run already going joined (``lead_or_join``), or
+    ``run`` led — its ``done`` stored (unless the answer is degraded or ``keep`` says
+    no) before the frame goes out, and its follow-ups added once they come.
+
+    Stored at ``done``, not after the loop: follow-ups are generated after it, and a
+    client that leaves then (or as ``done`` arrives) closes this generator at the yield,
+    so a store after the loop never ran. Followers are released right after the store;
+    they never wait for the follow-ups. ``use_cache=False`` (Regenerate) skips the
+    lookup but still stores the result.
+    """
+
+    lead: threading.Event | None = None
+    if key is not None and use_cache and cache is not None:
+        hit = cache.get(key)
+        if hit is None:
+            joined = yield from lead_or_join(cache, key, should_stop)
+            if joined is None:
+                return
+            if isinstance(joined, CachedAnswer):
+                hit = joined
+            else:
+                lead = joined
+        if hit is not None:
+            yield from replay(hit)
+            return
+    done: DoneEvent | None = None
+    events = run()
+
+    def finish_lead() -> None:
+        if lead is not None and key is not None and cache is not None:
+            cache.inflight.finish(key, lead)
+
+    def store(followups: Sequence[str]) -> None:
+        if key is None or done is None or cache is None or was_degraded() or not keep(done):
+            return
+        cache.put(key, CachedAnswer.from_done(done, followups))
+
+    try:
+        for event in events:
+            if event["type"] == "done":
+                done = event
+                store(())
+                finish_lead()
+            elif event["type"] == "followups":
+                store(event["questions"])
+            yield event
+    finally:
+        # Closing this generator (the client left) must close the inner one now: its
+        # `finally` records the "closed early" trace. Left to garbage collection, it ran
+        # whenever the inner generator was freed — never, while anything (a tracer, a
+        # traceback) still held it.
+        events.close()
+        finish_lead()
+
+
 def drain[T](events: Generator[StreamEvent, None, T]) -> T:
     """Run a stage-yielding generator to its return value (the sync route has no
     stream to send its frames to)."""
@@ -772,15 +857,22 @@ class RagPipeline:
             llm_temperature=float(effective_settings.llm_temperature),
             rerank_min_score=float(effective_settings.rerank_min_score),
             fused_top_n=int(effective_settings.fused_top_n),
-            filenames=list(filenames) if filenames else None,
-            tags=list(tags) if tags else None,
+            # Sorted: the same scope given in another order is the same setting.
+            filenames=sorted(filenames) if filenames else None,
+            tags=sorted(tags) if tags else None,
             reranker_model=effective_settings.reranker_model,
             answer_format=effective_settings.answer_format,
             answer_language=effective_settings.answer_language,
-            narrowing=_narrowing_record(narrow),
+            narrowing=narrowing_record(narrow),
             llm_model=trace_model_name(effective_settings),
             context_neighbor_radius=int(effective_settings.context_neighbor_radius),
             rerank_fallback_count=int(effective_settings.rerank_fallback_count),
+            rerank_candidates=int(effective_settings.rerank_candidates),
+            rerank_relative_floor=float(effective_settings.rerank_relative_floor),
+            recency_boost_weight=float(effective_settings.recency_boost_weight),
+            query_expansion_enabled=bool(effective_settings.query_expansion_enabled),
+            reranker_onnx_file=effective_settings.reranker_onnx_file,
+            context_neighbor_max_chars=int(effective_settings.context_neighbor_max_chars),
         )
 
     def _phase_timings(
@@ -895,6 +987,8 @@ class RagPipeline:
                 diversity_dropped_ids=phase.diversity_dropped_ids,
                 relative_cut_ids=phase.relative_cut_ids,
                 context_budget_dropped_ids=context_budget_dropped_ids,
+                cited_source_numbers=frozenset(cited_source_numbers),
+                leg_ranks=phase.leg_ranks,
             ),
             prompt_messages=prompt_messages,
             answer=answer,
@@ -1083,10 +1177,12 @@ class RagPipeline:
         tag_variants: Future[list[str]] | None,
         narrow: PassageFilter | None,
         seed: EmbeddedText | None = None,
+        leg_ranks: LegRanks | None = None,
     ) -> tuple[list[RetrievedChunk], float, float]:
         """Every query embedded and hybrid-searched side by side, the result lists
         RRF-fused when there are several; the candidates, embed_ms and search_ms.
-        With ``seed`` (a stored passage's own vectors) that is the one query, as is."""
+        With ``seed`` (a stored passage's own vectors) that is the one query, as is.
+        ``leg_ranks`` is filled for the trace (``VectorRepository.hybrid_search``)."""
 
         embed_start = time.monotonic()
         query_embeddings = (
@@ -1102,11 +1198,13 @@ class RagPipeline:
             tags = tag_variants.result()
 
         search_start = time.monotonic()
-        # Passed only when set, so a repository double without the parameter still works.
-        narrowing = {"narrow": narrow} if narrow is not None else {}
+        # Passed only when set, so a repository double without the parameters still works.
+        extra: dict[str, Any] = {"narrow": narrow} if narrow is not None else {}
+        if leg_ranks is not None:
+            extra["leg_ranks"] = leg_ranks
         result_lists = _map_concurrently(
             lambda embedding: self._repository.hybrid_search(
-                settings, embedding, filenames, tags, **narrowing
+                settings, embedding, filenames, tags, **extra
             ),
             query_embeddings,
         )
@@ -1186,8 +1284,10 @@ class RagPipeline:
         if extra_query and extra_query.casefold() not in {q.casefold() for q in queries}:
             queries.insert(1, extra_query)
 
+        # Which leg found each candidate, for its trace (none is kept without one).
+        leg_ranks: LegRanks | None = {} if self._trace_store is not None else None
         candidates, embed_ms, search_ms = self._search(
-            queries, effective_settings, filenames, tags, tag_variants, narrow, seed
+            queries, effective_settings, filenames, tags, tag_variants, narrow, seed, leg_ranks
         )
         if should_stop is not None and should_stop():
             raise QuestionAbandoned
@@ -1230,6 +1330,7 @@ class RagPipeline:
             relative_cut_ids=frozenset(selection.relative_cut_ids),
             query_variants=queries[1:],
             below_min_score=selection.below_min_score,
+            leg_ranks=leg_ranks or {},
         )
 
     def retrieve(
@@ -1260,6 +1361,55 @@ class RagPipeline:
             narrow=narrow,
             also_search=also_search,
         )
+
+    def rerun_retrieval(
+        self, trace: QueryTrace, settings_update: Mapping[str, Any]
+    ) -> tuple[RetrievalPhase, QueryTrace]:
+        """``trace``'s question searched again — what it searched (a follow-up's
+        rewrite, next to the question as asked), in its scope and narrowing — under the
+        server's settings with ``settings_update`` (ranking settings only), and the
+        trace that retrieval would have left: ``POST /traces/{id}/rerun``. No LLM call:
+        query expansion is left out (its variants came from the model)."""
+
+        config = trace.config
+        settings = self._effective_settings(AnswerOverrides()).model_copy(
+            update={**settings_update, "query_expansion_enabled": False}
+        )
+        record = config.narrowing if config is not None else None
+        narrow = _filter_from_record(record) if record else None
+        query = trace.condensed_question or trace.question
+        phase = self._retrieve_and_rerank(
+            query,
+            settings,
+            config.filenames if config is not None else None,
+            config.tags if config is not None else None,
+            for_generation=True,
+            narrow=narrow,
+            also_search=trace.question if query != trace.question else None,
+        )
+        selected = phase.context_chunks[: int(settings.max_context_chunks)]
+        rerun = dataclasses.replace(
+            trace,
+            config=self._trace_config(
+                settings,
+                config.filenames if config is not None else None,
+                config.tags if config is not None else None,
+                narrow,
+            ),
+            candidates=build_trace_candidates(
+                phase.fused_candidates,
+                phase.scored_chunks,
+                phase.context_chunks,
+                selected,
+                min_score=float(settings.rerank_min_score),
+                diversity_dropped_ids=phase.diversity_dropped_ids,
+                relative_cut_ids=phase.relative_cut_ids,
+                leg_ranks=phase.leg_ranks,
+            ),
+            answer=None,
+            weak_matches=phase.below_min_score,
+        )
+        return phase, rerun
 
     def retrieve_similar(
         self,
@@ -1351,7 +1501,7 @@ class RagPipeline:
                 return hit.as_grounded(_cached_timings(started))
         try:
             grounded = self._answer_uncached(question, overrides, filenames, history, tags)
-            if key is not None and self._answer_cache is not None:
+            if key is not None and self._answer_cache is not None and not was_degraded():
                 self._answer_cache.put(key, CachedAnswer.from_grounded(grounded))
         finally:
             # After the store, so followers find the answer; on a failure they find
@@ -1379,61 +1529,21 @@ class RagPipeline:
         """
 
         started = time.monotonic()
-        key = self._cache_key(question, overrides, filenames, tags, history)
-        lead: threading.Event | None = None
-        if key is not None and use_cache and self._answer_cache is not None:
-            hit = self._answer_cache.get(key)
-            if hit is None:
-                joined = yield from lead_or_join(self._answer_cache, key, should_stop)
-                if joined is None:
-                    return
-                if isinstance(joined, CachedAnswer):
-                    hit = joined
-                else:
-                    lead = joined
-            if hit is not None:
-                yield from replay_cached(
-                    hit,
-                    started,
-                    top_rerank_score=hit.top_rerank_score,
-                    weak_matches=hit.weak_matches,
-                )
-                return
-        done: DoneEvent | None = None
-        events = self._answer_stream_uncached(
-            question, overrides, filenames, history, tags, should_stop
+        yield from cached_run(
+            self._answer_cache,
+            self._cache_key(question, overrides, filenames, tags, history),
+            use_cache=use_cache,
+            should_stop=should_stop,
+            replay=lambda hit: replay_cached(
+                hit,
+                started,
+                top_rerank_score=hit.top_rerank_score,
+                weak_matches=hit.weak_matches,
+            ),
+            run=lambda: self._answer_stream_uncached(
+                question, overrides, filenames, history, tags, should_stop
+            ),
         )
-
-        def finish_lead() -> None:
-            if lead is not None and key is not None and self._answer_cache is not None:
-                self._answer_cache.inflight.finish(key, lead)
-
-        def store(followups: Sequence[str]) -> None:
-            if key is None or done is None or self._answer_cache is None:
-                return
-            self._answer_cache.put(key, CachedAnswer.from_done(done, followups))
-
-        try:
-            for event in events:
-                # Cached as soon as the answer is complete, before its frame goes out:
-                # follow-up questions are generated after it, and a client that leaves
-                # then (or as `done` arrives) closes this generator at the yield, so a
-                # store after the loop never ran. The follow-ups, if any come, are added.
-                if event["type"] == "done":
-                    done = event
-                    store(())
-                    # Followers replay it now; they never wait for the follow-ups.
-                    finish_lead()
-                elif event["type"] == "followups":
-                    store(event["questions"])
-                yield event
-        finally:
-            # Closing this generator (the client left) must close the inner one now: its
-            # `finally` records the "closed early" trace. Left to garbage collection, it
-            # ran whenever the inner generator was freed — never, while anything (a
-            # tracer, a traceback) still held it.
-            events.close()
-            finish_lead()
 
     def _store_error_trace(self, run: AnswerRun, error: str) -> None:
         """Record ``run`` as failed (or abandoned), with the answer streamed so far."""

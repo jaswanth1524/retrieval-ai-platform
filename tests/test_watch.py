@@ -201,8 +201,13 @@ def test_the_app_watcher_indexes_into_its_workspace(
     monkeypatch.setattr(main, "get_token_counter", lambda: HeuristicTokenCounter())
     from api.raw_documents import RawDocumentStore
 
+    store = RawDocumentStore(str(tmp_path / "raw"))
+    monkeypatch.setattr(main, "get_raw_document_store", lambda: store)
+    # The watcher takes its workspace's store as the other workers do (raw_store_for).
     monkeypatch.setattr(
-        main, "get_raw_document_store", lambda: RawDocumentStore(str(tmp_path / "raw"))
+        main,
+        "raw_store_for",
+        lambda s: RawDocumentStore(s.raw_document_dir) if s.raw_document_dir else store,
     )
     repository = VectorRepository(qdrant)
     legal = settings_for(settings, "legal")
@@ -360,8 +365,13 @@ def test_the_app_watcher_refuses_a_near_duplicate_name_with_originals_stored(
     monkeypatch.setattr(main, "get_qdrant_client", lambda: qdrant)
     monkeypatch.setattr(main, "get_embedding_provider", lambda: FakeEmbeddingProvider())
     monkeypatch.setattr(main, "get_token_counter", lambda: HeuristicTokenCounter())
+    store = RawDocumentStore(str(tmp_path / "raw"))
+    monkeypatch.setattr(main, "get_raw_document_store", lambda: store)
+    # The watcher takes its workspace's store as the other workers do (raw_store_for).
     monkeypatch.setattr(
-        main, "get_raw_document_store", lambda: RawDocumentStore(str(tmp_path / "raw"))
+        main,
+        "raw_store_for",
+        lambda s: RawDocumentStore(s.raw_document_dir) if s.raw_document_dir else store,
     )
     repository = VectorRepository(qdrant)
 
@@ -511,7 +521,26 @@ def test_a_job_the_store_forgot_falls_back_to_the_index(tmp_path: Path) -> None:
     folder.scan_once()
     recorder.jobs.clear()  # evicted, and the document never made it into the index
 
+    # Counted as a failed attempt: sent again after the back-off, not every pass.
+    assert folder.scan_once()["retrying"] == ["a.txt"]
+    clock.now += 10_000
     assert folder.scan_once()["indexed"] == ["a.txt"]
+
+
+def test_an_evicted_job_whose_document_indexed_is_not_retried(tmp_path: Path) -> None:
+    write(tmp_path / "a.txt", "A")
+    recorder, clock = JobRecorder(), Clock()
+    folder = retrying_watcher(tmp_path, recorder, clock)
+    folder.scan_once()
+    folder.scan_once()
+    mtime = (tmp_path / "a.txt").stat().st_mtime
+    recorder.indexed["a.txt"] = mtime  # it did index; then the store let the job go
+    recorder.jobs.clear()
+
+    folder.scan_once()
+    clock.now += 10_000
+    assert not any(folder.scan_once().values())
+    assert folder.status().retrying == []
 
 
 def test_a_refused_file_waits_for_a_change_and_an_unreadable_one_is_retried(

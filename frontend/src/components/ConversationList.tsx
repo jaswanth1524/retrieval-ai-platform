@@ -18,6 +18,8 @@ interface ConversationListProps {
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
   onPin?: (id: string, pinned: boolean) => void;
+  /** Replace a conversation's labels (to filter the list by). */
+  onSetLabels?: (id: string, labels: string[]) => void;
   /** Matches the query against question and answer text (titles are matched here). */
   onSearch?: (query: string) => Map<string, ConversationMatch>;
   disabled?: boolean;
@@ -34,6 +36,7 @@ function ConversationList({
   onRename,
   onDelete,
   onPin,
+  onSetLabels,
   onSearch,
   disabled,
   streamingId = null,
@@ -50,6 +53,18 @@ function ConversationList({
   const [draftTitle, setDraftTitle] = useState('');
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  const [labelFilter, setLabelFilter] = useState<string | null>(null);
+  const [labelingId, setLabelingId] = useState<string | null>(null);
+  const [labelDraft, setLabelDraft] = useState('');
+  const allLabels = useMemo(() => {
+    const byKey = new Map<string, string>();
+    for (const conversation of conversations) {
+      for (const label of conversation.labels ?? []) {
+        if (!byKey.has(label.toLocaleLowerCase())) byKey.set(label.toLocaleLowerCase(), label);
+      }
+    }
+    return [...byKey.values()].sort((a, b) => a.localeCompare(b));
+  }, [conversations]);
   // Deferred: matching every answer's text runs on each keystroke otherwise.
   const needle = useDeferredValue(query.trim().toLowerCase());
   // Re-run when the list changes (a new answer may now match), not on every frame:
@@ -61,8 +76,8 @@ function ConversationList({
   );
   // Pinned first, each group most recently used first (the order they arrive in).
   const ordered = useMemo(
-    () => listedConversations(conversations, filter, workspaceFilter),
-    [conversations, filter, workspaceFilter],
+    () => listedConversations(conversations, filter, workspaceFilter, labelFilter),
+    [conversations, filter, workspaceFilter, labelFilter],
   );
   // The active conversation always stays listed, so the list never hides where you are.
   const visible = needle
@@ -81,6 +96,14 @@ function ConversationList({
   useEffect(() => {
     if (filter === 'saved' && !anySaved) setFilter('all');
   }, [filter, anySaved]);
+  useEffect(() => {
+    if (
+      labelFilter !== null &&
+      !allLabels.some((label) => label.toLocaleLowerCase() === labelFilter.toLocaleLowerCase())
+    ) {
+      setLabelFilter(null);
+    }
+  }, [labelFilter, allLabels]);
   useEffect(() => {
     if (workspaceFilter !== ALL_WORKSPACES && !workspaces.includes(workspaceFilter)) {
       setWorkspaceFilter(ALL_WORKSPACES);
@@ -127,13 +150,13 @@ function ConversationList({
   const refocusRowIdRef = useRef<string | null>(null);
   useEffect(() => {
     const id = refocusRowIdRef.current;
-    if (editingId !== null || id === null) return;
+    if (editingId !== null || labelingId !== null || id === null) return;
     refocusRowIdRef.current = null;
     const row = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-conversation-id]') ?? [])].find(
       (candidate) => candidate.dataset.conversationId === id,
     );
     row?.querySelector<HTMLElement>('.conversation-list__select')?.focus();
-  }, [editingId]);
+  }, [editingId, labelingId]);
 
   const commitEditing = () => {
     if (editingId && draftTitle.trim()) onRename(editingId, draftTitle);
@@ -143,7 +166,9 @@ function ConversationList({
 
   return (
     <>
-      {conversations.length > SEARCH_THRESHOLD && (
+      {/* Shown while a search is typed even below the threshold: hidden, a filter left
+          after a delete couldn't be seen or cleared. */}
+      {(conversations.length > SEARCH_THRESHOLD || query !== '') && (
         <input
           type="search"
           className="conversation-list__search"
@@ -153,6 +178,22 @@ function ConversationList({
           onChange={(event) => setQuery(event.target.value)}
           data-testid="conversation-search"
         />
+      )}
+      {allLabels.length > 0 && (
+        <div className="conversation-list__labels" role="group" aria-label="Labels" data-testid="conversation-label-filters">
+          {allLabels.map((label) => (
+            <button
+              key={label}
+              type="button"
+              className="conversation-list__label"
+              aria-pressed={labelFilter === label}
+              onClick={() => setLabelFilter((current) => (current === label ? null : label))}
+              data-testid="conversation-label-filter"
+            >
+              #{label}
+            </button>
+          ))}
+        </div>
       )}
       {(anySaved || workspaces.length > 1) && (
         <div className="conversation-list__filters" data-testid="conversation-filters">
@@ -235,6 +276,32 @@ function ConversationList({
                 }}
                 confirmTestId="conversation-delete-confirm"
               />
+            ) : labelingId === conversation.id ? (
+              <input
+                className="conversation-list__edit"
+                value={labelDraft}
+                autoFocus
+                placeholder="labels, comma-separated"
+                onChange={(event) => setLabelDraft(event.target.value)}
+                onBlur={() => {
+                  onSetLabels?.(conversation.id, labelDraft.split(','));
+                  setLabelingId(null);
+                }}
+                onKeyDown={(event) => {
+                  if (isImeComposing(event)) return;
+                  if (event.key === 'Enter') {
+                    refocusRowIdRef.current = conversation.id;
+                    event.currentTarget.blur();
+                  }
+                  if (event.key === 'Escape') {
+                    event.stopPropagation();
+                    refocusRowIdRef.current = conversation.id;
+                    setLabelingId(null);
+                  }
+                }}
+                aria-label={`Labels of ${conversation.title}, comma-separated`}
+                data-testid="conversation-labels-input"
+              />
             ) : editingId === conversation.id ? (
               <input
                 className="conversation-list__edit"
@@ -306,6 +373,12 @@ function ConversationList({
                         &middot; {conversation.workspace}
                       </span>
                     )}
+                    {conversation.labels?.length ? (
+                      <span data-testid="conversation-labels">
+                        {' '}
+                        &middot; {conversation.labels.map((label) => `#${label}`).join(' ')}
+                      </span>
+                    ) : null}
                     {(conversation.savedCount ?? 0) > 0 && (
                       <span data-testid="conversation-saved-count">
                         {' '}
@@ -342,6 +415,21 @@ function ConversationList({
                   >
                     ✎
                   </button>
+                  {onSetLabels && (
+                    <button
+                      type="button"
+                      className="conversation-list__row-action"
+                      onClick={() => {
+                        setLabelingId(conversation.id);
+                        setLabelDraft((conversation.labels ?? []).join(', '));
+                      }}
+                      aria-label={`Label ${conversation.title}`}
+                      title="Labels, to filter the list by"
+                      data-testid="conversation-label"
+                    >
+                      #
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="conversation-list__row-action"

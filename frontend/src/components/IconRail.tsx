@@ -4,6 +4,7 @@ import './IconRail.css';
 export type RailPanel =
   | 'chat'
   | 'saved'
+  | 'review'
   | 'corpus'
   | 'search'
   | 'traces'
@@ -19,6 +20,7 @@ interface RailItem {
 const RAIL_ITEMS: RailItem[] = [
   { key: 'chat', glyph: '☰', label: 'Conversations' },
   { key: 'saved', glyph: '☆', label: 'Saved answers' },
+  { key: 'review', glyph: '⚑', label: 'Needs review' },
   { key: 'corpus', glyph: '▤', label: 'Corpus' },
   { key: 'search', glyph: '⌕', label: 'Search passages' },
   { key: 'traces', glyph: '◔', label: 'Traces' },

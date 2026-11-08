@@ -1,3 +1,5 @@
+import { usageTotal } from './deepLink';
+import { formatCost } from './cost';
 import type { CitationResponse } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
 import { toCsv } from './csv';
@@ -64,7 +66,14 @@ export function chatToMarkdown(turns: ChatTurn[], title?: string): string {
       .join('\n\n');
   });
   const body = blocks.join('\n\n---\n\n');
-  return title ? `# ${title}\n\n${body}` : body;
+  const usage = usageTotal(turns);
+  // What the answers used, at the end: an export is also how costs are reported.
+  const footer = usage
+    ? `\n\n---\n\n_Answers used ${usage.tokens.toLocaleString('en-US')} tokens${
+        usage.costUsd !== undefined ? ` (about ${formatCost(usage.costUsd)})` : ''
+      }._`
+    : '';
+  return (title ? `# ${title}\n\n${body}` : body) + footer;
 }
 
 /** Saved answers as one Markdown file: each with its question, conversation, sources

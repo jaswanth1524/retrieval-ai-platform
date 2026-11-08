@@ -17,6 +17,8 @@ from api.dependencies import (
 from api.document_names import indexing_now
 from api.document_ops import (
     enqueue_refetched,
+    refuse_if_replaced,
+    reindex_from_original,
     retry_refusal,
 )
 from api.ingest_jobs import (
@@ -38,7 +40,6 @@ from api.routes.documents_common import (
     _job_response,
     _job_status,
 )
-from api.routes.documents_write import reindex_document
 from api.schemas import (
     DocumentJobAcceptedResponse,
     DocumentJobListResponse,
@@ -136,7 +137,7 @@ async def retry_document_job(
         )
     if job.kind == "reindex":
         accepted = await run_in_threadpool(
-            reindex_document, job.filename, repository, settings, queue, raw_store
+            reindex_from_original, job.filename, repository, settings, queue, raw_store
         )
     else:
         accepted = await _fetch_again(job, repository, settings, queue, raw_store)
@@ -165,6 +166,7 @@ async def _fetch_again(
     assert job.source_url is not None
     await run_in_threadpool(repository.ensure_writable, settings)
     meta = await run_in_threadpool(repository.document_metadata, settings, job.filename)
+    refuse_if_replaced(job, meta)
     fetched = await _fetch_for_ingest(
         queue,
         functools.partial(

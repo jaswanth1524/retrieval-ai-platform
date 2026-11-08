@@ -46,6 +46,7 @@ class Recorder:
         uploaded_at: float | None,
         tags: tuple[str, ...],
         source: DocumentSource | None,
+        watched_from: str | None = None,
     ) -> DocumentJobAcceptedResponse:
         self.queued.append((name, content))
         self.sources[name] = source

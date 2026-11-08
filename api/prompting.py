@@ -16,6 +16,7 @@ from api.llm import (
     completion_model_and_kwargs,
     effective_max_tokens,
     logger,
+    note_degraded,
     reset_finish_reason,
     stopped_at_token_limit,
 )
@@ -68,8 +69,13 @@ def answer_language_instruction(settings: AppSettings) -> str:
 _ANSWER_FORMAT_INSTRUCTIONS = {
     "bullets": "Format the answer as a bulleted list, one point per line, each point "
     "with its citation.",
-    "table": "Where the content allows it, format the answer as a Markdown table, with "
-    "citations inside the cells; otherwise answer in prose.",
+    # Firm on purpose: "where the content allows it" let gpt-5-mini answer a one-fact
+    # question in prose after the reader had asked for a table (Reformat → table). And
+    # "say so in prose instead" still got a refusal as a one-row table; "write no table"
+    # didn't (gpt-5-mini, 2 of 2 each), which keeps a refusal readable as one.
+    "table": "Format the answer as a Markdown table, with citations inside the cells, even "
+    "when it holds a single row. When the sources do not answer the question, write no "
+    "table: say so in one sentence.",
     "brief": "Keep the answer to two or three sentences.",
 }
 
@@ -823,6 +829,7 @@ def generate_query_variants(
     try:
         raw = generator.complete(build_expansion_messages(question, count), expansion_settings)
     except GenerationError:
+        note_degraded()
         return []
 
     return _distinct_lines(raw, question, count)
@@ -901,10 +908,23 @@ def generate_followups(
     followup_settings = settings.model_copy(
         update={"llm_temperature": 0.3, "llm_max_tokens": int(settings.followup_max_tokens)}
     )
+    messages = build_followup_messages(question, answer, sources, count)
+    # In the answer's language (ANSWER_LANGUAGE, or the request's): a German answer
+    # with English suggestions read as a different conversation. Not its format: the
+    # suggestions are one question a line, whatever shape the answer took.
+    language = settings.answer_language
+    if language == "match":
+        language = "the language of the question"
+    if language and messages and messages[0]["role"] == "system":
+        messages = [
+            {
+                "role": "system",
+                "content": f"{messages[0]['content']} Write the questions in {language}.",
+            },
+            *messages[1:],
+        ]
     try:
-        raw = generator.complete(
-            build_followup_messages(question, answer, sources, count), followup_settings
-        )
+        raw = generator.complete(messages, followup_settings)
     except GenerationError as exc:
         logger.warning("Follow-up suggestions failed: %s", exc)
         return []

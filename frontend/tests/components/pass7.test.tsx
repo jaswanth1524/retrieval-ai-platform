@@ -153,7 +153,7 @@ describe('ChatThread', () => {
       />,
     );
     expect(screen.queryByTestId('chat-message-weak-support')).toBeNull();
-    expect(screen.getByTestId('citation-not-relevant')).toBeDisabled();
+    expect(screen.getByTestId('citation-not-relevant')).toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByTestId('citation-not-relevant')).toHaveTextContent('not relevant');
   });
 

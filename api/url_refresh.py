@@ -24,21 +24,21 @@ import dataclasses
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 
 from api.audit import audit
 from api.background import BackgroundLoop, OwnedJobs
+from api.backoff import doubled_wait
 from api.document_names import indexing_now
 from api.document_ops import enqueue_refreshed
 from api.ingest_jobs import IngestQueue
 from api.jobs import IngestJob
 from api.metrics import url_refresh_total
 from api.qdrant_schema import CollectionSchemaError
-from api.raw_documents import RawDocumentStore
 from api.repository import DocumentMetadata, VectorRepository
 from api.settings import AppSettings
 from api.url_fetch import BacklogFullError, FetchedDocument, fetch_document, fetch_slots
 from api.url_refresh_state import MemoryRefreshStateStore, RefreshState, RefreshStateStore
+from api.workspace_target import WorkspaceTarget
 from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
@@ -75,17 +75,8 @@ def refresh_due(
         return (meta.uploaded_at or 0.0) + interval
     wait = interval
     if state.failures > 0:
-        wait = min(interval * 2 ** min(state.failures, 20), max(MAX_BACKOFF_SECONDS, interval))
+        wait = doubled_wait(interval, state.failures, max(MAX_BACKOFF_SECONDS, interval))
     return state.last_checked + wait
-
-
-@dataclass(frozen=True)
-class RefreshTarget:
-    """One workspace whose fetched documents are kept current."""
-
-    settings: AppSettings
-    raw_store: RawDocumentStore | None
-    queue: IngestQueue
 
 
 class UrlRefresher(BackgroundLoop):
@@ -95,7 +86,7 @@ class UrlRefresher(BackgroundLoop):
         self,
         settings: AppSettings,
         repository: VectorRepository,
-        targets: Callable[[], Sequence[RefreshTarget]],
+        targets: Callable[[], Sequence[WorkspaceTarget]],
         *,
         fetch: Fetch = fetch_document,
         clock: Callable[[], float] = time.time,
@@ -166,6 +157,9 @@ class UrlRefresher(BackgroundLoop):
         for target in targets:
             if outcomes["deferred"] or sum(outcomes.values()) >= room:
                 break
+            queue = target.queue
+            if queue is None:
+                continue
             try:
                 metadata = self._repository.filename_metadata(target.settings)
             except CollectionSchemaError as exc:
@@ -187,7 +181,7 @@ class UrlRefresher(BackgroundLoop):
                 if sum(outcomes.values()) >= room:
                     break
                 assert meta.source_url is not None
-                outcome = self._refresh(target, name, meta.source_url, meta)
+                outcome = self._refresh(target, queue, name, meta.source_url, meta)
                 outcomes[outcome] += 1
                 url_refresh_total.labels(outcome=outcome).inc()
                 if outcome == "deferred":
@@ -208,15 +202,22 @@ class UrlRefresher(BackgroundLoop):
                 )
         return outcomes
 
-    def _refresh(self, target: RefreshTarget, name: str, url: str, meta: DocumentMetadata) -> str:
-        if not target.queue.backlog.has_room(1) or not fetch_slots.acquire(blocking=False):
+    def _refresh(
+        self,
+        target: WorkspaceTarget,
+        queue: IngestQueue,
+        name: str,
+        url: str,
+        meta: DocumentMetadata,
+    ) -> str:
+        if not queue.backlog.has_room(1) or not fetch_slots.acquire(blocking=False):
             return "deferred"  # the routes' fetches and uploads come first
         try:
             fetched = self._fetch(
                 url,
                 target.settings,
                 filename=name,
-                has_room=target.queue.backlog.has_room,
+                has_room=queue.backlog.has_room,
                 etag=meta.source_etag,
                 last_modified=meta.source_last_modified,
             )
@@ -234,7 +235,7 @@ class UrlRefresher(BackgroundLoop):
                 name,
                 url,
                 fetched,
-                target.queue,
+                queue,
                 target.raw_store,
                 expected=meta,
                 repository=self._repository,
@@ -243,7 +244,7 @@ class UrlRefresher(BackgroundLoop):
             logger.warning("Scheduled refresh of %s could not be queued: %s", name, exc)
             return "deferred"
         self._jobs.add(
-            target.queue.job_store,
+            queue.job_store,
             accepted.job_id,
             (target.settings.qdrant_collection, name, meta),
         )

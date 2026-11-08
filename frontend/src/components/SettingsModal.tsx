@@ -5,6 +5,7 @@ import { useDialog } from '../hooks/useDialog';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
+import AdminTools from './settings/AdminTools';
 import { ANSWER_FORMATS, EMPTY_OVERRIDES, isAnswerFormat, isAnswerLanguage } from '../utils/overrides';
 
 const FORMAT_LABELS: Record<string, string> = {
@@ -28,6 +29,10 @@ interface SettingsModalProps {
   serverVersion?: string | null;
   /** The server's last readiness report (/health/ready); null until one arrived. */
   readiness?: ReadinessResponse | null;
+  /** The full key: workspace settings, cached answers, backups, consistency. */
+  showAdmin?: boolean;
+  /** A backup was restored: the corpus listing should be read again. */
+  onRestored?: () => void;
 }
 
 const SYSTEM_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
@@ -96,8 +101,11 @@ function SettingsModal({
   onNotifyOnAnswerChange,
   serverVersion = null,
   readiness = null,
+  showAdmin = false,
+  onRestored,
 }: SettingsModalProps) {
   const dialogRef = useDialog(true, onClose);
+  const [adminOpen, setAdminOpen] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState(getApiKey);
   // Staged like the API key: sliders only touch this draft, never onOverridesChange
   // directly, so a drag doesn't localStorage-write on every tick and Cancel (unmount,
@@ -401,6 +409,17 @@ function SettingsModal({
                 </p>
               )}
             </section>
+          )}
+
+          {showAdmin && (
+            <details
+              className="settings__system"
+              onToggle={(event) => setAdminOpen((event.target as HTMLDetailsElement).open)}
+              data-testid="settings-admin-toggle"
+            >
+              <summary className="mono">Administration</summary>
+              {adminOpen && <AdminTools onRestored={onRestored} />}
+            </details>
           )}
 
           <details className="settings__system">

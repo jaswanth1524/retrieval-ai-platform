@@ -1111,6 +1111,7 @@ class FakeServer:
                     {
                         "filename": "a.txt",
                         "page": 2,
+                        "section": "Intro",
                         "rank_a": 1,
                         "rank_b": 4,
                         "drop_reason_b": "below_min_score",
@@ -1461,7 +1462,7 @@ def test_the_score_report_trace_diff_and_recheck_commands() -> None:
     code, out = run(mock_client(FakeServer()), "traces", "diff", "t1", "t2")
     assert code == 0
     assert "same answer: no" in out and "rerank_top_k: 3 -> 5" in out
-    assert "a.txt p.2: rank 1 -> 4  below_min_score" in out
+    assert "a.txt p.2 · Intro: rank 1 -> 4  below_min_score" in out
     assert run(mock_client(FakeServer()), "traces", "diff", "t1")[0] == 2
 
     code, out = run(mock_client(FakeServer()), "queries", "--recheck")

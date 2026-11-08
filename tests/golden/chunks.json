@@ -728,5 +728,61 @@
    "section": "Leave",
    "text_sha1": "d48d35f851f1a49b"
   }
+ ],
+ "costs.ods": [
+  {
+   "chunk_id": "6f650aad3f80df875776",
+   "page": 1,
+   "section": "Costs · Rows 2-6",
+   "text_sha1": "7cb6806f7c8469bb"
+  }
+ ],
+ "deck.odp": [
+  {
+   "chunk_id": "116970765d07ba2641f9",
+   "page": 1,
+   "section": "Roadmap",
+   "text_sha1": "96bbd043efad41b7"
+  },
+  {
+   "chunk_id": "3711e51b9f02727b749a",
+   "page": 2,
+   "section": "Slide 2",
+   "text_sha1": "a50ce07cae3bdd41"
+  }
+ ],
+ "team.mbox": [
+  {
+   "chunk_id": "5b477c1f025fd07c020b",
+   "page": 1,
+   "section": "Standup",
+   "text_sha1": "992c7835693be675"
+  },
+  {
+   "chunk_id": "e44d1d2298fe4bb4f698",
+   "page": 1,
+   "section": "Standup",
+   "text_sha1": "487a9000e2e74a60"
+  },
+  {
+   "chunk_id": "c3742c1f7c95889b6458",
+   "page": 2,
+   "section": "Invoice 42",
+   "text_sha1": "81ee5b67b2453234"
+  },
+  {
+   "chunk_id": "5cec6c060f0add3e5ebd",
+   "page": 2,
+   "section": "Invoice 42",
+   "text_sha1": "605763548b32d645"
+  }
+ ],
+ "analysis.ipynb": [
+  {
+   "chunk_id": "4547e92dbc4a05811e87",
+   "page": 1,
+   "section": "Load",
+   "text_sha1": "e9cde249ca4d6a22"
+  }
  ]
 }

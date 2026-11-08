@@ -130,7 +130,7 @@ describe('CorpusPanel', () => {
       onSummarize: vi.fn(),
       summarizeDisabled: true,
     });
-    expect(screen.getByLabelText('Summarize a.txt')).toBeDisabled();
+    expect(screen.getByLabelText('Summarize a.txt')).toHaveAttribute('aria-disabled', 'true');
     for (const box of screen.getAllByTestId('corpus-select')) await userEvent.click(box);
     expect(screen.getByTestId('corpus-bulk-compare')).toBeDisabled();
     expect(props.onSummarize).not.toHaveBeenCalled();

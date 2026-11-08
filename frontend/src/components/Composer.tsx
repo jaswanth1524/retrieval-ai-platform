@@ -1,20 +1,16 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
-import { SCOPE_PRESET_NAME_MAX_CHARS, type ScopePreset } from '../utils/scopePresets';
+import type { ScopePreset } from '../utils/scopePresets';
+import ScopePopover from './ScopePopover';
 import './Composer.css';
 import { isImeComposing } from '../utils/keyboard';
 import { enterAddsNewline } from '../utils/platform';
 import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
-import { MAX_QUESTION_CHARS, MAX_SCOPE_FILENAMES } from '../utils/limits';
+import { MAX_QUESTION_CHARS } from '../utils/limits';
 import { isProviderAllowed, isProviderUsable } from '../utils/providers';
-import { endOfDayFromDateInput, fromDateInput, toDateInput } from '../utils/dates';
 
-// The most tags and files one question may be scoped to (api/schemas.py's
-// MAX_TAGS_PER_DOCUMENT and REQUEST_FILENAMES_MAX): one more was a 422 on every
-// question and every passage search, with nothing saying why.
-const MAX_SCOPE_TAGS = 20;
 // The most of the window the question box grows to before it scrolls.
 const COMPOSER_MAX_HEIGHT_SHARE = 0.4;
 
@@ -62,11 +58,6 @@ interface ComposerProps {
   onDeleteScopePreset?: (name: string) => void;
 }
 
-function pageInput(value: string): number | undefined {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined;
-}
-
 // Typing is saved this long after the last keystroke.
 const DRAFT_SAVE_DELAY_MS = 300;
 
@@ -106,14 +97,6 @@ function Composer({
   onSaveScopePreset,
   onDeleteScopePreset,
 }: ComposerProps) {
-  const [presetName, setPresetName] = useState<string | null>(null);
-  const scopeNarrows =
-    selectedFilenames.length > 0 ||
-    selectedTags.length > 0 ||
-    pageRange?.min !== undefined ||
-    pageRange?.max !== undefined ||
-    uploadedAfter !== undefined ||
-    uploadedBefore !== undefined;
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
   // long question pasted from elsewhere lost its end without a word.
@@ -124,6 +107,10 @@ function Composer({
   valueRef.current = value;
   useEffect(() => {
     if (!draftKey) return;
+    // A send queued during startup belongs to the conversation it was typed in: going
+    // out after a switch, it sent the next conversation's draft there instead. Its text
+    // stays saved as that conversation's draft.
+    setSendQueued(false);
     setValue(readDraft(draftKey));
     const save = () => writeDraft(draftKey, valueRef.current);
     // A reload inside the save delay would otherwise lose the last few keystrokes.
@@ -145,7 +132,6 @@ function Composer({
     textareaRef.current?.focus();
   }, [prefill]);
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
-  const [scopeQuery, setScopeQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Grows with what is typed (up to a share of the window, then scrolls): two fixed
@@ -266,25 +252,6 @@ function Composer({
 
   // Sets for the per-row checks: up to 500 selected files against every listed one was
   // a quadratic scan on each render of the popover.
-  const selectedFileSet = useMemo(() => new Set(selectedFilenames), [selectedFilenames]);
-  const selectedTagSet = useMemo(() => new Set(selectedTags), [selectedTags]);
-
-  const toggleTag = (tag: string) => {
-    onSelectedTagsChange?.(
-      selectedTagSet.has(tag)
-        ? selectedTags.filter((name) => name !== tag)
-        : [...selectedTags, tag],
-    );
-  };
-
-  const toggleFilename = (filename: string) => {
-    onSelectedFilenamesChange(
-      selectedFileSet.has(filename)
-        ? selectedFilenames.filter((name) => name !== filename)
-        : [...selectedFilenames, filename],
-    );
-  };
-
   // ALLOWED_REQUEST_PROVIDERS: a provider the server refuses per request is shown
   // disabled rather than offered and turned away with a 400.
   const allowed = (name: string) => !config || isProviderAllowed(name, config);
@@ -292,22 +259,6 @@ function Composer({
   const ollamaEnabled = config !== null && isProviderUsable('ollama', config);
   const compatibleAllowed = allowed('openai_compatible');
   const anthropicEnabled = config !== null && isProviderUsable('anthropic', config);
-
-  // A search hiding an already-selected filename would make it permanently
-  // unselectable (the checkbox list is the only way to remove it from scope), so a
-  // selected filename always stays visible regardless of match.
-  const trimmedScopeQuery = scopeQuery.trim().toLowerCase();
-  const visibleFilenames =
-    trimmedScopeQuery === ''
-      ? indexedFilenames
-      : indexedFilenames.filter(
-          (filename) =>
-            filename.toLowerCase().includes(trimmedScopeQuery) ||
-            selectedFileSet.has(filename),
-        );
-
-  const tagsFull = selectedTags.length >= MAX_SCOPE_TAGS;
-  const filenamesFull = selectedFilenames.length >= MAX_SCOPE_FILENAMES;
 
   return (
     <div className="composer" ref={wrapRef}>
@@ -363,7 +314,6 @@ function Composer({
               className="composer__chip"
               onClick={() => {
                 setOpenPopover((prev) => (prev === 'scope' ? null : 'scope'));
-                setScopeQuery('');
               }}
               disabled={indexedFilenames.length === 0}
               aria-expanded={openPopover === 'scope'}
@@ -374,204 +324,24 @@ function Composer({
               <span aria-hidden="true">◎</span> {scopeLabel}
             </button>
             {openPopover === 'scope' && (
-              <div
-                className="composer__popover"
-                id="composer-scope-popover"
-                role="group"
-                aria-label="Search scope"
-                data-testid="composer-scope-popover"
-              >
-                <label className="composer__popover-item">
-                  <input
-                    type="checkbox"
-                    checked={selectedFilenames.length === 0 && selectedTags.length === 0}
-                    onChange={() => {
-                      onSelectedFilenamesChange([]);
-                      onSelectedTagsChange?.([]);
-                    }}
-                    data-testid="scope-all"
-                  />
-                  <span>All documents</span>
-                </label>
-                {onApplyScopePreset && (scopePresets.length > 0 || onSaveScopePreset) && (
-                  <div className="composer__presets" role="group" aria-label="Saved scopes">
-                    {scopePresets.map((preset) => (
-                      <span key={preset.name} className="composer__preset" data-testid="scope-preset">
-                        <button
-                          type="button"
-                          className="composer__preset-apply"
-                          onClick={() => onApplyScopePreset(preset)}
-                          title="Search these documents"
-                        >
-                          {preset.name}
-                        </button>
-                        {onDeleteScopePreset && (
-                          <button
-                            type="button"
-                            className="composer__preset-delete"
-                            onClick={() => onDeleteScopePreset(preset.name)}
-                            aria-label={`Delete the saved scope ${preset.name}`}
-                            data-testid="scope-preset-delete"
-                          >
-                            ✕
-                          </button>
-                        )}
-                      </span>
-                    ))}
-                    {onSaveScopePreset &&
-                      (presetName === null ? (
-                        <button
-                          type="button"
-                          className="composer__preset-save"
-                          onClick={() => setPresetName('')}
-                          disabled={!scopeNarrows}
-                          title={scopeNarrows ? 'Save this scope to pick it again' : 'Choose documents, tags, pages or dates first'}
-                          data-testid="scope-preset-save"
-                        >
-                          Save scope as…
-                        </button>
-                      ) : (
-                        <form
-                          className="composer__preset-form"
-                          onSubmit={(event) => {
-                            event.preventDefault();
-                            if (!presetName.trim()) return;
-                            onSaveScopePreset(presetName);
-                            setPresetName(null);
-                          }}
-                        >
-                          <input
-                            type="text"
-                            value={presetName}
-                            maxLength={SCOPE_PRESET_NAME_MAX_CHARS}
-                            onChange={(event) => setPresetName(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Escape') {
-                                event.stopPropagation();
-                                setPresetName(null);
-                              }
-                            }}
-                            placeholder="Name"
-                            aria-label="Name for this scope"
-                            autoFocus
-                            data-testid="scope-preset-name"
-                          />
-                          <button type="submit" disabled={!presetName.trim()} data-testid="scope-preset-confirm">
-                            Save
-                          </button>
-                        </form>
-                      ))}
-                  </div>
-                )}
-                {indexedFilenames.length > 5 && (
-                  <input
-                    type="search"
-                    className="composer__popover-search"
-                    placeholder="Filter documents…"
-                    aria-label="Filter documents"
-                    value={scopeQuery}
-                    onChange={(event) => setScopeQuery(event.target.value)}
-                    data-testid="composer-scope-search"
-                  />
-                )}
-                {tagsFull && (
-                  <p className="composer__popover-note" data-testid="scope-tags-full">
-                    Up to {MAX_SCOPE_TAGS} tags per question.
-                  </p>
-                )}
-                {filenamesFull && (
-                  <p className="composer__popover-note" data-testid="scope-files-full">
-                    Up to {MAX_SCOPE_FILENAMES} documents per question.
-                  </p>
-                )}
-                {availableTags.length > 0 && onSelectedTagsChange && (
-                  <div className="composer__popover-tags" role="group" aria-label="Tags">
-                    {availableTags.map((tag) => (
-                      <label key={tag} className="composer__popover-item" data-testid="scope-tag">
-                        <input
-                          type="checkbox"
-                          checked={selectedTagSet.has(tag)}
-                          disabled={tagsFull && !selectedTagSet.has(tag)}
-                          onChange={() => toggleTag(tag)}
-                        />
-                        <span>#{tag}</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-                {onPageRangeChange && selectedFilenames.length === 1 && (
-                  <div className="composer__popover-pages" data-testid="scope-pages">
-                    <span>Pages</span>
-                    <input
-                      type="number"
-                      min={1}
-                      inputMode="numeric"
-                      value={pageRange?.min ?? ''}
-                      onChange={(event) =>
-                        onPageRangeChange({ ...pageRange, min: pageInput(event.target.value) })
-                      }
-                      aria-label={`First page of ${selectedFilenames[0]}`}
-                      placeholder="from"
-                      data-testid="scope-page-min"
-                    />
-                    <span>to</span>
-                    <input
-                      type="number"
-                      min={pageRange?.min ?? 1}
-                      inputMode="numeric"
-                      value={pageRange?.max ?? ''}
-                      onChange={(event) =>
-                        onPageRangeChange({ ...pageRange, max: pageInput(event.target.value) })
-                      }
-                      aria-label={`Last page of ${selectedFilenames[0]}`}
-                      placeholder="to"
-                      data-testid="scope-page-max"
-                    />
-                    {pageRange?.min !== undefined &&
-                      pageRange.max !== undefined &&
-                      pageRange.min > pageRange.max && (
-                        <span className="composer__popover-note" role="status" data-testid="scope-pages-order">
-                          Read as pages {pageRange.max}–{pageRange.min}.
-                        </span>
-                      )}
-                  </div>
-                )}
-                {onUploadedAfterChange && (
-                  <label className="composer__popover-pages" data-testid="scope-uploaded">
-                    <span>Uploaded since</span>
-                    <input
-                      type="date"
-                      value={toDateInput(uploadedAfter)}
-                      onChange={(event) => onUploadedAfterChange(fromDateInput(event.target.value))}
-                      data-testid="scope-uploaded-after"
-                    />
-                  </label>
-                )}
-                {onUploadedBeforeChange && (
-                  <label className="composer__popover-pages" data-testid="scope-uploaded-up-to">
-                    <span>Uploaded up to</span>
-                    <input
-                      type="date"
-                      value={toDateInput(uploadedBefore)}
-                      onChange={(event) =>
-                        onUploadedBeforeChange(endOfDayFromDateInput(event.target.value))
-                      }
-                      data-testid="scope-uploaded-before"
-                    />
-                  </label>
-                )}
-                {visibleFilenames.map((filename) => (
-                  <label key={filename} className="composer__popover-item" data-testid="scope-item">
-                    <input
-                      type="checkbox"
-                      checked={selectedFileSet.has(filename)}
-                      disabled={filenamesFull && !selectedFileSet.has(filename)}
-                      onChange={() => toggleFilename(filename)}
-                    />
-                    <span className="composer__popover-filename mono">{filename}</span>
-                  </label>
-                ))}
-              </div>
+              <ScopePopover
+                indexedFilenames={indexedFilenames}
+                selectedFilenames={selectedFilenames}
+                onSelectedFilenamesChange={onSelectedFilenamesChange}
+                availableTags={availableTags}
+                selectedTags={selectedTags}
+                onSelectedTagsChange={onSelectedTagsChange}
+                pageRange={pageRange}
+                onPageRangeChange={onPageRangeChange}
+                uploadedAfter={uploadedAfter}
+                onUploadedAfterChange={onUploadedAfterChange}
+                uploadedBefore={uploadedBefore}
+                onUploadedBeforeChange={onUploadedBeforeChange}
+                scopePresets={scopePresets}
+                onApplyScopePreset={onApplyScopePreset}
+                onSaveScopePreset={onSaveScopePreset}
+                onDeleteScopePreset={onDeleteScopePreset}
+              />
             )}
           </div>
           <div className="composer__popover-anchor">

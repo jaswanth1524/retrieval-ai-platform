@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, apiErrorMessage } from '../api/client';
+import { api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { ScoreReportResponse, TraceDiffResponse } from '../api/types';
 
 /** One request's state: loading, the answer, or the reason it failed. */
@@ -23,7 +23,26 @@ function useFetched<T>(load: (signal: AbortSignal) => Promise<T>, key: string) {
 
 /** The best rerank score of each traced question, answered against not answered, and
  *  the RERANK_MIN_SCORE that would separate them best on this corpus. */
-export function ScoreReportView({ onClose }: { onClose: () => void }) {
+export function ScoreReportView({
+  onClose,
+  canApply = false,
+}: {
+  onClose: () => void;
+  /** Offer to set the suggested bar for this workspace (the full key). */
+  canApply?: boolean;
+}) {
+  const [applied, setApplied] = useState<string | null>(null);
+  const apply = async (bar: number) => {
+    const workspace = getWorkspace() || 'default';
+    try {
+      // PUT replaces every setting: the workspace's others are kept as they are.
+      const current = await api.workspaceSettings(workspace);
+      await api.putWorkspaceSettings(workspace, { ...current.settings, rerank_min_score: bar });
+      setApplied(`This workspace now uses ${bar}; its cached answers were cleared.`);
+    } catch (err) {
+      setApplied(apiErrorMessage(err, 'Could not set it.'));
+    }
+  };
   const fetched = useFetched<ScoreReportResponse>((signal) => api.scoreReport(signal), 'report');
   const report = fetched?.value;
   const tallest = report ? Math.max(1, ...report.answered, ...report.unanswered) : 1;
@@ -63,6 +82,23 @@ export function ScoreReportView({ onClose }: { onClose: () => void }) {
             <p data-testid="score-report-suggestion">
               Suggested <span className="mono">RERANK_MIN_SCORE={report.suggested_min_score}</span>
               {report.would_change ? ` — ${report.would_change} traced question(s) decided differently` : ''}
+              {canApply && (
+                <>
+                  {' '}
+                  <button
+                    type="button"
+                    onClick={() => void apply(report.suggested_min_score as number)}
+                    data-testid="score-report-apply"
+                  >
+                    Use it for this workspace
+                  </button>
+                </>
+              )}
+            </p>
+          )}
+          {applied && (
+            <p role="status" data-testid="score-report-applied">
+              {applied}
             </p>
           )}
           <p className="trace-tools__note">{report.note}</p>
@@ -114,7 +150,8 @@ export function TraceDiffView({ a, b, onClose }: { a: string; b: string; onClose
             <ul className="mono">
               {diff.candidates.map((change) => (
                 <li key={change.point_id} data-testid="trace-diff-candidate">
-                  {change.filename} p.{change.page}: rank {shown(change.rank_a)} → {shown(change.rank_b)}
+                  {change.filename} p.{change.page}
+                  {change.section ? ` · ${change.section}` : ''}: rank {shown(change.rank_a)} → {shown(change.rank_b)}
                   {change.selected_a !== change.selected_b &&
                     (change.selected_b ? ' · now in the prompt' : ' · no longer in the prompt')}
                   {change.drop_reason_b ? ` · ${change.drop_reason_b}` : ''}

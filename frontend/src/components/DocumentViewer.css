@@ -267,3 +267,31 @@
   opacity: 0.5;
   cursor: default;
 }
+
+.document-viewer__find {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--rule);
+  font-size: 12.5px;
+}
+
+.document-viewer__find input {
+  flex: 1;
+  min-width: 10em;
+  font: inherit;
+}
+
+.document-viewer__found {
+  background: var(--accent-soft);
+  background: color-mix(in oklch, var(--warn) 40%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+
+.document-viewer__chunk--found {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

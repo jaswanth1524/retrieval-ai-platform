@@ -25,7 +25,19 @@ from api.chunking import HeuristicTokenCounter
 from api.documents import chunk_sections, parse_document_bytes
 from api.settings import AppSettings
 from tests.factories import make_test_settings
-from tests.samples import eml_bytes, epub_bytes, odt_bytes, pdf_bytes, pptx_bytes, xlsx_bytes
+from tests.samples import (
+    eml_bytes,
+    epub_bytes,
+    ipynb_bytes,
+    mbox_bytes,
+    odf_bytes,
+    odp_slide,
+    ods_row,
+    odt_bytes,
+    pdf_bytes,
+    pptx_bytes,
+    xlsx_bytes,
+)
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "chunks.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -114,6 +126,33 @@ def _documents() -> dict[str, bytes]:
         "<text:p>Employees accrue twenty days of paid leave per year.</text:p>"
         '<text:h text:outline-level="1">Travel</text:h>'
         "<text:p>Book flights through the travel portal.</text:p>"
+    )
+    documents["costs.ods"] = odf_bytes(
+        "spreadsheet",
+        '<table:table table:name="Costs">'
+        + ods_row("Item", "Amount")
+        + ods_row("Servers", "1200")
+        + ods_row(repeat=3)
+        + ods_row("Licences", "300.5")
+        + "</table:table>",
+    )
+    documents["deck.odp"] = odf_bytes(
+        "presentation",
+        odp_slide("Roadmap", ["Ship hybrid search.", "Add spans."])
+        + odp_slide(None, ["A slide without a title."], notes="Say the date."),
+    )
+    documents["team.mbox"] = mbox_bytes(
+        [
+            ("Standup", "Search is green.\nFrom now on we ship daily."),
+            ("Invoice 42", "Please pay the invoice by Friday."),
+        ]
+    )
+    documents["analysis.ipynb"] = ipynb_bytes(
+        [
+            ("markdown", "# Load\n\nRead the sales table."),
+            ("code", "import pandas as pd\nsales = pd.read_csv('sales.csv')"),
+            ("markdown", "# Totals\n\nSum by region."),
+        ]
     )
     return documents
 

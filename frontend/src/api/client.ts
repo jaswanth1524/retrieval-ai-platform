@@ -29,6 +29,16 @@ import type {
   QueryRecheckResponse,
   ReadinessResponse,
   ScoreReportResponse,
+  AnswerCacheResponse,
+  ArchiveUploadResponse,
+  BackupCheckResponse,
+  BackupListResponse,
+  ConsistencyResponse,
+  SitemapIngestResponse,
+  TraceRerunRequest,
+  TraceRerunResponse,
+  WorkspaceSettingsRequest,
+  WorkspaceSettingsResponse,
   UsageResponse,
   WatchStatusResponse,
   DocumentTask,
@@ -368,6 +378,8 @@ function summaryRequestBody(
   // Only what a summary uses: retrieval overrides, scope and history don't apply to it.
   const body: Record<string, unknown> = { mode: task.mode, filenames: task.filenames };
   if (task.instruction) body.instruction = task.instruction;
+  if (task.pageMin !== undefined) body.page_min = task.pageMin;
+  if (task.pageMax !== undefined) body.page_max = task.pageMax;
   if (llmProvider) body.llm_provider = llmProvider;
   if (overrides?.llmTemperature != null) body.llm_temperature = overrides.llmTemperature;
   if (options?.bypassCache) body.use_cache = false;
@@ -740,6 +752,80 @@ export const api = {
   scoreReport: (signal?: AbortSignal) =>
     request<ScoreReportResponse>('/traces/score-report', { signal }),
 
+  // A traced question searched again under other ranking settings (no answer written).
+  rerunTrace: (traceId: string, settings: TraceRerunRequest, signal?: AbortSignal) =>
+    request<TraceRerunResponse>(`/traces/${encodeURIComponent(traceId)}/rerun`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+    }),
+
+  // A workspace's own relevance settings ("default" for the default workspace).
+  workspaceSettings: (name: string, signal?: AbortSignal) =>
+    request<WorkspaceSettingsResponse>(`/workspaces/${encodeURIComponent(name)}/settings`, {
+      signal,
+    }),
+
+  putWorkspaceSettings: (name: string, settings: WorkspaceSettingsRequest) =>
+    request<WorkspaceSettingsResponse>(`/workspaces/${encodeURIComponent(name)}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    }),
+
+  // This workspace's cached answers, and clearing them.
+  answerCache: (signal?: AbortSignal) => request<AnswerCacheResponse>('/answer-cache', { signal }),
+
+  clearAnswerCache: () => request<{ removed: number }>('/answer-cache', { method: 'DELETE' }),
+
+  // BACKUP_DIR's backups of this workspace (404 when scheduled backups are off).
+  listBackups: (signal?: AbortSignal) => request<BackupListResponse>('/backups', { signal }),
+
+  runBackup: () => request<{ workspace: string }>('/backups/run', { method: 'POST' }),
+
+  verifyStoredBackup: (name: string) =>
+    request<BackupCheckResponse>(`/backups/${encodeURIComponent(name)}/verify`, {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
+
+  restoreStoredBackup: (name: string) =>
+    request<ImportResponse>(`/backups/${encodeURIComponent(name)}/restore`, {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
+
+  // How the index and the stored originals agree (a report; nothing changes).
+  consistency: (signal?: AbortSignal) =>
+    request<ConsistencyResponse>('/admin/consistency', { signal }),
+
+  // A zip of documents, each indexed as its own.
+  uploadArchive: (file: File, tags?: string[], signal?: AbortSignal, workspace?: string) => {
+    const form = new FormData();
+    form.append('file', file);
+    for (const tag of tags ?? []) form.append('tags', tag);
+    return request<ArchiveUploadResponse>('/documents/archive', {
+      method: 'POST',
+      body: form,
+      timeoutMs: uploadTimeoutMs(file.size),
+      signal,
+      workspace,
+    });
+  },
+
+  // A site's pages from its sitemap or feed, fetched in the background.
+  addFromSitemap: (url: string, tags?: string[], signal?: AbortSignal, workspace?: string) =>
+    request<SitemapIngestResponse>('/documents/from-sitemap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tags && tags.length > 0 ? { url, tags } : { url }),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+      workspace,
+    }),
+
   // What differs between two traces: settings, and candidates that moved.
   diffTraces: (traceId: string, otherId: string, signal?: AbortSignal) =>
     request<TraceDiffResponse>(
@@ -908,7 +994,14 @@ export const api = {
                   truncated: event.truncated,
                   ...(event.usage ? { usage: event.usage } : {}),
                   ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'
-                    ? { coverage: { read: event.chunks_read, total: event.chunks_total } }
+                    ? {
+                        coverage: {
+                          read: event.chunks_read,
+                          total: event.chunks_total,
+                          ...(event.parts_skipped ? { skipped: event.parts_skipped } : {}),
+                          ...(event.notes_truncated ? { cutOff: event.notes_truncated } : {}),
+                        },
+                      }
                     : {}),
                 },
               );

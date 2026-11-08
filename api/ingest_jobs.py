@@ -30,6 +30,7 @@ from api.metrics import (
     ingest_job_seconds,
     ingest_jobs_total,
 )
+from api.parse_isolation import ParseInterruptedError
 from api.pipeline import IngestService
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
@@ -141,6 +142,8 @@ def job_error_message(exc: Exception) -> str:
 def ingest_error_type(exc: Exception) -> str:
     """Coarse error_type label for docrag_ingest_jobs_total{outcome="failed"}."""
 
+    if isinstance(exc, ParseInterruptedError):
+        return "parse_timeout"
     if isinstance(exc, DocumentError):
         return "document"
     if isinstance(exc, IngestionError):
@@ -176,6 +179,9 @@ class IngestRequest:
     source: DocumentSource | None = None
     dedupe: bool = False
     kind: str = "upload"
+    # The watched folder that owns the document (a restore carries it; None keeps the
+    # stored one, or the ingest service's own when it is the watcher's).
+    watched_from: str | None = None
 
 
 def run_ingest_job(
@@ -226,10 +232,11 @@ def run_ingest_job(
             # as not indexed when it is. The original is an opt-in extra — but a
             # previous version's original must not outlive the index it described, or
             # /original would serve bytes that no longer match what is indexed. No
-            # original (404) beats a wrong one.
+            # original (404) beats a wrong one. Its earlier versions stay: they are
+            # still right, and a full disk shouldn't cost the document its history.
             logger.exception("Indexed %r but could not store its original bytes.", filename)
             try:
-                raw_store.delete(filename)
+                raw_store.remove_current(filename)
             except OSError:
                 logger.exception(
                     "Could not remove the outdated original of %r either; "
@@ -254,6 +261,7 @@ def run_ingest_job(
             tags=request.tags,
             source=request.source,
             dedupe=request.dedupe,
+            watched_from=request.watched_from,
         )
     except IngestCancelledError as exc:
         # Asked for, not a fault: one line, no traceback.
@@ -338,6 +346,7 @@ class IngestQueue:
         source: DocumentSource | None = None,
         dedupe: bool = False,
         kind: str = "upload",
+        watched_from: str | None = None,
     ) -> DocumentJobAcceptedResponse:
         """``enqueue_ingest`` with this queue's collaborators (``IngestRequest``'s fields
         as keywords)."""
@@ -348,15 +357,16 @@ class IngestQueue:
             backlog=self.backlog,
             ingest_service=self.ingest_service,
             request=IngestRequest(
-                filename,
-                content,
-                raw_store,
-                uploaded_at,
-                precondition,
-                tags,
-                source,
-                dedupe,
-                kind,
+                filename=filename,
+                content=content,
+                raw_store=raw_store,
+                uploaded_at=uploaded_at,
+                precondition=precondition,
+                tags=tags,
+                source=source,
+                dedupe=dedupe,
+                kind=kind,
+                watched_from=watched_from,
             ),
         )
 

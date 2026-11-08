@@ -73,7 +73,7 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         anthropic_model=settings.anthropic_model,
         allowed_request_providers=allowed_request_providers(settings),
         supported_extensions=sorted(SUPPORTED_EXTENSIONS),
-        watch_enabled=bool(settings.watch_dir),
+        watch_enabled=bool(settings.watch_dir or settings.watch_dirs.strip()),
         answer_language=settings.answer_language,
         summary_max_documents=settings.summary_max_documents,
         answer_format=settings.answer_format,
@@ -85,10 +85,30 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
     )
 
 
-def _last_backup(app: FastAPI) -> BackupStatusResponse | None:
+def _last_backup(app: FastAPI, settings: AppSettings) -> BackupStatusResponse | None:
     backup = getattr(app.state, "backup", None)
     last = getattr(backup, "last", None)
-    return BackupStatusResponse(**dataclasses.asdict(last)) if last is not None else None
+    if last is None:
+        return None
+    status = BackupStatusResponse(**dataclasses.asdict(last))
+    if settings.api_key:
+        # /health/ready needs no key: no workspace names, file names or error text
+        # (which can carry paths) for anyone who can reach the port.
+        status = BackupStatusResponse(
+            at=status.at,
+            workspace="",
+            ok=status.ok,
+            error=None if status.ok else "The backup failed; see the server log.",
+        )
+    return status
+
+
+def _backups_failing(app: FastAPI, settings: AppSettings) -> list[str]:
+    backup = getattr(app.state, "backup", None)
+    failing = backup.failing() if backup is not None else []
+    if settings.api_key and failing:
+        return ["(hidden)"]
+    return list(failing)
 
 
 def register(app: FastAPI) -> None:
@@ -143,7 +163,8 @@ def register(app: FastAPI) -> None:
             index_detail=index_detail,
             originals_kept=bool(settings.raw_document_dir),
             models=health.states() if health is not None else {},
-            last_backup=_last_backup(app),
+            last_backup=_last_backup(app, settings),
+            backups_failing=_backups_failing(app, settings),
         )
         status_code = 200 if ready else 503
         return JSONResponse(status_code=status_code, content=body.model_dump())

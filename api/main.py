@@ -9,7 +9,6 @@ import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -18,7 +17,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.audit import audit
-from api.auto_reindex import ReindexTarget, StaleReindexer
+from api.auto_reindex import StaleReindexer
 from api.chunking import TokenCounter
 from api.dependencies import (
     get_app_settings,
@@ -39,7 +38,13 @@ from api.document_names import (
     known_filenames,
     refuse_near_duplicate_name,
 )
-from api.document_ops import delete_indexed_document, enqueue_refetched, retry_refusal
+from api.document_ops import (
+    delete_indexed_document,
+    enqueue_refetched,
+    refuse_if_replaced,
+    reindex_from_original,
+    retry_refusal,
+)
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.ingest_jobs import (
@@ -52,7 +57,6 @@ from api.logging_config import configure_logging
 from api.metrics import build_info
 from api.model_health import ModelHealth, ModelState
 from api.qdrant_schema import check_dense_dimension
-from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.request_guard import RequestGuardMiddleware
 from api.request_id import RequestIdMiddleware
@@ -65,16 +69,16 @@ from api.routes import search as search_routes
 from api.routes import traces as traces_routes
 from api.routes import watch as watch_routes
 from api.routes import workspaces as workspaces_routes
-from api.routes.documents_write import reindex_document
-from api.scheduled_backup import BackupTarget, ScheduledBackup
+from api.scheduled_backup import ScheduledBackup
 from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.static_files import FrontendFiles
 from api.storage import check_writable_storage
 from api.url_fetch import fetch_document, fetch_slots
-from api.url_refresh import RefreshTarget, UrlRefresher
+from api.url_refresh import UrlRefresher
 from api.version import app_version
-from api.watch import FolderWatcher, WatchedJob
+from api.watch import FolderWatcher, WatchedJob, watch_folders
+from api.workspace_target import WorkspaceTarget
 from api.workspaces import (
     WorkspaceError,
     list_workspaces,
@@ -295,7 +299,6 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
 
     target = watch_target(settings)
     repository = VectorRepository(get_qdrant_client())
-    raw_store = get_raw_document_store()
     if target is not settings:
         # Named in the configuration, so made here if it doesn't exist yet (a request
         # never creates a workspace by naming it).
@@ -303,8 +306,8 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
         if not workspace_exists(get_qdrant_client(), settings.qdrant_collection, name):
             logger.info("Creating workspace %r for WATCH_DIR.", name)
         repository.ensure_writable(target, create_workspace=True)
-        if raw_store is not None and target.raw_document_dir:
-            raw_store = RawDocumentStore(target.raw_document_dir, int(target.raw_document_versions))
+    # The same store requests use for that workspace (one per process, not a second).
+    raw_store = raw_store_for(target)
     settings = target
     folder = str(Path(settings.watch_dir).resolve())
     service = IngestService(
@@ -379,16 +382,6 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
     return watcher
 
 
-@dataclass(frozen=True)
-class WorkspaceTarget:
-    """One workspace a background worker goes over: its settings, its originals store
-    (None when originals aren't kept) and an ingest queue for its documents."""
-
-    settings: AppSettings
-    raw_store: RawDocumentStore | None
-    queue: IngestQueue
-
-
 def workspace_target(
     settings: AppSettings, repository: VectorRepository, token_counter: TokenCounter
 ) -> WorkspaceTarget:
@@ -424,11 +417,7 @@ def start_scheduled_backup(settings: AppSettings) -> ScheduledBackup:
     """Start BACKUP_DIR's backups (api/scheduled_backup.py) of every workspace."""
 
     repository = VectorRepository(get_qdrant_client())
-    every_workspace = workspace_targets(settings, repository, get_token_counter())
-
-    def targets() -> list[BackupTarget]:
-        return [BackupTarget(target.settings, target.raw_store) for target in every_workspace()]
-
+    targets = workspace_targets(settings, repository, get_token_counter())
     backup = ScheduledBackup(
         settings, repository, targets, get_feedback_store(), backup_routes._export_running
     )
@@ -455,27 +444,31 @@ def requeue_interrupted_jobs(settings: AppSettings) -> list[str]:
             continue
         workspace_settings = settings_for(settings, job.workspace) if job.workspace else settings
         target = workspace_target(workspace_settings, repository, token_counter)
+        queue = target.queue
+        if queue is None:  # pragma: no cover - workspace_target always builds one
+            continue
         try:
             if job.kind == "reindex":
-                accepted = reindex_document(
-                    job.filename, repository, workspace_settings, target.queue, target.raw_store
+                accepted = reindex_from_original(
+                    job.filename, repository, workspace_settings, queue, target.raw_store
                 )
             else:
                 if not settings.url_ingest_enabled or job.source_url is None:
                     continue
                 meta = repository.document_metadata(workspace_settings, job.filename)
+                refuse_if_replaced(job, meta)
                 with fetch_slots:
                     fetched = fetch_document(
                         job.source_url,
                         workspace_settings,
                         filename=job.filename,
-                        has_room=target.queue.backlog.has_room,
+                        has_room=queue.backlog.has_room,
                     )
                 accepted = enqueue_refetched(
                     job,
                     repository,
                     workspace_settings,
-                    target.queue,
+                    queue,
                     target.raw_store,
                     fetched,
                     meta,
@@ -507,15 +500,7 @@ def start_stale_reindexer(settings: AppSettings) -> StaleReindexer | None:
         return None
     repository = VectorRepository(get_qdrant_client())
     token_counter = get_token_counter()
-    every_workspace = workspace_targets(settings, repository, token_counter)
-
-    def targets() -> list[ReindexTarget]:
-        return [
-            ReindexTarget(target.settings, target.raw_store, target.queue)
-            for target in every_workspace()
-            if target.raw_store is not None
-        ]
-
+    targets = workspace_targets(settings, repository, token_counter)
     reindexer = StaleReindexer(settings, repository, targets, get_ingest_job_store(), token_counter)
     reindexer.start()
     return reindexer
@@ -526,14 +511,7 @@ def start_url_refresher(settings: AppSettings) -> UrlRefresher:
     the default workspace and every other one."""
 
     repository = VectorRepository(get_qdrant_client())
-    every_workspace = workspace_targets(settings, repository, get_token_counter())
-
-    def targets() -> list[RefreshTarget]:
-        return [
-            RefreshTarget(target.settings, target.raw_store, target.queue)
-            for target in every_workspace()
-        ]
-
+    targets = workspace_targets(settings, repository, get_token_counter())
     refresher = UrlRefresher(settings, repository, targets, state=get_url_refresh_state_store())
     refresher.start()
     return refresher
@@ -550,14 +528,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         health.record(await run_in_threadpool(warm_models, settings))
         # For /health/ready: a model that never loaded makes the app "degraded".
         app.state.model_health = health
-    watcher = None
+    watchers: list[FolderWatcher] = []
     reindexer = None
     refresher = None
     backup = None
     try:
-        watcher = start_folder_watcher(settings) if settings.watch_dir else None
+        watchers = [
+            start_folder_watcher(
+                settings.model_copy(
+                    update={"watch_dir": folder.path, "watch_workspace": folder.workspace}
+                )
+            )
+            for folder in watch_folders(settings)
+        ]
+        watcher = watchers[0] if watchers else None
         # For GET /watch and POST /watch/scan.
         app.state.watcher = watcher
+        app.state.watchers = watchers
         reindexer = start_stale_reindexer(settings) if settings.auto_reindex_stale else None
         if settings.requeue_interrupted_jobs:
             # On its own thread: a URL fetch can take its whole timeout, and startup
@@ -581,8 +568,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             refresher.stop()
         if reindexer is not None:
             reindexer.stop()
-        if watcher is not None:
-            watcher.stop()
+        for each in watchers:
+            each.stop()
     shutdown_executors()
 
 

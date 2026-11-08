@@ -459,6 +459,9 @@ export interface DocumentTask {
   filenames: string[];
   /** What to concentrate on; a general summary when absent. */
   instruction?: string;
+  /** A summary of part of one document: its pages from..to. */
+  pageMin?: number;
+  pageMax?: number;
 }
 
 /** GET /workspaces: the workspaces besides the default one. */
@@ -469,6 +472,10 @@ export interface WorkspaceListResponse {
 
 /** How much of the documents a summary read (fewer than all when sampled). */
 export interface SummaryCoverage {
+  /** Parts left out after their call failed twice (the summary may miss them). */
+  skipped?: number;
+  /** Parts whose notes stopped at the token limit. */
+  cutOff?: number;
   read: number;
   total: number;
 }
@@ -509,6 +516,9 @@ export interface QuestionOptions {
   /** Client-only (the X-Workspace header, not the body): the workspace to ask in, when
    *  it must not follow a later switch ("" = the default). Else the current one. */
   workspace?: string;
+  /** Client-only: the answer (turn id) this one replaces once it is done — Regenerate
+   *  and Reformat keep it as an earlier version of the new one. */
+  replacesAnswer?: string;
 }
 
 export type TraceStatus = 'ok' | 'insufficient_context' | 'error';
@@ -595,6 +605,12 @@ export interface TraceCandidateResponse {
   drop_reason: TraceDropReason | null;
   selected_for_context: boolean;
   neighbor_expanded: boolean;
+  /** Its [n] in the prompt (null: not in it), and whether the answer cited it. */
+  source_number?: number | null;
+  cited?: boolean;
+  /** Its rank on the dense and BM25 legs before fusion (null: not returned / not kept). */
+  dense_rank?: number | null;
+  sparse_rank?: number | null;
 }
 
 export interface TraceSummaryResponse {
@@ -650,9 +666,116 @@ export interface TraceDetailResponse {
   truncated?: boolean;
   /** History messages left out of the prompt to fit the context window. */
   dropped_history_messages?: number;
+  /** "question", or "summary" (whose question is its task line). */
+  kind?: string;
 }
 
 /** GET /traces/score-report: best rerank scores of answered against unanswered questions. */
+export interface TraceRerunRequest {
+  rerank_min_score?: number;
+  rerank_top_k?: number;
+  rerank_relative_floor?: number;
+  recency_boost_weight?: number;
+}
+
+/** POST /traces/{id}/rerun: the question searched again under other ranking settings. */
+export interface TraceRerunResponse {
+  query: string;
+  settings: Record<string, number>;
+  would_answer: boolean;
+  weak_matches: boolean;
+  diff: TraceDiffResponse;
+  candidates: TraceCandidateResponse[];
+}
+
+/** A workspace's own relevance settings (null: the server's). */
+export interface WorkspaceSettingsRequest {
+  rerank_min_score?: number | null;
+  recency_boost_weight?: number | null;
+  answer_language?: string | null;
+  answer_format?: AnswerFormat | null;
+}
+
+export interface WorkspaceSettingsResponse {
+  workspace: string;
+  settings: WorkspaceSettingsRequest;
+  effective: WorkspaceSettingsRequest;
+}
+
+export interface CachedQuestionResponse {
+  question: string;
+  age_seconds: number;
+}
+
+/** GET /answer-cache: this workspace's cached answers. */
+export interface AnswerCacheResponse {
+  enabled: boolean;
+  entries: CachedQuestionResponse[];
+  total_entries: number;
+  max_entries: number;
+  ttl_seconds: number;
+  in_flight: number;
+}
+
+export interface BackupFileResponse {
+  name: string;
+  size: number;
+  created_at: number;
+  /** Read back cleanly when written (null: not checked in this run). */
+  verified?: boolean | null;
+  problems?: string[];
+}
+
+/** GET /backups: this workspace's scheduled backups, newest first. */
+export interface BackupListResponse {
+  backups: BackupFileResponse[];
+  interval_hours: number;
+  keep: number;
+}
+
+export interface BackupCheckResponse {
+  ok: boolean;
+  documents: number;
+  originals: number;
+  originals_missing: number;
+  versions: number;
+  feedback: boolean;
+  problems: string[];
+}
+
+/** GET /admin/consistency: how the index and the stored originals agree. */
+export interface ConsistencyResponse {
+  documents: number;
+  originals_kept: boolean;
+  problems: number;
+  originals_without_document: string[];
+  documents_without_original: string[];
+  versions_without_document: string[];
+  incomplete: string[];
+  stale: string[];
+  duplicate_groups: string[][];
+  in_flight: string[];
+}
+
+export interface ArchiveSkipResponse {
+  name: string;
+  reason: string;
+}
+
+/** POST /documents/archive: a zip's documents, each queued as its own upload. */
+export interface ArchiveUploadResponse {
+  jobs: DocumentJobAcceptedResponse[];
+  skipped: ArchiveSkipResponse[];
+  deferred: string[];
+}
+
+/** POST /documents/from-sitemap: the pages being fetched in the background. */
+export interface SitemapIngestResponse {
+  urls: string[];
+  left_out: number;
+  child_sitemaps: number;
+}
+
 export interface ScoreReportResponse {
   current_min_score: number;
   /** answered[i] counts scores in [bin_edges[i], bin_edges[i + 1]). */
@@ -676,6 +799,7 @@ export interface TraceCandidateChangeResponse {
   point_id: string;
   filename: string;
   page: number;
+  section?: string;
   chunk_id: string;
   rank_a?: number | null;
   rank_b?: number | null;

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import platform
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -92,6 +93,26 @@ def summarized_parser_warnings(filename: str) -> Iterator[None]:
             )
 
 
+class ParseInterruptedError(DocumentParseError):
+    """The parse was stopped (PARSE_TIMEOUT_SECONDS) or its process died: not proof the
+    file is bad — a load spike or a busy machine can cause either — so it is a transient
+    failure (error type ``parse_timeout``), retried, not given up on."""
+
+
+def _limit_memory(settings: AppSettings) -> None:
+    """PARSE_MEMORY_LIMIT_MB in the parse child (Linux): an address-space cap, so a
+    parser blowing up fails with MemoryError in the child instead of the container's
+    OOM killer picking a process — possibly the API's, which holds the models."""
+
+    limit_mb = int(settings.parse_memory_limit_mb)
+    if limit_mb <= 0 or platform.system() != "Linux":
+        return
+    import resource
+
+    limit = limit_mb * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+
 def _parse(filename: str, content: bytes, settings: AppSettings) -> list[DocumentSection]:
     with summarized_parser_warnings(filename):
         return parse_document_bytes(filename, content, settings)
@@ -109,9 +130,15 @@ def _parse_in_child(
     except Exception:  # noqa: BLE001 - logging is no reason to fail a parse
         pass
     try:
+        _limit_memory(settings)
+    except Exception:  # noqa: BLE001 - parse without the cap rather than not at all
+        pass
+    try:
         result: tuple[str, object] = ("ok", _parse(filename, content, settings))
     except DocumentError as exc:
         result = ("document_error", exc)
+    except MemoryError:
+        result = ("memory", None)
     except BaseException as exc:  # noqa: BLE001 - reported to the parent, never raised here
         result = ("error", f"{type(exc).__name__}: {exc}")
     try:
@@ -157,7 +184,7 @@ def parse_with_limit(
     sender.close()  # the child holds the only writing end now
     try:
         if not receiver.poll(timeout):
-            raise DocumentParseError(
+            raise ParseInterruptedError(
                 f"Reading '{filename}' took longer than PARSE_TIMEOUT_SECONDS "
                 f"({timeout:g} s) and was stopped. If the file is valid, raise the limit."
             )
@@ -166,7 +193,7 @@ def parse_with_limit(
         except EOFError:
             # The child died without a word: killed for memory, or a crash in native code.
             process.join(timeout=5)  # for its exit code
-            raise DocumentParseError(
+            raise ParseInterruptedError(
                 f"Reading '{filename}' failed: the parser process exited unexpectedly "
                 f"(exit code {process.exitcode})."
             ) from None
@@ -179,5 +206,10 @@ def parse_with_limit(
         return payload
     if status == "document_error" and isinstance(payload, DocumentError):
         raise payload
+    if status == "memory":
+        raise DocumentParseError(
+            f"Reading '{filename}' needed more memory than PARSE_MEMORY_LIMIT_MB "
+            f"({settings.parse_memory_limit_mb} MB) allows."
+        )
     logger.warning("Parsing %s failed in the parser process: %s", filename, payload)
     raise DocumentParseError(f"Could not read '{filename}'.")

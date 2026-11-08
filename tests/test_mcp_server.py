@@ -380,3 +380,50 @@ async def test_each_tool_can_work_in_another_workspace() -> None:
     assert in_legal == "nda.txt (1 passages)"
     assert "not a workspace name" in bad
     assert "two years" in read
+
+
+@pytest.mark.asyncio
+async def test_write_tools_only_with_allow_writes_and_the_full_key(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_dependency_caches()
+    settings = make_settings(
+        api_key="full-key",
+        api_read_key="read-key",
+        raw_document_dir=str(tmp_path),
+    )
+    # The originals store is built from the app's settings, not the overridden ones.
+    monkeypatch.setattr("api.main.get_app_settings", lambda: settings)
+    monkeypatch.setattr("api.dependencies.get_app_settings", lambda: settings)
+    app = hermetic_app(settings, QdrantClient(":memory:"))
+    with TestClient(app) as test_client:
+        headers = {"X-API-Key": "full-key"}
+        assert (
+            upload_and_wait(test_client, "guide.txt", b"Intro\nAlpha.", headers=headers)["state"]
+            == "done"
+        )
+        writer = build_server(
+            lambda: DocragClient("http://testserver", "full-key", http=test_client),
+            allow_writes=True,
+        )
+        tools = {tool.name: tool for tool in await writer.list_tools()}
+        assert {"add_url", "reindex", "retry_job", "job_status"} <= set(tools)
+        assert tools["reindex"].annotations is not None
+        assert tools["reindex"].annotations.read_only_hint is False
+
+        queued = text_of(await writer.call_tool("reindex", {"filename": "guide.txt"}))
+        assert queued.startswith("Queued guide.txt as job ")
+        job_id = queued.split("job ")[1].split(";")[0]
+        status = text_of(await writer.call_tool("job_status", {"job_id": job_id}))
+        assert status.startswith("guide.txt: ")
+        refused = text_of(await writer.call_tool("add_url", {"url": "https://example.com/a"}))
+        assert refused.startswith("DocRAG error (404)")
+
+        reader = build_server(
+            lambda: DocragClient("http://testserver", "read-key", http=test_client),
+            allow_writes=True,
+        )
+        denied = text_of(await reader.call_tool("reindex", {"filename": "guide.txt"}))
+        assert denied.startswith("DocRAG error (403)")
+    monkeypatch.undo()
+    clear_dependency_caches()

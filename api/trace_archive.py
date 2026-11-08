@@ -11,14 +11,10 @@ and what users asked — so it is opt-in, and never part of a backup.
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
-from contextlib import AbstractContextManager
-from pathlib import Path
-from threading import Lock
 
-from api.sqlite_store import enable_wal, sqlite_transaction
+from api.sqlite_store import CappedRowLog
 from api.tracing import (
     QueryTrace,
     TraceSummary,
@@ -49,10 +45,16 @@ _SUMMARY_COLUMNS = (
     ("kept_count", "INTEGER NOT NULL DEFAULT 0"),
     ("answer_status", "TEXT"),
     ("top_rerank_score", "REAL"),
-    # 0 on rows written before these columns existed, until they are filled in.
+    ("reranker_model", "TEXT"),
+    ("gated", "INTEGER NOT NULL DEFAULT 1"),
+    ("kind", "TEXT NOT NULL DEFAULT 'question'"),
+    # Which set of these columns a row has filled (_SUMMARY_LEVEL); 0 on rows written
+    # before any existed, until they are filled in.
     ("summarized", "INTEGER NOT NULL DEFAULT 0"),
 )
 _SUMMARY_FIELDS = tuple(name for name, _ in _SUMMARY_COLUMNS if name != "summarized")
+# Raised when columns are added, so rows filled before are filled again.
+_SUMMARY_LEVEL = 2
 # Rows backfilled per transaction when an older archive is opened.
 _BACKFILL_ROWS = 500
 
@@ -61,17 +63,13 @@ def _summary_values(summary: TraceSummary) -> tuple[object, ...]:
     return tuple(getattr(summary, name) for name in _SUMMARY_FIELDS)
 
 
-class TraceArchive:
-    """Sqlite-backed trace rows; a connection per call under one lock, as the query
-    log does (sqlite3 connections aren't shared across threads)."""
+class TraceArchive(CappedRowLog):
+    """Sqlite-backed trace rows (``CappedRowLog``: newest TRACE_STORE_MAX_ROWS kept)."""
+
+    _table = "traces"
 
     def __init__(self, path: str, max_rows: int) -> None:
-        self._path = path
-        self._max_rows = max_rows
-        self._lock = Lock()
-        self._added = 0
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        enable_wal(path)
+        super().__init__(path, max_rows)
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE)
             conn.execute(
@@ -91,8 +89,8 @@ class TraceArchive:
         while True:
             with self._lock, self._connect() as conn:
                 rows = conn.execute(
-                    "SELECT rowid, body FROM traces WHERE summarized = 0 LIMIT ?",
-                    (_BACKFILL_ROWS,),
+                    "SELECT rowid, body FROM traces WHERE summarized < ? LIMIT ?",
+                    (_SUMMARY_LEVEL, _BACKFILL_ROWS),
                 ).fetchall()
                 if not rows:
                     return
@@ -100,16 +98,16 @@ class TraceArchive:
                     try:
                         values = _summary_values(summarize_trace(trace_from_json(body)))
                     except Exception:  # noqa: BLE001 - an unreadable row lists as blank
-                        conn.execute("UPDATE traces SET summarized = 1 WHERE rowid = ?", (rowid,))
+                        conn.execute(
+                            "UPDATE traces SET summarized = ? WHERE rowid = ?",
+                            (_SUMMARY_LEVEL, rowid),
+                        )
                         continue
                     assignments = ", ".join(f"{name} = ?" for name in _SUMMARY_FIELDS)
                     conn.execute(
-                        f"UPDATE traces SET {assignments}, summarized = 1 WHERE rowid = ?",
-                        (*values, rowid),
+                        f"UPDATE traces SET {assignments}, summarized = ? WHERE rowid = ?",
+                        (*values, _SUMMARY_LEVEL, rowid),
                     )
-
-    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
-        return sqlite_transaction(self._path)
 
     def add(self, trace: QueryTrace) -> None:
         body = trace_to_json(trace)
@@ -118,33 +116,22 @@ class TraceArchive:
         with self._lock, self._connect() as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO traces (trace_id, created_at, workspace, body, "
-                f"{columns}, summarized) VALUES (?, ?, ?, ?, {marks}, 1)",
+                f"{columns}, summarized) VALUES (?, ?, ?, ?, {marks}, ?)",
                 (
                     trace.trace_id,
                     trace.created_at,
                     trace.workspace,
                     body,
                     *_summary_values(summarize_trace(trace)),
+                    _SUMMARY_LEVEL,
                 ),
             )
-            self._added += 1
-            # Trimmed every so often, not on each insert (a count per question).
-            if self._added % 100 == 1:
-                conn.execute(
-                    "DELETE FROM traces WHERE rowid <= (SELECT MAX(rowid) FROM traces) - ?",
-                    (self._max_rows,),
-                )
+            self._added_one(conn)
 
     def get(self, trace_id: str) -> QueryTrace | None:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT body FROM traces WHERE trace_id = ?", (trace_id,)).fetchone()
         return trace_from_json(row[0]) if row is not None else None
-
-    def delete_workspace(self, workspace: str) -> int:
-        """Remove every archived trace of ``workspace`` (deleted)."""
-
-        with self._lock, self._connect() as conn:
-            return conn.execute("DELETE FROM traces WHERE workspace = ?", (workspace,)).rowcount
 
     def recent(self, workspace: str | None, limit: int) -> list[QueryTrace]:
         """The newest ``limit`` traces (only ``workspace``'s when given), newest first."""
@@ -180,14 +167,12 @@ class TraceArchive:
                 f"{where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
-        return [
-            TraceSummary(
-                trace_id=row[0],
-                created_at=row[1],
-                **dict(zip(_SUMMARY_FIELDS, row[2:], strict=True)),
-            )
-            for row in rows
-        ]
+        summaries = []
+        for row in rows:
+            fields = dict(zip(_SUMMARY_FIELDS, row[2:], strict=True))
+            fields["gated"] = bool(fields["gated"])
+            summaries.append(TraceSummary(trace_id=row[0], created_at=row[1], **fields))
+        return summaries
 
     def export_lines(self, workspace: str) -> Iterator[str]:
         """``workspace``'s traces as JSON lines, oldest first, a page at a time."""

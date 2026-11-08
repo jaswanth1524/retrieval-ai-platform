@@ -34,9 +34,26 @@ export const ACCEPTED_EXTENSIONS = [
   '.xlsx',
   '.pptx',
   '.odt',
+  '.ods',
+  '.odp',
+  '.mbox',
+  '.ipynb',
   '.json',
   ...CODE_EXTENSIONS,
 ];
+
+/** A zip of documents: sent to POST /documents/archive, each member its own document. */
+export const ARCHIVE_EXTENSION = '.zip';
+
+/** What an upload takes: the documents' suffixes, and a zip of them. */
+export function uploadExtensions(fromServer?: readonly string[]): readonly string[] {
+  const documents = acceptedExtensions(fromServer);
+  return documents.includes(ARCHIVE_EXTENSION) ? documents : [...documents, ARCHIVE_EXTENSION];
+}
+
+export function isArchive(file: File): boolean {
+  return file.name.toLowerCase().endsWith(ARCHIVE_EXTENSION);
+}
 
 /** The suffixes to accept: the server's list when it sent one. */
 export function acceptedExtensions(fromServer?: readonly string[]): readonly string[] {

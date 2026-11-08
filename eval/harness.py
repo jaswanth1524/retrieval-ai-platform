@@ -32,10 +32,11 @@ import argparse
 import datetime
 import json
 import math
+import os
 import platform
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -403,11 +404,19 @@ def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
 
 def run_retrieval_eval(
     examples: Sequence[RetrievalExample],
-    collaborators: Collaborators,
+    collaborators: Collaborators | None,
     ks: Sequence[int],
     arm: str = "reranked",
+    *,
+    ranker: Callable[[RetrievalExample], RankedResult] | None = None,
+    fingerprint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Score every example's filename ranking (and chunk ranking when labeled)."""
+    """Score every example's filename ranking (and chunk ranking when labeled).
+
+    ``ranker`` ranks an example some other way than the local pipeline (``--server``:
+    a running DocRAG's ``POST /search``); then ``fingerprint`` describes the run and
+    passage labels can't be resolved (no repository), so only file and chunk-id labels
+    count."""
 
     per_question: list[dict[str, Any]] = []
     filename_rows: list[dict[str, float]] = []
@@ -416,18 +425,26 @@ def run_retrieval_eval(
     latencies: list[float] = []
     # Filename and chunk scores by the format of the files a question is labelled with.
     by_format: dict[str, dict[str, list[dict[str, float]]]] = {}
-    passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
+    if ranker is None:
+        assert collaborators is not None
+        passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
+    else:
+        passage_ids = {}
     for index, example in enumerate(examples):
-        ranked = rank_for_question(
-            example.question,
-            history=example.history,
-            repository=collaborators.repository,
-            embedding_provider=collaborators.embedding_provider,
-            reranker=collaborators.reranker,
-            settings=collaborators.settings,
-            arm=arm,
-            generator=getattr(collaborators, "generator", None),
-        )
+        if ranker is not None:
+            ranked = ranker(example)
+        else:
+            assert collaborators is not None
+            ranked = rank_for_question(
+                example.question,
+                history=example.history,
+                repository=collaborators.repository,
+                embedding_provider=collaborators.embedding_provider,
+                reranker=collaborators.reranker,
+                settings=collaborators.settings,
+                arm=arm,
+                generator=getattr(collaborators, "generator", None),
+            )
         entry: dict[str, Any] = {
             "question": example.question,
             "latency_ms": {"total_ms": round(ranked.total_ms, 1)}
@@ -465,8 +482,11 @@ def run_retrieval_eval(
         # Only with such questions, so a baseline from a dataset without them keeps its
         # shape.
         levels["unanswerable"] = aggregate(no_context_rows)
+    if fingerprint is None:
+        assert collaborators is not None
+        fingerprint = settings_fingerprint(collaborators.settings, arm)
     result: dict[str, Any] = {
-        "fingerprint": settings_fingerprint(collaborators.settings, arm),
+        "fingerprint": fingerprint,
         "k_values": list(ks),
         "question_count": len(examples),
         "aggregate": levels,
@@ -486,6 +506,25 @@ def run_retrieval_eval(
             for suffix, levels_by in sorted(by_format.items())
         }
     return result
+
+
+def server_ranker(client: Any, top_k: int) -> Callable[[RetrievalExample], RankedResult]:
+    """Rank an example with a running DocRAG's ``POST /search`` (``cli.client``): the
+    deployment's own models, settings and corpus. A follow-up is searched as typed (the
+    search route has no conversation)."""
+
+    def rank(example: RetrievalExample) -> RankedResult:
+        started = time.monotonic()
+        response = client.search_response(example.question, top_k=top_k)
+        results = response.get("results", [])
+        return RankedResult(
+            filenames=[str(item.get("filename")) for item in results],
+            chunk_ids=[str(item.get("chunk_id")) for item in results],
+            below_min_score=bool(response.get("weak_matches")),
+            total_ms=(time.monotonic() - started) * 1000,
+        )
+
+    return rank
 
 
 def latency_summary(values: Sequence[float]) -> dict[str, float]:
@@ -585,6 +624,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retrieval.add_argument(
         "--baseline", type=Path, help="Baseline results JSON to compare against."
+    )
+    retrieval.add_argument(
+        "--server",
+        metavar="URL",
+        help="Score a running DocRAG through its POST /search instead of the local "
+        "pipeline (no Qdrant or models here). Not for baselines: it has no settings "
+        "fingerprint.",
+    )
+    retrieval.add_argument(
+        "--key-env",
+        default="DOCRAG_API_KEY",
+        help="--server: the environment variable holding its API key.",
     )
     retrieval.add_argument(
         "--max-regression",
@@ -732,6 +783,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{len(examples)} examples, {labeled} labeled: OK")
         return 0 if labeled else 2
 
+    if args.command == "retrieval" and args.server:
+        return _server_retrieval(args, examples)
+
     settings = get_settings()
 
     if args.command == "retrieval":
@@ -750,6 +804,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.limit > 0:
         examples = examples[: args.limit]
     return run_answer_eval(examples, Collaborators(settings), args.output, resume=args.resume)
+
+
+def _server_retrieval(args: argparse.Namespace, examples: Sequence[RetrievalExample]) -> int:
+    """``retrieval --server``: a deployment scored through its own search route."""
+
+    from cli.client import DocragClient, DocragError
+
+    if args.baseline is not None:
+        print(
+            "error: a --server run has no settings fingerprint to check a baseline "
+            "against; compare runs with `harness diff` instead.",
+            file=sys.stderr,
+        )
+        return 2
+    ks = tuple(args.ks) if args.ks else DEFAULT_KS
+    key = os.environ.get(args.key_env) or None
+    try:
+        with DocragClient(args.server, key) as client:
+            results = run_retrieval_eval(
+                examples,
+                None,
+                ks,
+                ranker=server_ranker(client, max(ks)),
+                fingerprint={"server": args.server, "arm": "reranked"},
+            )
+    except DocragError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    unresolved = sum(
+        1
+        for example in examples
+        if example.relevant_passages
+        and not example.relevant_filenames
+        and not example.relevant_chunk_ids
+    )
+    if unresolved:
+        results["passage_labels_skipped"] = unresolved
+    _emit(results, args.output)
+    return 0
 
 
 def compare_runs(args: argparse.Namespace) -> int:

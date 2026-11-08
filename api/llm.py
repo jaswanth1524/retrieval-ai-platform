@@ -202,9 +202,25 @@ def last_finish_reason() -> str | None:
 
 
 def begin_usage() -> None:
-    """Start adding up this thread's reported token usage (see ``usage_totals``)."""
+    """Start adding up this thread's reported token usage (see ``usage_totals``) — the
+    start of an answer — and clear its degraded mark (``note_degraded``)."""
 
     _last_call.usage = [0, 0]
+    _last_call.degraded = False
+
+
+def note_degraded() -> None:
+    """A best-effort step of this thread's answer failed and was skipped (the citation
+    retry, query expansion): the answer stands, but is not cached, so a passing
+    provider hiccup doesn't stay in the answer cache for ANSWER_CACHE_TTL_SECONDS."""
+
+    _last_call.degraded = True
+
+
+def was_degraded() -> bool:
+    """Whether ``note_degraded`` was called on this thread since ``begin_usage``."""
+
+    return bool(getattr(_last_call, "degraded", False))
 
 
 def add_usage(usage: tuple[int, int] | None) -> None:

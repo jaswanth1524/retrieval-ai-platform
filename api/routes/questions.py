@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from typing import get_args
 
@@ -28,7 +28,13 @@ from api.metrics import (
     questions_total,
     summaries_total,
 )
-from api.pipeline import AnswerOverrides, check_rerank_top_k, timings_dict
+from api.pipeline import (
+    AnswerOverrides,
+    DoneEvent,
+    StreamEvent,
+    check_rerank_top_k,
+    timings_dict,
+)
 from api.repository import PassageFilter
 from api.routes.deps import (
     DocumentSummarizerDep,
@@ -146,12 +152,21 @@ def check_request_provider(
 def summary_request(request: SummaryRequest) -> PipelineSummaryRequest:
     """The pipeline's request: names checked like any document path parameter."""
 
+    narrowed = request.page_min is not None or request.page_max is not None or request.section
+    low, high = request.page_min, request.page_max
+    if low is not None and high is not None and low > high:
+        low, high = high, low
     return PipelineSummaryRequest(
         mode=request.mode,
         filenames=tuple(stored_filename(name) for name in request.filenames),
         instruction=(request.instruction or "").strip() or None,
         llm_provider=request.llm_provider,
         llm_temperature=request.llm_temperature,
+        narrow=(
+            PassageFilter(page_min=low, page_max=high, section=request.section)
+            if narrowed
+            else None
+        ),
     )
 
 
@@ -189,6 +204,61 @@ def question_overrides(request: QuestionRequest) -> AnswerOverrides:
         narrow=passage_narrowing(request),
         passages_only=request.passages_only,
         strong_matches_only=request.strong_matches_only,
+    )
+
+
+def sse_response(
+    events: Iterator[StreamEvent],
+    lease: StreamLease,
+    stop: threading.Event,
+    *,
+    on_done: Callable[[DoneEvent], None],
+    on_error: Callable[[Exception], None],
+    what: str,
+) -> ClosingStreamingResponse:
+    """A question's or summary's events as an SSE response, with keepalives.
+
+    A mid-stream error becomes an SSE ``error`` event instead of a raw 500 the client
+    would never see: the status is committed by the time one can happen. Closing (not a
+    plain StreamingResponse): a client that leaves mid-answer closes the frames at once,
+    which sets ``stop`` and stops the pipeline thread before its next stage, instead of
+    whenever the generator was collected.
+    """
+
+    def frames() -> Iterator[str]:
+        keepalive = with_keepalive(
+            events,
+            SSE_KEEPALIVE_SECONDS,
+            stop=stop,
+            on_start=lease.hand_off,
+            on_finish=lease.release,
+        )
+        try:
+            for event in keepalive:
+                if event is None:
+                    yield SSE_KEEPALIVE_FRAME
+                    continue
+                if event["type"] == "done":
+                    on_done(event)
+                yield sse_event(dict(event))
+        except Exception as exc:
+            on_error(exc)
+            logger.warning("Streamed %s failed: %s", what, exc, exc_info=True)
+            yield sse_event({"type": "error", "detail": public_error_message(exc)})
+        finally:
+            # Sets `stop` when this generator is closed early (the client left).
+            keepalive.close()
+            lease.release_if_not_handed_off()
+
+    return ClosingStreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+        # Stops the pipeline as soon as the client leaves (see the class).
+        on_disconnect=stop.set,
+        # Also after a disconnect before the first frame, which never runs the
+        # generator (and so never its finally). The release is idempotent.
+        background=BackgroundTask(lease.release_if_not_handed_off),
     )
 
 
@@ -263,68 +333,37 @@ def register(app: FastAPI) -> None:
         stop = threading.Event()
         overrides = question_overrides(request)
 
-        def event_source() -> Iterator[str]:
-            # The try/except below turns a mid-stream domain error into a clean SSE
-            # `error` event instead of a raw 500 the client would otherwise never see
-            # — the HTTP status is already committed by the time an error can occur
-            # here (partway through an already-started streamed response).
-            events = with_keepalive(
-                pipeline.answer_stream(
-                    request.question,
-                    overrides,
-                    filenames=request.filenames,
-                    history=history_messages(request.history),
-                    tags=request.tags,
-                    use_cache=request.use_cache,
-                    should_stop=stop.is_set,
-                ),
-                SSE_KEEPALIVE_SECONDS,
-                stop=stop,
-                on_start=lease.hand_off,
-                on_finish=lease.release,
+        def on_done(event: DoneEvent) -> None:
+            count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
+            questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+            if event.get("cached"):
+                answer_cache_hits_total.inc()
+                return
+            observe_question_timings(event["timings"])
+            log_question(
+                provider=request.llm_provider,
+                source_count=len(event["sources"]),
+                timings=event["timings"],
             )
-            try:
-                for event in events:
-                    if event is None:
-                        yield SSE_KEEPALIVE_FRAME
-                        continue
-                    if event["type"] == "done":
-                        count_answer(
-                            event.get("answer_status", "answered"), event.get("truncated", False)
-                        )
-                    if event["type"] == "done" and event.get("cached"):
-                        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-                        answer_cache_hits_total.inc()
-                    elif event["type"] == "done":
-                        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-                        observe_question_timings(event["timings"])
-                        log_question(
-                            provider=request.llm_provider,
-                            source_count=len(event["sources"]),
-                            timings=event["timings"],
-                        )
-                    yield sse_event(dict(event))
-            except Exception as exc:
-                questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
-                logger.warning("Streamed question failed: %s", exc, exc_info=True)
-                yield sse_event({"type": "error", "detail": public_error_message(exc)})
-            finally:
-                # Sets `stop` when this generator is closed early (the client left).
-                events.close()
-                lease.release_if_not_handed_off()
 
-        # Closing (not a plain StreamingResponse): a client that leaves mid-answer
-        # closes event_source at once, which sets `stop` and stops the pipeline thread
-        # before its next stage, instead of whenever the generator was collected.
-        return ClosingStreamingResponse(
-            event_source(),
-            media_type="text/event-stream",
-            headers=SSE_HEADERS,
-            # Stops the pipeline as soon as the client leaves (see the class).
-            on_disconnect=stop.set,
-            # Also after a disconnect before the first frame, which never runs the
-            # generator (and so never its finally). The release is idempotent.
-            background=BackgroundTask(lease.release_if_not_handed_off),
+        def on_error(exc: Exception) -> None:
+            questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
+
+        return sse_response(
+            pipeline.answer_stream(
+                request.question,
+                overrides,
+                filenames=request.filenames,
+                history=history_messages(request.history),
+                tags=request.tags,
+                use_cache=request.use_cache,
+                should_stop=stop.is_set,
+            ),
+            lease,
+            stop,
+            on_done=on_done,
+            on_error=on_error,
+            what="question",
         )
 
     # Whole-document tasks: the same admission, provider check, key guard, rate limit
@@ -367,6 +406,8 @@ def register(app: FastAPI) -> None:
             citation_backfilled=grounded.citation_backfilled,
             chunks_read=result.chunks_read,
             chunks_total=result.chunks_total,
+            parts_skipped=result.parts_skipped,
+            notes_truncated=result.notes_truncated,
         )
 
     @app.post("/questions/summary/stream", dependencies=[Depends(require_api_key)])
@@ -383,39 +424,15 @@ def register(app: FastAPI) -> None:
         lease = StreamLease(question_slot(slots, count_metric=False, kind="summary"))
         stop = threading.Event()
 
-        def event_source() -> Iterator[str]:
-            events = with_keepalive(
-                summarizer.summarize_stream(
-                    task, use_cache=request.use_cache, should_stop=stop.is_set
-                ),
-                SSE_KEEPALIVE_SECONDS,
-                stop=stop,
-                on_start=lease.hand_off,
-                on_finish=lease.release,
-            )
-            try:
-                for event in events:
-                    if event is None:
-                        yield SSE_KEEPALIVE_FRAME
-                        continue
-                    if event["type"] == "done":
-                        summaries_total.labels(mode=request.mode, outcome="ok").inc()
-                        count_answer(
-                            event.get("answer_status", "answered"), event.get("truncated", False)
-                        )
-                    yield sse_event(dict(event))
-            except Exception as exc:
-                summaries_total.labels(mode=request.mode, outcome="error").inc()
-                logger.warning("Streamed summary failed: %s", exc, exc_info=True)
-                yield sse_event({"type": "error", "detail": public_error_message(exc)})
-            finally:
-                events.close()
-                lease.release_if_not_handed_off()
+        def on_done(event: DoneEvent) -> None:
+            summaries_total.labels(mode=request.mode, outcome="ok").inc()
+            count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
 
-        return ClosingStreamingResponse(
-            event_source(),
-            media_type="text/event-stream",
-            headers=SSE_HEADERS,
-            on_disconnect=stop.set,
-            background=BackgroundTask(lease.release_if_not_handed_off),
+        return sse_response(
+            summarizer.summarize_stream(task, use_cache=request.use_cache, should_stop=stop.is_set),
+            lease,
+            stop,
+            on_done=on_done,
+            on_error=lambda exc: summaries_total.labels(mode=request.mode, outcome="error").inc(),
+            what="summary",
         )

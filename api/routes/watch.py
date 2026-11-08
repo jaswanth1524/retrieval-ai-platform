@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 
 from api.audit import audit
 from api.dependencies import get_app_settings, require_api_key, require_full_key
-from api.schemas import WatchStatusResponse
+from api.schemas import WatchFolderStatusResponse, WatchStatusResponse
 from api.settings import AppSettings
 from api.watch import FolderWatcher
 
@@ -19,6 +19,27 @@ def _watcher(request: Request) -> FolderWatcher:
     if watcher is None:
         raise HTTPException(status_code=404, detail="No folder is watched (WATCH_DIR is unset).")
     return watcher
+
+
+def _watchers(request: Request) -> list[FolderWatcher]:
+    watchers: list[FolderWatcher] | None = getattr(request.app.state, "watchers", None)
+    return watchers or [_watcher(request)]
+
+
+def _status(request: Request) -> WatchStatusResponse:
+    """The first folder's status (the fields every client reads), and each folder's."""
+
+    first = _watcher(request)
+    folders = [
+        WatchFolderStatusResponse.model_validate(
+            {
+                **asdict(watcher.status()),
+                "workspace": getattr(watcher, "workspace", "") or "default",
+            }
+        )
+        for watcher in _watchers(request)
+    ]
+    return WatchStatusResponse.model_validate({**asdict(first.status()), "folders": folders})
 
 
 def register(app: FastAPI) -> None:
@@ -32,14 +53,14 @@ def register(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def watch_status(request: Request) -> WatchStatusResponse:
-        return WatchStatusResponse.model_validate(asdict(_watcher(request).status()))
+        return _status(request)
 
     @app.post("/watch/scan", status_code=202, dependencies=[Depends(require_full_key)])
     def watch_scan_now(
         request: Request, settings: Annotated[AppSettings, Depends(get_app_settings)]
     ) -> WatchStatusResponse:
-        watcher = _watcher(request)
-        watcher.scan_now()
+        for watcher in _watchers(request):
+            watcher.scan_now()
         audit("watch.scan", workspace=settings.watch_workspace)
-        # The status as of the previous pass: the new one runs on the watcher's thread.
-        return WatchStatusResponse.model_validate(asdict(watcher.status()))
+        # The status as of the previous pass: the new one runs on the watchers' threads.
+        return _status(request)

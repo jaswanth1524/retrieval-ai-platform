@@ -62,7 +62,12 @@ def chunk(chunk_id: str, text: str, filename: str = "guide.md", page: int = 1) -
 def server(request: pytest.FixtureRequest) -> Generator[tuple[QdrantClient, AppSettings]]:
     clear_readiness_cache()
     clear_hybrid_fallback_cache()
-    client = QdrantClient(url=QDRANT_URL, prefer_grpc=request.param, grpc_port=QDRANT_GRPC_PORT)
+    # A generous timeout: on a loaded machine (load average ~15) gRPC calls hit the
+    # client's default deadline (DEADLINE_EXCEEDED) and passed on a re-run. The tests
+    # check behaviour, not speed.
+    client = QdrantClient(
+        url=QDRANT_URL, prefer_grpc=request.param, grpc_port=QDRANT_GRPC_PORT, timeout=30
+    )
     defaults: dict[str, Any] = {
         "qdrant_url": QDRANT_URL,
         # Unique per test: the server outlives the test and is shared by all of them.

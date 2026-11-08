@@ -488,3 +488,28 @@ describe('DocumentViewer focus', () => {
     expect(Number(focused.dataset.chunkId?.slice(1))).toBeGreaterThan(5);
   });
 });
+
+describe('DocumentViewer find', () => {
+  it('finds a word in the loaded passages and steps through them', async () => {
+    getContentMock.mockResolvedValue({
+      ...CONTENT,
+      chunks: [
+        { chunk_id: 'c1', page: 1, section: 'Intro', text: 'Leave rules here.', chunk_ordinal: 1 },
+        { chunk_id: 'c2', page: 1, section: 'Setup', text: 'Nothing.', chunk_ordinal: 2 },
+        { chunk_id: 'c3', page: 2, section: 'More', text: 'Annual LEAVE again.', chunk_ordinal: 3 },
+      ],
+      total_chunks: 3,
+    } as never);
+    render(<DocumentViewer filename="guide.md" chunkId={null} onClose={() => {}} />);
+    await screen.findAllByTestId('viewer-chunk');
+
+    await userEvent.click(screen.getByTestId('viewer-find-open'));
+    await userEvent.type(screen.getByTestId('viewer-find-input'), 'leave');
+
+    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('1 of 2 passages');
+    expect(screen.getAllByTestId('viewer-found').map((mark) => mark.textContent)).toEqual(['Leave', 'LEAVE']);
+    await userEvent.click(screen.getByTestId('viewer-find-next'));
+    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('2 of 2 passages');
+    await userEvent.keyboard('{Escape}');
+  });
+});

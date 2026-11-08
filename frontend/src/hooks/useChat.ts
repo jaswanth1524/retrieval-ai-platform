@@ -12,7 +12,12 @@ import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
 import { useChatPersistence } from './useChatPersistence';
 import { useConversationActions } from './useConversationActions';
+import { answerStreamHandlers, createDeltaBuffer } from './streamHandlers';
+import { mergeRegenerated } from '../utils/answerVersions';
 import type { ImportItem } from './useConversationActions';
+
+/** How often streamed answer text is applied (see createDeltaBuffer's use below). */
+export const STREAM_FLUSH_MS = 50;
 export type { ImportItem } from './useConversationActions';
 import {
   EMPTY_SCOPE,
@@ -20,12 +25,13 @@ import {
   applyDeleteHeldDuringStream,
   byRecentUse,
   capConversations,
-  cleanFollowups,
   conversationWorkspace,
+  coverageWorthShowing,
   deriveTitle,
   loadStorage,
   searchConversations as searchStoredConversations,
   updateTurn,
+  withConversationRestored,
   withoutConversation,
 } from './chatPersistence';
 import type {
@@ -102,7 +108,10 @@ export interface UseChatResult {
   /** Every saved answer across the conversations, newest first. */
   savedAnswers: SavedAnswer[];
   /** Every answer in this browser's conversations citing ``filename``, newest first. */
-  answersCiting: (filename: string) => SavedAnswer[];
+  /** Answers citing `filename` in conversations asked in `workspace` ('' = default). */
+  answersCiting: (filename: string, workspace: string) => SavedAnswer[];
+  /** Every answer in ``workspace``'s conversations, newest first, with its question. */
+  answersIn: (workspace: string) => SavedAnswer[];
   activeConversationId: string | null;
   // The active conversation's search scope.
   scope: ConversationScope;
@@ -154,9 +163,14 @@ export interface UseChatResult {
   newConversation: () => void;
   switchConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
-  deleteConversation: (id: string) => void;
+  /** The deleted conversation (null when it couldn't be: an answer streams into it). */
+  deleteConversation: (id: string) => Conversation | null;
+  /** Put a just-deleted conversation back (the delete's Undo). */
+  restoreConversation: (conversation: Conversation) => void;
   /** Pin or unpin; false (nothing changes) past MAX_PINNED_CONVERSATIONS pins. */
   setPinned: (id: string, pinned: boolean) => boolean;
+  /** Replace a conversation's labels (cleaned; an empty list removes them). */
+  setLabels: (id: string, labels: string[]) => void;
   /** Conversations whose question or answer text contains `query`, by id. Reads the
    *  latest history, so call it from an effect or a memo keyed on `conversations`. */
   searchConversations: (query: string) => Map<string, ConversationMatch>;
@@ -322,7 +336,7 @@ export function answeredTurn(
     ...(status === 'uncited' ? { uncited: true } : {}),
     ...(grounding?.weakMatches ? { weakMatch: true } : {}),
     ...(grounding?.truncated ? { truncated: true } : {}),
-    ...(grounding?.coverage && grounding.coverage.read < grounding.coverage.total
+    ...(grounding?.coverage && coverageWorthShowing(grounding.coverage)
       ? { coverage: grounding.coverage }
       : {}),
     ...(typeof grounding?.topRerankScore === 'number'
@@ -402,6 +416,7 @@ export function useChat(): UseChatResult {
     switchConversation,
     renameConversation,
     setPinned,
+    setLabels,
   } = useConversationActions(setStorage, storageRef, streamingConversationIdRef);
 
   // Tracks the in-flight question's controller: doubles as a reentrancy guard and lets
@@ -514,7 +529,6 @@ export function useChat(): UseChatResult {
     };
     // Searched within some documents or tags: a "not found" is about those, not all.
     const scoped = (filenames?.length ?? 0) > 0 || (options?.tags?.length ?? 0) > 0;
-    let streamedText = false;
 
     // The assistant turn is created lazily on the first `sources`/`delta` event so a
     // mid-stream failure before any event arrives renders as a clean error turn.
@@ -536,21 +550,20 @@ export function useChat(): UseChatResult {
       }, touch);
     };
 
-    // Deltas are coalesced into one state update per animation frame. Each update
-    // re-renders the streaming message, whose markdown is re-parsed over the whole
-    // answer so far — per token that is quadratic in answer length on a fast provider.
-    bufferedDeltaRef.current = '';
-    let frameId: number | null = null;
-    const flushDelta = () => {
-      if (frameId !== null) {
-        cancelAnimationFrame(frameId);
-        frameId = null;
-      }
-      if (!bufferedDeltaRef.current) return;
-      const text = bufferedDeltaRef.current;
-      bufferedDeltaRef.current = '';
-      updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false);
-    };
+    // Streamed text is applied every STREAM_FLUSH_MS, not every animation frame.
+    // Measured on the production build (400 deltas over ~5 s): main-thread scripting per
+    // answer 197 → 67 ms and task time 436 → 186 ms, the view still following the end.
+    // Each flush re-renders the answer, re-parses its last markdown block and lays the
+    // thread out; 20 a second still reads as continuous text (a model sends ~30-80
+    // tokens a second). The first text is shown at once.
+    const deltas = createDeltaBuffer(
+      bufferedDeltaRef,
+      (text) => updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false),
+      (flush) => window.setTimeout(flush, STREAM_FLUSH_MS),
+      (id) => window.clearTimeout(id),
+      true,
+    );
+    const flushDelta = deltas.flush;
 
     // The answer is finished at `done`, though the stream stays open for the suggested
     // follow-ups the server works out after it: until then the answer read as still
@@ -592,30 +605,13 @@ export function useChat(): UseChatResult {
             overrides,
             filenames,
             history,
-            {
-              onStage: (serverStage, progress, reading) => {
-                enterStage(stageLabel(serverStage, progress), reading?.etaMs ?? null);
-              },
-              onSources: (sources, traceId) => {
-                // Sources land the moment retrieval finishes, which is when generation
-                // starts; a newer server follows with "reading" (or "waiting").
-                enterStage(task ? 'writing the summary…' : 'generating answer…');
-                updateAssistantTurn((turn) => ({ ...turn, sources, traceId }));
-              },
-              onDelta: (text) => {
-                if (!streamedText) {
-                  // The model is writing: "reading the passages…" is over.
-                  streamedText = true;
-                  enterStage(task ? 'writing the summary…' : 'generating answer…');
-                }
-                bufferedDeltaRef.current += text;
-                if (frameId === null) frameId = requestAnimationFrame(flushDelta);
-              },
-              onFollowups: (questions) => {
-                const followups = cleanFollowups(questions);
-                if (followups.length === 0) return;
-                // Onto this answer by id, and never creating it: by now it may have been
-                // cleared or deleted, and other questions may have been asked since.
+            answerStreamHandlers(Boolean(task), deltas, {
+              enterStage,
+              stageLabel,
+              updateAnswer: updateAssistantTurn,
+              // Onto this answer by id, and never creating it: by now it may have been
+              // cleared or deleted, and other questions may have been asked since.
+              setFollowups: (followups) =>
                 setConversationTurns(
                   conversationId,
                   (prev) =>
@@ -623,19 +619,23 @@ export function useChat(): UseChatResult {
                       ? prev.map((turn) => (turn.id === assistantTurnId ? { ...turn, followups } : turn))
                       : prev,
                   false,
-                );
-              },
-              onDone: (answer, sources, timings, traceId, cached, grounding) => {
-                flushDelta();
+                ),
+              done: (answer, sources, timings, traceId, cached, grounding) => {
                 updateAssistantTurn((turn) =>
                   answeredTurn(turn, answer, sources, timings, traceId, cached, grounding),
                 );
+                // Regenerated: the answer it replaces becomes its earlier version (only
+                // now — a regenerate that failed leaves the old answer where it was).
+                const replaces = options?.replacesAnswer;
+                if (replaces) {
+                  updateTurns((prev) => mergeRegenerated(prev, replaces, assistantTurnId));
+                }
                 finish();
                 // Still open for follow-ups; aborted on unmount or by a newer question here.
                 trailing = { conversationId, controller };
                 trailingRef.current.add(trailing);
               },
-            },
+            }),
             controller.signal,
             // The workspace it was asked in: a retry after a 429 countdown went to
             // whichever one the reader had switched to meanwhile.
@@ -891,9 +891,16 @@ export function useChat(): UseChatResult {
     }));
   }, []);
 
-  const deleteConversation = useCallback((id: string) => {
-    if (isStreamingInto(id)) return;
+  // Returns what was deleted, so the caller can offer it back (restoreConversation).
+  const deleteConversation = useCallback((id: string): Conversation | null => {
+    if (isStreamingInto(id)) return null;
+    const removed = storageRef.current.conversations.find((conversation) => conversation.id === id);
     setStorage((prev) => withoutConversation(prev, id, Date.now()));
+    return removed ?? null;
+  }, []);
+
+  const restoreConversation = useCallback((conversation: Conversation) => {
+    setStorage((prev) => withConversationRestored(prev, conversation));
   }, []);
 
   const searchConversations = useCallback(
@@ -914,6 +921,7 @@ export function useChat(): UseChatResult {
               title: conversation.title,
               createdAt: conversation.createdAt,
               updatedAt: conversation.updatedAt,
+              ...(conversation.labels?.length ? { labels: conversation.labels } : {}),
               turns: conversation.turns,
             })),
         },
@@ -1007,11 +1015,36 @@ export function useChat(): UseChatResult {
     return found;
   }, [conversations]);
 
-  // Read when asked (a card's "Questions that cited this"), not kept up to date: it walks
-  // every turn of every conversation.
-  const answersCiting = useCallback((filename: string) => {
+  // Every answer of a workspace's conversations, newest first, with its question: what
+  // the "Needs review" panel looks through (read when it is open).
+  const answersIn = useCallback((workspace: string) => {
     const found: SavedAnswer[] = [];
     for (const conversation of storageRef.current.conversations) {
+      if ((conversation.workspace ?? '') !== workspace) continue;
+      let question: string | null = null;
+      for (const turn of conversation.turns) {
+        if (turn.role === 'user') question = turn.content;
+        else if (turn.role === 'assistant') {
+          found.push({
+            conversationId: conversation.id,
+            conversationTitle: conversation.title,
+            workspace,
+            turn,
+            question,
+          });
+        }
+      }
+    }
+    return found.sort((a, b) => b.turn.timestamp - a.turn.timestamp);
+  }, []);
+
+  // Read when asked (a card's "Questions that cited this"), not kept up to date: it walks
+  // every turn of every conversation.
+  const answersCiting = useCallback((filename: string, workspace: string) => {
+    const found: SavedAnswer[] = [];
+    for (const conversation of storageRef.current.conversations) {
+      // Another workspace's document of the same name is a different document.
+      if ((conversation.workspace ?? '') !== workspace) continue;
       conversation.turns.forEach((turn, index) => {
         if (turn.role !== 'assistant' || !turn.sources.some((source) => source.filename === filename)) {
           return;
@@ -1041,6 +1074,7 @@ export function useChat(): UseChatResult {
       title: conversation.title,
       updatedAt: conversation.updatedAt,
       ...(conversation.pinned ? { pinned: true } : {}),
+      ...(conversation.labels?.length ? { labels: conversation.labels } : {}),
       ...(conversation.workspace && conversation.turns.length > 0
         ? { workspace: conversation.workspace }
         : {}),
@@ -1056,6 +1090,7 @@ export function useChat(): UseChatResult {
           summary.updatedAt === next[index].updatedAt &&
           summary.turnCount === next[index].turnCount &&
           summary.pinned === next[index].pinned &&
+          summary.labels === next[index].labels &&
           summary.workspace === next[index].workspace &&
           summary.savedCount === next[index].savedCount &&
           summary.firstSavedTurnId === next[index].firstSavedTurnId,
@@ -1087,6 +1122,7 @@ export function useChat(): UseChatResult {
     conversations: summaries,
     savedAnswers,
     answersCiting,
+    answersIn,
     activeConversationId: activeConversation?.id ?? null,
     ask,
     cancel,
@@ -1095,7 +1131,9 @@ export function useChat(): UseChatResult {
     switchConversation,
     renameConversation,
     deleteConversation,
+    restoreConversation,
     setPinned,
+    setLabels,
     searchConversations,
     setTurnFeedback,
     setSourceIrrelevant,

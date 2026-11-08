@@ -7,8 +7,13 @@ import './SummaryDialog.css';
 interface SummaryDialogProps {
   /** One document to summarize, or two to compare. */
   filenames: string[];
-  onRun: (instruction: string | undefined) => void;
+  onRun: (instruction: string | undefined, pages?: { min?: number; max?: number }) => void;
   onClose: () => void;
+}
+
+function page(value: string): number | undefined {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined;
 }
 
 /** Asks what a summary or comparison should concentrate on (optional) before it runs:
@@ -16,6 +21,8 @@ interface SummaryDialogProps {
 export default function SummaryDialog({ filenames, onRun, onClose }: SummaryDialogProps) {
   const dialogRef = useDialog(true, onClose);
   const [focus, setFocus] = useState('');
+  const [fromPage, setFromPage] = useState('');
+  const [toPage, setToPage] = useState('');
   const inputId = useId();
   const compare = filenames.length === 2;
   const brief = filenames.length > 2;
@@ -26,7 +33,10 @@ export default function SummaryDialog({ filenames, onRun, onClose }: SummaryDial
       : `Summarize ${filenames[0]}`;
   const run = () => {
     const instruction = focus.trim();
-    onRun(instruction || undefined);
+    const min = page(fromPage);
+    const max = page(toPage);
+    if (min === undefined && max === undefined) onRun(instruction || undefined);
+    else onRun(instruction || undefined, { min, max });
   };
   return (
     <div
@@ -67,6 +77,32 @@ export default function SummaryDialog({ filenames, onRun, onClose }: SummaryDial
             autoFocus
             data-testid="summary-focus-input"
           />
+          {!compare && !brief && (
+            <div className="summary-dialog__pages" data-testid="summary-pages">
+              <span>Only pages (optional)</span>
+              <input
+                type="number"
+                min={1}
+                inputMode="numeric"
+                value={fromPage}
+                onChange={(event) => setFromPage(event.target.value)}
+                aria-label="From page"
+                placeholder="from"
+                data-testid="summary-page-min"
+              />
+              <span>to</span>
+              <input
+                type="number"
+                min={1}
+                inputMode="numeric"
+                value={toPage}
+                onChange={(event) => setToPage(event.target.value)}
+                aria-label="To page"
+                placeholder="to"
+                data-testid="summary-page-max"
+              />
+            </div>
+          )}
           <div className="summary-dialog__actions">
             <button type="button" className="summary-dialog__cancel" onClick={onClose}>
               Cancel

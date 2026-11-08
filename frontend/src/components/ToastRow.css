@@ -93,3 +93,14 @@
 .toast__dismiss:hover {
   color: var(--ink);
 }
+
+.toast__action {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+}

@@ -90,6 +90,7 @@ class IngestService:
         tags: tuple[str, ...] | None = None,
         source: DocumentSource | None = None,
         dedupe: bool = False,
+        watched_from: str | None = None,
     ) -> DocumentIngestOutcome:
         """Parse, chunk, embed, and index an uploaded document. Blocking — run off-loop.
 
@@ -101,7 +102,8 @@ class IngestService:
         ``tags`` sets the document's tags (a restore) instead of carrying its current ones.
         ``source`` records where a URL-ingested document came from (a plain upload
         has none, and drops a previous one). With ``dedupe``, bytes identical to the
-        indexed version leave it as it is (see ``_leave_unchanged``).
+        indexed version leave it as it is (see ``_leave_unchanged``). ``watched_from``
+        names the watched folder that owns it (a restore), over this service's own.
         """
 
         # Before parsing: an index built for another embedding setup refuses the
@@ -180,7 +182,7 @@ class IngestService:
                 carry_tags=True,
                 before_first_write=start_writing,
                 tags=tags,
-                watched_from=self._watched_from,
+                watched_from=watched_from or self._watched_from,
             )
         finally:
             # Even a failed ingest may have written points; cached answers could
@@ -263,7 +265,8 @@ class IngestService:
             changed = False
             # The same bytes under new validators (a dynamic page, a CDN that re-stamps)
             # or another refresh interval: only those change, or every refresh would
-            # re-embed the document.
+            # re-embed the document. No answer reads them, so the listing is patched
+            # and the answer cache kept (a re-stamping CDN used to empty it each time).
             if source is not None and (
                 meta.source_etag,
                 meta.source_last_modified,
@@ -272,7 +275,8 @@ class IngestService:
                 self._repository.set_source_details(
                     settings, name, source.etag, source.last_modified, source.refresh_minutes
                 )
-                changed = True
+                self._repository.refresh_listed(settings, [name])
+            # The upload time is read by answers (RECENCY_BOOST_WEIGHT, uploaded_after).
             if uploaded_at is not None and meta.uploaded_at != uploaded_at:
                 self._repository.set_uploaded_at(settings, name, uploaded_at)
                 changed = True

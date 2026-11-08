@@ -93,10 +93,14 @@ class OwnedJobs[T]:
     def add(self, job_store: JobStore, job_id: str, info: T) -> None:
         self._jobs[(job_store, job_id)] = info
 
-    def running(self, on_finished: Callable[[T, IngestJob], None] | None = None) -> int:
+    def running(
+        self,
+        on_finished: Callable[[T, IngestJob], None] | None = None,
+        on_forgotten: Callable[[T], None] | None = None,
+    ) -> int:
         """How many are still queued or running. Each one found finished is handed to
-        ``on_finished`` once and forgotten; one the job store no longer has is just
-        forgotten."""
+        ``on_finished`` once and forgotten; one the job store no longer has (evicted
+        before this saw it end) to ``on_forgotten``."""
 
         still: dict[tuple[JobStore, str], T] = {}
         for (job_store, job_id), info in self._jobs.items():
@@ -105,5 +109,7 @@ class OwnedJobs[T]:
                 still[(job_store, job_id)] = info
             elif job is not None and on_finished is not None:
                 on_finished(info, job)
+            elif job is None and on_forgotten is not None:
+                on_forgotten(info)
         self._jobs = still
         return len(still)

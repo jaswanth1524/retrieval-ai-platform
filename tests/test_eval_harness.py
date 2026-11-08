@@ -54,6 +54,7 @@ class FakeRepository:
         query_embedding: EmbeddedText,
         filenames: Sequence[str] | None = None,
         tags: Sequence[str] | None = None,
+        **_: object,
     ) -> list[models.ScoredPoint]:
         return self._points
 

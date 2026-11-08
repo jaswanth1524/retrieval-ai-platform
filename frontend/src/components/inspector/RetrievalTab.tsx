@@ -171,6 +171,19 @@ function RetrievalTab({ trace, onOpenSource }: RetrievalTabProps) {
             </div>
             <div className="retrieval-tab__candidate-meta mono">
               p.{candidate.page}
+              {candidate.source_number ? (
+                <span data-testid="retrieval-candidate-source">
+                  {` · [${candidate.source_number}]${candidate.cited ? ' cited' : ''}`}
+                </span>
+              ) : null}
+              {candidate.dense_rank != null || candidate.sparse_rank != null ? (
+                <span
+                  title="Its rank on each search before fusion: dense (meaning) and BM25 (words)"
+                  data-testid="retrieval-candidate-legs"
+                >
+                  {` · dense ${candidate.dense_rank ?? '–'} · bm25 ${candidate.sparse_rank ?? '–'}`}
+                </span>
+              ) : null}
               {candidate.neighbor_expanded ? ' · expanded' : ''}
               {candidate.drop_reason ? ` · ${dropReasonLabel(candidate.drop_reason)}` : ''}
             </div>

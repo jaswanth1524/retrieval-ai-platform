@@ -3,6 +3,7 @@ import type { CitationResponse } from '../api/types';
 import type { StageTiming } from '../hooks/useChat';
 import type { SourceChange } from '../utils/citationFreshness';
 import { STREAMING_STAGE_LABELS } from '../utils/stages';
+import type { ComponentProps } from 'react';
 import ChatMessage, { type AskAgain, type ChatTurn, type FeedbackPayload } from './ChatMessage';
 import StreamingSkeleton from './StreamingSkeleton';
 import './ChatThread.css';
@@ -54,6 +55,10 @@ interface ChatThreadProps {
   onSearchPassages?: (question: string) => void;
   /** Save or unsave an answer. */
   onToggleSaved?: (turnId: string, saved: boolean) => void;
+  /** Copy a link back to one answer (it opens in this browser). */
+  onCopyLink?: (turnId: string) => void;
+  /** Reformat an answer (ChatMessage's onReformat). */
+  onReformat?: ComponentProps<typeof ChatMessage>['onReformat'];
   /** Whether a cited document was deleted or uploaded again after an answer. */
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
 }
@@ -135,6 +140,8 @@ function ChatThread({
   onAskEverywhere,
   onSearchPassages,
   onToggleSaved,
+  onCopyLink,
+  onReformat,
   sourceChangeOf,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -369,6 +376,8 @@ function ChatThread({
             onCitationHover={onCitationHover}
             onCitationLeave={onCitationLeave}
             onToggleSaved={onToggleSaved}
+            onCopyLink={onCopyLink}
+            onReformat={onReformat}
             sourceChangeOf={sourceChangeOf}
             answerNumber={answerNumbers[index] || undefined}
           />

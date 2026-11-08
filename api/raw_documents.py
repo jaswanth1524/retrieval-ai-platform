@@ -248,6 +248,22 @@ class RawDocumentStore:
             logger.warning("Cannot list stored originals in %s", self._directory, exc_info=True)
         return names
 
+    def versioned_names(self) -> set[str]:
+        """Names with a folder of kept earlier versions (one directory read)."""
+
+        names: set[str] = set()
+        try:
+            with os.scandir(self._directory / VERSIONS_DIR) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir():
+                            names.add(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return names
+
     def size(self, filename: str) -> int | None:
         """Size in bytes of the stored original, or None when none is stored."""
 
@@ -294,6 +310,17 @@ class RawDocumentStore:
         path = self._path_for(filename)
         # Its earlier versions go with it: they are versions of a document that's gone.
         shutil.rmtree(self._versions_dir(filename), ignore_errors=True)
+        if not _is_file(path):
+            return False
+        path.unlink(missing_ok=True)
+        return True
+
+    def remove_current(self, filename: str) -> bool:
+        """Remove only the current original, keeping its earlier versions: what a failed
+        save leaves behind must not describe the newly indexed bytes, but the history
+        before them is still right. True when there was one to remove."""
+
+        path = self._path_for(filename)
         if not _is_file(path):
             return False
         path.unlink(missing_ok=True)

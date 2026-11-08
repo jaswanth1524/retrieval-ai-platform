@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import functools
 import logging
-import threading
+import re
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
 from api.answer_cache import AnswerCache, CachedAnswer, CacheKey, corpus_state
@@ -54,7 +54,8 @@ from api.pipeline import (
     DoneEvent,
     QuestionAbandoned,
     StreamEvent,
-    lead_or_join,
+    cached_run,
+    narrowing_record,
     replay_cached,
     timings_dict,
     trace_model_name,
@@ -74,7 +75,7 @@ from api.prompting import (
     weighted_length,
     with_answer_language,
 )
-from api.repository import VectorRepository
+from api.repository import PassageFilter, VectorRepository
 from api.request_id import current_request_id, submit_in_context
 from api.reranking import RerankedChunk
 from api.retrieval import RetrievalError
@@ -89,6 +90,18 @@ SummaryMode = Literal["summarize", "compare", "brief"]
 # What a part's notes say when nothing in it bears on the task; such notes are left out
 # of the combining step.
 NOTHING_RELEVANT = "NOTHING RELEVANT"
+_CITATION_MARKERS_RE = re.compile(r"\[[\d\s,\-–]+\]")
+
+
+def is_nothing_relevant(note: str) -> bool:
+    """Whether a part's note is the marker alone. Citations don't count: qwen2.5
+    replied "NOTHING RELEVANT [5-8]", which got past an exact match into the combine
+    prompt, and the brief then said the document didn't cover the topic. Notes that
+    merely mention it ("... not NOTHING RELEVANT here [2]") still carry findings."""
+
+    return _CITATION_MARKERS_RE.sub(" ", note).strip(" .\n").upper() == NOTHING_RELEVANT
+
+
 # A document with more passages than this is refused: picking an even sample still reads
 # every payload, and past this a summary would see too small a fraction to be honest.
 SUMMARY_MAX_DOCUMENT_CHUNKS = 5000
@@ -129,6 +142,8 @@ class SummaryRequest:
     instruction: str | None = None
     llm_provider: str | None = None
     llm_temperature: float | None = None
+    # A page range or one section of the document (summaries of one document only).
+    narrow: PassageFilter | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +151,8 @@ class SummaryResult:
     grounded: GroundedAnswer
     chunks_read: int
     chunks_total: int
+    parts_skipped: int = 0
+    notes_truncated: int = 0
 
 
 def task_description(request: SummaryRequest) -> str:
@@ -151,6 +168,16 @@ def task_description(request: SummaryRequest) -> str:
         task = f"Write one brief covering the documents {names}."
     else:
         task = f"Summarize the document {names}."
+    narrow = request.narrow
+    if narrow is not None and (narrow.page_min is not None or narrow.page_max is not None):
+        first = narrow.page_min if narrow.page_min is not None else 1
+        task += (
+            f" Only pages {first}-{narrow.page_max}."
+            if narrow.page_max is not None
+            else f" Only page {first} onwards."
+        )
+    if narrow is not None and narrow.section is not None:
+        task += f" Only the section {one_line(narrow.section)!r}."
     if request.instruction and request.instruction.strip():
         task += f" Focus on: {one_line(request.instruction)}"
     return task
@@ -294,8 +321,14 @@ def build_notes_messages(
     part: Sequence[tuple[int, RerankedChunk]],
     *,
     several_documents: bool = False,
+    focused: bool = True,
 ) -> list[ChatMessage]:
     """The prompt that turns one part of a document into cited notes.
+
+    A comparison or brief with no focus (``focused`` False) is about all of each
+    document, so a part can't be irrelevant to it: the NOTHING RELEVANT reply isn't
+    offered. With it, qwen2.5 answered it for whole documents (4 of 16 parts of the
+    handbook briefs and comparisons), which the brief then reported as not covered.
 
     ``several_documents`` (compare, brief): a part shows one document while the task
     names all of them, and without saying so the model answered NOTHING RELEVANT for a
@@ -320,7 +353,11 @@ def build_notes_messages(
                     else ""
                 )
                 + "- Use only the excerpts. Cite every note with its source numbers, such as [3].\n"
-                f"- If nothing in them bears on the task, reply exactly: {NOTHING_RELEVANT}"
+                + (
+                    f"- If nothing in them bears on the task, reply exactly: {NOTHING_RELEVANT}"
+                    if focused or not several_documents
+                    else "- The task covers all of this document: note what these excerpts say."
+                )
             ),
         },
     ]
@@ -366,7 +403,11 @@ def build_direct_messages(
 
 
 def build_combine_messages(
-    task: str, mode: SummaryMode, notes: Sequence[tuple[str, int, int, str]], budget: int
+    task: str,
+    mode: SummaryMode,
+    notes: Sequence[tuple[str, int, int, str]],
+    budget: int,
+    source_ranges: Sequence[tuple[int, int]] | None = None,
 ) -> list[ChatMessage]:
     """The prompt that combines every part's notes into the answer.
 
@@ -377,11 +418,19 @@ def build_combine_messages(
     # floor: a fixed minimum per note let many notes overrun a small window together.
     share = max(budget // max(len(notes), 1), 1)
     blocks = []
-    for filename, index, count, text in notes:
+    for position, (filename, index, count, text) in enumerate(notes):
         clipped = clip_to_weight(text, share)
         if clipped != text:
             clipped = clipped.rstrip() + " …"
-        blocks.append(f"Notes on {one_line(filename)}, part {index} of {count}:\n{clipped}")
+        # Several documents: which source numbers are this document's. Without it qwen2.5
+        # put one document's points under another's numbers in a brief.
+        numbers = ""
+        if source_ranges is not None:
+            first, last = source_ranges[position]
+            numbers = f" (sources [{first}]-[{last}])" if last > first else f" (source [{first}])"
+        blocks.append(
+            f"Notes on {one_line(filename)}, part {index} of {count}{numbers}:\n{clipped}"
+        )
     joined = "\n\n".join(blocks)
     return [
         {
@@ -412,6 +461,8 @@ def summary_cache_key(request: SummaryRequest, settings: AppSettings) -> CacheKe
         settings.llm_provider.lower().strip(),
         model,
         float(settings.llm_temperature),
+        # Pages 3-5 is another summary than the whole document.
+        request.narrow,
         int(settings.summary_max_tokens),
         int(settings.summary_batch_chars),
         int(settings.summary_max_batches),
@@ -510,7 +561,7 @@ class DocumentSummarizer:
         readable: list[tuple[str, list[RerankedChunk]]] = []
         chunks_total = 0
         for filename in request.filenames:
-            chunks = self._document_chunks(settings, filename)
+            chunks = self._document_chunks(settings, filename, request.narrow)
             if not chunks and request.mode != "summarize":
                 # Compared with nothing, the other document would be "compared"
                 # alone and the answer would read as if both had been.
@@ -541,9 +592,11 @@ class DocumentSummarizer:
         should_stop: Callable[[], bool] | None,
         steps: int,
         waits: list[float],
+        report: PartReport,
     ) -> Generator[StreamEvent, None, list[ChatMessage]]:
         """Notes on each part, then the combine prompt over them (the final call's
-        messages), with the ``summarizing``/``combining`` stage frames."""
+        messages), with the ``summarizing``/``combining`` stage frames. Parts that
+        failed twice, or whose notes were cut off, are counted in ``report``."""
 
         jobs = [
             (filename, index, len(doc_parts), excerpts)
@@ -551,22 +604,42 @@ class DocumentSummarizer:
             for index, excerpts in enumerate(doc_parts, start=1)
         ]
         notes: list[tuple[str, int, int, str]] = []
-        for (filename, index, count, _), text in zip(
+        ranges: list[tuple[int, int]] = []
+        for (filename, index, count, excerpts), text in zip(
             jobs,
-            (yield from self._part_notes(task, jobs, settings, should_stop, steps, waits)),
+            (
+                yield from self._part_notes(
+                    task,
+                    jobs,
+                    settings,
+                    should_stop,
+                    steps,
+                    waits,
+                    report,
+                    focused=bool(request.instruction and request.instruction.strip()),
+                )
+            ),
             strict=True,
         ):
-            # Only a reply that is the marker: notes that merely mention it
-            # ("... not NOTHING RELEVANT here [2]") still carry findings.
-            if text and text.strip(" .").upper() != NOTHING_RELEVANT:
+            if text and not is_nothing_relevant(text):
                 notes.append((filename, index, count, text))
+                numbers = [number for number, _ in excerpts]
+                ranges.append((min(numbers), max(numbers)) if numbers else (0, 0))
         if not notes:
             notes.append(("the documents", 1, 1, NOTHING_RELEVANT))
         if should_stop is not None and should_stop():
             raise QuestionAbandoned
         yield {"type": "stage", "stage": "combining"}
         return with_answer_language(
-            build_combine_messages(task, request.mode, notes, budget), settings
+            build_combine_messages(
+                task,
+                request.mode,
+                notes,
+                budget,
+                # Only where one document's points could be cited under another's.
+                ranges if len({job[0] for job in jobs}) > 1 and len(ranges) == len(notes) else None,
+            ),
+            settings,
         )
 
     def _part_notes(
@@ -577,9 +650,17 @@ class DocumentSummarizer:
         should_stop: Callable[[], bool] | None,
         steps: int,
         waits: list[float],
+        report: PartReport,
+        *,
+        focused: bool = True,
     ) -> Generator[StreamEvent, None, list[str]]:
         """Each part's notes, in part order, yielding a ``summarizing`` stage frame as
         each starts (one at a time) or finishes (several at once).
+
+        A part whose call fails is tried once more, then left out ("" in its place,
+        counted in ``report.skipped``): one provider error no longer loses the whole
+        summary. Every part failing is still an error. Notes cut off at the token limit
+        are kept and counted (``report.truncated``).
 
         Several at once (SUMMARY_PARALLEL_PARTS) with a hosted provider, where requests
         run side by side; one at a time with a local model (Ollama, or an OpenAI-
@@ -598,16 +679,39 @@ class DocumentSummarizer:
 
         several_documents = len({job[0] for job in jobs}) > 1
 
-        def note(job: tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]) -> str:
+        def note(job: tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]) -> _PartNote:
             filename, index, count, excerpts = job
             messages = build_notes_messages(
-                task, filename, index, count, excerpts, several_documents=several_documents
+                task,
+                filename,
+                index,
+                count,
+                excerpts,
+                several_documents=several_documents,
+                focused=focused,
             )
-            return self._generator.complete(messages, settings).strip()
+            failure: GenerationError | None = None
+            for _attempt in range(_PART_ATTEMPTS):
+                try:
+                    reset_finish_reason()
+                    text = self._generator.complete(messages, settings).strip()
+                    return _PartNote(text, stopped_at_token_limit(), None)
+                except GenerationError as exc:
+                    failure = exc
+                    logger.warning("Summary part %d of %s failed: %s", index, filename, exc)
+            return _PartNote("", False, failure)
+
+        def collect(notes: Sequence[_PartNote]) -> list[str]:
+            failures = [n.failure for n in notes if n.failure is not None]
+            if failures and len(failures) == len(notes):
+                raise failures[-1]
+            report.skipped += len(failures)
+            report.truncated += sum(n.truncated for n in notes)
+            return [n.text for n in notes]
 
         width = int(settings.summary_parallel_parts)
         if is_local_provider(settings) or width <= 1 or len(jobs) <= 1:
-            texts: list[str] = []
+            texts: list[_PartNote] = []
             for step, job in enumerate(jobs, start=1):
                 if stop_requested():
                     raise QuestionAbandoned
@@ -620,7 +724,7 @@ class DocumentSummarizer:
                     texts.append(note(job))
                 finally:
                     slot.release()
-            return texts
+            return collect(texts)
 
         def counted(job: tuple[str, int, int, Sequence[tuple[int, RerankedChunk]]]):  # type: ignore[no-untyped-def]
             if stop_requested():
@@ -628,9 +732,9 @@ class DocumentSummarizer:
             begin_usage()
             return note(job), usage_totals()
 
-        results: dict[int, str] = {}
+        results: dict[int, _PartNote] = {}
         pool = ThreadPoolExecutor(max_workers=min(width, len(jobs)))
-        futures: dict[Future[tuple[str, tuple[int, int] | None]], int] = {}
+        futures: dict[Future[tuple[_PartNote, tuple[int, int] | None]], int] = {}
         try:
             for position, job in enumerate(jobs):
                 futures[submit_in_context(pool, functools.partial(counted, job))] = position
@@ -657,11 +761,18 @@ class DocumentSummarizer:
             # Not waited for: on the way out (the reader left, a part failed) the parts
             # still running would hold this summary's slot until their calls returned.
             pool.shutdown(wait=False, cancel_futures=True)
-        return [results[position] for position in range(len(jobs))]
+        return collect([results[position] for position in range(len(jobs))])
 
-    def _document_chunks(self, settings: AppSettings, filename: str) -> list[RerankedChunk]:
+    def _document_chunks(
+        self, settings: AppSettings, filename: str, narrow: PassageFilter | None = None
+    ) -> list[RerankedChunk]:
+        """The document's passages in order; with ``narrow``, only those in its page
+        range or section."""
+
         self._checked_count(settings, filename)
         payloads = self._repository.chunks_for_filename(settings, filename)
+        if narrow is not None:
+            payloads = [payload for payload in payloads if narrow.admits_neighbour(payload)]
         return [chunk for chunk in map(payload_chunk, payloads) if chunk is not None]
 
     def summarize(self, request: SummaryRequest, *, use_cache: bool = True) -> SummaryResult:
@@ -685,7 +796,13 @@ class DocumentSummarizer:
             cost_usd=usage_cost(done.get("usage")),
             citation_backfilled=done.get("citation_backfilled", False),
         )
-        return SummaryResult(grounded, done.get("chunks_read", 0), done.get("chunks_total", 0))
+        return SummaryResult(
+            grounded,
+            done.get("chunks_read", 0),
+            done.get("chunks_total", 0),
+            done.get("parts_skipped", 0),
+            done.get("notes_truncated", 0),
+        )
 
     def summarize_stream(
         self,
@@ -709,37 +826,32 @@ class DocumentSummarizer:
             # An unconfigured provider (no key): ``_run`` raises it with its error trace,
             # as questions do; failing here left no trace of the request at all.
             key = None
-        lead: threading.Event | None = None
-        if key is not None and use_cache and self._answer_cache is not None:
-            hit = self._answer_cache.get(key)
-            if hit is None:
-                # The same summary already being written: wait for it, not write it twice.
-                joined = yield from lead_or_join(self._answer_cache, key, should_stop)
-                if joined is None:
-                    return
-                if isinstance(joined, CachedAnswer):
-                    hit = joined
-                else:
-                    lead = joined
-            if hit is not None:
-                read, total = hit.coverage or (0, 0)
-                yield from replay_cached(hit, started, chunks_read=read, chunks_total=total)
-                return
-        events = self._run(request, settings, should_stop, mode, stream=mode == "stream")
-        try:
-            for event in events:
-                # Cached before the `done` frame goes out, as answers are: a client that
-                # leaves as it arrives closes this generator at the yield, and a store
-                # after the loop never ran.
-                if event["type"] == "done" and key is not None and self._answer_cache is not None:
-                    self._answer_cache.put(key, CachedAnswer.from_done(event))
-                    if lead is not None:
-                        self._answer_cache.inflight.finish(key, lead)
-                yield event
-        finally:
-            events.close()
-            if lead is not None and key is not None and self._answer_cache is not None:
-                self._answer_cache.inflight.finish(key, lead)
+
+        def replay(hit: CachedAnswer) -> Iterator[StreamEvent]:
+            read, total = hit.coverage or (0, 0)
+            # Only a whole summary is kept (``keep`` below), so nothing was skipped or cut
+            # off: said, as the first answer's ``done`` said it.
+            return replay_cached(
+                hit,
+                started,
+                chunks_read=read,
+                chunks_total=total,
+                parts_skipped=0,
+                notes_truncated=0,
+            )
+
+        # The same summary already being written is waited for, not written twice.
+        yield from cached_run(
+            self._answer_cache,
+            key,
+            use_cache=use_cache,
+            should_stop=should_stop,
+            replay=replay,
+            run=lambda: self._run(request, settings, should_stop, mode, stream=mode == "stream"),
+            # One that left a part out or had notes cut off isn't kept: asked again, it
+            # may come out whole.
+            keep=lambda done: not done.get("parts_skipped") and not done.get("notes_truncated"),
+        )
 
     def _run(
         self,
@@ -750,209 +862,326 @@ class DocumentSummarizer:
         *,
         stream: bool,
     ) -> Generator[StreamEvent]:
-        started = time.monotonic()
-        trace_id = str(uuid.uuid4()) if self._trace_store is not None else None
-        task = task_description(request)
-        final_messages: list[ChatMessage] | None = None
-        parts_text: list[str] = []
-        finalized = False
-        slot: GenerationSlot | None = None
+        """One summary, start to ``done``: read the documents (``_read``), write it
+        (``_generate``), finish it (``_finish``). Only this step records an error or
+        abandoned trace and gives the model back, however the run ends."""
 
-        def store_trace(
-            status: Literal["ok", "insufficient_context", "error"],
-            *,
-            answer: str | None,
-            cited: Sequence[int] = (),
-            timings: StageTimings | None = None,
-            error: str | None = None,
-            usage: tuple[int, int] | None = None,
-            citation_retry_used: bool = False,
-            citation_backfilled: bool = False,
-            status_of_answer: str | None = None,
-            truncated: bool = False,
-        ) -> None:
-            if self._trace_store is None or trace_id is None:
-                return
-            self._trace_store.add(
-                QueryTrace(
-                    trace_id=trace_id,
-                    created_at=time.time(),
-                    question=task,
-                    mode=mode,
-                    status=status,
-                    config=TraceConfig(
-                        llm_provider=settings.llm_provider,
-                        rerank_top_k=int(settings.rerank_top_k),
-                        max_context_chunks=int(settings.max_context_chunks),
-                        llm_temperature=float(settings.llm_temperature),
-                        rerank_min_score=float(settings.rerank_min_score),
-                        fused_top_n=int(settings.fused_top_n),
-                        filenames=list(request.filenames),
-                        answer_format=settings.answer_format,
-                        answer_language=settings.answer_language,
-                        llm_model=trace_model_name(settings),
-                    ),
-                    candidates=[],
-                    prompt_messages=final_messages,
-                    answer=answer,
-                    cited_source_numbers=list(cited),
-                    timings=timings_dict(timings) if timings is not None else None,
-                    error=error,
-                    request_id=current_request_id(),
-                    workspace=workspace_of(self._settings),
-                    usage=usage,
-                    cost_usd=usage_cost_usd(settings, usage),
-                    citation_retry_used=citation_retry_used,
-                    citation_backfilled=citation_backfilled,
-                    answer_status=status_of_answer,
-                    truncated=truncated,
-                )
-            )
-
+        run = SummaryRun(
+            request=request,
+            settings=settings,
+            mode=mode,
+            stream=stream,
+            trace_id=str(uuid.uuid4()) if self._trace_store is not None else None,
+            task=task_description(request),
+            started=time.monotonic(),
+        )
         try:
-            yield {"type": "stage", "stage": "reading_documents"}
-            read_start = time.monotonic()
-            budget = batch_char_budget(settings)
-            documents, chunks_total = self._read_documents(request, settings, budget)
-            read_ms = (time.monotonic() - read_start) * 1000
-            selected, numbered = number_sources(documents)
-            chunks_read = len(selected)
-            all_sources = source_citations(selected, scored=False)
-
-            if not selected:
-                timings = _elapsed_timings(started, search_ms=read_ms)
-                store_trace(
-                    "insufficient_context",
-                    answer=INSUFFICIENT_CONTEXT_ANSWER,
-                    timings=timings,
-                    status_of_answer="no_context",
-                )
-                finalized = True
-                yield {"type": "sources", "sources": [], "trace_id": trace_id}
-                yield {
-                    "type": "done",
-                    "answer": INSUFFICIENT_CONTEXT_ANSWER,
-                    "sources": [],
-                    "timings": timings_dict(timings),
-                    "trace_id": trace_id,
-                    "answer_status": "no_context",
-                    "chunks_read": 0,
-                    "chunks_total": chunks_total,
-                }
+            reading = yield from self._read(run)
+            if reading is None:
                 return
-
-            generate_start = time.monotonic()
-            # Time spent waiting for the local model (another request had it), left out
-            # of generate_ms as a question's is: queueing isn't generating.
-            waits: list[float] = []
-            # Every call from here on (notes, the answer, a citation retry) is counted.
-            begin_usage()
-            part_total = sum(len(doc_parts) for _, doc_parts in numbered)
-            # Everything read fits one part (one document's, or two short ones to
-            # compare): answer in one call rather than notes per document plus a combine.
-            if sum(_packed_size(chunk) for chunk in selected) <= budget:
-                everything = [
-                    pair for _, doc_parts in numbered for part in doc_parts for pair in part
-                ]
-                final_messages = with_answer_language(
-                    build_direct_messages(task, request.mode, everything), settings
-                )
-            else:
-                final_messages = yield from self._notes_then_combine(
-                    task, request, numbered, settings, budget, should_stop, part_total, waits
-                )
-
-            final_settings = settings.model_copy(
-                update={"llm_max_tokens": int(settings.summary_max_tokens)}
-            )
-            # Held through the final call and its citation retry, like an answer's.
-            slot = yield from _timed_wait(final_settings, should_stop, waits)
-            yield {
-                "type": "sources",
-                "sources": [asdict(source) for source in all_sources],
-                "trace_id": trace_id,
-            }
-            first_token_ms = 0.0
-            reset_finish_reason()
-            if stream:
-                for delta in self._generator.stream(final_messages, final_settings):
-                    if not parts_text:
-                        first_token_ms = (time.monotonic() - started) * 1000
-                    parts_text.append(delta)
-                    yield {"type": "delta", "text": delta}
-                answer = "".join(parts_text).strip()
-            else:
-                answer = self._generator.complete(final_messages, final_settings).strip()
-            generate_ms = (time.monotonic() - generate_start - sum(waits)) * 1000
-            if not answer:
-                raise GenerationError("Generation provider returned an empty answer.")
-
-            if stream and will_call_llm_for_citations(
-                answer, all_sources, final_settings, context_chunks=selected
-            ):
-                yield {"type": "stage", "stage": "verifying_citations"}
-            outcome, cited = finish_answer(
-                final_messages, answer, selected, self._generator, final_settings, scored=False
-            )
-            answer = outcome.answer
-            final_messages = list(outcome.prompt_messages)
-            truncated = stopped_at_token_limit()
-            usage = usage_totals()
-            timings = _elapsed_timings(
-                started,
-                search_ms=read_ms,
-                generate_ms=generate_ms,
-                citation_retry_ms=outcome.retry_ms,
-                first_token_ms=first_token_ms,
-            )
-            status = answer_status(answer, len(cited), len(selected))
-            # A summary the documents couldn't support is "insufficient_context" in its
-            # trace too, so the query log lists it as uncovered.
-            store_trace(
-                trace_status(status),
-                answer=answer,
-                cited=[source.source_number for source in cited],
-                timings=timings,
-                usage=usage,
-                citation_retry_used=outcome.retry_used,
-                citation_backfilled=outcome.backfilled,
-                status_of_answer=status,
-                truncated=truncated,
-            )
-            finalized = True
-            yield {
-                "type": "done",
-                "answer": answer,
-                "sources": [asdict(source) for source in cited],
-                "timings": timings_dict(timings),
-                "trace_id": trace_id,
-                "answer_status": status,
-                "truncated": truncated,
-                "citation_backfilled": outcome.backfilled,
-                "chunks_read": chunks_read,
-                "chunks_total": chunks_total,
-                "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
-            }
+            written = yield from self._generate(run, reading, should_stop)
+            yield from self._finish(run, reading, written)
         except QuestionAbandoned:
             return
         except Exception as exc:
-            if not finalized:
-                store_trace(
+            if not run.finalized:
+                self._store_trace(
+                    run,
                     "error",
-                    answer="".join(parts_text).strip() or None,
+                    answer="".join(run.parts_text).strip() or None,
                     error=public_error_message(exc),
                 )
-                finalized = True
             raise
         finally:
-            if slot is not None:
-                slot.release()
-            if not finalized:
-                store_trace(
+            if run.slot is not None:
+                run.slot.release()
+            if not run.finalized:
+                self._store_trace(
+                    run,
                     "error",
-                    answer="".join(parts_text).strip() or None,
+                    answer="".join(run.parts_text).strip() or None,
                     error="Stream closed before completion.",
                 )
+
+    def _store_trace(
+        self,
+        run: SummaryRun,
+        status: Literal["ok", "insufficient_context", "error"],
+        *,
+        answer: str | None,
+        cited: Sequence[int] = (),
+        timings: StageTimings | None = None,
+        error: str | None = None,
+        usage: tuple[int, int] | None = None,
+        citation_retry_used: bool = False,
+        citation_backfilled: bool = False,
+        status_of_answer: str | None = None,
+        truncated: bool = False,
+    ) -> None:
+        """Record ``run``'s trace; it is finalized after (none is recorded again)."""
+
+        if self._trace_store is None or run.trace_id is None:
+            run.finalized = True
+            return
+        settings = run.settings
+        self._trace_store.add(
+            QueryTrace(
+                trace_id=run.trace_id,
+                created_at=time.time(),
+                question=run.task,
+                mode=run.mode,
+                status=status,
+                # Its own config, not a question's: those carry ranking settings a
+                # summary never used.
+                config=TraceConfig(
+                    llm_provider=settings.llm_provider,
+                    rerank_top_k=int(settings.rerank_top_k),
+                    max_context_chunks=int(settings.max_context_chunks),
+                    llm_temperature=float(settings.llm_temperature),
+                    rerank_min_score=float(settings.rerank_min_score),
+                    fused_top_n=int(settings.fused_top_n),
+                    filenames=list(run.request.filenames),
+                    narrowing=narrowing_record(run.request.narrow),
+                    answer_format=settings.answer_format,
+                    answer_language=settings.answer_language,
+                    llm_model=trace_model_name(settings),
+                ),
+                candidates=[],
+                prompt_messages=run.final_messages,
+                answer=answer,
+                cited_source_numbers=list(cited),
+                timings=timings_dict(timings) if timings is not None else None,
+                error=error,
+                request_id=current_request_id(),
+                workspace=workspace_of(self._settings),
+                kind="summary",
+                usage=usage,
+                cost_usd=usage_cost_usd(settings, usage),
+                citation_retry_used=citation_retry_used,
+                citation_backfilled=citation_backfilled,
+                answer_status=status_of_answer,
+                truncated=truncated,
+            )
+        )
+        run.finalized = True
+
+    def _read(self, run: SummaryRun) -> Generator[StreamEvent, None, _Reading | None]:
+        """Read and number the documents' passages; with none to read, the "not in the
+        documents" answer is given here and None returned."""
+
+        yield {"type": "stage", "stage": "reading_documents"}
+        read_start = time.monotonic()
+        budget = batch_char_budget(run.settings)
+        documents, chunks_total = self._read_documents(run.request, run.settings, budget)
+        read_ms = (time.monotonic() - read_start) * 1000
+        selected, numbered = number_sources(documents)
+        if selected:
+            return _Reading(budget, selected, numbered, chunks_total, read_ms)
+        timings = _elapsed_timings(run.started, search_ms=read_ms)
+        self._store_trace(
+            run,
+            "insufficient_context",
+            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            timings=timings,
+            status_of_answer="no_context",
+        )
+        yield {"type": "sources", "sources": [], "trace_id": run.trace_id}
+        yield {
+            "type": "done",
+            "answer": INSUFFICIENT_CONTEXT_ANSWER,
+            "sources": [],
+            "timings": timings_dict(timings),
+            "trace_id": run.trace_id,
+            "answer_status": "no_context",
+            "chunks_read": 0,
+            "chunks_total": chunks_total,
+        }
+        return None
+
+    def _generate(
+        self, run: SummaryRun, reading: _Reading, should_stop: Callable[[], bool] | None
+    ) -> Generator[StreamEvent, None, _Written]:
+        """Notes per part (when it doesn't fit one call), then the final call, streamed
+        or whole; the model is held from the final call on (``run.slot``)."""
+
+        settings, task = run.settings, run.task
+        generate_start = time.monotonic()
+        report = PartReport()
+        # Time spent waiting for the local model (another request had it), left out
+        # of generate_ms as a question's is: queueing isn't generating.
+        waits: list[float] = []
+        # Every call from here on (notes, the answer, a citation retry) is counted.
+        begin_usage()
+        part_total = sum(len(doc_parts) for _, doc_parts in reading.numbered)
+        # Everything read fits one part (one document's, or two short ones to
+        # compare): answer in one call rather than notes per document plus a combine.
+        if sum(_packed_size(chunk) for chunk in reading.selected) <= reading.budget:
+            everything = [
+                pair for _, doc_parts in reading.numbered for part in doc_parts for pair in part
+            ]
+            run.final_messages = with_answer_language(
+                build_direct_messages(task, run.request.mode, everything), settings
+            )
+        else:
+            run.final_messages = yield from self._notes_then_combine(
+                task,
+                run.request,
+                reading.numbered,
+                settings,
+                reading.budget,
+                should_stop,
+                part_total,
+                waits,
+                report,
+            )
+
+        final_settings = settings.model_copy(
+            update={"llm_max_tokens": int(settings.summary_max_tokens)}
+        )
+        # Held through the final call and its citation retry, like an answer's.
+        run.slot = yield from _timed_wait(final_settings, should_stop, waits)
+        all_sources = source_citations(reading.selected, scored=False)
+        yield {
+            "type": "sources",
+            "sources": [asdict(source) for source in all_sources],
+            "trace_id": run.trace_id,
+        }
+        first_token_ms = 0.0
+        reset_finish_reason()
+        if run.stream:
+            for delta in self._generator.stream(run.final_messages, final_settings):
+                if not run.parts_text:
+                    first_token_ms = (time.monotonic() - run.started) * 1000
+                run.parts_text.append(delta)
+                yield {"type": "delta", "text": delta}
+            answer = "".join(run.parts_text).strip()
+        else:
+            answer = self._generator.complete(run.final_messages, final_settings).strip()
+        generate_ms = (time.monotonic() - generate_start - sum(waits)) * 1000
+        if not answer:
+            raise GenerationError("Generation provider returned an empty answer.")
+        if run.stream and will_call_llm_for_citations(
+            answer, all_sources, final_settings, context_chunks=reading.selected
+        ):
+            yield {"type": "stage", "stage": "verifying_citations"}
+        return _Written(answer, final_settings, generate_ms, first_token_ms, report)
+
+    def _finish(
+        self, run: SummaryRun, reading: _Reading, written: _Written
+    ) -> Generator[StreamEvent]:
+        """Citations checked (and retried or backfilled), the trace stored, ``done``."""
+
+        assert run.final_messages is not None
+        outcome, cited = finish_answer(
+            run.final_messages,
+            written.answer,
+            reading.selected,
+            self._generator,
+            written.final_settings,
+            scored=False,
+        )
+        answer = outcome.answer
+        run.final_messages = list(outcome.prompt_messages)
+        truncated = stopped_at_token_limit()
+        usage = usage_totals()
+        timings = _elapsed_timings(
+            run.started,
+            search_ms=reading.read_ms,
+            generate_ms=written.generate_ms,
+            citation_retry_ms=outcome.retry_ms,
+            first_token_ms=written.first_token_ms,
+        )
+        status = answer_status(answer, len(cited), len(reading.selected))
+        # A summary the documents couldn't support is "insufficient_context" in its
+        # trace too, so the query log lists it as uncovered.
+        self._store_trace(
+            run,
+            trace_status(status),
+            answer=answer,
+            cited=[source.source_number for source in cited],
+            timings=timings,
+            usage=usage,
+            citation_retry_used=outcome.retry_used,
+            citation_backfilled=outcome.backfilled,
+            status_of_answer=status,
+            truncated=truncated,
+        )
+        yield {
+            "type": "done",
+            "answer": answer,
+            "sources": [asdict(source) for source in cited],
+            "timings": timings_dict(timings),
+            "trace_id": run.trace_id,
+            "answer_status": status,
+            "truncated": truncated,
+            "citation_backfilled": outcome.backfilled,
+            "chunks_read": len(reading.selected),
+            "chunks_total": reading.chunks_total,
+            "usage": usage_dict(usage, usage_cost_usd(run.settings, usage)),
+            "parts_skipped": written.report.skipped,
+            "notes_truncated": written.report.truncated,
+        }
+
+
+@dataclass
+class SummaryRun:
+    """One summary's state across its steps (as ``pipeline.AnswerRun`` is a question's):
+    what the trace records and the ``finally`` must clean up, however the run ends."""
+
+    request: SummaryRequest
+    settings: AppSettings
+    mode: TraceMode
+    stream: bool
+    trace_id: str | None
+    task: str
+    started: float
+    final_messages: list[ChatMessage] | None = None
+    parts_text: list[str] = field(default_factory=list)
+    finalized: bool = False
+    slot: GenerationSlot | None = None
+
+
+@dataclass(frozen=True)
+class _Reading:
+    """What ``_read`` found: the part budget, the passages read (numbered), how they
+    split into documents and parts, the documents' passage total and the time taken."""
+
+    budget: int
+    selected: list[RerankedChunk]
+    numbered: list[tuple[str, list[list[tuple[int, RerankedChunk]]]]]
+    chunks_total: int
+    read_ms: float
+
+
+@dataclass(frozen=True)
+class _Written:
+    """What ``_generate`` wrote: the answer as the model gave it, the settings of its
+    call, timings and how the parts went."""
+
+    answer: str
+    final_settings: AppSettings
+    generate_ms: float
+    first_token_ms: float
+    report: PartReport
+
+
+# Tries per summary part before it is left out.
+_PART_ATTEMPTS = 2
+
+
+@dataclass
+class PartReport:
+    """How a summary's parts went: left out after failing, or cut off at the limit."""
+
+    skipped: int = 0
+    truncated: int = 0
+
+
+@dataclass(frozen=True)
+class _PartNote:
+    text: str
+    truncated: bool
+    failure: GenerationError | None
 
 
 def _timed_wait(

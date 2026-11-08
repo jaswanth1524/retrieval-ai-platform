@@ -184,6 +184,9 @@ def _write_archive(
                 # Where a URL-ingested document came from, so a restored copy can
                 # still be refreshed. Absent for uploads (older restores ignore it).
                 **_source_fields(meta),
+                # The watched folder that owns it (WATCH_DIR), so a restored copy is
+                # still the watcher's to delete when its file goes.
+                **({"watched_from": meta.watched_from} if meta.watched_from else {}),
                 # Its earlier originals (RAW_DOCUMENT_VERSIONS), newest first, as
                 # `versions/<filename>/<id>`; only when asked for (older restores
                 # ignore both).

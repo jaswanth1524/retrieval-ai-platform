@@ -202,3 +202,26 @@
   text-transform: uppercase;
   color: var(--rail-dim);
 }
+
+.conversation-list__labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 6px;
+}
+
+.conversation-list__label {
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: none;
+  color: var(--dim);
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.conversation-list__label[aria-pressed='true'] {
+  border-color: var(--accent);
+  color: var(--ink);
+}

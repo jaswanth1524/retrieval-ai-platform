@@ -212,3 +212,100 @@ def odt_bytes(body_xml: str, *, extra_members: dict[str, bytes] | None = None) -
         for name, data in (extra_members or {}).items():
             archive.writestr(name, data)
     return buffer.getvalue()
+
+
+def odf_bytes(kind: str, body_xml: str) -> bytes:
+    """An OpenDocument spreadsheet (``kind`` "spreadsheet") or presentation
+    ("presentation") whose ``office:<kind>`` holds ``body_xml``."""
+
+    import zipfile
+
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<office:document-content"
+        ' xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+        ' xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"'
+        ' xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"'
+        ' xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"'
+        ' xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"'
+        ' office:version="1.3">'
+        f"<office:body><office:{kind}>{body_xml}</office:{kind}></office:body>"
+        "</office:document-content>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("mimetype", f"application/vnd.oasis.opendocument.{kind}")
+        archive.writestr("content.xml", content)
+    return buffer.getvalue()
+
+
+def ods_row(*cells: str, repeat: int = 1) -> str:
+    inner = "".join(
+        f"<table:table-cell><text:p>{cell}</text:p></table:table-cell>"
+        if cell
+        else "<table:table-cell/>"
+        for cell in cells
+    )
+    attribute = f' table:number-rows-repeated="{repeat}"' if repeat > 1 else ""
+    return f"<table:table-row{attribute}>{inner}</table:table-row>"
+
+
+def odp_slide(title: str | None, body: list[str], notes: str | None = None) -> str:
+    frames = ""
+    if title:
+        frames += (
+            '<draw:frame presentation:class="title"><draw:text-box>'
+            f"<text:p>{title}</text:p></draw:text-box></draw:frame>"
+        )
+    if body:
+        paragraphs = "".join(f"<text:p>{line}</text:p>" for line in body)
+        frames += f"<draw:frame><draw:text-box>{paragraphs}</draw:text-box></draw:frame>"
+    if notes:
+        frames += (
+            "<presentation:notes><draw:frame><draw:text-box>"
+            f"<text:p>{notes}</text:p></draw:text-box></draw:frame></presentation:notes>"
+        )
+    return f"<draw:page>{frames}</draw:page>"
+
+
+def mbox_bytes(messages: list[tuple[str, str]]) -> bytes:
+    """A mailbox of (subject, body) messages."""
+
+    out = []
+    for number, (subject, body) in enumerate(messages, start=1):
+        escaped = "\n".join(
+            ">" + line if line.startswith("From ") else line for line in body.split("\n")
+        )
+        out.append(
+            f"From ada@example.com Mon Jan  {number} 09:00:00 2024\n"
+            f"From: Ada <ada@example.com>\nTo: team@example.com\nSubject: {subject}\n"
+            f"Date: Mon, {number} Jan 2024 09:00:00 +0000\n\n{escaped}\n"
+        )
+    return "\n".join(out).encode()
+
+
+def ipynb_bytes(cells: list[tuple[str, str]], language: str = "python") -> bytes:
+    """A notebook of (cell_type, source) cells; outputs on code cells are ignored."""
+
+    import json
+
+    return json.dumps(
+        {
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "metadata": {"kernelspec": {"name": "python3", "language": language}},
+            "cells": [
+                {
+                    "cell_type": kind,
+                    "source": source.splitlines(keepends=True),
+                    "metadata": {},
+                    **(
+                        {"outputs": [{"text": "SECRET OUTPUT"}], "execution_count": 1}
+                        if kind == "code"
+                        else {}
+                    ),
+                }
+                for kind, source in cells
+            ],
+        }
+    ).encode()

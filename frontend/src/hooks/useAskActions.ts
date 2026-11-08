@@ -3,6 +3,7 @@ import type {
   DocumentTask,
   LlmProvider,
   PassageNarrowing,
+  QuestionOptions,
   QuestionOverrides,
 } from '../api/types';
 import { scopeForAskAbout } from '../appHelpers';
@@ -12,6 +13,25 @@ import type { ConversationScope } from './chatPersistence';
 import type { UseChatResult } from './useChat';
 import { useStableHandler } from './useStableHandler';
 import type { ToastInput } from './useToasts';
+
+// The parts of a narrowing that come from the conversation's scope (its page range
+// and upload dates, scopeNarrowing): a question asked again takes the scope as it is
+// now, so these are the current scope's, never the ones stored on the old turn — a page
+// range kept from another document searched the wrong one.
+const SCOPE_NARROWING_KEYS = ['page_min', 'page_max', 'uploaded_after', 'uploaded_before'] as const;
+
+/** A turn's own narrowing (left-out passages and documents, a section) with the
+ *  current scope's page range and dates in place of the ones it was asked with. */
+export function withCurrentScope(
+  own: PassageNarrowing | undefined,
+  scope: PassageNarrowing | undefined,
+): PassageNarrowing | undefined {
+  if (own === undefined) return scope;
+  const kept: PassageNarrowing = { ...own };
+  for (const key of SCOPE_NARROWING_KEYS) delete kept[key];
+  const merged = { ...kept, ...(scope ?? {}) };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
 
 export interface AskSettings {
   provider: LlmProvider;
@@ -59,18 +79,20 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
       task: DocumentTask | undefined,
       narrowing: PassageNarrowing | undefined,
       bypassCache: boolean,
+      extra?: Pick<QuestionOptions, 'answerFormat' | 'answerLanguage' | 'replacesAnswer'>,
     ) => {
-      const looking = narrowing ?? scopePages;
       // Picked passages are the scope: the conversation's documents and tags are AND-ed
       // with them on the server, so a passage from another document (the viewer's
       // "Ask about this") found nothing.
-      const picked = Boolean(looking?.chunk_ids?.length) && !task;
+      const picked = Boolean(narrowing?.chunk_ids?.length) && !task;
+      const looking = picked ? narrowing : withCurrentScope(narrowing, scopePages);
       return ask(question, provider, overrides, picked ? undefined : scopeFilenames, {
         tags: picked ? [] : selectedTags,
         ...(bypassCache ? { bypassCache: true } : {}),
         modelLabel,
         ...(task ? { task } : {}),
         ...(looking && !task ? { narrowing: looking } : {}),
+        ...extra,
       });
     },
     [ask, provider, overrides, scopeFilenames, selectedTags, modelLabel, scopePages],
@@ -81,8 +103,19 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
     [askWith],
   );
   const regenerateQuestion = useCallback(
-    (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) =>
-      askWith(question, task, narrowing, true),
+    (question: string, task?: DocumentTask, narrowing?: PassageNarrowing, replaces?: string) =>
+      askWith(question, task, narrowing, true, replaces ? { replacesAnswer: replaces } : undefined),
+    [askWith],
+  );
+  // "Reformat": the same question answered again in another shape or language, the
+  // answer it replaces kept as its earlier version.
+  const reformatAnswer = useCallback(
+    (
+      question: string,
+      narrowing: PassageNarrowing | undefined,
+      style: Pick<QuestionOptions, 'answerFormat' | 'answerLanguage'>,
+      replaces: string,
+    ) => askWith(question, undefined, narrowing, true, { ...style, replacesAnswer: replaces }),
     [askWith],
   );
   // A "not found" answer asked within some documents: the same question over all of
@@ -114,23 +147,35 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
     if (deps.summarizeDisabled || filenames.length === 0) return;
     setSummaryFilenames([...new Set(filenames)]);
   });
-  const runSummary = useStableHandler((filenames: string[], instruction?: string) => {
+  const runSummary = useStableHandler(
+    (filenames: string[], instruction?: string, pages?: { min?: number; max?: number }) => {
     setSummaryFilenames(null);
     if (deps.summarizeDisabled) return;
     const mode: DocumentTask['mode'] =
       filenames.length === 1 ? 'summarize' : filenames.length === 2 ? 'compare' : 'brief';
-    const task: DocumentTask = { mode, filenames, ...(instruction ? { instruction } : {}) };
+    const ranged = mode === 'summarize' && pages ? pages : undefined;
+    const task: DocumentTask = {
+      mode,
+      filenames,
+      ...(instruction ? { instruction } : {}),
+      ...(ranged?.min !== undefined ? { pageMin: ranged.min } : {}),
+      ...(ranged?.max !== undefined ? { pageMax: ranged.max } : {}),
+    };
+    const range = ranged
+      ? ` (pages ${ranged.min ?? 1}–${ranged.max ?? 'end'})`
+      : '';
     const label =
       mode === 'compare'
         ? `Compare ${filenames[0]} and ${filenames[1]}`
         : mode === 'brief'
           ? `Brief on ${filenames.length} documents: ${filenames.join(', ')}`
-          : `Summarize ${filenames[0]}`;
+          : `Summarize ${filenames[0]}${range}`;
     const shown = instruction ? `${label} — focus: ${instruction}` : label;
     // On a narrow screen the corpus panel is a drawer over the conversation.
     setPanelDrawerOpen(false);
     void askQuestion(shown, task);
-  });
+    },
+  );
   // "Ask about these": the open conversation's scope becomes those documents, and the
   // question box takes focus. Before, the composer's scope popover was the only way.
   const askAbout = useStableHandler((filenames: string[]) => {
@@ -168,6 +213,7 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
   return {
     askQuestion,
     regenerateQuestion,
+    reformatAnswer,
     askEverywhere,
     askAboutPassages,
     askAboutViewedPassage,

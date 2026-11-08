@@ -60,6 +60,7 @@ def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(
         "originals_kept": False,
         "models": {},
         "last_backup": None,
+        "backups_failing": [],
     }
 
 

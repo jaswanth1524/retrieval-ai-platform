@@ -43,6 +43,7 @@ from api.url_refresh_state import (
     RefreshStateStore,
     SqliteRefreshStateStore,
 )
+from api.workspace_settings import WorkspaceSettingsStore
 from api.workspaces import (
     WORKSPACE_HEADER,
     WorkspaceError,
@@ -230,18 +231,34 @@ def get_vector_repository(
     return VectorRepository(client)
 
 
+@lru_cache
+def get_workspace_settings_store() -> WorkspaceSettingsStore:
+    """Each workspace's relevance settings (api/workspace_settings.py)."""
+
+    return WorkspaceSettingsStore(get_app_settings().workspace_settings_path)
+
+
+def with_workspace_settings(settings: AppSettings, store: WorkspaceSettingsStore) -> AppSettings:
+    """``settings`` with its workspace's own relevance settings, when it has any."""
+
+    values = store.get(workspace_of(settings))
+    return settings.model_copy(update=values) if values else settings
+
+
 def get_request_settings(
     settings: Annotated[AppSettings, Depends(get_app_settings)],
     client: Annotated[QdrantClient, Depends(get_qdrant_client)],
+    store: Annotated[WorkspaceSettingsStore, Depends(get_workspace_settings_store)],
     x_workspace: Annotated[str | None, Header(alias=WORKSPACE_HEADER)] = None,
 ) -> AppSettings:
     """The settings this request runs with: the app's, pointed at the workspace its
-    ``X-Workspace`` header names (api/workspaces.py). No header (or an empty one) is the
-    default workspace, so a client that has never heard of workspaces is unaffected.
+    ``X-Workspace`` header names (api/workspaces.py), with that workspace's relevance
+    settings (api/workspace_settings.py). No header (or an empty one) is the default
+    workspace, so a client that has never heard of workspaces is unaffected.
     """
 
     if not x_workspace or not x_workspace.strip():
-        return settings
+        return with_workspace_settings(settings, store)
     if not settings.workspaces_enabled:
         raise HTTPException(status_code=400, detail="Workspaces are not enabled on this server.")
     try:
@@ -252,7 +269,7 @@ def get_request_settings(
     # so a typo in the header would otherwise become a new, empty workspace.
     if not workspace_exists(client, settings.qdrant_collection, name):
         raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
-    return settings_for(settings, name)
+    return with_workspace_settings(settings_for(settings, name), store)
 
 
 @lru_cache
@@ -560,6 +577,7 @@ def clear_dependency_caches() -> None:
     get_trace_store.cache_clear()
     _answer_cache_for.cache_clear()
     _question_slots_for.cache_clear()
+    get_workspace_settings_store.cache_clear()
     clear_readiness_cache()
     clear_ollama_reachability_cache()
     clear_hybrid_fallback_cache()

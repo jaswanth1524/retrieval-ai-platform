@@ -22,6 +22,7 @@ import ToastRow from './components/ToastRow';
 import SearchPanel, { type SearchRequestFromElsewhere } from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import SavedPanel from './components/SavedPanel';
+import ReviewPanel from './components/ReviewPanel';
 import FeedbackPanel from './components/FeedbackPanel';
 import UnansweredPanel from './components/UnansweredPanel';
 import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
@@ -57,12 +58,15 @@ import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { sourceChange } from './utils/citationFreshness';
 import { copyText } from './utils/clipboard';
+import { deepLinkUrl, parseDeepLink, usageTotal } from './utils/deepLink';
+import { formatCost } from './utils/cost';
 import { withCitationFootnotes } from './utils/exportChat';
 import { folderPickNote, pickFolderFiles } from './utils/folderFiles';
 import { initialProvider } from './utils/providers';
 import { readStored, writeStored } from './utils/safeStorage';
 import {
   acceptedExtensions,
+  uploadExtensions,
   DEFAULT_MAX_UPLOAD_BYTES,
   validateUploads,
 } from './utils/uploadValidation';
@@ -156,12 +160,15 @@ function App() {
     conversations,
     savedAnswers,
     answersCiting,
+    answersIn,
     activeConversationId,
     newConversation: createConversation,
     switchConversation: selectConversation,
     renameConversation,
     deleteConversation: removeConversation,
+    restoreConversation,
     setPinned,
+    setLabels,
     searchConversations,
     persistError,
     persistPartial,
@@ -225,6 +232,7 @@ function App() {
     handleSetRefreshInterval,
     handleRestoreVersion,
     handleUploadFromUrl,
+    handleAddSitemap,
     handleReindexMany,
     handleReindexAllStale,
     handleDeleteDocument,
@@ -404,9 +412,19 @@ function App() {
     (id: string) => {
       setPinnedTraceId(null);
       setHoveredCitation(null);
-      removeConversation(id);
+      const removed = removeConversation(id);
+      // A delete is easy to make by mistake and used to be final: offered back for a
+      // while, as long as the toast shows.
+      if (removed && removed.turns.length > 0) {
+        pushToast({
+          id: `deleted-${removed.id}`,
+          tone: 'info',
+          title: `Deleted “${removed.title}”`,
+          action: { label: 'Undo', run: () => restoreConversation(removed) },
+        });
+      }
     },
-    [removeConversation, setPinnedTraceId, setHoveredCitation],
+    [removeConversation, restoreConversation, pushToast, setPinnedTraceId, setHoveredCitation],
   );
   // A conversation search hit names the turn it matched: the thread scrolls to it.
   const [focusTurn, setFocusTurn] = useState<{ turnId: string } | null>(null);
@@ -418,6 +436,50 @@ function App() {
     },
     [switchConversation],
   );
+  // Links back to a conversation or an answer (#c=…&t=…): opened on load and whenever
+  // the hash changes. They work in this browser only — conversations live in its
+  // storage — so one from elsewhere says so instead of doing nothing.
+  const conversationIdsRef = useRef<Set<string>>(new Set());
+  conversationIdsRef.current = new Set(conversations.map((conversation) => conversation.id));
+  useEffect(() => {
+    if (!historyReady) return;
+    const open = () => {
+      const link = parseDeepLink(window.location.hash);
+      if (!link) return;
+      // Taken off the address once read: reloading shouldn't jump back to it.
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      if (!conversationIdsRef.current.has(link.conversationId)) {
+        pushToast({
+          tone: 'warn',
+          title: 'That conversation isn’t in this browser',
+          body: 'Links open conversations saved here; it may have been deleted.',
+        });
+        return;
+      }
+      switchConversationFromList(link.conversationId, link.turnId);
+    };
+    open();
+    window.addEventListener('hashchange', open);
+    return () => window.removeEventListener('hashchange', open);
+  }, [historyReady, pushToast, switchConversationFromList]);
+  const copyLink = useCallback(
+    (turnId?: string) => {
+      if (!activeConversationId) return;
+      const url = deepLinkUrl({ conversationId: activeConversationId, turnId }, window.location);
+      void copyText(url).then((ok) =>
+        pushToast(
+          ok
+            ? { tone: 'good', title: 'Link copied', body: 'It opens this conversation in this browser.' }
+            : { tone: 'warn', title: 'Could not copy the link', body: url },
+        ),
+      );
+    },
+    [activeConversationId, pushToast],
+  );
+  const usage = usageTotal(turns);
+  const usageLabel = usage
+    ? `${usage.tokens.toLocaleString()} tokens${usage.costUsd !== undefined ? ` · ${formatCost(usage.costUsd)}` : ''}`
+    : null;
   const pinConversation = useCallback(
     (id: string, pinned: boolean) => {
       if (!setPinned(id, pinned)) {
@@ -542,7 +604,7 @@ function App() {
     const { accepted, rejected } = validateUploads(
       files,
       config?.max_upload_bytes ?? DEFAULT_MAX_UPLOAD_BYTES,
-      acceptedExtensions(config?.supported_extensions),
+      uploadExtensions(config?.supported_extensions),
     );
     if (rejected.length > 0) {
       pushToast({
@@ -640,6 +702,7 @@ function App() {
   const {
     askQuestion,
     regenerateQuestion,
+    reformatAnswer,
     askEverywhere,
     askAboutPassages,
     askAboutViewedPassage,
@@ -874,6 +937,18 @@ function App() {
     (name: string) => saveScopePreset(name, scope),
     [saveScopePreset, scope],
   );
+  // The "Needs review" panel: this workspace's answers, walked only while it is open
+  // (conversations change on every streamed frame).
+  const reviewAnswers = useMemo(
+    () => (rail === 'review' ? answersIn(workspace) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rail, workspace, answersIn, conversations],
+  );
+  // The card lists answers from this workspace's conversations only.
+  const answersCitingHere = useCallback(
+    (filename: string) => answersCiting(filename, workspace),
+    [answersCiting, workspace],
+  );
   // A cited document deleted or uploaded again after the answer: flagged on its card.
   const sourceChangeOf = useCallback(
     (filename: string, answeredAtMs: number) =>
@@ -1047,6 +1122,8 @@ function App() {
     else if (rail === 'feedback') loadFeedback();
     else if (rail === 'unanswered') loadUnanswered();
     else if (rail === 'saved') exportSavedAnswers();
+    // Its "changed since" flags come from the corpus listing: read it again.
+    else if (rail === 'review') void refreshDocuments().catch(noteAuthFailure);
     else loadTraces();
   });
 
@@ -1119,6 +1196,7 @@ function App() {
             onRename={renameConversation}
             onDelete={deleteConversation}
             onPin={pinConversation}
+            onSetLabels={setLabels}
             onSearch={searchConversations}
             streamingId={pending ? streamingConversationId : null}
             onVisibleOrder={noteListedOrder}
@@ -1176,6 +1254,7 @@ function App() {
             onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
             onRead={handleReadDocument}
             onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
+            onAddSitemap={config?.url_ingest_enabled && !readOnly ? handleAddSitemap : undefined}
             canPreview={!readOnly}
             onSummarize={summarizeDocuments}
             onAskAbout={askAbout}
@@ -1187,7 +1266,7 @@ function App() {
             }
             workspace={workspace}
             summarizeDisabled={summarizeDisabled}
-            findAnswersCiting={answersCiting}
+            findAnswersCiting={answersCitingHere}
             queryLogEnabled={Boolean(config?.query_log_enabled) && !readOnly}
             onOpenAnswer={switchConversationFromList}
           />
@@ -1219,6 +1298,7 @@ function App() {
             onAnswerFilter={setTraceAnswerFilter}
             onExport={readOnly ? undefined : exportTraces}
             exporting={exportingTraces}
+            canApplySuggestion={!readOnly}
           />
         )}
         {rail === 'feedback' && (
@@ -1226,6 +1306,13 @@ function App() {
             feedback={feedbackItems}
             error={feedbackError}
             onSelectTrace={handleSelectTrace}
+          />
+        )}
+        {rail === 'review' && (
+          <ReviewPanel
+            answers={reviewAnswers}
+            onOpen={switchConversationFromList}
+            sourceChangeOf={sourceChangeOf}
           />
         )}
         {rail === 'saved' && (
@@ -1271,6 +1358,8 @@ function App() {
             />
             <ChatHeader
               key={activeConversationId ?? 'none'}
+              onCopyLink={activeConversationId ? () => copyLink() : undefined}
+              usageLabel={usageLabel}
               title={activeConversation?.title ?? 'New chat'}
               scopeLabel={currentScopeLabel}
               mode={mode}
@@ -1297,6 +1386,8 @@ function App() {
               onAskEverywhere={askEverywhere}
               onSearchPassages={searchForPassages}
               onToggleSaved={setTurnSaved}
+              onCopyLink={copyLink}
+              onReformat={reformatAnswer}
               // Only once the listing is this conversation's workspace's (it switches
               // to it on opening): another's documents would all read "deleted".
               sourceChangeOf={
@@ -1407,7 +1498,7 @@ function App() {
           {summaryFilenames && (
             <SummaryDialog
               filenames={summaryFilenames}
-              onRun={(instruction) => runSummary(summaryFilenames, instruction)}
+              onRun={(instruction, pages) => runSummary(summaryFilenames, instruction, pages)}
               onClose={() => setSummaryFilenames(null)}
             />
           )}
@@ -1416,6 +1507,12 @@ function App() {
               config={config}
               serverVersion={serverVersion}
               readiness={readiness}
+              showAdmin={access === 'full' || access === 'open'}
+              onRestored={() => {
+                refreshDocuments().catch((err) => {
+                  noteAuthFailure(err);
+                });
+              }}
               overrides={advancedOptions}
               onOverridesChange={updateAdvancedOptions}
               onClose={() => setSettingsOpen(false)}

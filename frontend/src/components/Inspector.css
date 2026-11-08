@@ -516,3 +516,39 @@
   padding-left: 18px;
   font-size: 12px;
 }
+
+.trace-rerun {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+}
+
+.trace-rerun__form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+}
+
+.trace-rerun__form label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--dim);
+}
+
+.trace-rerun__form input {
+  width: 6em;
+}
+
+.trace-rerun__result p {
+  margin: 8px 0 4px;
+}
+
+.trace-rerun__changes {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}

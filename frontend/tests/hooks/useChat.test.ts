@@ -6,6 +6,7 @@ import {
   busyRetrySeconds,
   historyForQuestion,
   mergeConversations,
+  STREAM_FLUSH_MS,
   useChat,
 } from '../../src/hooks/useChat';
 import { MAX_CONVERSATIONS, sanitizeTurn } from '../../src/hooks/chatPersistence';
@@ -130,10 +131,11 @@ describe('useChat', () => {
     expect(result.current.pending).toBe(true);
     expect(result.current.turns).toHaveLength(2);
     expect(result.current.turns[0]).toMatchObject({ role: 'user', content: 'How do I run it?' });
-    // Deltas are coalesced per animation frame rather than applied one render each.
-    expect(result.current.turns[1]).toMatchObject({ role: 'assistant', content: '' });
+    // The first text shows at once; the rest is coalesced and applied every
+    // STREAM_FLUSH_MS rather than one render per delta.
+    expect(result.current.turns[1]).toMatchObject({ role: 'assistant', content: 'Run ' });
     await act(async () => {
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      await new Promise((resolve) => setTimeout(resolve, STREAM_FLUSH_MS + 20));
     });
     expect(result.current.turns[1]).toMatchObject({
       role: 'assistant',

@@ -382,7 +382,13 @@ describe('ChatMessage', () => {
 
     expect(screen.getByTestId('chat-message-coverage')).toHaveTextContent('read 40 of 300 passages');
     await userEvent.click(screen.getByTestId('chat-message-regenerate'));
-    expect(onRegenerate).toHaveBeenCalledWith('Compare a.pdf and b.pdf', task);
+    // The answer it replaces goes along: kept as an earlier version of the new one.
+    expect(onRegenerate).toHaveBeenCalledWith(
+      'Compare a.pdf and b.pdf',
+      task,
+      undefined,
+      expect.any(String),
+    );
   });
 
   it('offers suggested follow-ups as one-click questions, held while another is answered', async () => {
@@ -838,7 +844,7 @@ describe('ChatMessage answer-progress announcement', () => {
 
     await userEvent.click(screen.getByTestId('chat-message-regenerate'));
 
-    expect(onRegenerate).toHaveBeenCalledWith('Q?');
+    expect(onRegenerate).toHaveBeenCalledWith('Q?', undefined, undefined, expect.any(String));
     expect(onRetry).not.toHaveBeenCalled();
   });
 

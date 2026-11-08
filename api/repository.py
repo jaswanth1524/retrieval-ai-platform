@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Literal
@@ -360,8 +360,14 @@ class VectorRepository:
         filenames: Sequence[str] | None = None,
         tags: Sequence[str] | None = None,
         narrow: PassageFilter | None = None,
+        leg_ranks: LegRanks | None = None,
     ) -> list[models.ScoredPoint]:
         """Fused dense+sparse candidates: server-side RRF, falling back to manual fusion.
+
+        ``leg_ranks``, when given, is filled with each point's 1-based rank on each leg
+        (the best rank when several queries fill it): from the legs themselves when
+        fusion runs here, and from one more query when Qdrant fuses, only with
+        TRACE_LEG_RANKS.
 
         ``filenames`` and ``tags``, when given, restrict both the dense and sparse legs
         before fusion (payload filters on the indexed ``filename`` / ``tags`` fields):
@@ -373,9 +379,12 @@ class VectorRepository:
         query_filter = _scope_filter(filenames, tags, narrow)
         try:
             if self._client in _server_side_hybrid_unsupported:
-                return self._manual_hybrid_query(settings, query_embedding, query_filter)
+                return self._manual_hybrid_query(settings, query_embedding, query_filter, leg_ranks)
             try:
-                return self._server_side_hybrid_query(settings, query_embedding, query_filter)
+                fused = self._server_side_hybrid_query(settings, query_embedding, query_filter)
+                if leg_ranks is not None and settings.trace_leg_ranks:
+                    self._record_leg_ranks(settings, query_embedding, query_filter, leg_ranks)
+                return fused
             except UnexpectedResponse as exc:
                 if exc.status_code not in _RRF_UNSUPPORTED_STATUS_CODES:
                     # A real query error (auth, malformed request, server fault) —
@@ -386,7 +395,9 @@ class VectorRepository:
                 # Remembered only once manual fusion works: a 400 for any other reason
                 # (a vector of the wrong size) fails that too, and remembering it
                 # switched this client off server-side hybrid until a restart.
-                points = self._manual_hybrid_query(settings, query_embedding, query_filter)
+                points = self._manual_hybrid_query(
+                    settings, query_embedding, query_filter, leg_ranks
+                )
                 _server_side_hybrid_unsupported.add(self._client)
                 return points
         except ResponseHandlingException as exc:
@@ -640,6 +651,28 @@ class VectorRepository:
                     metadata,
                 )
         return dict(metadata)
+
+    def refresh_listed(self, settings: AppSettings, names: Iterable[str]) -> None:
+        """Re-read ``names`` into the cached listing without moving the corpus
+        generation: for payload changes no answer depends on (a URL document's
+        validators or refresh interval), which must show in the listing but must not
+        empty the collection's answer cache. Nothing is cached: nothing to do."""
+
+        collection = settings.qdrant_collection
+        only = frozenset(names)
+        with _metadata_lock:
+            cached = _metadata_cache.get(self._client, {}).get(collection)
+        if cached is None or not only:
+            return
+        fresh = self._scan_filename_metadata(settings, only=only)
+        with _metadata_lock:
+            entries = _metadata_cache.get(self._client, {})
+            if entries.get(collection) is not cached:
+                return  # replaced meanwhile by a newer read, which has the change
+            generation, stored_at, metadata = cached
+            patched = {name: meta for name, meta in metadata.items() if name not in only}
+            patched.update(fresh)
+            entries[collection] = (generation, stored_at, patched)
 
     def _patched_metadata(
         self, settings: AppSettings, generation: int
@@ -1080,6 +1113,7 @@ class VectorRepository:
         settings: AppSettings,
         query_embedding: EmbeddedText,
         query_filter: models.Filter | None,
+        leg_ranks: LegRanks | None = None,
     ) -> list[models.ScoredPoint]:
         # Both legs in one round trip; fused here with the same pinned rrf_k.
         responses = self._call(
@@ -1091,11 +1125,36 @@ class VectorRepository:
                 _leg_request(settings, query_embedding, "sparse", query_filter),
             ],
         )
-        return reciprocal_rank_fusion(
-            [_response_points(response) for response in responses],
-            k=int(settings.rrf_k),
-            limit=int(settings.fused_top_n),
-        )
+        legs = [_response_points(response) for response in responses]
+        if leg_ranks is not None:
+            _note_leg_ranks(leg_ranks, legs[0], legs[1])
+        return reciprocal_rank_fusion(legs, k=int(settings.rrf_k), limit=int(settings.fused_top_n))
+
+    def _record_leg_ranks(
+        self,
+        settings: AppSettings,
+        query_embedding: EmbeddedText,
+        query_filter: models.Filter | None,
+        leg_ranks: LegRanks,
+    ) -> None:
+        """Each leg's ranking on its own (ids only), for a trace: Qdrant's fusion
+        doesn't say which leg found a point. Best effort: a failure leaves none."""
+
+        try:
+            responses = self._call(
+                settings,
+                "query_batch_points",
+                collection_name=settings.qdrant_collection,
+                requests=[
+                    _leg_request(settings, query_embedding, "dense", query_filter, payload=False),
+                    _leg_request(settings, query_embedding, "sparse", query_filter, payload=False),
+                ],
+            )
+        except Exception:  # noqa: BLE001 - only the trace's detail is lost
+            logger.debug("Could not read the legs' ranks for the trace.", exc_info=True)
+            return
+        dense, sparse = (_response_points(response) for response in responses)
+        _note_leg_ranks(leg_ranks, dense, sparse)
 
     def fetch_neighbors(
         self,
@@ -1301,9 +1360,13 @@ def _leg_request(
     query_embedding: EmbeddedText,
     leg: Literal["dense", "sparse"],
     query_filter: models.Filter | None,
+    *,
+    payload: bool = True,
 ) -> models.QueryRequest:
-    """One retrieval leg (dense or BM25) as a query request."""
+    """One retrieval leg (dense or BM25) as a query request (ids only without
+    ``payload``)."""
 
+    fields: list[str] | bool = SEARCH_PAYLOAD_FIELDS if payload else False
     if leg == "dense":
         return models.QueryRequest(
             query=query_embedding.dense,
@@ -1311,7 +1374,7 @@ def _leg_request(
             limit=int(settings.dense_retrieval_limit),
             filter=query_filter,
             params=_dense_search_params(settings),
-            with_payload=SEARCH_PAYLOAD_FIELDS,
+            with_payload=fields,
             with_vector=False,
         )
     return models.QueryRequest(
@@ -1319,6 +1382,26 @@ def _leg_request(
         using=settings.qdrant_sparse_vector_name,
         limit=int(settings.sparse_retrieval_limit),
         filter=query_filter,
-        with_payload=SEARCH_PAYLOAD_FIELDS,
+        with_payload=fields,
         with_vector=False,
     )
+
+
+# Point id -> [dense rank, sparse rank], 1-based, None where that leg didn't return it.
+LegRanks = dict[str, list[int | None]]
+
+
+def _note_leg_ranks(
+    leg_ranks: LegRanks,
+    dense: Sequence[models.ScoredPoint],
+    sparse: Sequence[models.ScoredPoint],
+) -> None:
+    """Each point's rank on each leg, keeping the best one when several queries (query
+    variants, a follow-up's two phrasings) fill the same map."""
+
+    for index, points in ((0, dense), (1, sparse)):
+        for rank, point in enumerate(points, start=1):
+            ranks = leg_ranks.setdefault(str(point.id), [None, None])
+            current = ranks[index]
+            if current is None or rank < current:
+                ranks[index] = rank

@@ -1700,6 +1700,6 @@ describe('App workspace switching', () => {
     render(<App />);
     await openCorpusPanel();
     await waitFor(() => expect(card('guide.md')).toBeDefined());
-    expect(screen.getByLabelText('Summarize guide.md')).toBeDisabled();
+    expect(screen.getByLabelText('Summarize guide.md')).toHaveAttribute('aria-disabled', 'true');
   });
 });

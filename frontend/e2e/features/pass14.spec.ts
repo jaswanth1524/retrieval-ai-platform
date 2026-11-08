@@ -86,7 +86,7 @@ test('a document card lists the questions that cited it, here and in the log', a
   const card = page.getByTestId('corpus-panel-item').filter({ hasText: 'guide.md' });
   await card.getByTestId('corpus-usage-toggle').click();
   await expect(card.getByTestId('corpus-usage-answer')).toHaveText(/What retrieval strategy/);
-  await expect(card.getByTestId('corpus-usage-logged')).toContainText('1 logged question drew on it');
+  await expect(card.getByTestId('corpus-usage-logged')).toContainText('1 logged question cited it');
   expect(api.queryLogFilenames).toEqual(['guide.md']);
 });
 

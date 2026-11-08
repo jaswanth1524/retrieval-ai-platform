@@ -12,7 +12,7 @@ import dataclasses
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from threading import Lock
@@ -63,6 +63,13 @@ class TraceCandidate:
     drop_reason: DropReason | None
     selected_for_context: bool
     neighbor_expanded: bool
+    # Its [n] in the prompt (None: not in the prompt), and whether the answer cited it.
+    source_number: int | None = None
+    cited: bool = False
+    # Its rank on the dense and the BM25 leg before fusion (None: that leg didn't return
+    # it, or ranks weren't recorded — TRACE_LEG_RANKS with Qdrant's own fusion).
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +96,13 @@ class TraceConfig:
     # PASSAGES_ONLY sets the radius to 0, STRONG_MATCHES_ONLY the fallback count.
     context_neighbor_radius: int | None = None
     rerank_fallback_count: int | None = None
+    # Ranking settings that move scores or order (None on older traces).
+    rerank_candidates: int | None = None
+    rerank_relative_floor: float | None = None
+    recency_boost_weight: float | None = None
+    query_expansion_enabled: bool | None = None
+    reranker_onnx_file: str | None = None
+    context_neighbor_max_chars: int | None = None
 
 
 @dataclass
@@ -141,6 +155,8 @@ class QueryTrace:
     truncated: bool = False
     # History messages the prompt fitter left out to fit the context window.
     dropped_history_messages: int = 0
+    # "question" or "summary" (a summary's ``question`` is its task line).
+    kind: str = "question"
 
 
 @dataclass(frozen=True)
@@ -159,6 +175,17 @@ class TraceSummary:
     kept_count: int
     answer_status: str | None
     top_rerank_score: float | None
+    # The cross-encoder that scored it: scores from different ones don't compare.
+    reranker_model: str | None = None
+    # Whether RERANK_MIN_SCORE decided what reached the prompt (picked passages skip
+    # the bar: their scores say nothing about where it should be).
+    gated: bool = True
+    kind: str = "question"
+
+
+def _picked_passages(trace: QueryTrace) -> bool:
+    narrowing = trace.config.narrowing if trace.config is not None else None
+    return bool(narrowing and narrowing.get("chunk_ids"))
 
 
 def summarize_trace(trace: QueryTrace) -> TraceSummary:
@@ -175,6 +202,9 @@ def summarize_trace(trace: QueryTrace) -> TraceSummary:
         kept_count=sum(1 for candidate in trace.candidates if candidate.kept),
         answer_status=trace_answer_status(trace),
         top_rerank_score=max(scores) if scores else None,
+        reranker_model=trace.config.reranker_model if trace.config is not None else None,
+        gated=not _picked_passages(trace),
+        kind=trace.kind,
     )
 
 
@@ -313,14 +343,19 @@ class TraceStore:
         self,
         workspace: str | None = None,
         answer_statuses: AbstractSet[str] | None = None,
+        *,
+        limit: int | None = None,
     ) -> list[TraceSummary]:
         """The trace list's rows, newest first: ``workspace``'s, and with
         ``answer_statuses`` only traces with one of them. With an archive, its newest
-        ``max_retained`` matching ones, read from its summary columns (no prompts)."""
+        ``limit`` (default ``max_retained``) matching ones, read from its summary
+        columns (no prompts) — the score report reads the whole archive."""
 
         if self._archive is not None:
             try:
-                return self._archive.summaries(workspace, self._max_retained, answer_statuses)
+                return self._archive.summaries(
+                    workspace, limit or self._max_retained, answer_statuses
+                )
             except Exception:  # noqa: BLE001 - fall back to what memory holds
                 logger.warning("Could not list traces from the archive.", exc_info=True)
         with self._lock:
@@ -355,6 +390,8 @@ def build_trace_candidates(
     diversity_dropped_ids: AbstractSet[str] = frozenset(),
     context_budget_dropped_ids: AbstractSet[str] = frozenset(),
     relative_cut_ids: AbstractSet[str] = frozenset(),
+    cited_source_numbers: AbstractSet[int] = frozenset(),
+    leg_ranks: Mapping[str, Sequence[int | None]] | None = None,
 ) -> list[TraceCandidate]:
     """Join the fused, scored, kept, and context-selected candidate lists by point id.
 
@@ -369,6 +406,14 @@ def build_trace_candidates(
     kept_ids = {chunk.point_id for chunk in kept_chunks}
     selected_ids = {chunk.point_id for chunk in selected_chunks}
     expanded_ids = {chunk.point_id for chunk in selected_chunks if chunk.expanded_text is not None}
+    # The prompt numbers its passages from 1 in this order; the fitter drops from the
+    # end, so the ones it dropped have no number and the rest keep theirs.
+    numbers = {
+        chunk.point_id: number
+        for number, chunk in enumerate(
+            (c for c in selected_chunks if c.point_id not in context_budget_dropped_ids), start=1
+        )
+    }
 
     result: list[TraceCandidate] = []
     for candidate in fused_candidates:
@@ -405,6 +450,10 @@ def build_trace_candidates(
                 drop_reason=drop_reason,
                 selected_for_context=candidate.point_id in selected_ids,
                 neighbor_expanded=candidate.point_id in expanded_ids,
+                source_number=numbers.get(candidate.point_id),
+                cited=numbers.get(candidate.point_id) in cited_source_numbers,
+                dense_rank=(leg_ranks or {}).get(candidate.point_id, (None, None))[0],
+                sparse_rank=(leg_ranks or {}).get(candidate.point_id, (None, None))[1],
             )
         )
     return result

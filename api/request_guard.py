@@ -37,10 +37,14 @@ GUARDED_PREFIXES = (
     "/workspaces",
     "/watch",
     "/query-log",
+    "/backups",
+    "/admin",
     "/docs",
     "/redoc",
 )
-GUARDED_EXACT = frozenset({"/metrics", "/export", "/access", "/search", "/import", "/openapi.json"})
+GUARDED_EXACT = frozenset(
+    {"/metrics", "/export", "/access", "/search", "/import", "/openapi.json", "/answer-cache"}
+)
 # Room for the multipart boundary and part headers around an upload's own bytes.
 UPLOAD_OVERHEAD_BYTES = 64 * 1024
 # JSON bodies (a question with its history, feedback) are a few tens of KB at most.
@@ -91,13 +95,18 @@ def needs_full_key(method: str, path: str) -> bool:
     """Routes the read-only key (API_READ_KEY) may not use: changes to the corpus, and
     operator data (feedback, metrics, the full export)."""
 
-    if path in ("/metrics", "/export", "/query-log", "/traces/export") or (
+    if path in ("/metrics", "/export", "/query-log", "/traces/export", "/answer-cache") or (
         path == "/feedback" and method == "GET"
     ):
         return True
+    # Stored backups and the consistency report: operator data, whatever the method.
+    if path.startswith(("/backups", "/admin/")) or path == "/backups":
+        return True
     if method == "POST" and path in ("/import", "/watch/scan", "/query-log/recheck"):
         return True
-    if method in ("POST", "DELETE") and (path == "/workspaces" or path.startswith("/workspaces/")):
+    if method in ("POST", "PUT", "DELETE") and (
+        path == "/workspaces" or path.startswith("/workspaces/")
+    ):
         return True
     if method == "DELETE" and path.startswith("/documents/"):
         return True
@@ -105,6 +114,8 @@ def needs_full_key(method: str, path: str) -> bool:
         "/documents",
         "/documents/reindex",
         "/documents/from-url",
+        "/documents/from-sitemap",
+        "/documents/archive",
         "/documents/preview",
     ):
         return True
@@ -114,9 +125,9 @@ def needs_full_key(method: str, path: str) -> bool:
 
 
 def body_limit(method: str, path: str, settings: AppSettings) -> int:
-    if method == "POST" and path in ("/documents", "/documents/preview"):
+    if method == "POST" and path in ("/documents", "/documents/preview", "/documents/archive"):
         return int(settings.max_upload_bytes) + UPLOAD_OVERHEAD_BYTES
-    if method == "POST" and path == "/import":
+    if method == "POST" and path in ("/import", "/backups/verify"):
         return int(settings.max_import_bytes) + UPLOAD_OVERHEAD_BYTES
     return MAX_JSON_BODY_BYTES
 

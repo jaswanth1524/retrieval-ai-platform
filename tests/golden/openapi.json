@@ -20,6 +20,242 @@
     "title": "AccessResponse",
     "type": "object"
    },
+   "AnswerCacheClearResponse": {
+    "properties": {
+     "removed": {
+      "title": "Removed",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "removed"
+    ],
+    "title": "AnswerCacheClearResponse",
+    "type": "object"
+   },
+   "AnswerCacheResponse": {
+    "description": "GET /answer-cache: this workspace's cached answers (ANSWER_CACHE_SIZE).",
+    "properties": {
+     "enabled": {
+      "title": "Enabled",
+      "type": "boolean"
+     },
+     "entries": {
+      "items": {
+       "$ref": "#/components/schemas/CachedQuestionResponse"
+      },
+      "title": "Entries",
+      "type": "array"
+     },
+     "in_flight": {
+      "title": "In Flight",
+      "type": "integer"
+     },
+     "max_entries": {
+      "title": "Max Entries",
+      "type": "integer"
+     },
+     "total_entries": {
+      "title": "Total Entries",
+      "type": "integer"
+     },
+     "ttl_seconds": {
+      "title": "Ttl Seconds",
+      "type": "number"
+     }
+    },
+    "required": [
+     "enabled",
+     "entries",
+     "total_entries",
+     "max_entries",
+     "ttl_seconds",
+     "in_flight"
+    ],
+    "title": "AnswerCacheResponse",
+    "type": "object"
+   },
+   "ArchiveSkipResponse": {
+    "properties": {
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "reason": {
+      "title": "Reason",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name",
+     "reason"
+    ],
+    "title": "ArchiveSkipResponse",
+    "type": "object"
+   },
+   "ArchiveUploadResponse": {
+    "description": "POST /documents/archive: a zip's documents, each queued as its own upload.",
+    "properties": {
+     "deferred": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Deferred",
+      "type": "array"
+     },
+     "jobs": {
+      "items": {
+       "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
+      },
+      "title": "Jobs",
+      "type": "array"
+     },
+     "skipped": {
+      "items": {
+       "$ref": "#/components/schemas/ArchiveSkipResponse"
+      },
+      "title": "Skipped",
+      "type": "array"
+     }
+    },
+    "required": [
+     "jobs",
+     "skipped",
+     "deferred"
+    ],
+    "title": "ArchiveUploadResponse",
+    "type": "object"
+   },
+   "BackupCheckResponse": {
+    "description": "POST /backups/verify, /backups/{name}/verify: a backup read through without\nrestoring anything.",
+    "properties": {
+     "documents": {
+      "title": "Documents",
+      "type": "integer"
+     },
+     "feedback": {
+      "title": "Feedback",
+      "type": "boolean"
+     },
+     "ok": {
+      "title": "Ok",
+      "type": "boolean"
+     },
+     "originals": {
+      "title": "Originals",
+      "type": "integer"
+     },
+     "originals_missing": {
+      "title": "Originals Missing",
+      "type": "integer"
+     },
+     "problems": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     },
+     "versions": {
+      "title": "Versions",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "ok",
+     "documents",
+     "originals",
+     "originals_missing",
+     "versions",
+     "feedback",
+     "problems"
+    ],
+    "title": "BackupCheckResponse",
+    "type": "object"
+   },
+   "BackupFileResponse": {
+    "description": "One backup in BACKUP_DIR (GET /backups).",
+    "properties": {
+     "created_at": {
+      "title": "Created At",
+      "type": "number"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "problems": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     },
+     "size": {
+      "title": "Size",
+      "type": "integer"
+     },
+     "verified": {
+      "anyOf": [
+       {
+        "type": "boolean"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Verified"
+     }
+    },
+    "required": [
+     "name",
+     "size",
+     "created_at"
+    ],
+    "title": "BackupFileResponse",
+    "type": "object"
+   },
+   "BackupListResponse": {
+    "description": "GET /backups: this workspace's scheduled backups, newest first.",
+    "properties": {
+     "backups": {
+      "items": {
+       "$ref": "#/components/schemas/BackupFileResponse"
+      },
+      "title": "Backups",
+      "type": "array"
+     },
+     "interval_hours": {
+      "title": "Interval Hours",
+      "type": "number"
+     },
+     "keep": {
+      "title": "Keep",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "backups",
+     "interval_hours",
+     "keep"
+    ],
+    "title": "BackupListResponse",
+    "type": "object"
+   },
+   "BackupRunResponse": {
+    "description": "POST /backups/run: a backup of this workspace was asked for; it is written on a\npass that starts now (GET /backups lists it once written).",
+    "properties": {
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "workspace"
+    ],
+    "title": "BackupRunResponse",
+    "type": "object"
+   },
    "Body_import_backup_import_post": {
     "properties": {
      "file": {
@@ -46,6 +282,35 @@
      "file"
     ],
     "title": "Body_preview_document_documents_preview_post",
+    "type": "object"
+   },
+   "Body_upload_archive_documents_archive_post": {
+    "properties": {
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Tags for every document.",
+      "title": "Tags"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_upload_archive_documents_archive_post",
     "type": "object"
    },
    "Body_upload_document_documents_post": {
@@ -75,6 +340,38 @@
      "file"
     ],
     "title": "Body_upload_document_documents_post",
+    "type": "object"
+   },
+   "Body_verify_uploaded_backup_backups_verify_post": {
+    "properties": {
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_verify_uploaded_backup_backups_verify_post",
+    "type": "object"
+   },
+   "CachedQuestionResponse": {
+    "properties": {
+     "age_seconds": {
+      "title": "Age Seconds",
+      "type": "number"
+     },
+     "question": {
+      "title": "Question",
+      "type": "string"
+     }
+    },
+    "required": [
+     "question",
+     "age_seconds"
+    ],
+    "title": "CachedQuestionResponse",
     "type": "object"
    },
    "CitationResponse": {
@@ -168,6 +465,89 @@
      "quote"
     ],
     "title": "CitationSpanResponse",
+    "type": "object"
+   },
+   "ConsistencyResponse": {
+    "description": "GET /admin/consistency: how the index and the stored originals agree. A report\nonly: nothing is changed.",
+    "properties": {
+     "documents": {
+      "title": "Documents",
+      "type": "integer"
+     },
+     "documents_without_original": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Documents Without Original",
+      "type": "array"
+     },
+     "duplicate_groups": {
+      "items": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "title": "Duplicate Groups",
+      "type": "array"
+     },
+     "in_flight": {
+      "items": {
+       "type": "string"
+      },
+      "title": "In Flight",
+      "type": "array"
+     },
+     "incomplete": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Incomplete",
+      "type": "array"
+     },
+     "originals_kept": {
+      "title": "Originals Kept",
+      "type": "boolean"
+     },
+     "originals_without_document": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Originals Without Document",
+      "type": "array"
+     },
+     "problems": {
+      "title": "Problems",
+      "type": "integer"
+     },
+     "stale": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Stale",
+      "type": "array"
+     },
+     "versions_without_document": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Versions Without Document",
+      "type": "array"
+     }
+    },
+    "required": [
+     "documents",
+     "originals_kept",
+     "problems",
+     "originals_without_document",
+     "documents_without_original",
+     "versions_without_document",
+     "incomplete",
+     "stale",
+     "duplicate_groups",
+     "in_flight"
+    ],
+    "title": "ConsistencyResponse",
     "type": "object"
    },
    "DocumentChunkResponse": {
@@ -726,6 +1106,14 @@
        "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
       },
       "title": "Jobs",
+      "type": "array"
+     },
+     "no_original": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "No Original",
       "type": "array"
      }
     },
@@ -1480,6 +1868,17 @@
       "title": "Covered Now",
       "type": "boolean"
      },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
      "question": {
       "title": "Question",
       "type": "string"
@@ -1547,6 +1946,11 @@
       },
       "title": "Items",
       "type": "array"
+     },
+     "stopped_early": {
+      "default": false,
+      "title": "Stopped Early",
+      "type": "boolean"
      }
     },
     "required": [
@@ -2328,6 +2732,96 @@
     "title": "SearchTimingsResponse",
     "type": "object"
    },
+   "SitemapIngestRequest": {
+    "description": "Add a site's pages from its sitemap, sitemap index, RSS or Atom feed\n(POST /documents/from-sitemap).",
+    "properties": {
+     "max_pages": {
+      "anyOf": [
+       {
+        "maximum": 10000.0,
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Max Pages"
+     },
+     "refresh_minutes": {
+      "anyOf": [
+       {
+        "maximum": 525600.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Refresh Minutes"
+     },
+     "same_host": {
+      "default": true,
+      "title": "Same Host",
+      "type": "boolean"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 128,
+         "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tags"
+     },
+     "url": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Url",
+      "type": "string"
+     }
+    },
+    "required": [
+     "url"
+    ],
+    "title": "SitemapIngestRequest",
+    "type": "object"
+   },
+   "SitemapIngestResponse": {
+    "description": "The pages that are being fetched and queued, one after another, in the background\n(each a ``url`` job in GET /documents/jobs?state=active as it goes).",
+    "properties": {
+     "child_sitemaps": {
+      "title": "Child Sitemaps",
+      "type": "integer"
+     },
+     "left_out": {
+      "title": "Left Out",
+      "type": "integer"
+     },
+     "urls": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Urls",
+      "type": "array"
+     }
+    },
+    "required": [
+     "urls",
+     "left_out",
+     "child_sitemaps"
+    ],
+    "title": "SitemapIngestResponse",
+    "type": "object"
+   },
    "SummaryRequest": {
     "description": "Summarize one whole document, compare two, or write one brief across several\n(POST /questions/summary).",
     "properties": {
@@ -2392,6 +2886,43 @@
       "title": "Mode",
       "type": "string"
      },
+     "page_max": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Max"
+     },
+     "page_min": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Min"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Section"
+     },
      "use_cache": {
       "default": true,
       "title": "Use Cache",
@@ -2450,6 +2981,16 @@
       },
       "title": "Followups",
       "type": "array"
+     },
+     "notes_truncated": {
+      "default": 0,
+      "title": "Notes Truncated",
+      "type": "integer"
+     },
+     "parts_skipped": {
+      "default": 0,
+      "title": "Parts Skipped",
+      "type": "integer"
      },
      "passages_left_out": {
       "default": 0,
@@ -2671,6 +3212,11 @@
       ],
       "title": "Score B"
      },
+     "section": {
+      "default": "",
+      "title": "Section",
+      "type": "string"
+     },
      "selected_a": {
       "default": false,
       "title": "Selected A",
@@ -2697,6 +3243,22 @@
      "chunk_id": {
       "title": "Chunk Id",
       "type": "string"
+     },
+     "cited": {
+      "default": false,
+      "title": "Cited",
+      "type": "boolean"
+     },
+     "dense_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Dense Rank"
      },
      "drop_reason": {
       "anyOf": [
@@ -2760,6 +3322,28 @@
      "selected_for_context": {
       "title": "Selected For Context",
       "type": "boolean"
+     },
+     "source_number": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Source Number"
+     },
+     "sparse_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Sparse Rank"
      }
     },
     "required": [
@@ -2790,6 +3374,17 @@
       "default": "",
       "title": "Answer Language",
       "type": "string"
+     },
+     "context_neighbor_max_chars": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Context Neighbor Max Chars"
      },
      "context_neighbor_radius": {
       "anyOf": [
@@ -2855,6 +3450,39 @@
       ],
       "title": "Narrowing"
      },
+     "query_expansion_enabled": {
+      "anyOf": [
+       {
+        "type": "boolean"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Query Expansion Enabled"
+     },
+     "recency_boost_weight": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Recency Boost Weight"
+     },
+     "rerank_candidates": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Candidates"
+     },
      "rerank_fallback_count": {
       "anyOf": [
        {
@@ -2870,6 +3498,17 @@
       "title": "Rerank Min Score",
       "type": "number"
      },
+     "rerank_relative_floor": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Relative Floor"
+     },
      "rerank_top_k": {
       "title": "Rerank Top K",
       "type": "integer"
@@ -2884,6 +3523,17 @@
        }
       ],
       "title": "Reranker Model"
+     },
+     "reranker_onnx_file": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Reranker Onnx File"
      },
      "tags": {
       "anyOf": [
@@ -3017,6 +3667,11 @@
       "default": 0,
       "title": "History Message Count",
       "type": "integer"
+     },
+     "kind": {
+      "default": "question",
+      "title": "Kind",
+      "type": "string"
      },
      "mode": {
       "enum": [
@@ -3178,6 +3833,116 @@
      "traces"
     ],
     "title": "TraceListResponse",
+    "type": "object"
+   },
+   "TraceRerunRequest": {
+    "description": "POST /traces/{id}/rerun: ranking settings to try (each optional; unset ones are\nthe server's).",
+    "properties": {
+     "recency_boost_weight": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Recency Boost Weight"
+     },
+     "rerank_min_score": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Min Score"
+     },
+     "rerank_relative_floor": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Relative Floor"
+     },
+     "rerank_top_k": {
+      "anyOf": [
+       {
+        "maximum": 50.0,
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Top K"
+     }
+    },
+    "title": "TraceRerunRequest",
+    "type": "object"
+   },
+   "TraceRerunResponse": {
+    "description": "A traced question searched again under other ranking settings (no answer is\nwritten): whether passages would reach the prompt, and how the ranking moved.",
+    "properties": {
+     "candidates": {
+      "items": {
+       "$ref": "#/components/schemas/TraceCandidateResponse"
+      },
+      "title": "Candidates",
+      "type": "array"
+     },
+     "diff": {
+      "$ref": "#/components/schemas/TraceDiffResponse"
+     },
+     "query": {
+      "title": "Query",
+      "type": "string"
+     },
+     "settings": {
+      "additionalProperties": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Settings",
+      "type": "object"
+     },
+     "weak_matches": {
+      "title": "Weak Matches",
+      "type": "boolean"
+     },
+     "would_answer": {
+      "title": "Would Answer",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "query",
+     "settings",
+     "would_answer",
+     "weak_matches",
+     "diff",
+     "candidates"
+    ],
+    "title": "TraceRerunResponse",
     "type": "object"
    },
    "TraceSettingChangeResponse": {
@@ -3481,6 +4246,73 @@
     "title": "ValidationError",
     "type": "object"
    },
+   "WatchFolderStatusResponse": {
+    "description": "One watched folder as of its last pass.",
+    "properties": {
+     "deferred": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Deferred",
+      "type": "array"
+     },
+     "files": {
+      "default": 0,
+      "title": "Files",
+      "type": "integer"
+     },
+     "folder": {
+      "title": "Folder",
+      "type": "string"
+     },
+     "gave_up": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Gave Up",
+      "type": "array"
+     },
+     "last_scan_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Last Scan At"
+     },
+     "problems": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     },
+     "retrying": {
+      "default": [],
+      "items": {
+       "$ref": "#/components/schemas/WatchRetry"
+      },
+      "title": "Retrying",
+      "type": "array"
+     },
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "folder",
+     "workspace"
+    ],
+    "title": "WatchFolderStatusResponse",
+    "type": "object"
+   },
    "WatchRetry": {
     "description": "A watched file waiting to be tried again after a failure.",
     "properties": {
@@ -3529,6 +4361,14 @@
      "folder": {
       "title": "Folder",
       "type": "string"
+     },
+     "folders": {
+      "default": [],
+      "items": {
+       "$ref": "#/components/schemas/WatchFolderStatusResponse"
+      },
+      "title": "Folders",
+      "type": "array"
      },
      "gave_up": {
       "default": [],
@@ -3622,6 +4462,90 @@
     ],
     "title": "WorkspaceResponse",
     "type": "object"
+   },
+   "WorkspaceSettingsRequest": {
+    "description": "A workspace's own relevance and answer settings (PUT /workspaces/{name}/settings).\nEach one unset (null) is the server's; the PUT replaces them all.",
+    "properties": {
+     "answer_format": {
+      "anyOf": [
+       {
+        "enum": [
+         "default",
+         "bullets",
+         "table",
+         "brief"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Format"
+     },
+     "answer_language": {
+      "anyOf": [
+       {
+        "maxLength": 40,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Language"
+     },
+     "recency_boost_weight": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Recency Boost Weight"
+     },
+     "rerank_min_score": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Min Score"
+     }
+    },
+    "title": "WorkspaceSettingsRequest",
+    "type": "object"
+   },
+   "WorkspaceSettingsResponse": {
+    "description": "A workspace's own settings (``settings``; unset ones null), and what its requests\nrun with (``effective``: those, else the server's).",
+    "properties": {
+     "effective": {
+      "$ref": "#/components/schemas/WorkspaceSettingsRequest"
+     },
+     "settings": {
+      "$ref": "#/components/schemas/WorkspaceSettingsRequest"
+     },
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "workspace",
+     "settings",
+     "effective"
+    ],
+    "title": "WorkspaceSettingsResponse",
+    "type": "object"
    }
   }
  },
@@ -3691,6 +4615,524 @@
      }
     },
     "summary": "Access"
+   }
+  },
+  "/admin/consistency": {
+   "get": {
+    "operationId": "check_consistency_admin_consistency_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ConsistencyResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Check Consistency"
+   }
+  },
+  "/answer-cache": {
+   "delete": {
+    "operationId": "clear_answer_cache_answer_cache_delete",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AnswerCacheClearResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Clear Answer Cache"
+   },
+   "get": {
+    "operationId": "answer_cache_entries_answer_cache_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AnswerCacheResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Answer Cache Entries"
+   }
+  },
+  "/backups": {
+   "get": {
+    "operationId": "list_stored_backups_backups_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackupListResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "Scheduled backups are off (BACKUP_DIR)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Stored Backups"
+   }
+  },
+  "/backups/run": {
+   "post": {
+    "operationId": "run_backup_now_backups_run_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackupRunResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "Scheduled backups are off (BACKUP_DIR)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Run Backup Now"
+   }
+  },
+  "/backups/verify": {
+   "post": {
+    "operationId": "verify_uploaded_backup_backups_verify_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_verify_uploaded_backup_backups_verify_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackupCheckResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Verify Uploaded Backup"
+   }
+  },
+  "/backups/{name}/restore": {
+   "post": {
+    "operationId": "restore_stored_backup_backups__name__restore_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ImportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such backup, or BACKUP_DIR is unset."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Restore Stored Backup"
+   }
+  },
+  "/backups/{name}/verify": {
+   "post": {
+    "operationId": "verify_stored_backup_backups__name__verify_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackupCheckResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such backup, or BACKUP_DIR is unset."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Verify Stored Backup"
    }
   },
   "/config": {
@@ -3844,6 +5286,162 @@
      }
     },
     "summary": "Upload Document"
+   }
+  },
+  "/documents/archive": {
+   "post": {
+    "operationId": "upload_archive_documents_archive_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_upload_archive_documents_archive_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ArchiveUploadResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Not a zip, or one past MAX_ARCHIVE_MEMBERS."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Upload Archive"
+   }
+  },
+  "/documents/from-sitemap": {
+   "post": {
+    "operationId": "add_from_sitemap_documents_from_sitemap_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SitemapIngestRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SitemapIngestResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Not a sitemap or feed, or it could not be fetched."
+     },
+     "404": {
+      "description": "URL ingest is not enabled (URL_INGEST_ENABLED)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     },
+     "429": {
+      "description": "Too many URL fetches are running."
+     }
+    },
+    "summary": "Add From Sitemap"
    }
   },
   "/documents/from-url": {
@@ -6406,6 +8004,90 @@
     "summary": "Diff Traces"
    }
   },
+  "/traces/{trace_id}/rerun": {
+   "post": {
+    "operationId": "rerun_trace_traces__trace_id__rerun_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "trace_id",
+      "required": true,
+      "schema": {
+       "title": "Trace Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/TraceRerunRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TraceRerunResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     },
+     "429": {
+      "description": "Every question slot is busy."
+     }
+    },
+    "summary": "Rerun Trace"
+   }
+  },
   "/watch": {
    "get": {
     "operationId": "watch_status_watch_get",
@@ -6654,6 +8336,124 @@
      }
     },
     "summary": "Delete Workspace"
+   }
+  },
+  "/workspaces/{name}/settings": {
+   "get": {
+    "operationId": "workspace_settings_workspaces__name__settings_get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WorkspaceSettingsResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Workspace Settings"
+   },
+   "put": {
+    "operationId": "put_workspace_settings_workspaces__name__settings_put",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/WorkspaceSettingsRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WorkspaceSettingsResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Put Workspace Settings"
    }
   }
  }

@@ -32,6 +32,19 @@ function ToastRow({ toasts, onDismiss, onHold, onRelease }: ToastRowProps) {
         <span className="toast__title">{toast.title}</span>
         {toast.body && <span className="toast__body">{toast.body}</span>}
       </span>
+      {toast.action && (
+        <button
+          type="button"
+          className="toast__action"
+          onClick={() => {
+            toast.action?.run();
+            onDismiss(toast.id);
+          }}
+          data-testid="toast-action"
+        >
+          {toast.action.label}
+        </button>
+      )}
       <button
         type="button"
         className="toast__dismiss"

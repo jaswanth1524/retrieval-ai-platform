@@ -11,6 +11,7 @@ import {
   TITLE_MAX_CHARS,
   byRecentUse,
   capConversations,
+  cleanLabels,
   deriveTitle,
   emptyConversation,
   sanitizeTurn,
@@ -57,6 +58,8 @@ function importedConversation(
   // Kept in its place by its own date, but changed here now: that puts it in the copy
   // other tabs read (conversationsForLocalStorage), so their next save keeps it.
   if (keepDates) conversation.editedAt = now;
+  const labels = cleanLabels(record.labels);
+  if (labels.length > 0) conversation.labels = labels;
   const workspace = getWorkspace();
   if (workspace) conversation.workspace = workspace;
   return conversation;
@@ -200,7 +203,24 @@ export function useConversationActions(
     return true;
   }, [setStorage, storageRef]);
 
+  const setLabels = useCallback((id: string, labels: string[]) => {
+    const cleaned = cleanLabels(labels);
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) => {
+        if (conversation.id !== id) return conversation;
+        const { labels: _previous, ...rest } = conversation;
+        return {
+          ...rest,
+          ...(cleaned.length > 0 ? { labels: cleaned } : {}),
+          editedAt: Date.now(),
+        };
+      }),
+    }));
+  }, [setStorage]);
+
   return {
+    setLabels,
     importConversation,
     importPreview,
     importConversations,

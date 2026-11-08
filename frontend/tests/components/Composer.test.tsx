@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import Composer from '../../src/components/Composer';
+import { writeDraft } from '../../src/utils/drafts';
 import type { PublicConfigResponse } from '../../src/api/types';
 
 function makeConfig(overrides: Partial<PublicConfigResponse> = {}): PublicConfigResponse {
@@ -77,6 +78,23 @@ describe('Composer', () => {
     expect(props.onSubmit).toHaveBeenCalledWith('What is the refund window?');
     expect(screen.getByTestId('question-textarea')).toHaveValue('');
     expect(screen.queryByTestId('question-queued')).not.toBeInTheDocument();
+  });
+
+  it('drops a send queued in one conversation when another is opened before startup ends', async () => {
+    writeDraft('conv-b', 'B was drafting this');
+    const props = baseProps({ sendHeld: true, sendQueueable: true, draftKey: 'conv-a' });
+    const { rerender } = render(<Composer {...props} />);
+    await userEvent.type(screen.getByTestId('question-textarea'), 'Asked in A?');
+    await userEvent.keyboard('{Enter}');
+
+    rerender(<Composer {...props} draftKey="conv-b" />);
+    rerender(<Composer {...props} draftKey="conv-b" sendHeld={false} sendQueueable={false} />);
+
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByTestId('question-textarea')).toHaveValue('B was drafting this');
+    rerender(<Composer {...props} draftKey="conv-a" sendHeld={false} sendQueueable={false} />);
+    expect(screen.getByTestId('question-textarea')).toHaveValue('Asked in A?');
+    expect(props.onSubmit).not.toHaveBeenCalled();
   });
 
   it('keeps the question when startup ends unable to send, and never queues other holds', async () => {

@@ -181,6 +181,19 @@ export class MockApi {
   /** POST /query-log/recheck's answer; how many times it was asked. */
   recheck: object = { checked: 0, covered_now: 0, items: [] };
   rechecks = 0;
+  /** GET /backups (null answers 404: BACKUP_DIR unset); POST /backups/run count. */
+  backups: object | null = null;
+  backupRuns = 0;
+  /** GET /admin/consistency, GET /answer-cache, and DELETE /answer-cache count. */
+  consistency: object | null = null;
+  answerCache: object = { enabled: true, entries: [], total_entries: 0, max_entries: 256, ttl_seconds: 3600, in_flight: 0 };
+  cacheClears = 0;
+  /** POST /traces/{id}/rerun's answer, and the settings each was asked with. */
+  rerun: object | null = null;
+  readonly reruns: object[] = [];
+  /** GET/PUT /workspaces/{name}/settings: the stored settings, and every PUT body. */
+  workspaceSettings: Record<string, unknown> = {};
+  readonly settingsPuts: object[] = [];
   /** In-flight ingest jobs by id: the file each one indexes, how often it was polled and
    *  whether it was cancelled. Every job walks `jobSteps` on its own, so a bulk re-index
    *  runs several at once. */
@@ -193,9 +206,9 @@ export class MockApi {
   async install(page: Page): Promise<void> {
     await page.route(
       (url) =>
-        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch|query-log)(\/|$)/.test(
+        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch|query-log|backups|admin|answer-cache)(\/|$)/.test(
           url.pathname,
-        ),
+        ) || /^\/workspaces\/[^/]+\/settings$/.test(url.pathname),
       (route) => this.handle(route),
     );
   }
@@ -262,6 +275,62 @@ export class MockApi {
     if (path === '/query-log/recheck' && method === 'POST') {
       this.rechecks += 1;
       return this.json(route, 200, this.recheck);
+    }
+    if (path === '/backups') {
+      if (this.backups === null) return this.configured(route, 404, { detail: 'Scheduled backups are off (BACKUP_DIR).' });
+      return this.json(route, 200, this.backups);
+    }
+    if (path === '/backups/run' && method === 'POST') {
+      this.backupRuns += 1;
+      return this.json(route, 202, { workspace: 'default' });
+    }
+    if (path === '/admin/consistency') {
+      return this.json(route, 200, this.consistency ?? {
+        documents: this.documents.length,
+        originals_kept: true,
+        problems: 0,
+        originals_without_document: [],
+        documents_without_original: [],
+        versions_without_document: [],
+        incomplete: [],
+        stale: [],
+        duplicate_groups: [],
+        in_flight: [],
+      });
+    }
+    if (path === '/answer-cache') {
+      if (method === 'DELETE') {
+        this.cacheClears += 1;
+        const removed = (this.answerCache as { entries: unknown[] }).entries.length;
+        this.answerCache = { ...this.answerCache, entries: [] };
+        return this.json(route, 200, { removed });
+      }
+      return this.json(route, 200, this.answerCache);
+    }
+    if (/^\/workspaces\/[^/]+\/settings$/.test(path)) {
+      const empty = { rerank_min_score: null, recency_boost_weight: null, answer_language: null, answer_format: null };
+      if (method === 'PUT') {
+        const body = JSON.parse(request.postData() ?? '{}');
+        this.settingsPuts.push(body);
+        this.workspaceSettings = body;
+      }
+      const own = { ...empty, ...this.workspaceSettings };
+      return this.json(route, 200, {
+        workspace: 'default',
+        settings: own,
+        effective: { ...own, rerank_min_score: own.rerank_min_score ?? 0.15 },
+      });
+    }
+    if (/^\/traces\/[^/]+\/rerun$/.test(path) && method === 'POST') {
+      this.reruns.push(JSON.parse(request.postData() ?? '{}'));
+      return this.json(route, 200, this.rerun ?? {
+        query: 'q',
+        settings: {},
+        would_answer: true,
+        weak_matches: false,
+        diff: { question_a: 'q', question_b: 'q', same_answer: false, settings: [], candidates: [] },
+        candidates: [],
+      });
     }
     if (path === '/traces/score-report') {
       return this.json(route, 200, this.scoreReport ?? {

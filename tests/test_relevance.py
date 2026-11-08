@@ -90,6 +90,8 @@ def test_two_traces_are_compared_by_settings_and_moved_candidates() -> None:
     # p1 kept its place: only p2 is listed.
     assert [c.point_id for c in diff.candidates] == ["p2"]
     (moved,) = diff.candidates
+    # Its section too: two passages on one page read apart.
+    assert moved.section == "S"
     assert (moved.selected_a, moved.selected_b, moved.drop_reason_b) == (
         True,
         False,
