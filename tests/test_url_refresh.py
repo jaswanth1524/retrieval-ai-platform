@@ -20,7 +20,8 @@ from api.jobs import IngestBacklog, IngestJobStore
 from api.repository import VectorRepository
 from api.settings import AppSettings
 from api.url_fetch import FetchedDocument, UrlFetchError, fetch_slots
-from api.url_refresh import RefreshTarget, UrlRefresher
+from api.url_refresh import UrlRefresher
+from api.workspace_target import WorkspaceTarget
 from tests.factories import wait_until
 from tests.routes_http.support import FakeEmbeddingProvider, make_settings
 
@@ -81,7 +82,7 @@ def _setup(
     refresher = UrlRefresher(
         settings,
         repository,
-        lambda: [RefreshTarget(settings, None, queue)],
+        lambda: [WorkspaceTarget(settings, None, queue)],
         fetch=remote,
         clock=clock,
     )
@@ -316,7 +317,7 @@ def test_a_failing_document_waits_twice_as_long_after_each_failure(
     refresher = UrlRefresher(
         settings,
         repository,
-        lambda: [RefreshTarget(settings, None, queue)],
+        lambda: [WorkspaceTarget(settings, None, queue)],
         fetch=remote,
         clock=clock,
         state=state,
@@ -372,7 +373,7 @@ def test_the_check_times_survive_a_restart_in_the_state_file(
         return UrlRefresher(
             settings,
             repository,
-            lambda: [RefreshTarget(settings, None, queue)],
+            lambda: [WorkspaceTarget(settings, None, queue)],
             fetch=remote,
             clock=clock,
             state=SqliteRefreshStateStore(path),
@@ -407,7 +408,7 @@ def test_a_page_that_changes_into_something_unreadable_backs_off(
     refresher = UrlRefresher(
         settings,
         repository,
-        lambda: [RefreshTarget(settings, None, queue)],
+        lambda: [WorkspaceTarget(settings, None, queue)],
         fetch=remote,
         clock=clock,
         state=state,

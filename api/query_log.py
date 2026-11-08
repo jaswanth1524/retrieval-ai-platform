@@ -17,12 +17,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from pathlib import Path
-from threading import Lock
 
-from api.sqlite_store import enable_wal, sqlite_transaction
+from api.sqlite_store import CappedRowLog
 from api.tracing import QueryTrace, TraceSink
 
 _CREATE_TABLE = """
@@ -34,9 +31,20 @@ _CREATE_TABLE = """
         top_score REAL,
         mode TEXT NOT NULL,
         trace_id TEXT,
-        filenames_json TEXT
+        filenames_json TEXT,
+        kind TEXT NOT NULL DEFAULT 'question',
+        retrieval_query TEXT,
+        top_filename TEXT
     )
 """
+# Columns added after the first release, with their declarations: an older log gains
+# them on open (its rows: questions, no rewrite, no top document recorded).
+_ADDED_COLUMNS = (
+    ("filenames_json", "TEXT"),
+    ("kind", "TEXT NOT NULL DEFAULT 'question'"),
+    ("retrieval_query", "TEXT"),
+    ("top_filename", "TEXT"),
+)
 # A status that means the documents didn't answer it.
 UNCOVERED_STATUSES = ("insufficient_context",)
 
@@ -53,42 +61,42 @@ class LoggedQuery:
     top_score: float | None
     mode: str
     trace_id: str | None
-    # The documents its answer was drawn from (the passages put in its prompt; a
-    # summary's documents), for answered questions only: what "questions that cited
-    # this document" counts.
+    # The documents its answer cited (the prompt's documents for an answer citing
+    # none, and a summary's documents), for answered questions only: what "questions
+    # that cited this document" counts.
     filenames: tuple[str, ...] = ()
+    # "question" or "summary" (its question is the task line).
+    kind: str = "question"
+    # What was searched, when it differs from the question: a follow-up's rewrite.
+    retrieval_query: str | None = None
+    # The document of the best-scoring passage.
+    top_filename: str | None = None
 
 
-class QueryLogStore:
-    """Sqlite-backed query log; a connection per call under one lock, as the feedback
-    store does (sqlite3 connections aren't shared across threads)."""
+class QueryLogStore(CappedRowLog):
+    """Sqlite-backed query log (``CappedRowLog``: newest QUERY_LOG_MAX_ROWS kept)."""
+
+    _table = "queries"
 
     def __init__(self, path: str, max_rows: int) -> None:
-        self._path = path
-        self._max_rows = max_rows
-        self._lock = Lock()
-        self._added = 0
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        enable_wal(path)
+        super().__init__(path, max_rows)
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE)
-            # A log from before documents were recorded: its rows name none.
             columns = {row[1] for row in conn.execute("PRAGMA table_info(queries)")}
-            if "filenames_json" not in columns:
-                conn.execute("ALTER TABLE queries ADD COLUMN filenames_json TEXT")
+            for name, declaration in _ADDED_COLUMNS:
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE queries ADD COLUMN {name} {declaration}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS queries_workspace_created_at "
                 "ON queries (workspace, created_at)"
             )
 
-    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
-        return sqlite_transaction(self._path)
-
     def add(self, query: LoggedQuery) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO queries (created_at, workspace, question, status, top_score, "
-                "mode, trace_id, filenames_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "mode, trace_id, filenames_json, kind, retrieval_query, top_filename) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     query.created_at,
                     query.workspace,
@@ -98,23 +106,12 @@ class QueryLogStore:
                     query.mode,
                     query.trace_id,
                     json.dumps(list(query.filenames)),
+                    query.kind,
+                    query.retrieval_query,
+                    query.top_filename,
                 ),
             )
-            self._added += 1
-            # Trimmed every so often, not on each insert: a count over the table per
-            # question would be the costliest part of logging it.
-            if self._added % 100 == 1:
-                conn.execute(
-                    "DELETE FROM queries WHERE rowid <= (SELECT MAX(rowid) FROM queries) - ?",
-                    (self._max_rows,),
-                )
-
-    def delete_workspace(self, workspace: str) -> int:
-        """Remove every row of ``workspace`` (deleted), so one created again under its
-        name starts with an empty log."""
-
-        with self._lock, self._connect() as conn:
-            return conn.execute("DELETE FROM queries WHERE workspace = ?", (workspace,)).rowcount
+            self._added_one(conn)
 
     def recent(
         self,
@@ -140,7 +137,7 @@ class QueryLogStore:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT created_at, workspace, question, status, top_score, mode, trace_id, "
-                "filenames_json "
+                "filenames_json, kind, retrieval_query, top_filename "
                 f"FROM queries WHERE {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
@@ -154,6 +151,9 @@ class QueryLogStore:
                 mode=str(row[5]),
                 trace_id=None if row[6] is None else str(row[6]),
                 filenames=_filenames(row[7]),
+                kind=str(row[8] or "question"),
+                retrieval_query=None if row[9] is None else str(row[9]),
+                top_filename=None if row[10] is None else str(row[10]),
             )
             for row in rows
         ]
@@ -162,14 +162,25 @@ class QueryLogStore:
 def logged_query(trace: QueryTrace) -> LoggedQuery:
     """What the log keeps of a trace: no prompt, answer or candidates."""
 
-    scores = [c.rerank_score for c in trace.candidates if c.rerank_score is not None]
+    scored = [c for c in trace.candidates if c.rerank_score is not None]
+    scores = [c.rerank_score for c in scored if c.rerank_score is not None]
+    top = max(scored, key=lambda c: c.rerank_score or 0.0) if scored else None
     # Only an answer counts as drawn from its documents: one that declined ("not in the
-    # documents") read the closest passages and used none of them.
+    # documents") read the closest passages and used none of them. Of an answer, the
+    # documents it cited; one citing none (or traced before citations were recorded per
+    # candidate) counts the prompt's.
     drawn_from: dict[str, None] = {}
+    summary = trace.kind == "summary" or (
+        trace.config is not None and bool(trace.config.filenames) and not trace.candidates
+    )
     if trace.status == "ok":
-        drawn_from = dict.fromkeys(c.filename for c in trace.candidates if c.selected_for_context)
-        if not drawn_from and trace.config is not None and trace.config.filenames and not scores:
-            drawn_from = dict.fromkeys(trace.config.filenames)  # a summary: its documents
+        if summary and trace.config is not None and trace.config.filenames:
+            drawn_from = dict.fromkeys(trace.config.filenames)
+        else:
+            drawn_from = dict.fromkeys(c.filename for c in trace.candidates if c.cited) or (
+                dict.fromkeys(c.filename for c in trace.candidates if c.selected_for_context)
+            )
+    rewrite = trace.condensed_question
     return LoggedQuery(
         created_at=trace.created_at,
         workspace=trace.workspace,
@@ -179,6 +190,9 @@ def logged_query(trace: QueryTrace) -> LoggedQuery:
         mode=trace.mode,
         trace_id=trace.trace_id,
         filenames=tuple(drawn_from),
+        kind="summary" if summary else "question",
+        retrieval_query=rewrite if rewrite and rewrite != trace.question else None,
+        top_filename=top.filename if top is not None else None,
     )
 
 

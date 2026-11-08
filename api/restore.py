@@ -78,8 +78,9 @@ class ImportOutcome:
     versions_restored: int = 0
 
 
+# (filename, bytes, uploaded_at, tags, source, watched_from) -> the queued job.
 Enqueue = Callable[
-    [str, bytes, float | None, tuple[str, ...], DocumentSource | None],
+    [str, bytes, float | None, tuple[str, ...], DocumentSource | None, str | None],
     DocumentJobAcceptedResponse,
 ]
 
@@ -254,6 +255,7 @@ def _restore_document(
                 _uploaded_at(document.get("uploaded_at")),
                 tags,
                 _source(document),
+                _watched_from(document),
             )
         )
         # A manifest that lists the name twice queues it once.
@@ -336,6 +338,16 @@ def _source(document: dict[str, Any]) -> DocumentSource | None:
         and 0 <= minutes <= MAX_REFRESH_MINUTES
         else None,
     )
+
+
+def _watched_from(document: dict[str, object]) -> str | None:
+    """The watched folder a document came from (the folder watcher may delete it when
+    its file goes), when the manifest says so plausibly: an absolute path."""
+
+    value = document.get("watched_from")
+    if isinstance(value, str) and 0 < len(value) <= 4096 and value.startswith("/"):
+        return value
+    return None
 
 
 def _uploaded_at(value: object) -> float | None:
@@ -473,3 +485,74 @@ def _feedback_row(line: str) -> Feedback | None:
         # RecursionError: a line nested past the parser's depth is one bad row; as a
         # RuntimeError it read as a damaged member, dropping every row after it.
         return None
+
+
+@dataclass
+class BackupCheck:
+    """What ``verify_backup`` found: what the backup holds, and what is wrong with it."""
+
+    documents: int = 0
+    originals: int = 0
+    # Listed with no original (the export had none): restorable only as names.
+    originals_missing: int = 0
+    versions: int = 0
+    feedback: bool = False
+    # Damage: a member that fails its checksum, one the manifest names that isn't
+    # there, a manifest that isn't a DocRAG one. Empty: the backup restores as written.
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+
+def verify_backup(upload: IO[bytes]) -> BackupCheck:
+    """Check a backup without restoring anything: the manifest, every member's checksum
+    (each one read once, nothing kept), and that every original and version the
+    manifest lists is in the archive."""
+
+    check = BackupCheck()
+    try:
+        archive = zipfile.ZipFile(upload)
+    except (zipfile.BadZipFile, OSError):
+        check.problems.append("It isn't a zip archive.")
+        return check
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > MAX_MEMBERS:
+            check.problems.append(f"The archive has more than {MAX_MEMBERS} entries.")
+            return check
+        members = {info.filename: info for info in infos}
+        try:
+            manifest = _manifest(archive, members)
+        except BackupImportError as exc:
+            check.problems.append(str(exc))
+            return check
+        for info in infos:
+            try:
+                with archive.open(info) as handle:
+                    while handle.read(1 << 20):
+                        pass
+            except _UNREADABLE_MEMBER:
+                check.problems.append(f"{info.filename} is damaged (it fails its checksum).")
+        check.feedback = "feedback.jsonl" in members
+        for document in manifest["documents"]:
+            if not isinstance(document, dict) or not isinstance(document.get("filename"), str):
+                check.problems.append("The manifest lists an entry with no file name.")
+                continue
+            check.documents += 1
+            original = document.get("original")
+            if not original:
+                check.originals_missing += 1
+            elif original not in members:
+                check.problems.append(f"{original} is listed but not in the archive.")
+            else:
+                check.originals += 1
+            listed = document.get("versions")
+            for version in listed if isinstance(listed, list) else []:
+                name = f"versions/{document['filename']}/{version}"
+                if name in members:
+                    check.versions += 1
+                else:
+                    check.problems.append(f"{name} is listed but not in the archive.")
+    return check

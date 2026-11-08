@@ -21,6 +21,7 @@ from api.summarize import (
     SummaryRequest,
     SummaryTooLargeError,
     batch_char_budget,
+    is_nothing_relevant,
     payload_chunk,
     select_parts,
     task_description,
@@ -406,6 +407,24 @@ def test_a_repeat_summary_is_served_from_the_cache_with_its_coverage() -> None:
     assert traces.traces[0].config.filenames == ["a.txt"]
 
 
+def test_a_streamed_repeat_says_nothing_was_skipped_as_the_first_did() -> None:
+    summarizer = _summarizer(
+        FakeRepository({"a.txt": [_payload("a.txt", 1, "Alpha.")]}),
+        ScriptedGenerator(answer="Alpha [1]."),
+        answer_cache=AnswerCache(max_entries=8, ttl_seconds=60),
+    )
+    request = SummaryRequest(mode="summarize", filenames=("a.txt",))
+
+    first, second = (
+        next(e for e in summarizer.summarize_stream(request) if e["type"] == "done")
+        for _ in range(2)
+    )
+
+    assert not first.get("cached") and second.get("cached")
+    for done in (first, second):
+        assert (done.get("parts_skipped"), done.get("notes_truncated")) == (0, 0)
+
+
 def test_a_document_with_no_readable_passages_reports_no_context() -> None:
     repository = FakeRepository({"a.txt": [{"filename": "a.txt", "chunk_id": "c", "text": ""}]})
     generator = ScriptedGenerator()
@@ -596,6 +615,42 @@ def test_notes_for_several_documents_say_the_others_are_read_separately() -> Non
     assert not any(marker in prompt for prompt in generator.notes_prompts)
 
 
+def test_an_unfocused_compare_or_brief_offers_no_nothing_relevant_reply() -> None:
+    # Every part of a compare/brief with no focus is about its own document, which the
+    # task covers whole: qwen2.5 answered NOTHING RELEVANT for whole documents.
+    settings = _settings(llm_provider="ollama", summary_batch_chars=3000)
+    repository = FakeRepository(
+        {name: [_payload(name, n, "w" * 1200) for n in range(1, 7)] for name in ("a.txt", "b.txt")}
+    )
+    for instruction, offered in ((None, False), ("costs only", True)):
+        generator = NotesRecorder()
+        request = SummaryRequest(
+            mode="compare", filenames=("a.txt", "b.txt"), instruction=instruction
+        )
+        list(_summarizer(repository, generator, settings).summarize_stream(request))
+        assert generator.notes_prompts
+        assert all((NOTHING_RELEVANT in p) is offered for p in generator.notes_prompts)
+
+    # One document: unchanged, a part may still have nothing on the task.
+    generator = NotesRecorder()
+    request = SummaryRequest(mode="summarize", filenames=("long.txt",))
+    list(_summarizer(_long_document(3), generator, settings).summarize_stream(request))
+    assert all(NOTHING_RELEVANT in p for p in generator.notes_prompts)
+
+
+def test_the_marker_with_citations_is_still_the_marker() -> None:
+    for note in (
+        "NOTHING RELEVANT",
+        "NOTHING RELEVANT.",
+        "NOTHING RELEVANT [5-8]",
+        "nothing relevant [5, 6]",
+        "[3] NOTHING RELEVANT",
+    ):
+        assert is_nothing_relevant(note), note
+    for note in ("The fee is 10 euros [2]. NOTHING RELEVANT otherwise.", "Alpha [1].", ""):
+        assert not is_nothing_relevant(note), note
+
+
 @pytest.mark.parametrize("mode", ["backfill", "auto"])
 def test_an_uncited_local_summary_is_backfilled_without_a_retry_or_its_stage(mode: str) -> None:
     repository = FakeRepository(
@@ -695,6 +750,19 @@ def test_combined_notes_are_cut_to_their_weighted_share_of_the_budget() -> None:
     assert len(bodies) == 20
     # 100 weighted characters each (plus the " …" marking the cut), never 400 raw ones.
     assert all(weighted_length(body.removesuffix(" …")) <= 100 for body in bodies)
+
+
+def test_combined_notes_of_several_documents_name_their_source_numbers() -> None:
+    # Told nothing, qwen2.5 put one document's points under another's numbers in a brief.
+    from api.summarize import build_combine_messages
+
+    notes = [("a.txt", 1, 1, "Alpha [1]."), ("b.txt", 1, 1, "Beta [4].")]
+    labelled = build_combine_messages("Brief", "brief", notes, 2000, [(1, 3), (4, 4)])
+    content = labelled[-1]["content"]
+    assert "Notes on a.txt, part 1 of 1 (sources [1]-[3]):" in content
+    assert "Notes on b.txt, part 1 of 1 (source [4]):" in content
+    plain = build_combine_messages("Brief", "brief", notes, 2000)[-1]["content"]
+    assert "Notes on a.txt, part 1 of 1:" in plain and "(source" not in plain
 
 
 def test_a_backfilled_summary_says_so_in_its_answer_trace_and_cache() -> None:

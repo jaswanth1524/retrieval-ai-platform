@@ -14,7 +14,8 @@ from qdrant_client import QdrantClient
 from api.ingest_service import IngestService
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
-from api.scheduled_backup import BackupTarget, ScheduledBackup, backups_in
+from api.scheduled_backup import ScheduledBackup, backups_in
+from api.workspace_target import WorkspaceTarget
 from tests.routes_http.support import FakeEmbeddingProvider, make_settings
 
 
@@ -45,7 +46,7 @@ def _setup(tmp_path: Path) -> tuple[ScheduledBackup, Clock, threading.Lock]:
     backup = ScheduledBackup(
         settings,
         repository,
-        lambda: [BackupTarget(settings, store)],
+        lambda: [WorkspaceTarget(settings, store)],
         None,
         lock,
         clock=clock,

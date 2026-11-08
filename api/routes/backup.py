@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
-from typing import Annotated
+from pathlib import Path
+from typing import IO, Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 
 from api.audit import audit
+from api.consistency import consistency_report
 from api.dependencies import (
     require_full_key,
 )
@@ -21,18 +24,36 @@ from api.documents import (
     DocumentSource,
 )
 from api.export import build_export
-from api.restore import BackupImportError, restore_backup
+from api.feedback import FeedbackStore
+from api.ingest_jobs import IngestQueue
+from api.raw_documents import RawDocumentStore
+from api.repository import VectorRepository
+from api.restore import BackupCheck, BackupImportError, restore_backup, verify_backup
 from api.routes.deps import (
     FeedbackStoreDep,
     IngestQueueDep,
     RawDocumentStoreDep,
     SettingsDep,
+    TokenCounterDep,
     VectorRepositoryDep,
 )
+from api.scheduled_backup import (
+    BACKUP_NAME_RE,
+    ScheduledBackup,
+    backups_in,
+    load_check,
+    save_check,
+)
 from api.schemas import (
+    BackupCheckResponse,
+    BackupFileResponse,
+    BackupListResponse,
+    BackupRunResponse,
+    ConsistencyResponse,
     DocumentJobAcceptedResponse,
     ImportResponse,
 )
+from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
 from api.workspaces import workspace_of
 
@@ -123,6 +144,22 @@ def import_backup(
     raw_store: RawDocumentStoreDep,
     feedback_store: FeedbackStoreDep,
 ) -> ImportResponse:
+    return _restore(file.file, repository, settings, queue, raw_store, feedback_store)
+
+
+def _restore(
+    upload: IO[bytes],
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+    feedback_store: FeedbackStore | None,
+    *,
+    source: str | None = None,
+) -> ImportResponse:
+    """Restore one backup into ``settings``' workspace: an upload (``/import``) or one
+    of BACKUP_DIR's (``source`` names it, for the audit)."""
+
     # Read once for the whole backup, then kept up to date with what it queues:
     # read per document, each job finishing mid-import moved the corpus generation
     # and the next document paid for a fresh listing.
@@ -134,6 +171,7 @@ def import_backup(
         uploaded_at: float | None,
         tags: tuple[str, ...],
         source: DocumentSource | None,
+        watched_from: str | None,
     ) -> DocumentJobAcceptedResponse:
         nonlocal known
         if raw_store is not None:
@@ -149,6 +187,7 @@ def import_backup(
             uploaded_at=uploaded_at,
             tags=tags,
             source=source,
+            watched_from=watched_from,
             kind="import",
         )
 
@@ -157,8 +196,10 @@ def import_backup(
     repository.ensure_writable(settings)
     try:
         outcome = restore_backup(
-            file.file,
-            existing_filenames=set(repository.filename_metadata(settings)),
+            upload,
+            # Indexed, or being indexed: importing the same backup again while the
+            # first import's jobs run must not queue each document a second time.
+            existing_filenames=set(known_filenames(repository, settings)),
             max_original_bytes=int(settings.max_upload_bytes),
             has_room=queue.backlog.has_room,
             enqueue=enqueue,
@@ -187,3 +228,144 @@ def import_backup(
         feedback_skipped=outcome.feedback_skipped,
         versions_restored=outcome.versions_restored,
     )
+
+
+def _backup_dir(settings: AppSettings) -> Path:
+    if not settings.backup_dir:
+        raise HTTPException(status_code=404, detail="Scheduled backups are off (BACKUP_DIR).")
+    return Path(settings.backup_dir) / (workspace_of(settings) or "default")
+
+
+def _stored_backup(settings: AppSettings, name: str) -> Path:
+    """One of this workspace's backups by its file name; 404 for anything else (no
+    path in the name, only names the loop writes)."""
+
+    directory = _backup_dir(settings)
+    if not BACKUP_NAME_RE.fullmatch(name) or not (directory / name).is_file():
+        raise HTTPException(status_code=404, detail=f"No backup named '{name}'.")
+    return directory / name
+
+
+def _check_response(check: BackupCheck) -> BackupCheckResponse:
+    return BackupCheckResponse(ok=check.ok, **dataclasses.asdict(check))
+
+
+# BACKUP_DIR's backups of this workspace (api/scheduled_backup.py), newest first, with
+# whether each was read back cleanly when written. Operator data: the full key.
+@router.get(
+    "/backups",
+    response_model=BackupListResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "Scheduled backups are off (BACKUP_DIR)."}},
+)
+def list_stored_backups(request: Request, settings: SettingsDep) -> BackupListResponse:
+    directory = _backup_dir(settings)
+    loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
+    files: list[BackupFileResponse] = []
+    for path in reversed(backups_in(directory)):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        check = loop.check_for(path) if loop is not None else load_check(path)
+        files.append(
+            BackupFileResponse(
+                name=path.name,
+                size=stat.st_size,
+                created_at=stat.st_mtime,
+                verified=check.ok if check is not None else None,
+                problems=list(check.problems) if check is not None else [],
+            )
+        )
+    return BackupListResponse(
+        backups=files,
+        interval_hours=float(settings.backup_interval_hours),
+        keep=int(settings.backup_keep),
+    )
+
+
+# A backup of this workspace now, whatever the newest one's age: written on a pass the
+# background loop starts at once (202; GET /backups lists it once written).
+@router.post(
+    "/backups/run",
+    response_model=BackupRunResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "Scheduled backups are off (BACKUP_DIR)."}},
+)
+def run_backup_now(request: Request, settings: SettingsDep) -> BackupRunResponse:
+    _backup_dir(settings)
+    loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
+    if loop is None:
+        raise HTTPException(status_code=404, detail="Scheduled backups are not running.")
+    loop.request_now(settings)
+    audit("corpus.export", workspace=workspace_of(settings), scheduled=True, requested=True)
+    return BackupRunResponse(workspace=workspace_of(settings) or "default")
+
+
+# A backup read through without restoring anything: the manifest, every member's
+# checksum, every listed original and version present. An upload (any backup, from
+# anywhere), or one of BACKUP_DIR's below.
+@router.post(
+    "/backups/verify",
+    response_model=BackupCheckResponse,
+    dependencies=[Depends(require_full_key)],
+)
+def verify_uploaded_backup(file: Annotated[UploadFile, File()]) -> BackupCheckResponse:
+    return _check_response(verify_backup(file.file))
+
+
+@router.post(
+    "/backups/{name}/verify",
+    response_model=BackupCheckResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No such backup, or BACKUP_DIR is unset."}},
+)
+def verify_stored_backup(name: str, request: Request, settings: SettingsDep) -> BackupCheckResponse:
+    path = _stored_backup(settings, name)
+    with path.open("rb") as handle:
+        check = verify_backup(handle)
+    # Listed with this result from now on, after a restart too.
+    loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
+    if loop is not None:
+        loop.record_check(path, check)
+    else:
+        save_check(path, check)
+    return _check_response(check)
+
+
+# Restore one of this workspace's backups from BACKUP_DIR, as /import would the same
+# file uploaded — without sending it over the network first.
+@router.post(
+    "/backups/{name}/restore",
+    response_model=ImportResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No such backup, or BACKUP_DIR is unset."}},
+)
+def restore_stored_backup(
+    name: str,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    queue: IngestQueueDep,
+    raw_store: RawDocumentStoreDep,
+    feedback_store: FeedbackStoreDep,
+) -> ImportResponse:
+    with _stored_backup(settings, name).open("rb") as handle:
+        return _restore(handle, repository, settings, queue, raw_store, feedback_store, source=name)
+
+
+# How the index and the stored originals agree (api/consistency.py). A report only.
+@router.get(
+    "/admin/consistency",
+    response_model=ConsistencyResponse,
+    dependencies=[Depends(require_full_key)],
+)
+def check_consistency(
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    raw_store: RawDocumentStoreDep,
+    token_counter: TokenCounterDep,
+) -> ConsistencyResponse:
+    report = consistency_report(repository, settings, raw_store, token_counter)
+    return ConsistencyResponse(problems=report.problems, **dataclasses.asdict(report))

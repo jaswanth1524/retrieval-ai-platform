@@ -1233,10 +1233,15 @@ class CountingRepository:
         self.inner.ensure_ready(settings)
 
     def hybrid_search(
-        self, settings: AppSettings, query_embedding: Any, filenames: Any = None, tags: Any = None
+        self,
+        settings: AppSettings,
+        query_embedding: Any,
+        filenames: Any = None,
+        tags: Any = None,
+        **kwargs: Any,
     ) -> Any:
         self.search_calls += 1
-        return self.inner.hybrid_search(settings, query_embedding, filenames, tags)
+        return self.inner.hybrid_search(settings, query_embedding, filenames, tags, **kwargs)
 
     def fetch_neighbors(self, settings: AppSettings, filename: str, ordinals: Any) -> Any:
         return self.inner.fetch_neighbors(settings, filename, ordinals)
@@ -2694,10 +2699,13 @@ class NarrowRecordingRepository(CountingRepository):
         filenames: Any = None,
         tags: Any = None,
         narrow: Any = None,
+        **kwargs: Any,
     ) -> Any:
         self.search_calls += 1
         self.narrowings.append(narrow)
-        return self.inner.hybrid_search(settings, query_embedding, filenames, tags, narrow=narrow)
+        return self.inner.hybrid_search(
+            settings, query_embedding, filenames, tags, narrow=narrow, **kwargs
+        )
 
 
 def test_a_question_narrowing_reaches_every_search_leg() -> None:

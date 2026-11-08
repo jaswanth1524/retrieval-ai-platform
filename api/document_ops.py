@@ -100,14 +100,20 @@ def enqueue_refreshed(
     queue: IngestQueue,
     raw_store: RawDocumentStore | None,
     *,
-    expected: DocumentMetadata,
+    expected: DocumentMetadata | None,
     repository: VectorRepository,
+    tags: tuple[str, ...] | None = None,
 ) -> DocumentJobAcceptedResponse:
-    """Index what a refresh of ``name`` fetched (the route's and the scheduled
-    refresh's): its tags carry over, as on any re-upload, unchanged bytes are left
-    alone, and the server's new validators are kept for the next conditional fetch.
-    ``expected`` is the document as it was before the fetch; anything else by the time
-    the job writes refuses it (``unchanged_since_fetch``)."""
+    """Index what a fetch of ``name``'s URL brought back — a refresh (the route's and
+    the scheduled one's), a failed URL job's Retry, a restart's re-queue: one path for
+    every fetch of a known name. Unchanged bytes are left alone, and the server's new
+    validators are kept for the next conditional fetch.
+
+    ``expected`` is the document as it was before the fetch (None: there was none);
+    anything else by the time the job writes refuses it (``unchanged_since_fetch``,
+    ``still_absent``). ``tags`` sets the tags (a retry's, as the job had them); None
+    carries the document's over, as on any re-upload.
+    """
 
     settings = queue.ingest_service.settings
     return queue.enqueue(
@@ -115,10 +121,18 @@ def enqueue_refreshed(
         content=fetched.content,
         raw_store=raw_store,
         source=DocumentSource(
-            source_url, fetched.etag, fetched.last_modified, expected.source_refresh_minutes
+            source_url,
+            fetched.etag,
+            fetched.last_modified,
+            expected.source_refresh_minutes if expected is not None else None,
         ),
+        tags=tags,
         dedupe=True,
-        precondition=unchanged_since_fetch(repository, settings, name, expected),
+        precondition=(
+            unchanged_since_fetch(repository, settings, name, expected)
+            if expected is not None
+            else still_absent(repository, settings, name)
+        ),
         kind="url",
     )
 
@@ -149,6 +163,20 @@ def retry_refusal(job: IngestJob) -> str | None:
     return _NOT_RETRYABLE.get(job.kind, "This job can't be retried.")
 
 
+def refuse_if_replaced(job: IngestJob, meta: DocumentMetadata | None) -> None:
+    """409 when a failed URL job's name now holds something else: since the job failed,
+    a plain upload (or a fetch of another URL) took the name, and fetching the job's URL
+    again must not replace it. ``meta`` None (the document is gone) is fine."""
+
+    if meta is not None and meta.source_url != job.source_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{job.filename}' was replaced since this job failed (it no longer "
+            "comes from this job's URL); it was not fetched again. Add the URL again "
+            "under another name to keep both.",
+        )
+
+
 def enqueue_refetched(
     job: IngestJob,
     repository: VectorRepository,
@@ -163,25 +191,32 @@ def enqueue_refetched(
     fetch. A document changed or deleted meanwhile is not replaced (as for a refresh)."""
 
     assert job.source_url is not None
-    return queue.enqueue(
-        filename=job.filename,
-        content=fetched.content,
-        raw_store=raw_store,
-        source=DocumentSource(
-            job.source_url,
-            fetched.etag,
-            fetched.last_modified,
-            meta.source_refresh_minutes if meta is not None else None,
-        ),
+    refuse_if_replaced(job, meta)
+    return enqueue_refreshed(
+        job.filename,
+        job.source_url,
+        fetched,
+        queue,
+        raw_store,
+        expected=meta,
+        repository=repository,
         tags=job.tags,
-        dedupe=True,
-        kind="url",
-        precondition=(
-            unchanged_since_fetch(repository, settings, job.filename, meta)
-            if meta is not None
-            else None
-        ),
     )
+
+
+def still_absent(
+    repository: VectorRepository, settings: AppSettings, name: str
+) -> Callable[[], None]:
+    """A retried fetch's precondition when the name was free before the fetch: an
+    upload that took it while the URL was being fetched is not replaced."""
+
+    def check() -> None:
+        if repository.content_identity(settings, name) is not None:
+            raise IngestionError(
+                f"'{name}' was added while its URL was being fetched again; it was not replaced."
+            )
+
+    return check
 
 
 def source_of(meta: DocumentMetadata, *, validators: bool = True) -> DocumentSource | None:
@@ -217,6 +252,8 @@ class StaleReindex:
     failed: list[str]
     # Left alone because ``skip`` said so (the background pass's failed documents).
     skipped: list[str] = field(default_factory=list)
+    # Stale, but with no stored original to re-index from: only a re-upload helps.
+    no_original: list[str] = field(default_factory=list)
 
 
 def reindex_stale(
@@ -244,6 +281,7 @@ def reindex_stale(
     in_progress: list[str] = []
     failed: list[str] = []
     skipped: list[str] = []
+    no_original: list[str] = []
     for name, meta in sorted(metadata.items()):
         # Incomplete documents too: re-indexing from the original is their repair.
         if not (is_stale(meta) or meta.incomplete):
@@ -267,6 +305,9 @@ def reindex_stale(
             deferred.append(name)
             continue
         if content is None:
+            # Never kept, or unreadable: said, not passed over silently (the listing
+            # kept showing these stale with no reason given).
+            no_original.append(name)
             continue
         try:
             jobs.append(
@@ -290,7 +331,7 @@ def reindex_stale(
             # the client without their ids.
             logger.exception("Could not queue the re-index of %s.", name)
             failed.append(name)
-    return StaleReindex(jobs, deferred, in_progress, failed, skipped)
+    return StaleReindex(jobs, deferred, in_progress, failed, skipped, no_original)
 
 
 def admit_from_store(
@@ -336,6 +377,45 @@ def read_within_backlog(
     if not queue.backlog.has_room(size):
         raise backlog_full_error()
     return read()
+
+
+def reindex_from_original(
+    name: str,
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+) -> DocumentJobAcceptedResponse:
+    """Re-chunk and re-embed ``name`` (a stored name) from its stored original, audited:
+    ``POST /documents/{f}/reindex``, its job's Retry, and a restart's re-queue."""
+
+    store = require_raw_store(raw_store)
+    content = admit_from_store(
+        repository,
+        settings,
+        queue,
+        name,
+        store.size(name),
+        lambda: store.read(name),
+        f"No stored original for '{name}' to re-index.",
+    )
+    meta = repository.document_metadata(settings, name)
+    accepted = queue.enqueue(
+        filename=name,
+        content=content,
+        # The original is already stored, byte-identical. Passing the store would
+        # re-save it, and a failed save deletes it — losing the only copy.
+        raw_store=None,
+        uploaded_at=meta.uploaded_at if meta is not None else None,
+        precondition=original_still_stored(store, name),
+        # A re-index is the same document: where it came from carries over.
+        source=source_of(meta) if meta is not None else None,
+        kind="reindex",
+    )
+    audit(
+        "document.reindex", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
+    )
+    return accepted
 
 
 def require_raw_store(raw_store: RawDocumentStore | None) -> RawDocumentStore:
@@ -438,4 +518,5 @@ def _delete_original(
                 detail=f"The stored original of '{filename}' could not be removed; "
                 "check that RAW_DOCUMENT_DIR is writable.",
             ) from exc
-        return True
+        # Not removed: the audit says so (the points did go, so the delete stands).
+        return False

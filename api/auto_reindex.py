@@ -29,14 +29,15 @@ from dataclasses import dataclass
 
 from api.audit import audit
 from api.background import BackgroundLoop, OwnedJobs
+from api.backoff import doubled_wait
 from api.document_ops import reindex_stale
-from api.ingest_jobs import IngestQueue
 from api.jobs import JobStore
 from api.metrics import stale_documents
 from api.qdrant_schema import CollectionSchemaError
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from api.workspace_target import WorkspaceTarget
 from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
@@ -62,15 +63,6 @@ class _Failure:
     retry_at: float | None
 
 
-@dataclass(frozen=True)
-class ReindexTarget:
-    """One workspace to keep current: its settings, original store and ingest queue."""
-
-    settings: AppSettings
-    raw_store: RawDocumentStore
-    queue: IngestQueue
-
-
 class StaleReindexer(BackgroundLoop):
     """The background loop; ``run_once`` is one pass (tests call it directly)."""
 
@@ -78,7 +70,7 @@ class StaleReindexer(BackgroundLoop):
         self,
         settings: AppSettings,
         repository: VectorRepository,
-        targets: Callable[[], Sequence[ReindexTarget]],
+        targets: Callable[[], Sequence[WorkspaceTarget]],
         job_store: JobStore,
         token_counter: object,
         *,
@@ -116,7 +108,10 @@ class StaleReindexer(BackgroundLoop):
         finished ones ended."""
 
         return self._jobs.running(
-            lambda queued, job: self._note_outcome(queued, job.state, job.error_type, job.error)
+            lambda queued, job: self._note_outcome(queued, job.state, job.error_type, job.error),
+            # How it ended is unknown: backed off as a transient failure. One that did
+            # index is no longer stale, so the back-off never holds it.
+            lambda queued: self._note_outcome(queued, "failed", "evicted", None),
         )
 
     def _note_outcome(
@@ -141,7 +136,7 @@ class StaleReindexer(BackgroundLoop):
                 error,
             )
         else:
-            delay = min(FAILURE_BACKOFF_SECONDS * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_SECONDS)
+            delay = doubled_wait(FAILURE_BACKOFF_SECONDS, failures - 1, MAX_FAILURE_BACKOFF_SECONDS)
             retry_at = self._clock() + delay
         self._failures[key] = _Failure(queued.original, failures, retry_at)
 
@@ -167,16 +162,19 @@ class StaleReindexer(BackgroundLoop):
         stale = 0
         for target in self._targets():
             name = workspace_of(target.settings) or "default"
+            store, queue = target.raw_store, target.queue
+            if store is None or queue is None:
+                continue  # no originals kept there: nothing to re-index from
             room = self._batch - self._running()
             try:
                 outcome = reindex_stale(
                     self._repository,
                     target.settings,
-                    target.queue,
-                    target.raw_store,
+                    queue,
+                    store,
                     self._token_counter,
                     limit=max(room, 0),
-                    skip=self._held_back(workspace_of(target.settings), target.raw_store),
+                    skip=self._held_back(workspace_of(target.settings), store),
                 )
             except CollectionSchemaError as exc:
                 if name not in self._skipped:
@@ -190,6 +188,7 @@ class StaleReindexer(BackgroundLoop):
                 + len(outcome.in_progress)
                 + len(outcome.failed)
                 + len(outcome.skipped)
+                + len(outcome.no_original)
             )
             for job in outcome.jobs:
                 self._jobs.add(
@@ -198,7 +197,7 @@ class StaleReindexer(BackgroundLoop):
                     _QueuedJob(
                         workspace_of(target.settings),
                         job.filename,
-                        target.raw_store.identity(job.filename),
+                        store.identity(job.filename),
                     ),
                 )
             queued += len(outcome.jobs)

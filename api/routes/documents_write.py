@@ -6,6 +6,9 @@ from __future__ import annotations
 import functools
 import logging
 import threading
+import zipfile
+import zlib
+from pathlib import PurePosixPath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -28,12 +31,14 @@ from api.document_ops import (
     admit_from_store,
     delete_indexed_document,
     enqueue_refreshed,
-    original_still_stored,
+    reindex_from_original,
     reindex_stale,
     require_raw_store,
     source_of,
 )
 from api.documents import (
+    SUPPORTED_EXTENSIONS,
+    DocumentError,
     DocumentNotFoundError,
     DocumentSource,
     chunk_sections,
@@ -52,8 +57,11 @@ from api.routes.deps import (
 )
 from api.routes.documents_common import (
     _fetch_for_ingest,
+    _url_fetch_slots,
 )
 from api.schemas import (
+    ArchiveSkipResponse,
+    ArchiveUploadResponse,
     DocumentDeleteResponse,
     DocumentJobAcceptedResponse,
     DocumentPreviewResponse,
@@ -64,10 +72,14 @@ from api.schemas import (
     DocumentTagsRequest,
     DocumentTagsResponse,
     PreviewChunkResponse,
+    SitemapIngestRequest,
+    SitemapIngestResponse,
     UrlIngestRequest,
 )
+from api.sitemap import PageImport, read_sitemap, start_page_import
 from api.upload import read_upload_within_limit
 from api.url_fetch import (
+    FetchedDocument,
     fetch_document,
     loggable_url,
 )
@@ -145,6 +157,197 @@ async def upload_document(
         **({"tags": list(given_tags)} if given_tags else {}),
     )
     return accepted
+
+
+# A site's pages from its sitemap (or sitemap index, RSS or Atom feed): read now, its
+# pages fetched and queued one by one in the background (api/sitemap.py). The full key
+# and URL_INGEST_ENABLED, as /documents/from-url.
+@router.post(
+    "/documents/from-sitemap",
+    response_model=SitemapIngestResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={
+        400: {"description": "Not a sitemap or feed, or it could not be fetched."},
+        404: {"description": "URL ingest is not enabled (URL_INGEST_ENABLED)."},
+        429: {"description": "Too many URL fetches are running."},
+    },
+)
+async def add_from_sitemap(
+    request: SitemapIngestRequest,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    queue: IngestQueueDep,
+    raw_store: RawDocumentStoreDep,
+) -> SitemapIngestResponse:
+    if not settings.url_ingest_enabled:
+        raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+    given_tags = normalize_tags(request.tags) if request.tags else None
+    await run_in_threadpool(repository.ensure_writable, settings)
+    limit = min(
+        request.max_pages or int(settings.sitemap_max_pages), int(settings.sitemap_max_pages)
+    )
+
+    def fetch_listing(url: str) -> FetchedDocument:
+        # A name only so the fetch takes any content type (XML isn't one DocRAG indexes);
+        # the listing is read here, never indexed.
+        return fetch_document(url, settings, filename="sitemap.txt")
+
+    if not _url_fetch_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many URL fetches are running. Try again in a moment.",
+            headers={"Retry-After": "5"},
+        )
+    try:
+        found = await run_in_threadpool(
+            read_sitemap, request.url, fetch_listing, same_host=request.same_host, limit=limit
+        )
+    finally:
+        _url_fetch_slots.release()
+    known = set(await run_in_threadpool(known_filenames, repository, settings))
+    start_page_import(
+        found.urls,
+        PageImport(
+            queue=queue,
+            raw_store=raw_store,
+            fetch=lambda url, has_room: fetch_document(url, settings, has_room=has_room),
+            tags=given_tags,
+            refresh_minutes=request.refresh_minutes,
+            known=known,
+        ),
+    )
+    logger.info(
+        "Adding %d page(s) from the sitemap %s.", len(found.urls), loggable_url(request.url)
+    )
+    return SitemapIngestResponse(
+        urls=found.urls, left_out=found.left_out, child_sitemaps=len(found.child_sitemaps)
+    )
+
+
+# A zip of documents, each indexed as its own (as if uploaded one by one, with the same
+# tags): the folder a team keeps, in one request. Members are named by their base name;
+# a name met twice, an unsupported type, a hidden file or one over MAX_UPLOAD_BYTES is
+# skipped and said so. Nothing in the zip is ever extracted to disk.
+@router.post(
+    "/documents/archive",
+    response_model=ArchiveUploadResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={400: {"description": "Not a zip, or one past MAX_ARCHIVE_MEMBERS."}},
+)
+def upload_archive(
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    queue: IngestQueueDep,
+    raw_store: RawDocumentStoreDep,
+    file: Annotated[UploadFile, File()],
+    tags: Annotated[list[str] | None, Form(description="Tags for every document.")] = None,
+) -> ArchiveUploadResponse:
+    given_tags = normalize_tags(tags) if tags else None
+    repository.ensure_writable(settings)
+    try:
+        archive = zipfile.ZipFile(file.file)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise HTTPException(status_code=400, detail="That file isn't a zip archive.") from exc
+    limit = int(settings.max_upload_bytes)
+    budget = int(settings.max_import_bytes)
+    jobs: list[DocumentJobAcceptedResponse] = []
+    skipped: list[ArchiveSkipResponse] = []
+    deferred: list[str] = []
+    with archive:
+        members = [info for info in archive.infolist() if not info.is_dir()]
+        if len(members) > int(settings.max_archive_members):
+            raise HTTPException(
+                status_code=400,
+                detail=f"The zip has more than {settings.max_archive_members} files "
+                "(MAX_ARCHIVE_MEMBERS); split it.",
+            )
+        known = set(known_filenames(repository, settings)) if raw_store is not None else set()
+        seen: set[str] = set()
+        for info in members:
+            base = PurePosixPath(info.filename.replace("\\", "/")).name
+            reason = _archive_skip_reason(info, base, seen, limit)
+            if reason is None:
+                try:
+                    name = validate_upload_filename(base)
+                except DocumentError as exc:
+                    reason = str(exc)
+                else:
+                    try:
+                        if raw_store is not None:
+                            refuse_near_duplicate_name(name, known)
+                    except FilenameConflictError as exc:
+                        reason = str(exc)
+            if reason is not None:
+                if reason:  # hidden files and folders' metadata are skipped silently
+                    skipped.append(ArchiveSkipResponse(name=info.filename, reason=reason))
+                continue
+            seen.add(base.casefold())
+            if deferred or not queue.backlog.has_room(info.file_size):
+                deferred.append(name)
+                continue
+            try:
+                with archive.open(info) as handle:
+                    content = handle.read(limit + 1)
+            except (zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, NotImplementedError):
+                skipped.append(ArchiveSkipResponse(name=info.filename, reason="It is damaged."))
+                continue
+            # The header's size isn't trusted: what it expands to is counted.
+            budget -= len(content)
+            if len(content) > limit or budget < 0:
+                skipped.append(
+                    ArchiveSkipResponse(
+                        name=info.filename,
+                        reason="Too large (MAX_UPLOAD_BYTES, or the zip past MAX_IMPORT_BYTES).",
+                    )
+                )
+                continue
+            try:
+                accepted = queue.enqueue(
+                    filename=name,
+                    content=content,
+                    raw_store=raw_store,
+                    tags=given_tags,
+                    dedupe=True,
+                )
+            except HTTPException as exc:
+                if exc.status_code != 503:
+                    skipped.append(ArchiveSkipResponse(name=info.filename, reason=str(exc.detail)))
+                    continue
+                deferred.append(name)
+                continue
+            known.add(name)
+            jobs.append(accepted)
+    audit(
+        "document.upload",
+        workspace=workspace_of(settings),
+        source="archive",
+        archive=file.filename or "",
+        queued=len(jobs),
+        skipped=len(skipped),
+        deferred=len(deferred),
+        **({"tags": list(given_tags)} if given_tags else {}),
+    )
+    return ArchiveUploadResponse(jobs=jobs, skipped=skipped, deferred=deferred)
+
+
+def _archive_skip_reason(
+    info: zipfile.ZipInfo, base: str, seen: set[str], limit: int
+) -> str | None:
+    """Why a zip member isn't indexed ("" for one skipped without a word: hidden files,
+    macOS folder metadata), or None to index it."""
+
+    parts = PurePosixPath(info.filename.replace("\\", "/")).parts
+    if not base or base.startswith(".") or "__MACOSX" in parts:
+        return ""
+    if PurePosixPath(base).suffix.lower() not in SUPPORTED_EXTENSIONS:
+        return "Not a supported document type."
+    if base.casefold() in seen:
+        return "Another file in the zip has the same name."
+    if info.file_size > limit:
+        return "Larger than MAX_UPLOAD_BYTES."
+    return None
 
 
 # At most this many previews parse at once (each holds a parse process and the file).
@@ -456,12 +659,14 @@ def reindex_stale_documents(
         deferred=len(outcome.deferred),
         in_progress=len(outcome.in_progress),
         failed=len(outcome.failed),
+        no_original=len(outcome.no_original),
     )
     return DocumentReindexAllResponse(
         jobs=outcome.jobs,
         deferred=outcome.deferred,
         in_progress=outcome.in_progress,
         failed=outcome.failed,
+        no_original=outcome.no_original,
     )
 
 
@@ -484,34 +689,7 @@ def reindex_document(
     queue: IngestQueueDep,
     raw_store: RawDocumentStoreDep,
 ) -> DocumentJobAcceptedResponse:
-    store = require_raw_store(raw_store)
-    name = stored_filename(filename)
-    content = admit_from_store(
-        repository,
-        settings,
-        queue,
-        name,
-        store.size(name),
-        lambda: store.read(name),
-        f"No stored original for '{name}' to re-index.",
-    )
-    meta = repository.document_metadata(settings, name)
-    accepted = queue.enqueue(
-        filename=name,
-        content=content,
-        # The original is already stored, byte-identical. Passing the store would
-        # re-save it, and a failed save deletes it — losing the only copy.
-        raw_store=None,
-        uploaded_at=meta.uploaded_at if meta is not None else None,
-        precondition=original_still_stored(store, name),
-        # A re-index is the same document: where it came from carries over.
-        source=source_of(meta) if meta is not None else None,
-        kind="reindex",
-    )
-    audit(
-        "document.reindex", workspace=workspace_of(settings), filename=name, job_id=accepted.job_id
-    )
-    return accepted
+    return reindex_from_original(stored_filename(filename), repository, settings, queue, raw_store)
 
 
 @router.delete(
@@ -604,7 +782,8 @@ def set_document_refresh_settings(
             meta.source_last_modified,
             request.refresh_minutes,
         )
-    bump_corpus_generation([filename], collection=settings.qdrant_collection)
+        # Only the listing shows it: no answer depends on the refresh interval.
+        repository.refresh_listed(settings, [filename])
     audit(
         "document.refresh_settings",
         workspace=workspace_of(settings),

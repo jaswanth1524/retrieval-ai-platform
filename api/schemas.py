@@ -114,7 +114,9 @@ class HealthResponse(BaseModel):
 
 
 class BackupStatusResponse(BaseModel):
-    """The last scheduled backup written or attempted (BACKUP_DIR)."""
+    """The last scheduled backup written or attempted (BACKUP_DIR). /health/ready is
+    open, so with API_KEY set ``workspace`` is "" and ``file`` and ``error`` are left
+    out (the error is in the server log)."""
 
     at: float
     workspace: str
@@ -145,6 +147,9 @@ class ReadinessResponse(BaseModel):
     # With BACKUP_DIR: the last scheduled backup (null until one has run). A failed one
     # doesn't make `status` degraded: questions still work.
     last_backup: BackupStatusResponse | None = None
+    # Workspaces whose last scheduled backup failed (empty with API_KEY set, unless
+    # one failed: then ["(hidden)"], as workspace names are not public).
+    backups_failing: list[str] = Field(default_factory=list)
 
 
 class PublicConfigResponse(BaseModel):
@@ -361,6 +366,8 @@ class DocumentReindexAllResponse(BaseModel):
     in_progress: list[str] = []
     # Could not be queued (logged on the server); the others were.
     failed: list[str] = []
+    # Stale, but no stored original to re-index from (re-upload them).
+    no_original: list[str] = []
 
 
 class DocumentDeleteResponse(BaseModel):
@@ -504,6 +511,14 @@ class TraceConfigResponse(BaseModel):
     # closest passages are used when none clears the bar (0: none).
     context_neighbor_radius: int | None = None
     rerank_fallback_count: int | None = None
+    # Ranking settings that move scores or order (null on traces from before they were
+    # recorded): what a trace comparison needs to explain a difference.
+    rerank_candidates: int | None = None
+    rerank_relative_floor: float | None = None
+    recency_boost_weight: float | None = None
+    query_expansion_enabled: bool | None = None
+    reranker_onnx_file: str | None = None
+    context_neighbor_max_chars: int | None = None
 
 
 class TraceCandidateResponse(BaseModel):
@@ -524,6 +539,13 @@ class TraceCandidateResponse(BaseModel):
     )
     selected_for_context: bool
     neighbor_expanded: bool
+    # Its [n] in the prompt (null: not in the prompt), and whether the answer cited it.
+    source_number: int | None = None
+    cited: bool = False
+    # Its rank on the dense and the BM25 leg before fusion (null: not returned by that
+    # leg, or not recorded — TRACE_LEG_RANKS when Qdrant fuses).
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
 
 
 class TraceSummaryResponse(BaseModel):
@@ -579,6 +601,7 @@ class TraceCandidateChangeResponse(BaseModel):
     point_id: str
     filename: str
     page: int
+    section: str = ""
     chunk_id: str
     rank_a: int | None = None
     rank_b: int | None = None
@@ -601,6 +624,30 @@ class TraceDiffResponse(BaseModel):
     candidates: list[TraceCandidateChangeResponse]
 
 
+class TraceRerunRequest(BaseModel):
+    """POST /traces/{id}/rerun: ranking settings to try (each optional; unset ones are
+    the server's)."""
+
+    rerank_min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
+    rerank_relative_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+    recency_boost_weight: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class TraceRerunResponse(BaseModel):
+    """A traced question searched again under other ranking settings (no answer is
+    written): whether passages would reach the prompt, and how the ranking moved."""
+
+    query: str
+    settings: dict[str, float | int]
+    # Passages cleared the bar and would be sent to the model.
+    would_answer: bool
+    # Only the closest passages would be (the weak-match fallback).
+    weak_matches: bool
+    diff: TraceDiffResponse
+    candidates: list[TraceCandidateResponse]
+
+
 class QueryRecheckItemResponse(BaseModel):
     question: str
     status: str
@@ -609,6 +656,8 @@ class QueryRecheckItemResponse(BaseModel):
     top_score: float | None = None
     top_filename: str | None = None
     top_chunk_id: str | None = None
+    # Why this one couldn't be searched (the rest were).
+    error: str | None = None
 
 
 class QueryRecheckResponse(BaseModel):
@@ -618,6 +667,8 @@ class QueryRecheckResponse(BaseModel):
     checked: int
     covered_now: int
     items: list[QueryRecheckItemResponse]
+    # RECHECK_TIME_BUDGET_SECONDS ran out before every question was searched.
+    stopped_early: bool = False
 
 
 class QueryLogEntryResponse(BaseModel):
@@ -693,6 +744,8 @@ class TraceDetailResponse(BaseModel):
     truncated: bool = False
     # History messages left out of the prompt to fit the context window.
     dropped_history_messages: int = 0
+    # "question", or "summary" (whose question is its task line).
+    kind: str = "question"
 
 
 class HistoryMessageRequest(BaseModel):
@@ -836,6 +889,50 @@ class WorkspaceResponse(BaseModel):
     name: str
 
 
+class CachedQuestionResponse(BaseModel):
+    question: str
+    age_seconds: float
+
+
+class AnswerCacheResponse(BaseModel):
+    """GET /answer-cache: this workspace's cached answers (ANSWER_CACHE_SIZE)."""
+
+    enabled: bool
+    entries: list[CachedQuestionResponse]
+    total_entries: int
+    max_entries: int
+    ttl_seconds: float
+    in_flight: int
+
+
+class AnswerCacheClearResponse(BaseModel):
+    removed: int
+
+
+class WorkspaceSettingsRequest(BaseModel):
+    """A workspace's own relevance and answer settings (PUT /workspaces/{name}/settings).
+    Each one unset (null) is the server's; the PUT replaces them all."""
+
+    rerank_min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    recency_boost_weight: float | None = Field(default=None, ge=0.0, le=1.0)
+    answer_language: str | None = Field(default=None, max_length=40)
+    answer_format: AnswerFormat | None = None
+
+    @field_validator("answer_language")
+    @classmethod
+    def _check_answer_language(cls, value: str | None) -> str | None:
+        return None if value is None else normalize_answer_language(value)
+
+
+class WorkspaceSettingsResponse(BaseModel):
+    """A workspace's own settings (``settings``; unset ones null), and what its requests
+    run with (``effective``: those, else the server's)."""
+
+    workspace: str
+    settings: WorkspaceSettingsRequest
+    effective: WorkspaceSettingsRequest
+
+
 class WorkspaceListResponse(BaseModel):
     """The workspaces besides the default one (which has no name and is always there)."""
 
@@ -855,6 +952,30 @@ class UrlIngestRequest(BaseModel):
     # How often the scheduled refresh checks it (URL_REFRESH_INTERVAL_MINUTES must be on),
     # in minutes: omitted = the server's interval, 0 = never.
     refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
+
+
+class SitemapIngestRequest(BaseModel):
+    """Add a site's pages from its sitemap, sitemap index, RSS or Atom feed
+    (POST /documents/from-sitemap)."""
+
+    url: str = Field(min_length=1, max_length=2048)
+    # At most this many pages (and never more than SITEMAP_MAX_PAGES).
+    max_pages: int | None = Field(default=None, ge=1, le=10_000)
+    # Only pages on the sitemap's own host (a feed often links elsewhere).
+    same_host: bool = True
+    tags: list[RequestTag] | None = Field(default=None, max_length=MAX_TAGS_PER_DOCUMENT)
+    refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
+
+
+class SitemapIngestResponse(BaseModel):
+    """The pages that are being fetched and queued, one after another, in the background
+    (each a ``url`` job in GET /documents/jobs?state=active as it goes)."""
+
+    urls: list[str]
+    # Listed but not added: another host, a duplicate, not http(s), or past the cap.
+    left_out: int
+    # Sitemaps of a sitemap index that were read for pages.
+    child_sitemaps: int
 
 
 class PreviewChunkResponse(BaseModel):
@@ -909,6 +1030,11 @@ class SummaryRequest(BaseModel):
     )
     # False skips the answer cache's lookup (Regenerate); the new summary is still cached.
     use_cache: bool = True
+    # Only part of the document (a summary of one document): a page range, or one
+    # section by its exact label.
+    page_min: int | None = Field(default=None, ge=1)
+    page_max: int | None = Field(default=None, ge=1)
+    section: str | None = Field(default=None, min_length=1, max_length=SEARCH_SECTION_MAX_CHARS)
 
     @model_validator(mode="after")
     def _validate_document_count(self) -> SummaryRequest:
@@ -921,6 +1047,9 @@ class SummaryRequest(BaseModel):
             raise ValueError("summarize takes one document")
         if self.mode == "brief" and distinct < 2:
             raise ValueError("a brief takes two documents or more")
+        narrowed = self.page_min is not None or self.page_max is not None or self.section
+        if narrowed and self.mode != "summarize":
+            raise ValueError("a page range or section narrows a summary of one document")
         return self
 
 
@@ -931,6 +1060,10 @@ class SummaryResponse(QuestionResponse):
     # read at evenly spaced passages (SUMMARY_MAX_BATCHES parts per request).
     chunks_read: int = 0
     chunks_total: int = 0
+    # Parts left out after their call failed twice, and parts whose notes stopped at
+    # the token limit: the summary may miss what they held.
+    parts_skipped: int = 0
+    notes_truncated: int = 0
 
 
 class AccessResponse(BaseModel):
@@ -1000,6 +1133,78 @@ class SearchResponse(BaseModel):
     weak_matches: bool = False
 
 
+class ArchiveSkipResponse(BaseModel):
+    name: str
+    reason: str
+
+
+class ArchiveUploadResponse(BaseModel):
+    """POST /documents/archive: a zip's documents, each queued as its own upload."""
+
+    jobs: list[DocumentJobAcceptedResponse]
+    # Members not indexed, and why (an unsupported type, a duplicate name, too large).
+    skipped: list[ArchiveSkipResponse]
+    # Not queued: the indexing queue was full. Upload the zip again later; the ones
+    # already indexed are left as they are.
+    deferred: list[str]
+
+
+class BackupFileResponse(BaseModel):
+    """One backup in BACKUP_DIR (GET /backups)."""
+
+    name: str
+    size: int
+    created_at: float
+    # Checked when it was written: true, false (``problems`` says why), or null when
+    # it wasn't checked in this process (written before a restart, or by hand).
+    verified: bool | None = None
+    problems: list[str] = Field(default_factory=list)
+
+
+class BackupListResponse(BaseModel):
+    """GET /backups: this workspace's scheduled backups, newest first."""
+
+    backups: list[BackupFileResponse]
+    interval_hours: float
+    keep: int
+
+
+class BackupRunResponse(BaseModel):
+    """POST /backups/run: a backup of this workspace was asked for; it is written on a
+    pass that starts now (GET /backups lists it once written)."""
+
+    workspace: str
+
+
+class BackupCheckResponse(BaseModel):
+    """POST /backups/verify, /backups/{name}/verify: a backup read through without
+    restoring anything."""
+
+    ok: bool
+    documents: int
+    originals: int
+    originals_missing: int
+    versions: int
+    feedback: bool
+    problems: list[str]
+
+
+class ConsistencyResponse(BaseModel):
+    """GET /admin/consistency: how the index and the stored originals agree. A report
+    only: nothing is changed."""
+
+    documents: int
+    originals_kept: bool
+    problems: int
+    originals_without_document: list[str]
+    documents_without_original: list[str]
+    versions_without_document: list[str]
+    incomplete: list[str]
+    stale: list[str]
+    duplicate_groups: list[list[str]]
+    in_flight: list[str]
+
+
 class ImportResponse(BaseModel):
     """What POST /import did with each document in the backup."""
 
@@ -1029,6 +1234,19 @@ class WatchRetry(BaseModel):
     error: str
 
 
+class WatchFolderStatusResponse(BaseModel):
+    """One watched folder as of its last pass."""
+
+    folder: str
+    workspace: str
+    last_scan_at: float | None = None
+    files: int = 0
+    problems: list[str] = []
+    deferred: list[str] = []
+    retrying: list[WatchRetry] = []
+    gave_up: list[str] = []
+
+
 class WatchStatusResponse(BaseModel):
     """The watched folder (WATCH_DIR) as of the watcher's last pass."""
 
@@ -1041,3 +1259,6 @@ class WatchStatusResponse(BaseModel):
     retrying: list[WatchRetry] = []
     # Refused for good, or out of retries: tried again when the file changes.
     gave_up: list[str] = []
+    # Every watched folder (WATCH_DIR, then WATCH_DIRS), each as above, with the
+    # workspace it indexes into; the fields above are the first one's.
+    folders: list[WatchFolderStatusResponse] = []

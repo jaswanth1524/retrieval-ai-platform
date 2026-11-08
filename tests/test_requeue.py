@@ -33,12 +33,12 @@ def test_an_interrupted_reindex_is_started_again_and_an_upload_is_not(
 
     asked: list[str] = []
 
-    def reindex_document(filename: str, *args: Any) -> DocumentJobAcceptedResponse:
+    def reindex_from_original(filename: str, *args: Any) -> DocumentJobAcceptedResponse:
         asked.append(filename)
         return DocumentJobAcceptedResponse(job_id="new-job", filename=filename, state="queued")
 
     monkeypatch.setattr(main, "get_ingest_job_store", lambda: restarted)
-    monkeypatch.setattr(main, "reindex_document", reindex_document)
+    monkeypatch.setattr(main, "reindex_from_original", reindex_from_original)
     monkeypatch.setattr(main, "get_qdrant_client", lambda: QdrantClient(":memory:"))
     monkeypatch.setattr(main, "get_token_counter", lambda: HeuristicTokenCounter())
     monkeypatch.setattr(main, "get_embedding_provider", lambda: FakeEmbeddingProvider())

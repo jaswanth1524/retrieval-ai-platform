@@ -275,3 +275,33 @@ class AnswerCache:
     def __len__(self) -> int:
         with self._lock:
             return len(self._entries)
+
+    @property
+    def max_entries(self) -> int:
+        return self._max_entries
+
+    @property
+    def ttl_seconds(self) -> float:
+        return self._ttl
+
+    def entries_for(self, collection: str) -> list[tuple[str, float]]:
+        """``collection``'s live entries, newest first: what was asked (a summary's
+        task) and how old the answer is, in seconds. Every key names its collection."""
+
+        now = self._clock()
+        with self._lock:
+            found = [
+                (str(key[0]), now - stored_at)
+                for key, (stored_at, _value, _scope) in self._entries.items()
+                if collection in key and now - stored_at <= self._ttl
+            ]
+        return list(reversed(found))
+
+    def drop_collection(self, collection: str) -> int:
+        """Forget ``collection``'s entries (DELETE /answer-cache); how many went."""
+
+        with self._lock:
+            keys = [key for key in self._entries if collection in key]
+            for key in keys:
+                del self._entries[key]
+        return len(keys)

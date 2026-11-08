@@ -76,41 +76,15 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         question=trace.question,
         mode=trace.mode,
         status=trace.status,
+        # Field for field (a field added to TraceConfig/TraceCandidate shows up here
+        # once the response model has it; copying by hand, one was easy to miss).
         config=(
-            TraceConfigResponse(
-                llm_provider=trace.config.llm_provider,
-                rerank_top_k=trace.config.rerank_top_k,
-                max_context_chunks=trace.config.max_context_chunks,
-                llm_temperature=trace.config.llm_temperature,
-                rerank_min_score=trace.config.rerank_min_score,
-                fused_top_n=trace.config.fused_top_n,
-                filenames=trace.config.filenames,
-                tags=trace.config.tags,
-                reranker_model=trace.config.reranker_model,
-                answer_format=trace.config.answer_format,
-                answer_language=trace.config.answer_language,
-                narrowing=trace.config.narrowing,
-                llm_model=trace.config.llm_model,
-                context_neighbor_radius=trace.config.context_neighbor_radius,
-                rerank_fallback_count=trace.config.rerank_fallback_count,
-            )
+            TraceConfigResponse.model_validate(dataclasses.asdict(trace.config))
             if trace.config is not None
             else None
         ),
         candidates=[
-            TraceCandidateResponse(
-                point_id=candidate.point_id,
-                filename=candidate.filename,
-                page=candidate.page,
-                section=candidate.section,
-                chunk_id=candidate.chunk_id,
-                retrieval_score=candidate.retrieval_score,
-                rerank_score=candidate.rerank_score,
-                kept=candidate.kept,
-                drop_reason=candidate.drop_reason,
-                selected_for_context=candidate.selected_for_context,
-                neighbor_expanded=candidate.neighbor_expanded,
-            )
+            TraceCandidateResponse.model_validate(dataclasses.asdict(candidate))
             for candidate in trace.candidates
         ],
         prompt_messages=(
@@ -137,6 +111,7 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         answer_status=trace.answer_status,
         truncated=trace.truncated,
         dropped_history_messages=trace.dropped_history_messages,
+        kind=trace.kind,
     )
 
 

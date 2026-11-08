@@ -16,7 +16,9 @@ from api.llm import (
     ChatGenerator,
     ChatMessage,
     GenerationError,
+    is_local_provider,
     last_finish_reason,
+    note_degraded,
     reset_finish_reason,
 )
 from api.metrics import citation_backfills_total, citation_retries_total
@@ -814,6 +816,7 @@ def retry_uncited_answer(
     try:
         retried = generator.complete(messages, settings).strip()
     except GenerationError:
+        note_degraded()
         return None
     if not retried or not _CITATION_RE.search(retried):
         return None
@@ -853,8 +856,7 @@ def _citation_steps(settings: AppSettings) -> tuple[bool, bool]:
         return False, True
     if mode == "backfill":
         return True, False
-    local = settings.llm_provider.lower().strip() in ("ollama", "openai_compatible")
-    return local, True
+    return is_local_provider(settings), True
 
 
 def will_retry_citations(

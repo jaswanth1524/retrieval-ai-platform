@@ -38,6 +38,10 @@ from api.parsers.eml import parse_eml_document
 from api.parsers.epub import parse_epub_document
 from api.parsers.html import parse_html_document
 from api.parsers.image import IMAGE_EXTENSIONS, ocr_available, parse_image_document
+from api.parsers.ipynb import parse_ipynb_document
+from api.parsers.mbox import parse_mbox_document
+from api.parsers.odp import parse_odp_document
+from api.parsers.ods import parse_ods_document
 from api.parsers.odt import parse_odt_document
 from api.parsers.pdf import parse_pdf_document
 from api.parsers.pptx import parse_pptx_document
@@ -152,6 +156,24 @@ def _parse_odt(
     return parse_odt_document(filename, content)
 
 
+def _parse_mbox(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_mbox_document(filename, content)
+
+
+def _parse_odp(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_odp_document(filename, content)
+
+
+def _parse_ipynb(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_ipynb_document(filename, decode_text_document(filename, content))
+
+
 def _parse_json(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
@@ -179,6 +201,10 @@ PARSERS: dict[str, Parser] = {
     ".csv": _parse_csv,
     ".txt": _parse_txt,
     ".odt": _parse_odt,
+    ".ods": parse_ods_document,
+    ".odp": _parse_odp,
+    ".mbox": _parse_mbox,
+    ".ipynb": _parse_ipynb,
     ".json": _parse_json,
     **dict.fromkeys(CODE_EXTENSIONS, _parse_code),
     # Images only with the ocr extra: offering them without it would accept an upload

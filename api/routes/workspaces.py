@@ -13,15 +13,18 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from qdrant_client import QdrantClient
 
+from api.answer_cache import AnswerCache
 from api.audit import audit
 from api.corpus import bump_corpus_generation
 from api.dependencies import (
     clear_workspace_raw_stores,
+    get_answer_cache,
     get_app_settings,
     get_feedback_store,
     get_ingest_job_store,
     get_query_log_store,
     get_trace_store,
+    get_workspace_settings_store,
     require_api_key,
     require_full_key,
 )
@@ -34,9 +37,17 @@ from api.query_log import QueryLogStore
 from api.raw_documents import VERSIONS_DIR, is_temp_file_name
 from api.repository import forget_metadata
 from api.routes.deps import QdrantClientDep, VectorRepositoryDep
-from api.schemas import WorkspaceCreateRequest, WorkspaceListResponse, WorkspaceResponse
+from api.schemas import (
+    WorkspaceCreateRequest,
+    WorkspaceListResponse,
+    WorkspaceResponse,
+    WorkspaceSettingsRequest,
+    WorkspaceSettingsResponse,
+)
 from api.settings import AppSettings
 from api.tracing import TraceStore
+from api.watch import watched_workspaces
+from api.workspace_settings import WORKSPACE_SETTING_FIELDS, WorkspaceSettingsStore
 from api.workspaces import (
     MAX_WORKSPACES,
     WorkspaceError,
@@ -46,6 +57,7 @@ from api.workspaces import (
     settings_for,
     validate_name,
     workspace_exists,
+    workspace_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +76,34 @@ def _name(raw: str, *, new: bool = False) -> str:
         return validate_name(raw, new=new)
     except WorkspaceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+WorkspaceSettingsStoreDep = Annotated[WorkspaceSettingsStore, Depends(get_workspace_settings_store)]
+
+
+def _settings_target(settings: AppSettings, client: QdrantClient, raw: str) -> AppSettings:
+    """The settings of the workspace ``raw`` names ("default": the default one)."""
+
+    if raw == "default":
+        return settings
+    _require_enabled(settings)
+    name = _name(raw)
+    if not workspace_exists(client, settings.qdrant_collection, name):
+        raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
+    return settings_for(settings, name)
+
+
+def _settings_response(
+    target: AppSettings, store: WorkspaceSettingsStore
+) -> WorkspaceSettingsResponse:
+    own = store.get(workspace_of(target))
+    return WorkspaceSettingsResponse(
+        workspace=workspace_of(target) or "default",
+        settings=WorkspaceSettingsRequest(**own),
+        effective=WorkspaceSettingsRequest(
+            **{field: own.get(field, getattr(target, field)) for field in WORKSPACE_SETTING_FIELDS}
+        ),
+    )
 
 
 def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> None:
@@ -118,6 +158,7 @@ def _forget_rows(
     query_log: QueryLogStore | None,
     traces: TraceStore,
     jobs: JobStore,
+    workspace_settings: WorkspaceSettingsStore | None = None,
 ) -> dict[str, int]:
     """Remove a deleted workspace's rows from every store keyed by workspace, so one
     created again under its name starts empty (its ratings, asked questions, traces and
@@ -130,6 +171,10 @@ def _forget_rows(
         ("queries", query_log.delete_workspace if query_log is not None else None),
         ("traces", traces.delete_workspace),
         ("jobs", jobs.delete_finished),
+        (
+            "settings",
+            workspace_settings.delete_workspace if workspace_settings is not None else None,
+        ),
     ]
     for label, delete in stores:
         if delete is None:
@@ -186,6 +231,44 @@ def register(app: FastAPI) -> None:
         audit("workspace.create", workspace=name)
         return WorkspaceResponse(name=name)
 
+    # A workspace's own relevance settings ("default" for the default workspace): read
+    # with any key, changed with the full key. A change empties its cached answers.
+    @app.get(
+        "/workspaces/{name}/settings",
+        response_model=WorkspaceSettingsResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    def workspace_settings(
+        name: str,
+        settings: BaseSettingsDep,
+        client: QdrantClientDep,
+        store: WorkspaceSettingsStoreDep,
+    ) -> WorkspaceSettingsResponse:
+        return _settings_response(_settings_target(settings, client, name), store)
+
+    @app.put(
+        "/workspaces/{name}/settings",
+        response_model=WorkspaceSettingsResponse,
+        dependencies=[Depends(require_full_key)],
+    )
+    def put_workspace_settings(
+        name: str,
+        request: WorkspaceSettingsRequest,
+        settings: BaseSettingsDep,
+        client: QdrantClientDep,
+        store: WorkspaceSettingsStoreDep,
+        cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+    ) -> WorkspaceSettingsResponse:
+        target = _settings_target(settings, client, name)
+        values = request.model_dump(exclude_none=True)
+        store.put(workspace_of(target), values)
+        # Answers cached under the old settings would be served as if given under these.
+        if cache is not None:
+            cache.drop_collection(target.qdrant_collection)
+        bump_corpus_generation(collection=target.qdrant_collection)
+        audit("workspace.settings", workspace=workspace_of(target), **values)
+        return _settings_response(target, store)
+
     @app.delete(
         "/workspaces/{name}",
         response_model=WorkspaceResponse,
@@ -200,6 +283,7 @@ def register(app: FastAPI) -> None:
         query_log: Annotated[QueryLogStore | None, Depends(get_query_log_store)],
         traces: Annotated[TraceStore, Depends(get_trace_store)],
         jobs: Annotated[JobStore, Depends(get_ingest_job_store)],
+        workspace_settings: WorkspaceSettingsStoreDep,
     ) -> WorkspaceResponse:
         _require_enabled(settings)
         name = _name(name)
@@ -207,7 +291,7 @@ def register(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
         # The watched folder's workspace: its watcher would fail every pass once the
         # collection is gone (it is never recreated implicitly), until a restart.
-        if settings.watch_dir and settings.watch_workspace.strip() == name:
+        if name in watched_workspaces(settings):
             raise HTTPException(
                 status_code=409,
                 detail=f"Workspace '{name}' is WATCH_WORKSPACE, where the watched folder "
@@ -234,6 +318,6 @@ def register(app: FastAPI) -> None:
         finally:
             ingest_sequencer.reopen(group)
         forget_workspace_metrics(name)
-        removed = _forget_rows(name, feedback, query_log, traces, jobs)
+        removed = _forget_rows(name, feedback, query_log, traces, jobs, workspace_settings)
         audit("workspace.delete", workspace=name, **{f"{k}_removed": v for k, v in removed.items()})
         return WorkspaceResponse(name=name)

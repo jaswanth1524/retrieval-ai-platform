@@ -627,6 +627,36 @@ def _content_codings(response: httpx.Response) -> list[str]:
     ]
 
 
+class _GzipBody:
+    """Decodes a gzip body piece by piece within ``limit``: every member of a
+    multi-member body (gzip files may be concatenated; each one's end leaves the next in
+    ``unused_data``), trailing zero padding ignored, as gzip(1) does."""
+
+    def __init__(self, limit: int, too_large: str) -> None:
+        self._limit = limit
+        self._too_large = too_large
+        self._decoder = zlib.decompressobj(wbits=31)
+        self._started = False
+
+    def feed(self, piece: bytes, body: bytearray) -> None:
+        data = piece
+        while data:
+            if self._decoder.eof:
+                if not data.strip(b"\0"):
+                    return  # padding after the last member
+                self._decoder = zlib.decompressobj(wbits=31)
+            self._started = True
+            body.extend(self._decoder.decompress(data, self._limit - len(body) + 1))
+            if self._decoder.unconsumed_tail or len(body) > self._limit:
+                raise UrlFetchError(self._too_large)
+            data = self._decoder.unused_data if self._decoder.eof else b""
+
+    def complete(self) -> bool:
+        """Every member ended (an empty body is complete: there was nothing to decode)."""
+
+        return not self._started or self._decoder.eof
+
+
 def _read_body(
     response: httpx.Response, limit: int, host: str, remaining: Callable[[str], float]
 ) -> bytes:
@@ -651,19 +681,21 @@ def _read_body(
             f"'{host}' sent the document with an unsupported Content-Encoding "
             f"({', '.join(codings)}); nothing was fetched."
         )
-    decoder = zlib.decompressobj(wbits=31) if codings else None
+    gzip = _GzipBody(limit, too_large) if codings else None
     body = bytearray()
     try:
         for piece in response.iter_raw():
-            if decoder is None:
+            if gzip is None:
                 body.extend(piece)
             else:
-                body.extend(decoder.decompress(piece, limit - len(body) + 1))
-                if decoder.unconsumed_tail:
-                    raise UrlFetchError(too_large)
+                gzip.feed(piece, body)
             if len(body) > limit:
                 raise UrlFetchError(too_large)
             remaining(host)
+        if gzip is not None and not gzip.complete():
+            # No end of stream: a connection closed early, with no Content-Length for
+            # httpx to notice it by. Indexing what arrived would store half a document.
+            raise UrlFetchError(f"The gzip body from '{host}' was cut off; nothing was fetched.")
     except zlib.error as exc:
         raise UrlFetchError(f"The gzip body from '{host}' could not be decoded.") from exc
     except httpx.TimeoutException as exc:

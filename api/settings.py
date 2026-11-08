@@ -265,6 +265,13 @@ class AppSettings(BaseSettings):
     # POST /import: the largest backup zip (GET /export) accepted. Each original inside
     # is still held to max_upload_bytes.
     max_import_bytes: PositiveInt = 256 * 1024 * 1024
+    # POST /documents/archive: a zip of documents, each indexed as its own. At most this
+    # many members are looked at; what they expand to in all is held to
+    # MAX_IMPORT_BYTES, and each one to MAX_UPLOAD_BYTES. The zip itself is an upload
+    # (MAX_UPLOAD_BYTES).
+    max_archive_members: PositiveInt = 500
+    # POST /documents/from-sitemap: the most pages one sitemap or feed adds.
+    sitemap_max_pages: PositiveInt = 100
     # Real dense-model subword tokens (api/chunking.py counts with the model's own
     # tokenizer). bge-small hard-truncates at 512 tokens; the chunker reserves headroom
     # for the contextual-embedding prefix and never exceeds this budget, so the embedded
@@ -297,6 +304,11 @@ class AppSettings(BaseSettings):
     # indefinitely, competing with questions for the GIL. 0 parses in the API process
     # with no limit.
     parse_timeout_seconds: float = Field(default=300.0, ge=0)
+    # An address-space cap (MB) on that child process, Linux only (ignored elsewhere and
+    # when PARSE_TIMEOUT_SECONDS is 0): a parser running away fails the one document with
+    # a named error instead of drawing the container's OOM killer. 0 = no cap. Address
+    # space is larger than resident memory (native libraries map a lot); leave headroom.
+    parse_memory_limit_mb: int = Field(default=0, ge=0)
 
     # Chunks are embedded and upserted in batches of this size rather than all at
     # once, so a single huge document reports incremental job progress and never
@@ -387,6 +399,17 @@ class AppSettings(BaseSettings):
     query_log_enabled: bool = False
     query_log_path: str = "./data/query_log.db"
     query_log_max_rows: PositiveInt = 20_000
+    # Per-workspace relevance settings (PUT /workspaces/{name}/settings) are kept here
+    # (sqlite) to survive a restart; empty keeps them in memory only.
+    workspace_settings_path: str = ""
+    # Record each candidate's rank on the dense and the sparse leg in its trace (which
+    # side found it). Free when fusion runs in the app; with Qdrant's own fusion it
+    # costs one more query per question, so it is off by default.
+    trace_leg_ranks: bool = False
+    # POST /query-log/recheck stops searching after this long and returns what it has
+    # (stopped_early): a proxy times a long request out (nginx's default is 60 s). 0 =
+    # no limit.
+    recheck_time_budget_seconds: float = Field(default=45.0, ge=0)
 
     # After rerank, each selected chunk's context is expanded with up to this many
     # neighboring chunks (by chunk_ordinal) on each side from the same document —
@@ -529,6 +552,11 @@ class AppSettings(BaseSettings):
     # deleted by WATCH_DELETE_MISSING. Empty = every supported file.
     watch_include: str = Field(default="", max_length=4000)
     watch_exclude: str = Field(default="", max_length=4000)
+    # More watched folders, each into its own workspace: "path=>workspace;path2=>ws2"
+    # (no "=>workspace": the default one). Alongside WATCH_DIR, with the same interval,
+    # filters and deletion rule; the same folder twice, or one inside another, stops
+    # startup.
+    watch_dirs: str = Field(default="", max_length=8000)
 
     url_ingest_enabled: bool = False
     url_ingest_allow_private: bool = False

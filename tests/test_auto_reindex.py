@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from qdrant_client import QdrantClient
 
-from api.auto_reindex import ReindexTarget, StaleReindexer
+from api.auto_reindex import StaleReindexer
 from api.chunking import HeuristicTokenCounter
 from api.ingest_jobs import IngestQueue
 from api.ingest_service import IngestService
@@ -20,6 +20,7 @@ from api.qdrant_schema import CollectionSchemaError
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.settings import AppSettings
+from api.workspace_target import WorkspaceTarget
 from tests.factories import wait_until
 from tests.routes_http.support import FakeEmbeddingProvider, make_settings
 
@@ -60,7 +61,7 @@ def _reindexer(
     return StaleReindexer(
         current,
         repository,
-        lambda: [ReindexTarget(current, store, queue)],
+        lambda: [WorkspaceTarget(current, store, queue)],
         jobs,
         counter,
     )

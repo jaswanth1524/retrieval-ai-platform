@@ -11,6 +11,7 @@ settings change): what moved in the ranking, and which settings differed.
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import itertools
 from collections.abc import Sequence
@@ -39,6 +40,9 @@ class ScoreReport:
     # Traces whose top score lies between the current bar and the suggested one: the
     # questions the suggestion would decide differently.
     would_change: int
+    # Traces not counted: scored by another cross-encoder, or picked passages (which
+    # skip the bar), or summaries.
+    left_out: int = 0
 
 
 def _histogram(scores: Sequence[float]) -> list[int]:
@@ -56,27 +60,49 @@ def _best_bar(answered: Sequence[float], unanswered: Sequence[float]) -> tuple[f
 
     scores = sorted({*answered, *unanswered})
     candidates = [0.0, *((low + high) / 2 for low, high in itertools.pairwise(scores)), 1.0]
+    # Sorted once, each bar's count by bisection: the archive can hold thousands of
+    # traces, and a count over both lists per bar was quadratic.
+    ordered_answered = sorted(answered)
+    ordered_unanswered = sorted(unanswered)
     best: tuple[float, int] | None = None
     for bar in candidates:
-        wrong = sum(score < bar for score in answered) + sum(score >= bar for score in unanswered)
+        wrong = bisect.bisect_left(ordered_answered, bar) + (
+            len(ordered_unanswered) - bisect.bisect_left(ordered_unanswered, bar)
+        )
         if best is None or wrong < best[1]:
             best = (bar, wrong)
     assert best is not None
     return best
 
 
-def score_report(summaries: Sequence[TraceSummary], current_min_score: float) -> ScoreReport:
+def score_report(
+    summaries: Sequence[TraceSummary],
+    current_min_score: float,
+    reranker_model: str | None = None,
+) -> ScoreReport:
     """The top rerank score of each traced question, answered against not answered.
 
     Traces with no score (nothing was reranked) or no answer status (errors, traces
     from before statuses were kept) are left out. "uncited" answers count as answered:
-    the passages were there.
+    the passages were there. Counted apart (``left_out``): traces scored by another
+    cross-encoder than ``reranker_model`` (scores don't compare across models),
+    questions about picked passages (they skip the bar, so their low scores would pull
+    it down) and summaries.
     """
 
     answered: list[float] = []
     unanswered: list[float] = []
+    left_out = 0
     for summary in summaries:
         if summary.top_rerank_score is None or summary.answer_status is None:
+            continue
+        other_model = (
+            reranker_model is not None
+            and summary.reranker_model is not None
+            and summary.reranker_model != reranker_model
+        )
+        if other_model or not summary.gated or summary.kind != "question":
+            left_out += 1
             continue
         side = unanswered if summary.answer_status in UNANSWERED_STATUSES else answered
         side.append(float(summary.top_rerank_score))
@@ -109,6 +135,7 @@ def score_report(summaries: Sequence[TraceSummary], current_min_score: float) ->
         suggested_min_score=suggested,
         note=note,
         would_change=would_change,
+        left_out=left_out,
     )
 
 
@@ -117,6 +144,8 @@ class CandidateChange:
     point_id: str
     filename: str
     page: int
+    # Told apart from another passage on the same page by its section.
+    section: str
     chunk_id: str
     # 1-based rank by rerank score among each trace's scored candidates; None when the
     # candidate wasn't in that trace (or wasn't scored).
@@ -143,8 +172,34 @@ class TraceDiff:
     question_b: str
     same_answer: bool
     settings: list[SettingChange]
-    # Only candidates whose rank, selection or drop reason differ.
+    # Only candidates whose rank, score (by SCORE_CHANGE_MIN or more), selection or
+    # drop reason differ.
     candidates: list[CandidateChange]
+
+
+# TraceConfig fields older traces lack (None there), compared only when both have them.
+_RECORDED_LATER = frozenset(
+    {
+        "rerank_candidates",
+        "rerank_relative_floor",
+        "recency_boost_weight",
+        "query_expansion_enabled",
+        "reranker_onnx_file",
+        "context_neighbor_max_chars",
+        "context_neighbor_radius",
+        "rerank_fallback_count",
+        "reranker_model",
+        "llm_model",
+    }
+)
+# A score that moved less than this is the same (int8 scores shift with batching).
+SCORE_CHANGE_MIN = 0.01
+
+
+def _score_moved(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) >= SCORE_CHANGE_MIN
 
 
 def _ranked(candidates: Sequence[TraceCandidate]) -> dict[str, tuple[int, TraceCandidate]]:
@@ -168,7 +223,9 @@ def trace_diff(a: QueryTrace, b: QueryTrace) -> TraceDiff:
         for field in dataclasses.fields(a.config):
             value_a = getattr(a.config, field.name)
             value_b = getattr(b.config, field.name)
-            if value_a != value_b:
+            # One trace from before the setting was recorded: not a difference.
+            unrecorded = (value_a is None) != (value_b is None) and field.name in _RECORDED_LATER
+            if value_a != value_b and not unrecorded:
                 settings.append(SettingChange(field.name, value_a, value_b))
     ranked_a = _ranked(a.candidates)
     ranked_b = _ranked(b.candidates)
@@ -182,6 +239,7 @@ def trace_diff(a: QueryTrace, b: QueryTrace) -> TraceDiff:
             point_id=point_id,
             filename=some.filename,
             page=some.page,
+            section=some.section,
             chunk_id=some.chunk_id,
             rank_a=rank_a or None,
             rank_b=rank_b or None,
@@ -196,6 +254,7 @@ def trace_diff(a: QueryTrace, b: QueryTrace) -> TraceDiff:
             change.rank_a != change.rank_b
             or change.selected_a != change.selected_b
             or change.drop_reason_a != change.drop_reason_b
+            or _score_moved(change.score_a, change.score_b)
         ):
             changes.append(change)
     return TraceDiff(
