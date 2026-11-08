@@ -19,11 +19,16 @@ export function useCitationPreview() {
   // dismissed without moving the pointer or focus).
   useEffect(() => {
     if (!hoveredCitation) return;
+    // Captured, and stopped there: this Escape is the preview's alone. Reaching the
+    // composer too, it also stopped the answer being written.
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setHoveredCitation(null);
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      event.preventDefault();
+      setHoveredCitation(null);
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [hoveredCitation]);
   // A pointer or focus on a citation usually precedes a click on it: the viewer's code
   // and its first page start loading now, so the click opens it without waiting.

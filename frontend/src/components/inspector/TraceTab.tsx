@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { TraceDetailResponse } from '../../api/types';
 import { formatCost } from '../../utils/cost';
+import TraceRerun from './TraceRerun';
 
 interface TraceTabProps {
   trace: TraceDetailResponse;
@@ -153,6 +154,7 @@ function TraceTab({ trace }: TraceTabProps) {
         ) : null}
       </p>
       <TraceIds trace={trace} />
+      <TraceRerun trace={trace} />
       {trace.error && (
         // A stream that failed late has timings too: the error used to be hidden then.
         <p className="trace-tab__error" role="note" data-testid="trace-error">

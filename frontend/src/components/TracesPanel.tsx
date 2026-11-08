@@ -15,6 +15,8 @@ interface TracesPanelProps {
   /** Download every trace of this workspace as JSON Lines (full key only). */
   onExport?: () => void;
   exporting?: boolean;
+  /** The full key: the score report's suggested bar can be set for this workspace. */
+  canApplySuggestion?: boolean;
 }
 
 function latencyClass(totalMs: number | null): string {
@@ -39,6 +41,7 @@ function TracesPanel({
   exporting = false,
   answerFilter = 'any',
   onAnswerFilter,
+  canApplySuggestion = false,
 }: TracesPanelProps) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
@@ -139,7 +142,9 @@ function TracesPanel({
           </button>
         )}
       </div>
-      {showReport && <ScoreReportView onClose={() => setShowReport(false)} />}
+      {showReport && (
+        <ScoreReportView onClose={() => setShowReport(false)} canApply={canApplySuggestion} />
+      )}
       {comparing?.length === 2 && (
         <TraceDiffView a={comparing[0]} b={comparing[1]} onClose={() => setComparing(null)} />
       )}

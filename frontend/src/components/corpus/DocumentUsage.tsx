@@ -18,7 +18,7 @@ interface DocumentUsageProps {
 }
 
 /** "Questions that cited this": the answers here that cite the document, and with the
- *  query log on, every logged question whose answer was drawn from it — to see which
+ *  query log on, every logged question whose answer cited it — to see which
  *  documents are relied on and which are never used. */
 export default function DocumentUsage({
   filename,
@@ -77,10 +77,10 @@ export default function DocumentUsage({
           {logged !== null && (
             <p data-testid="corpus-usage-logged">
               {logged.length === 0
-                ? 'No logged question drew on it.'
+                ? 'No logged question cited it.'
                 : `${logged.length >= 200 ? '200+' : logged.length} logged question${
                     logged.length === 1 ? '' : 's'
-                  } drew on it, the latest: “${logged[0].question}”.`}
+                  } cited it, the latest: “${logged[0].question}”.`}
             </p>
           )}
         </>

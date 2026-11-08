@@ -21,11 +21,15 @@ export function listedConversations(
   conversations: readonly ConversationSummary[],
   filter: ListFilter,
   workspace: string,
+  label: string | null = null,
 ): ConversationSummary[] {
+  const wanted = label?.toLocaleLowerCase() ?? null;
   const shown = conversations.filter(
     (conversation) =>
       (filter === 'all' || (conversation.savedCount ?? 0) > 0) &&
-      (workspace === ALL_WORKSPACES || (conversation.workspace ?? '') === workspace),
+      (workspace === ALL_WORKSPACES || (conversation.workspace ?? '') === workspace) &&
+      (wanted === null ||
+        (conversation.labels ?? []).some((candidate) => candidate.toLocaleLowerCase() === wanted)),
   );
   return [
     ...shown.filter((conversation) => conversation.pinned),

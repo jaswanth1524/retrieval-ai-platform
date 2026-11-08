@@ -22,6 +22,10 @@ interface ChatHeaderProps {
   onOpenPalette: () => void;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
+  /** Copy a link back to this conversation (it opens in this browser). */
+  onCopyLink?: () => void;
+  /** What the conversation's answers used, as one label ("4,210 tokens · $0.0123"). */
+  usageLabel?: string | null;
 }
 
 function ChatHeader({
@@ -36,6 +40,8 @@ function ChatHeader({
   onOpenPalette,
   inspectorOpen,
   onToggleInspector,
+  onCopyLink,
+  usageLabel = null,
 }: ChatHeaderProps) {
   // App keys this component by conversation, so a pending confirm can't carry over to
   // a different conversation.
@@ -65,6 +71,17 @@ function ChatHeader({
           >
             Export
           </button>
+          {onCopyLink && (
+            <button
+              type="button"
+              className="chat-header__action chat-header__link"
+              onClick={onCopyLink}
+              title="A link back to this conversation (opens in this browser)"
+              data-testid="chat-header-link"
+            >
+              Link
+            </button>
+          )}
           {confirmingClear ? (
             <ConfirmInline
               tone="main"
@@ -91,6 +108,15 @@ function ChatHeader({
             </button>
           )}
         </div>
+      )}
+      {usageLabel && (
+        <span
+          className="chat-header__usage mono"
+          title="What this conversation's answers used (the cost is an estimate)"
+          data-testid="chat-header-usage"
+        >
+          {usageLabel}
+        </span>
       )}
       <div className="chat-header__spacer" />
       <div

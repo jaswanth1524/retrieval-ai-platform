@@ -30,6 +30,9 @@ export type QuestionStreamEvent =
       passages_left_out?: number;
       chunks_read?: number;
       chunks_total?: number;
+      /** Summaries: parts left out after failing twice, and notes cut off at the limit. */
+      parts_skipped?: number;
+      notes_truncated?: number;
       usage?: UsageResponse | null;
     }
   | { type: 'followups'; questions: string[] }

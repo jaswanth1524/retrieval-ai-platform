@@ -84,4 +84,6 @@ export interface DocCard {
   uploadedAt?: number;
   sourceUrl?: string;
   urlRefresh?: UrlRefreshStatusResponse;
+  /** Other indexed documents with exactly the same bytes. */
+  sameAs?: string[];
 }

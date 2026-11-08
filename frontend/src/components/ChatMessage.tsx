@@ -16,14 +16,17 @@ import { formatTurnTime, withCitationFootnotes } from '../utils/exportChat';
 import { citationNumberFromHref, linkCitations } from '../utils/citations';
 import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
 import { pageLabel } from '../utils/pages';
-import CitationCard from './CitationCard';
 import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
+import AnswerFlags from './chat/AnswerFlags';
+import AnswerVersions from './chat/AnswerVersions';
+import ReformatMenu, { type ReformatStyle } from './chat/ReformatMenu';
+import AnswerSources from './chat/AnswerSources';
+import QuestionTurn from './chat/QuestionTurn';
+import { type AskAgain, askAgain } from './chat/askAgain';
+import { quotesOf } from './chat/quotes';
 import { STREAMING_STAGE_LABELS } from '../utils/stages';
 import './ChatMessage.css';
-import { isImeComposing } from '../utils/keyboard';
-import { enterAddsNewline } from '../utils/platform';
-import { MAX_QUESTION_CHARS } from '../utils/limits';
 import { formatCost } from '../utils/cost';
 
 // Answers quote retrieved documents, and a poisoned document can steer the model into
@@ -178,6 +181,16 @@ export interface ChatTurn {
   passagesLeftOut?: number;
   // Asked within some documents or tags, not the whole corpus.
   scoped?: boolean;
+  // Earlier answers to the same question, oldest first (Regenerate, Reformat keep them).
+  versions?: AnswerVersion[];
+}
+
+/** An earlier answer kept on a regenerated one (utils/answerVersions). */
+export interface AnswerVersion {
+  content: string;
+  sources: CitationResponse[];
+  timestamp: number;
+  model?: string;
 }
 
 interface ChatMessageProps {
@@ -234,6 +247,15 @@ interface ChatMessageProps {
   onToggleSaved?: (turnId: string, saved: boolean) => void;
   /** Whether a cited document was deleted or uploaded again after this answer. */
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
+  /** Copy a link back to this answer (it opens in this browser). */
+  onCopyLink?: (turnId: string) => void;
+  /** Ask this answer's question again in another shape or language (Reformat). */
+  onReformat?: (
+    question: string,
+    narrowing: PassageNarrowing | undefined,
+    style: ReformatStyle,
+    replaces: string,
+  ) => void;
   /** This turn's position among the conversation's answers (1-based), for its label. */
   answerNumber?: number;
 }
@@ -270,29 +292,12 @@ function groundingNotes(turn: ChatTurn): string[] {
   return notes;
 }
 
-/** Ask a question again: its task (a summary) and its narrowing, when it had them. */
-export type AskAgain = (question: string, task?: DocumentTask, narrowing?: PassageNarrowing) => void;
-
-/** Ask again, naming the task and narrowing only when there are some (a plain
- *  question keeps its one-argument call). */
-function askAgain(
-  ask: AskAgain,
-  question: string,
-  task: DocumentTask | undefined,
-  narrowing?: PassageNarrowing,
-): void {
-  if (narrowing) ask(question, task, narrowing);
-  else if (task) ask(question, task);
-  else ask(question);
-}
+export type { AskAgain } from './chat/askAgain';
 
 function formatDuration(totalMs: number): string {
   return `${(totalMs / 1000).toFixed(2)}s`;
 }
 
-function quotesOf(source: CitationResponse): string[] | undefined {
-  return source.spans?.length ? source.spans.map((span) => span.quote) : undefined;
-}
 
 function ChatMessage({
   turn,
@@ -322,6 +327,8 @@ function ChatMessage({
   onToggleSaved,
   sourceChangeOf,
   answerNumber,
+  onCopyLink,
+  onReformat,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -377,28 +384,6 @@ function ChatMessage({
   };
 
   const [alerting] = useState(() => announceOnce(turn));
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(turn.content);
-  // A cancelled edit hands focus back to ✎: the editor unmounting dropped it to <body>.
-  // (A sent edit opens a new conversation, which moves focus on its own.)
-  const editButtonRef = useRef<HTMLButtonElement>(null);
-  const refocusEditRef = useRef(false);
-  const cancelEdit = () => {
-    refocusEditRef.current = true;
-    setEditing(false);
-  };
-  useEffect(() => {
-    if (editing || !refocusEditRef.current) return;
-    refocusEditRef.current = false;
-    editButtonRef.current?.focus();
-  }, [editing]);
-  const submitEdit = () => {
-    const question = draft.trim();
-    if (!question || !onEditQuestion) return;
-    setEditing(false);
-    onEditQuestion(turn.id, question);
-  };
-
   const handleCopy = () => {
     // The answer's [n] markers would dangle without their sources, so the copy carries
     // them as footnotes — the same lines the Markdown export writes.
@@ -454,87 +439,7 @@ function ChatMessage({
       }
     >
       {turn.role === 'user' && (
-        <div className="chat-message__row">
-          <span className="chat-message__gutter" aria-hidden="true">
-            Q
-          </span>
-          {editing ? (
-            <form
-              className="chat-message__edit"
-              onSubmit={(event) => {
-                event.preventDefault();
-                submitEdit();
-              }}
-            >
-              <textarea
-                className="chat-message__edit-input"
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (isImeComposing(event)) return;
-                  if (event.key === 'Escape') {
-                    event.stopPropagation();
-                    cancelEdit();
-                  } else if (event.key === 'Enter' && !event.shiftKey && !enterAddsNewline()) {
-                    event.preventDefault();
-                    submitEdit();
-                  }
-                }}
-                aria-label="Edit question"
-                maxLength={MAX_QUESTION_CHARS}
-                rows={2}
-                autoFocus
-                data-testid="chat-message-edit-input"
-              />
-              <div className="chat-message__edit-actions">
-                <button type="submit" disabled={busy || !draft.trim()} data-testid="chat-message-edit-send">
-                  Ask as new chat
-                </button>
-                <button type="button" onClick={cancelEdit}>
-                  Cancel
-                </button>
-              </div>
-            </form>
-          ) : (
-            <>
-              <p className="chat-message__question" dir="auto">{turn.content}</p>
-              {/* A summary's text is a label, not the request: editing it would send a
-                  plain question, so summaries are asked again from the corpus panel. */}
-              {onEditQuestion && !turn.task && (
-                <button
-                  ref={editButtonRef}
-                  type="button"
-                  className="chat-message__edit-button"
-                  onClick={() => {
-                    if (busy) return;
-                    setDraft(turn.content);
-                    setEditing(true);
-                  }}
-                  aria-disabled={busy || undefined}
-                  aria-label="Edit this question"
-                  title="Edit and ask again in a new chat"
-                  data-testid="chat-message-edit"
-                >
-                  ✎
-                </button>
-              )}
-            </>
-          )}
-        </div>
-      )}
-      {turn.role === 'user' && unanswered && onRetry && !editing && (
-        <div className="chat-message__unanswered" data-testid="chat-message-unanswered">
-          <span>No answer to this question.</span>
-          <button
-            type="button"
-            className="chat-message__action"
-            onClick={() => !busy && askAgain(onRetry, turn.content, turn.task, turn.narrowing)}
-            aria-disabled={busy || undefined}
-            data-testid="chat-message-ask-again"
-          >
-            Ask again
-          </button>
-        </div>
+        <QuestionTurn turn={turn} busy={busy} unanswered={unanswered} onRetry={onRetry} onEditQuestion={onEditQuestion} />
       )}
 
       {turn.role === 'assistant' && (
@@ -569,89 +474,7 @@ function ChatMessage({
               </div>
             )}
             <div className="chat-message__meta-row">
-              {turn.stopped && (
-                <span className="chat-message__flag" data-testid="chat-message-stopped">
-                  stopped
-                </span>
-              )}
-              {turn.incomplete && (
-                <span
-                  className="chat-message__flag"
-                  title="The connection failed before this answer finished"
-                  data-testid="chat-message-incomplete"
-                >
-                  incomplete
-                </span>
-              )}
-              {turn.cached && (
-                <span
-                  className="chat-message__flag"
-                  title="Answered from the server's cache — Regenerate asks again"
-                  data-testid="chat-message-cached"
-                >
-                  cached
-                </span>
-              )}
-              {turn.notFound && (
-                <span className="chat-message__flag" data-testid="chat-message-not-found">
-                  {turn.scoped ? 'not in the selected documents' : 'not in your documents'}
-                </span>
-              )}
-              {turn.autoCited && (
-                <span className="chat-message__flag chat-message__flag--warn" data-testid="chat-message-auto-cited">
-                  auto-cited
-                </span>
-              )}
-              {turn.weakMatch && !turn.notFound && (
-                <span
-                  className="chat-message__flag chat-message__flag--warn"
-                  title="No passage matched this question closely; the answer comes from the nearest ones — check it against its sources"
-                  data-testid="chat-message-weak-match"
-                >
-                  weak match
-                </span>
-              )}
-              {weakSupportBelow !== undefined &&
-                !turn.weakMatch &&
-                typeof turn.topRerankScore === 'number' &&
-                turn.topRerankScore < weakSupportBelow &&
-                !turn.notFound &&
-                turn.sources.length > 0 && (
-                  <span
-                    className="chat-message__flag chat-message__flag--warn"
-                    title={`The best passage found scored ${turn.topRerankScore.toFixed(2)}, just over the bar for being used at all — the documents may only touch on this`}
-                    data-testid="chat-message-weak-support"
-                  >
-                    weakly supported
-                  </span>
-                )}
-              {turn.uncited && (
-                <span
-                  className="chat-message__flag chat-message__flag--warn"
-                  title="The answer cites none of the passages it was given — check it against your documents"
-                  data-testid="chat-message-uncited"
-                >
-                  no sources cited
-                </span>
-              )}
-              {turn.coverage && (
-                <span
-                  className="chat-message__flag"
-                  title="The document is longer than one summary reads (SUMMARY_MAX_BATCHES): it was read at evenly spaced passages"
-                  data-testid="chat-message-coverage"
-                >
-                  read {turn.coverage.read} of {turn.coverage.total} passages
-                </span>
-              )}
-              {turn.truncated && (
-                <span
-                  className="chat-message__flag chat-message__flag--warn"
-                  title="The model reached its output limit (LLM_MAX_TOKENS) and stopped mid-answer"
-                  data-testid="chat-message-truncated"
-                >
-                  cut off
-                </span>
-              )}
+              <AnswerFlags turn={turn} weakSupportBelow={weakSupportBelow} />
               <time
                 className="chat-message__timestamp mono"
                 dateTime={new Date(turn.timestamp).toISOString()}
@@ -666,6 +489,17 @@ function ChatMessage({
                   data-testid="chat-message-copy"
                 >
                   {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
+                </button>
+              )}
+              {turn.content && onCopyLink && !streamStage && (
+                <button
+                  type="button"
+                  className="chat-message__copy"
+                  onClick={() => onCopyLink(turn.id)}
+                  title="A link back to this answer (opens in this browser)"
+                  data-testid="chat-message-link"
+                >
+                  Link
                 </button>
               )}
               {turn.content && onToggleSaved && !streamStage && !turn.incomplete && (
@@ -690,13 +524,32 @@ function ChatMessage({
                   aria-disabled={busy || undefined}
                   onClick={() =>
                     !busy &&
-                    askAgain(onRegenerate ?? onRetry, regenerateQuestion, regenerateTask, regenerateNarrowing)
+                    askAgain(
+                      onRegenerate ?? onRetry,
+                      regenerateQuestion,
+                      regenerateTask,
+                      regenerateNarrowing,
+                      onRegenerate ? turn.id : undefined,
+                    )
                   }
                   data-testid="chat-message-regenerate"
                 >
                   Regenerate
                 </button>
               )}
+              {turn.content &&
+                regenerateQuestion &&
+                onReformat &&
+                !regenerateTask &&
+                !streamStage &&
+                !turn.incomplete && (
+                  <ReformatMenu
+                    disabled={busy}
+                    onReformat={(style) =>
+                      onReformat(regenerateQuestion, regenerateNarrowing, style, turn.id)
+                    }
+                  />
+                )}
               {turn.content &&
                 feedbackEnabled &&
                 regenerateQuestion &&
@@ -761,68 +614,38 @@ function ChatMessage({
                 )}
               </div>
             )}
-            {turn.contextSources && turn.contextSources.length > 0 && (
-              <details className="chat-message__closest" data-testid="chat-message-closest">
-                <summary>
-                  Passages it read ({turn.contextSources.length}) — none answered the question
-                </summary>
-                <div className="chat-message__citations">
-                  {turn.contextSources.map((source) => (
-                    <CitationCard
-                      key={`${turn.id}-context-${source.source_number}`}
-                      sourceNumber={source.source_number}
-                      filename={source.filename}
-                      page={source.page}
-                      pageEnd={source.page_end}
-                      section={source.section}
-                      onOpen={onOpenSource ? () => onOpenSource(source.filename, source.chunk_id) : undefined}
-                    />
-                  ))}
-                </div>
-              </details>
+            {turn.versions && turn.versions.length > 0 && !streamStage && (
+              <AnswerVersions
+                versions={turn.versions}
+                components={MARKDOWN_COMPONENTS}
+                onOpenSource={onOpenSource ? (filename, chunkId) => onOpenSource(filename, chunkId) : undefined}
+              />
             )}
-            {turn.sources.length > 0 && (
-              <div className="chat-message__citations" data-testid="chat-message-sources">
-                {turn.sources.map((source) => (
-                  <CitationCard
-                    key={`${turn.id}-${source.source_number}`}
-                    sourceNumber={source.source_number}
-                    filename={source.filename}
-                    page={source.page}
-                    pageEnd={source.page_end}
-                    section={source.section}
-                    onOpen={
-                      onOpenSource
-                        ? () => onOpenSource(source.filename, source.chunk_id, quotesOf(source))
-                        : undefined
-                    }
-                    onHoverStart={onCitationHover ? () => onCitationHover(source) : undefined}
-                    onHoverEnd={onCitationLeave}
-                    onNotRelevant={
-                      feedbackEnabled && onFeedback && regenerateQuestion && !streamStage
-                        ? () => markNotRelevant(source)
-                        : undefined
-                    }
-                    markedNotRelevant={turn.irrelevantSources?.includes(source.source_number)}
-                    score={source.rerank_score}
-                    change={sourceChangeOf?.(source.filename, turn.timestamp)}
-                    onAskWithout={
-                      regenerateQuestion && onRetry && !regenerateTask && !streamStage && !turn.incomplete
-                        ? () =>
-                            askAgain(onRegenerate ?? onRetry, regenerateQuestion, undefined, {
-                              ...regenerateNarrowing,
-                              exclude_chunk_ids: [
-                                ...(regenerateNarrowing?.exclude_chunk_ids ?? []),
-                                source.chunk_id,
-                              ].slice(-100),
-                            })
-                        : undefined
-                    }
-                    askDisabled={busy}
-                  />
-                ))}
-              </div>
-            )}
+            <AnswerSources
+              turn={turn}
+              busy={busy}
+              onOpenSource={onOpenSource}
+              onCitationHover={onCitationHover}
+              onCitationLeave={onCitationLeave}
+              sourceChangeOf={sourceChangeOf}
+              onNotRelevant={
+                feedbackEnabled && onFeedback && regenerateQuestion && !streamStage
+                  ? markNotRelevant
+                  : undefined
+              }
+              onAskWithout={
+                regenerateQuestion && onRetry && !regenerateTask && !streamStage && !turn.incomplete
+                  ? (source) =>
+                      askAgain(onRegenerate ?? onRetry, regenerateQuestion, undefined, {
+                        ...regenerateNarrowing,
+                        exclude_chunk_ids: [
+                          ...(regenerateNarrowing?.exclude_chunk_ids ?? []),
+                          source.chunk_id,
+                        ].slice(-100),
+                      })
+                  : undefined
+              }
+            />
             {turn.followups && onAskFollowup && !streamStage && (
               <div className="chat-message__followups" role="group" aria-label="Suggested follow-up questions">
                 {turn.followups.map((question) => (

@@ -5,6 +5,7 @@ import type { DocumentMeta, UploadItem } from '../components/CorpusPanel';
 import { newId } from '../utils/id';
 import { ingestNote } from '../utils/ingestNotes';
 import { createLimiter } from '../utils/pool';
+import { isArchive } from '../utils/uploadValidation';
 import type { ToastInput } from './useToasts';
 
 // With the server's 15 s Retry-After, about 10 minutes of waiting for a full queue.
@@ -42,6 +43,32 @@ function documentsFrom(response: DocumentListResponse): Record<string, DocumentM
     };
   }
   return documents;
+}
+
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/** `next`, with each record equal to its `prev` one replaced by it — and `prev` itself
+ *  when nothing changed — so consumers comparing by identity see no change. */
+export function keepUnchanged(
+  prev: Record<string, DocumentMeta>,
+  next: Record<string, DocumentMeta>,
+): Record<string, DocumentMeta> {
+  const names = Object.keys(next);
+  let same = names.length === Object.keys(prev).length;
+  const kept: Record<string, DocumentMeta> = {};
+  for (const name of names) {
+    const old = prev[name];
+    // Plain JSON-shaped records, built in a fixed key order by documentsFrom.
+    if (old !== undefined && JSON.stringify(old) === JSON.stringify(next[name])) {
+      kept[name] = old;
+    } else {
+      kept[name] = next[name];
+      same = false;
+    }
+  }
+  return same ? prev : kept;
 }
 
 export interface CorpusCallbacks {
@@ -111,7 +138,10 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       const response = await api.listDocuments(signal, workspace);
       // Another workspace's listing, from before a switch.
       if (sequence !== listingSequence || !isCurrent(workspace)) return;
-      setIndexedFilenames(response.filenames);
+      // An unchanged listing keeps its objects: the auto refresh re-lists every minute
+      // (a watched folder) or on coming back to the tab, and new objects re-rendered
+      // every answer and every card (their props compare by identity).
+      setIndexedFilenames((prev) => (sameList(prev, response.filenames) ? prev : response.filenames));
       // A document deleted elsewhere (another tab, the API) stayed in scope: the header
       // still named it and the popover — which lists only indexed files — couldn't
       // uncheck it.
@@ -121,7 +151,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         response.filenames,
         response.tags ? Object.values(response.tags).flat() : undefined,
       );
-      setDocuments(documentsFrom(response));
+      setDocuments((prev) => keepUnchanged(prev, documentsFrom(response)));
       // A key that used to be rejected now works — clear the banner.
       deps.current.onAuthRestored();
     };
@@ -391,6 +421,35 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest(workspace);
     };
 
+    // A sitemap or feed: the server fetches and queues its pages one by one; they show
+    // under server activity, and in the list as each is indexed.
+    const handleAddSitemap = async (url: string) => {
+      const workspace = getWorkspace();
+      try {
+        const added = await api.addFromSitemap(url, currentUploadTags(), undefined, workspace);
+        deps.current.pushToast({
+          tone: added.urls.length > 0 ? 'good' : 'warn',
+          title:
+            added.urls.length > 0
+              ? `Adding ${added.urls.length} page${added.urls.length === 1 ? '' : 's'}`
+              : 'No pages to add',
+          body:
+            added.urls.length > 0
+              ? `They are fetched one by one and appear as each is indexed${
+                  added.left_out ? `; ${added.left_out} left out (other sites, duplicates, or past the limit)` : ''
+                }.`
+              : 'The sitemap lists no pages on its own site.',
+        });
+      } catch (err) {
+        if (deps.current.onAuthFailure(err)) return;
+        deps.current.pushToast({
+          tone: 'bad',
+          title: 'The sitemap could not be read',
+          body: apiErrorMessage(err, 'Check the address.'),
+        });
+      }
+    };
+
     const handleReindex = async (filename: string, workspace = getWorkspace()) => {
       const id = newId();
       setUploads((prev) => [...prev, { id, filename, status: 'uploading', reindex: true, workspace }]);
@@ -552,9 +611,62 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       await refreshAfterIngest(workspace);
     };
 
-    const handleUpload = async (files: File[]) => {
+    // A zip: the server indexes each document in it; each gets its own card, followed
+    // like an upload's.
+    const uploadArchive = async (file: File, workspace: string, tags: string[] | undefined) => {
+      let report;
+      try {
+        report = await api.uploadArchive(file, tags, undefined, workspace);
+      } catch (err) {
+        if (deps.current.onAuthFailure(err)) return;
+        deps.current.pushToast({
+          tone: 'bad',
+          title: `${file.name} wasn't uploaded`,
+          body: apiErrorMessage(err, 'The zip could not be read.'),
+        });
+        return;
+      }
+      const left = [
+        ...report.skipped.map((item) => `${item.name}: ${item.reason}`),
+        ...report.deferred.map((name) => `${name}: the indexing queue was full; upload again later`),
+      ];
+      if (left.length > 0) {
+        deps.current.pushToast({
+          tone: 'warn',
+          title: `${report.jobs.length} of ${file.name}'s documents indexing`,
+          body: left.slice(0, 8).join(' · ') + (left.length > 8 ? ` · and ${left.length - 8} more` : ''),
+        });
+      }
+      const items = report.jobs.map((job) => ({ id: newId(), job }));
+      setUploads((prev) => [
+        ...prev,
+        ...items.map(({ id, job }): UploadItem => ({
+          id,
+          filename: job.filename,
+          status: 'uploading',
+          workspace,
+          tags,
+        })),
+      ]);
+      await Promise.allSettled(
+        items.map(({ id, job }) => runIngestJob(id, job.filename, workspace, async () => job)),
+      );
+    };
+
+    const handleUpload = async (allFiles: File[]) => {
       const workspace = getWorkspace();
       const tags = currentUploadTags();
+      const archives = allFiles.filter(isArchive);
+      const files = allFiles.filter((file) => !isArchive(file));
+      // Started, not awaited yet: the files' cards are added at once, as before.
+      const archiveUploads = Promise.allSettled(
+        archives.map((file) => uploadArchive(file, workspace, tags)),
+      );
+      if (files.length === 0) {
+        await archiveUploads;
+        if (archives.length > 0) await refreshAfterIngest(workspace);
+        return;
+      }
       const newItems: UploadItem[] = files.map((file) => ({
         id: newId(),
         filename: file.name,
@@ -568,9 +680,10 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       // at once, then all 20 waited and re-sent together when the queue was full. A file
       // used to hold its slot until it was indexed, so the third one wasn't even sent
       // until the first had finished.
-      await Promise.allSettled(
-        files.map((file, index) => uploadOne(file, newItems[index].id, workspace, tags)),
-      );
+      await Promise.allSettled([
+        archiveUploads,
+        ...files.map((file, index) => uploadOne(file, newItems[index].id, workspace, tags)),
+      ]);
       // Once for the whole batch, not once per file. Chunk counts live server-side and
       // GET /documents scrolls the entire collection to compute them, so refreshing
       // inside uploadOne meant a 20-file drop triggered 20 full-collection scans.
@@ -645,6 +758,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       handleDismissUpload,
       handleCancelUpload,
       handleUploadFromUrl,
+      handleAddSitemap,
       handleReindex,
       handleRestoreVersion,
       handleRefreshFromUrl,

@@ -8,6 +8,8 @@ export interface Toast {
   title: string;
   body?: string;
   tone: ToastTone;
+  /** One button on the toast ("Undo"); pressing it also dismisses the toast. */
+  action?: { label: string; run: () => void };
 }
 
 export type ToastInput = Omit<Toast, 'id'> & { id?: string; sticky?: boolean };
@@ -87,7 +89,13 @@ export function useToasts(): UseToastsResult {
 
       setToasts((prev) => [
         ...prev.filter((candidate) => candidate.id !== id),
-        { id, title: toast.title, body: toast.body, tone: toast.tone },
+        {
+          id,
+          title: toast.title,
+          body: toast.body,
+          tone: toast.tone,
+          ...(toast.action ? { action: toast.action } : {}),
+        },
       ]);
       if (toast.sticky) return id;
       const ms =

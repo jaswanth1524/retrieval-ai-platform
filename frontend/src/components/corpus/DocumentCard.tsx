@@ -20,6 +20,8 @@ interface DocumentCardProps {
   onAskDelete: (key: string) => void;
   onCancelDelete: () => void;
   onConfirmDelete: (filename: string) => void;
+  /** Delete this document's identical copies under other names (it is kept). */
+  onDeleteDuplicates?: (others: string[]) => Promise<void>;
   onRead?: (filename: string) => void;
   /** Scope the open conversation to this document, ready to ask about it. */
   onAskAbout?: (filenames: string[]) => void;
@@ -77,6 +79,7 @@ const DocumentCard = memo(function DocumentCard({
   onAskDelete,
   onCancelDelete,
   onConfirmDelete,
+  onDeleteDuplicates,
   onRead,
   onAskAbout,
   onSummarize,
@@ -96,6 +99,7 @@ const DocumentCard = memo(function DocumentCard({
   onOpenAnswer,
 }: DocumentCardProps) {
   const [showVersions, setShowVersions] = useState(false);
+  const [resolving, setResolving] = useState<'confirm' | 'busy' | null>(null);
   // Read when opened: the answers citing it, as they were then.
   const [usage, setUsage] = useState<SavedAnswer[] | null>(null);
   return (
@@ -157,8 +161,11 @@ const DocumentCard = memo(function DocumentCard({
               <button
                 type="button"
                 className="corpus-panel__read"
-                onClick={() => onSummarize([card.filename])}
-                disabled={disabled || summarizeDisabled}
+                // aria-disabled, not disabled: the summary dialog returns focus here as
+                // the summary starts (which disables summarizing), and a disabled button
+                // can't take it — focus fell to the page.
+                onClick={() => !(disabled || summarizeDisabled) && onSummarize([card.filename])}
+                aria-disabled={disabled || summarizeDisabled || undefined}
                 aria-label={`Summarize ${card.filename}`}
                 title="Summarize the whole document"
                 data-testid="corpus-summarize"
@@ -284,6 +291,36 @@ const DocumentCard = memo(function DocumentCard({
           <span role="status">{`failed — ${card.detail}`}</span>
         ) : (
           <span>{card.detail}</span>
+        )}
+        {card.status === 'indexed' && card.sameAs && onDeleteDuplicates && (
+          <span className="corpus-panel__duplicates">
+            {resolving === null ? (
+              <button
+                type="button"
+                className="corpus-panel__source-refresh"
+                onClick={() => setResolving('confirm')}
+                disabled={disabled}
+                title={`Delete ${card.sameAs.join(', ')} and keep this one`}
+                data-testid="corpus-keep-this"
+              >
+                keep this, delete the others
+              </button>
+            ) : (
+              <ConfirmInline
+                prompt={`Delete ${card.sameAs.join(', ')}?`}
+                confirmLabel="Delete"
+                busy={resolving === 'busy'}
+                disabled={disabled}
+                onCancel={() => setResolving(null)}
+                onConfirm={() => {
+                  const others = card.sameAs ?? [];
+                  setResolving('busy');
+                  void onDeleteDuplicates(others).finally(() => setResolving(null));
+                }}
+                confirmTestId="corpus-keep-this-confirm"
+              />
+            )}
+          </span>
         )}
         {card.status === 'indexed' && card.sourceUrl && (
           <span className="corpus-panel__source">

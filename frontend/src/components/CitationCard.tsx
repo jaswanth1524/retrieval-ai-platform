@@ -48,7 +48,16 @@ function CitationCard({
       className="citation-card"
       {...trigger}
       data-testid="citation-card"
-      aria-label={`Open ${filename} at source ${sourceNumber}`}
+      // The label replaces the button's content for a screen reader: everything the
+      // card shows that matters goes in it (the score and the freshness flag had only
+      // a title, which isn't read).
+      aria-label={[
+        `Open ${filename} at source ${sourceNumber}`,
+        typeof score === 'number' ? `match ${score.toFixed(2)}` : null,
+        change ? SOURCE_CHANGE_LABELS[change] : null,
+      ]
+        .filter(Boolean)
+        .join(', ')}
     >
       <span className="citation-card__index mono">{sourceNumber}</span>
       <span className="citation-card__file">{filename}</span>
@@ -97,8 +106,10 @@ function CitationCard({
       <button
         type="button"
         className="citation-card__irrelevant"
-        onClick={onNotRelevant}
-        disabled={markedNotRelevant || !onNotRelevant}
+        // aria-disabled, not disabled: a disabled button drops keyboard focus to the
+        // page the moment it is marked.
+        onClick={() => !markedNotRelevant && onNotRelevant?.()}
+        aria-disabled={markedNotRelevant || !onNotRelevant || undefined}
         aria-pressed={markedNotRelevant}
         aria-label={
           markedNotRelevant

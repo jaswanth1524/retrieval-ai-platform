@@ -6,6 +6,7 @@ import { formatRelativeTime } from '../utils/relativeTime';
 import { readStored, writeStored } from '../utils/safeStorage';
 import {
   acceptedExtensions,
+  uploadExtensions,
   DEFAULT_MAX_UPLOAD_BYTES,
   extensionsLabel,
   formatBytes,
@@ -83,6 +84,8 @@ interface CorpusPanelProps {
   summarizeDisabled?: boolean;
   /** Index a document the server fetches from a URL; absent when that is off. */
   onUploadFromUrl?: (url: string) => void;
+  /** A sitemap or feed's pages, added in the background. */
+  onAddSitemap?: (url: string) => void;
   /** Offer "Preview a file…" (POST /documents/preview, full key). */
   canPreview?: boolean;
 }
@@ -182,6 +185,7 @@ function CorpusPanel({
   workspace,
   summarizeDisabled = false,
   onUploadFromUrl,
+  onAddSitemap,
   canPreview = false,
   uploadTags,
   onUploadTagsChange,
@@ -215,7 +219,7 @@ function CorpusPanel({
     const { accepted, rejected } = validateUploads(
       Array.from(fileList),
       maxUploadBytes,
-      acceptedExtensions(supportedExtensions),
+      uploadExtensions(supportedExtensions),
     );
     setRejectedFiles(rejected);
     setStagedFiles((prev) => [...prev, ...accepted]);
@@ -341,6 +345,7 @@ function CorpusPanel({
           uploadedAt: meta?.uploadedAt,
           sourceUrl: meta?.sourceUrl,
           urlRefresh: meta?.urlRefresh,
+          ...(meta?.sameAs?.length ? { sameAs: meta.sameAs } : {}),
         };
       });
   }, [filenames, documents, inFlightKey, onReindex]);
@@ -447,6 +452,20 @@ function CorpusPanel({
     (next?.querySelector<HTMLElement>('button, input') ?? searchRef.current)?.focus();
   }, [filenames]);
 
+  // "Keep this, delete the others": a document's identical copies under other names,
+  // deleted one at a time (each takes that document's write lock on the server).
+  const deleteDuplicates = useStableHandler(async (others: string[]) => {
+    const failed: string[] = [];
+    for (const filename of others) {
+      try {
+        await onDelete(filename);
+      } catch {
+        failed.push(filename);
+      }
+    }
+    setDeleteError(failed.length > 0 ? `Couldn't delete: ${failed.join(', ')}` : null);
+  });
+
   const bulkDelete = async () => {
     const failed: string[] = [];
     // One at a time: each delete takes that document's write lock on the server.
@@ -497,12 +516,12 @@ function CorpusPanel({
         onDrop={handleDrop}
         data-testid="upload-dropzone"
       >
-        Drop files &middot; {extensionsLabel(acceptedExtensions(supportedExtensions))}
+        Drop files &middot; {extensionsLabel(uploadExtensions(supportedExtensions))}
         <input
           ref={inputRef}
           type="file"
           className="corpus-panel__input"
-          accept={acceptedExtensions(supportedExtensions).join(',')}
+          accept={uploadExtensions(supportedExtensions).join(',')}
           multiple
           onChange={(event) => {
             handleFilesChange(event.target.files);
@@ -559,7 +578,11 @@ function CorpusPanel({
         </p>
       )}
       {!readOnly && onUploadFromUrl && (
-        <UrlIngestForm disabled={disabled} onSubmit={onUploadFromUrl} />
+        <UrlIngestForm
+          disabled={disabled}
+          onSubmit={onUploadFromUrl}
+          onSubmitSitemap={onAddSitemap}
+        />
       )}
 
       {stagedFiles.length > 0 && (
@@ -741,6 +764,7 @@ function CorpusPanel({
             onAskDelete={setConfirming}
             onCancelDelete={cancelDelete}
             onConfirmDelete={handleDelete}
+            onDeleteDuplicates={readOnly ? undefined : deleteDuplicates}
             onRead={onRead}
             onAskAbout={onAskAbout}
             onSummarize={onSummarize}

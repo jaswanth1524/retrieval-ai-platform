@@ -4,12 +4,15 @@ interface UrlIngestFormProps {
   disabled?: boolean;
   /** Starts indexing the URL's document (a card follows it like an upload). */
   onSubmit: (url: string) => void;
+  /** The URL is a sitemap or feed: its pages are added in the background. */
+  onSubmitSitemap?: (url: string) => void;
 }
 
 /** "From URL": the server fetches the document (URL_INGEST_ENABLED). Only http(s)
  *  is accepted here; the server applies the real checks (public addresses, size). */
-export default function UrlIngestForm({ disabled, onSubmit }: UrlIngestFormProps) {
+export default function UrlIngestForm({ disabled, onSubmit, onSubmitSitemap }: UrlIngestFormProps) {
   const [url, setUrl] = useState('');
+  const [sitemap, setSitemap] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   return (
@@ -24,7 +27,8 @@ export default function UrlIngestForm({ disabled, onSubmit }: UrlIngestFormProps
         }
         setError(null);
         setUrl('');
-        onSubmit(trimmed);
+        if (sitemap && onSubmitSitemap) onSubmitSitemap(trimmed);
+        else onSubmit(trimmed);
       }}
       data-testid="url-ingest-form"
     >
@@ -47,8 +51,20 @@ export default function UrlIngestForm({ disabled, onSubmit }: UrlIngestFormProps
         disabled={disabled || !url.trim()}
         data-testid="url-ingest-submit"
       >
-        Add URL
+        {sitemap ? 'Add its pages' : 'Add URL'}
       </button>
+      {onSubmitSitemap && (
+        <label className="corpus-panel__url-sitemap" title="A sitemap, sitemap index, RSS or Atom feed: every page it lists on that site">
+          <input
+            type="checkbox"
+            checked={sitemap}
+            onChange={(event) => setSitemap(event.target.checked)}
+            disabled={disabled}
+            data-testid="url-ingest-sitemap"
+          />
+          sitemap or feed
+        </label>
+      )}
       {error && (
         <p id="url-ingest-error" className="corpus-panel__reject" role="alert">
           {error}
