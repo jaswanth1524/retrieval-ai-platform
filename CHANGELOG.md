@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11), then three fixes-and-features passes (passes 12, 13 and 14). **Re-index:
+(pass 11), then four fixes-and-features passes (passes 12 to 15). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,57 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 15: a comparison or brief with no focus no longer offers each part the
+  "NOTHING RELEVANT" reply (every part is about a document the task covers whole), and
+  that marker followed by citations ("NOTHING RELEVANT [5-8]") is dropped like the bare
+  one. Measured on the handbook briefs and comparisons (6 jobs × 2 runs): qwen2.5 gave
+  8 of 32 document parts as "nothing relevant", whose briefs then said those documents
+  didn't cover the topic; now 0, with every document's content in the answer (twice
+  under a wrong source number). gpt-5-mini: 0 before and after, every document cited.
+  The combining step of a comparison or brief now also sees which source numbers are
+  each document's ("Notes on b.md, part 1 of 1 (sources [5]-[8])"): qwen2.5's two
+  misnumbered citations went (31 of 31 documents cited in the runs measured, 30 of 32
+  before); gpt-5-mini 32 of 32.
+- Pass 15: streamed answer text is applied every 50 ms (`STREAM_FLUSH_MS`), not every
+  animation frame; the first text still shows at once. Production build, 400 deltas
+  over ~5 s: main-thread scripting per answer 197 → 68 ms, task time 436 → 182 ms, the
+  view still following the end.
+- Pass 15: `ANSWER_FORMAT=table` (and Reformat → table) asks for a table even for a
+  single fact, and for a plain sentence when the sources don't answer. "Where the content
+  allows it" let gpt-5-mini answer a one-fact question in prose after a table was asked
+  for; "say so in prose instead" still got refusals as a one-row table, "write no
+  table" didn't (2 of 2 each). Answers already cached keep their old form until they
+  expire.
+- Pass 15: a parse stopped at `PARSE_TIMEOUT_SECONDS`, or whose process died, is a
+  transient failure (job `error_type` `parse_timeout`), no longer "the file is bad": the
+  folder watcher retries it with its back-off, the background re-index backs off instead
+  of waiting for a new original, and Retry is offered. New `PARSE_MEMORY_LIMIT_MB` (0 =
+  off; Linux) caps the parse process's address space. **None.**
+- Pass 15: a refresh that brings back the same bytes under a new ETag, or a changed
+  refresh interval, no longer empties the workspace's answer cache (no answer reads
+  them); the document listing still shows the change. **None.**
+- Pass 15: a job the job history dropped before a background worker saw it end counts
+  as a failed attempt (back-off and give-up for the folder watcher, back-off for the
+  re-index): a file that kept failing was sent again on every pass. **None.**
+- Pass 15: the query log records what was searched (a follow-up's rewrite), whether a
+  row is a summary, and the best passage's document; the documents a logged question
+  "drew on" are now the ones its answer cited. `POST /query-log/recheck` skips
+  summaries, searches the rewrite, counts a question as covered only when something
+  changed (a better score, another document), reports a failed search per question,
+  and stops after `RECHECK_TIME_BUDGET_SECONDS` (45) with `stopped_early`. **None.**
+- Pass 15: the score report reads every archived trace (it read the newest hundred)
+  and leaves out, with a count, traces scored by another reranker, questions about
+  picked passages and summaries. Trace comparisons see six more ranking settings and
+  score changes. **None.**
+- Pass 15: an answer whose citation retry or query expansion failed is not cached, nor
+  a summary that left a part out. A summary part whose call fails is tried again, then
+  left out (`parts_skipped`; `notes_truncated` for notes cut off) instead of failing
+  the whole summary. **None.**
+- Pass 15: follow-up suggestions are written in the answer's language
+  (`ANSWER_LANGUAGE` or the question's). **None.**
+- Pass 15 (UI): Regenerate and Retry use the current scope's page range with the
+  question's own exclusions (a page range kept from another document searched the
+  wrong one). **None.**
 - Pass 14: a document fetched from a URL is downloaded with only gzip allowed, decoded
   here with its size counted after decoding: a few kilobytes of chained gzip used to
   expand to gigabytes inside the API before the upload limit was checked. Any other
@@ -249,6 +300,43 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 15: backups admin (full key) — `GET /backups` lists `BACKUP_DIR`'s backups of
+  the workspace, each verified when written; `POST /backups/run` writes one now;
+  `POST /backups/{name}/verify` and `POST /backups/verify` (an upload) read a backup
+  through without restoring; `POST /backups/{name}/restore` restores one as `/import`
+  would. `GET /admin/consistency` reports, and never fixes, originals with no document,
+  documents with no original, leftover earlier versions, incomplete, stale and
+  duplicate documents. CLI `docrag backup list|run|verify|restore`, `docrag check`;
+  Settings → Administration.
+- Pass 15: tuning — `POST /traces/{id}/rerun` (read key) searches a traced question
+  again under another bar or passage count and compares the ranking (no answer written;
+  CLI `docrag traces rerun ID --min-score`, Trace tab "Search again"); relevance
+  settings per workspace (`GET`/`PUT /workspaces/{name}/settings`: bar, recency weight,
+  answer language and format; `WORKSPACE_SETTINGS_PATH` keeps them across restarts;
+  the score report's "Use it for this workspace"); `GET`/`DELETE /answer-cache` (full
+  key); each trace candidate's prompt number, whether it was cited, and its dense and
+  BM25 rank (`TRACE_LEG_RANKS` adds one query when Qdrant fuses; off by default).
+  A trace comparison's moved passages carry their `section` (the Trace tab, the score
+  report and `docrag traces diff|rerun` show it), so two on one page read apart.
+- Pass 15: ingest — `POST /documents/from-sitemap` adds the pages a sitemap, sitemap
+  index, RSS or Atom feed lists (same host by default, at most `SITEMAP_MAX_PAGES`,
+  fetched one by one in the background through the guarded URL fetch; CLI `add-url
+  --sitemap`); `POST /documents/archive` indexes each document in a zip as its own
+  (`MAX_ARCHIVE_MEMBERS`; the UI and `docrag ingest` take `.zip`); `.ods`, `.odp`,
+  `.mbox` and `.ipynb` documents; `WATCH_DIRS="path=>workspace;..."` watches several
+  folders. **None** (new formats need no re-index).
+- Pass 15: a summary of part of one document (`page_min`/`page_max`/`section` on
+  `/questions/summary*`; the summary dialog's page fields; CLI `summarize --page-min`).
+- Pass 15: MCP write tools behind `docrag-mcp --allow-writes`: `add_url`, `reindex`,
+  `retry_job`, `job_status` (the full key). `harness retrieval --server URL` scores a
+  running DocRAG through its `/search`.
+- Pass 15 (UI): Undo after deleting a conversation; links back to a conversation or an
+  answer (`#c=…&t=…`, this browser only); a conversation's tokens and cost in its
+  header and export; Regenerate keeps the earlier answers (‹ n/m ›) and a Reformat menu
+  asks again as bullets, a table, shorter or in another language; a "Needs review"
+  panel (not found, weak match, uncited, auto-cited, cut off, a source changed);
+  "keep this, delete the others" on duplicate documents; find in the document viewer
+  (⌘F); conversation labels with a filter.
 - Pass 14: relevance tuning — `GET /traces/score-report` (read key) sets each traced
   question's best rerank score, answered against not answered, as a histogram, and
   suggests a `RERANK_MIN_SCORE` midway across the gap once there are at least 20 of
@@ -737,6 +825,31 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 15: a backup's check survives a restart. Each check is kept beside its file
+  (`.docrag-….zip.check.json`, keyed on size and modification time, so a file changed
+  since reads as unchecked), written by the scheduled write and by `POST
+  /backups/{name}/verify`, and removed with the backup when it is pruned; it used to be
+  memory only, so after a restart every backup listed "not checked".
+- Pass 15: a summary answered from the cache over the stream reports `parts_skipped`
+  and `notes_truncated` (0: only whole summaries are cached), as the first answer did.
+- Pass 15: retrying a failed URL job (or re-queuing one after a restart) no longer
+  replaces a document uploaded under that name since: a 409. **None.**
+- Pass 15: an original that can't be saved (a full disk) no longer takes the document's
+  earlier versions with it. **None.**
+- Pass 15: scheduled backups clean up the partial file a killed process left, report
+  each workspace's last attempt (`backups_failing` on `/health/ready`), and a backup
+  removed meanwhile no longer stops the pass. **None.**
+- Pass 15: a gzip download cut off without a length is refused instead of indexed
+  half-way; one of several gzip members is read whole. **None.**
+- Pass 15: importing the same backup again while its documents are still indexing no
+  longer queues them twice. Bulk re-index names stale documents with no original
+  (`no_original`). A backup carries the watched-folder marker. **None.**
+- Pass 15 (UI): an unchanged document listing no longer re-renders every answer and
+  card; Enter in the edit box while an answer streams keeps the edit; the conversation
+  search box stays while it filters; a send queued during startup no longer goes to
+  another conversation; "Questions that cited this" lists this workspace's answers only;
+  Escape on a citation preview no longer stops the answer; a second citation into the
+  open viewer no longer cancels "Load more". **None.**
 - Pass 14: `POST /documents/{f}/refresh` is a 409 while the document is being indexed
   (a second click fetched again and queued a job that could only fail). **None.**
 - Pass 14: deleting an orphaned original that can't be removed is a 500 naming
@@ -1116,6 +1229,8 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   passage they were reading; it now stays in place.
 
 ### Security
+- Pass 15: with `API_KEY` set, `/health/ready` (which needs no key) no longer shows a
+  backup's workspace, file name or error text. **None.**
 - Pass 14: pypdf 6.21.4 (at least 6.21.4, was 6.21.2), for CVE-2026-119203 to
   CVE-2026-119209: crafted PDFs could loop forever or use large amounts of memory
   (a missing trailer, cloned dictionaries, shared page resources, cross-reference
@@ -1190,6 +1305,9 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   starts.
 
 ### Accessibility
+- Pass 15: a citation card's label includes its match score and "changed since" /
+  "deleted"; "Not relevant" and ∑ keep focus (`aria-disabled`), and the summary dialog
+  hands focus back to its card. **None.**
 - Pass 10: Regenerate, Retry, Ask again, the rating buttons and follow-up suggestions
   stay focusable while they can't act (`aria-disabled`): pressing one used to drop
   keyboard focus to the page for the whole answer. Copying an answer is announced on
@@ -1215,6 +1333,27 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   many it found.
 
 ### Development
+- Pass 15: the Qdrant server tests give their client a 30 s timeout: under load
+  (average ~15) gRPC calls hit the default deadline and passed on a re-run.
+- Pass 15, measured and not done: moving the chat region out of `App`. In the
+  production build a 400-delta answer streamed over ~5 s costs ~0.5 s of scripting
+  (flat from the 1st to the 10th turn of a thread, no long tasks); React's share is
+  ~110 ms (~0.37 ms a frame, the streaming message included), App's own code ~60 ms.
+  The largest parts are the markdown renderer (~165 ms) and `scrollHeight` reads for
+  pinning the view to the bottom (~120 ms). Scrolling only from the ResizeObserver (no
+  read in the layout effect) was tried: the read went, the layout it forced moved to
+  the next step, total time unchanged, so it was left as it was. The 50 ms flush above
+  is what cut the cost.
+- Pass 15: code moved, behaviour unchanged (an identical before/after capture of answer
+  and summary streams, traces and cache state; the OpenAPI document unchanged by it):
+  one enqueue for every fetch of a known URL (`document_ops.enqueue_refreshed`), one
+  `WorkspaceTarget` for the background workers, `api/backoff.py`, `pipeline.cached_run`
+  for answers and summaries, `summarize._run` in three steps over a `SummaryRun`,
+  `sqlite_store.CappedRowLog` under the query log and trace archive, one SSE response
+  helper; on the frontend `QuestionTurn`/`AnswerFlags`/`AnswerSources`,
+  `ScopePopover`, `hooks/streamHandlers.ts` and `hooks/chat/{model,sanitize,persist,
+  merge}.ts` behind `chatPersistence`. Measured and left: moving the chat region out of
+  App (≈2.3 ms of App per streamed frame in a jsdom dev build).
 - Pass 14: code moved, behaviour unchanged (checked with a before/after capture of 30
   answer and summary scenarios, and an unchanged OpenAPI document):
   `api/routes/documents.py` is split into `documents_read`, `documents_write`,
