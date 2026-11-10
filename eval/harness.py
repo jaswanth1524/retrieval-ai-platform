@@ -629,13 +629,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--server",
         metavar="URL",
         help="Score a running DocRAG through its POST /search instead of the local "
-        "pipeline (no Qdrant or models here). Not for baselines: it has no settings "
-        "fingerprint.",
+        "pipeline (no Qdrant or models here). Its fingerprint is the server's reported "
+        "settings: a --baseline from another --server run with the same ones judges it.",
     )
     retrieval.add_argument(
         "--key-env",
         default="DOCRAG_API_KEY",
         help="--server: the environment variable holding its API key.",
+    )
+    retrieval.add_argument(
+        "--workspace",
+        help="--server: score this workspace (WORKSPACES_ENABLED) instead of the default.",
     )
     retrieval.add_argument(
         "--max-regression",
@@ -811,23 +815,19 @@ def _server_retrieval(args: argparse.Namespace, examples: Sequence[RetrievalExam
 
     from cli.client import DocragClient, DocragError
 
-    if args.baseline is not None:
-        print(
-            "error: a --server run has no settings fingerprint to check a baseline "
-            "against; compare runs with `harness diff` instead.",
-            file=sys.stderr,
-        )
-        return 2
     ks = tuple(args.ks) if args.ks else DEFAULT_KS
     key = os.environ.get(args.key_env) or None
     try:
         with DocragClient(args.server, key) as client:
+            if args.workspace:
+                client.use_workspace(args.workspace)
+            fingerprint = server_fingerprint(client, args.server)
             results = run_retrieval_eval(
                 examples,
                 None,
                 ks,
                 ranker=server_ranker(client, max(ks)),
-                fingerprint={"server": args.server, "arm": "reranked"},
+                fingerprint=fingerprint,
             )
     except DocragError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -842,7 +842,53 @@ def _server_retrieval(args: argparse.Namespace, examples: Sequence[RetrievalExam
     if unresolved:
         results["passage_labels_skipped"] = unresolved
     _emit(results, args.output)
+    if args.baseline is not None:
+        try:
+            baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"error: could not read baseline: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(baseline, dict) or "server_version" not in baseline.get(
+            "fingerprint", {}
+        ):
+            print(
+                "error: that baseline wasn't measured through a server (its settings "
+                "fingerprint isn't one a server reports); compare runs with `harness "
+                "diff` instead.",
+                file=sys.stderr,
+            )
+            return 2
+        return _check_baseline(results, args.baseline, args.max_regression)
     return 0
+
+
+# The ranking settings a server's GET /config reports, recorded with a --server run so
+# a baseline measured the same way can judge it (models, fusion, rerank limits).
+SERVER_FINGERPRINT_FIELDS = (
+    "dense_embedding_model",
+    "sparse_embedding_model",
+    "reranker_model",
+    "embedding_model_tag",
+    "rrf_k",
+    "fused_top_n",
+    "rerank_top_k",
+    "rerank_min_score",
+)
+
+
+def server_fingerprint(client: Any, server: str) -> dict[str, Any]:
+    """What a --server run measured: the server's ranking settings and version, and the
+    workspace (its bar may be the workspace's own; /config reports the server's)."""
+
+    config = client.config()
+    fingerprint: dict[str, Any] = {
+        "arm": "reranked",
+        "server": server,
+        "server_version": client.health().get("version"),
+        "workspace": client.workspace or "default",
+    }
+    fingerprint.update((name, config[name]) for name in SERVER_FINGERPRINT_FIELDS if name in config)
+    return fingerprint
 
 
 def compare_runs(args: argparse.Namespace) -> int:
