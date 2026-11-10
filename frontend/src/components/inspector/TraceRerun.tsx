@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, apiErrorMessage } from '../../api/client';
 import type { TraceDetailResponse, TraceRerunResponse } from '../../api/types';
 
@@ -16,24 +16,37 @@ export default function TraceRerun({ trace }: TraceRerunProps) {
   const [result, setResult] = useState<TraceRerunResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  // The search in flight: aborted by the next one and when this trace leaves the tab,
+  // so a slow result never lands under another trace.
+  const controllerRef = useRef<AbortController | null>(null);
+  useEffect(() => () => controllerRef.current?.abort(), []);
   if (!config || (trace.kind ?? 'question') !== 'question') return null;
 
   const run = async () => {
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
     setRunning(true);
     setError(null);
     try {
       const score = Number.parseFloat(minScore);
       const passages = Number.parseInt(topK, 10);
-      setResult(
-        await api.rerunTrace(trace.trace_id, {
+      const rerun = await api.rerunTrace(
+        trace.trace_id,
+        {
           ...(Number.isFinite(score) ? { rerank_min_score: score } : {}),
           ...(Number.isInteger(passages) ? { rerank_top_k: passages } : {}),
-        }),
+        },
+        controller.signal,
       );
+      if (!controller.signal.aborted) setResult(rerun);
     } catch (err) {
-      setError(apiErrorMessage(err, 'Could not search again.'));
+      if (!controller.signal.aborted) setError(apiErrorMessage(err, 'Could not search again.'));
     } finally {
-      setRunning(false);
+      if (controllerRef.current === controller) {
+        controllerRef.current = null;
+        setRunning(false);
+      }
     }
   };
 

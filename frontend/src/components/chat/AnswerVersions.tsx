@@ -1,29 +1,58 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Components } from 'react-markdown';
 import type { AnswerVersion } from '../ChatMessage';
 import CitationCard from '../CitationCard';
 import { useMarkdownRenderer } from '../markdownLoader';
+import { styleLabel } from '../../utils/answerVersions';
 import { formatTurnTime } from '../../utils/exportChat';
+import { wordDiff } from '../../utils/textDiff';
 
 interface AnswerVersionsProps {
   versions: AnswerVersion[];
   /** How the answer's markdown is rendered (the answer's own, without citation links). */
   components: Components;
   onOpenSource?: (filename: string, chunkId: string) => void;
+  /** The answer shown now: what a version is compared with. */
+  current?: string;
+  /** Make version ``index`` the answer again (the current one becomes a version). */
+  onUse?: (index: number) => void;
 }
 
 /** The earlier answers to this question (Regenerate and Reformat keep them), shown one
- *  at a time under the current one: ‹ 1/2 › to step through them. */
-export default function AnswerVersions({ versions, components, onOpenSource }: AnswerVersionsProps) {
+ *  at a time under the current one: ‹ 1/2 › to step through them, each comparable with
+ *  the current answer word by word, and any one made the answer again. */
+export default function AnswerVersions({
+  versions,
+  components,
+  onOpenSource,
+  current,
+  onUse,
+}: AnswerVersionsProps) {
   const [shown, setShown] = useState<number | null>(null);
+  const [comparing, setComparing] = useState(false);
   const Markdown = useMarkdownRenderer();
+  // Opening and hiding swap the controls: focus goes to the one that takes its place.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const hideRef = useRef<HTMLButtonElement | null>(null);
+  const moveFocus = useRef(false);
+  const isOpen = shown !== null;
+  useEffect(() => {
+    if (!moveFocus.current) return;
+    moveFocus.current = false;
+    (isOpen ? hideRef.current : toggleRef.current)?.focus();
+  }, [isOpen]);
+  const show = (index: number | null) => {
+    if ((index === null) === isOpen) moveFocus.current = true;
+    setShown(index);
+  };
   if (versions.length === 0) return null;
   if (shown === null) {
     return (
       <button
+        ref={toggleRef}
         type="button"
         className="chat-message__action chat-message__versions-toggle"
-        onClick={() => setShown(versions.length - 1)}
+        onClick={() => show(versions.length - 1)}
         data-testid="answer-versions-open"
       >
         Earlier answer{versions.length === 1 ? '' : 's'} ({versions.length})
@@ -57,17 +86,53 @@ export default function AnswerVersions({ versions, components, onOpenSource }: A
         >
           ›
         </button>
-        <span className="chat-message__versions-meta">
+        <span className="chat-message__versions-meta" data-testid="answer-version-meta">
           {formatTurnTime(version.timestamp)}
           {version.model ? ` · ${version.model}` : ''}
+          {styleLabel(version) ? ` · ${styleLabel(version)}` : ''}
         </span>
-        <button type="button" onClick={() => setShown(null)} aria-label="Hide earlier answers">
+        <button
+          ref={hideRef}
+          type="button"
+          onClick={() => show(null)}
+          aria-label="Hide earlier answers"
+        >
           ✕
         </button>
       </div>
-      <div className="chat-message__markdown" dir="auto" data-testid="answer-version-content">
-        {Markdown ? <Markdown text={version.content} components={components} /> : <p className="chat-message__plain">{version.content}</p>}
+      <div className="chat-message__versions-actions">
+        {current !== undefined && (
+          <button
+            type="button"
+            className="chat-message__action"
+            aria-pressed={comparing}
+            onClick={() => setComparing(!comparing)}
+            data-testid="answer-version-compare"
+          >
+            {comparing ? 'Show it as written' : 'Compare with the current answer'}
+          </button>
+        )}
+        {onUse && (
+          <button
+            type="button"
+            className="chat-message__action"
+            onClick={() => {
+              onUse(shown);
+              show(null);
+            }}
+            data-testid="answer-version-use"
+          >
+            Use this version
+          </button>
+        )}
       </div>
+      {comparing && current !== undefined ? (
+        <VersionDiff before={version.content} after={current} />
+      ) : (
+        <div className="chat-message__markdown" dir="auto" data-testid="answer-version-content">
+          {Markdown ? <Markdown text={version.content} components={components} /> : <p className="chat-message__plain">{version.content}</p>}
+        </div>
+      )}
       {version.sources.length > 0 && (
         <div className="chat-message__citations">
           {version.sources.map((source) => (
@@ -84,5 +149,31 @@ export default function AnswerVersions({ versions, components, onOpenSource }: A
         </div>
       )}
     </section>
+  );
+}
+
+/** The version (before) against the current answer (after): removed words struck,
+ *  added ones marked. */
+function VersionDiff({ before, after }: { before: string; after: string }) {
+  const parts = useMemo(() => wordDiff(before, after), [before, after]);
+  if (parts === null) {
+    return <p className="settings__hint">These answers are too long to compare word by word.</p>;
+  }
+  return (
+    <p className="chat-message__diff" dir="auto" data-testid="answer-version-diff">
+      {parts.map((part, index) =>
+        part.kind === 'same' ? (
+          <span key={index}>{part.text}</span>
+        ) : part.kind === 'removed' ? (
+          <del key={index} className="chat-message__diff-removed">
+            {part.text}
+          </del>
+        ) : (
+          <ins key={index} className="chat-message__diff-added">
+            {part.text}
+          </ins>
+        ),
+      )}
+    </p>
   );
 }

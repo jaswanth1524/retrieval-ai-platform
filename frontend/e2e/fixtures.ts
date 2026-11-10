@@ -42,13 +42,17 @@ export const GUIDE_SOURCE = {
 };
 
 /** A complete, successful answer stream citing GUIDE_SOURCE. */
-export function answerStream(answer = 'DocRAG uses hybrid retrieval [1].'): string {
+export function answerStream(
+  answer = 'DocRAG uses hybrid retrieval [1].',
+  /** More fields for the `done` frame (answer_status, weak_matches, …). */
+  done: Record<string, unknown> = {},
+): string {
   return sse(
     { type: 'stage', stage: 'searching' },
     { type: 'sources', sources: [GUIDE_SOURCE], trace_id: 'trace-1' },
     { type: 'delta', text: answer.slice(0, 10) },
     { type: 'delta', text: answer.slice(10) },
-    { type: 'done', answer, sources: [GUIDE_SOURCE], timings: TIMINGS, trace_id: 'trace-1' },
+    { type: 'done', answer, sources: [GUIDE_SOURCE], timings: TIMINGS, trace_id: 'trace-1', ...done },
   );
 }
 
@@ -188,6 +192,15 @@ export class MockApi {
   consistency: object | null = null;
   answerCache: object = { enabled: true, entries: [], total_entries: 0, max_entries: 256, ttl_seconds: 3600, in_flight: 0 };
   cacheClears = 0;
+  /** GET /documents/sitemap-imports, and every import cancelled by id. */
+  sitemapImports: object[] = [];
+  readonly sitemapCancels: string[] = [];
+  /** POST /traces/what-if's answer, and every body it was asked with. */
+  whatIf: object = { settings: {}, checked: 0, would_answer: 0, newly_answered: 0, newly_unanswered: 0, items: [] };
+  readonly whatIfs: object[] = [];
+  /** POST /admin/consistency/repair bodies; DELETE /backups/{name} names. */
+  readonly repairs: object[] = [];
+  readonly backupDeletes: string[] = [];
   /** POST /traces/{id}/rerun's answer, and the settings each was asked with. */
   rerun: object | null = null;
   readonly reruns: object[] = [];
@@ -271,6 +284,10 @@ export class MockApi {
         return this.json(route, 200, { queries: rows.filter((row) => row.filenames?.includes(filename)) });
       }
       return this.json(route, 200, { queries: this.unanswered });
+    }
+    if (path === '/traces/what-if' && method === 'POST') {
+      this.whatIfs.push(request.postDataJSON() as object);
+      return this.json(route, 200, this.whatIf);
     }
     if (path === '/query-log/recheck' && method === 'POST') {
       this.rechecks += 1;
@@ -431,6 +448,24 @@ export class MockApi {
       const state = new URL(request.url()).searchParams.get('state');
       if (state === 'failed' || state === 'recent') return this.json(route, 200, { jobs: this.finishedJobs });
       return this.json(route, 200, { jobs: this.activeJobs });
+    }
+    if (path === '/documents/sitemap-imports' && method === 'GET') {
+      return this.json(route, 200, { imports: this.sitemapImports });
+    }
+    const sitemapImport = /^\/documents\/sitemap-imports\/([^/]+)$/.exec(path);
+    if (sitemapImport && method === 'DELETE') {
+      this.sitemapCancels.push(sitemapImport[1]);
+      const found = this.sitemapImports.find((item) => (item as { id: string }).id === sitemapImport[1]);
+      return this.json(route, 202, { ...(found ?? {}), state: 'cancelling' });
+    }
+    if (path === '/admin/consistency/repair' && method === 'POST') {
+      this.repairs.push(request.postDataJSON() as object);
+      return this.json(route, 200, { originals_deleted: [], versions_deleted: [], reindex_jobs: [], left: [] });
+    }
+    const storedBackup = /^\/backups\/(docrag-[^/]+\.zip)$/.exec(path);
+    if (storedBackup && method === 'DELETE') {
+      this.backupDeletes.push(storedBackup[1]);
+      return this.json(route, 200, { name: storedBackup[1] });
     }
     if (path === '/watch' || path === '/watch/scan') {
       if (this.watchStatus === null) return this.configured(route, 404, { detail: 'No folder is watched.' });

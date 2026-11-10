@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Components } from 'react-markdown';
 import type {
+  AnswerFormat,
   CitationResponse,
   DocumentTask,
   FeedbackKind,
@@ -165,6 +166,17 @@ export interface ChatTurn {
   irrelevantSources?: number[];
   // Best cross-encoder score among the candidates (0-1), for the weak-support badge.
   topRerankScore?: number;
+  // The shape or language it was asked for (Reformat); Regenerate asks the same way.
+  style?: AnswerStyle;
+  // When someone marked it reviewed in the Needs review panel (epoch ms); an answer
+  // written since (Regenerate, a restored version) is unreviewed again.
+  reviewedAt?: number;
+  // Ids of the answers this one replaced (Regenerate, Reformat): a link or a pinned
+  // trace naming one of them finds this answer.
+  previousIds?: string[];
+  // The relevance bar it was answered under (the workspace's when it has one); the
+  // weak-support badge is judged against it, else against the server's.
+  rerankMinScore?: number;
   // No passage cleared the server's bar: answered from the closest ones, which the
   // model was told match only weakly.
   weakMatch?: boolean;
@@ -186,11 +198,20 @@ export interface ChatTurn {
 }
 
 /** An earlier answer kept on a regenerated one (utils/answerVersions). */
+/** The shape or language an answer was asked for (Reformat), when not the default. */
+export interface AnswerStyle {
+  answerFormat?: AnswerFormat;
+  answerLanguage?: string;
+}
+
 export interface AnswerVersion {
   content: string;
   sources: CitationResponse[];
   timestamp: number;
   model?: string;
+  style?: AnswerStyle;
+  /** The trace it was answered under (a pinned trace of it finds the answer now). */
+  traceId?: string;
 }
 
 interface ChatMessageProps {
@@ -258,6 +279,8 @@ interface ChatMessageProps {
   ) => void;
   /** This turn's position among the conversation's answers (1-based), for its label. */
   answerNumber?: number;
+  /** Make one of this answer's earlier versions the answer again. */
+  onUseVersion?: (turnId: string, index: number) => void;
 }
 
 /** What the reader should know about how an answer was grounded, in words: the flags
@@ -329,6 +352,7 @@ function ChatMessage({
   answerNumber,
   onCopyLink,
   onReformat,
+  onUseVersion,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -617,6 +641,8 @@ function ChatMessage({
             {turn.versions && turn.versions.length > 0 && !streamStage && (
               <AnswerVersions
                 versions={turn.versions}
+                current={turn.content}
+                onUse={onUseVersion && !busy ? (index) => onUseVersion(turn.id, index) : undefined}
                 components={MARKDOWN_COMPONENTS}
                 onOpenSource={onOpenSource ? (filename, chunkId) => onOpenSource(filename, chunkId) : undefined}
               />

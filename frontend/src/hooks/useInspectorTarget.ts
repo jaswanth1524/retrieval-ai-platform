@@ -11,8 +11,11 @@ export function useInspectorTarget(turns: ChatTurn[], streamingHere: boolean) {
   // most recent assistant turn so the panel tracks the conversation without a click.
   // A pin this conversation doesn't hold describes no turn here: falling back to the
   // latest answer showed that answer's trace instead of the row that was clicked.
+  // A pinned answer since regenerated: the answer that replaced it (its trace, its
+  // sources), not the old trace beside an empty Sources tab.
   const inspectedTurn = pinnedTraceId
-    ? turns.find((turn) => turn.traceId === pinnedTraceId)
+    ? (turns.find((turn) => turn.traceId === pinnedTraceId) ??
+      turns.find((turn) => turn.versions?.some((version) => version.traceId === pinnedTraceId)))
     : [...turns].reverse().find((turn) => turn.role === 'assistant');
   // A pinned trace from the trace browser may belong to a turn this conversation never
   // held (another session, or one since cleared) — fall back to the id itself so the

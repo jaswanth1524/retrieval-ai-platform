@@ -1,3 +1,5 @@
+import { WORKSPACE_NAME_PATTERN } from './limits';
+
 /** Links to a conversation or one answer in it: ``#c=<conversation>&t=<turn>``. They
  *  open in this browser only — conversations live in its storage — so a link is for
  *  coming back (a bookmark, a note), not for sending to someone else. */
@@ -25,6 +27,43 @@ export function deepLinkHash(link: DeepLink): string {
 
 export function deepLinkUrl(link: DeepLink, location: Pick<Location, 'origin' | 'pathname'>): string {
   return `${location.origin}${location.pathname}${deepLinkHash(link)}`;
+}
+
+/** A link to a document, or one passage in it, on this server:
+ *  ``#d=<filename>&k=<chunk id>&w=<workspace>``. Documents live on the server, so unlike
+ *  a conversation link it opens for anyone with access to the same server. */
+export interface PassageLink {
+  filename: string;
+  chunkId?: string;
+  /** Absent: the default workspace. */
+  workspace?: string;
+}
+
+const FILENAME_MAX = 1024;
+const CHUNK_ID_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
+
+export function parsePassageLink(hash: string): PassageLink | null {
+  const params = new URLSearchParams(hash.replace(/^#/, ''));
+  const filename = params.get('d');
+  // eslint-disable-next-line no-control-regex
+  if (!filename || filename.length > FILENAME_MAX || /[\x00-\x1f/\\]/.test(filename)) return null;
+  const chunkId = params.get('k');
+  const workspace = params.get('w');
+  return {
+    filename,
+    ...(chunkId && CHUNK_ID_PATTERN.test(chunkId) ? { chunkId } : {}),
+    ...(workspace && WORKSPACE_NAME_PATTERN.test(workspace) ? { workspace } : {}),
+  };
+}
+
+export function passageLinkUrl(
+  link: PassageLink,
+  location: Pick<Location, 'origin' | 'pathname'>,
+): string {
+  const params = new URLSearchParams({ d: link.filename });
+  if (link.chunkId) params.set('k', link.chunkId);
+  if (link.workspace) params.set('w', link.workspace);
+  return `${location.origin}${location.pathname}#${params.toString()}`;
 }
 
 /** Tokens and estimated cost of a conversation's answers (null when none reported). */

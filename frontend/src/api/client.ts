@@ -33,9 +33,15 @@ import type {
   ArchiveUploadResponse,
   BackupCheckResponse,
   BackupListResponse,
+  ConsistencyRepairRequest,
+  ConsistencyRepairResponse,
   ConsistencyResponse,
+  SitemapImportListResponse,
+  SitemapImportResponse,
   SitemapIngestResponse,
   TraceRerunRequest,
+  TraceWhatIfRequest,
+  TraceWhatIfResponse,
   TraceRerunResponse,
   WorkspaceSettingsRequest,
   WorkspaceSettingsResponse,
@@ -419,6 +425,8 @@ export interface QuestionStreamHandlers {
     grounding?: {
       answerStatus?: AnswerStatus;
       topRerankScore?: number | null;
+      /** The relevance bar the answer was given under. */
+      rerankMinScore?: number;
       /** No passage cleared the server's bar: answered from the closest ones. */
       weakMatches?: boolean;
       truncated?: boolean;
@@ -752,6 +760,17 @@ export const api = {
   scoreReport: (signal?: AbortSignal) =>
     request<ScoreReportResponse>('/traces/score-report', { signal }),
 
+  // The latest traced questions searched again under a proposed bar: how many would be
+  // answered (no answer written, nothing stored).
+  traceWhatIf: (body: TraceWhatIfRequest, signal?: AbortSignal) =>
+    request<TraceWhatIfResponse>('/traces/what-if', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+    }),
+
   // A traced question searched again under other ranking settings (no answer written).
   rerunTrace: (traceId: string, settings: TraceRerunRequest, signal?: AbortSignal) =>
     request<TraceRerunResponse>(`/traces/${encodeURIComponent(traceId)}/rerun`, {
@@ -791,6 +810,34 @@ export const api = {
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
     }),
 
+  // A stored backup downloaded (to keep it elsewhere), or deleted.
+  downloadStoredBackup: async (name: string, signal?: AbortSignal): Promise<Blob> =>
+    (await downloadBlob(`/backups/${encodeURIComponent(name)}`, signal)).blob,
+
+  deleteStoredBackup: (name: string) =>
+    request<{ name: string }>(`/backups/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Any backup zip read through (checksums, and what a restore would do with it).
+  verifyBackup: (file: File, signal?: AbortSignal) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<BackupCheckResponse>('/backups/verify', {
+      method: 'POST',
+      body: form,
+      timeoutMs: uploadTimeoutMs(file.size),
+      signal,
+    });
+  },
+
+  // The consistency report's findings put right — only the remedies asked for.
+  repairConsistency: (remedies: ConsistencyRepairRequest) =>
+    request<ConsistencyRepairResponse>('/admin/consistency/repair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(remedies),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
+
   restoreStoredBackup: (name: string) =>
     request<ImportResponse>(`/backups/${encodeURIComponent(name)}/restore`, {
       method: 'POST',
@@ -814,6 +861,16 @@ export const api = {
       workspace,
     });
   },
+
+  // This workspace's sitemap imports, newest first, and one stopped before its next page.
+  listSitemapImports: (signal?: AbortSignal, workspace?: string) =>
+    request<SitemapImportListResponse>('/documents/sitemap-imports', { signal, workspace }),
+
+  cancelSitemapImport: (id: string, workspace?: string) =>
+    request<SitemapImportResponse>(`/documents/sitemap-imports/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      workspace,
+    }),
 
   // A site's pages from its sitemap or feed, fetched in the background.
   addFromSitemap: (url: string, tags?: string[], signal?: AbortSignal, workspace?: string) =>
@@ -986,6 +1043,9 @@ export const api = {
                 {
                   answerStatus: event.answer_status,
                   topRerankScore: event.top_rerank_score,
+                  ...(typeof event.rerank_min_score === 'number'
+                    ? { rerankMinScore: event.rerank_min_score }
+                    : {}),
                   ...(event.weak_matches === true ? { weakMatches: true } : {}),
                   ...(event.citation_backfilled === true ? { autoCited: true } : {}),
                   ...(typeof event.passages_left_out === 'number' && event.passages_left_out > 0

@@ -13,7 +13,8 @@ import { newId } from '../utils/id';
 import { useChatPersistence } from './useChatPersistence';
 import { useConversationActions } from './useConversationActions';
 import { answerStreamHandlers, createDeltaBuffer } from './streamHandlers';
-import { mergeRegenerated } from '../utils/answerVersions';
+import { mergeRegenerated, withVersionRestored } from '../utils/answerVersions';
+import { sanitizeStyle } from './chat/sanitize';
 import type { ImportItem } from './useConversationActions';
 
 /** How often streamed answer text is applied (see createDeltaBuffer's use below). */
@@ -171,6 +172,8 @@ export interface UseChatResult {
   setPinned: (id: string, pinned: boolean) => boolean;
   /** Replace a conversation's labels (cleaned; an empty list removes them). */
   setLabels: (id: string, labels: string[]) => void;
+  /** Rename a label on every conversation (``to`` null: remove it everywhere). */
+  renameLabel: (from: string, to: string | null) => void;
   /** Conversations whose question or answer text contains `query`, by id. Reads the
    *  latest history, so call it from an effect or a memo keyed on `conversations`. */
   searchConversations: (query: string) => Map<string, ConversationMatch>;
@@ -178,11 +181,15 @@ export interface UseChatResult {
   setTurnFeedback: (turnId: string, rating: FeedbackRating | undefined) => void;
   /** Every conversation with turns, as one JSON document (Export all conversations);
    *  importConversations reads it back. */
-  allConversationsJson: () => string;
+  allConversationsJson: (label?: string) => string;
   /** Mark (or, after a failed send, unmark) one cited source of a turn not relevant. */
   setSourceIrrelevant: (turnId: string, sourceNumber: number, marked: boolean) => void;
   /** Save (or unsave) an answer of ``conversationId`` (the open one when omitted). */
   setTurnSaved: (turnId: string, saved: boolean, conversationId?: string) => void;
+  /** Make an answer's earlier version (by index) the answer again. */
+  restoreAnswerVersion: (turnId: string, index: number) => void;
+  /** Mark an answer looked at in the Needs review panel (or not). */
+  setTurnReviewed: (conversationId: string, turnId: string, reviewed: boolean) => void;
 }
 
 function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['sources'] = []): ChatTurn {
@@ -342,6 +349,9 @@ export function answeredTurn(
     ...(typeof grounding?.topRerankScore === 'number'
       ? { topRerankScore: grounding.topRerankScore }
       : {}),
+    ...(typeof grounding?.rerankMinScore === 'number'
+      ? { rerankMinScore: grounding.rerankMinScore }
+      : {}),
     ...(grounding?.usage
       ? {
           usage: {
@@ -417,6 +427,7 @@ export function useChat(): UseChatResult {
     renameConversation,
     setPinned,
     setLabels,
+    renameLabel,
   } = useConversationActions(setStorage, storageRef, streamingConversationIdRef);
 
   // Tracks the in-flight question's controller: doubles as a reentrancy guard and lets
@@ -540,6 +551,11 @@ export function useChat(): UseChatResult {
         if (!existing) {
           const created: ChatTurn = { ...makeTurn('assistant', ''), id: assistantTurnId };
           if (options?.modelLabel) created.model = options.modelLabel;
+          const style = sanitizeStyle({
+            answerFormat: options?.answerFormat,
+            answerLanguage: options?.answerLanguage,
+          });
+          if (style) created.style = style;
           // Asked with the conversation as history: rated as a follow-up (feedback kind).
           // A summary sends none.
           if (!task && history.length > 0) created.followUp = true;
@@ -693,16 +709,31 @@ export function useChat(): UseChatResult {
       overrides?: QuestionOverrides,
       filenames?: string[],
       options?: QuestionOptions,
-    ) =>
-      runAsk(
+    ) => {
+      const turns = activeConversationRef.current?.turns ?? [];
+      // Regenerating (or reformatting) an answer: with the conversation as it stood
+      // when its question was asked — an earlier answer's later turns are no part of
+      // it — and in the style it was asked for, unless another is asked for now.
+      const replacing = options?.replacesAnswer
+        ? turns.findIndex((turn) => turn.id === options.replacesAnswer)
+        : -1;
+      const replaced = replacing >= 0 ? turns[replacing] : undefined;
+      const history =
+        replacing >= 1 ? buildHistory(turns.slice(0, replacing - 1)) : historyForQuestion(turns, question);
+      const restyled =
+        replaced?.style && options && !options.answerFormat && !options.answerLanguage
+          ? { ...options, ...replaced.style }
+          : options;
+      return runAsk(
         activeConversationRef.current?.id ?? null,
         question,
-        historyForQuestion(activeConversationRef.current?.turns ?? [], question),
+        history,
         provider,
         overrides,
         filenames,
-        options,
-      ),
+        restyled,
+      );
+    },
     [runAsk],
   );
 
@@ -746,6 +777,8 @@ export function useChat(): UseChatResult {
         turns: prior,
         scope: source.scope,
         ...(source.workspace ? { workspace: source.workspace } : {}),
+        // Filed with the conversation it was edited from.
+        ...(source.labels?.length ? { labels: [...source.labels] } : {}),
       };
       setStorage((prev) => ({
         ...prev,
@@ -909,11 +942,19 @@ export function useChat(): UseChatResult {
   );
 
   const allConversationsJson = useCallback(
-    () =>
+    (label?: string) =>
       JSON.stringify(
         {
           docrag_conversations: storageRef.current.conversations
             .filter((conversation) => conversation.turns.length > 0)
+            // Only those filed under ``label``, when one is given.
+            .filter(
+              (conversation) =>
+                label === undefined ||
+                (conversation.labels ?? []).some(
+                  (each) => each.toLocaleLowerCase() === label.toLocaleLowerCase(),
+                ),
+            )
             .sort(byRecentUse)
             // With its dates: an import keeps them (importConversations), and without
             // them every imported conversation read as used just now.
@@ -966,6 +1007,33 @@ export function useChat(): UseChatResult {
         },
         Date.now(),
       ),
+    );
+  }, []);
+
+  // Marked looked at in the Needs review panel (or unmarked).
+  const setTurnReviewed = useCallback(
+    (conversationId: string, turnId: string, reviewed: boolean) => {
+      setStorage((prev) =>
+        updateTurn(
+          prev,
+          conversationId,
+          turnId,
+          (turn) => {
+            const { reviewedAt: _previous, ...rest } = turn;
+            return reviewed ? { ...rest, reviewedAt: Date.now() } : rest;
+          },
+          Date.now(),
+        ),
+      );
+    },
+    [],
+  );
+
+  // An earlier version of an answer made the answer again (the one shown becomes a
+  // version, so nothing is lost).
+  const restoreAnswerVersion = useCallback((turnId: string, index: number) => {
+    setStorage((prev) =>
+      updateTurn(prev, undefined, turnId, (turn) => withVersionRestored(turn, index), Date.now()),
     );
   }, []);
 
@@ -1134,10 +1202,13 @@ export function useChat(): UseChatResult {
     restoreConversation,
     setPinned,
     setLabels,
+    renameLabel,
     searchConversations,
     setTurnFeedback,
     setSourceIrrelevant,
     setTurnSaved,
+    restoreAnswerVersion,
+    setTurnReviewed,
     allConversationsJson,
   };
 }

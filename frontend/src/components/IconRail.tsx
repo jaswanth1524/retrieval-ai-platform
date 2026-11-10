@@ -38,6 +38,8 @@ interface IconRailProps {
   settingsAvailable?: boolean;
   /** Rail entries to leave out (the feedback panel when feedback is off or read-only). */
   hidden?: RailPanel[];
+  /** A count shown on an entry (answers still to review). */
+  badges?: Partial<Record<RailPanel, number>>;
 }
 
 function IconRail({
@@ -48,6 +50,7 @@ function IconRail({
   onOpenSettings,
   settingsAvailable = true,
   hidden = [],
+  badges = {},
 }: IconRailProps) {
   return (
     <nav className="icon-rail" aria-label="Primary">
@@ -61,13 +64,18 @@ function IconRail({
           key={item.key}
           type="button"
           title={item.label}
-          aria-label={item.label}
+          aria-label={badges[item.key] ? `${item.label} (${badges[item.key]})` : item.label}
           aria-pressed={active === item.key}
           className={`icon-rail__button${active === item.key ? ' icon-rail__button--active' : ''}`}
           onClick={() => onSelect(item.key)}
           data-testid={`rail-${item.key}`}
         >
           <span aria-hidden="true">{item.glyph}</span>
+          {badges[item.key] ? (
+            <span className="icon-rail__badge" aria-hidden="true" data-testid={`rail-badge-${item.key}`}>
+              {Math.min(badges[item.key] ?? 0, 99)}
+            </span>
+          ) : null}
         </button>
       ))}
       <div className="icon-rail__spacer" />

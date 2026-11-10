@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { CitationResponse } from '../api/types';
 import type { StageTiming } from '../hooks/useChat';
 import type { SourceChange } from '../utils/citationFreshness';
+import { findAnswer } from '../utils/answerVersions';
 import { STREAMING_STAGE_LABELS } from '../utils/stages';
 import type { ComponentProps } from 'react';
 import ChatMessage, { type AskAgain, type ChatTurn, type FeedbackPayload } from './ChatMessage';
@@ -59,6 +60,8 @@ interface ChatThreadProps {
   onCopyLink?: (turnId: string) => void;
   /** Reformat an answer (ChatMessage's onReformat). */
   onReformat?: ComponentProps<typeof ChatMessage>['onReformat'];
+  /** Make an answer's earlier version the answer again. */
+  onUseVersion?: (turnId: string, index: number) => void;
   /** Whether a cited document was deleted or uploaded again after an answer. */
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
 }
@@ -142,6 +145,7 @@ function ChatThread({
   onToggleSaved,
   onCopyLink,
   onReformat,
+  onUseVersion,
   sourceChangeOf,
 }: ChatThreadProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -241,16 +245,47 @@ function ChatThread({
   const focusedRef = useRef<{ turnId: string } | null>(null);
   useLayoutEffect(() => {
     if (!focusTurn || focusedRef.current === focusTurn) return;
+    // A link to an answer since regenerated finds the answer that replaced it.
+    const turnId = findAnswer(turns, focusTurn.turnId)?.id ?? focusTurn.turnId;
     const target = Array.from(
       containerRef.current?.querySelectorAll<HTMLElement>('[data-turn-id]') ?? [],
-    ).find((element) => element.dataset.turnId === focusTurn.turnId);
+    ).find((element) => element.dataset.turnId === turnId);
     if (!target) return;
     focusedRef.current = focusTurn;
     pinnedRef.current = false;
     target.scrollIntoView?.({ block: 'center' });
+    // Focus goes with the view (a drawer that opened it has closed; keyboard and screen
+    // reader users land on the turn, not on <body>).
+    const focusable = target.closest<HTMLElement>('[tabindex]') ?? target;
+    focusable.focus?.({ preventScroll: true });
     const element = containerRef.current;
     if (element) autoScrollTopRef.current = element.scrollTop;
   }, [focusTurn, turns]);
+
+  // An earlier answer regenerated or reformatted takes its old place once it is done
+  // (it streamed at the bottom): the view follows it there, rather than leaving the
+  // reader at the later turns. Answers already replaced when the thread was shown don't
+  // move it.
+  const placedRef = useRef<Set<string> | null>(null);
+  useLayoutEffect(() => {
+    const replaced = turns.filter((turn) => turn.previousIds?.length);
+    const placed = placedRef.current;
+    placedRef.current = new Set(replaced.map((turn) => `${turn.id}:${turn.previousIds?.length}`));
+    if (placed === null) return;
+    const moved = replaced.find(
+      (turn) =>
+        !placed.has(`${turn.id}:${turn.previousIds?.length}`) && turn.id !== turns[turns.length - 1]?.id,
+    );
+    if (!moved) return;
+    const target = containerRef.current?.querySelector<HTMLElement>(
+      `[data-turn-id="${CSS.escape(moved.id)}"]`,
+    );
+    if (!target) return;
+    pinnedRef.current = false;
+    target.scrollIntoView?.({ block: 'center' });
+    const element = containerRef.current;
+    if (element) autoScrollTopRef.current = element.scrollTop;
+  }, [turns]);
 
   const showsRail = turns.length > 0 || pending;
   useEffect(() => {
@@ -378,6 +413,7 @@ function ChatThread({
             onToggleSaved={onToggleSaved}
             onCopyLink={onCopyLink}
             onReformat={onReformat}
+            onUseVersion={onUseVersion}
             sourceChangeOf={sourceChangeOf}
             answerNumber={answerNumbers[index] || undefined}
           />

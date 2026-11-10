@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import type { SavedAnswer } from '../hooks/useChat';
 import type { SourceChange } from '../utils/citationFreshness';
 import { formatRelativeTime } from '../utils/relativeTime';
@@ -10,6 +10,8 @@ interface ReviewPanelProps {
   answers: SavedAnswer[];
   onOpen: (conversationId: string, turnId: string) => void;
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
+  /** Mark an answer looked at (hidden from the list unless reviewed ones are shown). */
+  onMarkReviewed?: (conversationId: string, turnId: string, reviewed: boolean) => void;
 }
 
 // At most this many rows: the oldest problems matter least.
@@ -18,20 +20,42 @@ const MAX_ROWS = 200;
 /** Answers worth a second look, across this workspace's conversations: not found, weak
  *  matches, uncited or auto-cited, cut off, or resting on a document that changed or was
  *  deleted since. */
-function ReviewPanel({ answers, onOpen, sourceChangeOf }: ReviewPanelProps) {
-  const rows = answers
+function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: ReviewPanelProps) {
+  const [showReviewed, setShowReviewed] = useState(false);
+  const flagged = answers
     .map((item) => ({ item, reasons: reviewReasons(item.turn, sourceChangeOf) }))
-    .filter((row) => row.reasons.length > 0)
+    .filter((row) => row.reasons.length > 0);
+  const reviewedCount = flagged.filter((row) => row.item.turn.reviewedAt).length;
+  const rows = flagged
+    .filter((row) => showReviewed || !row.item.turn.reviewedAt)
     .slice(0, MAX_ROWS);
+  const toggle =
+    reviewedCount > 0 ? (
+      <label className="unanswered-panel__toggle">
+        <input
+          type="checkbox"
+          checked={showReviewed}
+          onChange={(event) => setShowReviewed(event.target.checked)}
+          data-testid="review-show-reviewed"
+        />{' '}
+        Show the {reviewedCount} reviewed
+      </label>
+    ) : null;
   if (rows.length === 0) {
     return (
-      <p className="unanswered-panel__message" data-testid="review-empty">
-        Nothing to review: every answer here was found, cited, and rests on documents
-        as they are now.
-      </p>
+      <>
+        <p className="unanswered-panel__message" data-testid="review-empty">
+          {flagged.length > 0
+            ? 'Every answer worth a second look here has been reviewed.'
+            : 'Nothing to review: every answer here was found, cited, and rests on documents as they are now.'}
+        </p>
+        {toggle}
+      </>
     );
   }
   return (
+    <>
+    {toggle}
     <ul className="unanswered-panel__list" data-testid="review-list">
       {rows.map(({ item, reasons }) => (
         <li
@@ -59,10 +83,23 @@ function ReviewPanel({ answers, onOpen, sourceChangeOf }: ReviewPanelProps) {
             >
               Open
             </button>
+            {onMarkReviewed && (
+              <button
+                type="button"
+                aria-pressed={Boolean(item.turn.reviewedAt)}
+                onClick={() =>
+                  onMarkReviewed(item.conversationId, item.turn.id, !item.turn.reviewedAt)
+                }
+                data-testid="review-mark"
+              >
+                {item.turn.reviewedAt ? 'Reviewed ✓' : 'Mark reviewed'}
+              </button>
+            )}
           </span>
         </li>
       ))}
     </ul>
+    </>
   );
 }
 

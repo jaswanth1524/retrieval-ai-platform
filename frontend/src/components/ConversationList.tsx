@@ -20,6 +20,10 @@ interface ConversationListProps {
   onPin?: (id: string, pinned: boolean) => void;
   /** Replace a conversation's labels (to filter the list by). */
   onSetLabels?: (id: string, labels: string[]) => void;
+  /** Rename a label on every conversation (null: remove it everywhere). */
+  onRenameLabel?: (from: string, to: string | null) => void;
+  /** Download the conversations filed under a label. */
+  onExportLabel?: (label: string) => void;
   /** Matches the query against question and answer text (titles are matched here). */
   onSearch?: (query: string) => Map<string, ConversationMatch>;
   disabled?: boolean;
@@ -37,6 +41,8 @@ function ConversationList({
   onDelete,
   onPin,
   onSetLabels,
+  onRenameLabel,
+  onExportLabel,
   onSearch,
   disabled,
   streamingId = null,
@@ -56,6 +62,9 @@ function ConversationList({
   const [labelFilter, setLabelFilter] = useState<string | null>(null);
   const [labelingId, setLabelingId] = useState<string | null>(null);
   const [labelDraft, setLabelDraft] = useState('');
+  // The filtered-by label being renamed (its new name), or removed (confirming).
+  const [renamingTo, setRenamingTo] = useState<string | null>(null);
+  const [removingLabel, setRemovingLabel] = useState(false);
   const allLabels = useMemo(() => {
     const byKey = new Map<string, string>();
     for (const conversation of conversations) {
@@ -193,6 +202,89 @@ function ConversationList({
               #{label}
             </button>
           ))}
+          <datalist id="conversation-label-names">
+            {allLabels.map((label) => (
+              <option key={label} value={label} />
+            ))}
+          </datalist>
+        </div>
+      )}
+      {labelFilter !== null && (onRenameLabel || onExportLabel) && (
+        <div className="conversation-list__label-tools" data-testid="conversation-label-tools">
+          {renamingTo !== null ? (
+            <input
+              className="conversation-list__edit"
+              value={renamingTo}
+              autoFocus
+              maxLength={24}
+              aria-label={`New name for #${labelFilter}`}
+              onChange={(event) => setRenamingTo(event.target.value)}
+              onKeyDown={(event) => {
+                if (isImeComposing(event)) return;
+                if (event.key === 'Enter') {
+                  const name = renamingTo.trim();
+                  if (name) {
+                    onRenameLabel?.(labelFilter, name);
+                    setLabelFilter(name);
+                  }
+                  setRenamingTo(null);
+                }
+                if (event.key === 'Escape') {
+                  event.stopPropagation();
+                  setRenamingTo(null);
+                }
+              }}
+              onBlur={() => setRenamingTo(null)}
+              data-testid="conversation-label-rename-input"
+            />
+          ) : removingLabel ? (
+            <ConfirmInline
+              prompt={`Remove #${labelFilter} from every conversation?`}
+              confirmLabel="Remove"
+              onCancel={() => setRemovingLabel(false)}
+              onConfirm={() => {
+                onRenameLabel?.(labelFilter, null);
+                setRemovingLabel(false);
+                setLabelFilter(null);
+              }}
+              confirmTestId="conversation-label-remove-confirm"
+            />
+          ) : (
+            <>
+              {onRenameLabel && (
+                <button
+                  type="button"
+                  className="conversation-list__filter"
+                  onClick={() => setRenamingTo(labelFilter)}
+                  disabled={disabled}
+                  data-testid="conversation-label-rename"
+                >
+                  Rename #{labelFilter}
+                </button>
+              )}
+              {onRenameLabel && (
+                <button
+                  type="button"
+                  className="conversation-list__filter"
+                  onClick={() => setRemovingLabel(true)}
+                  disabled={disabled}
+                  data-testid="conversation-label-remove"
+                >
+                  Remove
+                </button>
+              )}
+              {onExportLabel && (
+                <button
+                  type="button"
+                  className="conversation-list__filter"
+                  onClick={() => onExportLabel(labelFilter)}
+                  data-testid="conversation-label-export"
+                >
+                  Export these
+                </button>
+              )}
+            </>
+          )}
         </div>
       )}
       {(anySaved || workspaces.length > 1) && (
@@ -282,6 +374,7 @@ function ConversationList({
                 value={labelDraft}
                 autoFocus
                 placeholder="labels, comma-separated"
+                list="conversation-label-names"
                 onChange={(event) => setLabelDraft(event.target.value)}
                 onBlur={() => {
                   onSetLabels?.(conversation.id, labelDraft.split(','));

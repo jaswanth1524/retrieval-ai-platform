@@ -225,3 +225,12 @@
   border-color: var(--accent);
   color: var(--ink);
 }
+
+/* The filtered-by label's own actions: rename, remove everywhere, export. */
+.conversation-list__label-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin: 0 0 6px;
+}

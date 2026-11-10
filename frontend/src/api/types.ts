@@ -230,6 +230,8 @@ export interface DocumentIngestResponse {
   chunks_removed?: number;
   /** Another indexed document with exactly these bytes (both are kept). */
   duplicate_of?: string | null;
+  /** What indexing left out or couldn't read (a cap reached, a page OCR failed on). */
+  warnings?: string[];
 }
 
 export type IngestJobState = 'queued' | 'parsing' | 'embedding' | 'done' | 'failed';
@@ -575,6 +577,9 @@ export interface QueryLogEntryResponse {
   trace_id: string | null;
   /** The documents the answer was drawn from (empty on rows logged before this). */
   filenames?: string[];
+  kind?: string;
+  /** Served from the answer cache (or by joining the same question in flight). */
+  cached?: boolean;
 }
 
 export interface QueryLogResponse {
@@ -678,6 +683,36 @@ export interface TraceRerunRequest {
   recency_boost_weight?: number;
 }
 
+/** POST /traces/what-if: settings to try on the latest traced questions. */
+export interface TraceWhatIfRequest {
+  rerank_min_score?: number;
+  rerank_relative_floor?: number;
+  rerank_fallback_count?: number;
+  limit?: number;
+  only_unanswered?: boolean;
+}
+
+export interface TraceWhatIfItemResponse {
+  trace_id: string;
+  question: string;
+  answered_before: boolean;
+  would_answer: boolean;
+  weak_matches?: boolean;
+  top_score?: number | null;
+  error?: string | null;
+}
+
+/** How many of the latest traced questions the settings tried would answer. */
+export interface TraceWhatIfResponse {
+  settings: Record<string, number>;
+  checked: number;
+  would_answer: number;
+  newly_answered: number;
+  newly_unanswered: number;
+  items: TraceWhatIfItemResponse[];
+  stopped_early?: boolean;
+}
+
 /** POST /traces/{id}/rerun: the question searched again under other ranking settings. */
 export interface TraceRerunResponse {
   query: string;
@@ -694,6 +729,10 @@ export interface WorkspaceSettingsRequest {
   recency_boost_weight?: number | null;
   answer_language?: string | null;
   answer_format?: AnswerFormat | null;
+  rerank_fallback_count?: number | null;
+  rerank_relative_floor?: number | null;
+  max_context_chunks?: number | null;
+  followups_enabled?: boolean | null;
 }
 
 export interface WorkspaceSettingsResponse {
@@ -741,6 +780,23 @@ export interface BackupCheckResponse {
   versions: number;
   feedback: boolean;
   problems: string[];
+  /** By restore's own rules: documents it would queue, and those it would refuse. */
+  would_restore?: number;
+  rejected?: string[];
+}
+
+/** POST /admin/consistency/repair: which findings to put right. */
+export interface ConsistencyRepairRequest {
+  delete_orphan_originals?: boolean;
+  delete_orphan_versions?: boolean;
+  reindex_incomplete?: boolean;
+}
+
+export interface ConsistencyRepairResponse {
+  originals_deleted: string[];
+  versions_deleted: string[];
+  reindex_jobs: DocumentJobAcceptedResponse[];
+  left: string[];
 }
 
 /** GET /admin/consistency: how the index and the stored originals agree. */
@@ -774,6 +830,29 @@ export interface SitemapIngestResponse {
   urls: string[];
   left_out: number;
   child_sitemaps: number;
+  /** Follow it at GET /documents/sitemap-imports/{import_id}. */
+  import_id?: string | null;
+}
+
+/** A sitemap import as it goes. */
+export interface SitemapImportResponse {
+  id: string;
+  url: string;
+  state: string;
+  total: number;
+  done: number;
+  queued: number;
+  failed: number;
+  skipped: number;
+  unchanged: number;
+  cancelled_pages: number;
+  started_at: number;
+  finished_at?: number | null;
+  problems?: string[];
+}
+
+export interface SitemapImportListResponse {
+  imports: SitemapImportResponse[];
 }
 
 export interface ScoreReportResponse {

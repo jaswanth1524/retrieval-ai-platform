@@ -1,3 +1,4 @@
+import { SITEMAP_STARTED_EVENT } from '../components/corpus/SitemapImports';
 import { useMemo, useRef, useState } from 'react';
 import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
@@ -301,7 +302,7 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         const note = ingestNote(status.result);
         if (note && indexedName) {
           deps.current.pushToast({
-            tone: status.result?.duplicate_of ? 'warn' : 'good',
+            tone: status.result?.duplicate_of || status.result?.warnings?.length ? 'warn' : 'good',
             title: `${indexedName} indexed`,
             body: note,
           });
@@ -427,6 +428,8 @@ export function useCorpus(callbacks: CorpusCallbacks) {
       const workspace = getWorkspace();
       try {
         const added = await api.addFromSitemap(url, currentUploadTags(), undefined, workspace);
+        // Its progress shows under server activity: read now, not at the next poll.
+        window.dispatchEvent(new Event(SITEMAP_STARTED_EVENT));
         deps.current.pushToast({
           tone: added.urls.length > 0 ? 'good' : 'warn',
           title:
@@ -614,15 +617,36 @@ export function useCorpus(callbacks: CorpusCallbacks) {
     // A zip: the server indexes each document in it; each gets its own card, followed
     // like an upload's.
     const uploadArchive = async (file: File, workspace: string, tags: string[] | undefined) => {
+      // A card for the zip while it is sent (a large one takes a while), which Cancel
+      // stops; its documents' own cards replace it once the server has read it.
+      const zipId = newId();
+      const controller = new AbortController();
+      sending.set(zipId, controller);
+      setUploads((prev) => [
+        ...prev,
+        { id: zipId, filename: file.name, status: 'uploading', workspace, tags },
+      ]);
       let report;
       try {
-        report = await api.uploadArchive(file, tags, undefined, workspace);
+        report = await api.uploadArchive(file, tags, controller.signal, workspace);
       } catch (err) {
-        if (deps.current.onAuthFailure(err)) return;
+        removeUpload(zipId);
+        if (controller.signal.aborted || deps.current.onAuthFailure(err)) return;
         deps.current.pushToast({
           tone: 'bad',
           title: `${file.name} wasn't uploaded`,
           body: apiErrorMessage(err, 'The zip could not be read.'),
+        });
+        return;
+      } finally {
+        sending.delete(zipId);
+      }
+      removeUpload(zipId);
+      if (report.jobs.length === 0 && report.skipped.length === 0 && report.deferred.length === 0) {
+        deps.current.pushToast({
+          tone: 'warn',
+          title: `${file.name} held no documents`,
+          body: 'Nothing in it is a type DocRAG indexes (hidden files and folders are skipped).',
         });
         return;
       }
@@ -730,6 +754,14 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         if (!(filename in prev)) return prev;
         const next = { ...prev };
         delete next[filename];
+        // Its duplicates no longer have it as a copy ("keep this, delete the others"
+        // left the kept card offering to delete what was already gone).
+        for (const [name, meta] of Object.entries(next)) {
+          if (!meta.sameAs?.includes(filename)) continue;
+          const others = meta.sameAs.filter((other) => other !== filename);
+          const { sameAs: _sameAs, ...rest } = meta;
+          next[name] = others.length > 0 ? { ...rest, sameAs: others } : rest;
+        }
         return next;
       });
     };

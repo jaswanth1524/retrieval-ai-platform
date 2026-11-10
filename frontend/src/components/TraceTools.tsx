@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, apiErrorMessage, getWorkspace } from '../api/client';
-import type { ScoreReportResponse, TraceDiffResponse } from '../api/types';
+import type { ScoreReportResponse, TraceDiffResponse, TraceWhatIfResponse } from '../api/types';
 
 /** One request's state: loading, the answer, or the reason it failed. */
 function useFetched<T>(load: (signal: AbortSignal) => Promise<T>, key: string) {
@@ -101,10 +101,90 @@ export function ScoreReportView({
               {applied}
             </p>
           )}
+          <WhatIf initial={report.suggested_min_score ?? report.current_min_score} />
           <p className="trace-tools__note">{report.note}</p>
         </>
       )}
     </section>
+  );
+}
+
+/** "Try this bar": the latest traced questions searched again under it, and how many
+ *  would be answered — before the setting is changed. */
+function WhatIf({ initial }: { initial: number }) {
+  const [bar, setBar] = useState(String(initial));
+  const [everything, setEverything] = useState(false);
+  const [result, setResult] = useState<TraceWhatIfResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const controllerRef = useRef<AbortController | null>(null);
+  useEffect(() => () => controllerRef.current?.abort(), []);
+  const run = async () => {
+    const score = Number.parseFloat(bar);
+    if (!Number.isFinite(score) || score < 0 || score > 1) {
+      setError('A bar between 0 and 1.');
+      return;
+    }
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setRunning(true);
+    setError(null);
+    try {
+      const response = await api.traceWhatIf(
+        { rerank_min_score: score, limit: 20, only_unanswered: !everything },
+        controller.signal,
+      );
+      if (!controller.signal.aborted) setResult(response);
+    } catch (err) {
+      if (!controller.signal.aborted) setError(apiErrorMessage(err, 'Could not try it.'));
+    } finally {
+      if (controllerRef.current === controller) setRunning(false);
+    }
+  };
+  return (
+    <form
+      className="trace-tools__what-if"
+      aria-label="Try a bar on recent questions"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void run();
+      }}
+      data-testid="what-if"
+    >
+      <label>
+        Try a bar of{' '}
+        <input
+          type="number"
+          min={0}
+          max={1}
+          step={0.01}
+          value={bar}
+          onChange={(event) => setBar(event.target.value)}
+          data-testid="what-if-bar"
+        />
+      </label>{' '}
+      <label>
+        <input
+          type="checkbox"
+          checked={everything}
+          onChange={(event) => setEverything(event.target.checked)}
+        />{' '}
+        answered ones too
+      </label>{' '}
+      <button type="submit" disabled={running} data-testid="what-if-run">
+        {running ? 'Searching…' : 'on the last 20'}
+      </button>
+      {error && <p role="alert">{error}</p>}
+      {result && (
+        <p role="status" data-testid="what-if-result">
+          {result.would_answer} of {result.checked} would be answered
+          {result.newly_answered ? ` · ${result.newly_answered} newly` : ''}
+          {result.newly_unanswered ? ` · ${result.newly_unanswered} no longer` : ''}
+          {result.stopped_early ? ' (stopped early: the time limit ran out)' : ''}.
+        </p>
+      )}
+    </form>
   );
 }
 

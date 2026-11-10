@@ -506,10 +506,59 @@ describe('DocumentViewer find', () => {
     await userEvent.click(screen.getByTestId('viewer-find-open'));
     await userEvent.type(screen.getByTestId('viewer-find-input'), 'leave');
 
-    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('1 of 2 passages');
+    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('1 of 2 in 2 passages');
     expect(screen.getAllByTestId('viewer-found').map((mark) => mark.textContent)).toEqual(['Leave', 'LEAVE']);
     await userEvent.click(screen.getByTestId('viewer-find-next'));
-    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('2 of 2 passages');
+    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('2 of 2 in 2 passages');
     await userEvent.keyboard('{Escape}');
+  });
+
+  it('typing shows the first match, Enter the next, and closing returns focus', async () => {
+    getContentMock.mockResolvedValue({
+      ...CONTENT,
+      chunks: [
+        { chunk_id: 'c1', page: 1, section: 'Intro', text: 'Leave rules here.', chunk_ordinal: 1 },
+        { chunk_id: 'c2', page: 2, section: 'More', text: 'Annual leave again.', chunk_ordinal: 2 },
+      ],
+      total_chunks: 2,
+    } as never);
+    const scrolled: string[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      const id = (this as HTMLElement).dataset?.chunkId;
+      if (id) scrolled.push(id);
+    };
+    try {
+      render(<DocumentViewer filename="guide.md" chunkId={null} onClose={() => {}} />);
+      await screen.findAllByTestId('viewer-chunk');
+      await userEvent.click(screen.getByTestId('viewer-find-open'));
+      await userEvent.type(screen.getByTestId('viewer-find-input'), 'leave');
+      expect(scrolled.at(-1)).toBe('c1');
+      await userEvent.keyboard('{Enter}');
+      expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('2 of 2 in 2 passages');
+      expect(scrolled.at(-1)).toBe('c2');
+      await userEvent.keyboard('{Escape}');
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('viewer-find-open')));
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it('steps through each occurrence, marking the current one', async () => {
+    getContentMock.mockResolvedValue({
+      ...CONTENT,
+      chunks: [{ chunk_id: 'c1', page: 1, section: 'Intro', text: 'Leave, leave and more leave.', chunk_ordinal: 1 }],
+      total_chunks: 1,
+    } as never);
+    render(<DocumentViewer filename="guide.md" chunkId={null} onClose={() => {}} />);
+    await screen.findAllByTestId('viewer-chunk');
+    await userEvent.click(screen.getByTestId('viewer-find-open'));
+    await userEvent.type(screen.getByTestId('viewer-find-input'), 'leave');
+    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('1 of 3');
+    const current = () => screen.getAllByTestId('viewer-found').findIndex((mark) => mark.dataset.current === 'true');
+    expect(current()).toBe(0);
+    await userEvent.keyboard('{Enter}');
+    expect(current()).toBe(1);
+    expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('2 of 3');
   });
 });

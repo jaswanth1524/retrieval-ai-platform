@@ -109,15 +109,19 @@ export function mergeConversations(
         if (
           conversation.title === mine.title &&
           Boolean(conversation.pinned) === Boolean(mine.pinned) &&
-          JSON.stringify(scope) === JSON.stringify(mine.scope)
+          JSON.stringify(scope) === JSON.stringify(mine.scope) &&
+          JSON.stringify(conversation.labels ?? []) === JSON.stringify(mine.labels ?? [])
         ) {
           continue;
         }
+        const { labels: _labels, ...withoutLabels } = mine;
         byId.set(conversation.id, {
-          ...mine,
+          ...withoutLabels,
           title: conversation.title,
           scope,
           pinned: conversation.pinned,
+          // Labels set in another tab meanwhile: kept, as the title and pin are.
+          ...(conversation.labels?.length ? { labels: conversation.labels } : {}),
           editedAt: Math.max(lastEdit(mine), conversation.editedAt ?? 0),
         });
         changed = true;

@@ -105,7 +105,9 @@ body {
   /* Small inline actions a finger has to hit (WCAG 2.5.8: at least 24 px). */
   .document-viewer__ask,
   .corpus-panel__job-cancel,
-  .conversation-list__filter {
+  .conversation-list__filter,
+  .conversation-list__label,
+  .chat-message__versions-head button {
     min-height: 24px;
     min-width: 24px;
   }

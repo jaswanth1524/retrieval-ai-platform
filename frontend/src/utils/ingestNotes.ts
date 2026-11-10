@@ -17,5 +17,7 @@ export function ingestNote(result: DocumentIngestResponse | null | undefined): s
     );
   }
   if (result.duplicate_of) parts.push(`same bytes as ${result.duplicate_of}`);
+  // What the server left out or couldn't read (a page limit, OCR failing on a page).
+  for (const warning of result.warnings ?? []) parts.push(warning);
   return parts.length ? parts.join(' · ') : null;
 }

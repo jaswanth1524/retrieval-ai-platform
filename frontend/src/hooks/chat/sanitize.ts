@@ -5,7 +5,8 @@ import type {
   PassageNarrowing,
   SummaryCoverage,
 } from '../../api/types';
-import type { ChatTurn } from '../../components/ChatMessage';
+import type { AnswerStyle, ChatTurn } from '../../components/ChatMessage';
+import { isAnswerFormat, isAnswerLanguage } from '../../utils/overrides';
 import { WORKSPACE_NAME_PATTERN } from '../../utils/limits';
 import {
   cleanLabels,
@@ -207,14 +208,20 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (Array.isArray(turn.versions) && turn.role === 'assistant') {
     const versions = turn.versions.flatMap((version: unknown) => {
       if (!version || typeof version !== 'object') return [];
-      const { content, sources, timestamp, model } = version as Record<string, unknown>;
+      const { content, sources, timestamp, model, style, traceId } = version as Record<
+        string,
+        unknown
+      >;
       if (typeof content !== 'string' || !Array.isArray(sources)) return [];
+      const versionStyle = sanitizeStyle(style);
       return [
         {
           content: content.slice(0, 200_000),
           sources: sources.filter(isCitation).slice(0, 50),
           timestamp: validTime(timestamp, sanitized.timestamp),
           ...(typeof model === 'string' && model ? { model: model.slice(0, 200) } : {}),
+          ...(versionStyle ? { style: versionStyle } : {}),
+          ...(typeof traceId === 'string' && traceId && traceId.length <= 100 ? { traceId } : {}),
         },
       ];
     });
@@ -227,6 +234,17 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   const followups = cleanFollowups(turn.followups);
   if (followups.length > 0) sanitized.followups = followups;
   if (turn.saved === true && turn.role === 'assistant') sanitized.saved = true;
+  if (turn.role === 'assistant' && typeof turn.reviewedAt === 'number' && turn.reviewedAt > 0) {
+    sanitized.reviewedAt = validTime(turn.reviewedAt, sanitized.timestamp);
+  }
+  const style = turn.role === 'assistant' ? sanitizeStyle(turn.style) : undefined;
+  if (style) sanitized.style = style;
+  if (Array.isArray(turn.previousIds) && turn.role === 'assistant') {
+    const ids = turn.previousIds.filter(
+      (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 100,
+    );
+    if (ids.length > 0) sanitized.previousIds = ids.slice(-20);
+  }
   if (
     typeof turn.passagesLeftOut === 'number' &&
     Number.isInteger(turn.passagesLeftOut) &&
@@ -243,6 +261,9 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   }
   if (typeof turn.topRerankScore === 'number' && turn.topRerankScore >= 0 && turn.topRerankScore <= 1) {
     sanitized.topRerankScore = turn.topRerankScore;
+  }
+  if (typeof turn.rerankMinScore === 'number' && turn.rerankMinScore >= 0 && turn.rerankMinScore <= 1) {
+    sanitized.rerankMinScore = turn.rerankMinScore;
   }
   const usage = turn.usage as unknown;
   if (usage && typeof usage === 'object') {
@@ -334,4 +355,18 @@ export function sanitizeScope(value: unknown): ConversationScope | undefined {
   if (after !== undefined) scope.uploadedAfter = after;
   if (before !== undefined) scope.uploadedBefore = before;
   return scope;
+}
+
+/** An answer's Reformat style, within what Settings → Answers offers; undefined for
+ *  none (or nothing usable). */
+export function sanitizeStyle(value: unknown): AnswerStyle | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const { answerFormat, answerLanguage } = value as Record<string, unknown>;
+  const style: AnswerStyle = {
+    ...(isAnswerFormat(answerFormat) && answerFormat !== 'default' ? { answerFormat } : {}),
+    ...(typeof answerLanguage === 'string' && isAnswerLanguage(answerLanguage) && answerLanguage
+      ? { answerLanguage }
+      : {}),
+  };
+  return Object.keys(style).length > 0 ? style : undefined;
 }

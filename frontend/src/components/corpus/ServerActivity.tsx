@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState, type SyntheticEvent } from 'react';
 import { api, apiErrorMessage } from '../../api/client';
 import type { DocumentJobStatusResponse, WatchStatusResponse } from '../../api/types';
 import { formatRelativeTime } from '../../utils/relativeTime';
+import SitemapImports from './SitemapImports';
 
 /** How often the jobs list is read while any job runs, and the watcher's status. */
 export const ACTIVE_JOBS_POLL_MS = 3_000;
@@ -174,6 +175,7 @@ function ServerActivity({
 
   return (
     <section className="corpus-panel__activity" aria-label="Server activity" data-testid="server-activity">
+      <SitemapImports workspace={workspace} canCancel={canScan} />
       {watch && (
         <div className="corpus-panel__watch" data-testid="watch-status">
           <span className="mono">

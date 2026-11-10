@@ -23,6 +23,8 @@ export type QuestionStreamEvent =
       cached?: boolean;
       answer_status?: AnswerStatus;
       top_rerank_score?: number | null;
+      /** The relevance bar the answer was given under (the workspace's, if set). */
+      rerank_min_score?: number;
       weak_matches?: boolean;
       truncated?: boolean;
       citation_backfilled?: boolean;
