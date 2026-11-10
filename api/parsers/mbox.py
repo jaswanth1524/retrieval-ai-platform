@@ -10,6 +10,7 @@ from api.parsers.common import (
     DocumentParseError,
     DocumentSection,
     EmptyDocumentError,
+    note_parse_warning,
 )
 from api.parsers.eml import parse_eml_document
 
@@ -39,6 +40,9 @@ def parse_mbox_document(filename: str, content: bytes) -> list[DocumentSection]:
             len(messages),
             MAX_MBOX_MESSAGES,
         )
+        note_parse_warning(
+            f"Only its first {MAX_MBOX_MESSAGES} of {len(messages)} messages were indexed."
+        )
         messages = messages[:MAX_MBOX_MESSAGES]
     sections: list[DocumentSection] = []
     skipped = 0
@@ -53,6 +57,7 @@ def parse_mbox_document(filename: str, content: bytes) -> list[DocumentSection]:
         sections.extend(replace(section, page=page, boundary="isolated") for section in parsed)
     if skipped:
         logger.info("Mailbox %s: %d message(s) had no readable text.", filename, skipped)
+        note_parse_warning(f"{skipped} message(s) had no readable text.")
     if not sections:
         raise EmptyDocumentError(f"Mailbox '{filename}' has no extractable text.")
     return sections

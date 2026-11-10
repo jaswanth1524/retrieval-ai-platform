@@ -46,6 +46,7 @@ def test_document_upload_ingests_chunks(api_context: ApiTestContext) -> None:
         "chunks_reused": 0,
         "chunks_removed": 0,
         "duplicate_of": None,
+        "warnings": [],
     }
     records, _ = api_context.qdrant.scroll(
         collection_name="api_documents",

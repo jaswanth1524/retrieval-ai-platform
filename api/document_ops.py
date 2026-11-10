@@ -103,6 +103,7 @@ def enqueue_refreshed(
     expected: DocumentMetadata | None,
     repository: VectorRepository,
     tags: tuple[str, ...] | None = None,
+    refresh_minutes: int | None = None,
 ) -> DocumentJobAcceptedResponse:
     """Index what a fetch of ``name``'s URL brought back — a refresh (the route's and
     the scheduled one's), a failed URL job's Retry, a restart's re-queue: one path for
@@ -112,7 +113,8 @@ def enqueue_refreshed(
     ``expected`` is the document as it was before the fetch (None: there was none);
     anything else by the time the job writes refuses it (``unchanged_since_fetch``,
     ``still_absent``). ``tags`` sets the tags (a retry's, as the job had them); None
-    carries the document's over, as on any re-upload.
+    carries the document's over, as on any re-upload. ``refresh_minutes`` is the
+    interval for a document there was none of (a retry's, as its job was asked).
     """
 
     settings = queue.ingest_service.settings
@@ -124,7 +126,7 @@ def enqueue_refreshed(
             source_url,
             fetched.etag,
             fetched.last_modified,
-            expected.source_refresh_minutes if expected is not None else None,
+            expected.source_refresh_minutes if expected is not None else refresh_minutes,
         ),
         tags=tags,
         dedupe=True,
@@ -201,6 +203,8 @@ def enqueue_refetched(
         expected=meta,
         repository=repository,
         tags=job.tags,
+        # A document that never got indexed: the interval its first fetch asked for.
+        refresh_minutes=job.refresh_minutes,
     )
 
 

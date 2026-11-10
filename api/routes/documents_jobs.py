@@ -44,8 +44,11 @@ from api.schemas import (
     DocumentJobAcceptedResponse,
     DocumentJobListResponse,
     DocumentJobStatusResponse,
+    SitemapImportListResponse,
+    SitemapImportResponse,
 )
 from api.settings import AppSettings
+from api.sitemap import ImportStatus, import_status, imports_of
 from api.url_fetch import (
     fetch_document,
 )
@@ -214,3 +217,67 @@ def cancel_document_job(
     status = _job_status(job_store, job_id, workspace)
     audit("job.cancel", workspace=workspace, job_id=job_id, filename=status.filename)
     return status
+
+
+def _import_response(status: ImportStatus) -> SitemapImportResponse:
+    return SitemapImportResponse(
+        id=status.id,
+        url=status.url,
+        state=status.state,
+        total=status.total,
+        done=status.done,
+        queued=status.queued,
+        failed=status.failed,
+        skipped=status.skipped,
+        unchanged=status.unchanged,
+        cancelled_pages=status.cancelled_pages,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        problems=list(status.problems),
+    )
+
+
+def _own_import(import_id: str, settings: AppSettings) -> ImportStatus:
+    status = import_status(import_id, workspace_of(settings))
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"No sitemap import '{import_id}'.")
+    return status
+
+
+# A sitemap import's progress (POST /documents/from-sitemap's import_id): pages queued,
+# unchanged, failed and skipped so far, and the first problems met. Kept in memory: the
+# latest imports of this process.
+@router.get(
+    "/documents/sitemap-imports",
+    response_model=SitemapImportListResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def list_sitemap_imports(settings: SettingsDep) -> SitemapImportListResponse:
+    return SitemapImportListResponse(
+        imports=[_import_response(status) for status in imports_of(workspace_of(settings))]
+    )
+
+
+@router.get(
+    "/documents/sitemap-imports/{import_id}",
+    response_model=SitemapImportResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_sitemap_import(import_id: str, settings: SettingsDep) -> SitemapImportResponse:
+    return _import_response(_own_import(import_id, settings))
+
+
+# Stops an import before its next page: pages already queued go on indexing.
+@router.delete(
+    "/documents/sitemap-imports/{import_id}",
+    response_model=SitemapImportResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+)
+def cancel_sitemap_import(import_id: str, settings: SettingsDep) -> SitemapImportResponse:
+    status = _own_import(import_id, settings)
+    if status.finished_at is not None:
+        raise HTTPException(status_code=409, detail="That import has already finished.")
+    status.cancel.set()
+    audit("sitemap.cancel", workspace=workspace_of(settings), import_id=import_id, url=status.url)
+    return _import_response(status)

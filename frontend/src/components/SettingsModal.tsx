@@ -1,6 +1,11 @@
 import { useState } from 'react';
 import { getApiKey, setApiKey } from '../api/client';
-import type { PublicConfigResponse, QuestionOverrides, ReadinessResponse } from '../api/types';
+import type {
+  DocumentJobAcceptedResponse,
+  PublicConfigResponse,
+  QuestionOverrides,
+  ReadinessResponse,
+} from '../api/types';
 import { useDialog } from '../hooks/useDialog';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
@@ -32,7 +37,7 @@ interface SettingsModalProps {
   /** The full key: workspace settings, cached answers, backups, consistency. */
   showAdmin?: boolean;
   /** A backup was restored: the corpus listing should be read again. */
-  onRestored?: () => void;
+  onRestored?: (jobs: DocumentJobAcceptedResponse[]) => void;
 }
 
 const SYSTEM_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [

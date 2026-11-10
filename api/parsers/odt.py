@@ -167,18 +167,28 @@ def _cell_text(cell: ElementTree.Element) -> str:
     )
 
 
+def row_cells(row: ElementTree.Element) -> list[str]:
+    """A table row's cells in their columns: a run of repeated cells (blank ones
+    included, and cells covered by a merge) takes as many columns as it says, up to
+    ``_MAX_REPEATED_CELLS``, so a value after a blank run stays under its own header.
+    Trailing blank cells are padding, not columns, and are dropped."""
+
+    cells: list[str] = []
+    for cell in row:
+        if cell.tag not in (f"{_TABLE}table-cell", f"{_TABLE}covered-table-cell"):
+            continue
+        text = _cell_text(cell) if cell.tag == f"{_TABLE}table-cell" else ""
+        repeat = _count(cell, f"{_TABLE}number-columns-repeated", _MAX_REPEATED_CELLS)
+        cells.extend([text] * repeat)
+    while cells and not cells[-1].strip():
+        cells.pop()
+    return cells
+
+
 def _table_rows(table: ElementTree.Element) -> list[str]:
     rows: list[list[str]] = []
     for row in table.iter(f"{_TABLE}table-row"):
-        cells: list[str] = []
-        for cell in row:
-            if cell.tag not in (f"{_TABLE}table-cell", f"{_TABLE}covered-table-cell"):
-                continue
-            text = _cell_text(cell) if cell.tag == f"{_TABLE}table-cell" else ""
-            # A repeated empty cell (a sheet-like table's padding) is one cell, not
-            # thousands: only cells with text are repeated.
-            repeat = _count(cell, f"{_TABLE}number-columns-repeated", _MAX_REPEATED_CELLS)
-            cells.extend([text] * (repeat if text else 1))
+        cells = row_cells(row)
         if any(cells):
             rows.append(cells)
     if len(rows) < 2:

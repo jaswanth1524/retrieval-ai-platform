@@ -1,3 +1,4 @@
+import { WEAK_SUPPORT_MARGIN } from '../../appHelpers';
 import type { ChatTurn } from '../ChatMessage';
 
 interface AnswerFlagsProps {
@@ -8,7 +9,12 @@ interface AnswerFlagsProps {
 
 /** The short flags under an answer: how it went (stopped, cached, not found, weak
  *  match, uncited, cut off…) and, for a summary, how much it read. */
-export default function AnswerFlags({ turn, weakSupportBelow }: AnswerFlagsProps) {
+export default function AnswerFlags({ turn, weakSupportBelow: serverBelow }: AnswerFlagsProps) {
+  // The bar this answer was given under (a workspace's own), when the server said.
+  const weakSupportBelow =
+    serverBelow !== undefined && typeof turn.rerankMinScore === 'number'
+      ? turn.rerankMinScore + WEAK_SUPPORT_MARGIN
+      : serverBelow;
   return (
     <>
       {turn.stopped && (

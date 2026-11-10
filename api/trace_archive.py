@@ -48,13 +48,14 @@ _SUMMARY_COLUMNS = (
     ("reranker_model", "TEXT"),
     ("gated", "INTEGER NOT NULL DEFAULT 1"),
     ("kind", "TEXT NOT NULL DEFAULT 'question'"),
+    ("rerank_min_score", "REAL"),
     # Which set of these columns a row has filled (_SUMMARY_LEVEL); 0 on rows written
     # before any existed, until they are filled in.
     ("summarized", "INTEGER NOT NULL DEFAULT 0"),
 )
 _SUMMARY_FIELDS = tuple(name for name, _ in _SUMMARY_COLUMNS if name != "summarized")
 # Raised when columns are added, so rows filled before are filled again.
-_SUMMARY_LEVEL = 2
+_SUMMARY_LEVEL = 3
 # Rows backfilled per transaction when an older archive is opened.
 _BACKFILL_ROWS = 500
 

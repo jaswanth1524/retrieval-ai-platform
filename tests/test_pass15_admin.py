@@ -68,7 +68,7 @@ def admin(
 
 
 def test_backups_are_listed_verified_run_on_demand_and_restored(
-    admin: tuple[TestClient, ScheduledBackup, Clock, Path],
+    admin: tuple[TestClient, ScheduledBackup, Clock, Path], caplog: pytest.LogCaptureFixture
 ) -> None:
     client, backup, clock, _ = admin
     assert upload_and_wait(client, "guide.txt", b"Intro\none")["state"] == "done"
@@ -91,12 +91,21 @@ def test_backups_are_listed_verified_run_on_demand_and_restored(
     assert check["ok"] and check["documents"] == 1 and check["versions"] == 1
 
     assert client.delete("/documents/guide.txt").status_code == 200
+    import logging
+
+    caplog.set_level(logging.INFO, logger="api.audit")
     restored = client.post(f"/backups/{second.name}/restore")
     assert restored.status_code == 202, restored.text
     (job,) = restored.json()["jobs"]
     assert wait_for_job(client, job["job_id"])["state"] == "done"
     assert "guide.txt" in client.get("/documents").json()["filenames"]
     assert len(client.get("/documents/guide.txt/versions").json()["versions"]) == 1
+    audited = [r.audit for r in caplog.records if r.name == "api.audit"]  # type: ignore[attr-defined]
+    (imported,) = [event for event in audited if event["event"] == "backup.import"]
+    assert imported["backup"] == second.name
+    # POST /backups/run is audited as asked for; the backup itself, as an export.
+    assert any(event["event"] == "corpus.export_requested" for event in audited)
+    assert not any(event.get("requested") for event in audited)
 
     for bad in ("secrets.zip", "docrag-1.zip", "docrag-20000101-000000.zip"):
         assert client.post(f"/backups/{bad}/verify").status_code == 404
@@ -256,3 +265,76 @@ def test_the_cli_lists_verifies_and_checks(
     out = io.StringIO()
     assert main(["check"], client=docrag, out=out) == 1
     assert "original, no document: orphan.txt" in out.getvalue()
+
+
+def test_a_stored_backup_is_downloaded_and_deleted(
+    admin: tuple[TestClient, ScheduledBackup, Clock, Path],
+) -> None:
+    from api.scheduled_backup import check_path
+
+    client, backup, _, _ = admin
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha")["state"] == "done"
+    (written,) = backup.run_once()
+
+    downloaded = client.get(f"/backups/{written.name}")
+    assert downloaded.status_code == 200
+    assert downloaded.content == written.read_bytes()
+    assert downloaded.headers["content-type"] == "application/zip"
+
+    assert client.delete(f"/backups/{written.name}").json() == {"name": written.name}
+    assert not written.exists() and not check_path(written).exists()
+    assert client.get("/backups").json()["backups"] == []
+    assert client.get(f"/backups/{written.name}").status_code == 404
+    assert client.delete("/backups/secret.zip").status_code == 404
+
+
+def test_the_cli_downloads_and_deletes_a_backup(
+    admin: tuple[TestClient, ScheduledBackup, Clock, Path], tmp_path: Path
+) -> None:
+    client, backup, _, _ = admin
+    assert upload_and_wait(client, "guide.txt", b"Intro\nalpha")["state"] == "done"
+    (written,) = backup.run_once()
+    docrag = DocragClient("http://testserver", None, http=client, sleep=lambda _: None)
+    target = tmp_path / "kept.zip"
+    assert main(["backup", "download", written.name, "-o", str(target)], client=docrag) == 0
+    assert target.read_bytes() == written.read_bytes()
+    out = io.StringIO()
+    assert main(["backup", "delete", written.name], client=docrag, out=out) == 0
+    assert out.getvalue().strip() == f"deleted {written.name}"
+
+
+def test_repair_puts_right_only_what_is_asked(
+    admin: tuple[TestClient, ScheduledBackup, Clock, Path],
+) -> None:
+    client, _, _, raw = admin
+    assert upload_and_wait(client, "kept.txt", b"Intro\nkept")["state"] == "done"
+    (raw / "orphan.txt").write_bytes(b"left behind")
+    (raw / VERSIONS_DIR / "gone.txt").mkdir(parents=True)
+    (raw / VERSIONS_DIR / "gone.txt" / "v1").write_bytes(b"old")
+
+    nothing = client.post("/admin/consistency/repair", json={}).json()
+    assert nothing["originals_deleted"] == [] and (raw / "orphan.txt").exists()
+
+    fixed = client.post(
+        "/admin/consistency/repair",
+        json={"delete_orphan_originals": True, "delete_orphan_versions": True},
+    ).json()
+    assert fixed["originals_deleted"] == ["orphan.txt"]
+    assert fixed["versions_deleted"] == ["gone.txt"]
+    assert not (raw / "orphan.txt").exists() and not (raw / VERSIONS_DIR / "gone.txt").exists()
+    # The indexed document and its original are untouched.
+    assert (raw / "kept.txt").exists()
+    assert client.get("/admin/consistency").json()["problems"] == 0
+
+
+def test_the_cli_repairs_on_request(
+    admin: tuple[TestClient, ScheduledBackup, Clock, Path],
+) -> None:
+    client, _, _, raw = admin
+    assert upload_and_wait(client, "kept.txt", b"Intro\nkept")["state"] == "done"
+    (raw / "orphan.txt").write_bytes(b"x")
+    docrag = DocragClient("http://testserver", None, http=client, sleep=lambda _: None)
+    out = io.StringIO()
+    assert main(["check", "--repair", "originals"], client=docrag, out=out) == 0
+    assert "deleted original: orphan.txt" in out.getvalue()
+    assert "0 problem(s)" in out.getvalue()

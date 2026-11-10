@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11), then four fixes-and-features passes (passes 12 to 15). **Re-index:
+(pass 11), then five fixes-and-features passes (passes 12 to 16). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,42 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 16: tables in OpenDocument files (ODS sheets, and tables in ODT and ODP) keep a
+  value after a run of blank cells under its own column: a row "Ann, (two blanks), 9"
+  under "Name | Q1 | Q2 | Total" read "Q2: 9" and now reads "Total: 9". **Re-index:
+  recommended** for those formats only (chunker version unchanged, so only ↻ on their
+  cards, or a changed upload, applies it).
+- Pass 16: `POST /traces/{id}/rerun` repeats the question as it was asked — its passage
+  count, prompt budget, fallback, floor, recency weight and bar from the trace (the
+  server's only where an older trace has none) — so a re-run with nothing changed shows
+  no difference; before, it used the server's current settings and reported changes
+  nobody made.
+- Pass 16: the query log keeps each question's scope (documents, tags, page range), and
+  a re-check searches only there; a scoped question with no candidates is a question,
+  not a summary. A cached or joined answer is logged too (`cached`), so the log counts
+  every time a question was asked.
+- Pass 16: answer cache keys include the relevance bar, recency weight, relative floor
+  and follow-up setting; summary keys the answer language and format (a workspace's own
+  settings could otherwise be served an answer given under the old ones).
+- Pass 16: a summary of a page range is counted and read through the index's filter:
+  the passage limit counts the range, and a range with nothing on it is a 400.
+- Pass 16: a summary part is tried again only when another try could help (not after a
+  local model timed out, not for bad credentials or an unknown model, not once the
+  reader left). Failed follow-up suggestions keep the answer out of the cache.
+- Pass 16: `verify_backup` (POST /backups/verify, the scheduled check) applies
+  restore's own rules: documents a restore would refuse (a name it wouldn't store, an
+  original past MAX_UPLOAD_BYTES, bad tags) are listed in `rejected`, with
+  `would_restore` counting the rest. They are reported, not counted as damage: an
+  intact backup stays "verified".
+- Pass 16: running out of `PARSE_MEMORY_LIMIT_MB` is error type `parse_memory`,
+  retried (watcher, re-indexer, Retry) like a parse timeout, not given up on.
+- Pass 16: the MCP `add_url` tool keeps a document from another source under the same
+  name unless asked (`replace`), and says it may replace one (`destructive_hint`).
+- Pass 16: Regenerate or Reformat on an earlier answer replaces that answer where it is,
+  asked with the conversation as it stood then and in the style it was asked for; a
+  saved answer stays saved; a link or pinned trace to the old answer finds the new one.
+- Pass 16: viewer find goes to the first match as you type and steps through each
+  occurrence ("2 of 5 in 3 passages"), the current one outlined.
 - Pass 15: a comparison or brief with no focus no longer offers each part the
   "NOTHING RELEVANT" reply (every part is about a document the task covers whole), and
   that marker followed by citations ("NOTHING RELEVANT [5-8]") is dropped like the bare
@@ -300,6 +336,39 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 16, tuning: `POST /traces/what-if` (UI: "Try a bar" in the score report; CLI
+  `docrag traces what-if --min-score`) searches the latest traced questions again under
+  a proposed bar, floor or fallback and says how many would be answered. Workspaces can
+  also set `rerank_fallback_count`, `rerank_relative_floor`, `max_context_chunks` and
+  `followups_enabled`. `GET /traces/score-report?since=&bar=` counts only traces asked
+  since then, or under that bar. Answers carry the `rerank_min_score` they were given
+  under, so the weak-support badge follows a workspace's own bar.
+- Pass 16, sources: a sitemap import has an id (`import_id`), a status
+  (`GET /documents/sitemap-imports[/{id}]`: queued, unchanged, failed, skipped, the first
+  problems) and Cancel (`DELETE`), shown under server activity; CLI `add-url --sitemap
+  --wait`. A page already indexed from its URL is skipped when the sitemap's
+  `<lastmod>` isn't newer, else fetched conditionally (a 304 is "unchanged"). Gzipped
+  child sitemaps are read, and a site's address or `robots.txt` gives its `Sitemap:`
+  lines. Pages whose names clash (`/docs/intro/` and `/blog/intro/`), or whose name
+  another source's document holds, are named from their URL
+  (`example.com_blog_intro.html`). `WATCH_DIRS` entries take their own patterns
+  (`path=>ws|include=*.pdf|exclude=drafts/*`). A job result lists what indexing left
+  out (`warnings`: pages past MAX_OCR_PAGES, OCR failing on a page, a mailbox's message
+  cap, a cut notebook cell), shown on the upload toast and by `docrag ingest`.
+- Pass 16, ops: `GET`/`DELETE /backups/{name}` (download or delete a stored backup;
+  CLI `docrag backup download|delete`), `POST /admin/consistency/repair` (delete
+  orphaned originals or version folders, re-index incomplete documents — each only when
+  asked; CLI `docrag check --repair`), and in Administration: the cached questions with
+  their age, a backup file checked before restoring it, Download/Delete, and Repair.
+  `harness retrieval --server URL --workspace NAME` records the server's reported
+  ranking settings, so a `--baseline` from another server run can judge it.
+- Pass 16, chat: an earlier answer version can be compared word by word with the
+  current one and made the answer again; versions are labelled with their style.
+  "Needs review" answers can be marked reviewed (hidden unless shown), with a count on
+  the rail. Passage links (`#d=<file>&k=<passage>&w=<workspace>`, "Copy link" in the
+  viewer) open a document at a passage for anyone using the same server. Labels can be
+  renamed or removed everywhere, suggested while typing, and their conversations
+  exported.
 - Pass 15: backups admin (full key) — `GET /backups` lists `BACKUP_DIR`'s backups of
   the workspace, each verified when written; `POST /backups/run` writes one now;
   `POST /backups/{name}/verify` and `POST /backups/verify` (an upload) read a backup
@@ -825,6 +894,31 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 16: two pages of one sitemap import with the same file name no longer replace
+  each other (or an upload of that name); two watched folders into one workspace are
+  refused at startup (they re-indexed each other's files forever, and a delete in one
+  removed the other's document); a workspace can't be deleted while a sitemap import
+  still adds pages to it; a zip upload is budgeted as an import (MAX_IMPORT_BYTES, not
+  MAX_UPLOAD_BYTES), its member cap counts documents (not Finder's `__MACOSX` entries),
+  and a damaged bzip2 or LZMA member is listed instead of failing the request (also in
+  `/import` and verify); a Latin-1 sitemap keeps its accented URLs; a retried URL job
+  keeps its refresh interval; ODP text in custom shapes and grouped shapes is read; a
+  notebook code cell holding a fence stays code; `PUT` passes CORS (workspace
+  settings from another origin); the backup restore audit names the stored backup,
+  and "Back up now" is audited as a request.
+- Pass 16: error and closed-early traces keep the passages retrieval found and the
+  tokens spent; leg ranks are fetched only for answers that are traced (not for search,
+  re-checks or the eval harness), without losing the best rank to a race; the cached
+  answers list names a summary's mode and documents and matches workspaces by their
+  key, not any matching value; summary cache hits are counted.
+- Pass 16, UI: labels added in another tab during an answer are kept; an edited copy
+  keeps its conversation's labels; Undo after a delete resets the inspector; the trace
+  re-run form resets per trace and aborts a search left behind; "keep this, delete the
+  others" stops naming deleted copies; restoring a stored backup follows its jobs in
+  the corpus panel; saving workspace settings re-reads the cache count; a zip shows a
+  card while it uploads (Cancel stops it) and an empty one says so; focus returns to
+  Reformat, the version toggle and Find when they close; a deep link focuses its turn;
+  the viewer's header wraps at 390 px and small chips get 24 px touch targets.
 - Pass 15: a backup's check survives a restart. Each check is kept beside its file
   (`.docrag-….zip.check.json`, keyed on size and modification time, so a file changed
   since reads as unchecked), written by the scheduled write and by `POST

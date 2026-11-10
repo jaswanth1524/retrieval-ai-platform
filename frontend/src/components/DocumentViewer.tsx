@@ -26,6 +26,8 @@ interface DocumentViewerProps {
   onAskAboutPassage?: (question: string, chunkId: string) => void;
   /** Search for the passages most like one ("more like this"). */
   onFindSimilar?: (chunkId: string, label: string) => void;
+  /** Copy a link that opens this document (at its cited passage) on this server. */
+  onCopyLink?: () => void;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -72,6 +74,7 @@ function DocumentViewer({
   highlights,
   onAskAboutPassage,
   onFindSimilar,
+  onCopyLink,
 }: DocumentViewerProps) {
   // The passage whose question box is open, and what is typed in it.
   const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
@@ -311,22 +314,53 @@ function DocumentViewer({
   const targetPage =
     loaded?.chunks.find((chunk) => chunkId !== null && chunk.chunk_id === chunkId)?.page ?? 1;
 
+  // Every occurrence in the loaded passages, in reading order: next/previous step
+  // through these, not through passages (a passage with three mentions is three stops).
   const findMatches = useMemo(
     () =>
       findOpen && findQuery.trim()
-        ? (chunks ?? []).filter((chunk) => matchRanges(chunk.text, findQuery).length > 0)
+        ? (chunks ?? []).flatMap((chunk) =>
+            matchRanges(chunk.text, findQuery).map(([start]) => ({ chunk_id: chunk.chunk_id, start })),
+          )
         : [],
     [chunks, findOpen, findQuery],
   );
+  const matchedPassages = useMemo(
+    () => new Set(findMatches.map((match) => match.chunk_id)).size,
+    [findMatches],
+  );
   const currentMatch = findMatches.length > 0 ? findMatches[findIndex % findMatches.length] : null;
+  const scrollToChunk = (id: string) =>
+    bodyRef.current
+      ?.querySelector<HTMLElement>(`[data-chunk-id="${CSS.escape(id)}"]`)
+      ?.scrollIntoView({ block: 'center' });
   const goToMatch = (step: number) => {
     if (findMatches.length === 0) return;
     const next = (((findIndex + step) % findMatches.length) + findMatches.length) % findMatches.length;
     setFindIndex(next);
-    const id = findMatches[next].chunk_id;
+    scrollToChunk(findMatches[next].chunk_id);
+  };
+  // Then to the occurrence itself, once it is marked (a long passage holds several).
+  useEffect(() => {
+    if (!findOpen) return;
     bodyRef.current
-      ?.querySelector<HTMLElement>(`[data-chunk-id="${CSS.escape(id)}"]`)
-      ?.scrollIntoView({ block: 'center' });
+      ?.querySelector<HTMLElement>('mark[data-current="true"]')
+      ?.scrollIntoView?.({ block: 'nearest' });
+  }, [findIndex, findQuery, findOpen]);
+  // As in a browser's find: typing shows the first match ("1 of N" is where the view
+  // is), and Enter then moves to the next.
+  const firstMatchId = findMatches[0]?.chunk_id;
+  useEffect(() => {
+    if (firstMatchId) scrollToChunk(firstMatchId);
+    // Only when the query (and so the first match) changes, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findQuery, firstMatchId]);
+  // Closing find puts focus back on the button that opened it (it unmounted with
+  // the bar open; focus fell to <body>).
+  const findOpenRef = useRef<HTMLButtonElement | null>(null);
+  const closeFind = () => {
+    setFindOpen(false);
+    requestAnimationFrame(() => findOpenRef.current?.focus());
   };
   const openFind = () => {
     setFindOpen(true);
@@ -366,7 +400,9 @@ function DocumentViewer({
       <div className="document-viewer__backdrop" data-testid="viewer-backdrop" onClick={onClose} />
       <div className="document-viewer__panel">
         <div className="document-viewer__header">
-          <span className="document-viewer__filename">{filename}</span>
+          <span className="document-viewer__filename" title={filename}>
+            {filename}
+          </span>
           {canPreviewOriginal && (
             <span className="document-viewer__modes" role="group" aria-label="View">
               <button
@@ -399,6 +435,17 @@ function DocumentViewer({
               Download original
             </button>
           )}
+          {onCopyLink && (
+            <button
+              type="button"
+              className="document-viewer__original"
+              onClick={onCopyLink}
+              title={chunkId ? 'A link to this passage, for anyone with access to this server' : 'A link to this document'}
+              data-testid="viewer-copy-link"
+            >
+              Copy link
+            </button>
+          )}
           <button
             type="button"
             className="document-viewer__close"
@@ -410,6 +457,7 @@ function DocumentViewer({
           </button>
           {mode === 'passages' && !findOpen && (
             <button
+              ref={findOpenRef}
               type="button"
               className="document-viewer__original"
               onClick={openFind}
@@ -453,11 +501,11 @@ function DocumentViewer({
               onKeyDown={(event) => {
                 if (event.key === 'Enter') {
                   event.preventDefault();
-                  goToMatch(event.shiftKey ? -1 : findQuery === '' ? 0 : 1);
+                  goToMatch(event.shiftKey ? -1 : 1);
                 } else if (event.key === 'Escape') {
                   // Closes the find bar, not the viewer.
                   event.stopPropagation();
-                  setFindOpen(false);
+                  closeFind();
                 }
               }}
               placeholder="Find in the passages…"
@@ -467,7 +515,9 @@ function DocumentViewer({
             <span className="mono" role="status" data-testid="viewer-find-count">
               {findQuery.trim()
                 ? findMatches.length > 0
-                  ? `${(findIndex % findMatches.length) + 1} of ${findMatches.length} passages`
+                  ? `${(findIndex % findMatches.length) + 1} of ${findMatches.length}${
+                      matchedPassages > 1 ? ` in ${matchedPassages} passages` : ''
+                    }`
                   : 'no passage'
                 : ''}
             </span>
@@ -488,7 +538,7 @@ function DocumentViewer({
                 Search the whole document
               </button>
             )}
-            <button type="button" onClick={() => setFindOpen(false)} aria-label="Close find">
+            <button type="button" onClick={closeFind} aria-label="Close find">
               ✕
             </button>
           </div>
@@ -596,7 +646,11 @@ function DocumentViewer({
                 )}
                 <p className="document-viewer__chunk-text" dir="auto">
                   {findOpen && findQuery.trim() && matchRanges(chunk.text, findQuery).length > 0 ? (
-                    <FoundText text={chunk.text} query={findQuery} />
+                    <FoundText
+                      text={chunk.text}
+                      query={findQuery}
+                      current={currentMatch?.chunk_id === chunk.chunk_id ? currentMatch.start : null}
+                    />
                   ) : isTarget && highlights?.length ? (
                     <MarkedText
                       text={chunk.text}
@@ -642,13 +696,19 @@ function DocumentViewer({
 }
 
 /** A passage with every match of the find query marked. */
-function FoundText({ text, query }: { text: string; query: string }) {
+function FoundText({ text, query, current = null }: { text: string; query: string; current?: number | null }) {
   const parts: ReactNode[] = [];
   let position = 0;
   for (const [start, end] of matchRanges(text, query)) {
     parts.push(text.slice(position, start));
+    const here = start === current;
     parts.push(
-      <mark key={start} className="document-viewer__found" data-testid="viewer-found">
+      <mark
+        key={start}
+        className={`document-viewer__found${here ? ' document-viewer__found--current' : ''}`}
+        data-testid="viewer-found"
+        {...(here ? { 'aria-current': true as const, 'data-current': 'true' } : {})}
+      >
         {text.slice(start, end)}
       </mark>,
     );

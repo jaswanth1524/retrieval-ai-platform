@@ -57,6 +57,7 @@ from api.pipeline import (
     cached_run,
     narrowing_record,
     replay_cached,
+    served_query,
     timings_dict,
     trace_model_name,
     trace_status,
@@ -75,6 +76,7 @@ from api.prompting import (
     weighted_length,
     with_answer_language,
 )
+from api.query_log import log_served
 from api.repository import PassageFilter, VectorRepository
 from api.request_id import current_request_id, submit_in_context
 from api.reranking import RerankedChunk
@@ -131,6 +133,24 @@ class NothingToCompareError(RetrievalError):
     DocumentNotFoundError: the stream reports it as an error frame, and only these
     messages are passed through there (api/errors.py), so the name still reaches the
     client."""
+
+
+class NothingInRangeError(RetrievalError):
+    """A summary's page range or section holds none of the document's passages (a 400:
+    "nothing there" is not a summary saying the document doesn't cover it)."""
+
+
+def _range_text(narrow: PassageFilter) -> str:
+    parts: list[str] = []
+    if narrow.page_min is not None and narrow.page_max is not None:
+        parts.append(f"on pages {narrow.page_min}-{narrow.page_max}")
+    elif narrow.page_min is not None:
+        parts.append(f"from page {narrow.page_min} on")
+    elif narrow.page_max is not None:
+        parts.append(f"up to page {narrow.page_max}")
+    if narrow.section:
+        parts.append(f"in the section '{narrow.section}'")
+    return " ".join(parts) or "that match"
 
 
 @dataclass(frozen=True)
@@ -461,6 +481,10 @@ def summary_cache_key(request: SummaryRequest, settings: AppSettings) -> CacheKe
         settings.llm_provider.lower().strip(),
         model,
         float(settings.llm_temperature),
+        # The summary's language and format (ANSWER_LANGUAGE / ANSWER_FORMAT, or the
+        # workspace's): another one is another summary.
+        settings.answer_language,
+        settings.answer_format,
         # Pages 3-5 is another summary than the whole document.
         request.narrow,
         int(settings.summary_max_tokens),
@@ -517,7 +541,9 @@ class DocumentSummarizer:
             update["llm_temperature"] = request.llm_temperature
         return self._settings.model_copy(update=update) if update else self._settings
 
-    def check_documents(self, filenames: Sequence[str]) -> None:
+    def check_documents(
+        self, filenames: Sequence[str], narrow: PassageFilter | None = None
+    ) -> None:
         """404 for a document with no passages, 400 for one too long to summarize —
         checked by the routes before a question slot is taken (a count, no payloads).
 
@@ -535,10 +561,24 @@ class DocumentSummarizer:
                 f"{len(filenames)} were named."
             )
         for filename in filenames:
-            self._checked_count(self._settings, filename)
+            self._checked_count(self._settings, filename, narrow)
 
-    def _checked_count(self, settings: AppSettings, filename: str) -> int:
-        count = self._repository.chunk_count_for_filename(settings, filename)
+    def _checked_count(
+        self, settings: AppSettings, filename: str, narrow: PassageFilter | None = None
+    ) -> int:
+        """How many passages a summary of ``filename`` reads (those ``narrow`` admits):
+        the cap counts those, so a long document can be summarized a page range at a
+        time."""
+
+        count = (
+            self._repository.chunk_count_for_filename(settings, filename, narrow)
+            if narrow is not None
+            else self._repository.chunk_count_for_filename(settings, filename)
+        )
+        if count == 0 and narrow is not None:
+            if self._repository.chunk_count_for_filename(settings, filename) == 0:
+                raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+            raise NothingInRangeError(f"'{filename}' has no passages {_range_text(narrow)}.")
         if count == 0:
             raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
         if count > SUMMARY_MAX_DOCUMENT_CHUNKS:
@@ -691,7 +731,11 @@ class DocumentSummarizer:
                 focused=focused,
             )
             failure: GenerationError | None = None
-            for _attempt in range(_PART_ATTEMPTS):
+            for attempt in range(_PART_ATTEMPTS):
+                # A second try only when the reader is still there and the same call
+                # could go differently (not bad credentials, not a local timeout).
+                if attempt and (stop_requested() or failure is None or not failure.worth_retrying):
+                    break
                 try:
                     reset_finish_reason()
                     text = self._generator.complete(messages, settings).strip()
@@ -769,10 +813,12 @@ class DocumentSummarizer:
         """The document's passages in order; with ``narrow``, only those in its page
         range or section."""
 
-        self._checked_count(settings, filename)
-        payloads = self._repository.chunks_for_filename(settings, filename)
-        if narrow is not None:
-            payloads = [payload for payload in payloads if narrow.admits_neighbour(payload)]
+        self._checked_count(settings, filename, narrow)
+        payloads = (
+            self._repository.chunks_for_filename(settings, filename, narrow)
+            if narrow is not None
+            else self._repository.chunks_for_filename(settings, filename)
+        )
         return [chunk for chunk in map(payload_chunk, payloads) if chunk is not None]
 
     def summarize(self, request: SummaryRequest, *, use_cache: bool = True) -> SummaryResult:
@@ -851,6 +897,18 @@ class DocumentSummarizer:
             # One that left a part out or had notes cut off isn't kept: asked again, it
             # may come out whole.
             keep=lambda done: not done.get("parts_skipped") and not done.get("notes_truncated"),
+            on_hit=lambda hit: log_served(
+                self._trace_store,
+                served_query(
+                    hit,
+                    question=task_description(request),
+                    mode=mode,
+                    workspace=workspace_of(self._settings),
+                    kind="summary",
+                    filenames=request.filenames,
+                    narrowing=narrowing_record(request.narrow),
+                ),
+            ),
         )
 
     def _run(

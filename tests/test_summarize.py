@@ -49,11 +49,22 @@ class FakeRepository:
     def ensure_ready(self, settings: AppSettings) -> None:
         return None
 
-    def chunk_count_for_filename(self, settings: AppSettings, filename: str) -> int:
+    def chunk_count_for_filename(
+        self, settings: AppSettings, filename: str, narrow: Any = None
+    ) -> int:
+        if narrow is not None:
+            return len(self.chunks_for_filename(settings, filename, narrow))
         return self.counts.get(filename, len(self.documents.get(filename, [])))
 
-    def chunks_for_filename(self, settings: AppSettings, filename: str) -> list[dict[str, object]]:
-        return list(self.documents.get(filename, []))
+    def chunks_for_filename(
+        self, settings: AppSettings, filename: str, narrow: Any = None
+    ) -> list[dict[str, object]]:
+        # The page/section filter Qdrant applies (repository._scope_filter).
+        return [
+            payload
+            for payload in self.documents.get(filename, [])
+            if narrow is None or narrow.admits_neighbour(payload)
+        ]
 
 
 class ScriptedGenerator:

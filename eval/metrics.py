@@ -141,7 +141,10 @@ def baseline_shape_problems(current: Mapping[str, Any], baseline: Mapping[str, A
     baseline_print = baseline.get("fingerprint", {})
     # The machine is recorded to explain a drift, not to refuse a run: CI's baseline is
     # amd64, and a developer's arm64 laptop must still be able to compare against it.
-    for key in sorted(set(current_print) & set(baseline_print) - {"arm", "platform_machine"}):
+    # Which server (its address, its release) a --server run measured is noted, not a
+    # refusal either: the settings it reports are what decide.
+    ignored = {"arm", "platform_machine", "server", "server_version"}
+    for key in sorted(set(current_print) & set(baseline_print) - ignored):
         if current_print[key] != baseline_print[key]:
             problems.append(
                 f"{key} differs: {current_print[key]!r} vs baseline {baseline_print[key]!r} "

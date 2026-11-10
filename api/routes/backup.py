@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import IO, Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse
 
 from api.audit import audit
-from api.consistency import consistency_report
+from api.consistency import consistency_report, repair
 from api.dependencies import (
     require_full_key,
 )
@@ -41,14 +42,18 @@ from api.scheduled_backup import (
     BACKUP_NAME_RE,
     ScheduledBackup,
     backups_in,
+    check_path,
     load_check,
     save_check,
 )
 from api.schemas import (
     BackupCheckResponse,
+    BackupDeleteResponse,
     BackupFileResponse,
     BackupListResponse,
     BackupRunResponse,
+    ConsistencyRepairRequest,
+    ConsistencyRepairResponse,
     ConsistencyResponse,
     DocumentJobAcceptedResponse,
     ImportResponse,
@@ -217,6 +222,8 @@ def _restore(
         skipped=len(outcome.skipped),
         rejected=len(outcome.rejected),
         feedback_imported=outcome.feedback_imported,
+        # Which of BACKUP_DIR's backups it came from (an upload names none).
+        **({"backup": source} if source else {}),
     )
     return ImportResponse(
         jobs=outcome.jobs,
@@ -248,6 +255,48 @@ def _stored_backup(settings: AppSettings, name: str) -> Path:
 
 def _check_response(check: BackupCheck) -> BackupCheckResponse:
     return BackupCheckResponse(ok=check.ok, **dataclasses.asdict(check))
+
+
+# One stored backup, downloaded (to keep it somewhere else) or deleted. Operator data:
+# the full key (request_guard covers every /backups path).
+@router.get(
+    "/backups/{name}",
+    response_class=FileResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={
+        200: {"content": {"application/zip": {}}},
+        404: {"description": "No such backup, or BACKUP_DIR is unset."},
+    },
+)
+def download_stored_backup(name: str, settings: SettingsDep) -> FileResponse:
+    path = _stored_backup(settings, name)
+    audit("backup.download", workspace=workspace_of(settings), backup=name)
+    return FileResponse(path, media_type="application/zip", filename=name)
+
+
+@router.delete(
+    "/backups/{name}",
+    response_model=BackupDeleteResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No such backup, or BACKUP_DIR is unset."}},
+)
+def delete_stored_backup(
+    name: str, request: Request, settings: SettingsDep
+) -> BackupDeleteResponse:
+    path = _stored_backup(settings, name)
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.warning("Could not delete the backup %s.", path, exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="The backup could not be deleted; see the server log."
+        ) from exc
+    check_path(path).unlink(missing_ok=True)
+    loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
+    if loop is not None:
+        loop.checks.pop(str(path), None)
+    audit("backup.delete", workspace=workspace_of(settings), backup=name)
+    return BackupDeleteResponse(name=name)
 
 
 # BACKUP_DIR's backups of this workspace (api/scheduled_backup.py), newest first, with
@@ -299,7 +348,8 @@ def run_backup_now(request: Request, settings: SettingsDep) -> BackupRunResponse
     if loop is None:
         raise HTTPException(status_code=404, detail="Scheduled backups are not running.")
     loop.request_now(settings)
-    audit("corpus.export", workspace=workspace_of(settings), scheduled=True, requested=True)
+    # Asked for, not yet written: the backup's own corpus.export is audited when it is.
+    audit("corpus.export_requested", workspace=workspace_of(settings))
     return BackupRunResponse(workspace=workspace_of(settings) or "default")
 
 
@@ -311,8 +361,10 @@ def run_backup_now(request: Request, settings: SettingsDep) -> BackupRunResponse
     response_model=BackupCheckResponse,
     dependencies=[Depends(require_full_key)],
 )
-def verify_uploaded_backup(file: Annotated[UploadFile, File()]) -> BackupCheckResponse:
-    return _check_response(verify_backup(file.file))
+def verify_uploaded_backup(
+    file: Annotated[UploadFile, File()], settings: SettingsDep
+) -> BackupCheckResponse:
+    return _check_response(verify_backup(file.file, int(settings.max_upload_bytes)))
 
 
 @router.post(
@@ -324,7 +376,7 @@ def verify_uploaded_backup(file: Annotated[UploadFile, File()]) -> BackupCheckRe
 def verify_stored_backup(name: str, request: Request, settings: SettingsDep) -> BackupCheckResponse:
     path = _stored_backup(settings, name)
     with path.open("rb") as handle:
-        check = verify_backup(handle)
+        check = verify_backup(handle, int(settings.max_upload_bytes))
     # Listed with this result from now on, after a restart too.
     loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
     if loop is not None:
@@ -369,3 +421,39 @@ def check_consistency(
 ) -> ConsistencyResponse:
     report = consistency_report(repository, settings, raw_store, token_counter)
     return ConsistencyResponse(problems=report.problems, **dataclasses.asdict(report))
+
+
+# What the report finds, put right — only the remedies asked for, each checked again
+# under the document's lock: orphaned originals and version folders deleted, incomplete
+# documents re-indexed from their originals. Audited.
+@router.post(
+    "/admin/consistency/repair",
+    response_model=ConsistencyRepairResponse,
+    dependencies=[Depends(require_full_key)],
+)
+def repair_consistency(
+    request: ConsistencyRepairRequest,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    raw_store: RawDocumentStoreDep,
+    queue: IngestQueueDep,
+    token_counter: TokenCounterDep,
+) -> ConsistencyRepairResponse:
+    outcome = repair(
+        repository,
+        settings,
+        raw_store,
+        queue,
+        token_counter,
+        delete_orphan_originals=request.delete_orphan_originals,
+        delete_orphan_versions=request.delete_orphan_versions,
+        reindex_incomplete=request.reindex_incomplete,
+    )
+    audit(
+        "admin.repair",
+        workspace=workspace_of(settings),
+        originals_deleted=outcome.originals_deleted,
+        versions_deleted=outcome.versions_deleted,
+        reindexed=[job.filename for job in outcome.reindex_jobs],
+    )
+    return ConsistencyRepairResponse(**dataclasses.asdict(outcome))

@@ -14,6 +14,7 @@ from api.parsers.common import (
     EmptyDocumentError,
     infer_section,
     normalize_text,
+    note_parse_warning,
 )
 from api.parsers.pdf import OCR_MAX_PAGE_PIXELS, _get_ocr_engine
 from api.settings import AppSettings
@@ -86,6 +87,7 @@ def parse_image_document(
                     filename,
                     max_pages,
                 )
+                note_parse_warning(f"Only its first {max_pages} pages were read (MAX_OCR_PAGES).")
                 break
             # Each frame of a TIFF declares its own size; only the first was checked.
             if frame.width * frame.height > MAX_IMAGE_PIXELS:
@@ -98,6 +100,7 @@ def parse_image_document(
                     frame.height,
                     MAX_IMAGE_PIXELS // 1_000_000,
                 )
+                note_parse_warning(f"Page {number} is too large to read and was skipped.")
                 continue
             try:
                 page = frame.convert("RGB")
@@ -110,6 +113,7 @@ def parse_image_document(
                 logger.warning(
                     "Image %s: OCR failed on page %d; skipping it.", filename, number, exc_info=True
                 )
+                note_parse_warning(f"OCR failed on page {number}: not read.")
                 continue
             text = normalize_text("\n".join(line[1] for line in (result or [])))
             if text:

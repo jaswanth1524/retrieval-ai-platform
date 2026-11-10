@@ -27,6 +27,12 @@ WORKSPACE_SETTING_FIELDS = (
     "recency_boost_weight",
     "answer_language",
     "answer_format",
+    # How many closest passages answer when none clears the bar (0: refuse instead),
+    # the relative floor, passages per answer, and suggested follow-up questions.
+    "rerank_fallback_count",
+    "rerank_relative_floor",
+    "max_context_chunks",
+    "followups_enabled",
 )
 
 

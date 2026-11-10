@@ -150,7 +150,15 @@ def test_a_parse_that_runs_out_of_memory_names_the_setting() -> None:
 
     with pytest.raises(DocumentParseError, match="PARSE_MEMORY_LIMIT_MB") as caught:
         parse_with_limit("a.txt", b"x", settings, _target=_out_of_memory)
-    assert not isinstance(caught.value, ParseInterruptedError)
+    # A limit the operator can raise: transient (retried), not a bad file.
+    from api.ingest_jobs import ingest_error_type
+    from api.jobs import IngestJob
+
+    assert ingest_error_type(caught.value) == "parse_memory"
+    job = IngestJob(
+        id="j", filename="a.txt", state="failed", kind="reindex", error_type="parse_memory"
+    )
+    assert retry_refusal(job) is None
 
 
 # --- validator-only refresh ---------------------------------------------------------

@@ -352,6 +352,34 @@ describe('useChat', () => {
     ]);
   });
 
+  it('regenerating an earlier answer asks with the conversation before it, in its style', async () => {
+    let n = 0;
+    askQuestionStreamMock.mockImplementation(async (_q, _p, _o, _f, _h, handlers: QuestionStreamHandlers) => {
+      n += 1;
+      handlers.onDone?.(`answer ${n}`, [], ZERO_TIMINGS, `trace-${n}`);
+    });
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('first', undefined, undefined, undefined, { answerFormat: 'table' });
+    });
+    await act(async () => {
+      await result.current.ask('second');
+    });
+    const first = result.current.turns[1];
+    expect(first.style).toEqual({ answerFormat: 'table' });
+
+    await act(async () => {
+      await result.current.ask('first', undefined, undefined, undefined, { replacesAnswer: first.id });
+    });
+
+    const call = askQuestionStreamMock.mock.calls[2];
+    // No history: 'first' was the opening question; 'second' came after it.
+    expect(call[4]).toEqual([]);
+    expect(call[7]).toMatchObject({ answerFormat: 'table' });
+    expect(result.current.turns.map((t) => t.content)).toEqual(['first', 'answer 3', 'second', 'answer 2']);
+    expect(result.current.turns[1].versions?.map((v) => v.content)).toEqual(['answer 1']);
+  });
+
   it('excludes error turns from the history sent with the next question', async () => {
     askQuestionStreamMock.mockRejectedValueOnce(new ApiClientError('boom'));
     askQuestionStreamMock.mockImplementationOnce(

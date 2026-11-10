@@ -20,7 +20,7 @@ export function useConversationExports(
   turns: ChatTurn[],
   title: string | undefined,
   savedAnswers: SavedAnswer[],
-  allConversationsJson: () => string,
+  allConversationsJson: (label?: string) => string,
   pushToast: (toast: ToastInput) => string,
   noteAuthFailure: (err: unknown) => boolean,
 ) {
@@ -84,10 +84,14 @@ export function useConversationExports(
       })
       .finally(() => setExportingTraces(false));
   });
-  const exportAllConversations = useCallback(() => {
-    const stamp = new Date().toISOString().slice(0, 10);
-    downloadFile(`docrag-conversations-${stamp}.json`, 'application/json', allConversationsJson());
-  }, [allConversationsJson]);
+  const exportAllConversations = useCallback(
+    (label?: string) => {
+      const stamp = new Date().toISOString().slice(0, 10);
+      const name = label ? `docrag-${safeFilename(label)}-${stamp}.json` : `docrag-conversations-${stamp}.json`;
+      downloadFile(name, 'application/json', allConversationsJson(label));
+    },
+    [allConversationsJson],
+  );
   const exportSavedAnswers = useCallback(() => {
     const items = savedAnswersRef.current;
     if (items.length === 0) {

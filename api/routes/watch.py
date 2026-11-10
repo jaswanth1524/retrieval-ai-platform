@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
 from api.audit import audit
-from api.dependencies import get_app_settings, require_api_key, require_full_key
+from api.dependencies import require_api_key, require_full_key
 from api.schemas import WatchFolderStatusResponse, WatchStatusResponse
-from api.settings import AppSettings
 from api.watch import FolderWatcher
 
 
@@ -56,11 +54,12 @@ def register(app: FastAPI) -> None:
         return _status(request)
 
     @app.post("/watch/scan", status_code=202, dependencies=[Depends(require_full_key)])
-    def watch_scan_now(
-        request: Request, settings: Annotated[AppSettings, Depends(get_app_settings)]
-    ) -> WatchStatusResponse:
-        for watcher in _watchers(request):
+    def watch_scan_now(request: Request) -> WatchStatusResponse:
+        watchers = _watchers(request)
+        for watcher in watchers:
             watcher.scan_now()
-        audit("watch.scan", workspace=settings.watch_workspace)
+        # Each folder's workspace (WATCH_DIRS feeds several), not WATCH_WORKSPACE alone.
+        for workspace in dict.fromkeys(getattr(w, "workspace", "") for w in watchers):
+            audit("watch.scan", workspace=workspace)
         # The status as of the previous pass: the new one runs on the watchers' threads.
         return _status(request)

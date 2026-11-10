@@ -219,8 +219,33 @@ export function useConversationActions(
     }));
   }, [setStorage]);
 
+  // A label renamed (or removed: ``to`` null) on every conversation that has it,
+  // matched case-insensitively, as the filter matches it.
+  const renameLabel = useCallback((from: string, to: string | null) => {
+    const key = from.toLocaleLowerCase();
+    setStorage((prev) => ({
+      ...prev,
+      conversations: prev.conversations.map((conversation) => {
+        if (!conversation.labels?.some((label) => label.toLocaleLowerCase() === key)) {
+          return conversation;
+        }
+        const kept = conversation.labels.flatMap((label) =>
+          label.toLocaleLowerCase() === key ? (to === null ? [] : [to]) : [label],
+        );
+        const cleaned = cleanLabels(kept);
+        const { labels: _previous, ...rest } = conversation;
+        return {
+          ...rest,
+          ...(cleaned.length > 0 ? { labels: cleaned } : {}),
+          editedAt: Date.now(),
+        };
+      }),
+    }));
+  }, [setStorage]);
+
   return {
     setLabels,
+    renameLabel,
     importConversation,
     importPreview,
     importConversations,

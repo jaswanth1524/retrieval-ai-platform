@@ -154,7 +154,9 @@ function TraceTab({ trace }: TraceTabProps) {
         ) : null}
       </p>
       <TraceIds trace={trace} />
-      <TraceRerun trace={trace} />
+      {/* Keyed by trace: another answer's trace starts with its own settings, not the
+          last trace's numbers and result. */}
+      <TraceRerun key={trace.trace_id} trace={trace} />
       {trace.error && (
         // A stream that failed late has timings too: the error used to be hidden then.
         <p className="trace-tab__error" role="note" data-testid="trace-error">

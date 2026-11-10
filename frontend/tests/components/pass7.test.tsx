@@ -113,6 +113,29 @@ describe('ChatThread', () => {
     );
   });
 
+  it('judges weak support against the bar the answer was given under', () => {
+    const answer = (rerankMinScore?: number) =>
+      turn({
+        id: 'a1',
+        role: 'assistant',
+        content: 'Ten days [1].',
+        sources: [SOURCE],
+        topRerankScore: 0.45,
+        ...(rerankMinScore !== undefined ? { rerankMinScore } : {}),
+      });
+    // Server bar 0.15 (+0.1 margin): 0.45 is well supported...
+    const { unmount } = render(
+      <ChatThread turns={[turn({ id: 'q1' }), answer()]} pending={false} engineerMode={false} weakSupportBelow={0.25} />,
+    );
+    expect(screen.queryByTestId('chat-message-weak-support')).not.toBeInTheDocument();
+    unmount();
+    // ...but just over this workspace's bar of 0.4.
+    render(
+      <ChatThread turns={[turn({ id: 'q1' }), answer(0.4)]} pending={false} engineerMode={false} weakSupportBelow={0.25} />,
+    );
+    expect(screen.getByTestId('chat-message-weak-support')).toBeInTheDocument();
+  });
+
   it('an answer from below-the-bar passages says weak match, not weakly supported', () => {
     const turns = [
       turn({ id: 'q1' }),

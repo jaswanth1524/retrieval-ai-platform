@@ -311,6 +311,13 @@ class DocragClient:
         )
         return result
 
+    def trace_what_if(self, body: dict[str, Any]) -> dict[str, Any]:
+        """The latest traced questions searched again under other ranking settings: how
+        many would be answered (POST /traces/what-if; no LLM call, nothing stored)."""
+
+        result: dict[str, Any] = self._json("POST", "/traces/what-if", json=body)
+        return result
+
     def feedback(self, limit: int = 100) -> list[dict[str, Any]]:
         """Recorded answer ratings, newest first (FEEDBACK_ENABLED, full key)."""
 
@@ -556,20 +563,44 @@ class DocragClient:
         )
         return result
 
+    def sitemap_import(self, import_id: str) -> dict[str, Any]:
+        """A sitemap import's progress (GET /documents/sitemap-imports/{id})."""
+
+        result: dict[str, Any] = self._json(
+            "GET", f"/documents/sitemap-imports/{_quote(import_id)}"
+        )
+        return result
+
+    def wait_for_sitemap_import(
+        self, import_id: str, *, timeout: float | None = None, poll_seconds: float = 2.0
+    ) -> dict[str, Any]:
+        """Poll a sitemap import until it has gone through every page (or ``timeout``
+        seconds pass: its status as it is then)."""
+
+        deadline = None if timeout is None else self._clock() + timeout
+        while True:
+            status = self.sitemap_import(import_id)
+            if status.get("finished_at") is not None:
+                return status
+            if deadline is not None and self._clock() >= deadline:
+                return status
+            self._sleep(poll_seconds)
+
     def upload_archive(self, path: Path, *, tags: Sequence[str] = ()) -> dict[str, Any]:
         """A zip of documents, each indexed as its own (POST /documents/archive)."""
 
         try:
-            handle = path.open("rb")
+            content = path.read_bytes()
         except OSError as exc:
             raise DocragError(f"Cannot read {path}: {exc.strerror or exc}") from exc
-        with handle:
-            result: dict[str, Any] = self._json(
-                "POST",
-                "/documents/archive",
-                files={"file": (path.name, handle, "application/zip")},
-                data={"tags": list(tags)} if tags else None,
-            )
+        # Bytes, not a handle: a busy server (429/503) is asked again, from the start.
+        result: dict[str, Any] = self._json(
+            "POST",
+            "/documents/archive",
+            files={"file": (path.name, content, "application/zip")},
+            data={"tags": list(tags)} if tags else None,
+            attempts=BUSY_MAX_ATTEMPTS,
+        )
         return result
 
     def upload_url(
@@ -964,6 +995,16 @@ class DocragClient:
 
     def restore_stored_backup(self, name: str) -> dict[str, Any]:
         result: dict[str, Any] = self._json("POST", f"/backups/{_quote(name)}/restore")
+        return result
+
+    def delete_stored_backup(self, name: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("DELETE", f"/backups/{_quote(name)}")
+        return result
+
+    def repair(self, **remedies: bool) -> dict[str, Any]:
+        """``POST /admin/consistency/repair`` with the remedies asked for."""
+
+        result: dict[str, Any] = self._json("POST", "/admin/consistency/repair", json=remedies)
         return result
 
     def consistency(self) -> dict[str, Any]:

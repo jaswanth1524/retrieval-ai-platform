@@ -43,6 +43,8 @@ class ScoreReport:
     # Traces not counted: scored by another cross-encoder, or picked passages (which
     # skip the bar), or summaries.
     left_out: int = 0
+    # Traces outside the asked-for window (``since``, ``bar``), not counted either.
+    filtered_out: int = 0
 
 
 def _histogram(scores: Sequence[float]) -> list[int]:
@@ -79,6 +81,9 @@ def score_report(
     summaries: Sequence[TraceSummary],
     current_min_score: float,
     reranker_model: str | None = None,
+    *,
+    since: float | None = None,
+    bar: float | None = None,
 ) -> ScoreReport:
     """The top rerank score of each traced question, answered against not answered.
 
@@ -88,13 +93,25 @@ def score_report(
     cross-encoder than ``reranker_model`` (scores don't compare across models),
     questions about picked passages (they skip the bar, so their low scores would pull
     it down) and summaries.
+
+    ``since`` (epoch seconds) and ``bar`` narrow it to the traces asked since then, and
+    to those answered under that bar — "since the bar last changed": answers given under
+    the old bar would blur a suggestion for the new one. A trace from before the bar
+    was recorded matches no ``bar``.
     """
 
     answered: list[float] = []
     unanswered: list[float] = []
     left_out = 0
+    filtered_out = 0
     for summary in summaries:
         if summary.top_rerank_score is None or summary.answer_status is None:
+            continue
+        if (since is not None and summary.created_at < since) or (
+            bar is not None
+            and (summary.rerank_min_score is None or abs(summary.rerank_min_score - bar) > 1e-9)
+        ):
+            filtered_out += 1
             continue
         other_model = (
             reranker_model is not None
@@ -136,6 +153,7 @@ def score_report(
         note=note,
         would_change=would_change,
         left_out=left_out,
+        filtered_out=filtered_out,
     )
 
 

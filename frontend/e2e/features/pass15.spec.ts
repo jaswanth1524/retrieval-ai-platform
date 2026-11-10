@@ -70,7 +70,7 @@ test('the viewer finds a word among its passages', async ({ page, api }) => {
   const viewer = page.getByRole('dialog');
   await viewer.getByTestId('viewer-find-open').click();
   await viewer.getByTestId('viewer-find-input').fill('fusion');
-  await expect(viewer.getByTestId('viewer-find-count')).toHaveText('1 of 1 passages');
+  await expect(viewer.getByTestId('viewer-find-count')).toHaveText('1 of 1');
   await expect(viewer.getByTestId('viewer-found')).toHaveText('Fusion');
 });
 

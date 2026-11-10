@@ -30,7 +30,7 @@ from api.metrics import (
     ingest_job_seconds,
     ingest_jobs_total,
 )
-from api.parse_isolation import ParseInterruptedError
+from api.parse_isolation import ParseInterruptedError, ParseMemoryError
 from api.pipeline import IngestService
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
@@ -142,6 +142,8 @@ def job_error_message(exc: Exception) -> str:
 def ingest_error_type(exc: Exception) -> str:
     """Coarse error_type label for docrag_ingest_jobs_total{outcome="failed"}."""
 
+    if isinstance(exc, ParseMemoryError):
+        return "parse_memory"
     if isinstance(exc, ParseInterruptedError):
         return "parse_timeout"
     if isinstance(exc, DocumentError):
@@ -300,6 +302,7 @@ def run_ingest_job(
             "chunks_reused": outcome.chunks_reused,
             "chunks_removed": outcome.chunks_removed,
             "duplicate_of": outcome.duplicate_of,
+            "warnings": list(outcome.warnings),
         },
     )
 
@@ -408,6 +411,9 @@ def enqueue_ingest(
             kind=request.kind,
             source_url=request.source.url if request.source is not None else None,
             tags=request.tags,
+            refresh_minutes=(
+                request.source.refresh_minutes if request.source is not None else None
+            ),
         )
     except BaseException:
         release()

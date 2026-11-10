@@ -154,7 +154,7 @@ def test_a_sitemaps_pages_are_fetched_and_queued_in_the_background(
     )
 
     assert response.status_code == 202, response.text
-    assert response.json() == {
+    assert {k: v for k, v in response.json().items() if k != "import_id"} == {
         "urls": ["https://example.com/a.txt", "https://example.com/b.txt"],
         "left_out": 2,
         "child_sitemaps": 0,
@@ -214,15 +214,16 @@ def test_watch_dirs_are_parsed_and_overlaps_refused(tmp_path: Any) -> None:
 
     a, b = tmp_path / "a", tmp_path / "b"
     settings = make_settings(
-        watch_dir=str(a), watch_workspace="", watch_dirs=f" {b} => legal ; ;{tmp_path / 'c'}"
+        watch_dir=str(a), watch_workspace="hr", watch_dirs=f" {b} => legal ; ;{tmp_path / 'c'}"
     )
     assert watch_folders(settings) == [
-        WatchFolder(str(a), ""),
+        WatchFolder(str(a), "hr"),
         WatchFolder(str(b), "legal"),
         WatchFolder(str(tmp_path / "c"), ""),
     ]
-    assert watched_workspaces(settings) == {"", "legal"}
-    for clash in (f"{a}=>x", f"{a / 'inner'}=>x", f"{tmp_path}=>x", "=>x"):
+    assert watched_workspaces(settings) == {"", "hr", "legal"}
+    # Two folders into the default workspace (WATCH_DIR's and an entry without one).
+    for clash in (f"{a}=>x", f"{a / 'inner'}=>x", f"{tmp_path}=>x", "=>x", str(b)):
         with pytest.raises(RuntimeError, match="WATCH_DIRS"):
             watch_folders(make_settings(watch_dir=str(a), watch_dirs=clash))
 

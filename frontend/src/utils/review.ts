@@ -27,3 +27,15 @@ export function reviewReasons(
   }
   return reasons;
 }
+
+/** How many answers still need a look: with a reason, and not marked reviewed. */
+export function unreviewedCount(
+  turns: Iterable<ChatTurn>,
+  sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null,
+): number {
+  let count = 0;
+  for (const turn of turns) {
+    if (!turn.reviewedAt && reviewReasons(turn, sourceChangeOf).length > 0) count += 1;
+  }
+  return count;
+}

@@ -309,6 +309,14 @@ def _single_filename_filter(filename: str) -> models.Filter:
     )
 
 
+def _document_filter(filename: str, narrow: PassageFilter | None) -> models.Filter:
+    if narrow is None:
+        return _single_filename_filter(filename)
+    scoped = _scope_filter([filename], None, narrow)
+    assert scoped is not None  # a filename is always a condition
+    return scoped
+
+
 class VectorRepository:
     """Owns collection lifecycle, hybrid search, and writes against Qdrant."""
 
@@ -491,8 +499,11 @@ class VectorRepository:
                 )
         return found
 
-    def chunks_for_filename(self, settings: AppSettings, filename: str) -> list[dict[str, object]]:
-        """Return all payloads for a filename, ordered by ``chunk_ordinal``.
+    def chunks_for_filename(
+        self, settings: AppSettings, filename: str, narrow: PassageFilter | None = None
+    ) -> list[dict[str, object]]:
+        """Return all payloads for a filename, ordered by ``chunk_ordinal``; with
+        ``narrow``, only those it admits (a summary of pages 3-5).
 
         Backs the document-content endpoint (reconstruct a document from its chunks for
         the source viewer). Points with no ``chunk_ordinal`` sort last, stably.
@@ -502,22 +513,25 @@ class VectorRepository:
         payloads: list[dict[str, object]] = [
             point.payload
             for point in self._scroll_all(
-                settings, scroll_filter=_single_filename_filter(filename), with_payload=True
+                settings, scroll_filter=_document_filter(filename, narrow), with_payload=True
             )
             if point.payload
         ]
         payloads.sort(key=_chunk_ordinal_sort_key)
         return payloads
 
-    def chunk_count_for_filename(self, settings: AppSettings, filename: str) -> int:
-        """How many points one document has (an exact count, no payloads read)."""
+    def chunk_count_for_filename(
+        self, settings: AppSettings, filename: str, narrow: PassageFilter | None = None
+    ) -> int:
+        """How many points one document has (an exact count, no payloads read); with
+        ``narrow``, how many of them it admits."""
 
         self.ensure_ready(settings, strict=False)
         result = self._call(
             settings,
             "count",
             collection_name=settings.qdrant_collection,
-            count_filter=_single_filename_filter(filename),
+            count_filter=_document_filter(filename, narrow),
             exact=True,
         )
         return int(result.count)
@@ -1389,6 +1403,7 @@ def _leg_request(
 
 # Point id -> [dense rank, sparse rank], 1-based, None where that leg didn't return it.
 LegRanks = dict[str, list[int | None]]
+_LEG_RANKS_LOCK = Lock()
 
 
 def _note_leg_ranks(
@@ -1399,9 +1414,11 @@ def _note_leg_ranks(
     """Each point's rank on each leg, keeping the best one when several queries (query
     variants, a follow-up's two phrasings) fill the same map."""
 
-    for index, points in ((0, dense), (1, sparse)):
-        for rank, point in enumerate(points, start=1):
-            ranks = leg_ranks.setdefault(str(point.id), [None, None])
-            current = ranks[index]
-            if current is None or rank < current:
-                ranks[index] = rank
+    # Concurrent searches (query variants) share the map: compare and write together.
+    with _LEG_RANKS_LOCK:
+        for index, points in ((0, dense), (1, sparse)):
+            for rank, point in enumerate(points, start=1):
+                ranks = leg_ranks.setdefault(str(point.id), [None, None])
+                current = ranks[index]
+                if current is None or rank < current:
+                    ranks[index] = rank

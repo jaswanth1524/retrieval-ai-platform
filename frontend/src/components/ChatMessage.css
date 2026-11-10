@@ -521,3 +521,26 @@
   font: inherit;
   font-size: 12px;
 }
+
+/* An earlier answer compared with the current one, word by word. */
+.chat-message__versions-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 4px 0;
+}
+
+.chat-message__diff {
+  white-space: pre-wrap;
+  line-height: 1.6;
+}
+
+.chat-message__diff-removed {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.chat-message__diff-added {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent);
+  text-decoration: none;
+}

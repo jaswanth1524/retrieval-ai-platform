@@ -181,6 +181,8 @@ class TraceSummary:
     # the bar: their scores say nothing about where it should be).
     gated: bool = True
     kind: str = "question"
+    # The relevance bar it was answered under (None on traces from before it was kept).
+    rerank_min_score: float | None = None
 
 
 def _picked_passages(trace: QueryTrace) -> bool:
@@ -205,6 +207,7 @@ def summarize_trace(trace: QueryTrace) -> TraceSummary:
         reranker_model=trace.config.reranker_model if trace.config is not None else None,
         gated=not _picked_passages(trace),
         kind=trace.kind,
+        rerank_min_score=trace.config.rerank_min_score if trace.config is not None else None,
     )
 
 

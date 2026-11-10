@@ -19,6 +19,7 @@ from api.parsers.common import (
     EmptyDocumentError,
     infer_section,
     normalize_text,
+    note_parse_warning,
 )
 from api.settings import AppSettings
 
@@ -155,6 +156,10 @@ def _with_ocr(
             max_ocr_pages,
             empty_pages[max_ocr_pages:],
         )
+        note_parse_warning(
+            f"{len(empty_pages) - max_ocr_pages} scanned page(s) past MAX_OCR_PAGES "
+            f"({max_ocr_pages}) were not read."
+        )
         empty_pages = empty_pages[:max_ocr_pages]
     if empty_pages:
         # Every empty page, not only all-empty PDFs: a scanned page bound into an
@@ -170,6 +175,10 @@ def _with_ocr(
                 filename,
                 empty_pages,
             )
+            note_parse_warning(
+                f"{len(empty_pages)} page(s) have no text layer and OCR isn't installed: "
+                "they were not read."
+            )
             ocr_sections = []
         except Exception:
             # OCR itself broke (engine load, unreadable PDF for the rasterizer). A fully
@@ -183,6 +192,7 @@ def _with_ocr(
                 empty_pages,
                 exc_info=True,
             )
+            note_parse_warning(f"OCR failed on {len(empty_pages)} scanned page(s): not read.")
             ocr_sections = []
         ocr_texts = rejoin_hyphenated([section.text for section in ocr_sections])
         ocr_sections = [

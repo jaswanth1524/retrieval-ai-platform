@@ -99,6 +99,10 @@ def test_a_workspace_bar_applies_to_its_questions_only_and_empties_its_cache(
         "recency_boost_weight": None,
         "answer_language": None,
         "answer_format": None,
+        "rerank_fallback_count": None,
+        "rerank_relative_floor": None,
+        "max_context_chunks": None,
+        "followups_enabled": None,
     }
 
     assert (
@@ -156,7 +160,7 @@ def test_the_cli_runs_a_trace_again(client: TestClient) -> None:
     assert "weak matches only" in out.getvalue()
     out = io.StringIO()
     assert main(["traces", "rerun", trace_id], client=docrag, out=out) == 0
-    assert "would answer with the server settings" in out.getvalue()
+    assert "would answer with the settings it was asked with" in out.getvalue()
 
 
 def test_a_running_server_is_scored_through_its_search(client: TestClient, tmp_path: Path) -> None:

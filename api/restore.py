@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import lzma
 import math
 import re
 import zipfile
@@ -102,6 +103,7 @@ _MAX_SOURCE_CHARS = 2048
 _UNREADABLE_MEMBER = (
     zipfile.BadZipFile,
     zlib.error,
+    lzma.LZMAError,
     EOFError,
     RuntimeError,
     NotImplementedError,
@@ -500,16 +502,24 @@ class BackupCheck:
     # Damage: a member that fails its checksum, one the manifest names that isn't
     # there, a manifest that isn't a DocRAG one. Empty: the backup restores as written.
     problems: list[str] = field(default_factory=list)
+    # Documents a restore would queue, and those it would refuse by its own rules (a
+    # name it wouldn't store, an original past MAX_UPLOAD_BYTES, bad tags), each with
+    # why ("report.pdf: larger than MAX_UPLOAD_BYTES"). Reported, not damage: ``ok``
+    # still means the archive restores as written (rules tighten across releases, and
+    # an intact backup isn't "damaged" for that).
+    would_restore: int = 0
+    rejected: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.problems
 
 
-def verify_backup(upload: IO[bytes]) -> BackupCheck:
+def verify_backup(upload: IO[bytes], max_original_bytes: int | None = None) -> BackupCheck:
     """Check a backup without restoring anything: the manifest, every member's checksum
-    (each one read once, nothing kept), and that every original and version the
-    manifest lists is in the archive."""
+    (each one read once, nothing kept), that every original and version the manifest
+    lists is in the archive, and — by restore's own rules — which documents a restore
+    would queue and which it would refuse (``max_original_bytes``: MAX_UPLOAD_BYTES)."""
 
     check = BackupCheck()
     try:
@@ -528,13 +538,18 @@ def verify_backup(upload: IO[bytes]) -> BackupCheck:
         except BackupImportError as exc:
             check.problems.append(str(exc))
             return check
+        sizes: dict[str, int] = {}
+        damaged: set[str] = set()
         for info in infos:
+            size = 0
             try:
                 with archive.open(info) as handle:
-                    while handle.read(1 << 20):
-                        pass
+                    while chunk := handle.read(1 << 20):
+                        size += len(chunk)
             except _UNREADABLE_MEMBER:
+                damaged.add(info.filename)
                 check.problems.append(f"{info.filename} is damaged (it fails its checksum).")
+            sizes[info.filename] = size
         check.feedback = "feedback.jsonl" in members
         for document in manifest["documents"]:
             if not isinstance(document, dict) or not isinstance(document.get("filename"), str):
@@ -548,11 +563,46 @@ def verify_backup(upload: IO[bytes]) -> BackupCheck:
                 check.problems.append(f"{original} is listed but not in the archive.")
             else:
                 check.originals += 1
+                reason = _refused_by_restore(document, sizes, max_original_bytes)
+                if reason is not None:
+                    check.rejected.append(f"{document['filename']}: {reason}")
+                elif original not in damaged:
+                    check.would_restore += 1
             listed = document.get("versions")
             for version in listed if isinstance(listed, list) else []:
                 name = f"versions/{document['filename']}/{version}"
-                if name in members:
+                if not isinstance(version, str) or not _VERSION_ID_RE.fullmatch(version):
+                    check.rejected.append(
+                        f"{document['filename']}: a version id restore doesn't read ({version!r})"
+                    )
+                elif name in members:
                     check.versions += 1
                 else:
                     check.problems.append(f"{name} is listed but not in the archive.")
     return check
+
+
+def _refused_by_restore(
+    document: dict[str, Any], sizes: dict[str, int], max_original_bytes: int | None
+) -> str | None:
+    """Why ``_restore_document`` would refuse a listed document whose original is in
+    the archive, or None when it would queue it."""
+
+    raw_name = document["filename"]
+    try:
+        filename = validate_upload_filename(raw_name)
+    except DocumentError as exc:
+        return str(exc)
+    if filename != raw_name:
+        return "a name the server would store differently"
+    if document.get("original") != f"originals/{filename}":
+        return f"its original is not at originals/{filename}"
+    raw_tags = document.get("tags")
+    if isinstance(raw_tags, list):
+        try:
+            normalize_tags([tag for tag in raw_tags if isinstance(tag, str)])
+        except DocumentError as exc:
+            return str(exc)
+    if max_original_bytes is not None and sizes.get(document["original"], 0) > max_original_bytes:
+        return "larger than MAX_UPLOAD_BYTES"
+    return None

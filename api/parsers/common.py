@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import re
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
@@ -258,3 +260,33 @@ def row_groups(
         rendered = [(number, line) for number, line in rendered if line]
         if rendered:
             yield group[0][0], group[-1][0], rendered
+
+
+# What a parse left out or couldn't read, for the job result (not only the log): a
+# cap reached, a page OCR failed on. Collected per parse (``collect_parse_warnings``);
+# outside one, noting is a no-op.
+_parse_warnings: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "parse_warnings", default=None
+)
+# Kept per document, at most.
+MAX_PARSE_WARNINGS = 20
+
+
+def note_parse_warning(text: str) -> None:
+    """Tell whoever reads this document's job result that part of it was not read."""
+
+    collected = _parse_warnings.get()
+    if collected is not None and len(collected) < MAX_PARSE_WARNINGS and text not in collected:
+        collected.append(text[:300])
+
+
+@contextlib.contextmanager
+def collect_parse_warnings() -> Iterator[list[str]]:
+    """The warnings noted while the block runs."""
+
+    collected: list[str] = []
+    token = _parse_warnings.set(collected)
+    try:
+        yield collected
+    finally:
+        _parse_warnings.reset(token)

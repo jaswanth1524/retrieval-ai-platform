@@ -13,6 +13,7 @@ const api = vi.hoisted(() => ({
   deleteDocument: vi.fn(),
   setDocumentTags: vi.fn(),
   reindexDocument: vi.fn(),
+  uploadArchive: vi.fn(),
 }));
 vi.mock('../../src/api/client', async () => {
   const actual = await vi.importActual<typeof import('../../src/api/client')>(
@@ -108,6 +109,56 @@ describe('useCorpus', () => {
     await act(() => result.current.handleDeleteDocument('b.md'));
     expect(result.current.documents).not.toHaveProperty('b.md');
     expect(result.current.availableTags).toEqual([]);
+  });
+
+  it('a deleted copy is no longer named as the kept one\'s duplicate', async () => {
+    api.listDocuments.mockResolvedValueOnce({
+      filenames: ['a.md', 'b.md', 'c.md'],
+      chunk_counts: {},
+      duplicate_groups: [['a.md', 'b.md', 'c.md']],
+    });
+    const { result } = setup();
+    await act(() => result.current.refreshDocuments());
+    expect(result.current.documents['a.md'].sameAs).toEqual(['b.md', 'c.md']);
+
+    api.deleteDocument.mockResolvedValue({ filename: 'x', points_deleted: 1 });
+    await act(() => result.current.handleDeleteDocument('b.md'));
+    expect(result.current.documents['a.md'].sameAs).toEqual(['c.md']);
+    await act(() => result.current.handleDeleteDocument('c.md'));
+    expect(result.current.documents['a.md'].sameAs).toBeUndefined();
+  });
+
+  it('a zip shows a card while it is sent, which Cancel stops', async () => {
+    let seen: AbortSignal | undefined;
+    api.uploadArchive.mockImplementation(
+      (_file: File, _tags: unknown, signal: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          seen = signal;
+          signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        }),
+    );
+    const { result, callbacks } = setup();
+    const zip = new File(['PK'], 'docs.zip', { type: 'application/zip' });
+    let sent!: Promise<void>;
+    act(() => {
+      sent = result.current.handleUpload([zip]);
+    });
+    await waitFor(() => expect(result.current.uploads.map((u) => u.filename)).toEqual(['docs.zip']));
+    act(() => result.current.handleCancelUpload(result.current.uploads[0].id));
+    await act(() => sent);
+    expect(seen?.aborted).toBe(true);
+    expect(result.current.uploads).toEqual([]);
+    expect(callbacks.pushToast).not.toHaveBeenCalled();
+  });
+
+  it('a zip with nothing to index says so', async () => {
+    api.uploadArchive.mockResolvedValue({ jobs: [], skipped: [], deferred: [] });
+    const { result, callbacks } = setup();
+    await act(() => result.current.handleUpload([new File(['PK'], 'empty.zip', { type: 'application/zip' })]));
+    expect(callbacks.pushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'empty.zip held no documents' }),
+    );
+    expect(result.current.uploads).toEqual([]);
   });
 
   it('ignores a listing that was overtaken by a delete', async () => {

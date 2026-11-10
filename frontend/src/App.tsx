@@ -1,5 +1,5 @@
 import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, apiErrorMessage } from './api/client';
+import { api, apiErrorMessage, getWorkspace } from './api/client';
 import type { LlmProvider, PublicConfigResponse, QuestionOverrides } from './api/types';
 import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
@@ -58,7 +58,14 @@ import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { sourceChange } from './utils/citationFreshness';
 import { copyText } from './utils/clipboard';
-import { deepLinkUrl, parseDeepLink, usageTotal } from './utils/deepLink';
+import { unreviewedCount } from './utils/review';
+import {
+  deepLinkUrl,
+  parseDeepLink,
+  parsePassageLink,
+  passageLinkUrl,
+  usageTotal,
+} from './utils/deepLink';
 import { formatCost } from './utils/cost';
 import { withCitationFootnotes } from './utils/exportChat';
 import { folderPickNote, pickFolderFiles } from './utils/folderFiles';
@@ -169,12 +176,15 @@ function App() {
     restoreConversation,
     setPinned,
     setLabels,
+    renameLabel,
     searchConversations,
     persistError,
     persistPartial,
     setTurnFeedback,
     setSourceIrrelevant,
     setTurnSaved,
+    restoreAnswerVersion,
+    setTurnReviewed,
     scope,
     conversationWorkspace,
     setScope,
@@ -310,6 +320,9 @@ function App() {
       setSearchResetKey((key) => key + 1);
     },
   });
+  // Read by the link handler (an effect that outlives one render's handler).
+  const chooseWorkspaceRef = useRef(chooseWorkspace);
+  chooseWorkspaceRef.current = chooseWorkspace;
   // The corpus panel's changes go to the workspace it was showing when they started: a
   // bulk delete or tag loop keeps these for its whole run (the panel is keyed by
   // workspace), so a switch halfway doesn't send the rest to the next workspace.
@@ -420,7 +433,15 @@ function App() {
           id: `deleted-${removed.id}`,
           tone: 'info',
           title: `Deleted “${removed.title}”`,
-          action: { label: 'Undo', run: () => restoreConversation(removed) },
+          action: {
+            label: 'Undo',
+            run: () => {
+              // Back to it as any switch is: the inspector no longer pinned elsewhere.
+              setPinnedTraceId(null);
+              setHoveredCitation(null);
+              restoreConversation(removed);
+            },
+          },
         });
       }
     },
@@ -444,6 +465,17 @@ function App() {
   useEffect(() => {
     if (!historyReady) return;
     const open = () => {
+      // A document or passage on this server (#d=…&k=…): opened in the viewer.
+      const passage = parsePassageLink(window.location.hash);
+      if (passage) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        if ((passage.workspace ?? '') !== (getWorkspace() ?? '')) {
+          chooseWorkspaceRef.current(passage.workspace ?? '');
+        }
+        setSourceView({ filename: passage.filename, chunkId: passage.chunkId ?? null });
+        setPanelDrawerOpen(false);
+        return;
+      }
       const link = parseDeepLink(window.location.hash);
       if (!link) return;
       // Taken off the address once read: reloading shouldn't jump back to it.
@@ -462,6 +494,24 @@ function App() {
     window.addEventListener('hashchange', open);
     return () => window.removeEventListener('hashchange', open);
   }, [historyReady, pushToast, switchConversationFromList]);
+  const copyPassageLink = useCallback(() => {
+    if (!sourceView) return;
+    const url = passageLinkUrl(
+      {
+        filename: sourceView.filename,
+        ...(sourceView.chunkId ? { chunkId: sourceView.chunkId } : {}),
+        ...(workspace ? { workspace } : {}),
+      },
+      window.location,
+    );
+    void copyText(url).then((ok) =>
+      pushToast(
+        ok
+          ? { tone: 'good', title: 'Link copied', body: 'It opens this passage for anyone with access to this server.' }
+          : { tone: 'warn', title: 'Could not copy the link', body: url },
+      ),
+    );
+  }, [sourceView, workspace, pushToast]);
   const copyLink = useCallback(
     (turnId?: string) => {
       if (!activeConversationId) return;
@@ -939,10 +989,20 @@ function App() {
   );
   // The "Needs review" panel: this workspace's answers, walked only while it is open
   // (conversations change on every streamed frame).
+  // Marking an answer reviewed changes a turn, not the conversation summaries: counted
+  // here so the list (and the rail's count) are read again.
+  const [reviewTick, setReviewTick] = useState(0);
+  const markReviewed = useCallback(
+    (conversationId: string, turnId: string, reviewed: boolean) => {
+      setTurnReviewed(conversationId, turnId, reviewed);
+      setReviewTick((tick) => tick + 1);
+    },
+    [setTurnReviewed],
+  );
   const reviewAnswers = useMemo(
     () => (rail === 'review' ? answersIn(workspace) : []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [rail, workspace, answersIn, conversations],
+    [rail, workspace, answersIn, conversations, reviewTick],
   );
   // The card lists answers from this workspace's conversations only.
   const answersCitingHere = useCallback(
@@ -955,6 +1015,19 @@ function App() {
       sourceChange(filename, answeredAtMs, documents, corpusChecked && !listingFailed),
     [documents, corpusChecked, listingFailed],
   );
+  // The rail's count of answers still to review: read between answers (walking every
+  // turn on each streamed frame would cost the stream), kept while one streams.
+  const reviewCountRef = useRef(0);
+  const reviewCount = useMemo(() => {
+    if (!pending) {
+      reviewCountRef.current = unreviewedCount(
+        answersIn(workspace).map((item) => item.turn),
+        sourceChangeOf,
+      );
+    }
+    return reviewCountRef.current;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, workspace, answersIn, conversations, sourceChangeOf, reviewTick]);
   const suggestions = useMemo(() => {
     const newest = [...indexedFilenames]
       .sort((a, b) => (documents[b]?.uploadedAt ?? 0) - (documents[a]?.uploadedAt ?? 0))
@@ -1177,6 +1250,7 @@ function App() {
         onOpenSettings={openSettings}
         settingsAvailable={configLoaded}
         hidden={hiddenRailPanels}
+        badges={reviewCount > 0 ? { review: reviewCount } : undefined}
       />
       <ContextPanel
         title={PANEL_META[rail].title}
@@ -1197,6 +1271,8 @@ function App() {
             onDelete={deleteConversation}
             onPin={pinConversation}
             onSetLabels={setLabels}
+            onRenameLabel={renameLabel}
+            onExportLabel={exportAllConversations}
             onSearch={searchConversations}
             streamingId={pending ? streamingConversationId : null}
             onVisibleOrder={noteListedOrder}
@@ -1313,6 +1389,7 @@ function App() {
             answers={reviewAnswers}
             onOpen={switchConversationFromList}
             sourceChangeOf={sourceChangeOf}
+            onMarkReviewed={readOnly ? undefined : markReviewed}
           />
         )}
         {rail === 'saved' && (
@@ -1388,6 +1465,7 @@ function App() {
               onToggleSaved={setTurnSaved}
               onCopyLink={copyLink}
               onReformat={reformatAnswer}
+              onUseVersion={restoreAnswerVersion}
               // Only once the listing is this conversation's workspace's (it switches
               // to it on opening): another's documents would all read "deleted".
               sourceChangeOf={
@@ -1508,10 +1586,11 @@ function App() {
               serverVersion={serverVersion}
               readiness={readiness}
               showAdmin={access === 'full' || access === 'open'}
-              onRestored={() => {
-                refreshDocuments().catch((err) => {
-                  noteAuthFailure(err);
-                });
+              onRestored={(jobs) => {
+                // Followed as the backup download's restore is: progress cards in the
+                // corpus panel, the listing refreshed as they finish.
+                showPanel('corpus');
+                void trackJobs(jobs).catch(noteAuthFailure);
               }}
               overrides={advancedOptions}
               onOverridesChange={updateAdvancedOptions}
@@ -1544,6 +1623,7 @@ function App() {
               onClose={closeSourceView}
               onAskAboutPassage={summarizeDisabled ? undefined : askAboutViewedPassage}
               onFindSimilar={findSimilarPassages}
+              onCopyLink={copyPassageLink}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
                   ? downloadViewedOriginal
