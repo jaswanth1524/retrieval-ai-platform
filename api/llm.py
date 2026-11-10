@@ -23,11 +23,20 @@ _OLLAMA_MODEL_PREFIXES = ("ollama/", "ollama_chat/")
 
 
 class GenerationError(RuntimeError):
-    """Raised when grounded generation fails."""
+    """Raised when grounded generation fails. ``worth_retrying`` is False when the
+    same call would fail the same way (bad credentials, an unknown model, a local
+    model that just timed out on this prompt)."""
+
+    def __init__(self, message: str = "", *, worth_retrying: bool = True) -> None:
+        super().__init__(message)
+        self.worth_retrying = worth_retrying
 
 
 class GenerationConfigError(GenerationError):
     """Raised when the selected generation provider is not configured."""
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message, worth_retrying=False)
 
 
 class ChatMessage(TypedDict):
@@ -116,6 +125,18 @@ def _never_connected(exc: BaseException) -> bool:
     return any(isinstance(link, httpx.ConnectError) for link in _exception_chain(exc))
 
 
+# Failures the same request would meet again: credentials, access, the model's name,
+# a prompt too long, a refusal.
+_NOT_WORTH_RETRYING: tuple[type[Exception], ...] = (
+    litellm_exceptions.AuthenticationError,
+    litellm_exceptions.PermissionDeniedError,
+    litellm_exceptions.NotFoundError,
+    litellm_exceptions.ContextWindowExceededError,
+    litellm_exceptions.ContentPolicyViolationError,
+    litellm_exceptions.BadRequestError,
+)
+
+
 def _provider_failure(exc: Exception) -> GenerationError:
     """A ``GenerationError`` naming the kind of failure, not the provider's raw text."""
 
@@ -124,7 +145,10 @@ def _provider_failure(exc: Exception) -> GenerationError:
         (text for kind, text in _PROVIDER_FAILURE_REASONS if isinstance(exc, kind)),
         f"{type(exc).__name__}; see the server log for details",
     )
-    return GenerationError(f"Generation provider request failed: {reason}.")
+    return GenerationError(
+        f"Generation provider request failed: {reason}.",
+        worth_retrying=not isinstance(exc, _NOT_WORTH_RETRYING),
+    )
 
 
 def redact_url(url: str) -> str:
@@ -149,6 +173,9 @@ def _connection_error(
 
     if _is_request_timeout(exc):
         base = float(settings.llm_request_timeout_seconds)
+        # A local model that ran out of time on this prompt would again (and holds
+        # the model meanwhile); a hosted one may just have been slow once.
+        local = is_local_provider(settings)
         if timeout is not None and timeout > base:
             # The base plus the time allowed to read this prompt
             # (LLM_PREFILL_TOKENS_PER_SECOND): name both knobs.
@@ -156,12 +183,14 @@ def _connection_error(
                 f"The generation provider sent nothing for {timeout:.0f}s "
                 f"(LLM_REQUEST_TIMEOUT_SECONDS={base:g}s plus time to read the prompt). "
                 "Local models on modest hardware can need longer — raise "
-                "LLM_REQUEST_TIMEOUT_SECONDS or lower LLM_PREFILL_TOKENS_PER_SECOND."
+                "LLM_REQUEST_TIMEOUT_SECONDS or lower LLM_PREFILL_TOKENS_PER_SECOND.",
+                worth_retrying=not local,
             )
         return GenerationError(
             "The generation provider did not finish within "
             f"LLM_REQUEST_TIMEOUT_SECONDS={base:g}s. "
-            "Local models on modest hardware can need longer — raise that setting."
+            "Local models on modest hardware can need longer — raise that setting.",
+            worth_retrying=not local,
         )
     if settings.llm_provider.lower().strip() == "ollama":
         return GenerationError(

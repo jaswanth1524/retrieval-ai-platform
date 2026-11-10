@@ -185,9 +185,46 @@ def answer_cache_key(
         # PASSAGES_ONLY / STRONG_MATCHES_ONLY: a stricter answer is another answer.
         int(settings.context_neighbor_radius),
         int(settings.rerank_fallback_count),
+        # Settings a workspace can change (WorkspaceSettingsStore): a key built after a
+        # change can't be served an answer ranked under the old ones.
+        float(settings.rerank_min_score),
+        float(settings.recency_boost_weight),
+        float(settings.rerank_relative_floor),
+        # An answer cached without follow-ups is replayed without them.
+        bool(settings.followups_enabled),
         narrow,
         corpus_state(settings, filenames, tags),
     )
+
+
+# Where the collection sits in each kind of key (``answer_cache_key``, and
+# ``summarize.summary_cache_key``, whose first element is "summary").
+_QUESTION_KEY_COLLECTION = 5
+_SUMMARY_KEY_COLLECTION = 4
+
+
+def _is_summary_key(key: CacheKey) -> bool:
+    # A question's second element is its filenames tuple, a summary's its mode.
+    return len(key) > _SUMMARY_KEY_COLLECTION and key[0] == "summary" and isinstance(key[1], str)
+
+
+def key_collection(key: CacheKey) -> object:
+    """The collection (workspace) a cache key was built for."""
+
+    index = _SUMMARY_KEY_COLLECTION if _is_summary_key(key) else _QUESTION_KEY_COLLECTION
+    return key[index] if len(key) > index else None
+
+
+def key_label(key: CacheKey) -> str:
+    """What a cache key was asked: the question, or a summary's mode, documents and
+    task ("compare: a.pdf, b.pdf — the costs")."""
+
+    if not _is_summary_key(key):
+        return str(key[0])
+    mode, instruction, filenames = key[1], key[2], key[3]
+    names = ", ".join(str(name) for name in filenames) if isinstance(filenames, tuple) else ""
+    label = f"{mode}: {names}" if names else str(mode)
+    return f"{label} — {instruction}" if instruction else label
 
 
 class InflightRuns:
@@ -286,14 +323,14 @@ class AnswerCache:
 
     def entries_for(self, collection: str) -> list[tuple[str, float]]:
         """``collection``'s live entries, newest first: what was asked (a summary's
-        task) and how old the answer is, in seconds. Every key names its collection."""
+        mode, documents and task) and how old the answer is, in seconds."""
 
         now = self._clock()
         with self._lock:
             found = [
-                (str(key[0]), now - stored_at)
+                (key_label(key), now - stored_at)
                 for key, (stored_at, _value, _scope) in self._entries.items()
-                if collection in key and now - stored_at <= self._ttl
+                if key_collection(key) == collection and now - stored_at <= self._ttl
             ]
         return list(reversed(found))
 
@@ -301,7 +338,7 @@ class AnswerCache:
         """Forget ``collection``'s entries (DELETE /answer-cache); how many went."""
 
         with self._lock:
-            keys = [key for key in self._entries if collection in key]
+            keys = [key for key in self._entries if key_collection(key) == collection]
             for key in keys:
                 del self._entries[key]
         return len(keys)

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import functools
 import logging
+import lzma
 import threading
 import zipfile
 import zlib
+from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Annotated
 
@@ -48,6 +50,7 @@ from api.documents import (
 from api.ingest_jobs import backlog_full_error
 from api.ingestion import filename_write_lock
 from api.parse_isolation import parse_with_limit
+from api.repository import VectorRepository
 from api.routes.deps import (
     IngestQueueDep,
     RawDocumentStoreDep,
@@ -76,7 +79,8 @@ from api.schemas import (
     SitemapIngestResponse,
     UrlIngestRequest,
 )
-from api.sitemap import PageImport, read_sitemap, start_page_import
+from api.settings import AppSettings
+from api.sitemap import KnownPage, PageImport, read_sitemap, start_page_import
 from api.upload import read_upload_within_limit
 from api.url_fetch import (
     FetchedDocument,
@@ -159,6 +163,23 @@ async def upload_document(
     return accepted
 
 
+def _names_and_sources(
+    repository: VectorRepository, settings: AppSettings
+) -> tuple[dict[str, str | None], dict[str, KnownPage]]:
+    """Every name in use, with the URL its document came from (None for an upload and
+    for a name with an upload in flight); and each fetched document by its URL."""
+
+    names: dict[str, str | None] = dict.fromkeys(indexing_now(settings))
+    pages: dict[str, KnownPage] = {}
+    for name, meta in repository.filename_metadata(settings).items():
+        names[name] = meta.source_url
+        if meta.source_url:
+            pages[meta.source_url] = KnownPage(
+                meta.uploaded_at, meta.source_etag, meta.source_last_modified
+            )
+    return names, pages
+
+
 # A site's pages from its sitemap (or sitemap index, RSS or Atom feed): read now, its
 # pages fetched and queued one by one in the background (api/sitemap.py). The full key
 # and URL_INGEST_ENABLED, as /documents/from-url.
@@ -205,23 +226,35 @@ async def add_from_sitemap(
         )
     finally:
         _url_fetch_slots.release()
-    known = set(await run_in_threadpool(known_filenames, repository, settings))
-    start_page_import(
+    known, indexed = await run_in_threadpool(_names_and_sources, repository, settings)
+
+    def fetch_page(
+        url: str, has_room: Callable[[int], bool], etag: str | None, modified: str | None
+    ) -> FetchedDocument:
+        return fetch_document(url, settings, has_room=has_room, etag=etag, last_modified=modified)
+
+    status = start_page_import(
         found.urls,
         PageImport(
             queue=queue,
             raw_store=raw_store,
-            fetch=lambda url, has_room: fetch_document(url, settings, has_room=has_room),
+            fetch=fetch_page,
             tags=given_tags,
             refresh_minutes=request.refresh_minutes,
             known=known,
+            indexed=indexed,
+            lastmods=found.lastmods,
         ),
+        url=request.url,
     )
     logger.info(
         "Adding %d page(s) from the sitemap %s.", len(found.urls), loggable_url(request.url)
     )
     return SitemapIngestResponse(
-        urls=found.urls, left_out=found.left_out, child_sitemaps=len(found.child_sitemaps)
+        urls=found.urls,
+        left_out=found.left_out,
+        child_sitemaps=len(found.child_sitemaps),
+        import_id=status.id,
     )
 
 
@@ -257,7 +290,10 @@ def upload_archive(
     deferred: list[str] = []
     with archive:
         members = [info for info in archive.infolist() if not info.is_dir()]
-        if len(members) > int(settings.max_archive_members):
+        # Counted without what is skipped silently (a Finder zip carries a __MACOSX
+        # entry for every file): the cap is on documents.
+        counted = [info for info in members if not _silently_skipped(info)]
+        if len(counted) > int(settings.max_archive_members):
             raise HTTPException(
                 status_code=400,
                 detail=f"The zip has more than {settings.max_archive_members} files "
@@ -290,11 +326,21 @@ def upload_archive(
             try:
                 with archive.open(info) as handle:
                     content = handle.read(limit + 1)
-            except (zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, NotImplementedError):
+            except (
+                zipfile.BadZipFile,
+                zlib.error,
+                lzma.LZMAError,
+                EOFError,
+                OSError,  # a damaged bzip2 member
+                RuntimeError,
+                NotImplementedError,
+            ):
                 skipped.append(ArchiveSkipResponse(name=info.filename, reason="It is damaged."))
                 continue
-            # The header's size isn't trusted: what it expands to is counted.
-            budget -= len(content)
+            # The header's size isn't trusted: what it expands to is counted — only for
+            # a member that is kept (one past the limit is skipped, not budgeted).
+            if len(content) <= limit:
+                budget -= len(content)
             if len(content) > limit or budget < 0:
                 skipped.append(
                     ArchiveSkipResponse(
@@ -332,14 +378,21 @@ def upload_archive(
     return ArchiveUploadResponse(jobs=jobs, skipped=skipped, deferred=deferred)
 
 
+def _silently_skipped(info: zipfile.ZipInfo) -> bool:
+    """Hidden files and macOS folder metadata: not documents, skipped without a word."""
+
+    parts = PurePosixPath(info.filename.replace("\\", "/")).parts
+    base = parts[-1] if parts else ""
+    return not base or base.startswith(".") or "__MACOSX" in parts
+
+
 def _archive_skip_reason(
     info: zipfile.ZipInfo, base: str, seen: set[str], limit: int
 ) -> str | None:
     """Why a zip member isn't indexed ("" for one skipped without a word: hidden files,
     macOS folder metadata), or None to index it."""
 
-    parts = PurePosixPath(info.filename.replace("\\", "/")).parts
-    if not base or base.startswith(".") or "__MACOSX" in parts:
+    if _silently_skipped(info):
         return ""
     if PurePosixPath(base).suffix.lower() not in SUPPORTED_EXTENSIONS:
         return "Not a supported document type."

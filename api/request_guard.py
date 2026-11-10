@@ -125,9 +125,11 @@ def needs_full_key(method: str, path: str) -> bool:
 
 
 def body_limit(method: str, path: str, settings: AppSettings) -> int:
-    if method == "POST" and path in ("/documents", "/documents/preview", "/documents/archive"):
+    if method == "POST" and path in ("/documents", "/documents/preview"):
         return int(settings.max_upload_bytes) + UPLOAD_OVERHEAD_BYTES
-    if method == "POST" and path in ("/import", "/backups/verify"):
+    # A zip of documents is budgeted as a backup is (each member is still capped at
+    # MAX_UPLOAD_BYTES by the route).
+    if method == "POST" and path in ("/import", "/backups/verify", "/documents/archive"):
         return int(settings.max_import_bytes) + UPLOAD_OVERHEAD_BYTES
     return MAX_JSON_BODY_BYTES
 

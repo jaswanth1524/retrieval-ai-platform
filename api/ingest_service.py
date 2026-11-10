@@ -47,6 +47,8 @@ class DocumentIngestOutcome:
     chunks_removed: int = 0
     # Another indexed document with these exact bytes (information only: both stay).
     duplicate_of: str | None = None
+    # What the parse left out or couldn't read (a cap reached, a page OCR failed on).
+    warnings: tuple[str, ...] = ()
 
 
 class IngestService:
@@ -202,6 +204,7 @@ class IngestService:
             chunks_reused=result.chunks_reused,
             chunks_removed=result.chunks_removed,
             duplicate_of=self._same_bytes_as(sections[0].filename, digest),
+            warnings=tuple(getattr(sections, "warnings", ())),
         )
 
     def _same_bytes_as(self, filename: str, digest: str) -> str | None:

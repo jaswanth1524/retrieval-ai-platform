@@ -43,7 +43,7 @@ def parse_odp_document(filename: str, content: bytes) -> list[DocumentSection]:
     for number, slide in enumerate(body.iter(f"{_DRAW}page"), start=1):
         title = ""
         lines: list[str] = []
-        for frame in slide.findall(f"{_DRAW}frame"):
+        for frame in _shapes(slide):
             text = _frame_text(frame)
             if not text:
                 continue
@@ -76,10 +76,34 @@ def parse_odp_document(filename: str, content: bytes) -> list[DocumentSection]:
     return sections
 
 
+# Groups nested deeper than this are not walked (a crafted file nests far past it).
+_MAX_GROUP_DEPTH = 32
+
+
+def _shapes(container: ElementTree.Element, depth: int = 0) -> list[ElementTree.Element]:
+    """The shapes holding a slide's text, in order: text frames and custom shapes (a
+    drawn box with text in it), including those inside groups."""
+
+    found: list[ElementTree.Element] = []
+    for element in container:
+        if element.tag in (f"{_DRAW}frame", f"{_DRAW}custom-shape"):
+            found.append(element)
+        elif element.tag == f"{_DRAW}g" and depth < _MAX_GROUP_DEPTH:
+            found.extend(_shapes(element, depth + 1))
+    return found
+
+
 def _frame_text(frame: ElementTree.Element) -> str:
     parts: list[str] = []
     for element in frame:
-        if element.tag == f"{_DRAW}text-box":
+        if element.tag in (f"{_TEXT}p", f"{_TEXT}h", f"{_TEXT}list"):
+            # A custom shape holds its paragraphs directly.
+            for paragraph in element.iter():
+                if paragraph.tag in (f"{_TEXT}p", f"{_TEXT}h"):
+                    text = normalize_text(_inline_text(paragraph))
+                    if text:
+                        parts.append(text)
+        elif element.tag == f"{_DRAW}text-box":
             for paragraph in element.iter():
                 if paragraph.tag in (f"{_TEXT}p", f"{_TEXT}h"):
                     text = normalize_text(_inline_text(paragraph))

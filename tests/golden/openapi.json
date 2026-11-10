@@ -156,8 +156,21 @@
       "title": "Problems",
       "type": "array"
      },
+     "rejected": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Rejected",
+      "type": "array"
+     },
      "versions": {
       "title": "Versions",
+      "type": "integer"
+     },
+     "would_restore": {
+      "default": 0,
+      "title": "Would Restore",
       "type": "integer"
      }
     },
@@ -171,6 +184,20 @@
      "problems"
     ],
     "title": "BackupCheckResponse",
+    "type": "object"
+   },
+   "BackupDeleteResponse": {
+    "description": "DELETE /backups/{name}: the stored backup that was deleted.",
+    "properties": {
+     "name": {
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "title": "BackupDeleteResponse",
     "type": "object"
    },
    "BackupFileResponse": {
@@ -467,6 +494,68 @@
     "title": "CitationSpanResponse",
     "type": "object"
    },
+   "ConsistencyRepairRequest": {
+    "description": "POST /admin/consistency/repair: which of the report's findings to put right\n(each off unless asked for).",
+    "properties": {
+     "delete_orphan_originals": {
+      "default": false,
+      "title": "Delete Orphan Originals",
+      "type": "boolean"
+     },
+     "delete_orphan_versions": {
+      "default": false,
+      "title": "Delete Orphan Versions",
+      "type": "boolean"
+     },
+     "reindex_incomplete": {
+      "default": false,
+      "title": "Reindex Incomplete",
+      "type": "boolean"
+     }
+    },
+    "title": "ConsistencyRepairRequest",
+    "type": "object"
+   },
+   "ConsistencyRepairResponse": {
+    "properties": {
+     "left": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Left",
+      "type": "array"
+     },
+     "originals_deleted": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Originals Deleted",
+      "type": "array"
+     },
+     "reindex_jobs": {
+      "items": {
+       "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
+      },
+      "title": "Reindex Jobs",
+      "type": "array"
+     },
+     "versions_deleted": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Versions Deleted",
+      "type": "array"
+     }
+    },
+    "required": [
+     "originals_deleted",
+     "versions_deleted",
+     "reindex_jobs",
+     "left"
+    ],
+    "title": "ConsistencyRepairResponse",
+    "type": "object"
+   },
    "ConsistencyResponse": {
     "description": "GET /admin/consistency: how the index and the stored originals agree. A report\nonly: nothing is changed.",
     "properties": {
@@ -708,6 +797,14 @@
       "default": false,
       "title": "Unchanged",
       "type": "boolean"
+     },
+     "warnings": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
      }
     },
     "required": [
@@ -1790,6 +1887,11 @@
    "QueryLogEntryResponse": {
     "description": "One logged question or summary (QUERY_LOG_ENABLED).",
     "properties": {
+     "cached": {
+      "default": false,
+      "title": "Cached",
+      "type": "boolean"
+     },
      "created_at": {
       "title": "Created At",
       "type": "number"
@@ -1801,6 +1903,11 @@
       },
       "title": "Filenames",
       "type": "array"
+     },
+     "kind": {
+      "default": "question",
+      "title": "Kind",
+      "type": "string"
      },
      "mode": {
       "title": "Mode",
@@ -2281,6 +2388,17 @@
       "title": "Passages Left Out",
       "type": "integer"
      },
+     "rerank_min_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Min Score"
+     },
      "sources": {
       "items": {
        "$ref": "#/components/schemas/CitationResponse"
@@ -2372,6 +2490,16 @@
      "current_min_score": {
       "title": "Current Min Score",
       "type": "number"
+     },
+     "filtered_out": {
+      "default": 0,
+      "title": "Filtered Out",
+      "type": "integer"
+     },
+     "left_out": {
+      "default": 0,
+      "title": "Left Out",
+      "type": "integer"
      },
      "note": {
       "title": "Note",
@@ -2732,6 +2860,105 @@
     "title": "SearchTimingsResponse",
     "type": "object"
    },
+   "SitemapImportListResponse": {
+    "properties": {
+     "imports": {
+      "items": {
+       "$ref": "#/components/schemas/SitemapImportResponse"
+      },
+      "title": "Imports",
+      "type": "array"
+     }
+    },
+    "required": [
+     "imports"
+    ],
+    "title": "SitemapImportListResponse",
+    "type": "object"
+   },
+   "SitemapImportResponse": {
+    "description": "A sitemap import as it goes (GET /documents/sitemap-imports/{id}).",
+    "properties": {
+     "cancelled_pages": {
+      "title": "Cancelled Pages",
+      "type": "integer"
+     },
+     "done": {
+      "title": "Done",
+      "type": "integer"
+     },
+     "failed": {
+      "title": "Failed",
+      "type": "integer"
+     },
+     "finished_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Finished At"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "problems": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     },
+     "queued": {
+      "title": "Queued",
+      "type": "integer"
+     },
+     "skipped": {
+      "title": "Skipped",
+      "type": "integer"
+     },
+     "started_at": {
+      "title": "Started At",
+      "type": "number"
+     },
+     "state": {
+      "title": "State",
+      "type": "string"
+     },
+     "total": {
+      "title": "Total",
+      "type": "integer"
+     },
+     "unchanged": {
+      "title": "Unchanged",
+      "type": "integer"
+     },
+     "url": {
+      "title": "Url",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "url",
+     "state",
+     "total",
+     "done",
+     "queued",
+     "failed",
+     "skipped",
+     "unchanged",
+     "cancelled_pages",
+     "started_at"
+    ],
+    "title": "SitemapImportResponse",
+    "type": "object"
+   },
    "SitemapIngestRequest": {
     "description": "Add a site's pages from its sitemap, sitemap index, RSS or Atom feed\n(POST /documents/from-sitemap).",
     "properties": {
@@ -2801,6 +3028,17 @@
      "child_sitemaps": {
       "title": "Child Sitemaps",
       "type": "integer"
+     },
+     "import_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Import Id"
      },
      "left_out": {
       "title": "Left Out",
@@ -2996,6 +3234,17 @@
       "default": 0,
       "title": "Passages Left Out",
       "type": "integer"
+     },
+     "rerank_min_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Min Score"
      },
      "sources": {
       "items": {
@@ -3836,7 +4085,7 @@
     "type": "object"
    },
    "TraceRerunRequest": {
-    "description": "POST /traces/{id}/rerun: ranking settings to try (each optional; unset ones are\nthe server's).",
+    "description": "POST /traces/{id}/rerun: ranking settings to try (each optional; unset ones are\nthose the question was asked with, or the server's where the trace has none).",
     "properties": {
      "recency_boost_weight": {
       "anyOf": [
@@ -4061,6 +4310,176 @@
      "kept_count"
     ],
     "title": "TraceSummaryResponse",
+    "type": "object"
+   },
+   "TraceWhatIfItemResponse": {
+    "properties": {
+     "answered_before": {
+      "title": "Answered Before",
+      "type": "boolean"
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "question": {
+      "title": "Question",
+      "type": "string"
+     },
+     "top_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Top Score"
+     },
+     "trace_id": {
+      "title": "Trace Id",
+      "type": "string"
+     },
+     "weak_matches": {
+      "default": false,
+      "title": "Weak Matches",
+      "type": "boolean"
+     },
+     "would_answer": {
+      "title": "Would Answer",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "trace_id",
+     "question",
+     "answered_before",
+     "would_answer"
+    ],
+    "title": "TraceWhatIfItemResponse",
+    "type": "object"
+   },
+   "TraceWhatIfRequest": {
+    "description": "POST /traces/what-if: ranking settings to try on the latest traced questions\n(each optional; unset ones are those each question was asked with).",
+    "properties": {
+     "limit": {
+      "default": 20,
+      "maximum": 100.0,
+      "minimum": 1.0,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "only_unanswered": {
+      "default": true,
+      "title": "Only Unanswered",
+      "type": "boolean"
+     },
+     "rerank_fallback_count": {
+      "anyOf": [
+       {
+        "maximum": 20.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Fallback Count"
+     },
+     "rerank_min_score": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Min Score"
+     },
+     "rerank_relative_floor": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Relative Floor"
+     }
+    },
+    "title": "TraceWhatIfRequest",
+    "type": "object"
+   },
+   "TraceWhatIfResponse": {
+    "description": "The latest traced questions searched again under other ranking settings\n(retrieval only, nothing stored): how many would be answered from the documents.",
+    "properties": {
+     "checked": {
+      "title": "Checked",
+      "type": "integer"
+     },
+     "items": {
+      "items": {
+       "$ref": "#/components/schemas/TraceWhatIfItemResponse"
+      },
+      "title": "Items",
+      "type": "array"
+     },
+     "newly_answered": {
+      "title": "Newly Answered",
+      "type": "integer"
+     },
+     "newly_unanswered": {
+      "title": "Newly Unanswered",
+      "type": "integer"
+     },
+     "settings": {
+      "additionalProperties": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Settings",
+      "type": "object"
+     },
+     "stopped_early": {
+      "default": false,
+      "title": "Stopped Early",
+      "type": "boolean"
+     },
+     "would_answer": {
+      "title": "Would Answer",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "settings",
+     "checked",
+     "would_answer",
+     "newly_answered",
+     "newly_unanswered",
+     "items"
+    ],
+    "title": "TraceWhatIfResponse",
     "type": "object"
    },
    "UrlIngestRequest": {
@@ -4495,6 +4914,30 @@
       ],
       "title": "Answer Language"
      },
+     "followups_enabled": {
+      "anyOf": [
+       {
+        "type": "boolean"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Followups Enabled"
+     },
+     "max_context_chunks": {
+      "anyOf": [
+       {
+        "maximum": 50.0,
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Max Context Chunks"
+     },
      "recency_boost_weight": {
       "anyOf": [
        {
@@ -4508,6 +4951,19 @@
       ],
       "title": "Recency Boost Weight"
      },
+     "rerank_fallback_count": {
+      "anyOf": [
+       {
+        "maximum": 20.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Fallback Count"
+     },
      "rerank_min_score": {
       "anyOf": [
        {
@@ -4520,6 +4976,19 @@
        }
       ],
       "title": "Rerank Min Score"
+     },
+     "rerank_relative_floor": {
+      "anyOf": [
+       {
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Relative Floor"
      }
     },
     "title": "WorkspaceSettingsRequest",
@@ -4677,6 +5146,78 @@
      }
     },
     "summary": "Check Consistency"
+   }
+  },
+  "/admin/consistency/repair": {
+   "post": {
+    "operationId": "repair_consistency_admin_consistency_repair_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ConsistencyRepairRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ConsistencyRepairResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Repair Consistency"
    }
   },
   "/answer-cache": {
@@ -4950,6 +5491,22 @@
        ],
        "title": "X-Api-Key"
       }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
      }
     ],
     "requestBody": {
@@ -4985,6 +5542,148 @@
      }
     },
     "summary": "Verify Uploaded Backup"
+   }
+  },
+  "/backups/{name}": {
+   "delete": {
+    "operationId": "delete_stored_backup_backups__name__delete",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackupDeleteResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such backup, or BACKUP_DIR is unset."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Delete Stored Backup"
+   },
+   "get": {
+    "operationId": "download_stored_backup_backups__name__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/zip": {}
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such backup, or BACKUP_DIR is unset."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Download Stored Backup"
    }
   },
   "/backups/{name}/restore": {
@@ -5967,6 +6666,208 @@
      }
     },
     "summary": "Reindex Stale Documents"
+   }
+  },
+  "/documents/sitemap-imports": {
+   "get": {
+    "operationId": "list_sitemap_imports_documents_sitemap_imports_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SitemapImportListResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Sitemap Imports"
+   }
+  },
+  "/documents/sitemap-imports/{import_id}": {
+   "delete": {
+    "operationId": "cancel_sitemap_import_documents_sitemap_imports__import_id__delete",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "import_id",
+      "required": true,
+      "schema": {
+       "title": "Import Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SitemapImportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Cancel Sitemap Import"
+   },
+   "get": {
+    "operationId": "get_sitemap_import_documents_sitemap_imports__import_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "import_id",
+      "required": true,
+      "schema": {
+       "title": "Import Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SitemapImportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Get Sitemap Import"
    }
   },
   "/documents/{filename}": {
@@ -7796,6 +8697,45 @@
     "operationId": "trace_score_report_traces_score_report_get",
     "parameters": [
      {
+      "description": "Only traces asked since (epoch seconds).",
+      "in": "query",
+      "name": "since",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 0,
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Only traces asked since (epoch seconds).",
+       "title": "Since"
+      }
+     },
+     {
+      "description": "Only traces answered under this RERANK_MIN_SCORE.",
+      "in": "query",
+      "name": "bar",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maximum": 1,
+         "minimum": 0,
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Only traces answered under this RERANK_MIN_SCORE.",
+       "title": "Bar"
+      }
+     },
+     {
       "in": "header",
       "name": "X-API-Key",
       "required": false,
@@ -7851,6 +8791,84 @@
      }
     },
     "summary": "Trace Score Report"
+   }
+  },
+  "/traces/what-if": {
+   "post": {
+    "operationId": "what_if_traces_what_if_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/TraceWhatIfRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TraceWhatIfResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "409": {
+      "description": "A re-check is already running."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     },
+     "429": {
+      "description": "Every question slot is busy."
+     }
+    },
+    "summary": "What If"
    }
   },
   "/traces/{trace_id}": {

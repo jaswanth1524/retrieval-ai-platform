@@ -800,6 +800,8 @@ def test_rag_pipeline_answer_records_partial_trace_on_generation_error() -> None
     # The retrieval phase completed before generation failed, so the effective
     # config is still captured even though the trace as a whole is an error.
     assert trace.config is not None
+    # ...and what retrieval found: the passage that would have been sent.
+    assert [c.filename for c in trace.candidates if c.selected_for_context] == ["guide.txt"]
 
 
 def test_rag_pipeline_answer_stream_carries_matching_trace_id_in_sources_and_done() -> None:
@@ -3165,3 +3167,33 @@ def test_picked_passages_past_the_context_limit_are_reported_left_out() -> None:
     assert streamed[0]["passages_left_out"] == 3
     # Nothing picked: nothing reported.
     assert pipeline.answer("alpha").passages_left_out == 0
+
+
+def test_leg_ranks_are_collected_only_for_a_traced_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = make_settings()
+    repository = VectorRepository(QdrantClient(":memory:"))
+    IngestService(repository, StaticEmbeddingProvider([make_embedding(1.0)]), settings).ingest(
+        "guide.txt", b"Intro\nalpha beta"
+    )
+    asked: list[bool] = []
+    real = repository.hybrid_search
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        asked.append("leg_ranks" in kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "hybrid_search", spy)
+    pipeline = RagPipeline(
+        repository=repository,
+        embedding_provider=StaticEmbeddingProvider([make_embedding(1.0)]),
+        reranker=FakeReranker(),
+        generator=FakeGenerator("Alpha [1]."),
+        settings=settings,
+        trace_store=ListTraceStore(),
+    )
+
+    pipeline.retrieve("alpha")
+    pipeline.retrieve("alpha", for_generation=False)
+    assert asked == [False, False]
+    pipeline.answer("alpha")
+    assert asked[-1] is True

@@ -85,6 +85,7 @@ from api.prompting import (
     one_line,
 )
 from api.qdrant_schema import check_dense_dimension
+from api.query_log import LoggedQuery, log_served
 from api.repository import LegRanks, PassageFilter, VectorRepository, reciprocal_rank_fusion
 from api.request_id import current_request_id, submit_in_context
 from api.reranking import (
@@ -162,7 +163,33 @@ def narrowing_record(narrow: PassageFilter | None) -> dict[str, Any] | None:
     return {key: value for key, value in record.items() if value not in (None, [])} or None
 
 
-def _filter_from_record(record: Mapping[str, Any]) -> PassageFilter:
+# The settings a traced question was answered under that a re-run repeats (ranking
+# and the prompt's budget; never the reranker or embedding model, which a re-run can't
+# change). A field an older trace didn't record is left at the current setting.
+_RERUN_FROM_TRACE = (
+    "llm_provider",
+    "rerank_top_k",
+    "max_context_chunks",
+    "rerank_min_score",
+    "answer_format",
+    "answer_language",
+    "context_neighbor_radius",
+    "rerank_fallback_count",
+    "rerank_candidates",
+    "rerank_relative_floor",
+    "recency_boost_weight",
+    "context_neighbor_max_chars",
+)
+
+
+def _recorded_settings(config: TraceConfig | None) -> dict[str, Any]:
+    if config is None:
+        return {}
+    recorded = {name: getattr(config, name) for name in _RERUN_FROM_TRACE}
+    return {name: value for name, value in recorded.items() if value is not None}
+
+
+def filter_from_record(record: Mapping[str, Any]) -> PassageFilter:
     """The ``PassageFilter`` a trace's narrowing record (``narrowing_record``) came
     from."""
 
@@ -274,6 +301,9 @@ class DoneEvent(TypedDict):
     # citations.answer_status, and the best cross-encoder score among the candidates.
     answer_status: NotRequired[str]
     top_rerank_score: NotRequired[float | None]
+    # The relevance bar (RERANK_MIN_SCORE, or the workspace's) the answer was given
+    # under: what the client compares top_rerank_score against.
+    rerank_min_score: NotRequired[float]
     # Answered from below-the-bar passages (RetrievalPhase.below_min_score).
     weak_matches: NotRequired[bool]
     # The provider cut the answer off at the token limit.
@@ -441,6 +471,50 @@ def replay_cached(hit: CachedAnswer, started: float, **done_fields: Any) -> Iter
     yield cast(DoneEvent, done)
     if hit.followups:
         yield {"type": "followups", "questions": list(hit.followups)}
+
+
+def served_query(
+    hit: CachedAnswer,
+    *,
+    question: str,
+    mode: TraceMode,
+    workspace: str,
+    kind: str = "question",
+    filenames: Sequence[str] | None = None,
+    tags: Sequence[str] | None = None,
+    narrowing: dict[str, Any] | None = None,
+) -> LoggedQuery:
+    """The query-log row of a question (or summary) served from the answer cache."""
+
+    status = trace_status(hit.answer_status)
+    cited = (
+        tuple(filenames or ())
+        if kind == "summary"
+        else tuple(dict.fromkeys(source.filename for source in hit.sources))
+    )
+    scope = {
+        key: value
+        for key, value in (
+            ("filenames", sorted(filenames or ())),
+            ("tags", sorted(tags or ())),
+            ("narrowing", narrowing),
+        )
+        if value
+    }
+    return LoggedQuery(
+        created_at=time.time(),
+        workspace=workspace,
+        question=question,
+        status=status,
+        top_score=hit.top_rerank_score,
+        mode=mode,
+        trace_id=hit.trace_id,
+        filenames=cited if status == "ok" else (),
+        kind=kind,
+        top_filename=None,
+        scope=scope or None,
+        cached=True,
+    )
 
 
 def usage_dict(
@@ -663,6 +737,7 @@ def cached_run(
     replay: Callable[[CachedAnswer], Iterator[StreamEvent]],
     run: Callable[[], Generator[StreamEvent]],
     keep: Callable[[DoneEvent], bool] = lambda done: True,
+    on_hit: Callable[[CachedAnswer], None] | None = None,
 ) -> Iterator[StreamEvent]:
     """A run through the answer cache, for answers and summaries alike: a hit replayed
     (``replay``), or the identical run already going joined (``lead_or_join``), or
@@ -673,7 +748,8 @@ def cached_run(
     client that leaves then (or as ``done`` arrives) closes this generator at the yield,
     so a store after the loop never ran. Followers are released right after the store;
     they never wait for the follow-ups. ``use_cache=False`` (Regenerate) skips the
-    lookup but still stores the result.
+    lookup but still stores the result. ``on_hit`` is told of a hit (or a join) before
+    it is replayed: it has no trace of its own, so the query log is told here.
     """
 
     lead: threading.Event | None = None
@@ -688,6 +764,8 @@ def cached_run(
             else:
                 lead = joined
         if hit is not None:
+            if on_hit is not None:
+                on_hit(hit)
             yield from replay(hit)
             return
     done: DoneEvent | None = None
@@ -774,6 +852,13 @@ class AnswerRun:
     parts: list[str] = field(default_factory=list)
     # The stream's model slot, held from generation through follow-ups.
     slot: GenerationSlot | None = None
+    # What retrieval found and what of it fit the prompt (kept on an error or
+    # closed-early trace, so it shows what the question got as far as).
+    phase: RetrievalPhase | None = None
+    fitted: FittedPrompt | None = None
+    # The thread the run began on: its usage counters (``llm.usage_totals``) are that
+    # thread's, so a trace stored from another thread leaves usage out.
+    thread: int = field(default_factory=threading.get_ident)
     # A trace has been stored (finished, no context, or an error): the closed-early
     # trace is for a stream that ends with none of those.
     finalized: bool = False
@@ -916,9 +1001,31 @@ class RagPipeline:
         history_message_count: int,
         condense_note: str | None = None,
         narrow: PassageFilter | None = None,
+        phase: RetrievalPhase | None = None,
+        fitted: FittedPrompt | None = None,
+        usage: tuple[int, int] | None = None,
     ) -> QueryTrace:
-        """The trace of a question that failed (or was abandoned) before finishing."""
+        """The trace of a question that failed (or was abandoned) before finishing:
+        with what retrieval found (``phase``, ``fitted``) when it got that far, and the
+        tokens already spent."""
 
+        candidates = (
+            build_trace_candidates(
+                phase.fused_candidates,
+                phase.scored_chunks,
+                phase.context_chunks,
+                fitted.context_chunks if fitted is not None else [],
+                min_score=float(effective_settings.rerank_min_score),
+                diversity_dropped_ids=phase.diversity_dropped_ids,
+                relative_cut_ids=phase.relative_cut_ids,
+                context_budget_dropped_ids=(
+                    fitted.dropped_point_ids if fitted is not None else frozenset()
+                ),
+                leg_ranks=phase.leg_ranks,
+            )
+            if phase is not None and effective_settings is not None
+            else []
+        )
         return QueryTrace(
             trace_id=trace_id,
             created_at=time.time(),
@@ -928,7 +1035,7 @@ class RagPipeline:
             config=self._trace_config(effective_settings, filenames, tags, narrow)
             if effective_settings is not None
             else None,
-            candidates=[],
+            candidates=candidates,
             prompt_messages=None,
             answer=answer,
             cited_source_numbers=[],
@@ -939,6 +1046,13 @@ class RagPipeline:
             history_message_count=history_message_count,
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
+            weak_matches=phase.below_min_score if phase is not None else False,
+            usage=usage,
+            cost_usd=(
+                usage_cost_usd(effective_settings, usage)
+                if usage is not None and effective_settings is not None
+                else None
+            ),
         )
 
     def _finished_trace(
@@ -1234,8 +1348,13 @@ class RagPipeline:
         also_search: str | None = None,
         expansion: tuple[list[str], float] | None = None,
         seed: EmbeddedText | None = None,
+        traced: bool | None = None,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
+
+        ``traced`` says whether a trace will show this retrieval (default: when it
+        feeds an answer): only then are each candidate's leg ranks collected, which
+        can cost Qdrant one more query (TRACE_LEG_RANKS).
 
         ``expansion`` is ``_expand_query``'s result when the caller already ran it (the
         stream does, so it can wait for the local model with a frame first).
@@ -1285,7 +1404,8 @@ class RagPipeline:
             queries.insert(1, extra_query)
 
         # Which leg found each candidate, for its trace (none is kept without one).
-        leg_ranks: LegRanks | None = {} if self._trace_store is not None else None
+        traced = for_generation if traced is None else traced
+        leg_ranks: LegRanks | None = {} if traced and self._trace_store is not None else None
         candidates, embed_ms, search_ms = self._search(
             queries, effective_settings, filenames, tags, tag_variants, narrow, seed, leg_ranks
         )
@@ -1360,6 +1480,8 @@ class RagPipeline:
             for_generation=for_generation,
             narrow=narrow,
             also_search=also_search,
+            # Search, re-check and the eval harness keep no trace of it.
+            traced=False,
         )
 
     def rerun_retrieval(
@@ -1367,16 +1489,21 @@ class RagPipeline:
     ) -> tuple[RetrievalPhase, QueryTrace]:
         """``trace``'s question searched again — what it searched (a follow-up's
         rewrite, next to the question as asked), in its scope and narrowing — under the
-        server's settings with ``settings_update`` (ranking settings only), and the
+        settings it was asked with (``_RERUN_FROM_TRACE``; the server's where the trace
+        has none) with ``settings_update`` (ranking settings only), and the
         trace that retrieval would have left: ``POST /traces/{id}/rerun``. No LLM call:
         query expansion is left out (its variants came from the model)."""
 
         config = trace.config
         settings = self._effective_settings(AnswerOverrides()).model_copy(
-            update={**settings_update, "query_expansion_enabled": False}
+            update={
+                **_recorded_settings(config),
+                **settings_update,
+                "query_expansion_enabled": False,
+            }
         )
         record = config.narrowing if config is not None else None
-        narrow = _filter_from_record(record) if record else None
+        narrow = filter_from_record(record) if record else None
         query = trace.condensed_question or trace.question
         phase = self._retrieve_and_rerank(
             query,
@@ -1387,7 +1514,16 @@ class RagPipeline:
             narrow=narrow,
             also_search=trace.question if query != trace.question else None,
         )
-        selected = phase.context_chunks[: int(settings.max_context_chunks)]
+        # What reached the prompt, fitted as the answer was (without its history, which
+        # a trace doesn't keep): passages the window left out are left out again.
+        fitted = fit_prompt_to_context_window(
+            query,
+            phase.context_chunks[: int(settings.max_context_chunks)],
+            None,
+            settings,
+            weak_matches=phase.below_min_score,
+        )
+        selected = fitted.context_chunks
         rerun = dataclasses.replace(
             trace,
             config=self._trace_config(
@@ -1404,6 +1540,7 @@ class RagPipeline:
                 min_score=float(settings.rerank_min_score),
                 diversity_dropped_ids=phase.diversity_dropped_ids,
                 relative_cut_ids=phase.relative_cut_ids,
+                context_budget_dropped_ids=fitted.dropped_point_ids,
                 leg_ranks=phase.leg_ranks,
             ),
             answer=None,
@@ -1498,6 +1635,7 @@ class RagPipeline:
                 elif joined is not None:
                     lead = joined
             if hit is not None:
+                self._log_hit(hit, question, "sync", filenames, tags, overrides)
                 return hit.as_grounded(_cached_timings(started))
         try:
             grounded = self._answer_uncached(question, overrides, filenames, history, tags)
@@ -1538,11 +1676,14 @@ class RagPipeline:
                 hit,
                 started,
                 top_rerank_score=hit.top_rerank_score,
+                # In the cache key: the bar it was answered under is today's.
+                rerank_min_score=float(self._settings.rerank_min_score),
                 weak_matches=hit.weak_matches,
             ),
             run=lambda: self._answer_stream_uncached(
                 question, overrides, filenames, history, tags, should_stop
             ),
+            on_hit=lambda hit: self._log_hit(hit, question, "stream", filenames, tags, overrides),
         )
 
     def _store_error_trace(self, run: AnswerRun, error: str) -> None:
@@ -1564,6 +1705,14 @@ class RagPipeline:
                 condensed_question=run.condensed_question,
                 condense_note=run.condense_note,
                 history_message_count=len(run.history),
+                phase=run.phase,
+                fitted=run.fitted,
+                # Begun with the run's settings (``begin_usage`` comes first).
+                usage=(
+                    usage_totals()
+                    if run.settings is not None and run.thread == threading.get_ident()
+                    else None
+                ),
             )
         )
 
@@ -1733,6 +1882,28 @@ class RagPipeline:
             cost_usd=cost_usd,
         )
 
+    def _log_hit(
+        self,
+        hit: CachedAnswer,
+        question: str,
+        mode: TraceMode,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        overrides: AnswerOverrides | None,
+    ) -> None:
+        log_served(
+            self._trace_store,
+            served_query(
+                hit,
+                question=question,
+                mode=mode,
+                workspace=workspace_of(self._settings),
+                filenames=filenames,
+                tags=tags,
+                narrowing=narrowing_record((overrides or AnswerOverrides()).narrow),
+            ),
+        )
+
     def _start_run(
         self,
         question: str,
@@ -1765,6 +1936,7 @@ class RagPipeline:
             settings,
             weak_matches=phase.below_min_score,
         )
+        run.phase, run.fitted = phase, fitted
         return prompt_question, fitted
 
     def _answer_stream_uncached(
@@ -1909,6 +2081,7 @@ class RagPipeline:
             "trace_id": run.trace_id,
             "answer_status": "no_context",
             "top_rerank_score": _top_rerank_score(phase),
+            "rerank_min_score": float(settings.rerank_min_score),
             "passages_left_out": _picked_left_out(run.narrow, []),
             "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
         }
@@ -2050,6 +2223,7 @@ class RagPipeline:
             "trace_id": run.trace_id,
             "answer_status": status,
             "top_rerank_score": _top_rerank_score(phase),
+            "rerank_min_score": float(settings.rerank_min_score),
             "weak_matches": phase.below_min_score,
             "truncated": truncated,
             "citation_backfilled": outcome.backfilled,

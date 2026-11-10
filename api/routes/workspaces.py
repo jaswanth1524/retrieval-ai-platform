@@ -45,6 +45,7 @@ from api.schemas import (
     WorkspaceSettingsResponse,
 )
 from api.settings import AppSettings
+from api.sitemap import importing_into
 from api.tracing import TraceStore
 from api.watch import watched_workspaces
 from api.workspace_settings import WORKSPACE_SETTING_FIELDS, WorkspaceSettingsStore
@@ -298,6 +299,12 @@ def register(app: FastAPI) -> None:
                 "is indexed; change that setting before deleting it.",
             )
         target = settings_for(settings, name)
+        if importing_into(target.qdrant_collection):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Workspace '{name}' has a sitemap import still adding pages; try "
+                "again when it finishes.",
+            )
         # Not while anything for it is queued or running: a job would recreate the
         # collection on its first write (the repository recreates a missing one), or
         # fail, after the workspace was reported deleted. Keys are workspace-qualified

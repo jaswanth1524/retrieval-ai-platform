@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 
-from api.parsers.common import DocumentParseError, DocumentSection, EmptyDocumentError
+from api.parsers.common import (
+    DocumentParseError,
+    DocumentSection,
+    EmptyDocumentError,
+    note_parse_warning,
+)
 from api.parsers.text import parse_markdown_document
 
 # A cell longer than this is cut (a pasted data dump in a markdown cell).
@@ -34,11 +40,19 @@ def parse_ipynb_document(filename: str, text: str) -> list[DocumentSection]:
         body = "".join(source) if isinstance(source, list) else source
         if not isinstance(body, str) or not body.strip():
             continue
-        body = body[:MAX_CELL_CHARS]
+        if len(body) > MAX_CELL_CHARS:
+            note_parse_warning(
+                f"A cell longer than {MAX_CELL_CHARS} characters was cut at that length."
+            )
+            body = body[:MAX_CELL_CHARS]
         if cell.get("cell_type") == "markdown":
             blocks.append(body.strip())
         elif cell.get("cell_type") == "code":
-            blocks.append(f"```{language}\n{body.rstrip()}\n```")
+            # Longer than any backtick run in the cell (CommonMark): a line of ``` in
+            # the code mustn't close the block and turn its comments into headings.
+            longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+            fence = "`" * max(3, longest + 1)
+            blocks.append(f"{fence}{language}\n{body.rstrip()}\n{fence}")
     if not blocks:
         raise EmptyDocumentError(f"Notebook '{filename}' has no cells with text.")
     return parse_markdown_document(filename, "\n\n".join(blocks))

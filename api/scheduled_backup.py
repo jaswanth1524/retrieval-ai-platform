@@ -86,6 +86,8 @@ def load_check(backup: Path) -> BackupCheck | None:
             versions=int(fields["versions"]),
             feedback=bool(fields["feedback"]),
             problems=[str(problem) for problem in fields["problems"]],
+            would_restore=int(fields.get("would_restore", 0)),
+            rejected=[str(item) for item in fields.get("rejected", [])],
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -265,7 +267,7 @@ class ScheduledBackup(BackgroundLoop):
         # Read back as a restore would: a backup that can't be is a failure now, not
         # when it is needed.
         with final.open("rb") as written:
-            check = verify_backup(written)
+            check = verify_backup(written, int(target.settings.max_upload_bytes))
         self.record_check(final, check)
         if not check.ok:
             logger.warning("The backup %s did not check out: %s", final, "; ".join(check.problems))

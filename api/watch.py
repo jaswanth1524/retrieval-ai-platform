@@ -118,17 +118,30 @@ class WatchStatus:
 
 @dataclass(frozen=True)
 class WatchFolder:
-    """One watched folder and the workspace it indexes into ("" = the default)."""
+    """One watched folder and the workspace it indexes into ("" = the default), with
+    its own WATCH_INCLUDE / WATCH_EXCLUDE patterns (None: the global ones)."""
 
     path: str
     workspace: str
+    include: str | None = None
+    exclude: str | None = None
+
+    def settings_update(self) -> dict[str, str]:
+        """What this folder's watcher runs with, over the server's settings."""
+
+        update = {"watch_dir": self.path, "watch_workspace": self.workspace}
+        if self.include is not None:
+            update["watch_include"] = self.include
+        if self.exclude is not None:
+            update["watch_exclude"] = self.exclude
+        return update
 
 
 def watch_folders(settings: AppSettings) -> list[WatchFolder]:
     """WATCH_DIR (into WATCH_WORKSPACE) and every WATCH_DIRS entry, in that order.
     ``RuntimeError`` (startup stops, naming the setting) for an entry without a path,
-    the same folder twice, or a folder inside another — two watchers would index (and
-    delete) the same files."""
+    the same folder twice, a folder inside another, or two folders into one workspace
+    — two watchers would index (and delete) the same files or names."""
 
     folders: list[WatchFolder] = []
     if settings.watch_dir:
@@ -136,10 +149,29 @@ def watch_folders(settings: AppSettings) -> list[WatchFolder]:
     for entry in settings.watch_dirs.split(";"):
         if not entry.strip():
             continue
-        path, _, workspace = entry.partition("=>")
+        # "path=>workspace|include=*.pdf,*.md|exclude=drafts/*": options after a "|".
+        target, *options = entry.split("|")
+        path, _, workspace = target.partition("=>")
         if not path.strip():
             raise RuntimeError(f"WATCH_DIRS: an entry has no folder ({entry.strip()!r}).")
-        folders.append(WatchFolder(path.strip(), workspace.strip()))
+        patterns: dict[str, str] = {}
+        for option in options:
+            name, equals, value = option.partition("=")
+            name = name.strip().lower()
+            if not equals or name not in ("include", "exclude"):
+                raise RuntimeError(
+                    f"WATCH_DIRS: {option.strip()!r} is not include=… or exclude=… "
+                    f"(in {entry.strip()!r})."
+                )
+            patterns[name] = value.strip()
+        folders.append(
+            WatchFolder(
+                path.strip(),
+                workspace.strip(),
+                include=patterns.get("include"),
+                exclude=patterns.get("exclude"),
+            )
+        )
     resolved = [Path(folder.path).resolve() for folder in folders]
     for index, first in enumerate(resolved):
         for second in resolved[index + 1 :]:
@@ -148,6 +180,17 @@ def watch_folders(settings: AppSettings) -> list[WatchFolder]:
                     f"WATCH_DIRS: {first} and {second} overlap; each folder can be "
                     "watched once, and not inside another watched one."
                 )
+    # Two folders into one workspace: a file name in both would be indexed from each in
+    # turn forever, and deleting it from one folder would delete the other's document.
+    by_workspace: dict[str, Path] = {}
+    for folder, where in zip(folders, resolved, strict=True):
+        other = by_workspace.setdefault(folder.workspace, where)
+        if other != where:
+            raise RuntimeError(
+                f"WATCH_DIRS: {other} and {where} both feed the "
+                f"{folder.workspace or 'default'} workspace; give each folder its own "
+                "workspace (path=>workspace), or watch one folder holding both."
+            )
     return folders
 
 

@@ -379,7 +379,16 @@ def _with_declared_charset(body: bytes, content_type: str) -> bytes:
         text = body.decode(match.group(1))
     except (LookupError, UnicodeDecodeError):
         return body
+    # An XML declaration naming the old encoding would make an XML parser (a sitemap, a
+    # feed) misread the UTF-8 bytes: it now names what they are.
+    text = _XML_DECLARED_ENCODING_RE.sub(r"\1UTF-8\2", text, count=1)
     return codecs.BOM_UTF8 + text.encode("utf-8")
+
+
+# encoding="..." in a leading <?xml ...?> declaration (quotes kept).
+_XML_DECLARED_ENCODING_RE = re.compile(
+    r"""(\A\s*<\?xml[^>]*?\bencoding\s*=\s*["'])[^"']*(["'])""", re.IGNORECASE
+)
 
 
 def loggable_url(url: str) -> str:

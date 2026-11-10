@@ -236,6 +236,9 @@ class DocumentIngestResponse(BaseModel):
     # Another indexed document in this workspace with exactly these bytes. Information
     # only: both are kept (and both are searched).
     duplicate_of: str | None = None
+    # What indexing left out or couldn't read: a cap reached (MAX_OCR_PAGES, a
+    # mailbox's message limit), a page OCR failed on. Empty when the whole was read.
+    warnings: list[str] = []
 
 
 class DocumentJobAcceptedResponse(BaseModel):
@@ -589,6 +592,10 @@ class ScoreReportResponse(BaseModel):
     note: str
     # Traced questions whose best score lies between the current and the suggested bar.
     would_change: int = 0
+    # Traced questions left out: scored by another reranker, about picked passages, or
+    # summaries (left_out); outside the asked-for since/bar (filtered_out).
+    left_out: int = 0
+    filtered_out: int = 0
 
 
 class TraceSettingChangeResponse(BaseModel):
@@ -626,12 +633,52 @@ class TraceDiffResponse(BaseModel):
 
 class TraceRerunRequest(BaseModel):
     """POST /traces/{id}/rerun: ranking settings to try (each optional; unset ones are
-    the server's)."""
+    those the question was asked with, or the server's where the trace has none)."""
 
     rerank_min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     rerank_top_k: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
     rerank_relative_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     recency_boost_weight: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class TraceWhatIfRequest(BaseModel):
+    """POST /traces/what-if: ranking settings to try on the latest traced questions
+    (each optional; unset ones are those each question was asked with)."""
+
+    rerank_min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    rerank_relative_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+    rerank_fallback_count: int | None = Field(default=None, ge=0, le=20)
+    # The latest this many traced questions (summaries and picked passages left out).
+    limit: int = Field(default=20, ge=1, le=100)
+    # Only those that went unanswered (insufficient_context, no_context).
+    only_unanswered: bool = True
+
+
+class TraceWhatIfItemResponse(BaseModel):
+    trace_id: str
+    question: str
+    # Answered from the documents when it was asked; would be under the settings tried.
+    answered_before: bool
+    would_answer: bool
+    # Only from the closest passages (the weak-match fallback).
+    weak_matches: bool = False
+    top_score: float | None = None
+    error: str | None = None
+
+
+class TraceWhatIfResponse(BaseModel):
+    """The latest traced questions searched again under other ranking settings
+    (retrieval only, nothing stored): how many would be answered from the documents."""
+
+    settings: dict[str, float | int]
+    checked: int
+    would_answer: int
+    # Unanswered then, answered now; answered then, not now.
+    newly_answered: int
+    newly_unanswered: int
+    items: list[TraceWhatIfItemResponse]
+    # RECHECK_TIME_BUDGET_SECONDS ran out before every question was searched.
+    stopped_early: bool = False
 
 
 class TraceRerunResponse(BaseModel):
@@ -685,6 +732,10 @@ class QueryLogEntryResponse(BaseModel):
     trace_id: str | None = None
     # The documents the answer was drawn from (empty for rows logged before this).
     filenames: list[str] = []
+    # "question" or "summary".
+    kind: str = "question"
+    # Served from the answer cache (or by joining the same question in flight).
+    cached: bool = False
 
 
 class QueryLogResponse(BaseModel):
@@ -862,6 +913,9 @@ class QuestionResponse(BaseModel):
     )
     # Best cross-encoder score (0-1) among the candidates, whether or not it was kept.
     top_rerank_score: float | None = None
+    # The relevance bar the answer was given under (RERANK_MIN_SCORE or the
+    # workspace's), to compare top_rerank_score with.
+    rerank_min_score: float | None = None
     # No passage cleared RERANK_MIN_SCORE: the answer comes from the closest ones
     # (RERANK_FALLBACK_COUNT), which the model was told match the question only weakly.
     weak_matches: bool = False
@@ -917,6 +971,10 @@ class WorkspaceSettingsRequest(BaseModel):
     recency_boost_weight: float | None = Field(default=None, ge=0.0, le=1.0)
     answer_language: str | None = Field(default=None, max_length=40)
     answer_format: AnswerFormat | None = None
+    rerank_fallback_count: int | None = Field(default=None, ge=0, le=20)
+    rerank_relative_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_context_chunks: int | None = Field(default=None, ge=1, le=REQUEST_RERANK_TOP_K_MAX)
+    followups_enabled: bool | None = None
 
     @field_validator("answer_language")
     @classmethod
@@ -976,6 +1034,33 @@ class SitemapIngestResponse(BaseModel):
     left_out: int
     # Sitemaps of a sitemap index that were read for pages.
     child_sitemaps: int
+    # Follow it at GET /documents/sitemap-imports/{import_id}; cancel with DELETE.
+    import_id: str | None = None
+
+
+class SitemapImportResponse(BaseModel):
+    """A sitemap import as it goes (GET /documents/sitemap-imports/{id})."""
+
+    id: str
+    url: str
+    # running, cancelling, done, cancelled
+    state: str
+    total: int
+    done: int
+    queued: int
+    failed: int
+    skipped: int
+    # Already indexed and unchanged since (the listing's date, or the server said so).
+    unchanged: int
+    cancelled_pages: int
+    started_at: float
+    finished_at: float | None = None
+    # The first problems met, each "url: why".
+    problems: list[str] = []
+
+
+class SitemapImportListResponse(BaseModel):
+    imports: list[SitemapImportResponse]
 
 
 class PreviewChunkResponse(BaseModel):
@@ -1176,6 +1261,12 @@ class BackupRunResponse(BaseModel):
     workspace: str
 
 
+class BackupDeleteResponse(BaseModel):
+    """DELETE /backups/{name}: the stored backup that was deleted."""
+
+    name: str
+
+
 class BackupCheckResponse(BaseModel):
     """POST /backups/verify, /backups/{name}/verify: a backup read through without
     restoring anything."""
@@ -1187,6 +1278,28 @@ class BackupCheckResponse(BaseModel):
     versions: int
     feedback: bool
     problems: list[str]
+    # By restore's own rules: documents it would queue, and those it would refuse
+    # ("name: why"). Reported only: ok is about damage.
+    would_restore: int = 0
+    rejected: list[str] = []
+
+
+class ConsistencyRepairRequest(BaseModel):
+    """POST /admin/consistency/repair: which of the report's findings to put right
+    (each off unless asked for)."""
+
+    delete_orphan_originals: bool = False
+    delete_orphan_versions: bool = False
+    reindex_incomplete: bool = False
+
+
+class ConsistencyRepairResponse(BaseModel):
+    originals_deleted: list[str]
+    versions_deleted: list[str]
+    reindex_jobs: list[DocumentJobAcceptedResponse]
+    # Not touched: indexed again meanwhile, in flight, couldn't be removed, or couldn't
+    # be queued for a re-index now (a full queue: try again).
+    left: list[str]
 
 
 class ConsistencyResponse(BaseModel):

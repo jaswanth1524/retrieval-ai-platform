@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import threading
 import time
@@ -20,9 +21,9 @@ from api.dependencies import (
     require_api_key,
     require_full_key,
 )
-from api.pipeline import RagPipeline, RetrievalPhase
+from api.pipeline import RagPipeline, RetrievalPhase, filter_from_record
 from api.query_log import LoggedQuery
-from api.relevance import TraceDiff, score_report, trace_diff
+from api.relevance import UNANSWERED_STATUSES, TraceDiff, score_report, trace_diff
 from api.reranking import RerankedChunk
 from api.routes.deps import (
     QueryLogDep,
@@ -51,10 +52,13 @@ from api.schemas import (
     TraceRerunRequest,
     TraceRerunResponse,
     TraceSettingChangeResponse,
+    TraceWhatIfItemResponse,
+    TraceWhatIfRequest,
+    TraceWhatIfResponse,
 )
 from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
-from api.tracing import QueryTrace, TraceNotFoundError, TraceStore
+from api.tracing import QueryTrace, TraceNotFoundError, TraceStore, TraceSummary
 from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
@@ -83,9 +87,11 @@ def _recheck_rows(
     rows: Sequence[LoggedQuery], pipeline: RagPipeline, budget_seconds: float
 ) -> tuple[list[QueryRecheckItemResponse], bool]:
     """Search each unanswered question again (what was searched for it: a follow-up's
-    rewrite). Summaries are left out: their "question" is a task line. Each question
-    is on its own (an error is that item's), and the whole stops after
-    ``budget_seconds`` (0 = no limit): a proxy times a long request out."""
+    rewrite), over what it was asked over (its documents, tags and narrowing, when the
+    log has them; the whole workspace for an older row). Summaries are left out: their
+    "question" is a task line. Each question is on its own (an error is that item's),
+    and the whole stops after ``budget_seconds`` (0 = no limit): a proxy times a long
+    request out."""
 
     deadline = time.monotonic() + budget_seconds if budget_seconds > 0 else None
     items: list[QueryRecheckItemResponse] = []
@@ -94,15 +100,23 @@ def _recheck_rows(
         if row.kind == "summary":
             continue
         query = row.retrieval_query or row.question
-        # Asked several times: searched once.
-        folded = " ".join(query.split()).casefold()
+        # Asked several times (over the same scope): searched once.
+        folded = " ".join(query.split()).casefold() + json.dumps(row.scope, sort_keys=True)
         if folded in seen or not query.strip():
             continue
         if deadline is not None and time.monotonic() >= deadline:
             return items, True
         seen.add(folded)
+        scope = row.scope or {}
         try:
-            phase = pipeline.retrieve(query, for_generation=False)
+            narrowing = scope.get("narrowing")
+            phase = pipeline.retrieve(
+                query,
+                filenames=scope.get("filenames") or None,
+                tags=scope.get("tags") or None,
+                for_generation=False,
+                narrow=filter_from_record(narrowing) if isinstance(narrowing, dict) else None,
+            )
         except Exception as exc:  # noqa: BLE001 - one question's failure is its own
             logger.warning("Re-checking %r failed: %s", query[:80], exc)
             items.append(
@@ -140,6 +154,57 @@ def _covered_now(row: LoggedQuery, phase: RetrievalPhase, top: RerankedChunk | N
     if top.rerank_score > row.top_score + RECHECK_SCORE_GAIN:
         return True
     return row.top_filename is not None and top.filename != row.top_filename
+
+
+def _what_if_rows(
+    summaries: Sequence[TraceSummary],
+    trace_store: TraceStore,
+    pipeline: RagPipeline,
+    update: dict[str, float | int],
+    budget_seconds: float,
+) -> tuple[list[TraceWhatIfItemResponse], bool]:
+    """Each traced question's retrieval run again under ``update`` (as
+    ``rerun_retrieval`` does: its rewrite, scope and narrowing); each on its own, and
+    the whole stops after ``budget_seconds`` (0 = no limit)."""
+
+    deadline = time.monotonic() + budget_seconds if budget_seconds > 0 else None
+    items: list[TraceWhatIfItemResponse] = []
+    for summary in summaries:
+        if deadline is not None and time.monotonic() >= deadline:
+            return items, True
+        trace = trace_store.get(summary.trace_id)
+        if trace is None or trace.config is None:
+            continue
+        answered_before = summary.answer_status not in UNANSWERED_STATUSES
+        try:
+            phase, _ = pipeline.rerun_retrieval(trace, update)
+        except Exception as exc:  # noqa: BLE001 - one question's failure is its own
+            logger.warning("What-if for trace %s failed: %s", summary.trace_id, exc)
+            items.append(
+                TraceWhatIfItemResponse(
+                    trace_id=summary.trace_id,
+                    question=summary.question,
+                    answered_before=answered_before,
+                    would_answer=False,
+                    error="The search failed; see the server log.",
+                )
+            )
+            continue
+        top = phase.scored_chunks[0] if phase.scored_chunks else None
+        items.append(
+            TraceWhatIfItemResponse(
+                trace_id=summary.trace_id,
+                question=summary.question,
+                answered_before=answered_before,
+                # Passages cleared the bar (as POST /traces/{id}/rerun says it): the
+                # weak-match fallback's closest passages don't count — a model told
+                # they match weakly mostly declines.
+                would_answer=bool(phase.context_chunks) and not phase.below_min_score,
+                weak_matches=phase.below_min_score,
+                top_score=top.rerank_score if top is not None else None,
+            )
+        )
+    return items, False
 
 
 def _diff_response(diff: TraceDiff) -> TraceDiffResponse:
@@ -185,6 +250,8 @@ def register(app: FastAPI) -> None:
                     mode=row.mode,
                     trace_id=row.trace_id,
                     filenames=list(row.filenames),
+                    kind=row.kind,
+                    cached=row.cached,
                 )
                 for row in rows
             ]
@@ -241,7 +308,15 @@ def register(app: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
     def trace_score_report(
-        trace_store: TraceStoreDep, settings: SettingsDep
+        trace_store: TraceStoreDep,
+        settings: SettingsDep,
+        since: Annotated[
+            float | None, Query(ge=0, description="Only traces asked since (epoch seconds).")
+        ] = None,
+        bar: Annotated[
+            float | None,
+            Query(ge=0, le=1, description="Only traces answered under this RERANK_MIN_SCORE."),
+        ] = None,
     ) -> ScoreReportResponse:
         # Every archived trace, not the list's newest hundred: 20 a side is the floor
         # for a suggestion, and a thin sample makes a noisy one.
@@ -251,6 +326,8 @@ def register(app: FastAPI) -> None:
             ),
             float(settings.rerank_min_score),
             reranker_model=settings.reranker_model,
+            since=since,
+            bar=bar,
         )
         return ScoreReportResponse(**dataclasses.asdict(report))
 
@@ -393,6 +470,64 @@ def register(app: FastAPI) -> None:
                 TraceCandidateResponse.model_validate(dataclasses.asdict(candidate))
                 for candidate in rerun.candidates
             ],
+        )
+
+    # The latest traced questions searched again under a proposed bar (or floor, or
+    # fallback): how many would be answered — what changing the setting would do, before
+    # it is changed. Retrieval only; one question slot for the whole run, the read key
+    # as a single re-run.
+    @app.post(
+        "/traces/what-if",
+        response_model=TraceWhatIfResponse,
+        dependencies=[Depends(require_api_key)],
+        responses={
+            409: {"description": "A re-check is already running."},
+            429: {"description": "Every question slot is busy."},
+        },
+    )
+    def what_if(
+        request: TraceWhatIfRequest,
+        trace_store: TraceStoreDep,
+        settings: SettingsDep,
+        pipeline: RagPipelineDep,
+        slots: QuestionSlotsDep,
+    ) -> TraceWhatIfResponse:
+        update = request.model_dump(exclude_none=True, exclude={"limit", "only_unanswered"})
+        statuses = UNANSWERED_STATUSES if request.only_unanswered else None
+        summaries = [
+            summary
+            for summary in trace_store.list_summaries(
+                workspace_of(settings), statuses, limit=int(settings.trace_store_max_rows)
+            )
+            if summary.kind == "question" and summary.gated and summary.answer_status
+        ][: request.limit]
+        if not _recheck_running.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="A re-check is already running.")
+        try:
+            release = question_slot(slots, count_metric=False)
+            try:
+                items, stopped_early = _what_if_rows(
+                    summaries,
+                    trace_store,
+                    pipeline,
+                    update,
+                    float(settings.recheck_time_budget_seconds),
+                )
+            finally:
+                release()
+        finally:
+            _recheck_running.release()
+        counted = [item for item in items if item.error is None]
+        gained = [item for item in counted if item.would_answer and not item.answered_before]
+        lost = [item for item in counted if item.answered_before and not item.would_answer]
+        return TraceWhatIfResponse(
+            settings=update,
+            checked=len(counted),
+            would_answer=sum(item.would_answer for item in counted),
+            newly_answered=len(gained),
+            newly_unanswered=len(lost),
+            items=items,
+            stopped_early=stopped_early,
         )
 
     # Why two runs of a question went differently: the settings that differ, and the

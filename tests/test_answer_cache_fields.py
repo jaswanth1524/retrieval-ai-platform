@@ -97,3 +97,55 @@ def test_every_answer_override_changes_the_cache_key() -> None:
     for name, value in changed.items():
         key = pipeline._cache_key("q", AnswerOverrides(**{name: value}), None, None, None)  # noqa: SLF001
         assert key is not None and key != plain, name
+
+
+# A value for each setting a workspace can change, other than the default.
+WORKSPACE_VALUES: dict[str, Any] = {
+    "rerank_min_score": 0.4,
+    "recency_boost_weight": 0.3,
+    "answer_language": "German",
+    "answer_format": "table",
+    "rerank_fallback_count": 0,
+    "rerank_relative_floor": 0.3,
+    "max_context_chunks": 1,
+    "followups_enabled": True,
+}
+
+
+def test_every_workspace_setting_changes_the_cache_keys() -> None:
+    from api.answer_cache import answer_cache_key
+    from api.summarize import SummaryRequest, summary_cache_key
+    from api.workspace_settings import WORKSPACE_SETTING_FIELDS
+
+    settings = make_test_settings()
+    assert set(WORKSPACE_SETTING_FIELDS) <= set(WORKSPACE_VALUES)
+    plain = answer_cache_key("q", settings, ["a.txt"])
+    request = SummaryRequest(mode="summarize", filenames=("a.txt",))
+    plain_summary = summary_cache_key(request, settings)
+    for name in WORKSPACE_SETTING_FIELDS:
+        changed = settings.model_copy(update={name: WORKSPACE_VALUES[name]})
+        assert answer_cache_key("q", changed, ["a.txt"]) != plain, name
+        if name in ("answer_language", "answer_format"):
+            assert summary_cache_key(request, changed) != plain_summary, name
+
+
+def test_cache_entries_are_listed_and_dropped_by_their_own_collection() -> None:
+    from api.answer_cache import AnswerCache, answer_cache_key, key_collection, key_label
+    from api.summarize import SummaryRequest, summary_cache_key
+
+    settings = make_test_settings(qdrant_collection="docs")
+    other = settings.model_copy(update={"qdrant_collection": "legal"})
+    # A question whose text is another workspace's collection name.
+    question = answer_cache_key("docs", other, None)
+    summary = summary_cache_key(
+        SummaryRequest(mode="compare", filenames=("a.pdf", "b.pdf"), instruction="costs"),
+        settings,
+    )
+    assert key_collection(question) == "legal" and key_collection(summary) == "docs"
+    assert key_label(summary) == "compare: a.pdf, b.pdf — costs"
+    cache = AnswerCache(max_entries=8, ttl_seconds=60)
+    for key in (question, summary):
+        cache.put(key, CachedAnswer(**{**NOT_DEFAULT, "followups": ()}))
+    assert [label for label, _ in cache.entries_for("docs")] == ["compare: a.pdf, b.pdf — costs"]
+    assert cache.drop_collection("docs") == 1
+    assert [label for label, _ in cache.entries_for("legal")] == ["docs"]

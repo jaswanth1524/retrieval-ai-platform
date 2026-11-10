@@ -71,6 +71,8 @@ class IngestJob:
     kind: str = "upload"
     source_url: str | None = None
     tags: tuple[str, ...] | None = None
+    # A URL job's refresh interval as asked (None: the server's), kept for its retry.
+    refresh_minutes: int | None = None
 
 
 JOB_KINDS = ("upload", "url", "reindex", "restore", "import", "watch")
@@ -147,6 +149,7 @@ class JobStore(Protocol):
         kind: str = "upload",
         source_url: str | None = None,
         tags: tuple[str, ...] | None = None,
+        refresh_minutes: int | None = None,
     ) -> IngestJob: ...
 
     def get(self, job_id: str) -> IngestJob | None: ...
@@ -181,6 +184,7 @@ class IngestJobStore:
         kind: str = "upload",
         source_url: str | None = None,
         tags: tuple[str, ...] | None = None,
+        refresh_minutes: int | None = None,
     ) -> IngestJob:
         job = IngestJob(
             id=str(uuid.uuid4()),
@@ -189,6 +193,7 @@ class IngestJobStore:
             kind=kind,
             source_url=source_url,
             tags=tags,
+            refresh_minutes=refresh_minutes,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -288,7 +293,7 @@ class IngestJobStore:
 
 _JOB_COLUMNS = (
     "id, filename, state, chunks_total, chunks_done, error, result_json, created_at_wall, "
-    "workspace, error_type, kind, source_url, tags_json"
+    "workspace, error_type, kind, source_url, tags_json, refresh_minutes"
 )
 
 
@@ -307,6 +312,7 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         kind,
         source_url,
         tags_json,
+        refresh_minutes,
     ) = row
     tags = json.loads(tags_json) if tags_json else None
     return IngestJob(
@@ -323,6 +329,7 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
         kind=str(kind or "upload"),
         source_url=None if source_url is None else str(source_url),
         tags=tuple(str(tag) for tag in tags) if isinstance(tags, list) else None,
+        refresh_minutes=None if refresh_minutes is None else int(refresh_minutes),
     )
 
 
@@ -373,6 +380,8 @@ class SqliteIngestJobStore:
                 conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
             if "tags_json" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN tags_json TEXT")
+            if "refresh_minutes" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN refresh_minutes INTEGER")
             # Only this process runs jobs (one uvicorn worker), so anything still
             # non-terminal at startup belonged to a process that died mid-ingest. Left
             # as-is, a client polling it would wait forever.
@@ -403,6 +412,7 @@ class SqliteIngestJobStore:
         kind: str = "upload",
         source_url: str | None = None,
         tags: tuple[str, ...] | None = None,
+        refresh_minutes: int | None = None,
     ) -> IngestJob:
         job = IngestJob(
             id=str(uuid.uuid4()),
@@ -411,12 +421,13 @@ class SqliteIngestJobStore:
             kind=kind,
             source_url=source_url,
             tags=tags,
+            refresh_minutes=refresh_minutes,
         )
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, filename, state, chunks_total, chunks_done, "
-                "error, result_json, created_at_wall, workspace, kind, source_url, tags_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "error, result_json, created_at_wall, workspace, kind, source_url, tags_json, "
+                "refresh_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job.id,
                     job.filename,
@@ -430,6 +441,7 @@ class SqliteIngestJobStore:
                     job.kind,
                     job.source_url,
                     json.dumps(list(tags)) if tags is not None else None,
+                    refresh_minutes,
                 ),
             )
             self._prune_finished_locked(conn)

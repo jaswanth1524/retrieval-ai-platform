@@ -24,7 +24,7 @@ from multiprocessing.connection import Connection
 from typing import Any
 
 from api.documents import DocumentError, DocumentParseError, parse_document_bytes
-from api.parsers.common import DocumentSection
+from api.parsers.common import DocumentSection, collect_parse_warnings
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,12 @@ class ParseInterruptedError(DocumentParseError):
     failure (error type ``parse_timeout``), retried, not given up on."""
 
 
+class ParseMemoryError(ParseInterruptedError):
+    """The parse needed more memory than PARSE_MEMORY_LIMIT_MB allows: a limit the
+    operator can raise, not proof the file is bad — so transient too (error type
+    ``parse_memory``), retried once the limit is raised, not given up on."""
+
+
 def _limit_memory(settings: AppSettings) -> None:
     """PARSE_MEMORY_LIMIT_MB in the parse child (Linux): an address-space cap, so a
     parser blowing up fails with MemoryError in the child instead of the container's
@@ -113,9 +119,19 @@ def _limit_memory(settings: AppSettings) -> None:
     resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
 
 
-def _parse(filename: str, content: bytes, settings: AppSettings) -> list[DocumentSection]:
-    with summarized_parser_warnings(filename):
-        return parse_document_bytes(filename, content, settings)
+class ParsedSections(list[DocumentSection]):
+    """A parse's sections, with what it left out or couldn't read (``warnings``: a cap
+    reached, a page OCR failed on), for the job result."""
+
+    def __init__(self, sections: list[DocumentSection], warnings: list[str] | None = None):
+        super().__init__(sections)
+        self.warnings = list(warnings or [])
+
+
+def _parse(filename: str, content: bytes, settings: AppSettings) -> ParsedSections:
+    with summarized_parser_warnings(filename), collect_parse_warnings() as warnings:
+        sections = parse_document_bytes(filename, content, settings)
+    return ParsedSections(sections, warnings)
 
 
 def _parse_in_child(
@@ -134,7 +150,9 @@ def _parse_in_child(
     except Exception:  # noqa: BLE001 - parse without the cap rather than not at all
         pass
     try:
-        result: tuple[str, object] = ("ok", _parse(filename, content, settings))
+        parsed = _parse(filename, content, settings)
+        # Plain values across the pipe: the sections and the warnings.
+        result: tuple[str, object] = ("ok", (list(parsed), parsed.warnings))
     except DocumentError as exc:
         result = ("document_error", exc)
     except MemoryError:
@@ -155,7 +173,7 @@ def parse_with_limit(
     settings: AppSettings,
     *,
     _target: Callable[[Connection, str, bytes, AppSettings], None] = _parse_in_child,
-) -> list[DocumentSection]:
+) -> ParsedSections:
     """``parse_document_bytes`` in a child process that is killed after
     ``settings.parse_timeout_seconds``; in this process when that is 0.
 
@@ -202,12 +220,15 @@ def parse_with_limit(
         if process.is_alive():
             process.kill()
         process.join(timeout=5)
-    if status == "ok" and isinstance(payload, list):
-        return payload
+    if status == "ok" and isinstance(payload, tuple) and len(payload) == 2:
+        sections, warnings = payload
+        return ParsedSections(list(sections), [str(warning) for warning in warnings])
+    if status == "ok" and isinstance(payload, list):  # a child that sends sections only
+        return ParsedSections(payload)
     if status == "document_error" and isinstance(payload, DocumentError):
         raise payload
     if status == "memory":
-        raise DocumentParseError(
+        raise ParseMemoryError(
             f"Reading '{filename}' needed more memory than PARSE_MEMORY_LIMIT_MB "
             f"({settings.parse_memory_limit_mb} MB) allows."
         )

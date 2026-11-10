@@ -14,7 +14,7 @@ from api.parsers.common import (
     check_zip_expanded_size,
     refuse_zip_xml_dtd,
 )
-from api.parsers.odt import _MAX_REPEATED_CELLS, _TABLE, _cell_text, _count
+from api.parsers.odt import _TABLE, _count, row_cells
 from api.parsers.xlsx import _sheet_sections
 from api.settings import AppSettings
 
@@ -52,16 +52,7 @@ def parse_ods_document(
         records: list[tuple[int, list[str]]] = []
         number = 0
         for row in table.iter(f"{_TABLE}table-row"):
-            values: list[str] = []
-            for cell in row:
-                if cell.tag not in (f"{_TABLE}table-cell", f"{_TABLE}covered-table-cell"):
-                    continue
-                text = _cell_text(cell) if cell.tag == f"{_TABLE}table-cell" else ""
-                repeat = _count(cell, f"{_TABLE}number-columns-repeated", _MAX_REPEATED_CELLS)
-                values.extend([text] * (repeat if text else 1))
-            # Trailing empty cells are padding, not columns.
-            while values and not values[-1].strip():
-                values.pop()
+            values = row_cells(row)
             filled = any(value.strip() for value in values)
             repeat = _count(row, f"{_TABLE}number-rows-repeated", 1 << 30)
             if not filled:

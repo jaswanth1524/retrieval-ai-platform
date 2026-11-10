@@ -72,6 +72,7 @@ from api.routes import workspaces as workspaces_routes
 from api.scheduled_backup import ScheduledBackup
 from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
+from api.sitemap import shutdown_imports
 from api.static_files import FrontendFiles
 from api.storage import check_writable_storage
 from api.url_fetch import fetch_document, fetch_slots
@@ -534,11 +535,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     backup = None
     try:
         watchers = [
-            start_folder_watcher(
-                settings.model_copy(
-                    update={"watch_dir": folder.path, "watch_workspace": folder.workspace}
-                )
-            )
+            start_folder_watcher(settings.model_copy(update=folder.settings_update()))
             for folder in watch_folders(settings)
         ]
         watcher = watchers[0] if watchers else None
@@ -570,6 +567,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             reindexer.stop()
         for each in watchers:
             each.stop()
+        shutdown_imports()
     shutdown_executors()
 
 
@@ -593,7 +591,7 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
-        allow_methods=["GET", "POST", "PATCH", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         # X-API-Key is not a CORS-simple header, so a cross-origin request carrying it
         # is preflighted — omitting it here made the middleware answer that preflight
         # with "Disallowed CORS headers" and every authenticated request failed before

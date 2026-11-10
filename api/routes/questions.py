@@ -311,6 +311,7 @@ def register(app: FastAPI) -> None:
             cached=grounded.cached,
             answer_status=grounded.answer_status,
             top_rerank_score=grounded.top_rerank_score,
+            rerank_min_score=float(settings.rerank_min_score),
             weak_matches=grounded.weak_matches,
             truncated=grounded.truncated,
             citation_backfilled=grounded.citation_backfilled,
@@ -382,7 +383,7 @@ def register(app: FastAPI) -> None:
     ) -> SummaryResponse:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
         task = summary_request(request)
-        summarizer.check_documents(task.filenames)
+        summarizer.check_documents(task.filenames, task.narrow)
         release = question_slot(slots, count_metric=False, kind="summary")
         try:
             result = summarizer.summarize(task, use_cache=request.use_cache)
@@ -393,6 +394,8 @@ def register(app: FastAPI) -> None:
             release()
         summaries_total.labels(mode=request.mode, outcome="ok").inc()
         count_answer(result.grounded.answer_status, result.grounded.truncated)
+        if result.grounded.cached:
+            answer_cache_hits_total.inc()
         grounded = result.grounded
         return SummaryResponse(
             answer=grounded.answer,
@@ -420,13 +423,15 @@ def register(app: FastAPI) -> None:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
         task = summary_request(request)
         # Before the 200: an unknown or oversized document is a plain 404 / 400.
-        summarizer.check_documents(task.filenames)
+        summarizer.check_documents(task.filenames, task.narrow)
         lease = StreamLease(question_slot(slots, count_metric=False, kind="summary"))
         stop = threading.Event()
 
         def on_done(event: DoneEvent) -> None:
             summaries_total.labels(mode=request.mode, outcome="ok").inc()
             count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
+            if event.get("cached"):
+                answer_cache_hits_total.inc()
 
         return sse_response(
             summarizer.summarize_stream(task, use_cache=request.use_cache, should_stop=stop.is_set),

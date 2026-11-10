@@ -927,6 +927,8 @@ def generate_followups(
         raw = generator.complete(messages, followup_settings)
     except GenerationError as exc:
         logger.warning("Follow-up suggestions failed: %s", exc)
+        # Best effort, but an answer without them isn't cached for the whole TTL.
+        note_degraded()
         return []
     # Filtered before the cap: a preamble line ("Here are some ideas:") must not use up
     # a question's place.
