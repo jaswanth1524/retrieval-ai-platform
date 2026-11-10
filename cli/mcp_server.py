@@ -13,7 +13,8 @@ Every tool goes through the REST API (``cli.client``), so the server's key, read
 key, rate limit and question slots apply; the read-only key is enough, since no tool
 changes the corpus — unless the server is started with ``--allow-writes`` (or
 ``DOCRAG_MCP_ALLOW_WRITES=1``), which adds ``add_url``, ``reindex``, ``retry_job`` and
-``job_status``: those need the full key, and let an agent add to the corpus.
+``job_status``: those need the full key, and let an agent add to the corpus (add_url
+replaces a document from another source only when asked to, with ``replace``).
 """
 
 from __future__ import annotations
@@ -49,9 +50,10 @@ _READ_TOTAL_CHARS = 24_000
 _READ_PASSAGE_CHARS = 4_000
 # None of the tools change the corpus; "open world" is false — they only read DocRAG.
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
-# The --allow-writes tools: they add to the corpus (never delete from it).
+# The --allow-writes tools: they add to the corpus and never delete a document, but a
+# re-index rewrites one's passages, and add_url can replace one (only with replace=true).
 _WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
-_FETCHES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
+_FETCHES = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
 INSTRUCTIONS = (
     "DocRAG answers questions from the user's own indexed documents, with citations. "
@@ -59,6 +61,22 @@ INSTRUCTIONS = (
     "cited answer, and summarize for a whole document (or two to compare). Quote the "
     "citations (filename, page, section) when you use an answer."
 )
+
+
+def _taken_by_another_source(client: DocragClient, url: str, filename: str | None) -> str | None:
+    """The name ``url`` would be stored under (``filename``, else its last path
+    segment), when a document with that name came from somewhere else; else None."""
+
+    from pathlib import PurePosixPath
+    from urllib.parse import unquote, urlsplit
+
+    name = (filename or "").strip() or PurePosixPath(unquote(urlsplit(url).path)).name
+    if not name:
+        return None
+    listing = client.documents()
+    if name not in listing.get("filenames", []):
+        return None
+    return None if listing.get("source_urls", {}).get(name) == url else name
 
 
 def _pages(item: dict[str, Any]) -> str:
@@ -454,11 +472,20 @@ def _add_write_tools(server: MCPServer, call: Call) -> None:
         filename: str | None = None,
         tags: list[str] | None = None,
         workspace: str | None = None,
+        replace: bool = False,
     ) -> str:
         """Have DocRAG fetch a web page or file and index it (URL_INGEST_ENABLED on the
-        server; the full key). filename names it; tags tag it."""
+        server; the full key). filename names it; tags tag it. A document already
+        indexed under that name from somewhere else is kept unless replace is true."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            if not replace:
+                taken = _taken_by_another_source(client, url, filename)
+                if taken is not None:
+                    return (
+                        f"'{taken}' is already indexed from another source; nothing was "
+                        "changed. Pass replace=true to replace it, or another filename."
+                    )
             return accepted(client.upload_url(url, filename, tags=tags or ()))
 
         result: str = await call(work, workspace)

@@ -37,6 +37,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import quote
 
 from cli.client import (
     FINISHED_JOB_STATES,
@@ -357,10 +358,22 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         if status.get("state") != "done":
             fail(path, _job_error(status))
             return
-        chunks = (status.get("result") or {}).get("chunks_ingested", status.get("chunks_done"))
-        indexed.append({"path": str(path), "filename": status.get("filename"), "chunks": chunks})
+        result = status.get("result") or {}
+        chunks = result.get("chunks_ingested", status.get("chunks_done"))
+        warnings = [str(warning) for warning in result.get("warnings") or []]
+        indexed.append(
+            {
+                "path": str(path),
+                "filename": status.get("filename"),
+                "chunks": chunks,
+                **({"warnings": warnings} if warnings else {}),
+            }
+        )
         if text:
             print(f"ok    {path} → {status.get('filename')} ({chunks} chunks)", file=text)
+            # What the server left out or couldn't read.
+            for warning in warnings:
+                print(f"      note: {warning}", file=text)
 
     statuses = client.index_files(
         uploads, timeout=_wait_limit(args), on_finished=finished, tags=args.tag or ()
@@ -370,7 +383,13 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             fail(path, _job_error(status))
     # A zip named on the command line: the server indexes each document in it.
     for archive in archives:
-        report = client.upload_archive(archive, tags=args.tag or ())
+        try:
+            report = client.upload_archive(archive, tags=args.tag or ())
+        except DocragError as exc:
+            # One zip refused (too large, not a zip): the others still go, and the
+            # summary still counts what was indexed.
+            fail(archive, str(exc))
+            continue
         for item in report.get("skipped", []):
             skip(Path(f"{archive}:{item.get('name')}"), str(item.get("reason")))
         for name in report.get("deferred", []):
@@ -412,6 +431,22 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
             max_pages=args.max_pages,
             same_host=not args.any_host,
         )
+        import_id = added.get("import_id")
+        if args.wait and import_id:
+            status = client.wait_for_sitemap_import(import_id, timeout=_wait_limit(args))
+            if args.json:
+                print(json.dumps(status), file=out)
+                return 0 if status.get("failed", 0) == 0 else 1
+            for problem in status.get("problems", []):
+                print(f"  {problem}", file=out)
+            print(
+                f"{status.get('queued', 0)} queued, {status.get('unchanged', 0)} unchanged, "
+                f"{status.get('failed', 0)} failed, {status.get('skipped', 0)} skipped "
+                f"of {status.get('total', 0)} page(s)"
+                f"{'' if status.get('finished_at') is not None else ' so far (still going)'}",
+                file=out,
+            )
+            return 0 if status.get("failed", 0) == 0 else 1
         if args.json:
             print(json.dumps(added), file=out)
             return 0
@@ -1096,10 +1131,8 @@ def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             if result.get("weak_matches")
             else ("would answer" if result.get("would_answer") else "nothing found")
         )
-        print(
-            f"{result.get('query')}\n  {verdict} with {overrides or 'the server settings'}",
-            file=out,
-        )
+        asked_with = overrides or "the settings it was asked with"
+        print(f"{result.get('query')}\n  {verdict} with {asked_with}", file=out)
         for change in result.get("diff", {}).get("candidates", []):
             print(
                 f"  {change['filename']} p.{change['page']}{_section_suffix(change)}: "
@@ -1108,6 +1141,37 @@ def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
                 f"{'  ' + str(change['drop_reason_b']) if change.get('drop_reason_b') else ''}",
                 file=out,
             )
+        return 0
+    if args.action == "what-if":
+        body: dict[str, Any] = {
+            name: value
+            for name, value in (
+                ("rerank_min_score", args.min_score),
+                ("rerank_relative_floor", args.relative_floor),
+                ("rerank_fallback_count", args.fallback),
+            )
+            if value is not None
+        }
+        body |= {"limit": args.last, "only_unanswered": not args.all}
+        report = client.trace_what_if(body)
+        if args.json:
+            print(json.dumps(report), file=out)
+            return 0
+        for item in report.get("items", []):
+            mark = (
+                "error"
+                if item.get("error")
+                else ("would answer" if item.get("would_answer") else "not answered")
+            )
+            score = item.get("top_score")
+            shown = f"{score:.3f}" if isinstance(score, (int, float)) else "-"
+            print(f"  {mark:<13} {shown}  {item.get('question')}", file=out)
+        print(
+            f"{report.get('would_answer')} of {report.get('checked')} would be answered "
+            f"({report.get('newly_answered')} newly, {report.get('newly_unanswered')} no "
+            f"longer){' — stopped early' if report.get('stopped_early') else ''}",
+            file=out,
+        )
         return 0
     if args.action == "export":
         if not args.target:
@@ -1240,6 +1304,11 @@ def _print_check(check: dict[str, Any], out: TextIO) -> None:
     )
     for problem in check.get("problems", []):
         print(f"  {problem}", file=out)
+    refused = check.get("rejected") or []
+    if refused:
+        print(f"  a restore would refuse {len(refused)}:", file=out)
+        for item in refused:
+            print(f"    {item}", file=out)
 
 
 def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -1288,6 +1357,18 @@ def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         else:
             _print_check(check, out)
         return 0 if check.get("ok") else 1
+    if args.action == "download":
+        destination = Path(args.output or args.target)
+        written = client.download(f"/backups/{quote(args.target, safe='')}", destination)
+        print(f"wrote {written} bytes to {destination}", file=sys.stderr)
+        return 0
+    if args.action == "delete":
+        deleted = client.delete_stored_backup(args.target)
+        if args.json:
+            print(json.dumps(deleted), file=out)
+        else:
+            print(f"deleted {deleted.get('name')}", file=out)
+        return 0
     report = client.restore_stored_backup(args.target)
     if args.json:
         print(json.dumps(report), file=out)
@@ -1302,8 +1383,24 @@ def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
 
 
 def cmd_check(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    """The consistency report; exits 1 when it found problems (nothing is changed)."""
+    """The consistency report; exits 1 when it found problems (nothing is changed),
+    or with ``--repair``, those remedies applied first."""
 
+    if args.repair:
+        remedies = {
+            "originals": "delete_orphan_originals",
+            "versions": "delete_orphan_versions",
+            "incomplete": "reindex_incomplete",
+        }
+        fixed = client.repair(**{remedies[name]: True for name in args.repair})
+        for name in fixed.get("originals_deleted", []):
+            print(f"deleted original: {name}", file=out)
+        for name in fixed.get("versions_deleted", []):
+            print(f"deleted earlier versions: {name}", file=out)
+        for job in fixed.get("reindex_jobs", []):
+            print(f"re-indexing: {job.get('filename')}", file=out)
+        for name in fixed.get("left", []):
+            print(f"left as it was: {name}", file=out)
     report = client.consistency()
     if args.json:
         print(json.dumps(report), file=out)
@@ -1466,6 +1563,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_url.add_argument("--max-pages", type=int, help="--sitemap: at most this many pages.")
     add_url.add_argument(
+        "--wait",
+        action="store_true",
+        help="--sitemap: wait until every page has been fetched, and report how it went.",
+    )
+    add_url.add_argument(
         "--any-host", action="store_true", help="--sitemap: pages on other hosts too."
     )
     wait_flag(add_url)
@@ -1583,7 +1685,7 @@ def build_parser() -> argparse.ArgumentParser:
     traces.add_argument(
         "action",
         nargs="?",
-        choices=("list", "show", "diff", "report", "export", "rerun"),
+        choices=("list", "show", "diff", "report", "export", "rerun", "what-if"),
         default="list",
     )
     traces.add_argument("target", nargs="?", help="The trace id (show, diff) or file (export).")
@@ -1598,6 +1700,15 @@ def build_parser() -> argparse.ArgumentParser:
     traces.add_argument("--top-k", type=int, help="rerun: RERANK_TOP_K to try.")
     traces.add_argument("--relative-floor", type=float, help="rerun: RERANK_RELATIVE_FLOOR to try.")
     traces.add_argument("--recency", type=float, help="rerun: RECENCY_BOOST_WEIGHT to try.")
+    traces.add_argument("--fallback", type=int, help="what-if: RERANK_FALLBACK_COUNT to try.")
+    traces.add_argument(
+        "--last", type=int, default=20, help="what-if: how many traced questions (default 20)."
+    )
+    traces.add_argument(
+        "--all",
+        action="store_true",
+        help="what-if: answered questions too, not only those that went unanswered.",
+    )
 
     feedback = command("feedback", "Recorded answer ratings (FEEDBACK_ENABLED, full key).")
     feedback.add_argument("--limit", type=int, default=50)
@@ -1614,11 +1725,23 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--scan", action="store_true", help="Start a pass now (full key).")
 
     backup = command("backup", "Scheduled backups in BACKUP_DIR (full key).")
-    backup.add_argument("action", choices=["list", "run", "verify", "restore"])
+    backup.add_argument(
+        "action", choices=["list", "run", "verify", "restore", "download", "delete"]
+    )
     backup.add_argument(
         "target", nargs="?", help="A backup's name (from list), or a local zip to verify."
     )
-    command("check", "How the index and stored originals agree (full key; report only).")
+    backup.add_argument(
+        "-o", "--output", help="download: where to write it (default: its name, here)."
+    )
+    check = command("check", "How the index and stored originals agree (full key; report only).")
+    check.add_argument(
+        "--repair",
+        action="append",
+        choices=("originals", "versions", "incomplete"),
+        help="Put right one kind of finding first (repeatable): delete orphaned originals "
+        "or version folders, or re-index incomplete documents.",
+    )
 
     export = command("export", "Download a backup zip (full key).")
     export.add_argument("output")
