@@ -28,6 +28,7 @@ from api.audit import audit
 from api.background import BackgroundLoop
 from api.export import build_export
 from api.feedback import FeedbackStore
+from api.metrics import backup_last_ok, backup_last_success_timestamp
 from api.repository import VectorRepository
 from api.restore import BackupCheck, verify_backup
 from api.settings import AppSettings
@@ -102,6 +103,8 @@ class BackupStatus:
     ok: bool
     file: str | None = None
     error: str | None = None
+    # Indexed documents the backup holds no original of: a restore can't bring them back.
+    originals_missing: int = 0
 
 
 def backups_in(directory: Path) -> list[Path]:
@@ -199,6 +202,9 @@ class ScheduledBackup(BackgroundLoop):
     def _note(self, status: BackupStatus) -> None:
         self.last = status
         self.by_workspace[status.workspace] = status
+        backup_last_ok.labels(workspace=status.workspace).set(1 if status.ok else 0)
+        if status.ok:
+            backup_last_success_timestamp.labels(workspace=status.workspace).set(status.at)
 
     def run_pass(self) -> list[Path]:
         return self.run_once()
@@ -278,6 +284,7 @@ class ScheduledBackup(BackgroundLoop):
                 check.ok,
                 file=final.name,
                 error=None if check.ok else check.problems[0][:200],
+                originals_missing=stream.originals_missing,
             )
         )
         return final
@@ -299,8 +306,22 @@ class ScheduledBackup(BackgroundLoop):
             except OSError:
                 continue
 
+    def forget_workspace(self, name: str) -> None:
+        """A deleted workspace: its last attempt no longer counts as failing (readiness)."""
+
+        self.by_workspace.pop(name, None)
+
     def _prune(self, directory: Path) -> None:
-        for old in backups_in(directory)[: -self._keep]:
+        backups = backups_in(directory)
+        doomed = backups[: -self._keep]
+        # The newest backup that passed its check stays, even past BACKUP_KEEP: with a
+        # small keep, failed ones would otherwise push out the last one worth restoring.
+        good = next(
+            (b for b in reversed(backups) if (check := self.check_for(b)) and check.ok), None
+        )
+        for old in doomed:
+            if old == good:
+                continue
             try:
                 old.unlink()
             except OSError:

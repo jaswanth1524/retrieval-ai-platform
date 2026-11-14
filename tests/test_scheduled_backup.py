@@ -82,3 +82,12 @@ def test_a_running_export_is_not_raced(tmp_path: Path) -> None:
     with lock:  # GET /export streaming
         assert backup.run_once() == []
     assert len(backup.run_once()) == 1
+
+
+def test_the_last_backup_says_how_many_documents_it_cannot_restore(tmp_path: Path) -> None:
+    backup, _, _ = _setup(tmp_path)
+    (tmp_path / "raw" / "guide.txt").unlink()  # indexed, its original gone
+
+    backup.run_once()
+
+    assert backup.last is not None and backup.last.originals_missing == 1

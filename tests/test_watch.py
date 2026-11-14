@@ -95,6 +95,32 @@ def test_a_full_backlog_defers_to_the_next_pass(tmp_path: Path) -> None:
     assert folder.scan_once()["indexed"] == ["a.txt"]
 
 
+def test_after_a_full_backlog_the_other_files_wait_unread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import api.watch as watch_module
+
+    for name in ("a.txt", "b.txt", "c.txt"):
+        write(tmp_path / name, name)
+    write(tmp_path / "~$report.docx", "lock")
+    recorder = Recorder()
+    recorder.full = True
+    folder = watcher(tmp_path, recorder)
+    folder.scan_once()
+    reads: list[str] = []
+    real = watch_module.read_regular_file
+
+    def counting(path: Path, max_bytes: int) -> bytes:
+        reads.append(path.name)
+        return real(path, max_bytes)
+
+    monkeypatch.setattr(watch_module, "read_regular_file", counting)
+    assert sorted(folder.scan_once()["deferred"]) == ["a.txt", "b.txt", "c.txt"]
+    assert len(reads) == 1
+    # Office's lock file beside an open document is never picked up.
+    assert "~$report.docx" not in scan_folder(tmp_path, 1 << 20).files
+
+
 def test_removed_files_are_deleted_only_when_asked_and_only_if_seen(tmp_path: Path) -> None:
     write(tmp_path / "a.txt", "A")
     write(tmp_path / "stays.txt", "S")

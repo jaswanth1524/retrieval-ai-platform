@@ -35,8 +35,10 @@ from api.routes.responses import content_chunk
 from api.schemas import (
     DocumentContentResponse,
     DocumentListResponse,
+    DocumentOutlineResponse,
     DocumentVersionResponse,
     DocumentVersionsResponse,
+    OutlineEntryResponse,
     UrlRefreshStatusResponse,
 )
 from api.settings import AppSettings
@@ -107,6 +109,9 @@ def list_documents(
             for name, meta in metadata.items()
             if meta.source_url
         },
+        content_sha256s={
+            name: meta.content_sha256 for name, meta in metadata.items() if meta.content_sha256
+        },
     )
 
 
@@ -171,6 +176,52 @@ def list_document_versions(
 # Guarded alongside GET /documents: this returns every chunk's raw text, so leaving
 # it open would let an unauthenticated caller list the corpus and then dump it in
 # full — the key would protect Q&A while the documents themselves stayed readable.
+# A table of contents and page starts, from the stored passages (no text): the viewer
+# shows a document 30 passages at a time, so its own sections and pages were only the
+# ones loaded.
+OUTLINE_MAX_SECTIONS = 1000
+
+
+@router.get(
+    "/documents/{filename}/outline",
+    response_model=DocumentOutlineResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def document_outline(
+    filename: str, repository: VectorRepositoryDep, settings: SettingsDep
+) -> DocumentOutlineResponse:
+    filename = stored_filename(filename)
+    rows = repository.passage_index(settings, filename)
+    if not rows:
+        raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
+    sections: list[OutlineEntryResponse] = []
+    pages: list[OutlineEntryResponse] = []
+    truncated = False
+    last_section: str | None = None
+    last_page: int | None = None
+    for row in rows:
+        section = str(row.get("section") or "")
+        page_value = row.get("page")
+        page = page_value if isinstance(page_value, int) else 1
+        entry = OutlineEntryResponse(section=section, page=page, chunk_id=str(row.get("chunk_id")))
+        if section != last_section:
+            if len(sections) < OUTLINE_MAX_SECTIONS:
+                sections.append(entry)
+            else:
+                truncated = True
+            last_section = section
+        if page != last_page:
+            pages.append(entry)
+            last_page = page
+    return DocumentOutlineResponse(
+        filename=filename,
+        total_chunks=len(rows),
+        sections=sections,
+        pages=pages,
+        truncated=truncated,
+    )
+
+
 @router.get(
     "/documents/{filename}/content",
     response_model=DocumentContentResponse,

@@ -103,6 +103,12 @@ class TraceConfig:
     query_expansion_enabled: bool | None = None
     reranker_onnx_file: str | None = None
     context_neighbor_max_chars: int | None = None
+    # Also moved selection or the answer (None on traces from before pass 17).
+    context_diversity_enabled: bool | None = None
+    context_diversity_max_similarity: float | None = None
+    citation_retry_mode: str | None = None
+    llm_max_tokens: int | None = None
+    query_expansion_count: int | None = None
 
 
 @dataclass
@@ -139,6 +145,11 @@ class QueryTrace:
     citation_retry_used: bool = False
     # The answer's citations were added by matching it to the sources, not by the model.
     citation_backfilled: bool = False
+    unsupported_claims: int = 0
+    prompt_cached: bool = False
+    # The provider read far less of the prompt than was sent: cut to fit its context
+    # window, grounding rules first (raise OLLAMA_NUM_CTX).
+    prompt_cut: bool = False
     # (prompt, completion) tokens reported for the answer's LLM calls, when reported.
     usage: tuple[int, int] | None = None
     cost_usd: float | None = None

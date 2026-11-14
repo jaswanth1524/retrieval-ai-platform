@@ -14,6 +14,9 @@ from api.settings import AppSettings
 
 _DEFAULT_CSV_ROWS_PER_SECTION = 50
 
+# A cell may be as long as an upload may be large (MAX_UPLOAD_BYTES is 50 MB).
+_FIELD_SIZE_LIMIT = 1 << 27
+
 
 def parse_csv_document(
     filename: str, text: str, settings: AppSettings | None = None
@@ -36,6 +39,10 @@ def parse_csv_document(
         delimiter = ","
     # A stream with newline="", as the csv module requires: str.splitlines() cut quoted
     # multi-line cells apart and also split on \u2028/\x0c inside a cell.
+    # The default 128 KiB field limit failed a whole file over one long cell; the
+    # upload cap already bounds the input.
+    if csv.field_size_limit() < _FIELD_SIZE_LIMIT:
+        csv.field_size_limit(_FIELD_SIZE_LIMIT)
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     try:
         # Numbered before blank rows are dropped, so a section label names the rows a

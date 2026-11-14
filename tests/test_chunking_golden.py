@@ -154,6 +154,20 @@ def _documents() -> dict[str, bytes]:
             ("markdown", "# Totals\n\nSum by region."),
         ]
     )
+    documents["memo.rtf"] = (
+        b"{\\rtf1\\ansi\\ansicpg1252{\\fonttbl{\\f0 Arial;}}{\\*\\generator Word;}"
+        b"\\f0 Travel memo\\par Book flights fourteen days ahead.\\par "
+        b"Caf\\'e9 receipts are kept\\u8212? always.\\par}"
+    )
+    documents["talk.srt"] = (
+        b"1\n00:00:01,000 --> 00:00:04,000\nWelcome to the <i>onboarding</i> talk.\n\n"
+        b"2\n00:01:10,000 --> 00:01:14,000\nLaptops are issued on day one.\n"
+    )
+    documents["talk.vtt"] = (
+        b"WEBVTT\n\nNOTE speaker notes\nskip me\n\n00:05.000 --> 00:08.000\n"
+        b"Security training comes first.\n"
+    )
+    documents["guide.rst"] = b"Guide\n=====\n\nInstall the package first.\n\nThen run it.\n"
     return documents
 
 

@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
+from prometheus_client import REGISTRY
 from qdrant_client import QdrantClient
 
 from api.chunking import HeuristicTokenCounter
@@ -108,20 +109,30 @@ def test_due_documents_are_asked_conditionally_a_batch_at_a_time(
     clock.now = 1000.0 + 61 * 60
 
     first = refresher.run_once()
-    assert first == {"unchanged": 1, "queued": 1, "failed": 0, "deferred": 0}
+    # Unchanged checks cost no indexing: they don't use up the batch of 2.
+    assert first == {"unchanged": 2, "queued": 1, "failed": 0, "deferred": 0}
     # The etag stored with each document went with the request; the upload wasn't asked.
     assert remote.asked == [
         ("https://example.com/a.txt", '"v1"'),
         ("https://example.com/b.txt", '"v1"'),
+        ("https://example.com/c.txt", '"v1"'),
     ]
     wait_until(lambda: "edited" in _text(repository, settings, "b.txt"))
 
-    second = refresher.run_once()
-    assert second["unchanged"] == 1 and len(remote.asked) == 3
     # Everything was checked this hour: nothing more until the next.
     assert sum(refresher.run_once().values()) == 0
     clock.now += 61 * 60
-    assert sum(refresher.run_once().values()) == 2
+    assert sum(refresher.run_once().values()) == 3
+
+
+def test_changed_documents_still_stop_at_the_batch(executor: ThreadPoolExecutor) -> None:
+    _, _, remote, refresher, clock, _ = _setup(executor, url_refresh_batch=1)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        remote.pages[f"https://example.com/{name}"] = (f"Intro\n{name} edited".encode(), '"v2"')
+    clock.now = 1000.0 + 61 * 60
+    assert refresher.run_once()["queued"] == 1
+    # The two left for a later pass are what the overdue gauge reports.
+    assert REGISTRY.get_sample_value("docrag_url_refresh_overdue") == 2
 
 
 def test_a_failed_fetch_waits_for_the_next_interval(
@@ -231,6 +242,8 @@ def test_a_document_deleted_while_its_refresh_was_fetched_stays_deleted(
     refresher._fetch = fetch_then_delete
     clock.now = 1000.0 + 61 * 60
     assert refresher.run_once()["queued"] == 1
+    # The two left for a later pass are what the overdue gauge reports.
+    assert REGISTRY.get_sample_value("docrag_url_refresh_overdue") == 2
     (job,) = _finished(jobs, 1)
     assert job.state == "failed"
     assert "changed or deleted while its refresh was being fetched" in str(job.error)
@@ -270,9 +283,11 @@ def test_new_validators_on_the_same_bytes_are_stored_without_reindexing(
     assert job.state == "done" and job.result is not None and job.result["unchanged"] is True
     meta = repository.document_metadata(settings, "a.txt")
     assert meta is not None and meta.source_etag == '"v2"' and meta.source_url == url
-    # The next check sends the new ETag, so it is a 304.
+    # The next check sends the new ETag, so it is a 304 (b and c were checked
+    # alongside: unchanged checks don't use up the batch).
     clock.now += 61 * 60
-    assert refresher.run_once()["unchanged"] == 1
+    assert refresher.run_once() == {"unchanged": 3, "queued": 0, "failed": 0, "deferred": 0}
+    assert (url, '"v2"') in remote.asked[-3:]
 
 
 def test_no_fetch_while_a_batch_of_its_own_jobs_is_still_indexing(

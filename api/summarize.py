@@ -841,6 +841,7 @@ class DocumentSummarizer:
             usage=usage_tuple(done.get("usage")),
             cost_usd=usage_cost(done.get("usage")),
             citation_backfilled=done.get("citation_backfilled", False),
+            unsupported_claims=done.get("unsupported_claims", 0),
         )
         return SummaryResult(
             grounded,
@@ -896,7 +897,11 @@ class DocumentSummarizer:
             run=lambda: self._run(request, settings, should_stop, mode, stream=mode == "stream"),
             # One that left a part out or had notes cut off isn't kept: asked again, it
             # may come out whole.
-            keep=lambda done: not done.get("parts_skipped") and not done.get("notes_truncated"),
+            keep=lambda done: (
+                not done.get("parts_skipped")
+                and not done.get("notes_truncated")
+                and not done.get("truncated")
+            ),
             on_hit=lambda hit: log_served(
                 self._trace_store,
                 served_query(
@@ -973,6 +978,7 @@ class DocumentSummarizer:
         usage: tuple[int, int] | None = None,
         citation_retry_used: bool = False,
         citation_backfilled: bool = False,
+        unsupported_claims: int = 0,
         status_of_answer: str | None = None,
         truncated: bool = False,
     ) -> None:
@@ -1017,6 +1023,7 @@ class DocumentSummarizer:
                 cost_usd=usage_cost_usd(settings, usage),
                 citation_retry_used=citation_retry_used,
                 citation_backfilled=citation_backfilled,
+                unsupported_claims=unsupported_claims,
                 answer_status=status_of_answer,
                 truncated=truncated,
             )
@@ -1161,6 +1168,7 @@ class DocumentSummarizer:
             usage=usage,
             citation_retry_used=outcome.retry_used,
             citation_backfilled=outcome.backfilled,
+            unsupported_claims=outcome.unsupported_claims,
             status_of_answer=status,
             truncated=truncated,
         )
@@ -1173,6 +1181,7 @@ class DocumentSummarizer:
             "answer_status": status,
             "truncated": truncated,
             "citation_backfilled": outcome.backfilled,
+            "unsupported_claims": outcome.unsupported_claims,
             "chunks_read": len(reading.selected),
             "chunks_total": reading.chunks_total,
             "usage": usage_dict(usage, usage_cost_usd(run.settings, usage)),

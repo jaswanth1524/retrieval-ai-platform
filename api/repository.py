@@ -449,6 +449,23 @@ class VectorRepository:
             if offset is None:
                 return
 
+    def passage_index(self, settings: AppSettings, filename: str) -> list[dict[str, object]]:
+        """Every passage of ``filename`` as (chunk_id, chunk_ordinal, page, section) only,
+        by ordinal: what a document outline is built from, without any text."""
+
+        self.ensure_ready(settings, strict=False)
+        rows = [
+            point.payload
+            for point in self._scroll_all(
+                settings,
+                scroll_filter=_single_filename_filter(filename),
+                with_payload=["chunk_id", "chunk_ordinal", "page", "section"],
+            )
+            if point.payload
+        ]
+        rows.sort(key=_chunk_ordinal_sort_key)
+        return rows
+
     def point_ids_for_filename(self, settings: AppSettings, filename: str) -> list[str]:
         """Return all point IDs currently indexed for a filename.
 

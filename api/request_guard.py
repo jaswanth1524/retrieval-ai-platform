@@ -74,7 +74,12 @@ def is_rate_limited(method: str, path: str) -> bool:
     every stored original."""
 
     return method in RATE_LIMITED_METHODS or (
-        method == "GET" and path in ("/export", "/traces/export")
+        method == "GET"
+        and (
+            path in ("/export", "/traces/export")
+            # A stored backup's download reads a whole archive, like /export.
+            or (path.startswith("/backups/") and path.count("/") == 2)
+        )
     )
 
 

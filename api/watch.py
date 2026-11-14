@@ -45,6 +45,7 @@ from api.documents import (
     DocumentNotFoundError,
     validate_upload_filename,
 )
+from api.metrics import watch_files
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -280,7 +281,12 @@ def scan_folder(root: Path, max_bytes: int, path_filter: PathFilter | None = Non
             d for d in subdirectories if not d.startswith(".") and keep.keeps_directory(prefix + d)
         )
         for name in sorted(filenames):
-            if name.startswith(".") or Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
+            # "~$report.docx": the lock file Office keeps beside an open document — it
+            # never parses, and would be given up on every time the document is opened.
+            if (
+                name.startswith((".", "~$"))
+                or Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS
+            ):
                 continue
             # Left out by WATCH_INCLUDE / WATCH_EXCLUDE: not seen at all, so never deleted.
             if not keep.keeps_file(prefix + name):
@@ -438,6 +444,7 @@ class FolderWatcher(BackgroundLoop):
         indexed = self._list_indexed()
         previous, self._previous = self._previous, {}
         now = self._clock()
+        backlog_full = False
         for name, state in files.items():
             self._seen.add(name)
             signature = (state.size, state.mtime)
@@ -461,11 +468,17 @@ class FolderWatcher(BackgroundLoop):
             if retry is not None and now < retry.next_at:
                 done["retrying"].append(name)
                 continue
+            if backlog_full:
+                # Not read just to be refused: a first import of a large folder re-read
+                # every waiting file (up to 50 MB each) on every pass.
+                done["deferred"].append(name)
+                continue
             try:
                 content = read_regular_file(state.path, self._max_bytes)
                 job_id = self._enqueue(name, content, state.mtime)
             except HTTPException as exc:
-                if exc.status_code == 503:  # the backlog is full: next pass
+                if exc.status_code == 503:  # the backlog is full: the rest wait too
+                    backlog_full = True
                     done["deferred"].append(name)
                     continue
                 # Refused as it is (a bad name, a conflict): sending it again would be
@@ -590,6 +603,13 @@ class FolderWatcher(BackgroundLoop):
         )
         with self._status_lock:
             self._status = status
+        for state, count in (
+            ("seen", status.files),
+            ("deferred", len(status.deferred)),
+            ("retrying", len(status.retrying)),
+            ("gave_up", len(status.gave_up)),
+        ):
+            watch_files.labels(folder=status.folder, state=state).set(count)
 
     def status(self) -> WatchStatus:
         """The watcher as of its last pass."""

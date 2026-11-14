@@ -223,6 +223,33 @@ def still_absent(
     return check
 
 
+def held_by_another_source(
+    repository: VectorRepository, settings: AppSettings, name: str, url: str
+) -> bool:
+    """``name`` is indexed and came from somewhere other than ``url`` (an upload, or
+    another URL). Compared with the stored ``source_url`` (``content_identity``), not the
+    listing's, which drops the query string."""
+
+    identity = repository.content_identity(settings, name)
+    return identity is not None and identity[1] != url
+
+
+def free_or_from(
+    repository: VectorRepository, settings: AppSettings, name: str, url: str
+) -> Callable[[], None]:
+    """A URL ingest's precondition: ``name`` is still free or still comes from ``url``,
+    so an upload that took the name while the URL was fetched isn't replaced."""
+
+    def check() -> None:
+        if held_by_another_source(repository, settings, name, url):
+            raise IngestionError(
+                f"'{name}' was added from elsewhere while its URL was being fetched; "
+                "it was not replaced."
+            )
+
+    return check
+
+
 def source_of(meta: DocumentMetadata, *, validators: bool = True) -> DocumentSource | None:
     """Where a URL-fetched document came from, carried over by a re-index.
 

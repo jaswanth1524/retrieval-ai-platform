@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
+import shutil
+import tempfile
 import threading
 import time
+import zipfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from api.audit import audit
+from api.audit_log import AuditLog
 from api.consistency import consistency_report, repair
 from api.dependencies import (
+    get_audit_log,
     require_full_key,
 )
+from api.doctor import diagnose
 from api.document_names import (
     known_filenames,
     refuse_near_duplicate_name,
@@ -26,6 +34,8 @@ from api.documents import (
 )
 from api.export import build_export
 from api.feedback import FeedbackStore
+from api.imports import BackgroundImport, wait_for_room
+from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
@@ -47,6 +57,8 @@ from api.scheduled_backup import (
     save_check,
 )
 from api.schemas import (
+    AuditEntryResponse,
+    AuditResponse,
     BackupCheckResponse,
     BackupDeleteResponse,
     BackupFileResponse,
@@ -55,6 +67,8 @@ from api.schemas import (
     ConsistencyRepairRequest,
     ConsistencyRepairResponse,
     ConsistencyResponse,
+    DoctorFindingResponse,
+    DoctorResponse,
     DocumentJobAcceptedResponse,
     ImportResponse,
 )
@@ -148,8 +162,102 @@ def import_backup(
     queue: IngestQueueDep,
     raw_store: RawDocumentStoreDep,
     feedback_store: FeedbackStoreDep,
+    background: Annotated[
+        bool,
+        Form(
+            description="Restore in the background: every document is queued as room "
+            "frees (none deferred); follow it with GET /documents/imports/{import_id}."
+        ),
+    ] = False,
 ) -> ImportResponse:
+    if background:
+        spool = _spool_upload(file)
+        return _restore_in_background(
+            spool,
+            file.filename or "backup.zip",
+            repository,
+            settings,
+            queue,
+            raw_store,
+            feedback_store,
+            cleanup=lambda: spool.unlink(missing_ok=True),
+        )
     return _restore(file.file, repository, settings, queue, raw_store, feedback_store)
+
+
+def _spool_upload(file: UploadFile) -> Path:
+    """The upload copied to a temporary file the import thread reads after the request."""
+
+    handle = tempfile.NamedTemporaryFile(prefix="docrag-restore-", suffix=".zip", delete=False)
+    with handle:
+        shutil.copyfileobj(file.file, handle, length=1 << 20)
+    return Path(handle.name)
+
+
+def _restore_in_background(
+    path: Path,
+    name: str,
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+    feedback_store: FeedbackStore | None,
+    *,
+    cleanup: Callable[[], None] = lambda: None,
+    source: str | None = None,
+) -> ImportResponse:
+    """Check the backup's manifest now (a bad one is a 400 here, not a failed import),
+    then restore it on the import thread, waiting for room instead of deferring."""
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if "manifest.json" not in archive.namelist():
+                raise BackupImportError("The archive has no manifest.json; it isn't a backup.")
+    except (zipfile.BadZipFile, OSError, BackupImportError) as exc:
+        cleanup()
+        detail = (
+            str(exc) if isinstance(exc, BackupImportError) else "That file isn't a zip archive."
+        )
+        raise HTTPException(status_code=400, detail=detail) from exc
+    repository.ensure_writable(settings)
+
+    def run(status: BackgroundImport) -> None:
+        with path.open("rb") as handle:
+            outcome = _restore(
+                handle,
+                repository,
+                settings,
+                queue,
+                raw_store,
+                feedback_store,
+                source=source,
+                status=status,
+            )
+        status.skipped += len(outcome.skipped) + len(outcome.missing_originals)
+        status.failed += len(outcome.rejected) + len(outcome.deferred)
+        for filename in outcome.rejected:
+            status.note(f"{filename}: refused by restore's rules (or damaged)")
+        for filename in outcome.missing_originals:
+            status.note(f"{filename}: the backup holds no original of it")
+
+    started = start_import(
+        "restore",
+        name,
+        workspace_of(settings),
+        str(settings.qdrant_collection),
+        run,
+        cleanup=cleanup,
+    )
+    return ImportResponse(
+        jobs=[],
+        deferred=[],
+        skipped=[],
+        missing_originals=[],
+        rejected=[],
+        feedback_imported=0,
+        feedback_skipped=0,
+        import_id=started.id,
+    )
 
 
 def _restore(
@@ -161,9 +269,11 @@ def _restore(
     feedback_store: FeedbackStore | None,
     *,
     source: str | None = None,
+    status: BackgroundImport | None = None,
 ) -> ImportResponse:
     """Restore one backup into ``settings``' workspace: an upload (``/import``) or one
-    of BACKUP_DIR's (``source`` names it, for the audit)."""
+    of BACKUP_DIR's (``source`` names it, for the audit). With ``status`` (a background
+    import) a full queue is waited out instead of deferring, and its count follows."""
 
     # Read once for the whole backup, then kept up to date with what it queues:
     # read per document, each job finishing mid-import moved the corpus generation
@@ -185,7 +295,7 @@ def _restore(
             # A DocumentError: listed under `rejected`, the rest still restored.
             refuse_near_duplicate_name(filename, known)
             known.add(filename)
-        return queue.enqueue(
+        accepted = queue.enqueue(
             filename=filename,
             content=content,
             raw_store=raw_store,
@@ -195,6 +305,14 @@ def _restore(
             watched_from=watched_from,
             kind="import",
         )
+        if status is not None:
+            status.queued += 1
+        return accepted
+
+    def has_room(size: int) -> bool:
+        if status is None:
+            return queue.backlog.has_room(size)
+        return wait_for_room(queue.backlog.has_room, size, status)
 
     # The last step of recovering from an embedding change (export, delete all,
     # import): an emptied collection is rebuilt here; a non-empty one is a 409.
@@ -206,7 +324,7 @@ def _restore(
             # first import's jobs run must not queue each document a second time.
             existing_filenames=set(known_filenames(repository, settings)),
             max_original_bytes=int(settings.max_upload_bytes),
-            has_room=queue.backlog.has_room,
+            has_room=has_room,
             enqueue=enqueue,
             feedback_store=feedback_store,
             workspace=workspace_of(settings),
@@ -353,6 +471,22 @@ def run_backup_now(request: Request, settings: SettingsDep) -> BackupRunResponse
     return BackupRunResponse(workspace=workspace_of(settings) or "default")
 
 
+# One verify at a time: each reads (and decompresses) a whole archive.
+_verify_running = threading.Lock()
+
+
+@contextlib.contextmanager
+def _one_verify() -> Iterator[None]:
+    if not _verify_running.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail="A backup is already being checked; try again shortly."
+        )
+    try:
+        yield
+    finally:
+        _verify_running.release()
+
+
 # A backup read through without restoring anything: the manifest, every member's
 # checksum, every listed original and version present. An upload (any backup, from
 # anywhere), or one of BACKUP_DIR's below.
@@ -364,7 +498,8 @@ def run_backup_now(request: Request, settings: SettingsDep) -> BackupRunResponse
 def verify_uploaded_backup(
     file: Annotated[UploadFile, File()], settings: SettingsDep
 ) -> BackupCheckResponse:
-    return _check_response(verify_backup(file.file, int(settings.max_upload_bytes)))
+    with _one_verify():
+        return _check_response(verify_backup(file.file, int(settings.max_upload_bytes)))
 
 
 @router.post(
@@ -375,7 +510,7 @@ def verify_uploaded_backup(
 )
 def verify_stored_backup(name: str, request: Request, settings: SettingsDep) -> BackupCheckResponse:
     path = _stored_backup(settings, name)
-    with path.open("rb") as handle:
+    with _one_verify(), path.open("rb") as handle:
         check = verify_backup(handle, int(settings.max_upload_bytes))
     # Listed with this result from now on, after a restart too.
     loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
@@ -402,9 +537,71 @@ def restore_stored_backup(
     queue: IngestQueueDep,
     raw_store: RawDocumentStoreDep,
     feedback_store: FeedbackStoreDep,
+    background: bool = False,
 ) -> ImportResponse:
-    with _stored_backup(settings, name).open("rb") as handle:
+    path = _stored_backup(settings, name)
+    if background:
+        return _restore_in_background(
+            path, name, repository, settings, queue, raw_store, feedback_store, source=name
+        )
+    with path.open("rb") as handle:
         return _restore(handle, repository, settings, queue, raw_store, feedback_store, source=name)
+
+
+# The audit events kept in AUDIT_LOG_PATH (api/audit_log.py): this workspace's, or every
+# workspace's with all_workspaces. 404 when the store is off.
+@router.get(
+    "/admin/audit",
+    response_model=AuditResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "AUDIT_LOG_PATH is not set."}},
+)
+def list_audit(
+    settings: SettingsDep,
+    audit_log: Annotated[AuditLog | None, Depends(get_audit_log)],
+    event: Annotated[
+        str | None,
+        Query(max_length=64, description='An event name, or a prefix ending in "." (document.).'),
+    ] = None,
+    since: Annotated[
+        float | None, Query(ge=0, description="Only events since (epoch seconds).")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    all_workspaces: bool = False,
+) -> AuditResponse:
+    if audit_log is None:
+        raise HTTPException(status_code=404, detail="The audit log is off (AUDIT_LOG_PATH).")
+    entries = audit_log.recent(
+        None if all_workspaces else (workspace_of(settings) or "default"),
+        event=event,
+        since=since,
+        limit=limit,
+    )
+    return AuditResponse(
+        entries=[AuditEntryResponse(**dataclasses.asdict(entry)) for entry in entries]
+    )
+
+
+# Risky configurations of this server (api/doctor.py). A report only.
+@router.get(
+    "/admin/doctor",
+    response_model=DoctorResponse,
+    dependencies=[Depends(require_full_key)],
+)
+def run_doctor(repository: VectorRepositoryDep, settings: SettingsDep) -> DoctorResponse:
+    try:
+        counts = {
+            name: meta.chunk_count for name, meta in repository.filename_metadata(settings).items()
+        }
+    except Exception:  # noqa: BLE001 - the index's checks are left out, the rest still run
+        logger.warning("Doctor: could not read the document listing.", exc_info=True)
+        counts = {}
+    return DoctorResponse(
+        findings=[
+            DoctorFindingResponse(**dataclasses.asdict(finding))
+            for finding in diagnose(settings, chunk_counts=counts)
+        ]
+    )
 
 
 # How the index and the stored originals agree (api/consistency.py). A report only.

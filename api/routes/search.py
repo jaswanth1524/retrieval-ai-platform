@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from fastapi import Depends, FastAPI, HTTPException
 
 from api.citations import query_spans
 from api.dependencies import require_api_key
+from api.explain import explain
 from api.parsers.common import clean_text
 from api.pipeline import AnswerOverrides
 from api.routes.deps import QuestionSlotsDep, RagPipelineDep
 from api.routes.questions import passage_narrowing, question_slot
 from api.schemas import (
     CitationSpanResponse,
+    SearchExplanationResponse,
     SearchRequest,
     SearchResponse,
     SearchResultResponse,
@@ -59,6 +63,7 @@ def register(app: FastAPI) -> None:
                     tags=request.tags,
                     for_generation=False,
                     narrow=passage_narrowing(request),
+                    explain=request.explain,
                 )
         finally:
             release()
@@ -66,6 +71,16 @@ def register(app: FastAPI) -> None:
         # soft hyphens), so the raw one found the passage but marked nothing in it. A
         # passage search has no query words to mark.
         query_text = clean_text(request.query) if request.like_chunk_id is None else ""
+        explanation = None
+        if request.explain and (request.expect_chunk_id or request.expect_filename):
+            found = explain(
+                phase,
+                pipeline.effective_settings(overrides),
+                chunk_id=request.expect_chunk_id,
+                filename=request.expect_filename,
+            )
+            explanation = SearchExplanationResponse(**dataclasses.asdict(found))
+        ranks = phase.leg_ranks if request.explain else {}
         return SearchResponse(
             results=[
                 SearchResultResponse(
@@ -79,6 +94,8 @@ def register(app: FastAPI) -> None:
                     retrieval_score=chunk.retrieval_score,
                     rerank_score=chunk.rerank_score,
                     page_end=chunk.page_end,
+                    dense_rank=ranks.get(chunk.point_id, [None, None])[0],
+                    sparse_rank=ranks.get(chunk.point_id, [None, None])[1],
                     spans=[
                         CitationSpanResponse(start=span.start, end=span.end, quote=span.quote)
                         for span in query_spans(query_text, chunk.text, chunk.section)
@@ -90,4 +107,5 @@ def register(app: FastAPI) -> None:
                 embed_ms=phase.embed_ms, search_ms=phase.search_ms, rerank_ms=phase.rerank_ms
             ),
             weak_matches=phase.below_min_score,
+            explanation=explanation,
         )

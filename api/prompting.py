@@ -748,6 +748,15 @@ _FOLLOW_UP_OPENINGS = frozenset(
 )
 
 
+# "It", "this", "that" in Chinese, Japanese and Korean: a question holding one leans
+# on the conversation.
+_ANAPHORA_CJK = (
+    *("它", "这", "那", "其", "此"),
+    *("それ", "これ", "あれ", "その", "この"),
+    *("그것", "이것", "저것"),
+)
+
+
 # Words in any script (letters only, an inner apostrophe kept: "it's", "d'une"), a
 # hyphenated compound as one word ("part-time"), so it counts once as content.
 _WORD_RE = re.compile(r"[^\W\d_][^\W\d_']*(?:-[^\W\d_][^\W\d_']*)*")
@@ -783,12 +792,19 @@ def needs_condense(question: str) -> bool:
         return True
     if words and (words[0] in _FOLLOW_UP_FIRST_WORDS or tuple(words[:2]) in _FOLLOW_UP_OPENINGS):
         return True
+    cjk = "".join(_CJK_RE.findall(question))
+    if cjk and any(word in cjk for word in _ANAPHORA_CJK):
+        return True
     content = [
         word
         for word in words
-        if word not in _LOW_SIGNAL_WORDS and word not in _LOW_SIGNAL_WORDS_OTHER
+        if word not in _LOW_SIGNAL_WORDS
+        and word not in _LOW_SIGNAL_WORDS_OTHER
+        and not _CJK_RE.search(word)
     ]
-    return len(content) < _MIN_STANDALONE_CONTENT_WORDS
+    # Chinese and Japanese aren't spaced: a whole question was one "word", so every
+    # one of them paid a condense call. Two characters count as a word instead.
+    return len(content) + len(cjk) // 2 < _MIN_STANDALONE_CONTENT_WORDS
 
 
 def build_expansion_messages(question: str, count: int) -> list[ChatMessage]:

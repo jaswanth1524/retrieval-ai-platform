@@ -32,6 +32,7 @@ NOT_DEFAULT: dict[str, Any] = {
     "truncated": True,
     "weak_matches": True,
     "citation_backfilled": True,
+    "unsupported_claims": 2,
     "passages_left_out": 2,
     "coverage": (3, 9),
     "followups": ("Why?",),

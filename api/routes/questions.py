@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from typing import get_args
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from api.admission import QuestionSlots, Release, SlotKind
 from api.dependencies import (
@@ -30,7 +32,9 @@ from api.metrics import (
 )
 from api.pipeline import (
     AnswerOverrides,
+    ContinueRefused,
     DoneEvent,
+    QuestionAbandoned,
     StreamEvent,
     check_rerank_top_k,
     timings_dict,
@@ -41,6 +45,7 @@ from api.routes.deps import (
     QuestionSlotsDep,
     RagPipelineDep,
     SettingsDep,
+    TraceStoreDep,
 )
 from api.routes.responses import (
     history_messages,
@@ -50,6 +55,7 @@ from api.routes.responses import (
 )
 from api.schemas import (
     CitationResponse,
+    ContinueRequest,
     PassageNarrowing,
     QuestionRequest,
     QuestionResponse,
@@ -97,6 +103,30 @@ def question_slot(
         detail = SUMMARIES_BUSY_ERROR if kind == "summary" else QUESTIONS_BUSY_ERROR
         raise HTTPException(status_code=429, detail=detail, headers={"Retry-After": "5"})
     return release
+
+
+def check_question_text(question: str) -> None:
+    """400 for a blank question, before a slot is taken: it used to take one (and,
+    with history, a condense call) before the pipeline refused it, and the stream
+    refused it only after its 200, in an error frame."""
+
+    if not question.strip():
+        questions_total.labels(outcome="error", error_type="invalid_request").inc()
+        raise HTTPException(status_code=400, detail="Query text is required.")
+
+
+# How often the sync question route checks whether its client is still there.
+_DISCONNECT_POLL_SECONDS = 0.5
+
+
+async def _watch_disconnect(request: Request, stop: threading.Event) -> None:
+    """Set ``stop`` once ``request``'s client has gone."""
+
+    while not stop.is_set():
+        if await request.is_disconnected():
+            stop.set()
+            return
+        await asyncio.sleep(_DISCONNECT_POLL_SECONDS)
 
 
 def count_answer(status: str, truncated: bool) -> None:
@@ -268,28 +298,43 @@ def register(app: FastAPI) -> None:
     @app.post(
         "/questions", response_model=QuestionResponse, dependencies=[Depends(require_api_key)]
     )
-    def answer_question(
+    async def answer_question(
         request: QuestionRequest,
+        http_request: Request,
         pipeline: RagPipelineDep,
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> QuestionResponse:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
         check_rerank_top_k(request.rerank_top_k, settings)
+        check_question_text(request.question)
         release = question_slot(slots)
+        # A client that leaves (a CLI timeout, a closed connection) stops the pipeline
+        # before its next expensive stage, as on the stream: the slot, the local model
+        # and the LLM call were otherwise held to the end for nobody.
+        stop = threading.Event()
+        watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
         try:
-            grounded = pipeline.answer(
-                request.question,
-                question_overrides(request),
-                filenames=request.filenames,
-                history=history_messages(request.history),
-                tags=request.tags,
-                use_cache=request.use_cache,
+            grounded = await run_in_threadpool(
+                lambda: pipeline.answer(
+                    request.question,
+                    question_overrides(request),
+                    filenames=request.filenames,
+                    history=history_messages(request.history),
+                    tags=request.tags,
+                    use_cache=request.use_cache,
+                    should_stop=stop.is_set,
+                )
             )
+        except QuestionAbandoned:
+            questions_total.labels(outcome="error", error_type="abandoned").inc()
+            # Nobody reads it; a status is still needed for the access log.
+            raise HTTPException(status_code=499, detail="The client left.") from None
         except Exception as exc:
             questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
             raise
         finally:
+            watcher.cancel()
             release()
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
         count_answer(grounded.answer_status, grounded.truncated)
@@ -297,7 +342,7 @@ def register(app: FastAPI) -> None:
             answer_cache_hits_total.inc()
         elif grounded.timings is not None:
             timings = timings_dict(grounded.timings)
-            observe_question_timings(timings)
+            observe_question_timings(timings, prompt_cached=grounded.prompt_cached)
             log_question(
                 provider=request.llm_provider,
                 source_count=len(grounded.sources),
@@ -315,9 +360,53 @@ def register(app: FastAPI) -> None:
             weak_matches=grounded.weak_matches,
             truncated=grounded.truncated,
             citation_backfilled=grounded.citation_backfilled,
+            unsupported_claims=grounded.unsupported_claims,
+            prompt_cached=grounded.prompt_cached,
+            prompt_cut=grounded.prompt_cut,
             passages_left_out=grounded.passages_left_out,
             followups=grounded.followups,
             usage=usage_response(grounded.usage, grounded.cost_usd),
+        )
+
+    @app.post(
+        "/questions/continue",
+        dependencies=[Depends(require_api_key)],
+        responses={
+            404: {"description": "No such trace here, or traces are off."},
+            409: {"description": "That answer wasn't cut off, or its passages changed."},
+        },
+    )
+    def continue_answer_stream(
+        request: ContinueRequest,
+        pipeline: RagPipelineDep,
+        slots: QuestionSlotsDep,
+        settings: SettingsDep,
+        traces: TraceStoreDep,
+    ) -> ClosingStreamingResponse:
+        """The rest of an answer cut off at the token limit, streamed like
+        /questions/stream (sources, deltas, done with the whole answer)."""
+
+        try:
+            plan = pipeline.continuable(request.trace_id, traces.get(request.trace_id), settings)
+        except ContinueRefused as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        lease = StreamLease(question_slot(slots))
+        stop = threading.Event()
+
+        def on_done(event: DoneEvent) -> None:
+            count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
+            questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+
+        def on_error(exc: Exception) -> None:
+            questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
+
+        return sse_response(
+            pipeline.continue_stream(plan, settings, should_stop=stop.is_set),
+            lease,
+            stop,
+            on_done=on_done,
+            on_error=on_error,
+            what="continued answer",
         )
 
     @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
@@ -329,6 +418,7 @@ def register(app: FastAPI) -> None:
     ) -> ClosingStreamingResponse:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
         check_rerank_top_k(request.rerank_top_k, settings)
+        check_question_text(request.question)
         # Taken here, before the 200 is committed, so a full server can still say 429.
         lease = StreamLease(question_slot(slots))
         stop = threading.Event()
@@ -340,7 +430,9 @@ def register(app: FastAPI) -> None:
             if event.get("cached"):
                 answer_cache_hits_total.inc()
                 return
-            observe_question_timings(event["timings"])
+            observe_question_timings(
+                event["timings"], prompt_cached=bool(event.get("prompt_cached"))
+            )
             log_question(
                 provider=request.llm_provider,
                 source_count=len(event["sources"]),
@@ -407,6 +499,9 @@ def register(app: FastAPI) -> None:
             truncated=grounded.truncated,
             usage=usage_response(grounded.usage, grounded.cost_usd),
             citation_backfilled=grounded.citation_backfilled,
+            unsupported_claims=grounded.unsupported_claims,
+            prompt_cached=grounded.prompt_cached,
+            prompt_cut=grounded.prompt_cut,
             chunks_read=result.chunks_read,
             chunks_total=result.chunks_total,
             parts_skipped=result.parts_skipped,

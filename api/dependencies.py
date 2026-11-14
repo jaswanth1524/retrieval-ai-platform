@@ -14,6 +14,7 @@ from qdrant_client import QdrantClient
 
 from api.admission import QuestionSlots
 from api.answer_cache import AnswerCache
+from api.audit_log import AuditLog
 from api.chunking import TokenCounter, make_token_counter
 from api.embeddings import EmbeddingError, LocalEmbeddingProvider
 from api.feedback import FeedbackStore
@@ -478,6 +479,16 @@ def get_feedback_store() -> FeedbackStore | None:
 
 
 @lru_cache
+def get_audit_log() -> AuditLog | None:
+    """The optional audit store (AUDIT_LOG_PATH), or None when it is off."""
+
+    settings = get_app_settings()
+    if not settings.audit_log_path:
+        return None
+    return AuditLog(settings.audit_log_path, int(settings.audit_log_max_rows))
+
+
+@lru_cache
 def get_query_log_store() -> QueryLogStore | None:
     """The optional query log (QUERY_LOG_ENABLED), or None when it is off."""
 
@@ -519,12 +530,15 @@ def _trace_sink(
 def get_ingest_executor() -> ThreadPoolExecutor:
     """Return the process-wide executor background ingest jobs run on.
 
-    Two workers: enough to overlap ingest of a couple of documents without starving
-    query-time model calls of CPU. Its queue is unbounded; ``get_ingest_backlog`` is
-    what bounds how much accepted-but-unfinished upload data can pile up behind it.
+    INGEST_WORKERS workers (2 by default): enough to overlap ingest of a couple of
+    documents without starving query-time model calls of CPU. More index a big folder
+    sooner on a machine with cores and memory to spare (each worker holds a document's
+    parsed text and vectors). Its queue is unbounded; ``get_ingest_backlog`` is what
+    bounds how much accepted-but-unfinished upload data can pile up behind it.
     """
 
-    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="docrag-ingest")
+    workers = int(get_app_settings().ingest_workers)
+    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="docrag-ingest")
 
 
 @lru_cache

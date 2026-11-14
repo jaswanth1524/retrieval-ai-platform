@@ -27,10 +27,15 @@ from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobStore
 from api.metrics import (
     NO_ERROR_TYPE,
     ingest_chunks_total,
+    ingest_job_failures_total,
     ingest_job_seconds,
     ingest_jobs_total,
 )
-from api.parse_isolation import ParseInterruptedError, ParseMemoryError
+from api.parse_isolation import (
+    ParseEnvironmentError,
+    ParseInterruptedError,
+    ParseMemoryError,
+)
 from api.pipeline import IngestService
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.raw_documents import RawDocumentStore
@@ -144,6 +149,8 @@ def ingest_error_type(exc: Exception) -> str:
 
     if isinstance(exc, ParseMemoryError):
         return "parse_memory"
+    if isinstance(exc, ParseEnvironmentError):
+        return "parse_failed"
     if isinstance(exc, ParseInterruptedError):
         return "parse_timeout"
     if isinstance(exc, DocumentError):
@@ -279,6 +286,7 @@ def run_ingest_job(
         ingest_job_seconds.labels(outcome="failed").observe(time.monotonic() - started)
         error_type = ingest_error_type(exc)
         ingest_jobs_total.labels(outcome="failed", error_type=error_type).inc()
+        ingest_job_failures_total.labels(kind=request.kind).inc()
         job_store.update(
             job_id, state="failed", error=job_error_message(exc), error_type=error_type
         )

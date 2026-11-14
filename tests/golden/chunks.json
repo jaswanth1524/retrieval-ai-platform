@@ -784,5 +784,43 @@
    "section": "Load",
    "text_sha1": "e9cde249ca4d6a22"
   }
+ ],
+ "memo.rtf": [
+  {
+   "chunk_id": "d1aa6798be25435e3d28",
+   "page": 1,
+   "section": "Travel memo",
+   "text_sha1": "c3b2934b7b39eb67"
+  }
+ ],
+ "talk.srt": [
+  {
+   "chunk_id": "5170f7a5caa46afe308e",
+   "page": 1,
+   "section": "0:00",
+   "text_sha1": "a82f00bc5a5e9fe8"
+  },
+  {
+   "chunk_id": "0c01ab5178faaa2f4aad",
+   "page": 2,
+   "section": "1:00",
+   "text_sha1": "5c0bd0a5b20d6d02"
+  }
+ ],
+ "talk.vtt": [
+  {
+   "chunk_id": "bca65c898b8e4c37047b",
+   "page": 1,
+   "section": "0:00",
+   "text_sha1": "711ceb619b17f98b"
+  }
+ ],
+ "guide.rst": [
+  {
+   "chunk_id": "66f0c2748ee073ef568c",
+   "page": 1,
+   "section": "Guide",
+   "text_sha1": "0f2d767493715574"
+  }
  ]
 }

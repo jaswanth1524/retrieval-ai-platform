@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import Future
@@ -75,8 +77,10 @@ from api.llm import (
     usage_cost_usd,
     usage_totals,
     was_degraded,
+    was_prompt_cut,
 )
 from api.metrics import answer_inflight_joins_total
+from api.prompt_cache import CachingGenerator, shared_prompt_cache
 from api.prompting import (
     FittedPrompt,
     clip_text,
@@ -179,6 +183,8 @@ _RERUN_FROM_TRACE = (
     "rerank_relative_floor",
     "recency_boost_weight",
     "context_neighbor_max_chars",
+    "context_diversity_enabled",
+    "context_diversity_max_similarity",
 )
 
 
@@ -310,6 +316,9 @@ class DoneEvent(TypedDict):
     truncated: NotRequired[bool]
     # The answer's citations were added by matching it to the sources (backfill).
     citation_backfilled: NotRequired[bool]
+    unsupported_claims: NotRequired[int]
+    prompt_cached: NotRequired[bool]
+    prompt_cut: NotRequired[bool]
     # Picked passages (chunk_ids) the prompt had no room for (GroundedAnswer).
     passages_left_out: NotRequired[int]
     usage: NotRequired[dict[str, int] | None]
@@ -405,6 +414,155 @@ def _with_interpretation(question: str, condensed: str | None) -> str:
     return f"{question}\n(Read with the conversation as: {one_line(condensed)})"
 
 
+class CondenseMemo:
+    """Rewrites of follow-ups already made: Retry, an edited follow-up asked again or
+    the same follow-up asked in another tab paid the condense call (2.5-7 s at a local
+    model) every time. Keyed on everything the call is sent — the question, the history
+    as truncated, the provider and model, the condense settings — so only an identical
+    call is skipped. Only usable rewrites are kept (a failure or a rejected rewrite is
+    tried again). CONDENSE_CACHE_SIZE entries, least recently used dropped; 0 = off."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, str] = OrderedDict()
+
+    @staticmethod
+    def key(question: str, history: Sequence[ChatMessage], settings: AppSettings) -> str:
+        parts = [
+            question,
+            str(settings.llm_provider),
+            trace_model_name(settings) or "",
+            str(settings.condense_max_tokens),
+            *(f"{message['role']}:{message['content']}" for message in history),
+        ]
+        return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+    def get(self, key: str) -> str | None:
+        with self._lock:
+            found = self._entries.get(key)
+            if found is not None:
+                self._entries.move_to_end(key)
+            return found
+
+    def put(self, key: str, rewrite: str, size: int) -> None:
+        if size <= 0:
+            return
+        with self._lock:
+            self._entries.pop(key, None)
+            self._entries[key] = rewrite
+            while len(self._entries) > size:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+condense_memo = CondenseMemo()
+
+
+CONTINUE_INSTRUCTION = (
+    "Your answer above was cut off before it finished. Continue it from exactly where it "
+    "stopped: do not repeat anything already written, and keep citing the sources by "
+    "their [n] numbers."
+)
+
+
+class ContinueRefused(Exception):
+    """A cut-off answer that can't be continued, with the HTTP status that says why."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class ContinuePlan:
+    trace: QueryTrace
+    chunks: list[RerankedChunk]
+
+
+# Providers whose chat API continues a trailing assistant message (prefill) — measured
+# on Ollama (qwen2.5); Anthropic documents it. Asked in words instead ("continue where
+# you stopped"), qwen2.5 started its answer over every time. Hosted OpenAI ignores a
+# trailing assistant message, so it is asked in words.
+_PREFILL_PROVIDERS = frozenset({"ollama", "anthropic", "openai_compatible"})
+
+
+def continuation_messages(
+    base: Sequence[ChatMessage], answer_so_far: str, settings: AppSettings
+) -> list[ChatMessage]:
+    """The prompt that asks for the rest of ``answer_so_far``: the answer as a trailing
+    assistant message to continue, or, where the provider can't, followed by a request
+    to go on."""
+
+    if settings.llm_provider.lower().strip() in _PREFILL_PROVIDERS:
+        # Anthropic refuses a prefill ending in whitespace; the join puts it back.
+        return [*base, {"role": "assistant", "content": answer_so_far.rstrip()}]
+    return [
+        *base,
+        {"role": "assistant", "content": answer_so_far},
+        {"role": "user", "content": CONTINUE_INSTRUCTION},
+    ]
+
+
+def base_prompt(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
+    """A trace's prompt without what a Continue added (the answer so far, the request to
+    go on), so continuing again starts from the original prompt, not a nested one."""
+
+    trimmed = list(messages)
+    if trimmed and trimmed[-1]["role"] == "user" and trimmed[-1]["content"] == CONTINUE_INSTRUCTION:
+        trimmed = trimmed[:-1]
+    if trimmed and trimmed[-1]["role"] == "assistant":
+        trimmed = trimmed[:-1]
+    return trimmed
+
+
+def drop_restart(before: str, after: str) -> str:
+    """``after`` without a restart: a model asked to continue that writes the answer
+    again from the top has the part it repeats removed (the rest is the new text)."""
+
+    head = after.lstrip()
+    probe = before.lstrip()[:40]
+    if len(probe) < 20 or not head.startswith(probe):
+        return after
+    original = before.lstrip()
+    shared = 0
+    while shared < min(len(original), len(head)) and original[shared] == head[shared]:
+        shared += 1
+    return head[shared:]
+
+
+def join_continuation(before: str, after: str, *, prefilled: bool = False) -> str:
+    """A cut-off answer and its continuation as one text. Continuing a prefill, the
+    model writes its own leading space where a word ends (" can be", or "2]" inside a
+    marker): the two are joined as they are. Asked in words, a space goes between them
+    unless either side already has one or the continuation starts with punctuation."""
+
+    if not after:
+        return before
+    if prefilled:
+        return before.rstrip() + after
+    if before[-1:].isspace() or after[:1].isspace() or after[:1] in ".,;:!?)]}'\"":
+        return before + after
+    return f"{before} {after}"
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _reply_known(
+    generator: ChatGenerator, messages: Sequence[ChatMessage], settings: AppSettings
+) -> bool:
+    """The prompt cache holds the reply to ``messages``: no model call will be made."""
+
+    return (
+        isinstance(generator, CachingGenerator)
+        and generator.cached_reply(messages, settings) is not None
+    )
+
+
 def _condense_skip_reason(question: str, settings: AppSettings) -> str | None:
     """Why a question with history is not condensed, or None when it is. The one copy
     of the gate: ``_will_condense`` announces the stage from it, ``_condense_query``
@@ -465,6 +623,7 @@ def replay_cached(hit: CachedAnswer, started: float, **done_fields: Any) -> Iter
         "answer_status": hit.answer_status,
         "truncated": hit.truncated,
         "citation_backfilled": hit.citation_backfilled,
+        "unsupported_claims": hit.unsupported_claims,
         "passages_left_out": hit.passages_left_out,
         **done_fields,
     }
@@ -638,6 +797,24 @@ def _select_passages(
     return _PassageSelection(diverse_outcome, diversity_dropped, below_min_score, relative_cut_ids)
 
 
+def select_passages(
+    scored: Sequence[RerankedChunk], settings: AppSettings
+) -> tuple[list[RerankedChunk], bool]:
+    """The passages an answer would be given from ``scored`` (one rerank pass's scored
+    candidates, best first) under ``settings``: the floor and top-K cut as the reranker
+    applies them, then ``_select_passages``. With whether they are the weak-match
+    fallback. The seam the eval harness's sweep replays settings through without
+    retrieving or reranking again."""
+
+    ordered = list(scored)
+    floor = float(settings.rerank_min_score)
+    kept = [chunk for chunk in ordered if chunk.rerank_score >= floor][: int(settings.rerank_top_k)]
+    selection = _select_passages(
+        RerankOutcome(scored=ordered, kept=kept), settings, for_generation=True
+    )
+    return list(selection.outcome.kept), selection.below_min_score
+
+
 # How far back the recency boost looks: a document this much older than the newest kept
 # one gets none of it. A fixed span, not the kept passages' own: documents uploaded
 # seconds apart (a folder indexed in one go) must not be told apart by it.
@@ -775,10 +952,14 @@ def cached_run(
         if lead is not None and key is not None and cache is not None:
             cache.inflight.finish(key, lead)
 
+    stored: CachedAnswer | None = None
+
     def store(followups: Sequence[str]) -> None:
+        nonlocal stored
         if key is None or done is None or cache is None or was_degraded() or not keep(done):
             return
-        cache.put(key, CachedAnswer.from_done(done, followups))
+        stored = CachedAnswer.from_done(done, followups)
+        cache.put(key, stored)
 
     try:
         for event in events:
@@ -789,6 +970,10 @@ def cached_run(
             elif event["type"] == "followups":
                 store(event["questions"])
             yield event
+        # Stored at ``done``, before the follow-ups: when they failed (no frame comes
+        # then), the answer is degraded after all and isn't kept, as on the sync path.
+        if stored is not None and key is not None and cache is not None and was_degraded():
+            cache.discard(key, stored)
     finally:
         # Closing this generator (the client left) must close the inner one now: its
         # `finally` records the "closed early" trace. Left to garbage collection, it ran
@@ -843,6 +1028,11 @@ class AnswerRun:
     mode: TraceMode
     trace_id: str | None
     started: float
+    # False for Regenerate (use_cache=False): the condense step asks the model again,
+    # and the prompt cache is neither read nor written.
+    use_memo: bool = True
+    # The answer's generator: the pipeline's, wrapped by the prompt cache when it is on.
+    generator: ChatGenerator | None = None
     # Set as the steps run; an error before then leaves them as they are.
     settings: AppSettings | None = None
     history: list[ChatMessage] = field(default_factory=list)
@@ -904,6 +1094,12 @@ class RagPipeline:
         # tracing costs nothing when the operator has turned it off.
         self._trace_store = trace_store
 
+    def effective_settings(self, overrides: AnswerOverrides) -> AppSettings:
+        """The settings a question with ``overrides`` runs under (a search's explanation
+        names the bar and cuts it was given)."""
+
+        return self._effective_settings(overrides)
+
     def _effective_settings(self, overrides: AnswerOverrides) -> AppSettings:
         """Fold per-request overrides into a settings copy without mutating the base."""
 
@@ -958,6 +1154,13 @@ class RagPipeline:
             query_expansion_enabled=bool(effective_settings.query_expansion_enabled),
             reranker_onnx_file=effective_settings.reranker_onnx_file,
             context_neighbor_max_chars=int(effective_settings.context_neighbor_max_chars),
+            context_diversity_enabled=bool(effective_settings.context_diversity_enabled),
+            context_diversity_max_similarity=float(
+                effective_settings.context_diversity_max_similarity
+            ),
+            citation_retry_mode=effective_settings.citation_retry_mode,
+            llm_max_tokens=int(effective_settings.llm_max_tokens),
+            query_expansion_count=int(effective_settings.query_expansion_count),
         )
 
     def _phase_timings(
@@ -1078,6 +1281,9 @@ class RagPipeline:
         usage: tuple[int, int] | None = None,
         condense_note: str | None = None,
         citation_backfilled: bool = False,
+        unsupported_claims: int = 0,
+        prompt_cached: bool = False,
+        prompt_cut: bool = False,
         narrow: PassageFilter | None = None,
         answer_status: str | None = None,
         truncated: bool = False,
@@ -1116,6 +1322,9 @@ class RagPipeline:
             query_variants=phase.query_variants,
             citation_retry_used=citation_retry_used,
             citation_backfilled=citation_backfilled,
+            unsupported_claims=unsupported_claims,
+            prompt_cached=prompt_cached,
+            prompt_cut=prompt_cut,
             request_id=current_request_id(),
             workspace=workspace_of(self._settings),
             usage=usage,
@@ -1161,6 +1370,7 @@ class RagPipeline:
         question: str,
         truncated_history: Sequence[ChatMessage],
         effective_settings: AppSettings,
+        use_memo: bool = True,
     ) -> bool:
         """Whether ``_condense_query`` will actually make its LLM call.
 
@@ -1169,15 +1379,30 @@ class RagPipeline:
         condition would drift the first time either side changed.
         """
 
-        return bool(truncated_history) and (
-            _condense_skip_reason(question, effective_settings) is None
+        return (
+            bool(truncated_history)
+            and _condense_skip_reason(question, effective_settings) is None
+            and self._remembered_rewrite(question, truncated_history, effective_settings, use_memo)
+            is None
         )
+
+    @staticmethod
+    def _remembered_rewrite(
+        question: str,
+        truncated_history: Sequence[ChatMessage],
+        settings: AppSettings,
+        use_memo: bool,
+    ) -> str | None:
+        if not use_memo or int(settings.condense_cache_size) <= 0:
+            return None
+        return condense_memo.get(CondenseMemo.key(question, truncated_history, settings))
 
     def _condense_query(
         self,
         question: str,
         truncated_history: Sequence[ChatMessage],
         effective_settings: AppSettings,
+        use_memo: bool = True,
     ) -> tuple[str, float, str | None, str | None]:
         """Rewrite a follow-up into a standalone retrieval query, when history exists.
 
@@ -1196,6 +1421,13 @@ class RagPipeline:
         skip_reason = _condense_skip_reason(question, effective_settings)
         if skip_reason is not None:
             return question, 0.0, None, skip_reason
+        # The same call made before: its rewrite, with no LLM call (Regenerate, which
+        # passes use_memo=False, asks again — the earlier rewrite may be the problem).
+        remembered = self._remembered_rewrite(
+            question, truncated_history, effective_settings, use_memo
+        )
+        if remembered is not None:
+            return remembered, 0.0, remembered, "remembered"
 
         condense_start = time.monotonic()
         try:
@@ -1222,6 +1454,11 @@ class RagPipeline:
                 condensed.note,
             )
             return question, condense_ms, None, condensed.note
+        condense_memo.put(
+            CondenseMemo.key(question, truncated_history, effective_settings),
+            condensed.text,
+            int(effective_settings.condense_cache_size),
+        )
         return condensed.text, condense_ms, condensed.text, condensed.note
 
     def retrieval_query(self, question: str, history: Sequence[ChatMessage] | None = None) -> str:
@@ -1349,6 +1586,7 @@ class RagPipeline:
         expansion: tuple[list[str], float] | None = None,
         seed: EmbeddedText | None = None,
         traced: bool | None = None,
+        collect_leg_ranks: bool = False,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
 
@@ -1405,7 +1643,9 @@ class RagPipeline:
 
         # Which leg found each candidate, for its trace (none is kept without one).
         traced = for_generation if traced is None else traced
-        leg_ranks: LegRanks | None = {} if traced and self._trace_store is not None else None
+        leg_ranks: LegRanks | None = (
+            {} if (traced and self._trace_store is not None) or collect_leg_ranks else None
+        )
         candidates, embed_ms, search_ms = self._search(
             queries, effective_settings, filenames, tags, tag_variants, narrow, seed, leg_ranks
         )
@@ -1463,15 +1703,20 @@ class RagPipeline:
         for_generation: bool = True,
         narrow: PassageFilter | None = None,
         also_search: str | None = None,
+        explain: bool = False,
     ) -> RetrievalPhase:
         """Retrieval exactly as ``answer`` runs it — query expansion, hybrid search,
         rerank, diversity filter, neighbour expansion — without generating. The eval
         harness scores this, so it measures the pipeline users actually get.
         ``for_generation=False`` is ``POST /search``: the same hybrid search, RRF and
         rerank, minus the LLM query expansion and the neighbour expansion that only
-        feed a prompt."""
+        feed a prompt. ``explain`` (``POST /search``'s): each candidate's rank on the
+        dense and the BM25 search is recorded too (``phase.leg_ranks``)."""
 
         effective_settings = self._effective_settings(overrides or AnswerOverrides())
+        if explain:
+            # With Qdrant's own fusion the leg ranks cost one more query; asked for here.
+            effective_settings = effective_settings.model_copy(update={"trace_leg_ranks": True})
         return self._retrieve_and_rerank(
             question,
             effective_settings,
@@ -1482,6 +1727,7 @@ class RagPipeline:
             also_search=also_search,
             # Search, re-check and the eval harness keep no trace of it.
             traced=False,
+            collect_leg_ranks=explain,
         )
 
     def rerun_retrieval(
@@ -1616,11 +1862,14 @@ class RagPipeline:
         *,
         tags: Sequence[str] | None = None,
         use_cache: bool = True,
+        should_stop: Callable[[], bool] | None = None,
     ) -> GroundedAnswer:
         """``_answer_uncached``, served from the answer cache when it has this question.
 
         ``use_cache=False`` (Regenerate) skips the lookup but still stores the new
-        answer, so the next plain ask gets the regenerated one.
+        answer, so the next plain ask gets the regenerated one. ``should_stop`` (the
+        client has gone) is checked between stages, as on the stream: ``QuestionAbandoned``
+        is raised instead of finishing work nobody will read.
         """
 
         started = time.monotonic()
@@ -1629,7 +1878,9 @@ class RagPipeline:
         if key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
             if hit is None:
-                joined = drain(lead_or_join(self._answer_cache, key, None))
+                joined = drain(lead_or_join(self._answer_cache, key, should_stop))
+                if joined is None:
+                    raise QuestionAbandoned
                 if isinstance(joined, CachedAnswer):
                     hit = joined
                 elif joined is not None:
@@ -1638,8 +1889,17 @@ class RagPipeline:
                 self._log_hit(hit, question, "sync", filenames, tags, overrides)
                 return hit.as_grounded(_cached_timings(started))
         try:
-            grounded = self._answer_uncached(question, overrides, filenames, history, tags)
-            if key is not None and self._answer_cache is not None and not was_degraded():
+            grounded = self._answer_uncached(
+                question, overrides, filenames, history, tags, should_stop, use_memo=use_cache
+            )
+            # A cut-off answer isn't kept: asked again, it may come out whole.
+            if (
+                key is not None
+                and self._answer_cache is not None
+                and not was_degraded()
+                and not grounded.truncated
+                and not grounded.prompt_cut
+            ):
                 self._answer_cache.put(key, CachedAnswer.from_grounded(grounded))
         finally:
             # After the store, so followers find the answer; on a failure they find
@@ -1681,10 +1941,185 @@ class RagPipeline:
                 weak_matches=hit.weak_matches,
             ),
             run=lambda: self._answer_stream_uncached(
-                question, overrides, filenames, history, tags, should_stop
+                question, overrides, filenames, history, tags, should_stop, use_memo=use_cache
             ),
+            # A cut-off answer isn't kept: asked again, it may come out whole.
+            # Nor one whose prompt the provider cut short (its grounding rules gone).
+            keep=lambda done: not done.get("truncated") and not done.get("prompt_cut"),
             on_hit=lambda hit: self._log_hit(hit, question, "stream", filenames, tags, overrides),
         )
+
+    def continuable(
+        self, trace_id: str, trace: QueryTrace | None, settings: AppSettings
+    ) -> ContinuePlan:
+        """What continuing the cut-off answer of trace ``trace_id`` (``trace``, as the
+        trace store has it) needs: its prompt, its answer so far and its passages in
+        source order. ``ContinueRefused`` (with the HTTP status to give) when it can't
+        be continued — checked before the question slot and the 200."""
+
+        if self._trace_store is None:
+            raise ContinueRefused(
+                404, "Traces are off (TRACE_ENABLED), so answers can't be continued."
+            )
+        if trace is None or trace.workspace != workspace_of(settings):
+            raise ContinueRefused(404, f"No trace found with id '{trace_id}'.")
+        if not trace.truncated or not trace.answer or not trace.prompt_messages:
+            raise ContinueRefused(409, "That answer wasn't cut off; there is nothing to continue.")
+        prompt_sources = sorted(
+            (c for c in trace.candidates if c.source_number is not None),
+            key=lambda c: c.source_number or 0,
+        )
+        wanted: dict[str, list[str]] = {}
+        for candidate in prompt_sources:
+            wanted.setdefault(candidate.filename, []).append(candidate.chunk_id)
+        payloads: dict[str, dict[str, object]] = {}
+        for filename, chunk_ids in wanted.items():
+            for payload in self._repository.chunks_for_filename(
+                settings, filename, PassageFilter(chunk_ids=tuple(chunk_ids))
+            ):
+                payloads[str(payload.get("chunk_id"))] = payload
+        chunks: list[RerankedChunk] = []
+        for candidate in prompt_sources:
+            found = payloads.get(candidate.chunk_id)
+            if found is None:
+                # Numbered sources the answer cites by number: one gone shifts them all.
+                raise ContinueRefused(
+                    409,
+                    "A passage that answer was written from has changed or been deleted "
+                    "since; ask the question again instead.",
+                )
+            chunks.append(
+                RerankedChunk(
+                    point_id=candidate.point_id,
+                    filename=candidate.filename,
+                    page=candidate.page,
+                    section=candidate.section,
+                    chunk_id=candidate.chunk_id,
+                    text=str(found.get("text", "")),
+                    retrieval_score=candidate.retrieval_score,
+                    rerank_score=candidate.rerank_score or 0.0,
+                    page_end=_int_or_none(found.get("page_end")),
+                )
+            )
+        return ContinuePlan(trace, chunks)
+
+    def continue_stream(
+        self,
+        plan: ContinuePlan,
+        settings: AppSettings,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> Iterator[StreamEvent]:
+        """The rest of a cut-off answer: the model is shown its prompt and its answer so
+        far, asked to go on, and the two are joined. Citations and spans are worked out
+        again over the whole answer (the sources are the same, in the same order). A new
+        trace is stored; nothing is cached."""
+
+        trace = plan.trace
+        assert trace.answer is not None and trace.prompt_messages is not None
+        started = time.monotonic()
+        config = trace.config
+        if config is not None:
+            settings = settings.model_copy(
+                update={
+                    "llm_provider": config.llm_provider,
+                    "llm_temperature": config.llm_temperature,
+                }
+            )
+        begin_usage()
+        base = base_prompt(trace.prompt_messages)
+        messages = continuation_messages(base, trace.answer, settings)
+        all_sources = source_citations(plan.chunks)
+        new_trace_id = str(uuid.uuid4())
+        yield {
+            "type": "sources",
+            "sources": [_citation_dict(source) for source in all_sources],
+            "trace_id": new_trace_id,
+        }
+        slot = yield from wait_for_model(settings, should_stop)
+        try:
+            yield {
+                "type": "stage",
+                "stage": "reading",
+                "prompt_tokens": estimate_prompt_tokens(messages),
+            }
+            generate_start = time.monotonic()
+            reset_finish_reason()
+            parts: list[str] = []
+            for delta in self._generator.stream(messages, settings):
+                parts.append(delta)
+                yield {"type": "delta", "text": delta}
+            generate_ms = (time.monotonic() - generate_start) * 1000
+            truncated = stopped_at_token_limit()
+            answer = join_continuation(
+                trace.answer,
+                drop_restart(trace.answer, "".join(parts)),
+                prefilled=messages[-1]["role"] == "assistant",
+            )
+            outcome, cited = finish_answer(
+                base,
+                answer,
+                plan.chunks,
+                self._generator,
+                settings,
+                weak_matches=trace.weak_matches,
+            )
+        finally:
+            slot.release()
+        status = answer_status(outcome.answer, len(cited), len(plan.chunks))
+        usage = usage_totals()
+        cited_numbers = {source.source_number for source in cited}
+        timings = StageTimings(
+            embed_ms=0.0,
+            search_ms=0.0,
+            rerank_ms=0.0,
+            generate_ms=generate_ms,
+            total_ms=(time.monotonic() - started) * 1000,
+        )
+        if self._trace_store is not None:
+            self._trace_store.add(
+                replace(
+                    trace,
+                    trace_id=new_trace_id,
+                    created_at=time.time(),
+                    candidates=[
+                        replace(c, cited=c.source_number in cited_numbers) for c in trace.candidates
+                    ],
+                    prompt_messages=messages,
+                    answer=outcome.answer,
+                    cited_source_numbers=sorted(cited_numbers),
+                    timings=timings_dict(timings),
+                    status=trace_status(status),
+                    answer_status=status,
+                    truncated=truncated,
+                    citation_retry_used=outcome.retry_used,
+                    citation_backfilled=outcome.backfilled,
+                    unsupported_claims=outcome.unsupported_claims,
+                    prompt_cached=False,
+                    prompt_cut=was_prompt_cut(),
+                    usage=usage,
+                    cost_usd=usage_cost_usd(settings, usage),
+                    error=None,
+                )
+            )
+        yield {
+            "type": "done",
+            "answer": outcome.answer,
+            "sources": [_citation_dict(source) for source in cited],
+            "timings": timings_dict(timings),
+            "trace_id": new_trace_id,
+            "answer_status": status,
+            "top_rerank_score": max(
+                (c.rerank_score for c in trace.candidates if c.rerank_score is not None),
+                default=None,
+            ),
+            "rerank_min_score": float(settings.rerank_min_score),
+            "weak_matches": trace.weak_matches,
+            "truncated": truncated,
+            "citation_backfilled": outcome.backfilled,
+            "unsupported_claims": outcome.unsupported_claims,
+            "prompt_cut": was_prompt_cut(),
+            "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
+        }
 
     def _store_error_trace(self, run: AnswerRun, error: str) -> None:
         """Record ``run`` as failed (or abandoned), with the answer streamed so far."""
@@ -1747,6 +2182,9 @@ class RagPipeline:
         filenames: Sequence[str] | None = None,
         history: Sequence[ChatMessage] | None = None,
         tags: Sequence[str] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        *,
+        use_memo: bool = True,
     ) -> GroundedAnswer:
         """Retrieve, rerank, and generate a grounded, cited answer.
 
@@ -1761,6 +2199,7 @@ class RagPipeline:
         """
 
         run = self._start_run(question, overrides, filenames, tags, "sync")
+        run.use_memo = use_memo
         # Held from the answer through its citation retry and follow-ups, as the stream
         # does, so another question's call can't slip in between them at a local model.
         slot: GenerationSlot | None = None
@@ -1771,31 +2210,64 @@ class RagPipeline:
         try:
             effective_settings = run.settings = self._effective_settings(run.overrides)
             run.history = self._truncate_history(history, effective_settings)
-            retrieval_query, condense_ms, run.condensed_question, run.condense_note = (
-                self._condense_query(question, run.history, effective_settings)
-            )
+            # The condense and query-expansion calls wait their turn at a local model
+            # like the answer does, and give the place back for retrieval (as the
+            # stream does): sent unguarded, they queued inside Ollama with their
+            # timeout running behind another question's generation.
+            condense_slot: GenerationSlot | None = None
+            try:
+                if self._will_condense(question, run.history, effective_settings, run.use_memo):
+                    condense_slot = drain(wait_for_model(effective_settings, should_stop))
+                retrieval_query, condense_ms, run.condensed_question, run.condense_note = (
+                    self._condense_query(question, run.history, effective_settings, run.use_memo)
+                )
+            finally:
+                if condense_slot is not None:
+                    condense_slot.release()
+            expansion: tuple[list[str], float] | None = None
+            if effective_settings.query_expansion_enabled and retrieval_query.strip():
+                expansion_slot = drain(wait_for_model(effective_settings, should_stop))
+                try:
+                    expansion = self._expand_query(retrieval_query, effective_settings)
+                finally:
+                    expansion_slot.release()
             phase = self._retrieve_and_rerank(
                 retrieval_query,
                 effective_settings,
                 filenames,
                 tags,
+                should_stop,
                 narrow=run.narrow,
                 also_search=question if run.condensed_question else None,
+                expansion=expansion,
             )
             prompt_question, fitted = self._fit_prompt(run, effective_settings, phase)
             selected = fitted.context_chunks
+            generator = self._answer_generator(run, effective_settings)
 
             # Nothing to answer from: the canned answer makes no LLM call, so it must not
-            # queue behind another question's generation at a local model.
-            if selected:
-                slot = GenerationSlot(effective_settings)
-                slot.acquire()
+            # queue behind another question's generation at a local model — nor must an
+            # answer the prompt cache already holds.
+            if selected and not _reply_known(
+                generator,
+                answer_messages(
+                    prompt_question.strip(),
+                    list(selected[: int(effective_settings.max_context_chunks)]),
+                    fitted.history or None,
+                    effective_settings,
+                    weak_matches=phase.below_min_score,
+                ),
+                effective_settings,
+            ):
+                slot = drain(wait_for_model(effective_settings, should_stop))
+                if should_stop is not None and should_stop():
+                    raise QuestionAbandoned
             generate_start = time.monotonic()
             reset_finish_reason()
             grounded = generate_grounded_answer(
                 query=prompt_question,
                 context_chunks=selected,
-                generator=self._generator,
+                generator=generator,
                 settings=effective_settings,
                 history=fitted.history or None,
                 weak_matches=phase.below_min_score,
@@ -1834,7 +2306,7 @@ class RagPipeline:
                     question.strip(),
                     grounded.answer,
                     _cited_chunks(grounded.sources, selected),
-                    self._generator,
+                    generator,
                     effective_settings,
                 )
                 if wants_followups
@@ -1863,6 +2335,9 @@ class RagPipeline:
             timings=timings,
             citation_retry_used=grounded.citation_retry_used,
             citation_backfilled=grounded.citation_backfilled,
+            unsupported_claims=grounded.unsupported_claims,
+            prompt_cached=self._prompt_cached(run),
+            prompt_cut=was_prompt_cut(),
             usage=usage,
             answer_status=status,
             truncated=truncated,
@@ -1880,6 +2355,8 @@ class RagPipeline:
             followups=followups,
             usage=usage,
             cost_usd=cost_usd,
+            prompt_cached=self._prompt_cached(run),
+            prompt_cut=was_prompt_cut(),
         )
 
     def _log_hit(
@@ -1903,6 +2380,20 @@ class RagPipeline:
                 narrowing=narrowing_record((overrides or AnswerOverrides()).narrow),
             ),
         )
+
+    def _answer_generator(self, run: AnswerRun, settings: AppSettings) -> ChatGenerator:
+        """The generator for ``run``'s answer, citation retry and follow-ups: through the
+        prompt cache (PROMPT_CACHE_SIZE) unless it is off or this is a Regenerate."""
+
+        cache = shared_prompt_cache(settings) if run.use_memo else None
+        run.generator = (
+            CachingGenerator(self._generator, cache) if cache is not None else self._generator
+        )
+        return run.generator
+
+    @staticmethod
+    def _prompt_cached(run: AnswerRun) -> bool:
+        return isinstance(run.generator, CachingGenerator) and run.generator.answer_reused
 
     def _start_run(
         self,
@@ -1947,6 +2438,8 @@ class RagPipeline:
         history: Sequence[ChatMessage] | None = None,
         tags: Sequence[str] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        *,
+        use_memo: bool = True,
     ) -> Generator[StreamEvent]:
         """Stream a grounded answer as SSE-ready events: sources, deltas, then done.
 
@@ -1962,6 +2455,7 @@ class RagPipeline:
         """
 
         run = self._start_run(question, overrides, filenames, tags, "stream")
+        run.use_memo = use_memo
         try:
             # Everything this answer calls the LLM for, from the condense on (the
             # follow-ups come after `done` and aren't in its usage).
@@ -2016,11 +2510,11 @@ class RagPipeline:
         # the reader leaves), and gives the place back for retrieval.
         condense_slot: GenerationSlot | None = None
         try:
-            if self._will_condense(run.question, run.history, effective_settings):
+            if self._will_condense(run.question, run.history, effective_settings, run.use_memo):
                 condense_slot = yield from wait_for_model(effective_settings, should_stop)
                 yield {"type": "stage", "stage": "condensing"}
             retrieval_query, condense_ms, run.condensed_question, run.condense_note = (
-                self._condense_query(run.question, run.history, effective_settings)
+                self._condense_query(run.question, run.history, effective_settings, run.use_memo)
             )
         finally:
             if condense_slot is not None:
@@ -2114,23 +2608,27 @@ class RagPipeline:
         )
         if should_stop is not None and should_stop():
             return None
-        # Held until the answer, its citation retry and follow-ups are done, so another
-        # question's call can't slip in between them; released by the caller.
-        # Waiting inside Ollama ran this request's timeout; waiting here doesn't.
-        run.slot = yield from wait_for_model(settings, should_stop)
-        reading: StageEvent = {
-            "type": "stage",
-            "stage": "reading",
-            "prompt_tokens": estimate_prompt_tokens(messages),
-        }
-        eta_ms = expected_prefill_ms(messages, settings)
-        if eta_ms is not None:
-            reading["eta_ms"] = round(eta_ms)
-        yield reading
+        generator = self._answer_generator(run, settings)
+        # An answer the prompt cache holds needs neither the model nor a wait for it.
+        if not _reply_known(generator, messages, settings):
+            # Held until the answer, its citation retry and follow-ups are done, so
+            # another question's call can't slip in between them; released by the
+            # caller. Waiting inside Ollama ran this request's timeout; waiting here
+            # doesn't.
+            run.slot = yield from wait_for_model(settings, should_stop)
+            reading: StageEvent = {
+                "type": "stage",
+                "stage": "reading",
+                "prompt_tokens": estimate_prompt_tokens(messages),
+            }
+            eta_ms = expected_prefill_ms(messages, settings)
+            if eta_ms is not None:
+                reading["eta_ms"] = round(eta_ms)
+            yield reading
         generate_start = time.monotonic()
         first_token_ms = 0.0
         reset_finish_reason()
-        for delta in self._generator.stream(messages, settings):
+        for delta in generator.stream(messages, settings):
             if not run.parts:
                 first_token_ms = (time.monotonic() - run.started) * 1000
             run.parts.append(delta)
@@ -2176,7 +2674,7 @@ class RagPipeline:
             generated.messages,
             generated.answer,
             selected,
-            self._generator,
+            run.generator or self._generator,
             settings,
             weak_matches=phase.below_min_score,
         )
@@ -2209,6 +2707,9 @@ class RagPipeline:
             timings=timings,
             citation_retry_used=outcome.retry_used,
             citation_backfilled=outcome.backfilled,
+            unsupported_claims=outcome.unsupported_claims,
+            prompt_cached=self._prompt_cached(run),
+            prompt_cut=was_prompt_cut(),
             usage=usage,
             answer_status=status,
             truncated=truncated,
@@ -2227,6 +2728,9 @@ class RagPipeline:
             "weak_matches": phase.below_min_score,
             "truncated": truncated,
             "citation_backfilled": outcome.backfilled,
+            "unsupported_claims": outcome.unsupported_claims,
+            "prompt_cached": self._prompt_cached(run),
+            "prompt_cut": was_prompt_cut(),
             "passages_left_out": _picked_left_out(run.narrow, selected),
             "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
         }
@@ -2239,7 +2743,7 @@ class RagPipeline:
                 run.question.strip(),
                 answer,
                 _cited_chunks(cited, selected),
-                self._generator,
+                run.generator or self._generator,
                 settings,
             )
             if followups:

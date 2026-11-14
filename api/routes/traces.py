@@ -8,7 +8,7 @@ import logging
 import threading
 import time
 from collections.abc import Sequence
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -26,6 +26,7 @@ from api.query_log import LoggedQuery
 from api.relevance import UNANSWERED_STATUSES, TraceDiff, score_report, trace_diff
 from api.reranking import RerankedChunk
 from api.routes.deps import (
+    FeedbackStoreDep,
     QueryLogDep,
     QuestionSlotsDep,
     RagPipelineDep,
@@ -77,6 +78,10 @@ def _own_trace(trace_store: TraceStore, settings: AppSettings, trace_id: str) ->
     if trace is None or trace.workspace != workspace_of(settings):
         raise TraceNotFoundError(f"No trace found with id '{trace_id}'.")
     return trace
+
+
+# Ratings read for labels=feedback, newest first (the store keeps at most FEEDBACK_MAX_ROWS).
+FEEDBACK_LABEL_ROWS = 50_000
 
 
 # A score this much above the logged one counts as the documents having moved on.
@@ -310,6 +315,7 @@ def register(app: FastAPI) -> None:
     def trace_score_report(
         trace_store: TraceStoreDep,
         settings: SettingsDep,
+        feedback: FeedbackStoreDep,
         since: Annotated[
             float | None, Query(ge=0, description="Only traces asked since (epoch seconds).")
         ] = None,
@@ -317,9 +323,29 @@ def register(app: FastAPI) -> None:
             float | None,
             Query(ge=0, le=1, description="Only traces answered under this RERANK_MIN_SCORE."),
         ] = None,
+        labels: Annotated[
+            Literal["model", "feedback"],
+            Query(
+                description="What decides each side: the answer's status (model), or "
+                "people's ratings of the answers (feedback; FEEDBACK_ENABLED)."
+            ),
+        ] = "model",
     ) -> ScoreReportResponse:
         # Every archived trace, not the list's newest hundred: 20 a side is the floor
         # for a suggestion, and a thin sample makes a noisy one.
+        ratings: dict[str, str] | None = None
+        if labels == "feedback":
+            if feedback is None:
+                raise HTTPException(
+                    status_code=404, detail="Feedback is not enabled (FEEDBACK_ENABLED)."
+                )
+            ratings = {}
+            # Newest first: a trace's latest answer-level rating stands.
+            for row in feedback.list_recent(
+                limit=FEEDBACK_LABEL_ROWS, workspace=workspace_of(settings)
+            ):
+                if row.trace_id and row.citation_source_number is None and row.kind == "question":
+                    ratings.setdefault(row.trace_id, row.rating)
         report = score_report(
             trace_store.list_summaries(
                 workspace_of(settings), limit=int(settings.trace_store_max_rows)
@@ -328,6 +354,7 @@ def register(app: FastAPI) -> None:
             reranker_model=settings.reranker_model,
             since=since,
             bar=bar,
+            ratings=ratings,
         )
         return ScoreReportResponse(**dataclasses.asdict(report))
 
