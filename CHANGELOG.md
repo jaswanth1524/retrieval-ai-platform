@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11), then five fixes-and-features passes (passes 12 to 16). **Re-index:
+(pass 11), then six fixes-and-features passes (passes 12 to 17). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,33 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 17: `POST /documents/from-url` no longer replaces a document of the same name
+  that came from somewhere else (an upload, another URL) when the name comes from the
+  URL itself: that is a 409, and `replace: true` (CLI `add-url --replace`) replaces it.
+  Naming the document (`filename`) still replaces it, as documented; the same URL still
+  updates its own document. **Re-index: none.**
+- Pass 17: the prompt cache is on (`PROMPT_CACHE_SIZE=256`): a question whose retrieval
+  finds the same passages reuses the model's earlier reply — even after unrelated
+  uploads, which empty the answer cache. Retrieval, citations and the trace still run;
+  Regenerate always asks the model. Measured with qwen2.5 on the handbook set: 95 of 95
+  re-asks after 5 unrelated uploads reused (identical answers), 128 s → 0.3 s for 19
+  questions; an upload relevant to 2 questions made exactly those 2 ask again. Set 0 to
+  turn it off. **Re-index: none.**
+- Pass 17: a cut-off answer (it hit `LLM_MAX_TOKENS`) is never cached; nor is one whose
+  prompt the model read only part of. A streamed answer whose follow-up suggestions
+  failed is dropped from the cache, as the non-streamed one already was.
+- Pass 17: a blank question is a 400 before it takes a question slot, on both question
+  routes (the stream answered 200 and then an error frame).
+- Pass 17: a parse that fails on the server's surroundings rather than the file (a full
+  temp folder, a permission error, a missing module) is error type `parse_failed`, retried
+  by the watcher, the re-indexer and the URL refresher instead of given up on.
+- Pass 17: unchanged pages (a 304, or the same bytes) no longer count against the URL
+  refresher's per-pass batch (`URL_REFRESH_BATCH` counts documents re-queued).
+- Pass 17: a restored document keeps its watched-folder mark only when its file is in
+  that folder here: a backup restored into another instance with the same watch path
+  would otherwise have had its documents deleted by `WATCH_DELETE_MISSING`.
+- Pass 17: dependencies: `soupsieve` 2.9 → 4.1 (a major version; two advisories) and
+  `opentelemetry-api` 1.45.1 → 1.45.2 (one advisory).
 - Pass 16: tables in OpenDocument files (ODS sheets, and tables in ODT and ODP) keep a
   value after a run of blank cells under its own column: a row "Ann, (two blanks), 9"
   under "Name | Q1 | Q2 | Total" read "Q2: 9" and now reads "Total: 9". **Re-index:
@@ -336,6 +363,47 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 17: **Continue** for an answer cut off at the token limit
+  (`POST /questions/continue` with its `trace_id`): the model carries on from where it
+  stopped (the partial answer is passed as its own message to continue — asked in words,
+  qwen2.5 started over every time) and the two are joined, citations worked out over the
+  whole. The button shows under a cut-off answer.
+- Pass 17: `prompt_cut` on answers, traces and `docrag_prompt_cuts_total`: the model read
+  far less of the prompt than was sent — its context window cut it, grounding rules
+  first (measured: 1026 tokens read of ~12k sent at a 2048 window). The answer says so.
+- Pass 17: `unsupported_claims` (answers, traces, `docrag_unsupported_claims_total`, the
+  answer eval's `unsupported_claims_mean`): citing sentences no cited passage supports.
+- Pass 17: follow-up rewrites are remembered (`CONDENSE_CACHE_SIZE`, 256): Retry, an
+  edited follow-up asked again or another tab skip the 2-7 s rewrite call.
+- Pass 17: tuning and eval — `harness sweep --grid` (passage-selection settings scored
+  over one retrieval run); `POST /search` `explain` with `expect_chunk_id` /
+  `expect_filename` says where a passage was lost (CLI `search --explain --expect`, a
+  Search panel option); `harness generate` (eval questions written from sampled
+  passages) and `harness from-queries` (a dataset drafted from the query log); the score
+  report can take its sides from people's ratings (`labels=feedback`); `harness diff`
+  gives a 95% interval for each change; dataset rows can carry `filenames` / `tags`; the
+  answer eval reports `cited_chunk_precision`.
+- Pass 17: ingest and ops — background imports of a zip or a backup (`background=true`
+  on `/documents/archive`, `/import`, `/backups/{name}/restore`; `GET/DELETE
+  /documents/imports[/{id}]`; CLI `import --background`): every document is queued as
+  room frees instead of being deferred; `GET /admin/doctor` / `docrag doctor` / Settings
+  check (risky settings: backups, disk, memory, access); a stored audit trail
+  (`AUDIT_LOG_PATH`, `GET /admin/audit`, `docrag audit`); `docrag sync DIR [--delete]`
+  (with `content_sha256s` in `GET /documents`); `INGEST_WORKERS`; RTF, SRT/VTT subtitles
+  (a section per minute) and reStructuredText/AsciiDoc/LaTeX as plain text; gauges for
+  backups, free disk and the watched folder, with a Grafana dashboard and Prometheus alert
+  rules in `docs/observability/`.
+- Pass 17: `docrag_url_refresh_overdue` (URL-fetched documents a refresh pass left
+  unchecked) and `docrag_ingest_job_failures_total{kind}` (failed jobs by what started
+  them), with an alert and a dashboard panel each; `/health/ready`'s `last_backup` has
+  `originals_missing` (documents that backup can't restore); `docrag ingest --background`
+  sends a zip as a background import and waits until every document is queued.
+- Pass 17: chat and UI — Recently deleted conversations (kept 30 days in this browser,
+  Restore or Delete now); "Check against the documents" for saved answers; "Ask <model>"
+  in Reformat and versions side by side; the viewer's Contents and Go to page
+  (`GET /documents/{f}/outline`) and Copy with citation; Ask about / Similar passages /
+  Copy as quote on selected text; Search grouped by document, recent searches, CSV
+  download and `j`/`k`; a switch for the single-key shortcuts; Test key in Settings.
 - Pass 16, tuning: `POST /traces/what-if` (UI: "Try a bar" in the score report; CLI
   `docrag traces what-if --min-score`) searches the latest traced questions again under
   a proposed bar, floor or fallback and says how many would be answered. Workspaces can
@@ -894,6 +962,19 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 17: `/questions` (not streamed) stops when its client leaves, before its next
+  expensive stage, as the stream does; its rewrite and query-expansion calls wait their
+  turn at a local model. Citation markers past the last source are removed. "Insufficient"
+  and "does not contain" count as a refusal only when the sentence is about the sources.
+  Chinese and Japanese questions no longer always pay for a rewrite call. OpenAI-compatible
+  streams report token usage. A sitemap page no longer replaces a document uploaded after
+  the import began. Backup checks don't decompress past a cap, one at a time. Old-backup
+  pruning keeps the newest one that passed its check. The watcher stops reading files once
+  the queue is full, and skips Office lock files. Ratings, "not relevant" and "use this
+  version" stay in their own conversation, not an edited copy of it. The server's
+  settings are read again when its health changes. Stopped answers can't be rated. The
+  corpus panel keeps staged files across panel switches. Undo after a delete lasts 10 s.
+  Older Safari shows citations as plain text instead of a blank page.
 - Pass 16: two pages of one sitemap import with the same file name no longer replace
   each other (or an upload of that name); two watched folders into one workspace are
   refused at startup (they re-indexed each other's files forever, and a delete in one

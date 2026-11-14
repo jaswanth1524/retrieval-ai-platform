@@ -16,7 +16,7 @@ from litellm import exceptions as litellm_exceptions
 from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
-from api.metrics import llm_cost_usd_total, llm_tokens_total
+from api.metrics import llm_cost_usd_total, llm_tokens_total, prompt_cuts_total
 from api.settings import AppSettings
 
 _OLLAMA_MODEL_PREFIXES = ("ollama/", "ollama_chat/")
@@ -236,6 +236,7 @@ def begin_usage() -> None:
 
     _last_call.usage = [0, 0]
     _last_call.degraded = False
+    _last_call.prompt_cut = False
 
 
 def note_degraded() -> None:
@@ -287,7 +288,39 @@ def _record_finish_reason(response: object) -> None:
             _last_call.finish_reason = reason
 
 
-def _count_usage(response: object, settings: AppSettings) -> None:
+# A prompt the provider reports as this much smaller than the estimate was cut to fit
+# its context window (measured with qwen2.5 at num_ctx 2048: 1026 tokens reported for a
+# prompt estimated at 12219; uncut prompts report 0.9-1.6x the estimate). Ollama drops
+# the start of the prompt — the system prompt with the grounding rules — silently.
+PROMPT_CUT_RATIO = 0.5
+# Below this estimate a short prompt's ratio says nothing.
+_PROMPT_CUT_MIN_ESTIMATE = 500
+
+
+def _note_prompt_cut(messages: Sequence[ChatMessage] | None, reported: int) -> None:
+    if messages is None or reported <= 0:
+        return
+    estimate = _estimated_prompt_tokens(messages)
+    if estimate >= _PROMPT_CUT_MIN_ESTIMATE and reported < estimate * PROMPT_CUT_RATIO:
+        _last_call.prompt_cut = True
+        prompt_cuts_total.inc()
+        logger.warning(
+            "The provider read %d prompt tokens of about %d sent: the prompt was cut to "
+            "fit its context window (raise OLLAMA_NUM_CTX, or set LLM_CONTEXT_WINDOW).",
+            reported,
+            estimate,
+        )
+
+
+def was_prompt_cut() -> bool:
+    """Whether a call on this thread since ``begin_usage`` had its prompt cut."""
+
+    return bool(getattr(_last_call, "prompt_cut", False))
+
+
+def _count_usage(
+    response: object, settings: AppSettings, messages: Sequence[ChatMessage] | None = None
+) -> None:
     """Add a response's reported token usage to ``docrag_llm_tokens_total``.
 
     Only what the provider reports: a stream carries usage on its last chunk when the
@@ -308,6 +341,8 @@ def _count_usage(response: object, settings: AppSettings) -> None:
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             llm_tokens_total.labels(provider=provider, kind=kind).inc(value)
             counted[index] = value
+            if kind == "prompt":
+                _note_prompt_cut(messages, value)
             if isinstance(totals, list):
                 totals[index] += value
     cost = usage_cost_usd(settings, (counted[0], counted[1]))
@@ -553,17 +588,45 @@ class GenerationSlot:
         self.release()
 
 
+# OpenAI-compatible servers (by base URL) that refused ``stream_options``: asked once,
+# then never again in this process.
+_usage_refused: set[str] = set()
+
+
 def _stream_kwargs(settings: AppSettings) -> dict[str, object]:
     """Ask for token usage on a stream's last chunk where the provider supports it.
 
     Without it LiteLLM's Ollama stream reported no usage at all (measured), so the
-    prompt size a local model read was never known. Not sent to OpenAI-compatible
-    servers: some reject the field.
+    prompt size a local model read was never known. OpenAI-compatible servers (vLLM,
+    llama.cpp, LM Studio) mostly accept it too; one that refuses it is remembered
+    (``_open_stream``) and asked without it from then on.
     """
 
-    if _provider(settings) in ("ollama", "openai"):
+    provider = _provider(settings)
+    if provider in ("ollama", "openai") or (
+        provider == "openai_compatible"
+        and settings.openai_compatible_base_url not in _usage_refused
+    ):
         return {"stream_options": {"include_usage": True}}
     return {}
+
+
+def _open_stream(client: CompletionClient, settings: AppSettings, **kwargs: object) -> object:
+    """``client(stream=True, …)`` with usage asked for where it may be; an
+    OpenAI-compatible server that rejects ``stream_options`` is asked once more without
+    it, and remembered."""
+
+    extra = _stream_kwargs(settings)
+    try:
+        return client(stream=True, **extra, **kwargs)
+    except Exception as exc:
+        if not extra or _provider(settings) != "openai_compatible":
+            raise
+        if "stream_options" not in str(exc) and "include_usage" not in str(exc):
+            raise
+        _usage_refused.add(settings.openai_compatible_base_url)
+        logger.info("The OpenAI-compatible server refused stream_options; asking without it.")
+        return client(stream=True, **kwargs)
 
 
 class LiteLLMGenerator:
@@ -601,7 +664,7 @@ class LiteLLMGenerator:
                 )
 
             try:
-                response = self.completion_client(
+                call_kwargs: dict[str, object] = dict(
                     model=model,
                     messages=list(messages),
                     temperature=float(settings.llm_temperature),
@@ -613,13 +676,21 @@ class LiteLLMGenerator:
                     # param for the selected model rather than raising, so provider
                     # quirks don't turn into a hard failure.
                     drop_params=True,
-                    **({"stream": True, **_stream_kwargs(settings)} if streamed else {}),
                     **provider_kwargs,
+                )
+                response = (
+                    _open_stream(self.completion_client, settings, **call_kwargs)
+                    if streamed
+                    else self.completion_client(**call_kwargs)
                 )
                 if streamed and not _is_whole_response(response):
                     # Condense, summary parts and /questions read prompts too: their
                     # reads teach the rate the next "reading" stage's estimate uses.
-                    return "".join(self._read_stream(response, settings, on_first_chunk=read_rate))
+                    return "".join(
+                        self._read_stream(
+                            response, settings, on_first_chunk=read_rate, messages=messages
+                        )
+                    )
             except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
                 raise _connection_error(exc, settings, timeout) from exc
             except GenerationError:
@@ -633,7 +704,7 @@ class LiteLLMGenerator:
                     raise _connection_error(exc, settings, timeout) from exc
                 raise _provider_failure(exc) from exc
         _record_finish_reason(response)
-        _count_usage(response, settings)
+        _count_usage(response, settings, messages)
         return extract_completion_text(response)
 
     def _read_stream(
@@ -641,6 +712,7 @@ class LiteLLMGenerator:
         response: object,
         settings: AppSettings,
         on_first_chunk: Callable[[], None] | None = None,
+        messages: Sequence[ChatMessage] | None = None,
     ) -> Iterator[str]:
         """The text deltas of a streamed response; records its finish reason and the
         usage its last report carries, and releases the response however it ends."""
@@ -666,7 +738,7 @@ class LiteLLMGenerator:
             _close_stream(response)
         if last_with_usage is not None:
             # The last report only: some providers repeat running totals per chunk.
-            _count_usage(last_with_usage, settings)
+            _count_usage(last_with_usage, settings, messages)
 
     def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterator[str]:
         """Call the LiteLLM provider with ``stream=True`` and yield assistant text deltas.
@@ -691,7 +763,9 @@ class LiteLLMGenerator:
                     settings, _estimated_prompt_tokens(messages), time.monotonic() - started
                 )
 
-            response = self.completion_client(
+            response = _open_stream(
+                self.completion_client,
+                settings,
                 model=model,
                 messages=list(messages),
                 temperature=float(settings.llm_temperature),
@@ -699,11 +773,11 @@ class LiteLLMGenerator:
                 timeout=timeout,
                 num_retries=int(settings.llm_num_retries),
                 drop_params=True,
-                stream=True,
-                **_stream_kwargs(settings),
                 **provider_kwargs,
             )
-            yield from self._read_stream(response, settings, on_first_chunk=read_rate)
+            yield from self._read_stream(
+                response, settings, on_first_chunk=read_rate, messages=messages
+            )
         except (LiteLLMAPIConnectionError, LiteLLMTimeout) as exc:
             raise _connection_error(exc, settings, timeout) from exc
         except Exception as exc:

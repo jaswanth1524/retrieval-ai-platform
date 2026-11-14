@@ -240,6 +240,32 @@ def cited_numbers(text: str, max_number: int) -> set[int]:
     return numbers
 
 
+# A marker naming only sources past the last one on offer is a miscount ("[7]" with
+# four sources), not a reference — below this. At or above it ("[2019]", "[120]") it is
+# more likely the document's own bracketed number, quoted, and is left alone.
+_STRAY_MARKER_MAX = 100
+
+
+def strip_stray_markers(answer: str, max_number: int) -> str:
+    """``answer`` without markers that cite only sources past ``max_number``.
+
+    Left in, a dead ``[9]`` stayed in the text with nothing to open, and an answer
+    whose only markers were dead counted as citing (so no retry or backfill ran) while
+    its status said uncited. A marker with any number on offer is kept whole.
+    """
+
+    def keep_or_drop(match: re.Match[str]) -> str:
+        numbers: list[int] = []
+        for part in match.group(1).split(","):
+            bounds = _CITATION_RANGE_SEP.split(part.strip())
+            numbers.extend((int(bounds[0]), int(bounds[-1])))
+        if all(max_number < number < _STRAY_MARKER_MAX for number in numbers):
+            return ""
+        return match.group(0)  # the space before it included
+
+    return _MARKER_WITH_SPACE_RE.sub(keep_or_drop, answer)
+
+
 # Exact spans. No model involved: each answer sentence's content words are matched
 # against the cited chunk's sentences (and pairs of them, for a claim that spans two),
 # and the best-covering one is quoted. Below these bars nothing is claimed, rather than
@@ -392,6 +418,36 @@ def _claims_by_source(answer: str, max_number: int) -> dict[int, list[set[str]]]
             claims.setdefault(number, []).append(words)
         previous = words
     return claims
+
+
+def unsupported_claims(answer: str, chunks: Sequence[RerankedChunk]) -> int:
+    """How many of ``answer``'s citing sentences rest on no passage of the sources they
+    cite: no span (``_best_span``) in any of them. Out-of-range numbers are ignored; a
+    sentence with too few content words to match counts as supported (it claims
+    nothing a span could show)."""
+
+    unsupported = 0
+    previous: tuple[set[str], set[int]] | None = None
+    sentences: list[tuple[set[str], set[int]]] = []
+    for piece in _ANSWER_SENTENCE_RE.split(answer):
+        if not piece.strip():
+            continue
+        leading = _LEADING_MARKERS_RE.match(piece)
+        if leading is not None and previous is not None:
+            previous[1].update(cited_numbers(leading.group(0), len(chunks)))
+            piece = piece[leading.end() :]
+        current = (_content_words(_CITATION_RE.sub(" ", piece)), cited_numbers(piece, len(chunks)))
+        sentences.append(current)
+        previous = current
+    for words, numbers in sentences:
+        if not numbers or len(words) < SPAN_MIN_SHARED_WORDS:
+            continue
+        if not any(
+            _best_span(words, _span_index(chunks[number - 1].text)) is not None
+            for number in numbers
+        ):
+            unsupported += 1
+    return unsupported
 
 
 class _SpanIndex:
@@ -733,9 +789,23 @@ def only_declines(answer: str) -> bool:
 _DECLINE_CITATION_CHECK_MAX = 1000
 
 
+# English hints that also turn up in ordinary answers ("employees with insufficient
+# leave", "the form does not contain a signature field"): they count only in a
+# sentence that names the sources or the information (_SOURCES_SUBJECT_RE).
+_SUBJECT_BOUND_HINTS = frozenset({"insufficient", "do not contain", "does not contain"})
+_INSUFFICIENCY_SUBJECT_RE = re.compile(_SOURCES_SUBJECT_RE.pattern + r"|\b(?:docs?|data|details)\b")
+
+
 def states_insufficiency(answer: str) -> bool:
     lowered = _normalize_negation(_fold(answer))
-    return any(hint in lowered for hint in _INSUFFICIENCY_HINTS)
+    if any(hint in lowered for hint in _INSUFFICIENCY_HINTS if hint not in _SUBJECT_BOUND_HINTS):
+        return True
+    for sentence in _ANSWER_SENTENCE_RE.split(lowered):
+        if any(
+            hint in sentence for hint in _SUBJECT_BOUND_HINTS
+        ) and _INSUFFICIENCY_SUBJECT_RE.search(sentence):
+            return True
+    return False
 
 
 # Below this much of the first answer, a retry has too little to rewrite: skipped.
@@ -843,6 +913,9 @@ class CitationOutcome:
     retry_ms: float = 0.0
     # The citations were added by backfill_citations, not written by the model.
     backfilled: bool = False
+    # Citing sentences none of whose sources holds a passage they rest on (no span
+    # matched): a number to watch, not a verdict on the citation (finish_answer).
+    unsupported_claims: int = 0
 
 
 def _citation_steps(settings: AppSettings) -> tuple[bool, bool]:
@@ -1013,17 +1086,19 @@ def finalize_citations(
     False whenever the answer contains any ``[n]`` marker, and ``cited`` is only
     non-empty when a marker matched — so it never changes the outcome. It's kept as a
     cheap, explicit statement of the intent ("only retry when we ended up with zero
-    sources"). Note the deliberate gap it does *not* close: an answer citing ``[9]``
-    when only 3 sources exist yields empty ``cited`` but no retry, because the marker
-    check in ``needs_citation_retry`` short-circuits first. Retrying there would mean
-    re-prompting a model that did cite, just badly, so it's left alone.
+    sources"). A marker citing only sources past the last one (``[9]`` with 3 sources)
+    is stripped first (``strip_stray_markers``), so such an answer takes the uncited
+    path — backfill, or the retry — instead of keeping a dead marker.
 
     ``context_chunks`` (the prompt's sources, in order) let an uncited answer be
     backfilled without an LLM call (CITATION_RETRY_MODE); ``weak_matches`` skips adding
     citations to a refusal the weak-match prompt asked to be uncited.
     """
 
-    answer = strip_echoed_source_headers(answer)
+    answer = strip_stray_markers(
+        strip_echoed_source_headers(answer),
+        max((source.source_number for source in all_sources), default=0),
+    )
     cited = cited_sources(answer, all_sources)
     final_messages = list(prompt_messages)
     retry_used = False

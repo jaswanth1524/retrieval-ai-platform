@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
+from collections.abc import Sequence
+
 from prometheus_client import Counter, Gauge, Histogram, Info
 
 # Buckets tuned for a local-Ollama RAG pipeline: sub-second retrieval/rerank stages,
@@ -42,6 +45,13 @@ ingest_jobs_total = Counter(
     "docrag_ingest_jobs_total",
     "Total background ingestion jobs, labeled by outcome and (for outcome=failed) error_type.",
     labelnames=("outcome", "error_type"),
+)
+
+ingest_job_failures_total = Counter(
+    "docrag_ingest_job_failures_total",
+    "Failed ingestion jobs (cancelled ones left out), by what started them: upload, "
+    "url, reindex, restore, import, watch.",
+    ["kind"],
 )
 
 # Whole-job wall clock (parse through the last upsert), successful or not. Ingest of a
@@ -122,6 +132,20 @@ citation_retries_total = Counter(
     "Answers that cited nothing and were regenerated once to add citations.",
 )
 
+prompt_cuts_total = Counter(
+    "docrag_prompt_cuts_total",
+    "LLM calls whose prompt the provider read far less of than was sent: cut to fit "
+    "its context window (OLLAMA_NUM_CTX too small).",
+)
+prompt_cache_hits_total = Counter(
+    "docrag_prompt_cache_hits_total",
+    "Answers whose LLM reply came from the prompt cache (PROMPT_CACHE_SIZE).",
+)
+unsupported_claims_total = Counter(
+    "docrag_unsupported_claims_total",
+    "Citing sentences of generated answers that no passage of their cited sources "
+    "supports (no span matched).",
+)
 citation_backfills_total = Counter(
     "docrag_citation_backfills_total",
     "Answers that cited nothing and had citations added by matching their sentences "
@@ -170,6 +194,12 @@ url_refresh_total = Counter(
     ["outcome"],
 )
 
+url_refresh_overdue = Gauge(
+    "docrag_url_refresh_overdue",
+    "URL-fetched documents due a refresh that the last pass left unchecked (its batch "
+    "was spent, a fetch was deferred, or its own jobs were still indexing).",
+)
+
 corpus_documents = Gauge(
     "docrag_corpus_documents",
     "Indexed documents per workspace, as of that workspace's last document listing.",
@@ -177,17 +207,58 @@ corpus_documents = Gauge(
 )
 
 
+# Ops gauges: what the shipped alert rules (docs/observability/) watch.
+backup_last_success_timestamp = Gauge(
+    "docrag_backup_last_success_timestamp_seconds",
+    "When the workspace's last scheduled backup was written and verified (Unix seconds).",
+    ["workspace"],
+)
+backup_last_ok = Gauge(
+    "docrag_backup_last_ok",
+    "1 when the workspace's last scheduled backup attempt succeeded, 0 when it failed.",
+    ["workspace"],
+)
+storage_free_bytes = Gauge(
+    "docrag_storage_free_bytes",
+    "Free bytes on the disk each enabled store writes to (read at scrape time).",
+    ["setting"],
+)
+watch_files = Gauge(
+    "docrag_watch_files",
+    "Files in a watched folder as of its last pass, by state.",
+    ["folder", "state"],
+)
+
+
+def watch_storage(directories: Sequence[tuple[str, str]]) -> None:
+    """Report free disk for each (setting, directory) whenever /metrics is scraped."""
+
+    for setting, directory in directories:
+
+        def free(path: str = directory) -> float:
+            try:
+                return float(shutil.disk_usage(path).free)
+            except OSError:
+                return float("nan")
+
+        storage_free_bytes.labels(setting=setting).set_function(free)
+
+
 def forget_workspace_metrics(workspace: str) -> None:
     """Drop a deleted workspace's per-workspace series, or its last value stays exported."""
 
-    try:
-        corpus_documents.remove(workspace)
-    except KeyError:
-        pass  # never listed since the process started
+    for gauge in (corpus_documents, backup_last_success_timestamp, backup_last_ok):
+        try:
+            gauge.remove(workspace)
+        except KeyError:
+            pass  # never set since the process started
 
 
-def observe_question_timings(timings: dict[str, float]) -> None:
-    """Record one question's per-stage timings (input in milliseconds) as seconds."""
+def observe_question_timings(timings: dict[str, float], *, prompt_cached: bool = False) -> None:
+    """Record one question's per-stage timings (input in milliseconds) as seconds.
+
+    ``prompt_cached``: the reply came from the prompt cache, so no model ran — its
+    near-zero generate, first-token and total times would read as a fast model."""
 
     question_stage_seconds.labels(stage="condense").observe(timings.get("condense_ms", 0.0) / 1000)
     # Two distinct stages at opposite ends of retrieval — query-variant generation runs
@@ -202,7 +273,8 @@ def observe_question_timings(timings: dict[str, float]) -> None:
     question_stage_seconds.labels(stage="embed").observe(timings["embed_ms"] / 1000)
     question_stage_seconds.labels(stage="search").observe(timings["search_ms"] / 1000)
     question_stage_seconds.labels(stage="rerank").observe(timings["rerank_ms"] / 1000)
-    question_stage_seconds.labels(stage="generate").observe(timings["generate_ms"] / 1000)
+    if not prompt_cached:
+        question_stage_seconds.labels(stage="generate").observe(timings["generate_ms"] / 1000)
     # Its own series, not folded into "generate": it is a second LLM round trip that
     # fires on a minority of questions, so averaging it into generate would smear a
     # bimodal distribution into one meaningless number.
@@ -215,6 +287,9 @@ def observe_question_timings(timings: dict[str, float]) -> None:
     )
     # Streamed questions only: /questions has no first token, and a 0 there would
     # drag the series toward an instant answer nobody saw.
+    if prompt_cached:
+        prompt_cache_hits_total.inc()
+        return
     if timings.get("first_token_ms", 0.0) > 0:
         question_stage_seconds.labels(stage="first_token").observe(timings["first_token_ms"] / 1000)
     question_stage_seconds.labels(stage="total").observe(timings["total_ms"] / 1000)

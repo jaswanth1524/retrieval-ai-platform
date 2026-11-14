@@ -635,6 +635,20 @@ describe('ChatMessage', () => {
       expect(screen.queryByTestId('chat-message-feedback-down')).not.toBeInTheDocument();
     });
 
+    it('renders no feedback buttons on an answer stopped part-way', () => {
+      render(
+        <ChatMessage
+          turn={makeTurn({ role: 'assistant', content: 'The answer', traceId: 't1', stopped: true })}
+          engineerMode={false}
+          regenerateQuestion="What is the answer?"
+          onFeedback={vi.fn()}
+          feedbackEnabled
+        />,
+      );
+
+      expect(screen.queryByTestId('chat-message-feedback-up')).not.toBeInTheDocument();
+    });
+
     it('reports a full payload on a thumbs-up click, then disables both buttons', async () => {
       const onFeedback = vi.fn();
       render(

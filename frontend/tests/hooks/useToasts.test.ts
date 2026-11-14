@@ -6,6 +6,21 @@ describe('useToasts', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  it('keeps a toast with an action (Undo) up as long as a failure', () => {
+    const { result } = renderHook(() => useToasts());
+    act(() => {
+      result.current.push({ tone: 'info', title: 'Deleted', action: { label: 'Undo', run: () => {} } });
+    });
+    act(() => {
+      vi.advanceTimersByTime(TOAST_TIMEOUT_MS + 100);
+    });
+    expect(result.current.toasts).toHaveLength(1);
+    act(() => {
+      vi.advanceTimersByTime(FAILURE_TOAST_TIMEOUT_MS);
+    });
+    expect(result.current.toasts).toHaveLength(0);
+  });
+
   it('pushes a toast and auto-dismisses it after the timeout', () => {
     const { result } = renderHook(() => useToasts());
 

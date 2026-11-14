@@ -1259,6 +1259,32 @@ describe('useChat feature pack', () => {
     expect(result.current.turns[1].saved).toBe(true);
   });
 
+  it('rates and marks an answer in its own conversation only, not in an edited copy', async () => {
+    answeringStream('First answer.');
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.ask('First question');
+      await result.current.ask('Second question');
+    });
+    const originalId = result.current.activeConversationId!;
+    const answerId = result.current.turns[1].id;
+    await act(async () => {
+      await result.current.editAndResend(result.current.turns[2].id, 'Second, edited');
+    });
+    expect(result.current.turns[1].id).toBe(answerId);
+    act(() => result.current.setTurnFeedback(answerId, 'up'));
+    act(() => result.current.setSourceIrrelevant(answerId, 1, true));
+    expect(result.current.turns[1].feedback).toBe('up');
+    act(() => result.current.switchConversation(originalId));
+    expect(result.current.turns[1].feedback).toBeUndefined();
+    expect(result.current.turns[1].irrelevantSources).toBeUndefined();
+    // Named explicitly (a rating taken back after a switch), it lands where it was given.
+    const copyId = result.current.conversations.find((c) => c.id !== originalId)!.id;
+    act(() => result.current.setTurnFeedback(answerId, undefined, copyId));
+    act(() => result.current.switchConversation(copyId));
+    expect(result.current.turns[1].feedback).toBeUndefined();
+  });
+
   it('edits a question about picked passages without the conversation scope', async () => {
     answeringStream('Answer.');
     const { result } = renderHook(() => useChat());

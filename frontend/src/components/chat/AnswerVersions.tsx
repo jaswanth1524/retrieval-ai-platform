@@ -30,6 +30,9 @@ export default function AnswerVersions({
 }: AnswerVersionsProps) {
   const [shown, setShown] = useState<number | null>(null);
   const [comparing, setComparing] = useState(false);
+  // The version and the current answer next to each other (stacked on a narrow screen):
+  // a model compared with another reads better whole than as a word diff.
+  const [sideBySide, setSideBySide] = useState(false);
   const Markdown = useMarkdownRenderer();
   // Opening and hiding swap the controls: focus goes to the one that takes its place.
   const toggleRef = useRef<HTMLButtonElement | null>(null);
@@ -112,6 +115,20 @@ export default function AnswerVersions({
             {comparing ? 'Show it as written' : 'Compare with the current answer'}
           </button>
         )}
+        {current !== undefined && (
+          <button
+            type="button"
+            className="chat-message__action"
+            aria-pressed={sideBySide}
+            onClick={() => {
+              setSideBySide(!sideBySide);
+              setComparing(false);
+            }}
+            data-testid="answer-version-side-by-side"
+          >
+            {sideBySide ? 'One at a time' : 'Side by side'}
+          </button>
+        )}
         {onUse && (
           <button
             type="button"
@@ -126,7 +143,18 @@ export default function AnswerVersions({
           </button>
         )}
       </div>
-      {comparing && current !== undefined ? (
+      {sideBySide && current !== undefined ? (
+        <div className="chat-message__versions-side" data-testid="answer-version-side">
+          <div className="chat-message__markdown" dir="auto">
+            <p className="chat-message__versions-meta">This version{version.model ? ` · ${version.model}` : ''}</p>
+            {Markdown ? <Markdown text={version.content} components={components} /> : <p className="chat-message__plain">{version.content}</p>}
+          </div>
+          <div className="chat-message__markdown" dir="auto">
+            <p className="chat-message__versions-meta">The current answer</p>
+            {Markdown ? <Markdown text={current} components={components} /> : <p className="chat-message__plain">{current}</p>}
+          </div>
+        </div>
+      ) : comparing && current !== undefined ? (
         <VersionDiff before={version.content} after={current} />
       ) : (
         <div className="chat-message__markdown" dir="auto" data-testid="answer-version-content">

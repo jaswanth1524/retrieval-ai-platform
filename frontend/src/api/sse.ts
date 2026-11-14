@@ -28,6 +28,12 @@ export type QuestionStreamEvent =
       weak_matches?: boolean;
       truncated?: boolean;
       citation_backfilled?: boolean;
+      /** The provider read far less of the prompt than was sent (its window cut it). */
+      prompt_cut?: boolean;
+      /** The LLM reply came from the server's prompt cache. */
+      prompt_cached?: boolean;
+      /** Citing sentences no passage of their sources supports. */
+      unsupported_claims?: number;
       /** Picked passages the prompt had no room for (absent from older servers). */
       passages_left_out?: number;
       chunks_read?: number;

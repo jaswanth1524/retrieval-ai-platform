@@ -36,14 +36,14 @@ import os
 import platform
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from api.documents import CHUNKER_VERSION, SUPPORTED_EXTENSIONS
 from api.generation import ChatGenerator, ChatMessage
-from api.pipeline import RagPipeline
+from api.pipeline import RagPipeline, trace_model_name
 from api.reranking import Reranker
 from api.retrieval import QueryEmbeddingProvider, embed_query, points_to_chunks
 from api.settings import AppSettings, get_settings
@@ -110,6 +110,10 @@ class RetrievalExample:
     # A question about several things (a comparison): the answer must state one of
     # each group, e.g. [["sixty euros", "60 euros"], ["forty-five euros", "45 euros"]].
     answer_contains_all: tuple[tuple[str, ...], ...] = ()
+    # The scope the question is asked in, as the API's ``filenames`` and ``tags``:
+    # only those documents are searched (an empty set: the whole corpus).
+    filenames: frozenset[str] = frozenset()
+    tags: frozenset[str] = frozenset()
 
     @property
     def fact_groups(self) -> tuple[tuple[str, ...], ...]:
@@ -190,6 +194,7 @@ def rank_for_question(
     arm: str = "reranked",
     generator: ChatGenerator | None = None,
     history: Sequence[dict[str, str]] = (),
+    tags: Sequence[str] | None = None,
 ) -> RankedResult:
     """The ranking one question gets from ``arm`` (default: what the API serves).
 
@@ -220,6 +225,7 @@ def rank_for_question(
     phase = _pipeline(repository, embedding_provider, reranker, settings, generator).retrieve(
         question,
         filenames=filenames,
+        tags=tags,
         also_search=raw_question if question != raw_question else None,
     )
     ranked = phase.fused_candidates if arm == "fused" else phase.context_chunks
@@ -234,6 +240,95 @@ def rank_for_question(
             "rerank_ms": phase.rerank_ms,
         },
     )
+
+
+def scored_for_question(
+    question: str,
+    *,
+    repository: Any,
+    embedding_provider: QueryEmbeddingProvider,
+    reranker: Reranker,
+    settings: AppSettings,
+    generator: ChatGenerator | None = None,
+    history: Sequence[dict[str, str]] = (),
+    filenames: Sequence[str] | None = None,
+    tags: Sequence[str] | None = None,
+) -> list[Any]:
+    """Every candidate the cross-encoder scored for ``question``, best first — what
+    ``harness sweep`` replays passage selection over (condensed first for a follow-up,
+    as ``rank_for_question`` does)."""
+
+    pipeline = _pipeline(repository, embedding_provider, reranker, settings, generator)
+    query = question
+    if history:
+        turns: list[ChatMessage] = [
+            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+            for m in history
+        ]
+        query = pipeline.retrieval_query(question, turns)
+    phase = pipeline.retrieve(
+        query,
+        filenames=filenames,
+        tags=tags,
+        also_search=question if query != question else None,
+    )
+    return list(phase.scored_chunks)
+
+
+def run_sweep(
+    examples: Sequence[RetrievalExample],
+    collaborators: Collaborators,
+    grid: Mapping[str, Sequence[Any]],
+    ks: Sequence[int],
+    rank_by: str,
+) -> dict[str, Any]:
+    """Every combination of ``grid`` scored over one retrieval run, best first by
+    ``rank_by`` (``level.metric``, e.g. ``chunk.mrr``); the server's current values are
+    always one of the combinations."""
+
+    from eval import sweep
+
+    settings = collaborators.settings
+    current = {name: getattr(settings, name) for name in grid}
+    full_grid = {name: sorted({*values, current[name]}) for name, values in grid.items()}
+    passage_ids = resolve_passages(examples, collaborators.repository, settings)
+    scored = [
+        scored_for_question(
+            example.question,
+            history=example.history,
+            repository=collaborators.repository,
+            embedding_provider=collaborators.embedding_provider,
+            reranker=collaborators.reranker,
+            settings=settings,
+            generator=getattr(collaborators, "generator", None),
+            filenames=sorted(example.filenames) or None,
+            tags=sorted(example.tags) or None,
+        )
+        for example in examples
+    ]
+    rows = []
+    for combo in sweep.combinations(full_grid):
+        rows.append(
+            {
+                "settings": combo,
+                "current": combo == current,
+                "aggregate": sweep.score_combo(examples, scored, passage_ids, settings, combo, ks),
+            }
+        )
+
+    def order(row: Mapping[str, Any]) -> tuple[float, float]:
+        value = sweep.metric(row["aggregate"], rank_by)
+        refusal = sweep.metric(row["aggregate"], "unanswerable.no_context_rate")
+        return (-(value if value is not None else -1.0), -(refusal or 0.0))
+
+    rows.sort(key=order)
+    return {
+        "fingerprint": settings_fingerprint(settings, "reranked"),
+        "k_values": list(ks),
+        "question_count": len(examples),
+        "rank_by": rank_by,
+        "rows": rows,
+    }
 
 
 def load_retrieval_dataset(path: Path) -> list[RetrievalExample]:
@@ -298,6 +393,8 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
             sorted(_string_set(data.get("answer_contains"), index, "answer_contains"))
         ),
         answer_contains_all=_fact_groups(data.get("answer_contains_all"), index),
+        filenames=_string_set(data.get("filenames"), index, "filenames"),
+        tags=_string_set(data.get("tags"), index, "tags"),
     )
     if expect_no_context and example.fact_groups:
         raise HarnessDataError(
@@ -350,10 +447,26 @@ def _string_set(value: Any, index: int, field: str) -> frozenset[str]:
     return frozenset(item.strip() for item in value if item.strip())
 
 
-def settings_fingerprint(settings: AppSettings, arm: str) -> dict[str, Any]:
-    """What a baseline was measured with, so a comparison can say what changed."""
+def settings_fingerprint(
+    settings: AppSettings, arm: str, *, follow_ups: bool = False
+) -> dict[str, Any]:
+    """What a baseline was measured with, so a comparison can say what changed.
 
+    ``follow_ups``: the dataset has rows with ``history``, whose retrieval query is the
+    LLM's rewrite — so the model and the condense settings decide what is searched."""
+
+    condense: dict[str, Any] = (
+        {
+            "llm_provider": settings.llm_provider,
+            "llm_model": trace_model_name(settings),
+            "conversation_condense_enabled": bool(settings.conversation_condense_enabled),
+            "condense_max_tokens": int(settings.condense_max_tokens),
+        }
+        if follow_ups
+        else {}
+    )
     return {
+        **condense,
         "arm": arm,
         "embedding_model_tag": settings.embedding_model_tag,
         "sparse_embedding_model": settings.sparse_embedding_model,
@@ -444,6 +557,8 @@ def run_retrieval_eval(
                 settings=collaborators.settings,
                 arm=arm,
                 generator=getattr(collaborators, "generator", None),
+                filenames=sorted(example.filenames) or None,
+                tags=sorted(example.tags) or None,
             )
         entry: dict[str, Any] = {
             "question": example.question,
@@ -484,7 +599,9 @@ def run_retrieval_eval(
         levels["unanswerable"] = aggregate(no_context_rows)
     if fingerprint is None:
         assert collaborators is not None
-        fingerprint = settings_fingerprint(collaborators.settings, arm)
+        fingerprint = settings_fingerprint(
+            collaborators.settings, arm, follow_ups=any(e.history for e in examples)
+        )
     result: dict[str, Any] = {
         "fingerprint": fingerprint,
         "k_values": list(ks),
@@ -515,7 +632,12 @@ def server_ranker(client: Any, top_k: int) -> Callable[[RetrievalExample], Ranke
 
     def rank(example: RetrievalExample) -> RankedResult:
         started = time.monotonic()
-        response = client.search_response(example.question, top_k=top_k)
+        response = client.search_response(
+            example.question,
+            filenames=sorted(example.filenames) or None,
+            top_k=top_k,
+            tags=sorted(example.tags) or None,
+        )
         results = response.get("results", [])
         return RankedResult(
             filenames=[str(item.get("filename")) for item in results],
@@ -648,6 +770,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max allowed drop per metric vs baseline before failing (default 0.05).",
     )
 
+    sweep_parser = sub.add_parser(
+        "sweep",
+        help="Score combinations of the passage-selection settings over one retrieval run.",
+    )
+    sweep_parser.add_argument("dataset", type=Path, help="Path to .json or .jsonl labeled dataset.")
+    sweep_parser.add_argument(
+        "--grid",
+        nargs="+",
+        required=True,
+        metavar="NAME=V1,V2",
+        help="Settings and the values to try, e.g. rerank_min_score=0.05,0.1,0.15 "
+        "rerank_top_k=4,6 (the current value of each is always tried too).",
+    )
+    sweep_parser.add_argument(
+        "--rank-by",
+        default="chunk.mrr",
+        help="level.metric to rank combinations by (default chunk.mrr; e.g. filename.hit@1).",
+    )
+    sweep_parser.add_argument(
+        "--k", type=int, action="append", dest="ks", help="Cutoff for hit@k (repeatable)."
+    )
+    sweep_parser.add_argument("--output", type=Path, help="Optional JSON results path.")
+
+    generate = sub.add_parser(
+        "generate",
+        help="Draft a labelled dataset: the LLM writes a question per sampled passage.",
+    )
+    generate.add_argument("--count", type=int, default=30, help="Passages to sample.")
+    generate.add_argument("--seed", type=int, default=0, help="Sampling seed.")
+    generate.add_argument("--output", type=Path, required=True, help="Dataset .jsonl to write.")
+
+    queries = sub.add_parser(
+        "from-queries",
+        help="Draft a dataset from a server's query log (QUERY_LOG_ENABLED).",
+    )
+    queries.add_argument("--server", required=True, metavar="URL")
+    queries.add_argument("--key-env", default="DOCRAG_API_KEY")
+    queries.add_argument("--workspace")
+    queries.add_argument("--limit", type=int, default=1000)
+    queries.add_argument("--output", type=Path, required=True, help="Labelled rows (.jsonl).")
+    queries.add_argument(
+        "--review",
+        type=Path,
+        help="Unanswered questions, drafted as expect_no_context rows to check (.jsonl).",
+    )
+
     ingest = sub.add_parser("ingest", help="Index every document in a directory.")
     ingest.add_argument("directory", type=Path, help="e.g. eval/corpus")
 
@@ -775,6 +943,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return dataset_from_feedback(args)
     if args.command in ("diff", "report"):
         return compare_runs(args)
+    if args.command == "generate":
+        return generate_dataset(args)
+    if args.command == "from-queries":
+        return dataset_from_queries(args)
 
     try:
         examples = load_retrieval_dataset(args.dataset)
@@ -792,6 +964,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     settings = get_settings()
 
+    if args.command == "sweep":
+        from eval import sweep
+
+        try:
+            grid = sweep.parse_grid(args.grid)
+        except sweep.SweepGridError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        ks = tuple(args.ks) if args.ks else DEFAULT_KS
+        result = run_sweep(examples, Collaborators(settings), grid, ks, args.rank_by)
+        print(sweep.format_table(result["rows"], args.rank_by))
+        best = result["rows"][0]
+        print("\nBest by " + args.rank_by + ":\n" + "\n".join(sweep.env_lines(best["settings"])))
+        if args.output is not None:
+            args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return 0
+
     if args.command == "retrieval":
         ks = tuple(args.ks) if args.ks else DEFAULT_KS
         try:
@@ -808,6 +997,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.limit > 0:
         examples = examples[: args.limit]
     return run_answer_eval(examples, Collaborators(settings), args.output, resume=args.resume)
+
+
+def generate_dataset(args: argparse.Namespace) -> int:
+    """``harness generate``: questions written from sampled passages, re-validated."""
+
+    from eval.generate import generate_rows, sample_passages, write_jsonl
+
+    settings = get_settings()
+    collaborators = Collaborators(settings)
+    passages = sample_passages(collaborators.repository, settings, args.count, args.seed)
+    if not passages:
+        print("error: no indexed passages to sample (ingest a corpus first)", file=sys.stderr)
+        return 2
+    rows, skipped = generate_rows(passages, collaborators.generator, settings)
+    write_jsonl(args.output, rows)
+    try:
+        load_retrieval_dataset(args.output)
+    except HarnessDataError as exc:
+        print(f"error: the drafted dataset doesn't validate: {exc}", file=sys.stderr)
+        return 1
+    print(f"{len(rows)} questions written to {args.output} ({skipped} passages gave none)")
+    return 0 if rows else 1
+
+
+def dataset_from_queries(args: argparse.Namespace) -> int:
+    """``harness from-queries``: a server's logged questions as a dataset draft."""
+
+    from cli.client import DocragClient, DocragError
+    from eval.generate import rows_from_queries, write_jsonl
+
+    key = os.environ.get(args.key_env) or None
+    try:
+        with DocragClient(args.server, key) as client:
+            if args.workspace:
+                client.use_workspace(args.workspace)
+            logged = client.query_log(limit=args.limit)
+    except DocragError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    labelled, review = rows_from_queries(logged)
+    write_jsonl(args.output, labelled)
+    if args.review is not None:
+        write_jsonl(args.review, review)
+    print(
+        f"{len(labelled)} answered questions written to {args.output}; "
+        f"{len(review)} unanswered" + (f" in {args.review}" if args.review else "")
+    )
+    return 0
 
 
 def _server_retrieval(args: argparse.Namespace, examples: Sequence[RetrievalExample]) -> int:

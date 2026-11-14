@@ -45,7 +45,9 @@ from api.parsers.ods import parse_ods_document
 from api.parsers.odt import parse_odt_document
 from api.parsers.pdf import parse_pdf_document
 from api.parsers.pptx import parse_pptx_document
+from api.parsers.rtf import parse_rtf_document
 from api.parsers.structured import CODE_EXTENSIONS, parse_code_document, parse_json_document
+from api.parsers.subtitles import parse_subtitles_document
 from api.parsers.text import (
     declared_html_charset,
     decode_text_document,
@@ -186,6 +188,30 @@ def _parse_code(
     return parse_code_document(filename, decode_text_document(filename, content))
 
 
+def _parse_rtf(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_rtf_document(filename, content)
+
+
+def _parse_subtitles(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_subtitles_document(filename, decode_text_document(filename, content))
+
+
+def _parse_markup_text(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    # reStructuredText, AsciiDoc, LaTeX: read as plain text (their markup stays in the
+    # text, where it costs little; the paragraphs are what matter for search).
+    return parse_plain_text_document(filename, decode_text_document(filename, content))
+
+
+# Text formats with markup of their own, indexed as plain text.
+MARKUP_TEXT_EXTENSIONS = frozenset({".rst", ".adoc", ".asciidoc", ".tex"})
+
+
 # One parser per supported suffix (api/parsers/*); adding a format is one entry here.
 PARSERS: dict[str, Parser] = {
     ".pdf": parse_pdf_document,
@@ -206,6 +232,10 @@ PARSERS: dict[str, Parser] = {
     ".mbox": _parse_mbox,
     ".ipynb": _parse_ipynb,
     ".json": _parse_json,
+    ".rtf": _parse_rtf,
+    ".srt": _parse_subtitles,
+    ".vtt": _parse_subtitles,
+    **dict.fromkeys(MARKUP_TEXT_EXTENSIONS, _parse_markup_text),
     **dict.fromkeys(CODE_EXTENSIONS, _parse_code),
     # Images only with the ocr extra: offering them without it would accept an upload
     # that can only fail.

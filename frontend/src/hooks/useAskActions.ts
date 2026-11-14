@@ -79,20 +79,24 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
       task: DocumentTask | undefined,
       narrowing: PassageNarrowing | undefined,
       bypassCache: boolean,
-      extra?: Pick<QuestionOptions, 'answerFormat' | 'answerLanguage' | 'replacesAnswer'>,
+      extra?: Pick<
+        QuestionOptions,
+        'answerFormat' | 'answerLanguage' | 'replacesAnswer' | 'continueFrom'
+      > & { provider?: LlmProvider; modelLabel?: string },
     ) => {
+      const { provider: otherProvider, modelLabel: otherModel, ...options } = extra ?? {};
       // Picked passages are the scope: the conversation's documents and tags are AND-ed
       // with them on the server, so a passage from another document (the viewer's
       // "Ask about this") found nothing.
       const picked = Boolean(narrowing?.chunk_ids?.length) && !task;
       const looking = picked ? narrowing : withCurrentScope(narrowing, scopePages);
-      return ask(question, provider, overrides, picked ? undefined : scopeFilenames, {
+      return ask(question, otherProvider ?? provider, overrides, picked ? undefined : scopeFilenames, {
         tags: picked ? [] : selectedTags,
         ...(bypassCache ? { bypassCache: true } : {}),
-        modelLabel,
+        modelLabel: otherModel ?? modelLabel,
         ...(task ? { task } : {}),
         ...(looking && !task ? { narrowing: looking } : {}),
-        ...extra,
+        ...options,
       });
     },
     [ask, provider, overrides, scopeFilenames, selectedTags, modelLabel, scopePages],
@@ -113,9 +117,19 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
     (
       question: string,
       narrowing: PassageNarrowing | undefined,
-      style: Pick<QuestionOptions, 'answerFormat' | 'answerLanguage'>,
+      style: Pick<QuestionOptions, 'answerFormat' | 'answerLanguage'> & {
+        provider?: LlmProvider;
+        modelLabel?: string;
+      },
       replaces: string,
     ) => askWith(question, undefined, narrowing, true, { ...style, replacesAnswer: replaces }),
+    [askWith],
+  );
+  // "Continue": the rest of an answer cut off at the token limit, from its own prompt
+  // (the server's trace), joined to it in place once done.
+  const continueAnswer = useCallback(
+    (question: string, narrowing: PassageNarrowing | undefined, traceId: string, replaces: string) =>
+      askWith(question, undefined, narrowing, true, { continueFrom: traceId, replacesAnswer: replaces }),
     [askWith],
   );
   // A "not found" answer asked within some documents: the same question over all of
@@ -214,6 +228,7 @@ export function useAskActions(settings: AskSettings, deps: AskActionsDeps) {
     askQuestion,
     regenerateQuestion,
     reformatAnswer,
+    continueAnswer,
     askEverywhere,
     askAboutPassages,
     askAboutViewedPassage,

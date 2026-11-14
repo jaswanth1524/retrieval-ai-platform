@@ -2,6 +2,26 @@ import type { LlmProvider, PublicConfigResponse } from '../api/types';
 
 const PROVIDERS: readonly LlmProvider[] = ['ollama', 'openai', 'openai_compatible', 'anthropic'];
 
+/** The model a provider answers with (each answer records it; Reformat's "Ask …"). */
+export function modelLabelOf(provider: LlmProvider, config: PublicConfigResponse): string {
+  if (provider === 'ollama') return config.llm_model;
+  if (provider === 'openai_compatible') return config.openai_compatible_model || 'OpenAI-compatible';
+  if (provider === 'anthropic') return config.anthropic_model || 'Anthropic';
+  return config.openai_model;
+}
+
+/** The usable providers other than ``current``, with their models: what an answer can
+ *  be asked again with. */
+export function otherUsableProviders(
+  current: LlmProvider,
+  config: PublicConfigResponse,
+): Array<{ id: LlmProvider; label: string }> {
+  return PROVIDERS.filter((id) => id !== current && isProviderUsable(id, config)).map((id) => ({
+    id,
+    label: modelLabelOf(id, config),
+  }));
+}
+
 /** Whether the server lets a question pick `provider` (ALLOWED_REQUEST_PROVIDERS). */
 export function isProviderAllowed(provider: string, config: PublicConfigResponse): boolean {
   const allowed = config.allowed_request_providers;

@@ -332,6 +332,10 @@ class PageImport:
     # no newer than that, else fetched conditionally (304: unchanged, not downloaded).
     indexed: Mapping[str, KnownPage] = field(default_factory=dict)
     lastmods: Mapping[str, float] = field(default_factory=dict)
+    # (name, url) -> the check run under the filename lock before a page is written:
+    # ``known`` was read when the import began, and an upload (or another import) that
+    # took the name since must not be replaced by a page queued minutes later.
+    still_ours: Callable[[str, str], Callable[[], None]] | None = None
 
 
 # Problems kept per import (each "url: why"), at most.
@@ -545,6 +549,7 @@ def _import_pages(
                 tags=job.tags,
                 dedupe=True,
                 kind="url",
+                precondition=job.still_ours(filename, url) if job.still_ours else None,
             )
         except Exception as exc:  # noqa: BLE001 - a conflict, a full queue, a closing workspace
             logger.warning("Sitemap page %s was not queued: %s", loggable_url(url), exc)

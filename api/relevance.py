@@ -14,7 +14,7 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import itertools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from api.tracing import QueryTrace, TraceCandidate, TraceSummary
@@ -45,6 +45,8 @@ class ScoreReport:
     left_out: int = 0
     # Traces outside the asked-for window (``since``, ``bar``), not counted either.
     filtered_out: int = 0
+    # What decided each side: "model" (the answer's status) or "feedback" (ratings).
+    labels: str = "model"
 
 
 def _histogram(scores: Sequence[float]) -> list[int]:
@@ -84,6 +86,7 @@ def score_report(
     *,
     since: float | None = None,
     bar: float | None = None,
+    ratings: Mapping[str, str] | None = None,
 ) -> ScoreReport:
     """The top rerank score of each traced question, answered against not answered.
 
@@ -98,6 +101,13 @@ def score_report(
     to those answered under that bar — "since the bar last changed": answers given under
     the old bar would blur a suggestion for the new one. A trace from before the bar
     was recorded matches no ``bar``.
+
+    ``ratings`` (trace id -> "up" / "down", the latest answer-level rating) puts people's
+    judgement in place of the model's: a rated-up answer counts as rightly answered, a
+    rated-down one with the questions that shouldn't have been, and unrated traces are
+    left out. With RERANK_FALLBACK_COUNT at 0 every question under the bar is
+    "not answered" by construction, so the model's labels can only confirm the bar; the
+    ratings can move it.
     """
 
     answered: list[float] = []
@@ -121,7 +131,14 @@ def score_report(
         if other_model or not summary.gated or summary.kind != "question":
             left_out += 1
             continue
-        side = unanswered if summary.answer_status in UNANSWERED_STATUSES else answered
+        if ratings is not None:
+            rating = ratings.get(summary.trace_id)
+            if rating not in ("up", "down"):
+                left_out += 1
+                continue
+            side = answered if rating == "up" else unanswered
+        else:
+            side = unanswered if summary.answer_status in UNANSWERED_STATUSES else answered
         side.append(float(summary.top_rerank_score))
     edges = [round(index / SCORE_BINS, 4) for index in range(SCORE_BINS + 1)]
     suggested: float | None = None
@@ -139,8 +156,13 @@ def score_report(
         would_change = sum(low <= score < high for score in (*answered, *unanswered))
         note = (
             f"{wrong} of {len(answered) + len(unanswered)} traced questions are on the "
-            "wrong side of the suggested bar. Answers are judged by the model, not by a "
-            "person: check a few before changing RERANK_MIN_SCORE."
+            "wrong side of the suggested bar. "
+            + (
+                "Sides come from people's ratings (helpful / not helpful)."
+                if ratings is not None
+                else "Answers are judged by the model, not by a person: check a few "
+                "before changing RERANK_MIN_SCORE."
+            )
         )
     return ScoreReport(
         current_min_score=current_min_score,
@@ -154,6 +176,7 @@ def score_report(
         would_change=would_change,
         left_out=left_out,
         filtered_out=filtered_out,
+        labels="model" if ratings is None else "feedback",
     )
 
 
@@ -208,6 +231,11 @@ _RECORDED_LATER = frozenset(
         "rerank_fallback_count",
         "reranker_model",
         "llm_model",
+        "context_diversity_enabled",
+        "context_diversity_max_similarity",
+        "citation_retry_mode",
+        "llm_max_tokens",
+        "query_expansion_count",
     }
 )
 # A score that moved less than this is the same (int8 scores shift with batching).

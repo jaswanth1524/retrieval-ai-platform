@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Components } from 'react-markdown';
 import type {
+  LlmProvider,
   AnswerFormat,
   CitationResponse,
   DocumentTask,
@@ -149,6 +150,8 @@ export interface ChatTurn {
   uncited?: boolean;
   // The provider stopped at the token limit, so the answer ends mid-way.
   truncated?: boolean;
+  // The provider read far less of the prompt than was sent: cut to fit its window.
+  promptCut?: boolean;
   // A whole-document task (summary, comparison) rather than a question: on the user
   // turn that asked it, and on its error turn, so Retry and Regenerate repeat the task.
   task?: DocumentTask;
@@ -277,6 +280,15 @@ interface ChatMessageProps {
     style: ReformatStyle,
     replaces: string,
   ) => void;
+  /** Other models an answer can be asked again of (Reformat → "Ask …"). */
+  otherProviders?: Array<{ id: LlmProvider; label: string }>;
+  /** Ask for the rest of an answer cut off at the token limit (its trace's prompt). */
+  onContinue?: (
+    question: string,
+    narrowing: PassageNarrowing | undefined,
+    traceId: string,
+    replaces: string,
+  ) => void;
   /** This turn's position among the conversation's answers (1-based), for its label. */
   answerNumber?: number;
   /** Make one of this answer's earlier versions the answer again. */
@@ -305,6 +317,11 @@ function groundingNotes(turn: ChatTurn): string[] {
     );
   }
   if (turn.truncated) notes.push('The model reached its output limit and stopped mid-answer.');
+  if (turn.promptCut) {
+    notes.push(
+      "The model read only part of what it was sent (its context window is too small), so it may have missed its sources or its instructions — check this answer.",
+    );
+  }
   if (turn.passagesLeftOut) {
     const count = turn.passagesLeftOut;
     notes.push(
@@ -352,6 +369,8 @@ function ChatMessage({
   answerNumber,
   onCopyLink,
   onReformat,
+  onContinue,
+  otherProviders,
   onUseVersion,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
@@ -561,6 +580,31 @@ function ChatMessage({
                   Regenerate
                 </button>
               )}
+              {/* Cut off at the token limit: the rest, from the same prompt (its trace). */}
+              {turn.content &&
+                turn.truncated &&
+                turn.traceId &&
+                regenerateQuestion &&
+                onContinue &&
+                !regenerateTask &&
+                !streamStage &&
+                !turn.incomplete &&
+                !turn.stopped && (
+                  <button
+                    type="button"
+                    className="chat-message__regenerate"
+                    aria-disabled={busy || undefined}
+                    onClick={() =>
+                      !busy &&
+                      turn.traceId &&
+                      onContinue(regenerateQuestion, regenerateNarrowing, turn.traceId, turn.id)
+                    }
+                    title="Ask the model for the rest of this answer"
+                    data-testid="chat-message-continue"
+                  >
+                    Continue
+                  </button>
+                )}
               {turn.content &&
                 regenerateQuestion &&
                 onReformat &&
@@ -569,17 +613,20 @@ function ChatMessage({
                 !turn.incomplete && (
                   <ReformatMenu
                     disabled={busy}
+                    providers={otherProviders}
                     onReformat={(style) =>
                       onReformat(regenerateQuestion, regenerateNarrowing, style, turn.id)
                     }
                   />
                 )}
+              {/* Not on a stopped answer: rating a fragment sent a misleading row. */}
               {turn.content &&
                 feedbackEnabled &&
                 regenerateQuestion &&
                 onFeedback &&
                 !streamStage &&
-                !turn.incomplete && (
+                !turn.incomplete &&
+                !turn.stopped && (
                 <div className="chat-message__feedback" role="group" aria-label="Rate this answer">
                   <button
                     type="button"

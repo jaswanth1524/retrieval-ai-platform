@@ -21,6 +21,9 @@ from api.document_ops import (
     reindex_from_original,
     retry_refusal,
 )
+from api.imports import BackgroundImport
+from api.imports import imports_of as background_imports_of
+from api.imports import status_of as background_status_of
 from api.ingest_jobs import (
     IngestQueue,
     cancel_ingest_job,
@@ -41,6 +44,8 @@ from api.routes.documents_common import (
     _job_status,
 )
 from api.schemas import (
+    BackgroundImportListResponse,
+    BackgroundImportResponse,
     DocumentJobAcceptedResponse,
     DocumentJobListResponse,
     DocumentJobStatusResponse,
@@ -265,6 +270,65 @@ def list_sitemap_imports(settings: SettingsDep) -> SitemapImportListResponse:
 )
 def get_sitemap_import(import_id: str, settings: SettingsDep) -> SitemapImportResponse:
     return _import_response(_own_import(import_id, settings))
+
+
+def _background_response(status: BackgroundImport) -> BackgroundImportResponse:
+    return BackgroundImportResponse(
+        id=status.id,
+        kind=status.kind,
+        name=status.name,
+        state=status.state,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        queued=status.queued,
+        skipped=status.skipped,
+        failed=status.failed,
+        problems=list(status.problems),
+    )
+
+
+def _own_background(import_id: str, settings: AppSettings) -> BackgroundImport:
+    status = background_status_of(import_id, workspace_of(settings))
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"No import '{import_id}'.")
+    return status
+
+
+# Zips and backups imported in the background (api/imports.py).
+@router.get(
+    "/documents/imports",
+    response_model=BackgroundImportListResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def list_background_imports(settings: SettingsDep) -> BackgroundImportListResponse:
+    return BackgroundImportListResponse(
+        imports=[_background_response(s) for s in background_imports_of(workspace_of(settings))]
+    )
+
+
+@router.get(
+    "/documents/imports/{import_id}",
+    response_model=BackgroundImportResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_background_import(import_id: str, settings: SettingsDep) -> BackgroundImportResponse:
+    return _background_response(_own_background(import_id, settings))
+
+
+# Stops it before its next document: those already queued go on indexing.
+@router.delete(
+    "/documents/imports/{import_id}",
+    response_model=BackgroundImportResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+)
+def cancel_background_import(import_id: str, settings: SettingsDep) -> BackgroundImportResponse:
+    status = _own_background(import_id, settings)
+    if status.finished_at is not None:
+        raise HTTPException(status_code=409, detail="That import has already finished.")
+    status.cancel.set()
+    audit("import.cancel", workspace=workspace_of(settings), import_id=import_id, name=status.name)
+    return _background_response(status)
 
 
 # Stops an import before its next page: pages already queued go on indexing.

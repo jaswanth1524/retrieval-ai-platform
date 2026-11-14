@@ -58,6 +58,10 @@ interface ChatThreadProps {
   onToggleSaved?: (turnId: string, saved: boolean) => void;
   /** Copy a link back to one answer (it opens in this browser). */
   onCopyLink?: (turnId: string) => void;
+  /** Other models an answer can be asked again of (ChatMessage's otherProviders). */
+  otherProviders?: ComponentProps<typeof ChatMessage>['otherProviders'];
+  /** Continue a cut-off answer (ChatMessage's onContinue). */
+  onContinue?: ComponentProps<typeof ChatMessage>['onContinue'];
   /** Reformat an answer (ChatMessage's onReformat). */
   onReformat?: ComponentProps<typeof ChatMessage>['onReformat'];
   /** Make an answer's earlier version the answer again. */
@@ -145,6 +149,8 @@ function ChatThread({
   onToggleSaved,
   onCopyLink,
   onReformat,
+  onContinue,
+  otherProviders,
   onUseVersion,
   sourceChangeOf,
 }: ChatThreadProps) {
@@ -413,6 +419,8 @@ function ChatThread({
             onToggleSaved={onToggleSaved}
             onCopyLink={onCopyLink}
             onReformat={onReformat}
+            onContinue={onContinue}
+            otherProviders={otherProviders}
             onUseVersion={onUseVersion}
             sourceChangeOf={sourceChangeOf}
             answerNumber={answerNumbers[index] || undefined}

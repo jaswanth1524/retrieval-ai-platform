@@ -1,0 +1,74 @@
+# Prometheus alert rules for DocRAG. Load with `rule_files: [alerts.yml]`; the scrape
+# job must send X-API-Key when API_KEY is set (GET /metrics needs the full key).
+groups:
+  - name: docrag
+    rules:
+      - alert: DocragBackupFailing
+        expr: docrag_backup_last_ok == 0
+        for: 2h
+        labels: {severity: warning}
+        annotations:
+          summary: "Scheduled backup of workspace {{ $labels.workspace }} is failing"
+          description: "The last BACKUP_DIR attempt failed; GET /health/ready names the error."
+
+      - alert: DocragBackupStale
+        # Two intervals at the default BACKUP_INTERVAL_HOURS=24.
+        expr: time() - docrag_backup_last_success_timestamp_seconds > 2 * 86400
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "No backup of workspace {{ $labels.workspace }} for two days"
+
+      - alert: DocragDiskLow
+        expr: docrag_storage_free_bytes < 1e9
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Under 1 GB free where {{ $labels.setting }} writes"
+          description: "Uploads, backups and the job store fail when the disk fills."
+
+      - alert: DocragIngestFailures
+        expr: increase(docrag_ingest_jobs_total{outcome="failed", error_type!="document"}[1h]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: "Indexing jobs failing for reasons other than a bad document"
+          description: "{{ $labels.error_type }} failures: check the server log (and GET /documents/jobs?state=failed)."
+
+      - alert: DocragWatchGivingUp
+        expr: docrag_watch_files{state="gave_up"} > 0
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "The folder watcher gave up on files in {{ $labels.folder }}"
+          description: "GET /watch lists them and why (a bad document, a refused name)."
+
+      - alert: DocragPromptsCut
+        expr: increase(docrag_prompt_cuts_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The model read only part of its prompts"
+          description: "Its context window is smaller than the prompts: raise OLLAMA_NUM_CTX or set LLM_CONTEXT_WINDOW."
+
+      - alert: DocragQuestionsErroring
+        expr: >
+          sum(rate(docrag_questions_total{outcome="error", error_type!="busy"}[15m]))
+          / clamp_min(sum(rate(docrag_questions_total[15m])), 1e-9) > 0.2
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Over 20% of questions are failing"
+
+      - alert: DocragUrlRefreshBehind
+        expr: docrag_url_refresh_overdue > 0
+        for: 6h
+        labels: {severity: info}
+        annotations:
+          summary: "URL-fetched documents are waiting for their refresh"
+          description: "Passes keep ending before every due document is checked: raise URL_REFRESH_BATCH or lengthen the interval."
+
+      - alert: DocragScheduledIngestFailing
+        expr: sum by (kind) (increase(docrag_ingest_job_failures_total{kind=~"url|watch|reindex"}[6h])) > 5
+        labels: {severity: warning}
+        annotations:
+          summary: "Background {{ $labels.kind }} indexing jobs keep failing"
+          description: "GET /documents/jobs?state=failed lists them with their errors."

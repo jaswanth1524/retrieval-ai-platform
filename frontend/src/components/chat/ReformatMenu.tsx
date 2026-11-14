@@ -1,9 +1,13 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import type { AnswerFormat } from '../../api/types';
+import type { AnswerFormat, LlmProvider } from '../../api/types';
 
 export interface ReformatStyle {
   answerFormat?: AnswerFormat;
   answerLanguage?: string;
+  /** Asked again of another provider's model (the style kept as it was). */
+  provider?: LlmProvider;
+  /** That model's name, recorded on the answer. */
+  modelLabel?: string;
 }
 
 const SHAPES: Array<[AnswerFormat, string]> = [
@@ -17,9 +21,12 @@ const SHAPES: Array<[AnswerFormat, string]> = [
 export default function ReformatMenu({
   onReformat,
   disabled = false,
+  providers = [],
 }: {
   onReformat: (style: ReformatStyle) => void;
   disabled?: boolean;
+  /** Other models it can be asked of ("Ask gpt-4o-mini"), compared as versions. */
+  providers?: Array<{ id: LlmProvider; label: string }>;
 }) {
   const [open, setOpen] = useState(false);
   const [language, setLanguage] = useState('');
@@ -82,6 +89,19 @@ export default function ReformatMenu({
           data-testid={`chat-message-reformat-${format}`}
         >
           {label}
+        </button>
+      ))}
+      {providers.map((other) => (
+        <button
+          key={other.id}
+          type="button"
+          className="chat-message__regenerate"
+          aria-disabled={disabled || undefined}
+          onClick={() => !disabled && choose({ provider: other.id, modelLabel: other.label })}
+          title="Ask this question again of another model; compare the two under Versions"
+          data-testid={`chat-message-ask-${other.id}`}
+        >
+          Ask {other.label}
         </button>
       ))}
       <form

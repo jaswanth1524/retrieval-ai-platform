@@ -44,6 +44,7 @@ class CachedAnswer:
     truncated: bool = False
     weak_matches: bool = False
     citation_backfilled: bool = False
+    unsupported_claims: int = 0
     passages_left_out: int = 0
     # Summaries only: (passages read, passages in the documents).
     coverage: tuple[int, int] | None = None
@@ -64,6 +65,7 @@ class CachedAnswer:
             grounded.truncated,
             weak_matches=grounded.weak_matches,
             citation_backfilled=grounded.citation_backfilled,
+            unsupported_claims=grounded.unsupported_claims,
             passages_left_out=grounded.passages_left_out,
             followups=tuple(grounded.followups),
         )
@@ -82,6 +84,7 @@ class CachedAnswer:
             done.get("truncated", False),
             weak_matches=done.get("weak_matches", False),
             citation_backfilled=done.get("citation_backfilled", False),
+            unsupported_claims=done.get("unsupported_claims", 0),
             passages_left_out=done.get("passages_left_out", 0),
             coverage=(done.get("chunks_read", 0), done.get("chunks_total", 0)) if summary else None,
             followups=tuple(followups),
@@ -101,6 +104,7 @@ class CachedAnswer:
             weak_matches=self.weak_matches,
             truncated=self.truncated,
             citation_backfilled=self.citation_backfilled,
+            unsupported_claims=self.unsupported_claims,
             passages_left_out=self.passages_left_out,
             followups=list(self.followups),
         )
@@ -308,6 +312,18 @@ class AnswerCache:
             self._entries[key] = (self._clock(), value, scope)
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
+
+    def discard(self, key: CacheKey, value: CachedAnswer) -> bool:
+        """Forget ``key`` when it still holds ``value`` (the very object stored): an
+        answer found degraded after it was stored. A newer answer stored under the same
+        key since (a Regenerate) is left alone."""
+
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry[1] is not value:
+                return False
+            del self._entries[key]
+            return True
 
     def __len__(self) -> int:
         with self._lock:

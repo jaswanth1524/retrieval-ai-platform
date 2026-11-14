@@ -91,3 +91,38 @@ def test_a_child_that_cannot_start_closes_its_pipe(monkeypatch: pytest.MonkeyPat
     with pytest.raises(OSError, match="too many open files"):
         parse_with_limit("notes.txt", b"x", make_test_settings(parse_timeout_seconds=60))
     assert len(closed) == 2
+
+
+def report_an_environment_error(connection: object, *args: object) -> None:
+    """A child whose parse failed on its surroundings (a full /tmp), not the file."""
+
+    connection.send(("error", "OSError: [Errno 28] No space left on device"))  # type: ignore[attr-defined]
+
+
+def test_a_child_failing_on_its_environment_is_transient_not_a_bad_document() -> None:
+    from api.ingest_jobs import ingest_error_type
+    from api.parse_isolation import ParseEnvironmentError
+
+    with pytest.raises(ParseEnvironmentError) as raised:
+        parse_with_limit(
+            "notes.txt",
+            b"Intro\nalpha",
+            make_test_settings(parse_timeout_seconds=60),
+            _target=report_an_environment_error,
+        )
+    assert ingest_error_type(raised.value) == "parse_failed"
+
+
+def test_a_document_fault_in_a_real_child_stays_a_document_error() -> None:
+    """Only the child's environment is transient: a file a parser chokes on (here a
+    ValueError from a malformed workbook) still gives up as a bad document."""
+
+    from api.ingest_jobs import ingest_error_type
+
+    with pytest.raises(DocumentParseError) as raised:
+        parse_with_limit(
+            "broken.xlsx",
+            b"PK\x03\x04 not really a workbook",
+            make_test_settings(parse_timeout_seconds=60),
+        )
+    assert ingest_error_type(raised.value) == "document"

@@ -32,7 +32,7 @@ from api.document_names import indexing_now
 from api.document_ops import enqueue_refreshed
 from api.ingest_jobs import IngestQueue
 from api.jobs import IngestJob
-from api.metrics import url_refresh_total
+from api.metrics import url_refresh_overdue, url_refresh_total
 from api.qdrant_schema import CollectionSchemaError
 from api.repository import DocumentMetadata, VectorRepository
 from api.settings import AppSettings
@@ -77,6 +77,11 @@ def refresh_due(
     if state.failures > 0:
         wait = doubled_wait(interval, state.failures, max(MAX_BACKOFF_SECONDS, interval))
     return state.last_checked + wait
+
+
+# Fetches a pass may make per URL_REFRESH_BATCH, counting the unchanged ones: a 304
+# costs a request and no indexing, so a large URL corpus can still be checked in time.
+CHECKS_PER_BATCH = 10
 
 
 class UrlRefresher(BackgroundLoop):
@@ -140,8 +145,10 @@ class UrlRefresher(BackgroundLoop):
         """Check what is due in every workspace, earliest due first; how many of each
         outcome.
 
-        At most URL_REFRESH_BATCH fetches a pass, and none while that many of its own
-        jobs are still indexing: a run of changed pages must not fill the backlog the
+        At most URL_REFRESH_BATCH queued (changed) documents a pass, and none while that
+        many of its own jobs are still indexing; checks that came back unchanged (a
+        304, or the same bytes) cost no indexing and count against their own, larger
+        cap (``CHECKS_PER_BATCH`` × the batch): a run of changed pages must not fill the backlog the
         uploads share. The first fetch deferred (no backlog room or fetch slot) ends
         the pass — the rest would be deferred for the same reason. The state of
         documents (and workspaces) that are gone is dropped.
@@ -154,9 +161,18 @@ class UrlRefresher(BackgroundLoop):
         self._state.forget_collections_except(
             {target.settings.qdrant_collection for target in targets}
         )
+        checks = max(room, 0) * CHECKS_PER_BATCH
+
+        def spent() -> bool:
+            # Queued and failed fetches use the batch; every fetch uses a check.
+            return (
+                outcomes["queued"] + outcomes["failed"] >= room or sum(outcomes.values()) >= checks
+            )
+
+        waiting = 0
         for target in targets:
-            if outcomes["deferred"] or sum(outcomes.values()) >= room:
-                break
+            # Past the pass's budget the rest are only counted (the overdue gauge).
+            stopped = bool(outcomes["deferred"]) or spent()
             queue = target.queue
             if queue is None:
                 continue
@@ -177,8 +193,9 @@ class UrlRefresher(BackgroundLoop):
                 when = refresh_due(meta, states.get(name), self._every)
                 if when is not None and when <= now and name not in busy and meta.source_url:
                     due.append((when, name, meta))
+            handled = 0
             for _, name, meta in sorted(due):
-                if sum(outcomes.values()) >= room:
+                if stopped or spent():
                     break
                 assert meta.source_url is not None
                 outcome = self._refresh(target, queue, name, meta.source_url, meta)
@@ -200,6 +217,9 @@ class UrlRefresher(BackgroundLoop):
                         checked, next_due=refresh_due(meta, checked, self._every) or 0.0
                     ),
                 )
+                handled += 1
+            waiting += len(due) - handled
+        url_refresh_overdue.set(waiting)
         return outcomes
 
     def _refresh(

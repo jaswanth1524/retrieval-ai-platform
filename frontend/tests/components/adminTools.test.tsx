@@ -33,6 +33,19 @@ const cache = (entries: number) =>
   }) as never;
 
 describe('AdminTools', () => {
+  it('lists the settings check\'s findings', async () => {
+    serve();
+    vi.spyOn(api, 'answerCache').mockResolvedValue(cache(0));
+    vi.spyOn(api, 'doctor').mockResolvedValue({
+      findings: [{ level: 'warning', subject: 'BACKUP_DIR', message: 'Backups hold no documents.' }],
+    });
+    render(<AdminTools />);
+    await userEvent.click(screen.getByTestId('doctor-run'));
+    expect(await screen.findByTestId('doctor-finding')).toHaveTextContent(
+      'Warning BACKUP_DIR: Backups hold no documents.',
+    );
+  });
+
   it('a stored backup restored hands its jobs on, to be followed', async () => {
     serve();
     vi.spyOn(api, 'answerCache').mockResolvedValue(cache(0));

@@ -32,6 +32,8 @@ export interface BackupStatusResponse {
   ok: boolean;
   file?: string | null;
   error?: string | null;
+  /** Indexed documents the backup holds no original of. */
+  originals_missing?: number;
 }
 
 /** Tokens the provider reported for an answer's LLM calls. */
@@ -158,6 +160,27 @@ export interface SearchRequest {
   exclude_chunk_ids?: string[];
   uploaded_after?: number;
   uploaded_before?: number;
+  /** Each result's rank on the dense and the BM25 search, and where an expected
+   *  passage was lost (`explanation`). */
+  explain?: boolean;
+  expect_chunk_id?: string;
+  expect_filename?: string;
+}
+
+/** Where an expected passage was lost on its way through a search. */
+export interface SearchExplanationResponse {
+  target: string;
+  /** returned / not_retrieved / not_scored / below_min_score / near_duplicate /
+   *  past_top_k (extensible). */
+  outcome: string;
+  detail: string;
+  chunk_id?: string | null;
+  dense_rank?: number | null;
+  sparse_rank?: number | null;
+  fused_rank?: number | null;
+  rerank_rank?: number | null;
+  rerank_score?: number | null;
+  returned_rank?: number | null;
 }
 
 export interface SearchResultResponse {
@@ -177,6 +200,9 @@ export interface SearchResultResponse {
   /** The sentences sharing the most words with the query, for highlighting; absent
    *  from older servers. */
   spans?: CitationSpan[];
+  /** With `explain`: its rank on the dense and the BM25 search (null: not returned). */
+  dense_rank?: number | null;
+  sparse_rank?: number | null;
 }
 
 export interface SearchResponse {
@@ -185,6 +211,7 @@ export interface SearchResponse {
   /** Nothing cleared the relevance bar an answer's sources must clear; these are the
    *  closest passages (typical of a one- or two-word search). Absent from older servers. */
   weak_matches?: boolean;
+  explanation?: SearchExplanationResponse | null;
 }
 
 export interface FeedbackItemResponse {
@@ -521,6 +548,9 @@ export interface QuestionOptions {
   /** Client-only: the answer (turn id) this one replaces once it is done — Regenerate
    *  and Reformat keep it as an earlier version of the new one. */
   replacesAnswer?: string;
+  /** The trace of an answer cut off at the token limit: its rest is asked for
+   *  (POST /questions/continue) instead of a new answer. */
+  continueFrom?: string;
 }
 
 export type TraceStatus = 'ok' | 'insufficient_context' | 'error';
@@ -669,6 +699,12 @@ export interface TraceDetailResponse {
   answer_status?: string | null;
   /** The answer stopped at the token limit. */
   truncated?: boolean;
+  /** The provider read far less of the prompt than was sent. */
+  prompt_cut?: boolean;
+  /** The LLM reply came from the prompt cache (PROMPT_CACHE_SIZE). */
+  prompt_cached?: boolean;
+  /** Citing sentences no passage of their cited sources supports. */
+  unsupported_claims?: number;
   /** History messages left out of the prompt to fit the context window. */
   dropped_history_messages?: number;
   /** "question", or "summary" (whose question is its task line). */
@@ -855,6 +891,54 @@ export interface SitemapImportListResponse {
   imports: SitemapImportResponse[];
 }
 
+/** GET /admin/doctor: risky configurations of the server. A report only. */
+export interface DoctorFindingResponse {
+  /** "warning" or "note" (extensible). */
+  level: string;
+  subject: string;
+  message: string;
+}
+
+export interface DoctorResponse {
+  findings: DoctorFindingResponse[];
+}
+
+/** A zip or backup being imported in the background (GET /documents/imports/{id}). */
+export interface BackgroundImportResponse {
+  id: string;
+  /** "archive" or "restore" (extensible). */
+  kind: string;
+  name: string;
+  /** running / cancelling / done / cancelled. */
+  state: string;
+  started_at: number;
+  finished_at?: number | null;
+  queued?: number;
+  skipped?: number;
+  failed?: number;
+  problems?: string[];
+}
+
+export interface BackgroundImportListResponse {
+  imports: BackgroundImportResponse[];
+}
+
+/** GET /documents/{filename}/outline: sections and page starts, each with its first
+ *  passage. */
+export interface OutlineEntryResponse {
+  section: string;
+  page: number;
+  chunk_id: string;
+}
+
+export interface DocumentOutlineResponse {
+  filename: string;
+  total_chunks: number;
+  sections: OutlineEntryResponse[];
+  pages: OutlineEntryResponse[];
+  truncated?: boolean;
+}
+
 export interface ScoreReportResponse {
   current_min_score: number;
   /** answered[i] counts scores in [bin_edges[i], bin_edges[i + 1]). */
@@ -866,6 +950,8 @@ export interface ScoreReportResponse {
   suggested_min_score?: number | null;
   note: string;
   would_change?: number;
+  /** What decided each side: "model" (the answer's status) or "feedback" (ratings). */
+  labels?: string;
 }
 
 export interface TraceSettingChangeResponse {

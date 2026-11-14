@@ -234,3 +234,29 @@
     min-height: 24px;
   }
 }
+
+/* Recent searches, the result tools (group, CSV) and a group's heading. */
+.search-panel__recent,
+.search-panel__tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+
+.search-panel__recent-item {
+  min-height: 24px;
+  font-size: 12px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-panel__group {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

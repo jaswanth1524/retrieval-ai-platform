@@ -115,7 +115,12 @@ function CommandPalette({ commands, onClose }: CommandPaletteProps) {
             role="combobox"
             aria-expanded="true"
             aria-controls="palette-results"
-            aria-activedescendant={matches[highlighted] ? `palette-cmd-${matches[highlighted].id}` : undefined}
+            // Never a disabled option (every match disabled: none is active).
+            aria-activedescendant={
+              matches[highlighted] && !matches[highlighted].disabled
+                ? `palette-cmd-${matches[highlighted].id}`
+                : undefined
+            }
             data-testid="palette-input"
           />
           <span className="palette__esc mono">esc</span>

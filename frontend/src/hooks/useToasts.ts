@@ -98,8 +98,12 @@ export function useToasts(): UseToastsResult {
         },
       ]);
       if (toast.sticky) return id;
+      // A toast offering an action (Undo) lasts as long as a failure's: 4.2 s was
+      // barely time to read "Deleted …", let alone reach the button.
       const ms =
-        toast.tone === 'warn' || toast.tone === 'bad' ? FAILURE_TOAST_TIMEOUT_MS : TOAST_TIMEOUT_MS;
+        toast.tone === 'warn' || toast.tone === 'bad' || toast.action
+          ? FAILURE_TOAST_TIMEOUT_MS
+          : TOAST_TIMEOUT_MS;
       durations.current.set(id, ms);
       startTimer(id, ms);
       return id;

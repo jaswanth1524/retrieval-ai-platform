@@ -103,6 +103,17 @@
       "title": "Deferred",
       "type": "array"
      },
+     "import_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Import Id"
+     },
      "jobs": {
       "items": {
        "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
@@ -124,6 +135,152 @@
      "deferred"
     ],
     "title": "ArchiveUploadResponse",
+    "type": "object"
+   },
+   "AuditEntryResponse": {
+    "properties": {
+     "client": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Client"
+     },
+     "created_at": {
+      "title": "Created At",
+      "type": "number"
+     },
+     "event": {
+      "title": "Event",
+      "type": "string"
+     },
+     "fields": {
+      "additionalProperties": true,
+      "default": {},
+      "title": "Fields",
+      "type": "object"
+     },
+     "key": {
+      "title": "Key",
+      "type": "string"
+     },
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "created_at",
+     "workspace",
+     "event",
+     "key"
+    ],
+    "title": "AuditEntryResponse",
+    "type": "object"
+   },
+   "AuditResponse": {
+    "description": "GET /admin/audit: stored audit events (AUDIT_LOG_PATH), newest first.",
+    "properties": {
+     "entries": {
+      "items": {
+       "$ref": "#/components/schemas/AuditEntryResponse"
+      },
+      "title": "Entries",
+      "type": "array"
+     }
+    },
+    "required": [
+     "entries"
+    ],
+    "title": "AuditResponse",
+    "type": "object"
+   },
+   "BackgroundImportListResponse": {
+    "properties": {
+     "imports": {
+      "items": {
+       "$ref": "#/components/schemas/BackgroundImportResponse"
+      },
+      "title": "Imports",
+      "type": "array"
+     }
+    },
+    "required": [
+     "imports"
+    ],
+    "title": "BackgroundImportListResponse",
+    "type": "object"
+   },
+   "BackgroundImportResponse": {
+    "description": "A zip or backup being imported in the background (GET /documents/imports/{id}).",
+    "properties": {
+     "failed": {
+      "default": 0,
+      "title": "Failed",
+      "type": "integer"
+     },
+     "finished_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Finished At"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "kind": {
+      "title": "Kind",
+      "type": "string"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "problems": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     },
+     "queued": {
+      "default": 0,
+      "title": "Queued",
+      "type": "integer"
+     },
+     "skipped": {
+      "default": 0,
+      "title": "Skipped",
+      "type": "integer"
+     },
+     "started_at": {
+      "title": "Started At",
+      "type": "number"
+     },
+     "state": {
+      "title": "State",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "kind",
+     "name",
+     "state",
+     "started_at"
+    ],
+    "title": "BackgroundImportResponse",
     "type": "object"
    },
    "BackupCheckResponse": {
@@ -285,6 +442,12 @@
    },
    "Body_import_backup_import_post": {
     "properties": {
+     "background": {
+      "default": false,
+      "description": "Restore in the background: every document is queued as room frees (none deferred); follow it with GET /documents/imports/{import_id}.",
+      "title": "Background",
+      "type": "boolean"
+     },
      "file": {
       "contentMediaType": "application/octet-stream",
       "title": "File",
@@ -313,6 +476,12 @@
    },
    "Body_upload_archive_documents_archive_post": {
     "properties": {
+     "background": {
+      "default": false,
+      "description": "Import in the background: every document is queued as room frees (none deferred); follow it with GET /documents/imports/{import_id}.",
+      "title": "Background",
+      "type": "boolean"
+     },
      "file": {
       "contentMediaType": "application/octet-stream",
       "title": "File",
@@ -637,6 +806,62 @@
      "in_flight"
     ],
     "title": "ConsistencyResponse",
+    "type": "object"
+   },
+   "ContinueRequest": {
+    "description": "Continue an answer cut off at the token limit (POST /questions/continue).",
+    "properties": {
+     "trace_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Trace Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "trace_id"
+    ],
+    "title": "ContinueRequest",
+    "type": "object"
+   },
+   "DoctorFindingResponse": {
+    "properties": {
+     "level": {
+      "title": "Level",
+      "type": "string"
+     },
+     "message": {
+      "title": "Message",
+      "type": "string"
+     },
+     "subject": {
+      "title": "Subject",
+      "type": "string"
+     }
+    },
+    "required": [
+     "level",
+     "subject",
+     "message"
+    ],
+    "title": "DoctorFindingResponse",
+    "type": "object"
+   },
+   "DoctorResponse": {
+    "description": "GET /admin/doctor: risky configurations of this server. A report only.",
+    "properties": {
+     "findings": {
+      "items": {
+       "$ref": "#/components/schemas/DoctorFindingResponse"
+      },
+      "title": "Findings",
+      "type": "array"
+     }
+    },
+    "required": [
+     "findings"
+    ],
+    "title": "DoctorResponse",
     "type": "object"
    },
    "DocumentChunkResponse": {
@@ -970,6 +1195,14 @@
       "title": "Chunk Counts",
       "type": "object"
      },
+     "content_sha256s": {
+      "additionalProperties": {
+       "type": "string"
+      },
+      "default": {},
+      "title": "Content Sha256S",
+      "type": "object"
+     },
      "duplicate_groups": {
       "default": [],
       "items": {
@@ -1060,6 +1293,46 @@
      "filenames"
     ],
     "title": "DocumentListResponse",
+    "type": "object"
+   },
+   "DocumentOutlineResponse": {
+    "description": "GET /documents/{filename}/outline: the document's sections and pages, in order,\neach with its first passage \u2014 for a table of contents and \"go to page\".",
+    "properties": {
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "pages": {
+      "items": {
+       "$ref": "#/components/schemas/OutlineEntryResponse"
+      },
+      "title": "Pages",
+      "type": "array"
+     },
+     "sections": {
+      "items": {
+       "$ref": "#/components/schemas/OutlineEntryResponse"
+      },
+      "title": "Sections",
+      "type": "array"
+     },
+     "total_chunks": {
+      "title": "Total Chunks",
+      "type": "integer"
+     },
+     "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "filename",
+     "total_chunks",
+     "sections",
+     "pages"
+    ],
+    "title": "DocumentOutlineResponse",
     "type": "object"
    },
    "DocumentPreviewResponse": {
@@ -1566,6 +1839,17 @@
       "title": "Feedback Skipped",
       "type": "integer"
      },
+     "import_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Import Id"
+     },
      "jobs": {
       "items": {
        "$ref": "#/components/schemas/DocumentJobAcceptedResponse"
@@ -1610,6 +1894,30 @@
      "feedback_skipped"
     ],
     "title": "ImportResponse",
+    "type": "object"
+   },
+   "OutlineEntryResponse": {
+    "description": "Where a section (or a page) starts: open the viewer around ``chunk_id``.",
+    "properties": {
+     "chunk_id": {
+      "title": "Chunk Id",
+      "type": "string"
+     },
+     "page": {
+      "title": "Page",
+      "type": "integer"
+     },
+     "section": {
+      "title": "Section",
+      "type": "string"
+     }
+    },
+    "required": [
+     "section",
+     "page",
+     "chunk_id"
+    ],
+    "title": "OutlineEntryResponse",
     "type": "object"
    },
    "PreviewChunkResponse": {
@@ -2388,6 +2696,16 @@
       "title": "Passages Left Out",
       "type": "integer"
      },
+     "prompt_cached": {
+      "default": false,
+      "title": "Prompt Cached",
+      "type": "boolean"
+     },
+     "prompt_cut": {
+      "default": false,
+      "title": "Prompt Cut",
+      "type": "boolean"
+     },
      "rerank_min_score": {
       "anyOf": [
        {
@@ -2443,6 +2761,11 @@
       "title": "Truncated",
       "type": "boolean"
      },
+     "unsupported_claims": {
+      "default": 0,
+      "title": "Unsupported Claims",
+      "type": "integer"
+     },
      "usage": {
       "anyOf": [
        {
@@ -2496,6 +2819,11 @@
       "title": "Filtered Out",
       "type": "integer"
      },
+     "labels": {
+      "default": "model",
+      "title": "Labels",
+      "type": "string"
+     },
      "left_out": {
       "default": 0,
       "title": "Left Out",
@@ -2543,6 +2871,115 @@
      "note"
     ],
     "title": "ScoreReportResponse",
+    "type": "object"
+   },
+   "SearchExplanationResponse": {
+    "description": "What became of the expected passage (`expect_chunk_id`, or the best passage of\n`expect_filename`): the first search stage that left it out.",
+    "properties": {
+     "chunk_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chunk Id"
+     },
+     "dense_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Dense Rank"
+     },
+     "detail": {
+      "title": "Detail",
+      "type": "string"
+     },
+     "fused_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Fused Rank"
+     },
+     "outcome": {
+      "title": "Outcome",
+      "type": "string",
+      "x-extensible-enum": [
+       "returned",
+       "not_retrieved",
+       "not_scored",
+       "below_min_score",
+       "near_duplicate",
+       "past_top_k"
+      ]
+     },
+     "rerank_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Rank"
+     },
+     "rerank_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Score"
+     },
+     "returned_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Returned Rank"
+     },
+     "sparse_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Sparse Rank"
+     },
+     "target": {
+      "title": "Target",
+      "type": "string"
+     }
+    },
+    "required": [
+     "target",
+     "outcome",
+     "detail"
+    ],
+    "title": "SearchExplanationResponse",
     "type": "object"
    },
    "SearchRequest": {
@@ -2600,6 +3037,36 @@
        }
       ],
       "title": "Exclude Filenames"
+     },
+     "expect_chunk_id": {
+      "anyOf": [
+       {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Expect Chunk Id"
+     },
+     "expect_filename": {
+      "anyOf": [
+       {
+        "maxLength": 1024,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Expect Filename"
+     },
+     "explain": {
+      "default": false,
+      "title": "Explain",
+      "type": "boolean"
      },
      "filenames": {
       "anyOf": [
@@ -2734,6 +3201,16 @@
    },
    "SearchResponse": {
     "properties": {
+     "explanation": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/SearchExplanationResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
      "results": {
       "items": {
        "$ref": "#/components/schemas/SearchResultResponse"
@@ -2774,6 +3251,17 @@
        }
       ],
       "title": "Chunk Ordinal"
+     },
+     "dense_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Dense Rank"
      },
      "filename": {
       "title": "Filename",
@@ -2817,6 +3305,17 @@
       },
       "title": "Spans",
       "type": "array"
+     },
+     "sparse_rank": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Sparse Rank"
      },
      "text": {
       "title": "Text",
@@ -3235,6 +3734,16 @@
       "title": "Passages Left Out",
       "type": "integer"
      },
+     "prompt_cached": {
+      "default": false,
+      "title": "Prompt Cached",
+      "type": "boolean"
+     },
+     "prompt_cut": {
+      "default": false,
+      "title": "Prompt Cut",
+      "type": "boolean"
+     },
      "rerank_min_score": {
       "anyOf": [
        {
@@ -3289,6 +3798,11 @@
       "default": false,
       "title": "Truncated",
       "type": "boolean"
+     },
+     "unsupported_claims": {
+      "default": 0,
+      "title": "Unsupported Claims",
+      "type": "integer"
      },
      "usage": {
       "anyOf": [
@@ -3624,6 +4138,39 @@
       "title": "Answer Language",
       "type": "string"
      },
+     "citation_retry_mode": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Citation Retry Mode"
+     },
+     "context_diversity_enabled": {
+      "anyOf": [
+       {
+        "type": "boolean"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Context Diversity Enabled"
+     },
+     "context_diversity_max_similarity": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Context Diversity Max Similarity"
+     },
      "context_neighbor_max_chars": {
       "anyOf": [
        {
@@ -3664,6 +4211,17 @@
       "title": "Fused Top N",
       "type": "integer"
      },
+     "llm_max_tokens": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Llm Max Tokens"
+     },
      "llm_model": {
       "anyOf": [
        {
@@ -3698,6 +4256,17 @@
        }
       ],
       "title": "Narrowing"
+     },
+     "query_expansion_count": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Query Expansion Count"
      },
      "query_expansion_enabled": {
       "anyOf": [
@@ -3930,6 +4499,16 @@
       "title": "Mode",
       "type": "string"
      },
+     "prompt_cached": {
+      "default": false,
+      "title": "Prompt Cached",
+      "type": "boolean"
+     },
+     "prompt_cut": {
+      "default": false,
+      "title": "Prompt Cut",
+      "type": "boolean"
+     },
      "prompt_messages": {
       "anyOf": [
        {
@@ -3993,6 +4572,11 @@
       "default": false,
       "title": "Truncated",
       "type": "boolean"
+     },
+     "unsupported_claims": {
+      "default": 0,
+      "title": "Unsupported Claims",
+      "type": "integer"
      },
      "usage": {
       "anyOf": [
@@ -4509,6 +5093,11 @@
        }
       ],
       "title": "Refresh Minutes"
+     },
+     "replace": {
+      "default": false,
+      "title": "Replace",
+      "type": "boolean"
      },
      "tags": {
       "anyOf": [
@@ -5086,6 +5675,131 @@
     "summary": "Access"
    }
   },
+  "/admin/audit": {
+   "get": {
+    "operationId": "list_audit_admin_audit_get",
+    "parameters": [
+     {
+      "description": "An event name, or a prefix ending in \".\" (document.).",
+      "in": "query",
+      "name": "event",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 64,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "An event name, or a prefix ending in \".\" (document.).",
+       "title": "Event"
+      }
+     },
+     {
+      "description": "Only events since (epoch seconds).",
+      "in": "query",
+      "name": "since",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 0,
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Only events since (epoch seconds).",
+       "title": "Since"
+      }
+     },
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 100,
+       "maximum": 1000,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     },
+     {
+      "in": "query",
+      "name": "all_workspaces",
+      "required": false,
+      "schema": {
+       "default": false,
+       "title": "All Workspaces",
+       "type": "boolean"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AuditResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "AUDIT_LOG_PATH is not set."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Audit"
+   }
+  },
   "/admin/consistency": {
    "get": {
     "operationId": "check_consistency_admin_consistency_get",
@@ -5218,6 +5932,68 @@
      }
     },
     "summary": "Repair Consistency"
+   }
+  },
+  "/admin/doctor": {
+   "get": {
+    "operationId": "run_doctor_admin_doctor_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DoctorResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Run Doctor"
    }
   },
   "/answer-cache": {
@@ -5697,6 +6473,16 @@
       "schema": {
        "title": "Name",
        "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "background",
+      "required": false,
+      "schema": {
+       "default": false,
+       "title": "Background",
+       "type": "boolean"
       }
      },
      {
@@ -6219,6 +7005,208 @@
      }
     },
     "summary": "Upload Document From Url"
+   }
+  },
+  "/documents/imports": {
+   "get": {
+    "operationId": "list_background_imports_documents_imports_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackgroundImportListResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Background Imports"
+   }
+  },
+  "/documents/imports/{import_id}": {
+   "delete": {
+    "operationId": "cancel_background_import_documents_imports__import_id__delete",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "import_id",
+      "required": true,
+      "schema": {
+       "title": "Import Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackgroundImportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Cancel Background Import"
+   },
+   "get": {
+    "operationId": "get_background_import_documents_imports__import_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "import_id",
+      "required": true,
+      "schema": {
+       "title": "Import Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackgroundImportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Get Background Import"
    }
   },
   "/documents/jobs": {
@@ -7147,6 +8135,77 @@
      }
     },
     "summary": "Document Original"
+   }
+  },
+  "/documents/{filename}/outline": {
+   "get": {
+    "operationId": "document_outline_documents__filename__outline_get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "filename",
+      "required": true,
+      "schema": {
+       "title": "Filename",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DocumentOutlineResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Document Outline"
    }
   },
   "/documents/{filename}/refresh": {
@@ -8262,6 +9321,83 @@
     "summary": "Answer Question"
    }
   },
+  "/questions/continue": {
+   "post": {
+    "description": "The rest of an answer cut off at the token limit, streamed like\n/questions/stream (sources, deltas, done with the whole answer).",
+    "operationId": "continue_answer_stream_questions_continue_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ContinueRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such trace here, or traces are off."
+     },
+     "409": {
+      "description": "That answer wasn't cut off, or its passages changed."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Continue Answer Stream"
+   }
+  },
   "/questions/stream": {
    "post": {
     "operationId": "answer_question_stream_questions_stream_post",
@@ -8733,6 +9869,22 @@
        ],
        "description": "Only traces answered under this RERANK_MIN_SCORE.",
        "title": "Bar"
+      }
+     },
+     {
+      "description": "What decides each side: the answer's status (model), or people's ratings of the answers (feedback; FEEDBACK_ENABLED).",
+      "in": "query",
+      "name": "labels",
+      "required": false,
+      "schema": {
+       "default": "model",
+       "description": "What decides each side: the answer's status (model), or people's ratings of the answers (feedback; FEEDBACK_ENABLED).",
+       "enum": [
+        "model",
+        "feedback"
+       ],
+       "title": "Labels",
+       "type": "string"
       }
      },
      {

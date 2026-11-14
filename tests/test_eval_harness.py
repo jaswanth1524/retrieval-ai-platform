@@ -526,6 +526,7 @@ def test_answer_metrics_measure_grounding() -> None:
         "refused_unanswerable_rate": 1.0,
         "uncited_rate": 1 / 3,
         "error_rate": 0.0,
+        "unsupported_claims_mean": 0.0,
     }
     assert row(["a.md"], "answered").to_dict()["cited_filenames"] == ["a.md"]
 
@@ -644,6 +645,21 @@ def test_answer_rows_are_saved_as_they_finish_and_a_run_resumes(
     assert rows[0]["fact_hit"] is True
     assert len(generator.prompts) == 1
     assert "[2/2] answered" in capsys.readouterr().out
+
+    # A row saved as failed is asked again on --resume, not kept as a failure.
+    partial_path(output).write_text(
+        json.dumps({"index": 0, "row": {"question": "first", "answer": "kept c1 [1]"}})
+        + "\n"
+        + json.dumps(
+            {"index": 1, "row": {"question": "second", "answer": "", "error": "timed out"}}
+        )
+        + "\n"
+    )
+    generator = ScriptedGenerator("c1 again [1].")
+    run_answer_eval(examples, Collab(generator), output, resume=True)  # type: ignore[arg-type]
+    rows = json.loads(output.read_text())
+    assert [r["answer"] for r in rows] == ["kept c1 [1]", "c1 again [1]."]
+    assert len(generator.prompts) == 1
 
 
 def test_answer_contains_is_validated_and_scored(tmp_path: Path) -> None:

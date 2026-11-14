@@ -1934,17 +1934,20 @@ class _LengthLimitedGenerator(FakeGenerator):
         reset_finish_reason("length")
 
 
-def test_an_answer_cut_off_at_the_token_limit_is_flagged_in_both_modes_and_the_cache() -> None:
+def test_an_answer_cut_off_at_the_token_limit_is_flagged_in_both_modes_and_never_cached() -> None:
+    """Asked again, a cut-off answer may come out whole: it isn't replayed for the TTL."""
+
     pipeline = _status_pipeline(_LengthLimitedGenerator("Alpha is documented [1] and"))
 
     grounded = pipeline.answer("alpha")
     assert grounded.truncated is True
-    assert pipeline.answer("alpha").cached and pipeline.answer("alpha").truncated is True
+    again = pipeline.answer("alpha")
+    assert not again.cached and again.truncated is True
 
     done = _stream_done(pipeline, "alpha beta")
     assert done["truncated"] is True
-    replayed = _stream_done(pipeline, "alpha beta")
-    assert replayed["cached"] and replayed["truncated"] is True
+    asked_again = _stream_done(pipeline, "alpha beta")
+    assert not asked_again.get("cached") and asked_again["truncated"] is True
 
     plain = _status_pipeline(FakeGenerator("Alpha is documented [1]."))
     assert plain.answer("alpha").truncated is False

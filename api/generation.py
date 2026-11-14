@@ -8,7 +8,7 @@ where callers have always imported them from.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from api.citations import (
     CITATION_EXCERPT_MAX_CHARS,
@@ -24,6 +24,7 @@ from api.citations import (
     needs_citation_retry,
     retry_uncited_answer,
     source_citations,
+    unsupported_claims,
     will_call_llm_for_citations,
     will_retry_citations,
 )
@@ -42,6 +43,7 @@ from api.llm import (
     redact_url,
     supports_reasoning,
 )
+from api.metrics import unsupported_claims_total
 from api.prompting import (
     CONDENSE_SYSTEM_PROMPT,
     EXPANSION_SYSTEM_PROMPT,
@@ -185,6 +187,12 @@ class GroundedAnswer:
     # The answer cited nothing and citations were added by matching its sentences to
     # the sources (citations.backfill_citations), not by the model.
     citation_backfilled: bool = False
+    unsupported_claims: int = 0
+    # The reply came from the prompt cache (PROMPT_CACHE_SIZE): no LLM call was made.
+    prompt_cached: bool = False
+    # The provider read far less of the prompt than was sent: cut to fit its context
+    # window, grounding rules first (raise OLLAMA_NUM_CTX).
+    prompt_cut: bool = False
     # Passages the question picked (chunk_ids) that the prompt had no room for: past
     # max_context_chunks (or the reranker's candidates), or cut to fit the window.
     passages_left_out: int = 0
@@ -243,6 +251,11 @@ def finish_answer(
         weak_matches=weak_matches,
         context_chunks=context_chunks,
     )
+    outcome = replace(
+        outcome, unsupported_claims=unsupported_claims(outcome.answer, context_chunks)
+    )
+    if outcome.unsupported_claims:
+        unsupported_claims_total.inc(outcome.unsupported_claims)
     return outcome, attach_spans(outcome.answer, outcome.cited, context_chunks)
 
 
@@ -281,6 +294,7 @@ def generate_grounded_answer(
         sources=cited,
         citation_retry_used=outcome.retry_used,
         citation_backfilled=outcome.backfilled,
+        unsupported_claims=outcome.unsupported_claims,
         citation_retry_ms=outcome.retry_ms,
         prompt_messages=outcome.prompt_messages,
     )

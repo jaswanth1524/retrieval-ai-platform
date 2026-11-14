@@ -21,6 +21,7 @@ import zipfile
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, Any
 
 from fastapi import HTTPException
@@ -257,7 +258,7 @@ def _restore_document(
                 _uploaded_at(document.get("uploaded_at")),
                 tags,
                 _source(document),
-                _watched_from(document),
+                _watched_from(document, filename),
             )
         )
         # A manifest that lists the name twice queues it once.
@@ -342,14 +343,24 @@ def _source(document: dict[str, Any]) -> DocumentSource | None:
     )
 
 
-def _watched_from(document: dict[str, object]) -> str | None:
+def _watched_from(document: dict[str, object], filename: str) -> str | None:
     """The watched folder a document came from (the folder watcher may delete it when
-    its file goes), when the manifest says so plausibly: an absolute path."""
+    its file goes), when the manifest says so plausibly — an absolute path — and the
+    file is in that folder here.
+
+    A backup restored into another instance (or after the folder changed) would
+    otherwise hand its watcher documents it never saw: with WATCH_DELETE_MISSING, every
+    one whose file isn't in the folder would be deleted on the first scan. A document in
+    a subfolder loses the mark; the watcher stamps it again when it next indexes it."""
 
     value = document.get("watched_from")
-    if isinstance(value, str) and 0 < len(value) <= 4096 and value.startswith("/"):
-        return value
-    return None
+    if not (isinstance(value, str) and 0 < len(value) <= 4096 and value.startswith("/")):
+        return None
+    try:
+        present = (Path(value) / filename).is_file()
+    except (OSError, ValueError):
+        present = False
+    return value if present else None
 
 
 def _uploaded_at(value: object) -> float | None:
@@ -515,6 +526,11 @@ class BackupCheck:
         return not self.problems
 
 
+# What a verify decompresses, at most: per member, and for the whole archive.
+VERIFY_MAX_MEMBER_BYTES = 1 << 30
+VERIFY_MAX_EXPANDED_BYTES = 16 << 30
+
+
 def verify_backup(upload: IO[bytes], max_original_bytes: int | None = None) -> BackupCheck:
     """Check a backup without restoring anything: the manifest, every member's checksum
     (each one read once, nothing kept), that every original and version the manifest
@@ -540,8 +556,31 @@ def verify_backup(upload: IO[bytes], max_original_bytes: int | None = None) -> B
             return check
         sizes: dict[str, int] = {}
         damaged: set[str] = set()
+        budget = VERIFY_MAX_EXPANDED_BYTES
         for info in infos:
             size = 0
+            # Read to the size each member declares (zipfile stops there): one that
+            # declares more than restore would ever read, or more than is left of the
+            # budget, isn't decompressed at all — a small upload could expand for
+            # hours on a request thread.
+            if (
+                max_original_bytes is not None
+                and info.filename.startswith(("originals/", "versions/"))
+                and info.file_size > max_original_bytes
+            ):
+                # Restore refuses it by its size alone (reported below as a refusal,
+                # not damage): nothing to gain from decompressing it.
+                sizes[info.filename] = info.file_size
+                continue
+            if info.file_size > VERIFY_MAX_MEMBER_BYTES or info.file_size > budget:
+                damaged.add(info.filename)
+                check.problems.append(
+                    f"{info.filename} was not checked: it expands to {info.file_size} "
+                    "bytes, more than a check reads."
+                )
+                sizes[info.filename] = 0
+                continue
+            budget -= info.file_size
             try:
                 with archive.open(info) as handle:
                     while chunk := handle.read(1 << 20):

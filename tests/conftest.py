@@ -53,6 +53,10 @@ def _isolate_app_settings_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None
     # which a child process would not see. tests/test_parse_isolation.py covers the
     # child-process path with its own settings.
     monkeypatch.setenv("PARSE_TIMEOUT_SECONDS", "0")
+    # The prompt cache (on by default) would reuse a reply between two asks of one
+    # test; tests that count calls or stages expect the model asked each time. Tests of
+    # the cache turn it on themselves.
+    monkeypatch.setenv("PROMPT_CACHE_SIZE", "0")
     yield
 
 
@@ -84,6 +88,17 @@ def _fresh_llm_process_state() -> Generator[None]:
         llm._slots.clear()
         llm._measured_rates.clear()
         llm._slow_samples.clear()
+        llm._usage_refused.clear()
+        from api import pipeline
+
+        pipeline.condense_memo.clear()
+        from api import prompt_cache
+
+        prompt_cache.reset_shared_prompt_cache()
+        from api import imports
+
+        with imports._lock:
+            imports._imports.clear()
         # Memoized span matching: results depend on constants tests patch.
         citations._span_index.cache_clear()
         citations._backfill.cache_clear()

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import functools
+import hashlib
 import json
 import os
 import re
@@ -319,10 +320,15 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     files, unsupported = ingestible(
         paths, extensions, include=args.include or (), exclude=args.exclude or ()
     )
+    # A zip found while walking a directory is sent as an archive too, as one named on
+    # the command line is (it used to be skipped as an unsupported type).
+    archives += [p for p in unsupported if p.suffix.lower() == ".zip"]
+    unsupported = [p for p in unsupported if p.suffix.lower() != ".zip"]
     text = None if args.json else out
     skipped: list[dict[str, str]] = []
     failed: list[dict[str, str]] = []
     indexed: list[dict[str, Any]] = []
+    queued_in_background: list[dict[str, Any]] = []
 
     def skip(path: Path, reason: str) -> None:
         skipped.append({"path": str(path), "reason": reason})
@@ -384,11 +390,14 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     # A zip named on the command line: the server indexes each document in it.
     for archive in archives:
         try:
-            report = client.upload_archive(archive, tags=args.tag or ())
+            report = client.upload_archive(archive, tags=args.tag or (), background=args.background)
         except DocragError as exc:
             # One zip refused (too large, not a zip): the others still go, and the
             # summary still counts what was indexed.
             fail(archive, str(exc))
+            continue
+        if args.background:
+            _follow_archive_import(client, args, archive, report, fail, queued_in_background, text)
             continue
         for item in report.get("skipped", []):
             skip(Path(f"{archive}:{item.get('name')}"), str(item.get("reason")))
@@ -406,11 +415,159 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         for job_id, status in waited.items():
             if status.get("state") not in FINISHED_JOB_STATES:
                 fail(member[job_id], _job_error(status))
+    queued = sum(item["queued"] for item in queued_in_background)
     if args.json:
-        print(json.dumps({"indexed": indexed, "failed": failed, "skipped": skipped}), file=out)
+        report_json: dict[str, Any] = {"indexed": indexed, "failed": failed, "skipped": skipped}
+        if queued_in_background:
+            report_json["queued_in_background"] = queued_in_background
+        print(json.dumps(report_json), file=out)
     else:
-        print(f"{len(indexed)} indexed, {len(failed)} failed, {len(skipped)} skipped", file=out)
+        background = f", {queued} queued from zips (`docrag jobs` follows them)" if queued else ""
+        print(
+            f"{len(indexed)} indexed, {len(failed)} failed, {len(skipped)} skipped{background}",
+            file=out,
+        )
     return 1 if failed else 0
+
+
+def _follow_archive_import(
+    client: DocragClient,
+    args: argparse.Namespace,
+    archive: Path,
+    started: dict[str, Any],
+    fail: Callable[[Path, str], None],
+    queued_in_background: list[dict[str, Any]],
+    text: TextIO | None,
+) -> None:
+    """``ingest --background``: wait until the server has queued every document of a
+    zip (as room frees in its indexing queue; nothing is deferred)."""
+
+    import_id = started.get("import_id")
+    if not import_id:
+        fail(archive, "the server didn't start a background import (too old?)")
+        return
+    try:
+        status = client.wait_for_import(import_id, timeout=_wait_limit(args))
+    except DocragError as exc:
+        fail(archive, str(exc))
+        return
+    for problem in status.get("problems", []):
+        fail(archive, str(problem))
+    if status.get("state") != "done":
+        fail(archive, f"the import ended {status.get('state')}")
+    queued_in_background.append(
+        {
+            "path": str(archive),
+            "import_id": import_id,
+            "queued": int(status.get("queued", 0)),
+            "skipped": int(status.get("skipped", 0)),
+        }
+    )
+    if text:
+        print(
+            f"ok    {archive}: {status.get('queued', 0)} queued, "
+            f"{status.get('skipped', 0)} skipped",
+            file=text,
+        )
+
+
+# Tags are at most 40 characters: "sync:" and the folder's name, cut to fit.
+_SYNC_TAG_PREFIX = "sync:"
+_MAX_TAG_CHARS = 40
+
+
+def sync_tag(directory: Path) -> str:
+    """The tag ``docrag sync`` marks a folder's documents with (what --delete may remove)."""
+
+    name = directory.resolve().name or "root"
+    return (_SYNC_TAG_PREFIX + name)[:_MAX_TAG_CHARS]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def cmd_sync(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Make the index match a folder: upload files that are new or changed (by their
+    SHA-256 against the server's), and with --delete remove documents this folder's
+    sync put there whose file is gone. Unchanged files aren't sent at all."""
+
+    directory = Path(args.directory)
+    if not directory.is_dir():
+        print(f"error: not a directory: {directory}", file=sys.stderr)
+        return 2
+    tag = sync_tag(directory)
+    config = client.config()
+    extensions = {ext.lower() for ext in config.get("supported_extensions", [])}
+    files, _ = ingestible(
+        [directory], extensions, include=args.include or (), exclude=args.exclude or ()
+    )
+    listing = client.documents()
+    hashes: dict[str, str] = listing.get("content_sha256s") or {}
+    indexed = set(listing.get("filenames", []))
+    local: dict[str, Path] = {}
+    for path in files:
+        local.setdefault(stored_name_key(path.name), path)
+    changed: list[Path] = []
+    unchanged = 0
+    for path in local.values():
+        try:
+            same = path.name in indexed and hashes.get(path.name) == _sha256(path)
+        except OSError as exc:
+            print(f"skip  {path} (cannot read it: {exc.strerror or exc})", file=out)
+            continue
+        if same:
+            unchanged += 1
+        else:
+            changed.append(path)
+    tags: dict[str, list[str]] = listing.get("tags") or {}
+    gone = sorted(
+        name
+        for name, document_tags in tags.items()
+        if tag in document_tags and stored_name_key(name) not in local
+    )
+    if args.dry_run:
+        for path in changed:
+            print(f"send    {path}", file=out)
+        for name in gone if args.delete else []:
+            print(f"delete  {name}", file=out)
+        print(
+            f"{len(changed)} to send, {unchanged} unchanged"
+            + (f", {len(gone)} to delete" if args.delete else f", {len(gone)} gone (--delete)"),
+            file=out,
+        )
+        return 0
+    code = 0
+    if changed:
+        ingest_args = argparse.Namespace(
+            **{
+                **vars(args),
+                "paths": [str(path) for path in changed],
+                "tag": [*(args.tag or []), tag],
+                "include": None,
+                "exclude": None,
+            }
+        )
+        code = cmd_ingest(client, ingest_args, out)
+    deleted = 0
+    for name in gone if args.delete else []:
+        try:
+            client.delete(name)
+            deleted += 1
+            print(f"deleted {name}", file=out)
+        except DocragError as exc:
+            print(f"fail  delete {name}: {exc}", file=out)
+            code = 1
+    print(
+        f"sync: {len(changed)} sent, {unchanged} unchanged, {deleted} deleted"
+        + ("" if args.delete or not gone else f", {len(gone)} gone (--delete removes them)"),
+        file=out,
+    )
+    return code
 
 
 def _finished_member(
@@ -459,7 +616,11 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
         )
         return 0
     job = client.upload_url(
-        args.source_url, args.name, tags=args.tag or (), refresh_minutes=args.refresh_minutes
+        args.source_url,
+        args.name,
+        tags=args.tag or (),
+        refresh_minutes=args.refresh_minutes,
+        replace=args.replace,
     )
     status = client.wait_for_jobs([job["job_id"]], timeout=_wait_limit(args))[job["job_id"]]
     succeeded = status.get("state") == "done"
@@ -776,6 +937,41 @@ def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -
     return 0
 
 
+def cmd_audit(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    try:
+        since = upload_bound(args.since) if args.since else None
+    except ValueError:
+        print(f"error: --since {args.since!r} isn't a date (2026-11-01)", file=sys.stderr)
+        return 2
+    entries = client.audit(
+        event=args.event, since=since, limit=args.limit, all_workspaces=args.all_workspaces
+    )
+    if args.json:
+        print(json.dumps(entries), file=out)
+        return 0
+    for entry in entries:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(entry["created_at"])))
+        fields = " ".join(f"{name}={value}" for name, value in (entry.get("fields") or {}).items())
+        where = f"[{entry.get('workspace')}, {entry.get('key')}]"
+        print(f"{when}  {entry.get('event')}  {where}  {fields}", file=out)
+    return 0
+
+
+def cmd_doctor(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Exit 1 when there is a warning, so a script can check a deployment."""
+
+    findings = client.doctor()
+    if args.json:
+        print(json.dumps(findings), file=out)
+    elif not findings:
+        print("nothing to report", file=out)
+    for finding in [] if args.json else findings:
+        print(
+            f"{finding.get('level')}: {finding.get('subject')}: {finding.get('message')}", file=out
+        )
+    return 1 if any(f.get("level") == "warning" for f in findings) else 0
+
+
 def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     if not (args.query or "").strip() and not args.like:
         print("search needs a query, or --like CHUNK_ID", file=sys.stderr)
@@ -783,6 +979,12 @@ def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     options = narrowing_options(args)
     if args.like:
         options["like_chunk_id"] = args.like
+    if args.explain or args.expect:
+        options["explain"] = True
+    if args.expect:
+        # A chunk id has the form a passage's id has (hex); anything else is a file.
+        target = "expect_filename" if "." in args.expect else "expect_chunk_id"
+        options[target] = args.expect
     response = client.search_response(
         args.query or "",
         filenames=args.file or None,
@@ -791,16 +993,28 @@ def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         options=options,
     )
     results: list[dict[str, Any]] = response.get("results", [])
+    explanation = response.get("explanation")
     if args.json:
-        print(json.dumps(results), file=out)
+        print(json.dumps(response if options.get("explain") else results), file=out)
         return 0
     if response.get("weak_matches") and results:
         print("(no strong matches; the closest passages:)", file=out)
     for item in results:
         text = " ".join(str(item.get("text", "")).split())
+        legs = (
+            f" dense #{item.get('dense_rank') or '-'} · BM25 #{item.get('sparse_rank') or '-'}"
+            if options.get("explain")
+            else ""
+        )
         print(
             f"{item.get('rank')}. {item.get('filename')} p.{item.get('page')} "
-            f"({item.get('rerank_score', 0):.2f})\n   {text[:240]}",
+            f"({item.get('rerank_score', 0):.2f}){legs}\n   {text[:240]}",
+            file=out,
+        )
+    if isinstance(explanation, dict):
+        print(
+            f"\n{explanation.get('target')}: {explanation.get('outcome')} — "
+            f"{explanation.get('detail')}",
             file=out,
         )
     return 0
@@ -1436,12 +1650,46 @@ def cmd_export(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     return 0
 
 
+def _import_in_background(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """``import --background``: every document is queued as room frees (none deferred);
+    this follows the import until it has queued them all."""
+
+    started = client.restore(Path(args.archive), background=True)
+    import_id = started.get("import_id")
+    if not import_id:
+        print("error: the server didn't start a background import (too old?)", file=sys.stderr)
+        return 1
+    seen = -1
+
+    def progress(status: dict[str, Any]) -> None:
+        nonlocal seen
+        if not args.json and status.get("queued", 0) != seen:
+            seen = status.get("queued", 0)
+            print(f"queued {seen} so far…", file=out)
+
+    status = client.wait_for_import(import_id, timeout=_wait_limit(args), on_progress=progress)
+    if args.json:
+        print(json.dumps(status), file=out)
+    else:
+        for problem in status.get("problems", []):
+            print(f"  {problem}", file=out)
+        print(
+            f"{status.get('queued', 0)} queued, {status.get('skipped', 0)} skipped, "
+            f"{status.get('failed', 0)} failed ({status.get('state')}); `docrag jobs` "
+            "follows their indexing",
+            file=out,
+        )
+    return 0 if status.get("state") == "done" and not status.get("failed") else 1
+
+
 def cmd_import(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     """Restore a backup and wait for every indexing job it started (``--json`` too).
 
     Exits 1 when a job failed or could not be followed, or the server rejected or
     deferred anything (a deferred document needs the same import run again)."""
 
+    if args.background:
+        return _import_in_background(client, args, out)
     report = client.restore(Path(args.archive))
     jobs = report.get("jobs", [])
     rejected, deferred = report.get("rejected", []), report.get("deferred", [])
@@ -1538,12 +1786,31 @@ def build_parser() -> argparse.ArgumentParser:
         help='Only files matching ("*.pdf", or "drafts/*" under a directory given).',
     )
     ingest.add_argument(
+        "--background",
+        action="store_true",
+        help="Zips: the server queues every document as room frees (none deferred); "
+        "this waits until all are queued, not indexed.",
+    )
+    ingest.add_argument(
         "--exclude",
         action="append",
         metavar="GLOB",
         help='Leave matching files (or directories, by name) out ("*.py", "node_modules").',
     )
     wait_flag(ingest)
+
+    sync = command("sync", "Upload a folder's new and changed files; --delete removes ones gone.")
+    sync.add_argument("directory")
+    sync.add_argument("--tag", action="append", help="Tag every file sent (repeatable).")
+    sync.add_argument("--include", action="append", metavar="GLOB")
+    sync.add_argument("--exclude", action="append", metavar="GLOB")
+    sync.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete documents this folder's sync added whose file is gone.",
+    )
+    sync.add_argument("--dry-run", action="store_true", help="Only say what it would do.")
+    wait_flag(sync)
 
     add_url = command("add-url", "Have the server fetch and index a URL.")
     # Not `url`: that is the server's address (--url), which this would overwrite.
@@ -1560,6 +1827,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--sitemap",
         action="store_true",
         help="The URL is a sitemap, sitemap index, RSS or Atom feed: add the pages it lists.",
+    )
+    add_url.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace a document of the same name that came from another source.",
     )
     add_url.add_argument("--max-pages", type=int, help="--sitemap: at most this many pages.")
     add_url.add_argument(
@@ -1616,6 +1888,17 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--file", action="append")
     search.add_argument("--tag", action="append")
     search.add_argument("--top-k", type=int)
+    search.add_argument(
+        "--explain",
+        action="store_true",
+        help="Show each result's rank on the dense and the BM25 search.",
+    )
+    search.add_argument(
+        "--expect",
+        metavar="CHUNK_ID_OR_FILE",
+        help="Say where this passage (or the best passage of this file) was lost "
+        "(implies --explain).",
+    )
     _narrowing_flags(search)
 
     read = command("read", "Print a document's indexed passages.")
@@ -1734,6 +2017,14 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "-o", "--output", help="download: where to write it (default: its name, here)."
     )
+    command("doctor", "Risky server settings: backups, disk, memory, keys (full key).")
+
+    audit = command("audit", "Stored audit events, newest first (AUDIT_LOG_PATH; full key).")
+    audit.add_argument("--event", help='An event, or a prefix ending in "." (document.).')
+    audit.add_argument("--since", metavar="DATE", help="Only events since this date (ISO).")
+    audit.add_argument("--limit", type=int, default=50)
+    audit.add_argument("--all-workspaces", action="store_true")
+
     check = command("check", "How the index and stored originals agree (full key; report only).")
     check.add_argument(
         "--repair",
@@ -1747,6 +2038,12 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("output")
     restore = command("import", "Restore a backup zip and wait for it.")
     restore.add_argument("archive")
+    restore.add_argument(
+        "--background",
+        action="store_true",
+        help="Let the server queue every document as room frees (a large backup), and "
+        "follow that instead of sending the deferred ones again.",
+    )
     wait_flag(restore)
     return parser
 
@@ -1755,6 +2052,9 @@ COMMANDS = {
     "status": cmd_status,
     "backup": cmd_backup,
     "check": cmd_check,
+    "doctor": cmd_doctor,
+    "sync": cmd_sync,
+    "audit": cmd_audit,
     "documents": cmd_documents,
     "ingest": cmd_ingest,
     "add-url": cmd_add_url,

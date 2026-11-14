@@ -185,6 +185,29 @@ describe('DocumentViewer', () => {
       expect(screen.queryByTestId('viewer-load-later')).not.toBeInTheDocument();
     });
 
+    it('clears a failed load\'s error once a retry of it works', async () => {
+      const paged = servePaged(BIG_CONTENT.chunks);
+      let failNext = false;
+      getContentMock.mockImplementation(async (filename: string, signal?: AbortSignal, page: ContentPage = {}) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error('offline');
+        }
+        return paged(filename, signal, page);
+      });
+
+      render(<DocumentViewer filename="big.md" chunkId="c400" onClose={vi.fn()} />);
+      await waitFor(
+        () => expect(screen.getByTestId('viewer-load-earlier')).toBeInTheDocument(),
+        SLOW_RENDER,
+      );
+      failNext = true;
+      await userEvent.click(screen.getByTestId('viewer-load-earlier'));
+      await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+      await userEvent.click(screen.getByTestId('viewer-load-earlier'));
+      await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    });
+
     it('drops "Show the first 2000" once those chunks are on screen', async () => {
       // Past the server's unpaged cap the button fetched the same 2000 again and stayed.
       const huge = Array.from({ length: 2100 }, (_, i) => makeChunk(i));

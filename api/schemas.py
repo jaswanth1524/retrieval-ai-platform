@@ -123,6 +123,9 @@ class BackupStatusResponse(BaseModel):
     ok: bool
     file: str | None = None
     error: str | None = None
+    # Indexed documents that backup holds no original of (a restore can't bring them
+    # back): all of them without RAW_DOCUMENT_DIR.
+    originals_missing: int = 0
 
 
 class ReadinessResponse(BaseModel):
@@ -306,6 +309,9 @@ class DocumentListResponse(BaseModel):
     source_urls: dict[str, str] = {}
     # The scheduled refresh of each document fetched by URL.
     url_refresh: dict[str, UrlRefreshStatusResponse] = {}
+    # The SHA-256 of each document's original bytes (absent for one indexed before it
+    # was recorded): what `docrag sync` compares a local file with before sending it.
+    content_sha256s: dict[str, str] = {}
     # Documents holding exactly the same bytes under different names (each group in
     # name order). Both copies are searched, and citations split between them.
     duplicate_groups: list[list[str]] = []
@@ -445,6 +451,27 @@ class DocumentChunkResponse(BaseModel):
     page_end: int | None = None
 
 
+class OutlineEntryResponse(BaseModel):
+    """Where a section (or a page) starts: open the viewer around ``chunk_id``."""
+
+    section: str
+    page: int
+    chunk_id: str
+
+
+class DocumentOutlineResponse(BaseModel):
+    """GET /documents/{filename}/outline: the document's sections and pages, in order,
+    each with its first passage — for a table of contents and "go to page"."""
+
+    filename: str
+    total_chunks: int
+    sections: list[OutlineEntryResponse]
+    # Each page's first passage (the pages that hold one).
+    pages: list[OutlineEntryResponse]
+    # More sections than OUTLINE_MAX_SECTIONS: the list stops there.
+    truncated: bool = False
+
+
 class DocumentContentResponse(BaseModel):
     """A document reconstructed from its stored chunks, in ordinal order."""
 
@@ -522,6 +549,12 @@ class TraceConfigResponse(BaseModel):
     query_expansion_enabled: bool | None = None
     reranker_onnx_file: str | None = None
     context_neighbor_max_chars: int | None = None
+    # Also moved selection or the answer (None on traces from before pass 17).
+    context_diversity_enabled: bool | None = None
+    context_diversity_max_similarity: float | None = None
+    citation_retry_mode: str | None = None
+    llm_max_tokens: int | None = None
+    query_expansion_count: int | None = None
 
 
 class TraceCandidateResponse(BaseModel):
@@ -596,6 +629,9 @@ class ScoreReportResponse(BaseModel):
     # summaries (left_out); outside the asked-for since/bar (filtered_out).
     left_out: int = 0
     filtered_out: int = 0
+    # What decided each side: "model" (the answer's status) or "feedback" (people's
+    # ratings, ``labels=feedback``).
+    labels: str = "model"
 
 
 class TraceSettingChangeResponse(BaseModel):
@@ -785,6 +821,12 @@ class TraceDetailResponse(BaseModel):
     # True when a zero-citation answer had citations added by matching its sentences to
     # the sources (CITATION_RETRY_MODE), without a second LLM call.
     citation_backfilled: bool = False
+    unsupported_claims: int = 0
+    # The answer's LLM reply was reused from an identical earlier call (PROMPT_CACHE_SIZE).
+    prompt_cached: bool = False
+    # The provider read far less of the prompt than was sent: cut to fit its context
+    # window, grounding rules first (raise OLLAMA_NUM_CTX).
+    prompt_cut: bool = False
     # The X-Request-ID of the request that asked it, to find its log lines.
     request_id: str | None = None
     usage: UsageResponse | None = None
@@ -924,6 +966,12 @@ class QuestionResponse(BaseModel):
     # The model cited nothing; its citations were added by matching its sentences to the
     # sources (CITATION_RETRY_MODE), so check them ("auto-cited" in the UI).
     citation_backfilled: bool = False
+    unsupported_claims: int = 0
+    # The answer's LLM reply was reused from an identical earlier call (PROMPT_CACHE_SIZE).
+    prompt_cached: bool = False
+    # The provider read far less of the prompt than was sent: cut to fit its context
+    # window, grounding rules first (raise OLLAMA_NUM_CTX).
+    prompt_cut: bool = False
     # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.
     # Picked passages (chunk_ids) the prompt had no room for: past max_context_chunks,
     # past the reranker's candidates, or cut to fit the context window.
@@ -998,6 +1046,13 @@ class WorkspaceListResponse(BaseModel):
     workspaces: list[str]
 
 
+class ContinueRequest(BaseModel):
+    """Continue an answer cut off at the token limit (POST /questions/continue)."""
+
+    # The cut-off answer's trace (its `trace_id` from `done`).
+    trace_id: str = Field(min_length=1, max_length=REQUEST_TRACE_ID_MAX_CHARS)
+
+
 class UrlIngestRequest(BaseModel):
     """Index a document fetched from a URL (POST /documents/from-url)."""
 
@@ -1010,6 +1065,10 @@ class UrlIngestRequest(BaseModel):
     # How often the scheduled refresh checks it (URL_REFRESH_INTERVAL_MINUTES must be on),
     # in minutes: omitted = the server's interval, 0 = never.
     refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
+    # A document of that name from another source (an upload, another URL) is
+    # replaced only with this set (or with `filename` given); otherwise the request is
+    # a 409. The same URL always updates its own document.
+    replace: bool = False
 
 
 class SitemapIngestRequest(BaseModel):
@@ -1036,6 +1095,28 @@ class SitemapIngestResponse(BaseModel):
     child_sitemaps: int
     # Follow it at GET /documents/sitemap-imports/{import_id}; cancel with DELETE.
     import_id: str | None = None
+
+
+class BackgroundImportResponse(BaseModel):
+    """A zip or backup being imported in the background (GET /documents/imports/{id})."""
+
+    id: str
+    # "archive" (a zip of documents) or "restore" (a backup); extensible.
+    kind: str
+    name: str
+    # running / cancelling / done / cancelled.
+    state: str
+    started_at: float
+    finished_at: float | None = None
+    # Documents queued for indexing so far, and skipped (with why, in problems).
+    queued: int = 0
+    skipped: int = 0
+    failed: int = 0
+    problems: list[str] = []
+
+
+class BackgroundImportListResponse(BaseModel):
+    imports: list[BackgroundImportResponse]
 
 
 class SitemapImportResponse(BaseModel):
@@ -1163,6 +1244,11 @@ class SearchRequest(PassageNarrowing):
     (``like_chunk_id``) the passages most like a stored one."""
 
     query: str = Field(default="", max_length=MAX_QUESTION_CHARS)
+    # Each result's rank on the dense and the BM25 search, and with expect_chunk_id or
+    # expect_filename, where that passage was lost (`explanation`).
+    explain: bool = False
+    expect_chunk_id: RequestChunkId | None = None
+    expect_filename: RequestFilename | None = None
     # Search from this passage instead of a query: its own stored vectors drive both
     # search legs and the reranker scores against its text; it is left out of the
     # results. 404 when no passage has the id.
@@ -1201,6 +1287,39 @@ class SearchResultResponse(BaseModel):
     # The sentences that share the most words with the query (offsets into `text`),
     # for highlighting; empty when none shares enough.
     spans: list[CitationSpanResponse] = []
+    # With `explain`: its 1-based rank on the dense and the BM25 search (null: that
+    # search didn't return it).
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
+
+
+class SearchExplanationResponse(BaseModel):
+    """What became of the expected passage (`expect_chunk_id`, or the best passage of
+    `expect_filename`): the first search stage that left it out."""
+
+    target: str
+    # returned / not_retrieved / not_scored / below_min_score / near_duplicate /
+    # past_top_k (extensible).
+    outcome: str = Field(
+        json_schema_extra={
+            "x-extensible-enum": [
+                "returned",
+                "not_retrieved",
+                "not_scored",
+                "below_min_score",
+                "near_duplicate",
+                "past_top_k",
+            ]
+        }
+    )
+    detail: str
+    chunk_id: str | None = None
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
+    fused_rank: int | None = None
+    rerank_rank: int | None = None
+    rerank_score: float | None = None
+    returned_rank: int | None = None
 
 
 class SearchTimingsResponse(BaseModel):
@@ -1216,6 +1335,8 @@ class SearchResponse(BaseModel):
     # results are the closest ones, best first. Typical of a one- or two-word search,
     # which the cross-encoder scores low even against a passage containing the words.
     weak_matches: bool = False
+    # With `explain` and an expected passage: where it was lost.
+    explanation: SearchExplanationResponse | None = None
 
 
 class ArchiveSkipResponse(BaseModel):
@@ -1232,6 +1353,9 @@ class ArchiveUploadResponse(BaseModel):
     # Not queued: the indexing queue was full. Upload the zip again later; the ones
     # already indexed are left as they are.
     deferred: list[str]
+    # background=true: the import's id (GET /documents/imports/{id}); the lists above
+    # are empty, and the documents are queued as room frees.
+    import_id: str | None = None
 
 
 class BackupFileResponse(BaseModel):
@@ -1302,6 +1426,37 @@ class ConsistencyRepairResponse(BaseModel):
     left: list[str]
 
 
+class AuditEntryResponse(BaseModel):
+    created_at: float
+    workspace: str
+    # e.g. document.delete, document.upload, backup.import (extensible).
+    event: str
+    # The kind of key used: full, read, open (no API_KEY), or system (background work).
+    key: str
+    client: str | None = None
+    fields: dict[str, Any] = {}
+
+
+class AuditResponse(BaseModel):
+    """GET /admin/audit: stored audit events (AUDIT_LOG_PATH), newest first."""
+
+    entries: list[AuditEntryResponse]
+
+
+class DoctorFindingResponse(BaseModel):
+    # "warning" (something will go wrong or is at risk) or "note"; extensible.
+    level: str
+    # The setting (or document) it is about.
+    subject: str
+    message: str
+
+
+class DoctorResponse(BaseModel):
+    """GET /admin/doctor: risky configurations of this server. A report only."""
+
+    findings: list[DoctorFindingResponse]
+
+
 class ConsistencyResponse(BaseModel):
     """GET /admin/consistency: how the index and the stored originals agree. A report
     only: nothing is changed."""
@@ -1336,6 +1491,9 @@ class ImportResponse(BaseModel):
     # Earlier versions of the restored documents put back (a backup exported with
     # include_versions, restored where RAW_DOCUMENT_VERSIONS keeps versions).
     versions_restored: int = 0
+    # background=true: the restore's id (GET /documents/imports/{id}); the lists above
+    # are empty, and the documents are queued as room frees.
+    import_id: str | None = None
 
 
 class WatchRetry(BaseModel):

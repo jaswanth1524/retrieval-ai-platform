@@ -236,6 +236,10 @@ class AppSettings(BaseSettings):
     # the TTL. Questions with conversation history are never cached.
     answer_cache_size: int = Field(default=256, ge=0)
     answer_cache_ttl_seconds: float = Field(default=3600.0, gt=0.0)
+    # Replies to identical LLM calls (the same messages, model and options) reused for
+    # ANSWER_CACHE_TTL_SECONDS, whatever the corpus did meanwhile: retrieval, citations
+    # and the trace still run; only the call is saved. 0 = off.
+    prompt_cache_size: int = Field(default=256, ge=0, le=100_000)
     openai_api_key: str | None = Field(default=None)
     # Any server speaking the OpenAI chat-completions API — vLLM, llama.cpp's server,
     # LM Studio, LocalAI — selected with LLM_PROVIDER=openai_compatible (or per request).
@@ -267,8 +271,8 @@ class AppSettings(BaseSettings):
     max_import_bytes: PositiveInt = 256 * 1024 * 1024
     # POST /documents/archive: a zip of documents, each indexed as its own. At most this
     # many members are looked at; what they expand to in all is held to
-    # MAX_IMPORT_BYTES, and each one to MAX_UPLOAD_BYTES. The zip itself is an upload
-    # (MAX_UPLOAD_BYTES).
+    # MAX_IMPORT_BYTES, and each one to MAX_UPLOAD_BYTES. The zip itself may be up to
+    # MAX_IMPORT_BYTES too (request_guard.body_limit).
     max_archive_members: PositiveInt = 500
     # POST /documents/from-sitemap: the most pages one sitemap or feed adds.
     sitemap_max_pages: PositiveInt = 100
@@ -314,6 +318,10 @@ class AppSettings(BaseSettings):
     # once, so a single huge document reports incremental job progress and never
     # holds one giant embedding call in memory.
     ingest_batch_size: PositiveInt = 64
+    # Documents indexed at the same time (the ingest pool's threads). Each one holds a
+    # document's parsed text and vectors in memory, and they share the embedding model:
+    # more is faster on a big folder only with cores and memory to spare.
+    ingest_workers: int = Field(default=2, ge=1, le=32)
     # Points written per Qdrant upsert, independent of the embedding batch above. Each
     # upsert is a round trip with wait=True under the filename lock, so writing a
     # 1,000-chunk document in 64-point calls held the lock through 16 of them.
@@ -399,6 +407,10 @@ class AppSettings(BaseSettings):
     query_log_enabled: bool = False
     query_log_path: str = "./data/query_log.db"
     query_log_max_rows: PositiveInt = 20_000
+    # Keep the audit events (deletes, uploads, re-indexes, restores...) in this sqlite
+    # file, newest AUDIT_LOG_MAX_ROWS, for GET /audit: log lines rotate away. "" = off.
+    audit_log_path: str = ""
+    audit_log_max_rows: PositiveInt = 100_000
     # Per-workspace relevance settings (PUT /workspaces/{name}/settings) are kept here
     # (sqlite) to survive a restart; empty keeps them in memory only.
     workspace_settings_path: str = ""
@@ -481,6 +493,10 @@ class AppSettings(BaseSettings):
     # The condense call only needs to produce one rewritten sentence — capped well
     # below llm_max_tokens so a runaway rewrite can't burn the generation token budget.
     condense_max_tokens: PositiveInt = 128
+    # Follow-up rewrites remembered (the same question, history, provider and model):
+    # Retry, an edited follow-up asked again and other tabs skip the condense call.
+    # 0 = off.
+    condense_cache_size: int = Field(default=256, ge=0, le=100_000)
 
     # Multi-query expansion (default OFF): when enabled, one LLM call rewrites the
     # query into query_expansion_count alternative phrasings; each is embedded and
@@ -669,6 +685,12 @@ class AppSettings(BaseSettings):
             log.warning(
                 "RAW_DOCUMENT_VERSIONS=%d has no effect without RAW_DOCUMENT_DIR.",
                 self.raw_document_versions,
+            )
+        if self.backup_dir and not self.raw_document_dir:
+            # A backup carries the originals; without them it holds only the manifest
+            # and feedback, and a restore has nothing to index.
+            log.warning(
+                "BACKUP_DIR without RAW_DOCUMENT_DIR: backups hold no documents to restore."
             )
         if self.auto_reindex_stale and not self.raw_document_dir:
             # Re-indexing reads each document's stored original.

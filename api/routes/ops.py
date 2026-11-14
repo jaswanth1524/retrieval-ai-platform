@@ -99,6 +99,7 @@ def _last_backup(app: FastAPI, settings: AppSettings) -> BackupStatusResponse | 
             workspace="",
             ok=status.ok,
             error=None if status.ok else "The backup failed; see the server log.",
+            originals_missing=status.originals_missing,
         )
     return status
 

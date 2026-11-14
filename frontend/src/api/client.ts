@@ -35,7 +35,11 @@ import type {
   BackupListResponse,
   ConsistencyRepairRequest,
   ConsistencyRepairResponse,
+  BackgroundImportListResponse,
+  BackgroundImportResponse,
   ConsistencyResponse,
+  DoctorResponse,
+  DocumentOutlineResponse,
   SitemapImportListResponse,
   SitemapImportResponse,
   SitemapIngestResponse,
@@ -430,6 +434,8 @@ export interface QuestionStreamHandlers {
       /** No passage cleared the server's bar: answered from the closest ones. */
       weakMatches?: boolean;
       truncated?: boolean;
+      /** The provider cut the prompt to fit its window (its grounding rules first). */
+      promptCut?: boolean;
       /** The model cited nothing; the citations were matched to its sentences. */
       autoCited?: boolean;
       /** Picked passages the answer went without (no room in the prompt). */
@@ -483,6 +489,10 @@ export const api = {
 
   // Which key this browser holds: "read" hides what the server would refuse (403).
   access: (signal?: AbortSignal) => request<AccessResponse>('/access', { signal, workspace: '' }),
+
+  // What a key not yet saved unlocks (Settings → Test key): 401 for a wrong one.
+  accessWithKey: (key: string, signal?: AbortSignal) =>
+    request<AccessResponse>('/access', { signal, workspace: '', headers: { 'X-API-Key': key } }),
 
   // Recorded answer ratings, newest first (full key; 404 when feedback is off).
   listFeedback: (limit = 200, signal?: AbortSignal) =>
@@ -654,13 +664,22 @@ export const api = {
   // viewer (getDocumentOriginal serves the uploaded bytes themselves).
   // With no page, the whole document; `around` + `radius` for the chunks either side
   // of a cited one, or `start`/`end` (1-based ordinals, inclusive) for a range.
+  // A document's sections and page starts (no text), for the viewer's contents.
+  documentOutline: (filename: string, signal?: AbortSignal) =>
+    request<DocumentOutlineResponse>(`/documents/${encodeURIComponent(filename)}/outline`, {
+      signal,
+    }),
+
   getDocumentContent: (filename: string, signal?: AbortSignal, page: ContentPage = {}) => {
     const query = new URLSearchParams();
     if (page.around !== undefined) query.set('around', page.around);
     if (page.radius !== undefined) query.set('radius', String(page.radius));
     if (page.start !== undefined) query.set('start', String(page.start));
     if (page.end !== undefined) query.set('end', String(page.end));
-    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    // Not query.size: Safari before 17 lacks it, and the page window was dropped there
+    // (the whole document, up to 2000 passages, was asked for instead).
+    const encoded = query.toString();
+    const suffix = encoded ? `?${encoded}` : '';
     return request<DocumentContentResponse>(
       `/documents/${encodeURIComponent(filename)}/content${suffix}`,
       { signal },
@@ -757,8 +776,11 @@ export const api = {
     }),
 
   // Best rerank scores of answered against unanswered traced questions.
-  scoreReport: (signal?: AbortSignal) =>
-    request<ScoreReportResponse>('/traces/score-report', { signal }),
+  scoreReport: (signal?: AbortSignal, labels: 'model' | 'feedback' = 'model') =>
+    request<ScoreReportResponse>(
+      labels === 'feedback' ? '/traces/score-report?labels=feedback' : '/traces/score-report',
+      { signal },
+    ),
 
   // The latest traced questions searched again under a proposed bar: how many would be
   // answered (no answer written, nothing stored).
@@ -848,6 +870,10 @@ export const api = {
   consistency: (signal?: AbortSignal) =>
     request<ConsistencyResponse>('/admin/consistency', { signal }),
 
+  // Risky settings: backups with nothing in them, a full disk, a memory budget the
+  // models and the ingest backlog can exceed, an open server.
+  doctor: (signal?: AbortSignal) => request<DoctorResponse>('/admin/doctor', { signal }),
+
   // A zip of documents, each indexed as its own.
   uploadArchive: (file: File, tags?: string[], signal?: AbortSignal, workspace?: string) => {
     const form = new FormData();
@@ -861,6 +887,16 @@ export const api = {
       workspace,
     });
   },
+
+  // Zips and backups imported in the background, newest first, and one stopped.
+  listBackgroundImports: (signal?: AbortSignal, workspace?: string) =>
+    request<BackgroundImportListResponse>('/documents/imports', { signal, workspace }),
+
+  cancelBackgroundImport: (id: string, workspace?: string) =>
+    request<BackgroundImportResponse>(`/documents/imports/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      workspace,
+    }),
 
   // This workspace's sitemap imports, newest first, and one stopped before its next page.
   listSitemapImports: (signal?: AbortSignal, workspace?: string) =>
@@ -985,13 +1021,21 @@ export const api = {
       let response: Response;
       try {
         const task = options?.task;
-        response = await fetch(`${BASE_URL}${task ? '/questions/summary/stream' : '/questions/stream'}`, {
+        const continueFrom = options?.continueFrom;
+        const path = continueFrom
+          ? '/questions/continue'
+          : task
+            ? '/questions/summary/stream'
+            : '/questions/stream';
+        response = await fetch(`${BASE_URL}${path}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(workspace) },
           body: JSON.stringify(
-            task
-              ? summaryRequestBody(task, llmProvider, overrides, options)
-              : questionRequestBody(question, llmProvider, overrides, filenames, history, options),
+            continueFrom
+              ? { trace_id: continueFrom }
+              : task
+                ? summaryRequestBody(task, llmProvider, overrides, options)
+                : questionRequestBody(question, llmProvider, overrides, filenames, history, options),
           ),
           signal: limit.signal,
         });
@@ -1052,6 +1096,7 @@ export const api = {
                     ? { passagesLeftOut: event.passages_left_out }
                     : {}),
                   truncated: event.truncated,
+                  ...(event.prompt_cut === true ? { promptCut: true } : {}),
                   ...(event.usage ? { usage: event.usage } : {}),
                   ...(typeof event.chunks_read === 'number' && typeof event.chunks_total === 'number'
                     ? {

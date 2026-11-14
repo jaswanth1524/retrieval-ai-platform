@@ -105,6 +105,13 @@ class ParseMemoryError(ParseInterruptedError):
     ``parse_memory``), retried once the limit is raised, not given up on."""
 
 
+class ParseEnvironmentError(ParseInterruptedError):
+    """The parser process failed on something other than the document — a full or
+    unwritable temp directory, a missing module, a permission error. Not proof the file
+    is bad, so transient (error type ``parse_failed``): the watcher, the re-indexer and
+    the URL refresher retry it instead of giving the file up for good."""
+
+
 def _limit_memory(settings: AppSettings) -> None:
     """PARSE_MEMORY_LIMIT_MB in the parse child (Linux): an address-space cap, so a
     parser blowing up fails with MemoryError in the child instead of the container's
@@ -233,4 +240,7 @@ def parse_with_limit(
             f"({settings.parse_memory_limit_mb} MB) allows."
         )
     logger.warning("Parsing %s failed in the parser process: %s", filename, payload)
-    raise DocumentParseError(f"Could not read '{filename}'.")
+    # A document's own faults arrive as "document_error" (the parsers turn ValueError,
+    # RecursionError and their kind into DocumentParseError); what is left is the
+    # process's environment.
+    raise ParseEnvironmentError(f"Could not read '{filename}' (a server-side problem).")

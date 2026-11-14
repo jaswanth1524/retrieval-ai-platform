@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react';
+import { singleKeyShortcutsOn } from '../utils/shortcuts';
 import type { ChatMode } from '../components/ChatHeader';
 import type { Command } from '../components/CommandPalette';
 import { isShortcutModifier } from '../utils/platform';
@@ -386,6 +387,7 @@ export function useCommands(
     // and previous answer, 1-9 a source of the focused answer.
     const plainKey = (event: KeyboardEvent) => {
       if (event.repeat || paletteRef.current.otherDialogOpen) return;
+      if (!singleKeyShortcutsOn()) return;
       if (isEditable(event.target)) return;
       if (document.querySelector('[aria-modal="true"]')) return;
       const actions = actionsRef.current;

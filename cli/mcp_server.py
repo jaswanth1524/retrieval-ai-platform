@@ -63,20 +63,23 @@ INSTRUCTIONS = (
 )
 
 
-def _taken_by_another_source(client: DocragClient, url: str, filename: str | None) -> str | None:
-    """The name ``url`` would be stored under (``filename``, else its last path
-    segment), when a document with that name came from somewhere else; else None."""
+def _taken_by_another_source(client: DocragClient, url: str, filename: str) -> str | None:
+    """``filename`` when a document with that name came from somewhere other than
+    ``url``; else None. Only for a name given here: the server refuses a name it derives
+    from the URL itself unless ``replace`` is set, but treats a given name as consent.
+    The listing's source URLs have no query string, so neither does the comparison."""
 
-    from pathlib import PurePosixPath
-    from urllib.parse import unquote, urlsplit
+    from urllib.parse import urlsplit
 
-    name = (filename or "").strip() or PurePosixPath(unquote(urlsplit(url).path)).name
-    if not name:
-        return None
+    name = filename.strip()
     listing = client.documents()
     if name not in listing.get("filenames", []):
         return None
-    return None if listing.get("source_urls", {}).get(name) == url else name
+    try:
+        bare = urlsplit(url.strip())._replace(query="", fragment="").geturl()
+    except ValueError:
+        return name
+    return None if listing.get("source_urls", {}).get(name) == bare else name
 
 
 def _pages(item: dict[str, Any]) -> str:
@@ -359,18 +362,31 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     async def summarize(
-        filenames: list[str], focus: str | None = None, workspace: str | None = None
+        filenames: list[str],
+        focus: str | None = None,
+        workspace: str | None = None,
+        page_min: int | None = None,
+        page_max: int | None = None,
+        section: str | None = None,
     ) -> str:
         """Summarize one whole document, compare two (pass both names), or write one
         brief across several (pass them all; the server caps how many).
 
-        focus narrows it ("deadlines", "risks"). Long documents take minutes."""
+        focus narrows it ("deadlines", "risks"). For one document, page_min/page_max or
+        section summarize only that part. Long documents take minutes."""
 
         if not filenames:
             return "summarize takes at least one document."
         return await call(
             lambda client, should_stop: format_answer(
-                client.summarize(filenames, focus, should_stop=should_stop)
+                client.summarize(
+                    filenames,
+                    focus,
+                    should_stop=should_stop,
+                    page_min=page_min,
+                    page_max=page_max,
+                    section=section,
+                )
             ),
             workspace,
         )
@@ -479,14 +495,14 @@ def _add_write_tools(server: MCPServer, call: Call) -> None:
         indexed under that name from somewhere else is kept unless replace is true."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
-            if not replace:
+            if not replace and filename and filename.strip():
                 taken = _taken_by_another_source(client, url, filename)
                 if taken is not None:
                     return (
                         f"'{taken}' is already indexed from another source; nothing was "
                         "changed. Pass replace=true to replace it, or another filename."
                     )
-            return accepted(client.upload_url(url, filename, tags=tags or ()))
+            return accepted(client.upload_url(url, filename, tags=tags or (), replace=replace))
 
         result: str = await call(work, workspace)
         return result

@@ -16,11 +16,12 @@ from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.audit import audit
+from api.audit import audit, set_audit_store
 from api.auto_reindex import StaleReindexer
 from api.chunking import TokenCounter
 from api.dependencies import (
     get_app_settings,
+    get_audit_log,
     get_embedding_provider,
     get_feedback_store,
     get_ingest_backlog,
@@ -47,6 +48,7 @@ from api.document_ops import (
 )
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
+from api.imports import shutdown as shutdown_background_imports
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
     IngestQueue,
@@ -54,7 +56,7 @@ from api.ingest_jobs import (
 from api.ingest_service import IngestService
 from api.llm import GenerationConfigError, completion_model_and_kwargs
 from api.logging_config import configure_logging
-from api.metrics import build_info
+from api.metrics import build_info, watch_storage
 from api.model_health import ModelHealth, ModelState
 from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository
@@ -74,7 +76,7 @@ from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.sitemap import shutdown_imports
 from api.static_files import FrontendFiles
-from api.storage import check_writable_storage
+from api.storage import check_writable_storage, enabled_store_directories
 from api.url_fetch import fetch_document, fetch_slots
 from api.url_refresh import UrlRefresher
 from api.version import app_version
@@ -524,6 +526,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     settings = get_app_settings()
     check_writable_storage(settings)
+    # Free disk per store, read whenever /metrics is scraped.
+    watch_storage(
+        [(name, str(directory)) for name, directory in enabled_store_directories(settings)]
+    )
+    # Audit events into AUDIT_LOG_PATH from now on (every action, the watcher's too).
+    set_audit_store(app.dependency_overrides.get(get_audit_log, get_audit_log)())
     if settings.warmup_models:
         health = ModelHealth(lambda names: warm_models(settings, names))
         health.record(await run_in_threadpool(warm_models, settings))
@@ -568,6 +576,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for each in watchers:
             each.stop()
         shutdown_imports()
+        shutdown_background_imports()
+        set_audit_store(None)
     shutdown_executors()
 
 

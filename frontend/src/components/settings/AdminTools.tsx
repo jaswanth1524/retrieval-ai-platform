@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, apiErrorMessage, getWorkspace } from '../../api/client';
 import type {
+  DoctorFindingResponse,
   AnswerCacheResponse,
   AnswerFormat,
   BackupCheckResponse,
@@ -32,6 +33,7 @@ export default function AdminTools({
       <AnswerCache version={cacheVersion} />
       <Backups onRestored={onRestored} />
       <CheckUploadedBackup />
+      <SettingsCheck />
       <Consistency />
     </div>
   );
@@ -207,18 +209,35 @@ function WorkspaceSettings({ workspace, onSaved }: { workspace: string; onSaved?
   );
 }
 
+const BACKUP_POLL_MS = 5000;
+const BACKUP_POLL_TRIES = 12;
+
+// Backup names carry their time (docrag-YYYYmmdd-HHMMSS.zip): the newest sorts last.
+const newest = (response: BackupListResponse) =>
+  response.backups.map((backup) => backup.name).sort().at(-1) ?? null;
+
 function AnswerCache({ version = 0 }: { version?: number }) {
   const [cache, setCache] = useState<AnswerCacheResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+  // Settings closed before a read came back: its answer goes nowhere.
+  const alive = useRef(true);
+  useEffect(
+    () => () => {
+      alive.current = false;
+    },
+    [],
+  );
   const load = useCallback(() => {
     api
       .answerCache()
       .then((response) => {
+        if (!alive.current) return;
         // A read that works clears an earlier failure (it stayed until reopened).
         setError(null);
         setCache(response);
       })
-      .catch((err) => setError(apiErrorMessage(err, 'Could not read the cache.')));
+      .catch((err) => alive.current && setError(apiErrorMessage(err, 'Could not read the cache.')));
   }, []);
   useEffect(load, [load, version]);
   if (error) return <p className="settings__hint">{error}</p>;
@@ -245,20 +264,28 @@ function AnswerCache({ version = 0 }: { version?: number }) {
           {cache.entries.length > 20 && <li>and {cache.entries.length - 20} more</li>}
         </ul>
       )}
-      {cache.entries.length > 0 && (
-        <button
-          type="button"
-          onClick={() =>
-            void api
-              .clearAnswerCache()
-              .then(load)
-              .catch((err) => setError(apiErrorMessage(err, 'Could not clear the cache.')))
-          }
-          data-testid="answer-cache-clear"
-        >
-          Clear them
-        </button>
-      )}
+      {cache.entries.length > 0 &&
+        (clearing ? (
+          <ConfirmInline
+            prompt="Clear every cached answer in this workspace?"
+            confirmLabel="Clear"
+            onCancel={() => setClearing(false)}
+            onConfirm={() => {
+              setClearing(false);
+              void api
+                .clearAnswerCache()
+                .then(load)
+                .catch(
+                  (err) => alive.current && setError(apiErrorMessage(err, 'Could not clear the cache.')),
+                );
+            }}
+            confirmTestId="answer-cache-clear-confirm"
+          />
+        ) : (
+          <button type="button" onClick={() => setClearing(true)} data-testid="answer-cache-clear">
+            Clear them
+          </button>
+        ))}
     </section>
   );
 }
@@ -273,13 +300,42 @@ function Backups({
   const [confirming, setConfirming] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [checks, setChecks] = useState<Record<string, BackupCheckResponse>>({});
+  const alive = useRef(true);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      alive.current = false;
+      if (pollTimer.current !== null) clearTimeout(pollTimer.current);
+    },
+    [],
+  );
   const load = useCallback(() => {
     api
       .listBackups()
-      .then(setListing)
-      .catch((err) => setMessage(apiErrorMessage(err, 'Could not list the backups.')));
+      .then((response) => alive.current && setListing(response))
+      .catch(
+        (err) => alive.current && setMessage(apiErrorMessage(err, 'Could not list the backups.')),
+      );
   }, []);
   useEffect(load, [load]);
+  // After "Back up now": the list is read again until the new backup shows (or a minute
+  // passes), instead of asking the reader to refresh it.
+  const followNewBackup = useCallback((known: string | null, triesLeft: number) => {
+    pollTimer.current = setTimeout(() => {
+      void api
+        .listBackups()
+        .then((response) => {
+          if (!alive.current) return;
+          setListing(response);
+          if (newest(response) !== known) {
+            setMessage('The backup is written.');
+          } else if (triesLeft > 1) {
+            followNewBackup(known, triesLeft - 1);
+          }
+        })
+        .catch(() => undefined);
+    }, BACKUP_POLL_MS);
+  }, []);
   if (listing === null) {
     return message ? (
       <p className="settings__hint" data-testid="backups-off">
@@ -298,7 +354,10 @@ function Backups({
         onClick={() =>
           void api
             .runBackup()
-            .then(() => setMessage('A backup is being written; refresh the list in a moment.'))
+            .then(() => {
+              setMessage('A backup is being written…');
+              followNewBackup(newest(listing), BACKUP_POLL_TRIES);
+            })
             .catch((err) => setMessage(apiErrorMessage(err, 'Could not start a backup.')))
         }
         data-testid="backups-run"
@@ -417,6 +476,53 @@ const REMEDIES: Array<[keyof ConsistencyResponse, keyof ConsistencyRepairRequest
   ['versions_without_document', 'delete_orphan_versions', 'Delete the earlier versions with no document'],
   ['incomplete', 'reindex_incomplete', 'Re-index the incomplete documents'],
 ];
+
+function SettingsCheck() {
+  const [findings, setFindings] = useState<DoctorFindingResponse[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const run = () => {
+    setRunning(true);
+    setError(null);
+    api
+      .doctor()
+      .then((report) => setFindings(report.findings))
+      .catch((err) => setError(apiErrorMessage(err, 'Could not check.')))
+      .finally(() => setRunning(false));
+  };
+  return (
+    <section aria-label="Settings check" data-testid="doctor">
+      <h4 className="settings__subhead">Settings check</h4>
+      <p className="settings__hint">
+        Backups, free disk, the memory budget and access, as this server is set up.
+      </p>
+      <button type="button" onClick={run} disabled={running} data-testid="doctor-run">
+        {running ? 'Checking…' : 'Check settings'}
+      </button>
+      {error && (
+        <p className="settings__hint" role="alert">
+          {error}
+        </p>
+      )}
+      {findings !== null && (
+        <div role="status" data-testid="doctor-result">
+          {findings.length === 0 ? (
+            <p className="settings__hint">Nothing to report.</p>
+          ) : (
+            <ul className="settings__backups">
+              {findings.map((finding) => (
+                <li key={`${finding.subject}:${finding.message}`} data-testid="doctor-finding">
+                  <strong>{finding.level === 'warning' ? 'Warning' : 'Note'}</strong>{' '}
+                  <span className="mono">{finding.subject}</span>: {finding.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function Consistency() {
   const [report, setReport] = useState<ConsistencyResponse | null>(null);

@@ -394,6 +394,24 @@ jobs:
           docker compose -f docker-compose.yml -f .github/ci/compose.ci.yml exec -T api \
             /app/.venv/bin/python -c 'from api.dependencies import get_embedding_provider, get_reranker; vectors = get_embedding_provider().embed_texts(["leave policy"]); scores = get_reranker().score("leave policy", ["Employees get 28 days of leave."]); assert len(vectors[0].dense) == 384 and len(scores) == 1, (vectors, scores); print("models ok", scores)'
 
+      # A document through the whole hardened path: the upload spooled to the tmpfs /tmp,
+      # parsed in a forkserver child (PARSE_TIMEOUT_SECONDS), embedded and written to
+      # Qdrant, then found by POST /search. The models are loaded by the step above.
+      - name: Upload a document and search it
+        timeout-minutes: 10
+        run: |
+          printf 'Leave policy\n\nEmployees get twenty-eight days of paid leave a year.\n' > /tmp/leave.txt
+          job=$(curl -fsS -F "file=@/tmp/leave.txt" http://127.0.0.1:8000/documents | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')
+          for attempt in $(seq 1 120); do
+            state=$(curl -fsS "http://127.0.0.1:8000/documents/jobs/$job" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
+            case "$state" in done) break;; failed) curl -sS "http://127.0.0.1:8000/documents/jobs/$job"; exit 1;; esac
+            sleep 2
+          done
+          test "$state" = done || { echo "the upload never finished: $state"; exit 1; }
+          curl -fsS -H 'content-type: application/json' -d '{"query": "how many days of leave"}' \
+            http://127.0.0.1:8000/search \
+            | python3 -c 'import json,sys; r=json.load(sys.stdin)["results"]; assert r and r[0]["filename"] == "leave.txt", r; print("search ok", r[0]["rerank_score"])'
+
       - name: Show logs on failure
         if: failure()
         run: docker compose -f docker-compose.yml -f .github/ci/compose.ci.yml logs --no-color

@@ -9,10 +9,11 @@ import shutil
 from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from qdrant_client import QdrantClient
 
+from api import imports
 from api.answer_cache import AnswerCache
 from api.audit import audit
 from api.corpus import bump_corpus_generation
@@ -278,6 +279,7 @@ def register(app: FastAPI) -> None:
     )
     def delete_workspace(
         name: str,
+        http_request: Request,
         settings: BaseSettingsDep,
         client: QdrantClientDep,
         feedback: Annotated[FeedbackStore | None, Depends(get_feedback_store)],
@@ -299,11 +301,13 @@ def register(app: FastAPI) -> None:
                 "is indexed; change that setting before deleting it.",
             )
         target = settings_for(settings, name)
-        if importing_into(target.qdrant_collection):
+        if importing_into(target.qdrant_collection) or imports.importing_into(
+            target.qdrant_collection
+        ):
             raise HTTPException(
                 status_code=409,
-                detail=f"Workspace '{name}' has a sitemap import still adding pages; try "
-                "again when it finishes.",
+                detail=f"Workspace '{name}' has an import (a sitemap, a zip or a backup) "
+                "still adding documents; try again when it finishes.",
             )
         # Not while anything for it is queued or running: a job would recreate the
         # collection on its first write (the repository recreates a missing one), or
@@ -325,6 +329,9 @@ def register(app: FastAPI) -> None:
         finally:
             ingest_sequencer.reopen(group)
         forget_workspace_metrics(name)
+        backup = getattr(http_request.app.state, "backup", None)
+        if backup is not None:
+            backup.forget_workspace(name)
         removed = _forget_rows(name, feedback, query_log, traces, jobs, workspace_settings)
         audit("workspace.delete", workspace=name, **{f"{k}_removed": v for k, v in removed.items()})
         return WorkspaceResponse(name=name)

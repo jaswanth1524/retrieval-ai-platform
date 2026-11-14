@@ -77,6 +77,11 @@ import {
   DEFAULT_MAX_UPLOAD_BYTES,
   validateUploads,
 } from './utils/uploadValidation';
+import { addToTrash, removeFromTrash } from './utils/trash';
+import { otherUsableProviders } from './utils/providers';
+import RecentlyDeleted from './components/RecentlyDeleted';
+import SelectionActions from './components/SelectionActions';
+import type { Conversation } from './hooks/chat/model';
 import { sliceWhole } from './utils/text';
 import {
   ADVANCED_OPTIONS_STORAGE_KEY,
@@ -88,6 +93,7 @@ import {
   WEAK_SUPPORT_MARGIN,
   canPreviewOriginal,
   hiddenPanels,
+  MAX_IMPORT_FILE_BYTES,
   NO_SOURCES,
   PANEL_META,
   notFoundSourcesMessage,
@@ -109,6 +115,10 @@ function App() {
   const [rail, setRail] = useState<RailPanel>('chat');
   const [searchOpened, setSearchOpened] = useState(false);
   if (rail === 'search' && !searchOpened) setSearchOpened(true);
+  // Kept once opened, like Search: files staged for upload, a selection and the filter
+  // were lost on every switch to another panel and back.
+  const [corpusOpened, setCorpusOpened] = useState(false);
+  if (rail === 'corpus' && !corpusOpened) setCorpusOpened(true);
   const [searchResetKey, setSearchResetKey] = useState(0);
   // A search started from elsewhere (a "not found" answer's "Search the passages").
   const [searchRequest, setSearchRequest] = useState<SearchRequestFromElsewhere | null>(null);
@@ -285,6 +295,7 @@ function App() {
     noteAuthRestored,
     refreshAccess,
     relistCorpus,
+    refreshConfig,
     retryBoot,
   } = useAppBoot({
     refreshDocuments,
@@ -421,14 +432,25 @@ function App() {
     },
     [selectConversation, setPinnedTraceId, setHoveredCitation],
   );
+  const [trashVersion, setTrashVersion] = useState(0);
+  const restoreFromTrash = useCallback(
+    (conversation: Conversation) => {
+      setPinnedTraceId(null);
+      setHoveredCitation(null);
+      restoreConversation(conversation);
+    },
+    [restoreConversation, setPinnedTraceId, setHoveredCitation],
+  );
   const deleteConversation = useCallback(
     (id: string) => {
       setPinnedTraceId(null);
       setHoveredCitation(null);
       const removed = removeConversation(id);
       // A delete is easy to make by mistake and used to be final: offered back for a
-      // while, as long as the toast shows.
+      // while, as long as the toast shows, and after that from Recently deleted.
       if (removed && removed.turns.length > 0) {
+        addToTrash(removed);
+        setTrashVersion((version) => version + 1);
         pushToast({
           id: `deleted-${removed.id}`,
           tone: 'info',
@@ -439,6 +461,8 @@ function App() {
               // Back to it as any switch is: the inspector no longer pinned elsewhere.
               setPinnedTraceId(null);
               setHoveredCitation(null);
+              removeFromTrash(removed.id);
+              setTrashVersion((version) => version + 1);
               restoreConversation(removed);
             },
           },
@@ -678,6 +702,17 @@ function App() {
     servicesDown,
     readiness,
   } = useServerHealth(booted);
+  // What /config reports can change under a running tab: Ollama coming up after boot,
+  // a server restarted with other settings. Read again when the services' state, the
+  // connection or the server's version changes (not on the first report: boot read it).
+  const healthKey = `${servicesDown.join(',')}|${connectionLost}|${serverVersion ?? ''}`;
+  const lastHealthKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!booted) return;
+    const previous = lastHealthKey.current;
+    lastHealthKey.current = healthKey;
+    if (previous !== null && previous !== healthKey && !connectionLost) void refreshConfig();
+  }, [booted, healthKey, connectionLost, refreshConfig]);
   useCorpusAutoRefresh(
     corpusChecked && apiStatus === 'ok',
     connectionLost,
@@ -723,6 +758,12 @@ function App() {
   useBackgroundNotice(pending, notifyOnAnswer, lastQuestion, lastOutcome);
   // The selected provider's model. Each answer records the one it was asked of
   // (ChatTurn.model); this labels answers saved before that, and the composer.
+  // What an answer can be asked again of (Reformat → "Ask …"): one array per change of
+  // config or provider, so the memoized messages don't re-render per frame.
+  const otherProviders = useMemo(
+    () => (config && !readOnly ? otherUsableProviders(selectedProvider, config) : []),
+    [config, selectedProvider, readOnly],
+  );
   const currentModelLabel = config
     ? selectedProvider === 'ollama'
       ? config.llm_model
@@ -753,6 +794,7 @@ function App() {
     askQuestion,
     regenerateQuestion,
     reformatAnswer,
+    continueAnswer,
     askEverywhere,
     askAboutPassages,
     askAboutViewedPassage,
@@ -790,20 +832,30 @@ function App() {
       setSourceView({ filename, chunkId, highlights }),
     [],
   );
+  // The viewer's contents and "go to page": the same document, at another passage.
+  const goToViewedPassage = useCallback(
+    (chunkId: string) =>
+      setSourceView((current) => (current ? { filename: current.filename, chunkId } : current)),
+    [],
+  );
   const handleReadDocument = useCallback((filename: string) => {
     setSourceView({ filename, chunkId: null });
     // On a narrow screen the panel is a drawer over the viewer's opener.
     setPanelDrawerOpen(false);
   }, []);
+  const activeConversationIdRef = useRef(activeConversationId);
+  activeConversationIdRef.current = activeConversationId;
   // Shown at once (ChatMessage's feedbackGiven); taken back if it couldn't be sent, so
   // the buttons don't claim a rating the server never recorded and it can be retried.
   const handleFeedback = useCallback((payload: FeedbackPayload) => {
     const citation = payload.citationSourceNumber;
+    // The conversation rated in: a failed send is taken back there, even after a switch.
+    const conversationId = activeConversationIdRef.current ?? undefined;
     // One source rated, or the whole answer: each kept on the turn so it isn't sent twice.
     const mark = (on: boolean) =>
       citation !== undefined
-        ? setSourceIrrelevant(payload.turnId, citation, on)
-        : setTurnFeedback(payload.turnId, on ? payload.rating : undefined);
+        ? setSourceIrrelevant(payload.turnId, citation, on, conversationId)
+        : setTurnFeedback(payload.turnId, on ? payload.rating : undefined, conversationId);
     mark(true);
     void api
       .submitFeedback({
@@ -1120,6 +1172,15 @@ function App() {
   );
 
   const handleImportFile = async (file: File) => {
+    // Read whole and parsed on the main thread: a huge file froze the tab first.
+    if (file.size > MAX_IMPORT_FILE_BYTES) {
+      pushToast({
+        tone: 'warn',
+        title: 'That file is too large to import',
+        body: `Conversation exports up to ${Math.round(MAX_IMPORT_FILE_BYTES / 1_000_000)} MB can be imported.`,
+      });
+      return;
+    }
     const parsed = parseConversationFile(await file.text());
     let count = 0;
     let skipped = 0;
@@ -1278,6 +1339,9 @@ function App() {
             onVisibleOrder={noteListedOrder}
           />
         )}
+        {rail === 'chat' && (
+          <RecentlyDeleted version={trashVersion} onRestore={restoreFromTrash} />
+        )}
         {rail === 'corpus' && workspacesEnabled && (
           <WorkspaceBar
             current={workspace}
@@ -1299,53 +1363,55 @@ function App() {
             onJobsFinished={relistAfterOtherJobs}
           />
         )}
-        {rail === 'corpus' && (
-          <CorpusPanel
-            // A fresh panel per workspace: a selection, a pending confirm or a bulk
-            // action of the previous one can't act on this one's documents.
-            key={workspace}
-            filenames={indexedFilenames}
-            documents={documents}
-            uploads={workspaceUploads}
-            onUpload={handleUpload}
-            uploadTags={uploadTags}
-            onUploadTagsChange={readOnly ? undefined : setUploadTags}
-            onDelete={here.deleteDocument}
-            maxUploadBytes={config?.max_upload_bytes}
-            supportedExtensions={config?.supported_extensions}
-            // Only while this conversation's answer streams: an answer in another
-            // conversation locked tagging, deleting and uploading for its minute or two.
-            disabled={streamingHere}
-            browseInputRef={corpusBrowseInputRef}
-            onRetryUpload={handleRetryUpload}
-            onDismissUpload={handleDismissUpload}
-            onCancelUpload={readOnly ? undefined : handleCancelUpload}
-            onReindex={config?.raw_documents_enabled && !readOnly ? here.reindex : undefined}
-            onReindexMany={config?.raw_documents_enabled && !readOnly ? here.reindexMany : undefined}
-            onReindexAllStale={
-              config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
-            }
-            onSetTags={readOnly ? undefined : here.setTags}
-            readOnly={readOnly}
-            onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
-            onRead={handleReadDocument}
-            onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
-            onAddSitemap={config?.url_ingest_enabled && !readOnly ? handleAddSitemap : undefined}
-            canPreview={!readOnly}
-            onSummarize={summarizeDocuments}
-            onAskAbout={askAbout}
-            summaryMaxDocuments={config?.summary_max_documents}
-            onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? here.refresh : undefined}
-            onSetRefreshInterval={readOnly ? undefined : here.setRefreshInterval}
-            onRestoreVersion={
-              config?.document_versions_enabled && !readOnly ? here.restoreVersion : undefined
-            }
-            workspace={workspace}
-            summarizeDisabled={summarizeDisabled}
-            findAnswersCiting={answersCitingHere}
-            queryLogEnabled={Boolean(config?.query_log_enabled) && !readOnly}
-            onOpenAnswer={switchConversationFromList}
-          />
+        {corpusOpened && (
+          <div className="app-kept-panel" hidden={rail !== 'corpus'}>
+            <CorpusPanel
+              // A fresh panel per workspace: a selection, a pending confirm or a bulk
+              // action of the previous one can't act on this one's documents.
+              key={workspace}
+              filenames={indexedFilenames}
+              documents={documents}
+              uploads={workspaceUploads}
+              onUpload={handleUpload}
+              uploadTags={uploadTags}
+              onUploadTagsChange={readOnly ? undefined : setUploadTags}
+              onDelete={here.deleteDocument}
+              maxUploadBytes={config?.max_upload_bytes}
+              supportedExtensions={config?.supported_extensions}
+              // Only while this conversation's answer streams: an answer in another
+              // conversation locked tagging, deleting and uploading for its minute or two.
+              disabled={streamingHere}
+              browseInputRef={corpusBrowseInputRef}
+              onRetryUpload={handleRetryUpload}
+              onDismissUpload={handleDismissUpload}
+              onCancelUpload={readOnly ? undefined : handleCancelUpload}
+              onReindex={config?.raw_documents_enabled && !readOnly ? here.reindex : undefined}
+              onReindexMany={config?.raw_documents_enabled && !readOnly ? here.reindexMany : undefined}
+              onReindexAllStale={
+                config?.raw_documents_enabled && !readOnly ? handleReindexAllStale : undefined
+              }
+              onSetTags={readOnly ? undefined : here.setTags}
+              readOnly={readOnly}
+              onOpenOriginal={config?.raw_documents_enabled ? downloadOriginal : undefined}
+              onRead={handleReadDocument}
+              onUploadFromUrl={config?.url_ingest_enabled && !readOnly ? handleUploadFromUrl : undefined}
+              onAddSitemap={config?.url_ingest_enabled && !readOnly ? handleAddSitemap : undefined}
+              canPreview={!readOnly}
+              onSummarize={summarizeDocuments}
+              onAskAbout={askAbout}
+              summaryMaxDocuments={config?.summary_max_documents}
+              onRefreshFromUrl={config?.url_ingest_enabled && !readOnly ? here.refresh : undefined}
+              onSetRefreshInterval={readOnly ? undefined : here.setRefreshInterval}
+              onRestoreVersion={
+                config?.document_versions_enabled && !readOnly ? here.restoreVersion : undefined
+              }
+              workspace={workspace}
+              summarizeDisabled={summarizeDisabled}
+              findAnswersCiting={answersCitingHere}
+              queryLogEnabled={Boolean(config?.query_log_enabled) && !readOnly}
+              onOpenAnswer={switchConversationFromList}
+            />
+          </div>
         )}
         {/* Kept once opened, hidden while another panel shows: its query and results
             used to be lost on every switch to the corpus or traces and back. */}
@@ -1375,6 +1441,7 @@ function App() {
             onExport={readOnly ? undefined : exportTraces}
             exporting={exportingTraces}
             canApplySuggestion={!readOnly}
+            feedbackEnabled={Boolean(config?.feedback_enabled)}
           />
         )}
         {rail === 'feedback' && (
@@ -1465,6 +1532,8 @@ function App() {
               onToggleSaved={setTurnSaved}
               onCopyLink={copyLink}
               onReformat={reformatAnswer}
+              onContinue={continueAnswer}
+              otherProviders={otherProviders}
               onUseVersion={restoreAnswerVersion}
               // Only once the listing is this conversation's workspace's (it switches
               // to it on opening): another's documents would all read "deleted".
@@ -1624,6 +1693,7 @@ function App() {
               onAskAboutPassage={summarizeDisabled ? undefined : askAboutViewedPassage}
               onFindSimilar={findSimilarPassages}
               onCopyLink={copyPassageLink}
+              onGoTo={goToViewedPassage}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
                   ? downloadViewedOriginal
@@ -1638,6 +1708,7 @@ function App() {
           )}
         </Suspense>
       </LazyChunkBoundary>
+      <SelectionActions onAsk={suggestQuestion} onSearch={searchForPassages} />
     </div>
   );
 }

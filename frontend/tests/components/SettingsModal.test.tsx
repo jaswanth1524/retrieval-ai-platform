@@ -57,6 +57,26 @@ function setup(props: Partial<Parameters<typeof SettingsModal>[0]> = {}) {
 describe('SettingsModal', () => {
   beforeEach(() => localStorage.clear());
 
+  it('tests a key before it is saved, and saves the single-key switch', async () => {
+    const { api, ApiClientError } = await import('../../src/api/client');
+    const access = vi
+      .spyOn(api, 'accessWithKey')
+      .mockRejectedValueOnce(new ApiClientError('Invalid API key.', 401))
+      .mockResolvedValueOnce({ access: 'read' });
+    setup();
+    await userEvent.type(screen.getByTestId('settings-api-key'), 'wrong');
+    await userEvent.click(screen.getByTestId('settings-test-key'));
+    expect(await screen.findByTestId('settings-key-test')).toHaveTextContent('refused');
+    await userEvent.click(screen.getByTestId('settings-test-key'));
+    expect(await screen.findByText(/read-only access/)).toBeInTheDocument();
+    expect(access).toHaveBeenCalledWith('wrong');
+
+    await userEvent.click(screen.getByTestId('settings-single-keys'));
+    await userEvent.click(screen.getByTestId('settings-save'));
+    expect(localStorage.getItem('docrag-single-key-shortcuts')).toBe('off');
+    access.mockRestore();
+  });
+
   it('takes slider bounds from the server, never hardcoded values', () => {
     // A slider that can reach a value the backend rejects is a 400 waiting to happen,
     // and rerank_top_k_limit is capped by the live fused_top_n.

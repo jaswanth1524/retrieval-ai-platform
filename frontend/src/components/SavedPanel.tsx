@@ -1,4 +1,12 @@
-import { memo, useDeferredValue, useMemo, useState } from 'react';
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { api, apiErrorMessage } from '../api/client';
+import {
+  checkable,
+  judgeSaved,
+  SAVED_CHECK_LABELS,
+  SAVED_CHECK_TOP_K,
+  type SavedCheck,
+} from '../utils/savedCheck';
 import type { SavedAnswer } from '../hooks/useChat';
 import { SOURCE_CHANGE_HINTS, type SourceChange } from '../utils/citationFreshness';
 import { formatRelativeTime } from '../utils/relativeTime';
@@ -51,6 +59,40 @@ function excerpt(content: string): string {
  *  rather than by remembering which conversation it was in. */
 function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' }: SavedPanelProps) {
   const [filter, setFilter] = useState('');
+  // "Check against the documents": each checkable answer's question searched again.
+  const [checks, setChecks] = useState<Record<string, SavedCheck>>({});
+  const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const checkRef = useRef<AbortController | null>(null);
+  useEffect(() => () => checkRef.current?.abort(), []);
+  const runCheck = async () => {
+    checkRef.current?.abort();
+    const controller = new AbortController();
+    checkRef.current = controller;
+    const items = answers.filter((item) => checkable(item, workspace));
+    setChecks({});
+    setCheckError(null);
+    setChecking({ done: 0, total: items.length });
+    // One at a time: each search takes one of the server's question slots.
+    for (const [index, item] of items.entries()) {
+      try {
+        const response = await api.searchPassages(
+          { query: item.question ?? '', rerank_top_k: SAVED_CHECK_TOP_K },
+          controller.signal,
+        );
+        if (controller.signal.aborted) return;
+        const verdict = judgeSaved(item, response);
+        setChecks((prev) => ({ ...prev, [`${item.conversationId}:${item.turn.id}`]: verdict }));
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setCheckError(apiErrorMessage(err, 'The check stopped.'));
+        break;
+      }
+      setChecking({ done: index + 1, total: items.length });
+    }
+    setChecking(null);
+  };
+  const checkableCount = answers.filter((item) => checkable(item, workspace)).length;
   const needle = normalized(useDeferredValue(filter));
   const shown = useMemo(
     () =>
@@ -83,7 +125,23 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
           aria-label="Filter saved answers"
           data-testid="saved-filter"
         />
+        {checkableCount > 0 && (
+          <button
+            type="button"
+            onClick={() => void runCheck()}
+            disabled={checking !== null}
+            title="Search each saved question again (no answer is written) and flag the ones whose passages no longer rank"
+            data-testid="saved-check"
+          >
+            {checking ? `Checking ${checking.done}/${checking.total}…` : 'Check against the documents'}
+          </button>
+        )}
       </div>
+      {checkError && (
+        <p className="unanswered-panel__message" role="alert">
+          {checkError}
+        </p>
+      )}
       {shown.length === 0 ? (
         <p className="unanswered-panel__message">No saved answer matches.</p>
       ) : (
@@ -108,6 +166,16 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
                   </span>
                 ) : null;
               })()}
+              {checks[`${item.conversationId}:${item.turn.id}`] && (
+                <span
+                  className={`unanswered-panel__meta${
+                    checks[`${item.conversationId}:${item.turn.id}`] === 'found' ? '' : ' saved-panel__changed'
+                  }`}
+                  data-testid="saved-check-result"
+                >
+                  {SAVED_CHECK_LABELS[checks[`${item.conversationId}:${item.turn.id}`]]}
+                </span>
+              )}
               <span className="unanswered-panel__meta mono">
                 <span>{item.conversationTitle}</span>
                 <span className="unanswered-panel__spacer" />

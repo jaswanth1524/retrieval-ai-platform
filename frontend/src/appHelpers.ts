@@ -183,3 +183,7 @@ export function parseConversationFile(
   }
   return parsed === null ? { kind: 'none' } : { kind: 'one', raw: parsed };
 }
+
+/** The largest conversation export App reads (``file.text()`` then JSON.parse, on the
+ *  main thread). 100 conversations of long answers stay well under it. */
+export const MAX_IMPORT_FILE_BYTES = 50_000_000;

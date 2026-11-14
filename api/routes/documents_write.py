@@ -6,11 +6,13 @@ from __future__ import annotations
 import functools
 import logging
 import lzma
+import shutil
+import tempfile
 import threading
 import zipfile
 import zlib
 from collections.abc import Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -33,6 +35,8 @@ from api.document_ops import (
     admit_from_store,
     delete_indexed_document,
     enqueue_refreshed,
+    free_or_from,
+    held_by_another_source,
     reindex_from_original,
     reindex_stale,
     require_raw_store,
@@ -47,9 +51,12 @@ from api.documents import (
     normalize_tags,
     validate_upload_filename,
 )
-from api.ingest_jobs import backlog_full_error
+from api.imports import BackgroundImport, wait_for_room
+from api.imports import start as start_import
+from api.ingest_jobs import IngestQueue, backlog_full_error
 from api.ingestion import filename_write_lock
 from api.parse_isolation import parse_with_limit
+from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
 from api.routes.deps import (
     IngestQueueDep,
@@ -244,6 +251,7 @@ async def add_from_sitemap(
             known=known,
             indexed=indexed,
             lastmods=found.lastmods,
+            still_ours=functools.partial(free_or_from, repository, settings),
         ),
         url=request.url,
     )
@@ -276,79 +284,148 @@ def upload_archive(
     raw_store: RawDocumentStoreDep,
     file: Annotated[UploadFile, File()],
     tags: Annotated[list[str] | None, Form(description="Tags for every document.")] = None,
+    background: Annotated[
+        bool,
+        Form(
+            description="Import in the background: every document is queued as room "
+            "frees (none deferred); follow it with GET /documents/imports/{import_id}."
+        ),
+    ] = False,
 ) -> ArchiveUploadResponse:
     given_tags = normalize_tags(tags) if tags else None
     repository.ensure_writable(settings)
+    if background:
+        return _archive_in_background(repository, settings, queue, raw_store, file, given_tags)
     try:
         archive = zipfile.ZipFile(file.file)
     except (zipfile.BadZipFile, OSError) as exc:
         raise HTTPException(status_code=400, detail="That file isn't a zip archive.") from exc
+    with archive:
+        members = _archive_members(archive, settings)
+        jobs, skipped, deferred = _queue_archive_members(
+            archive, members, repository, settings, queue, raw_store, given_tags
+        )
+    _audit_archive(
+        settings, file.filename or "", given_tags, len(jobs), len(skipped), len(deferred)
+    )
+    return ArchiveUploadResponse(jobs=jobs, skipped=skipped, deferred=deferred)
+
+
+def _audit_archive(
+    settings: AppSettings,
+    name: str,
+    tags: tuple[str, ...] | None,
+    queued: int,
+    skipped: int,
+    deferred: int,
+    **extra: object,
+) -> None:
+    audit(
+        "document.upload",
+        workspace=workspace_of(settings),
+        source="archive",
+        archive=name,
+        queued=queued,
+        skipped=skipped,
+        deferred=deferred,
+        **({"tags": list(tags)} if tags else {}),
+        **extra,
+    )
+
+
+def _archive_members(archive: zipfile.ZipFile, settings: AppSettings) -> list[zipfile.ZipInfo]:
+    """The zip's file members; 400 past MAX_ARCHIVE_MEMBERS."""
+
+    members = [info for info in archive.infolist() if not info.is_dir()]
+    # Counted without what is skipped silently (a Finder zip carries a __MACOSX entry
+    # for every file): the cap is on documents.
+    counted = [info for info in members if not _silently_skipped(info)]
+    if len(counted) > int(settings.max_archive_members):
+        raise HTTPException(
+            status_code=400,
+            detail=f"The zip has more than {settings.max_archive_members} files "
+            "(MAX_ARCHIVE_MEMBERS); split it.",
+        )
+    return members
+
+
+def _queue_archive_members(
+    archive: zipfile.ZipFile,
+    members: list[zipfile.ZipInfo],
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+    given_tags: tuple[str, ...] | None,
+    status: BackgroundImport | None = None,
+) -> tuple[list[DocumentJobAcceptedResponse], list[ArchiveSkipResponse], list[str]]:
+    """Queue ``members``: (jobs, skipped, deferred). With ``status`` (a background
+    import) a full queue is waited out instead of deferring the rest, the import's
+    counts follow along, and a cancel stops it between documents."""
+
     limit = int(settings.max_upload_bytes)
     budget = int(settings.max_import_bytes)
     jobs: list[DocumentJobAcceptedResponse] = []
     skipped: list[ArchiveSkipResponse] = []
     deferred: list[str] = []
-    with archive:
-        members = [info for info in archive.infolist() if not info.is_dir()]
-        # Counted without what is skipped silently (a Finder zip carries a __MACOSX
-        # entry for every file): the cap is on documents.
-        counted = [info for info in members if not _silently_skipped(info)]
-        if len(counted) > int(settings.max_archive_members):
-            raise HTTPException(
-                status_code=400,
-                detail=f"The zip has more than {settings.max_archive_members} files "
-                "(MAX_ARCHIVE_MEMBERS); split it.",
-            )
-        known = set(known_filenames(repository, settings)) if raw_store is not None else set()
-        seen: set[str] = set()
-        for info in members:
-            base = PurePosixPath(info.filename.replace("\\", "/")).name
-            reason = _archive_skip_reason(info, base, seen, limit)
-            if reason is None:
-                try:
-                    name = validate_upload_filename(base)
-                except DocumentError as exc:
-                    reason = str(exc)
-                else:
-                    try:
-                        if raw_store is not None:
-                            refuse_near_duplicate_name(name, known)
-                    except FilenameConflictError as exc:
-                        reason = str(exc)
-            if reason is not None:
-                if reason:  # hidden files and folders' metadata are skipped silently
-                    skipped.append(ArchiveSkipResponse(name=info.filename, reason=reason))
-                continue
-            seen.add(base.casefold())
-            if deferred or not queue.backlog.has_room(info.file_size):
-                deferred.append(name)
-                continue
+
+    def skip(name: str, reason: str) -> None:
+        skipped.append(ArchiveSkipResponse(name=name, reason=reason))
+        if status is not None:
+            status.skipped += 1
+            status.note(f"{name}: {reason}")
+
+    known = set(known_filenames(repository, settings)) if raw_store is not None else set()
+    seen: set[str] = set()
+    for info in members:
+        if status is not None and status.cancel.is_set():
+            break
+        base = PurePosixPath(info.filename.replace("\\", "/")).name
+        reason = _archive_skip_reason(info, base, seen, limit)
+        if reason is None:
             try:
-                with archive.open(info) as handle:
-                    content = handle.read(limit + 1)
-            except (
-                zipfile.BadZipFile,
-                zlib.error,
-                lzma.LZMAError,
-                EOFError,
-                OSError,  # a damaged bzip2 member
-                RuntimeError,
-                NotImplementedError,
-            ):
-                skipped.append(ArchiveSkipResponse(name=info.filename, reason="It is damaged."))
-                continue
-            # The header's size isn't trusted: what it expands to is counted — only for
-            # a member that is kept (one past the limit is skipped, not budgeted).
-            if len(content) <= limit:
-                budget -= len(content)
-            if len(content) > limit or budget < 0:
-                skipped.append(
-                    ArchiveSkipResponse(
-                        name=info.filename,
-                        reason="Too large (MAX_UPLOAD_BYTES, or the zip past MAX_IMPORT_BYTES).",
-                    )
-                )
-                continue
+                name = validate_upload_filename(base)
+            except DocumentError as exc:
+                reason = str(exc)
+            else:
+                try:
+                    if raw_store is not None:
+                        refuse_near_duplicate_name(name, known)
+                except FilenameConflictError as exc:
+                    reason = str(exc)
+        if reason is not None:
+            if reason:  # hidden files and folders' metadata are skipped silently
+                skip(info.filename, reason)
+            continue
+        seen.add(base.casefold())
+        if status is not None:
+            if not wait_for_room(queue.backlog.has_room, info.file_size, status):
+                break
+        elif deferred or not queue.backlog.has_room(info.file_size):
+            deferred.append(name)
+            continue
+        try:
+            with archive.open(info) as handle:
+                content = handle.read(limit + 1)
+        except (
+            zipfile.BadZipFile,
+            zlib.error,
+            lzma.LZMAError,
+            EOFError,
+            OSError,  # a damaged bzip2 member
+            RuntimeError,
+            NotImplementedError,
+        ):
+            skip(info.filename, "It is damaged.")
+            continue
+        # The header's size isn't trusted: what it expands to is counted — only for
+        # a member that is kept (one past the limit is skipped, not budgeted).
+        if len(content) <= limit:
+            budget -= len(content)
+        if len(content) > limit or budget < 0:
+            skip(info.filename, "Too large (MAX_UPLOAD_BYTES, or the zip past MAX_IMPORT_BYTES).")
+            continue
+        while True:
             try:
                 accepted = queue.enqueue(
                     filename=name,
@@ -358,24 +435,75 @@ def upload_archive(
                     dedupe=True,
                 )
             except HTTPException as exc:
-                if exc.status_code != 503:
-                    skipped.append(ArchiveSkipResponse(name=info.filename, reason=str(exc.detail)))
-                    continue
-                deferred.append(name)
-                continue
-            known.add(name)
-            jobs.append(accepted)
-    audit(
-        "document.upload",
-        workspace=workspace_of(settings),
-        source="archive",
-        archive=file.filename or "",
-        queued=len(jobs),
-        skipped=len(skipped),
-        deferred=len(deferred),
-        **({"tags": list(given_tags)} if given_tags else {}),
+                if exc.status_code == 503 and status is not None:
+                    # Room went to an upload meanwhile: wait for it again.
+                    if wait_for_room(queue.backlog.has_room, len(content), status):
+                        continue
+                    accepted = None
+                elif exc.status_code == 503:
+                    deferred.append(name)
+                    accepted = None
+                else:
+                    skip(info.filename, str(exc.detail))
+                    accepted = None
+            break
+        if accepted is None:
+            continue
+        known.add(name)
+        jobs.append(accepted)
+        if status is not None:
+            status.queued += 1
+    return jobs, skipped, deferred
+
+
+def _archive_in_background(
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+    file: UploadFile,
+    given_tags: tuple[str, ...] | None,
+) -> ArchiveUploadResponse:
+    """Spool the zip, check it, and queue its documents on the import thread."""
+
+    spool = _spool(file)
+    try:
+        with zipfile.ZipFile(spool) as archive:
+            _archive_members(archive, settings)
+    except (zipfile.BadZipFile, OSError) as exc:
+        spool.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="That file isn't a zip archive.") from exc
+    except HTTPException:
+        spool.unlink(missing_ok=True)
+        raise
+    name = file.filename or "archive.zip"
+
+    def run(status: BackgroundImport) -> None:
+        with zipfile.ZipFile(spool) as archive:
+            members = _archive_members(archive, settings)
+            jobs, skipped, _ = _queue_archive_members(
+                archive, members, repository, settings, queue, raw_store, given_tags, status
+            )
+        _audit_archive(settings, name, given_tags, len(jobs), len(skipped), 0, import_id=status.id)
+
+    started = start_import(
+        "archive",
+        name,
+        workspace_of(settings),
+        str(settings.qdrant_collection),
+        run,
+        cleanup=lambda: spool.unlink(missing_ok=True),
     )
-    return ArchiveUploadResponse(jobs=jobs, skipped=skipped, deferred=deferred)
+    return ArchiveUploadResponse(jobs=[], skipped=[], deferred=[], import_id=started.id)
+
+
+def _spool(file: UploadFile) -> Path:
+    """The upload copied to a temporary file the import thread reads after the request."""
+
+    handle = tempfile.NamedTemporaryFile(prefix="docrag-import-", suffix=".zip", delete=False)
+    with handle:
+        shutil.copyfileobj(file.file, handle, length=1 << 20)
+    return Path(handle.name)
 
 
 def _silently_skipped(info: zipfile.ZipInfo) -> bool:
@@ -505,6 +633,19 @@ async def upload_document_from_url(
             has_room=queue.backlog.has_room,
         ),
     )
+    url = request.url.strip()
+    # Naming the document (`filename`) says which one to replace, as it always has;
+    # a name taken from the URL alone doesn't.
+    replacing = request.replace or bool((request.filename or "").strip())
+    if not replacing and await run_in_threadpool(
+        held_by_another_source, repository, settings, fetched.filename, url
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"A document named '{fetched.filename}' is already indexed from "
+            "another source; it was not replaced. Give this one a name (`filename` in "
+            "the API, --name on the CLI), or replace it (`replace`, --replace).",
+        )
     if raw_store is not None or fetched.remote_named:
         known = await run_in_threadpool(known_filenames, repository, settings)
         # A name the remote server picked (Content-Disposition, a redirect) must not
@@ -541,6 +682,9 @@ async def upload_document_from_url(
         tags=given_tags,
         dedupe=True,
         kind="url",
+        precondition=(
+            None if replacing else free_or_from(repository, settings, fetched.filename, url)
+        ),
     )
     audit(
         "document.upload_from_url",

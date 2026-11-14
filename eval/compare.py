@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import html
 import json
+import random
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,10 +36,17 @@ class Run:
 
     def questions(self) -> dict[str, dict[str, Any]]:
         rows = self.data["per_question"] if self.kind == "retrieval" else self.data
+        # The same question asked again (a follow-up under another history) is told
+        # apart by its turn: "question", then "question (#2)", in dataset order, which
+        # both runs share. Keyed by text alone, later ones were never compared.
         keyed: dict[str, dict[str, Any]] = {}
+        seen: dict[str, int] = {}
         for row in rows:
             if isinstance(row, dict) and isinstance(row.get("question"), str):
-                keyed.setdefault(row["question"], row)
+                question = row["question"]
+                seen[question] = seen.get(question, 0) + 1
+                count = seen[question]
+                keyed[question if count == 1 else f"{question} (#{count})"] = row
         return keyed
 
 
@@ -75,6 +84,29 @@ class RunDiff:
     latency: list[tuple[str, float, float]] = field(default_factory=list)
     # Per-format metrics that moved (a run over several formats; informational).
     by_format: list[tuple[str, float, float]] = field(default_factory=list)
+    # A 95% paired-bootstrap interval for each moved metric's change, over the questions
+    # both runs share: with 10-20 questions one flip moves a rate 5-10 points, and an
+    # interval spanning 0 says the change may be that noise.
+    intervals: dict[str, tuple[float, float]] = field(default_factory=dict)
+
+
+BOOTSTRAP_RESAMPLES = 2000
+
+
+def paired_interval(
+    pairs: Sequence[tuple[float, float]], resamples: int = BOOTSTRAP_RESAMPLES, seed: int = 0
+) -> tuple[float, float] | None:
+    """The 2.5th and 97.5th percentiles of the mean of ``after - before`` over
+    ``resamples`` resamplings (with replacement) of the questions; None for fewer than
+    two."""
+
+    if len(pairs) < 2:
+        return None
+    rng = random.Random(seed)
+    deltas = [after - before for before, after in pairs]
+    n = len(deltas)
+    means = sorted(sum(deltas[rng.randrange(n)] for _ in range(n)) / n for _ in range(resamples))
+    return means[int(0.025 * resamples)], means[min(resamples - 1, int(0.975 * resamples))]
 
 
 def _retrieval_change(before: dict[str, Any], after: dict[str, Any]) -> tuple[int, list[str]]:
@@ -147,6 +179,20 @@ def diff_runs(before: Run, after: Run) -> RunDiff:
                 if isinstance(value, int | float) and isinstance(other, int | float):
                     if value != other:
                         result.aggregates.append((f"{level} {metric}", float(value), float(other)))
+        for name, _, _ in result.aggregates:
+            level, _, metric = name.partition(" ")
+            pairs = [
+                (float(old[q][level][metric]), float(new[q][level][metric]))
+                for q in old
+                if q in new
+                and isinstance(old[q].get(level), dict)
+                and isinstance(new[q].get(level), dict)
+                and isinstance(old[q][level].get(metric), int | float)
+                and isinstance(new[q][level].get(metric), int | float)
+            ]
+            interval = paired_interval(pairs)
+            if interval is not None:
+                result.intervals[name] = interval
         for name, value, other in _format_metrics(before.data, after.data):
             if value != other:
                 result.by_format.append((name, value, other))
@@ -186,7 +232,14 @@ def format_diff(diff: RunDiff) -> str:
     for question in diff.only_after:
         lines.append(f"? only in the second run: {question}")
     for name, before, after in diff.aggregates:
-        lines.append(f"  {name}: {before:.3f} → {after:.3f} ({after - before:+.3f})")
+        interval = diff.intervals.get(name)
+        spread = (
+            f", 95% {interval[0]:+.3f}…{interval[1]:+.3f}"
+            + (" — may be noise" if interval[0] <= 0 <= interval[1] else "")
+            if interval is not None
+            else ""
+        )
+        lines.append(f"  {name}: {before:.3f} → {after:.3f} ({after - before:+.3f}{spread})")
     for name, before, after in diff.by_format:
         lines.append(f"  {name}: {before:.3f} → {after:.3f} ({after - before:+.3f})")
     for name, before, after in diff.latency:

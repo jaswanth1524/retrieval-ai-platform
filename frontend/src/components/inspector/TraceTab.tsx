@@ -122,6 +122,11 @@ function TraceIds({ trace }: TraceTabProps) {
         <span data-testid="trace-answer-status">
           answer <span className="trace-tab__id">{trace.answer_status.replace(/_/g, ' ')}</span>
           {trace.truncated ? ' · cut off at the token limit' : ''}
+          {trace.prompt_cut ? ' · the model read only part of its prompt' : ''}
+          {trace.prompt_cached ? ' · reply reused from the prompt cache' : ''}
+          {trace.unsupported_claims
+            ? ` · ${trace.unsupported_claims} citing sentence${trace.unsupported_claims === 1 ? '' : 's'} with no supporting passage`
+            : ''}
         </span>
       )}
     </div>
