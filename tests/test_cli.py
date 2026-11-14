@@ -151,6 +151,11 @@ def test_search_lists_ranked_passages(client: DocragClient, tmp_path: Path) -> N
     assert code == 0
     assert out.startswith("1. guide.txt p.1")
 
+    code, out = run(client, "search", "alpha", "--expect", "guide.txt")
+    assert code == 0
+    assert "dense #1" in out
+    assert "any passage of guide.txt: returned" in out
+
 
 def test_status_and_export(client: DocragClient, tmp_path: Path) -> None:
     # The test server reaches no Ollama: not ready, so a script would see a failure.
@@ -1469,3 +1474,90 @@ def test_the_score_report_trace_diff_and_recheck_commands() -> None:
     assert code == 0
     assert "1 of 2 unanswered questions now find a passage" in out
     assert "covered    Gym?  (gym.txt)" in out
+
+
+def test_doctor_lists_findings_and_exits_1_on_a_warning(client: DocragClient) -> None:
+    code, out = run(client, "doctor")
+    # The test server keeps no originals, has no rate limit and parses with no memory
+    # cap: notes only, so it exits 0.
+    assert "PARSE_MEMORY_LIMIT_MB" in out
+    assert code == (1 if "warning:" in out else 0)
+
+
+def test_audit_lists_stored_events(tmp_path: Path) -> None:
+    from api.audit_log import AuditLog
+    from api.dependencies import get_audit_log
+
+    store = AuditLog(str(tmp_path / "audit.db"), 100)
+    clear_dependency_caches()
+    app = hermetic_app(make_settings(api_key="full-key"), QdrantClient(":memory:"))
+    app.dependency_overrides[get_audit_log] = lambda: store
+    with TestClient(app) as test_client:
+        docrag = DocragClient("http://testserver", "full-key", http=test_client)
+        run(docrag, "ingest", str(corpus(tmp_path)))
+        code, out = run(docrag, "audit", "--event", "document.")
+        assert code == 0 and "document.upload" in out and "filename=guide.txt" in out
+        code, _ = run(docrag, "audit", "--since", "yesterday")
+        assert code == 2
+    clear_dependency_caches()
+
+
+def test_sync_sends_only_new_and_changed_files_and_deletes_with_delete(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    folder = tmp_path / "handbook"
+    folder.mkdir()
+    (folder / "a.txt").write_text("Intro\nalpha one")
+    (folder / "b.txt").write_text("Intro\nbeta two")
+
+    code, out = run(client, "sync", str(folder))
+    assert code == 0 and "sync: 2 sent, 0 unchanged" in out
+    code, out = run(client, "sync", str(folder))
+    assert "sync: 0 sent, 2 unchanged" in out
+
+    (folder / "a.txt").write_text("Intro\nalpha changed")
+    (folder / "b.txt").unlink()
+    code, out = run(client, "sync", str(folder), "--dry-run", "--delete")
+    assert "send    " in out and "delete  b.txt" in out
+    code, out = run(client, "sync", str(folder), "--delete")
+    assert code == 0 and "sync: 1 sent, 0 unchanged, 1 deleted" in out
+    assert sorted(client.documents()["filenames"]) == ["a.txt"]
+
+
+def test_import_in_the_background_follows_the_server_import(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    import json
+
+    archive = tmp_path / "backup.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "manifest_version": 1,
+                    "documents": [{"filename": "a.txt", "original": "originals/a.txt", "tags": []}],
+                }
+            ),
+        )
+        zipped.writestr("originals/a.txt", "Intro\nalpha")
+    code, out = run(client, "import", str(archive), "--background")
+    assert code == 0, out
+    assert "1 queued, 0 skipped, 0 failed (done)" in out
+
+
+def test_ingest_sends_a_zip_in_the_background_and_waits_until_it_is_queued(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    archive = tmp_path / "docs.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("a.txt", "Intro\nalpha")
+        zipped.writestr("b.txt", "Intro\nbeta")
+
+    code, out = run(client, "ingest", str(archive), "--background")
+
+    assert code == 0, out
+    assert "2 queued from zips" in out
+    code, out = run(client, "ingest", str(archive), "--background", "--json")
+    report = json.loads(out)
+    assert code == 0 and report["queued_in_background"][0]["queued"] == 2

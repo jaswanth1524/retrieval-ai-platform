@@ -578,16 +578,36 @@ class DocragClient:
         seconds pass: its status as it is then)."""
 
         deadline = None if timeout is None else self._clock() + timeout
+        failures = 0
+        status: dict[str, Any] = {}
         while True:
-            status = self.sitemap_import(import_id)
+            try:
+                status = self.sitemap_import(import_id)
+                failures = 0
+            except DocragError as exc:
+                # A restart or a dropped connection: asked again, as a job's poll is.
+                transient = (
+                    exc.status_code is None
+                    or exc.status_code in (408, 429)
+                    or (exc.status_code >= 500)
+                )
+                failures += 1
+                if not transient or failures >= JOB_POLL_MAX_FAILURES:
+                    raise
+                self._sleep(poll_seconds)
+                continue
             if status.get("finished_at") is not None:
                 return status
             if deadline is not None and self._clock() >= deadline:
                 return status
             self._sleep(poll_seconds)
 
-    def upload_archive(self, path: Path, *, tags: Sequence[str] = ()) -> dict[str, Any]:
-        """A zip of documents, each indexed as its own (POST /documents/archive)."""
+    def upload_archive(
+        self, path: Path, *, tags: Sequence[str] = (), background: bool = False
+    ) -> dict[str, Any]:
+        """A zip of documents, each indexed as its own (POST /documents/archive); with
+        ``background`` the server queues every document as room frees and returns an
+        ``import_id`` (``wait_for_import``)."""
 
         try:
             content = path.read_bytes()
@@ -598,7 +618,11 @@ class DocragClient:
             "POST",
             "/documents/archive",
             files={"file": (path.name, content, "application/zip")},
-            data={"tags": list(tags)} if tags else None,
+            data={
+                **({"tags": list(tags)} if tags else {}),
+                **({"background": "true"} if background else {}),
+            }
+            or None,
             attempts=BUSY_MAX_ATTEMPTS,
         )
         return result
@@ -610,11 +634,16 @@ class DocragClient:
         *,
         tags: Sequence[str] = (),
         refresh_minutes: int | None = None,
+        replace: bool = False,
     ) -> dict[str, Any]:
         """Have the server fetch and index ``url`` (URL_INGEST_ENABLED), with ``tags``,
-        and checked again every ``refresh_minutes`` (0 = never; None = the server's)."""
+        and checked again every ``refresh_minutes`` (0 = never; None = the server's).
+        ``replace``: a document of that name from another source is replaced (the
+        server refuses it otherwise)."""
 
         body: dict[str, Any] = {"url": url}
+        if replace:
+            body["replace"] = True
         if filename:
             body["filename"] = filename
         if tags:
@@ -861,6 +890,9 @@ class DocragClient:
             )
         except httpx.HTTPError as exc:
             raise self._unreachable(exc) from exc
+        if response.status_code >= 400:
+            # A 400 (unsupported type), 413 or 429 body is an error, not a preview.
+            raise DocragError(_detail(response), response.status_code)
         result: dict[str, Any] = _response_json(response)
         return result
 
@@ -953,16 +985,47 @@ class DocragClient:
             raise DocragError(f"Cannot write {destination}: {exc.strerror or exc}") from exc
         return written
 
-    def restore(self, archive: Path) -> dict[str, Any]:
+    def restore(self, archive: Path, *, background: bool = False) -> dict[str, Any]:
+        """``POST /import``; with ``background`` the server queues every document as
+        room frees and returns an ``import_id`` (``wait_for_import``)."""
+
         try:
             handle = archive.open("rb")
         except OSError as exc:
             raise DocragError(f"Cannot read {archive}: {exc.strerror or exc}") from exc
         with handle:
             result: dict[str, Any] = self._json(
-                "POST", "/import", files={"file": (archive.name, handle, "application/zip")}
+                "POST",
+                "/import",
+                files={"file": (archive.name, handle, "application/zip")},
+                data={"background": "true"} if background else None,
             )
         return result
+
+    def background_import(self, import_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("GET", f"/documents/imports/{_quote(import_id)}")
+        return result
+
+    def wait_for_import(
+        self,
+        import_id: str,
+        *,
+        timeout: float | None = None,
+        poll_seconds: float = 2.0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Poll a background import until it ends (or ``timeout``: its status then)."""
+
+        deadline = None if timeout is None else self._clock() + timeout
+        while True:
+            status = self.background_import(import_id)
+            if on_progress is not None:
+                on_progress(status)
+            if status.get("finished_at") is not None:
+                return status
+            if deadline is not None and self._clock() >= deadline:
+                return status
+            self._sleep(poll_seconds)
 
     # -- stored backups and the consistency report (full key) -------------------------
 
@@ -1006,6 +1069,32 @@ class DocragClient:
 
         result: dict[str, Any] = self._json("POST", "/admin/consistency/repair", json=remedies)
         return result
+
+    def audit(
+        self,
+        *,
+        event: str | None = None,
+        since: float | None = None,
+        limit: int = 100,
+        all_workspaces: bool = False,
+    ) -> list[dict[str, Any]]:
+        """``GET /admin/audit``: stored audit events, newest first (AUDIT_LOG_PATH)."""
+
+        params: dict[str, Any] = {"limit": limit}
+        if event:
+            params["event"] = event
+        if since is not None:
+            params["since"] = since
+        if all_workspaces:
+            params["all_workspaces"] = "true"
+        result: dict[str, Any] = self._json("GET", "/admin/audit", params=params)
+        return list(result.get("entries", []))
+
+    def doctor(self) -> list[dict[str, Any]]:
+        """``GET /admin/doctor``: the server's risky configurations (full key)."""
+
+        result: dict[str, Any] = self._json("GET", "/admin/doctor")
+        return list(result.get("findings", []))
 
     def consistency(self) -> dict[str, Any]:
         """``GET /admin/consistency``: how the index and stored originals agree."""

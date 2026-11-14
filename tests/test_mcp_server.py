@@ -419,7 +419,13 @@ async def test_write_tools_only_with_allow_writes_and_the_full_key(
         refused = text_of(await writer.call_tool("add_url", {"url": "https://example.com/a"}))
         assert refused.startswith("DocRAG error (404)")
         # An upload holds the name: kept, unless the agent asks to replace it.
-        kept = text_of(await writer.call_tool("add_url", {"url": "https://example.com/guide.txt"}))
+        # A name given here is checked first (the server treats it as consent); a name
+        # the server derives from the URL is the server's own 409.
+        kept = text_of(
+            await writer.call_tool(
+                "add_url", {"url": "https://example.com/guide.txt", "filename": "guide.txt"}
+            )
+        )
         assert "already indexed from another source" in kept
         assert tools["add_url"].annotations is not None
         assert tools["add_url"].annotations.destructive_hint is True
