@@ -1,4 +1,4 @@
-import { memo, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { SavedAnswer } from '../hooks/useChat';
 import type { SourceChange } from '../utils/citationFreshness';
 import { formatRelativeTime } from '../utils/relativeTime';
@@ -22,6 +22,20 @@ const MAX_ROWS = 200;
  *  deleted since. */
 function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: ReviewPanelProps) {
   const [showReviewed, setShowReviewed] = useState(false);
+  // "Mark reviewed" removes its row (and the focused button with it): focus goes to the
+  // row that took its place, else the empty message, not to the page.
+  const [focusRow, setFocusRow] = useState<number | null>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  const emptyRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (focusRow === null) return;
+    const buttons = listRef.current?.querySelectorAll<HTMLButtonElement>(
+      '[data-testid="review-open"]',
+    );
+    const target = buttons?.length ? buttons[Math.min(focusRow, buttons.length - 1)] : null;
+    (target ?? emptyRef.current)?.focus();
+    setFocusRow(null);
+  }, [focusRow]);
   const flagged = answers
     .map((item) => ({ item, reasons: reviewReasons(item.turn, sourceChangeOf) }))
     .filter((row) => row.reasons.length > 0);
@@ -44,7 +58,12 @@ function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: Review
   if (rows.length === 0) {
     return (
       <>
-        <p className="unanswered-panel__message" data-testid="review-empty">
+        <p
+          className="unanswered-panel__message"
+          data-testid="review-empty"
+          ref={emptyRef}
+          tabIndex={-1}
+        >
           {flagged.length > 0
             ? 'Every answer worth a second look here has been reviewed.'
             : 'Nothing to review: every answer here was found, cited, and rests on documents as they are now.'}
@@ -56,8 +75,8 @@ function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: Review
   return (
     <>
     {toggle}
-    <ul className="unanswered-panel__list" data-testid="review-list">
-      {rows.map(({ item, reasons }) => (
+    <ul className="unanswered-panel__list" data-testid="review-list" ref={listRef}>
+      {rows.map(({ item, reasons }, index) => (
         <li
           key={`${item.conversationId}:${item.turn.id}`}
           className="unanswered-panel__row"
@@ -87,9 +106,11 @@ function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: Review
               <button
                 type="button"
                 aria-pressed={Boolean(item.turn.reviewedAt)}
-                onClick={() =>
-                  onMarkReviewed(item.conversationId, item.turn.id, !item.turn.reviewedAt)
-                }
+                onClick={() => {
+                  const marking = !item.turn.reviewedAt;
+                  onMarkReviewed(item.conversationId, item.turn.id, marking);
+                  if (marking && !showReviewed) setFocusRow(index);
+                }}
                 data-testid="review-mark"
               >
                 {item.turn.reviewedAt ? 'Reviewed ✓' : 'Mark reviewed'}

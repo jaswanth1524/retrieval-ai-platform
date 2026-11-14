@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { getApiKey, setApiKey } from '../api/client';
+import { ApiClientError, api, apiErrorMessage, getApiKey, setApiKey } from '../api/client';
+import { setSingleKeyShortcuts, singleKeyShortcutsOn } from '../utils/shortcuts';
 import type {
   DocumentJobAcceptedResponse,
   PublicConfigResponse,
@@ -119,6 +120,29 @@ function SettingsModal({
   const [languageDraft, setLanguageDraft] = useState(overrides.answerLanguage ?? '');
   const [notifyDraft, setNotifyDraft] = useState(notifyOnAnswer);
   const [notifyBlocked, setNotifyBlocked] = useState(false);
+  const [singleKeysDraft, setSingleKeysDraft] = useState(singleKeyShortcutsOn);
+  const [keyTest, setKeyTest] = useState<string | null>(null);
+  const testKey = () => {
+    setKeyTest('Checking…');
+    api
+      .accessWithKey(apiKeyDraft.trim())
+      .then(({ access }) =>
+        setKeyTest(
+          access === 'full'
+            ? 'This key works: full access.'
+            : access === 'read'
+              ? 'This key works: read-only access (asking and searching, no changes).'
+              : 'The server has no API key set: any key (or none) works.',
+        ),
+      )
+      .catch((err) =>
+        setKeyTest(
+          err instanceof ApiClientError && err.statusCode === 401
+            ? 'The server refused this key.'
+            : apiErrorMessage(err, 'Could not reach the server.'),
+        ),
+      );
+  };
 
   const rerankTopK = draftOverrides.rerankTopK ?? config.rerank_top_k;
   const maxContextChunks = draftOverrides.maxContextChunks ?? config.max_context_chunks;
@@ -133,6 +157,7 @@ function SettingsModal({
   const save = () => {
     onOverridesChange(draftOverrides);
     setApiKey(apiKeyDraft);
+    setSingleKeyShortcuts(singleKeysDraft);
     onNotifyOnAnswerChange?.(notifyDraft);
     onSaved();
     onClose();
@@ -381,6 +406,30 @@ function SettingsModal({
             <p className="settings__hint">
               Only needed when the server has <code>API_KEY</code> set. Stored in this browser.
             </p>
+            <button type="button" onClick={testKey} data-testid="settings-test-key">
+              Test key
+            </button>
+            {keyTest && (
+              <p className="settings__hint" role="status" data-testid="settings-key-test">
+                {keyTest}
+              </p>
+            )}
+          </section>
+
+          <section className="settings__section">
+            <h3 className="settings__section-title mono">Keyboard</h3>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={singleKeysDraft}
+                onChange={(event) => setSingleKeysDraft(event.target.checked)}
+                data-testid="settings-single-keys"
+              />
+              Single-key shortcuts (? [ ] j k 1-9)
+            </label>
+            <p className="settings__hint">
+              Off if speech input or a switch sets them off by accident; the ⌘ shortcuts stay.
+            </p>
           </section>
 
           {onNotifyOnAnswerChange && notificationsSupported() && (
@@ -477,6 +526,10 @@ function SettingsModal({
                           {readiness.last_backup.ok
                             ? ` · ${readiness.last_backup.file ?? 'written'}`
                             : ` · failed: ${readiness.last_backup.error ?? 'see the server log'}`}
+                          {readiness.last_backup.ok &&
+                          (readiness.last_backup.originals_missing ?? 0) > 0
+                            ? ` · ${readiness.last_backup.originals_missing} without an original (not restorable)`
+                            : ''}
                         </td>
                       </tr>
                     )}

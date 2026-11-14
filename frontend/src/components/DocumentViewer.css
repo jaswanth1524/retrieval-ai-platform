@@ -309,3 +309,36 @@
   outline: 2px solid var(--accent, #3b82f6);
   outline-offset: 1px;
 }
+
+/* Contents (ViewerOutline): sections and "go to page", under the header. */
+.document-viewer__outline {
+  border-bottom: 1px solid var(--rule);
+  padding: 8px 16px;
+  max-height: 40vh;
+  max-height: 40dvh;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+.document-viewer__goto {
+  margin-bottom: 8px;
+}
+
+.document-viewer__goto input {
+  width: 6em;
+}
+
+.document-viewer__outline-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.document-viewer__outline-list button {
+  background: none;
+  border: none;
+  padding: 2px 0;
+  min-height: 24px;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}

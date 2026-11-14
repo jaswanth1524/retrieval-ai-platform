@@ -111,6 +111,10 @@ export class MockApi {
   readonly questionBodies: Record<string, unknown>[] = [];
   /** Body for POST /questions/stream, or a function for held/custom streams. */
   stream: string | ((route: Route) => Promise<void>) = answerStream();
+  /** Body for POST /questions/continue (the rest of a cut-off answer). */
+  continueStream: string = answerStream();
+  /** Every POST /questions/continue body the app sent. */
+  readonly continueBodies: Record<string, unknown>[] = [];
   /** Response for POST /documents; default accepts the upload as job "job-1". */
   uploadResponse: JobStep | null = null;
   /** How many uploads to turn away first with 503 + Retry-After (a full indexing queue). */
@@ -192,6 +196,8 @@ export class MockApi {
   consistency: object | null = null;
   answerCache: object = { enabled: true, entries: [], total_entries: 0, max_entries: 256, ttl_seconds: 3600, in_flight: 0 };
   cacheClears = 0;
+  /** GET /documents/imports: zips and backups imported in the background. */
+  backgroundImports: object[] = [];
   /** GET /documents/sitemap-imports, and every import cancelled by id. */
   sitemapImports: object[] = [];
   readonly sitemapCancels: string[] = [];
@@ -388,6 +394,11 @@ export class MockApi {
       });
     }
 
+    if (path === '/questions/continue' && method === 'POST') {
+      this.continueBodies.push(JSON.parse(request.postData() ?? '{}') as Record<string, unknown>);
+      return route.fulfill({ status: 200, contentType: 'text/event-stream', body: this.continueStream });
+    }
+
     if (path === '/questions/stream' && method === 'POST') {
       this.questionBodies.push(JSON.parse(request.postData() ?? '{}') as Record<string, unknown>);
       if (typeof this.stream === 'function') return this.stream(route);
@@ -449,6 +460,10 @@ export class MockApi {
       if (state === 'failed' || state === 'recent') return this.json(route, 200, { jobs: this.finishedJobs });
       return this.json(route, 200, { jobs: this.activeJobs });
     }
+    if (path === '/documents/imports' && method === 'GET') {
+      return this.json(route, 200, { imports: this.backgroundImports });
+    }
+
     if (path === '/documents/sitemap-imports' && method === 'GET') {
       return this.json(route, 200, { imports: this.sitemapImports });
     }
@@ -537,7 +552,7 @@ export class MockApi {
       return this.json(route, 200, { filename, versions: this.versions[filename] ?? [] });
     }
 
-    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|reindex|tags|original|refresh-settings))?$/.exec(
+    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|outline|reindex|tags|original|refresh-settings))?$/.exec(
       path,
     );
     if (documentRoute) {
@@ -549,6 +564,19 @@ export class MockApi {
       if (!action && method === 'DELETE') {
         this.documents = this.documents.filter((name) => name !== filename);
         return this.json(route, 200, { filename, points_deleted: 1 });
+      }
+      if (action === 'outline' && method === 'GET') {
+        const entries = [
+          { section: 'Intro', page: 1, chunk_id: 'c0' },
+          { section: GUIDE_SOURCE.section, page: 1, chunk_id: GUIDE_SOURCE.chunk_id },
+        ];
+        return this.json(route, 200, {
+          filename,
+          total_chunks: 2,
+          sections: entries,
+          pages: [entries[0]],
+          truncated: false,
+        });
       }
       if (action === 'content' && method === 'GET') {
         const all = (this.contentChunks ?? [

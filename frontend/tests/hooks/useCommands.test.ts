@@ -211,5 +211,13 @@ describe('pass 7 commands and keys', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true }));
     input.remove();
     expect(run.showShortcuts).toHaveBeenCalledTimes(1);
+
+    // Turned off in Settings: the single keys do nothing (the ⌘ ones still work).
+    localStorage.setItem('docrag-single-key-shortcuts', 'off');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }));
+    press('\\');
+    expect(run.showShortcuts).toHaveBeenCalledTimes(1);
+    expect(run.toggleInspector).toHaveBeenCalledTimes(2);
+    localStorage.removeItem('docrag-single-key-shortcuts');
   });
 });

@@ -107,7 +107,11 @@ body {
   .corpus-panel__job-cancel,
   .conversation-list__filter,
   .conversation-list__label,
-  .chat-message__versions-head button {
+  .chat-message__versions-head button,
+  .composer__chip,
+  .chat-message__copy,
+  .chat-message__regenerate,
+  .chat-message__feedback-btn {
     min-height: 24px;
     min-width: 24px;
   }
@@ -264,4 +268,23 @@ a {
     content-visibility: visible !important;
     break-inside: avoid-page;
   }
+}
+
+/* SelectionActions: over text selected in an answer or a viewer passage. */
+.selection-actions {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--rule-hi);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.12);
+}
+
+.selection-actions button {
+  min-height: 28px;
+  font-size: 12px;
+  white-space: nowrap;
 }

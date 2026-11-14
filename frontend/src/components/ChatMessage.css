@@ -544,3 +544,20 @@
   background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent);
   text-decoration: none;
 }
+
+/* An earlier version next to the current answer: two columns where there is room. */
+.chat-message__versions-side {
+  display: grid;
+  gap: 12px;
+}
+
+@media (min-width: 860px) {
+  .chat-message__versions-side {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.chat-message__versions-side > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

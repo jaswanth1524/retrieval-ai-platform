@@ -7,7 +7,7 @@ import type {
 } from '../../api/types';
 import type { AnswerStyle, ChatTurn } from '../../components/ChatMessage';
 import { isAnswerFormat, isAnswerLanguage } from '../../utils/overrides';
-import { WORKSPACE_NAME_PATTERN } from '../../utils/limits';
+import { MAX_QUESTION_CHARS, MAX_SCOPE_FILENAMES, WORKSPACE_NAME_PATTERN } from '../../utils/limits';
 import {
   cleanLabels,
   type Conversation,
@@ -167,25 +167,57 @@ export function coverageWorthShowing(coverage: SummaryCoverage): boolean {
 function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
+// Bounds on what a stored or imported turn may hold: a crafted import (or a bloated
+// store) otherwise filled the localStorage quota and left history "partly saved".
+const MAX_TURN_CHARS = 200_000;
+const MAX_TURN_SOURCES = 100;
+const MAX_SOURCE_TEXT_CHARS = 20_000;
+const MAX_ID_CHARS = 100;
+// Every stage a timing row shows: one missing read as NaN in the Retrieval tab.
+const TIMING_FIELDS = ['embed_ms', 'search_ms', 'rerank_ms', 'generate_ms', 'total_ms', 'condense_ms'] as const;
+const OPTIONAL_TIMING_FIELDS = [
+  'query_expansion_ms',
+  'context_expansion_ms',
+  'citation_retry_ms',
+  'rerank_wait_ms',
+  'first_token_ms',
+] as const;
+function sanitizeTimings(value: unknown): ChatTurn['timings'] {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const number = (item: unknown) => (typeof item === 'number' && Number.isFinite(item) ? item : null);
+  if (number(raw.total_ms) === null) return null;
+  const timings = Object.fromEntries(TIMING_FIELDS.map((key) => [key, number(raw[key]) ?? 0]));
+  for (const key of OPTIONAL_TIMING_FIELDS) {
+    const item = number(raw[key]);
+    if (item !== null) timings[key] = item;
+  }
+  return timings as unknown as ChatTurn['timings'];
+}
+function boundedSource(source: CitationResponse): CitationResponse {
+  return source.text.length > MAX_SOURCE_TEXT_CHARS
+    ? { ...source, text: source.text.slice(0, MAX_SOURCE_TEXT_CHARS) }
+    : source;
+}
 export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (!isChatTurn(value)) return null;
   const turn = value as ChatTurn & Record<string, unknown>;
-  const timings = turn.timings as unknown;
   const sanitized: ChatTurn = {
     id: turn.id,
     role: turn.role,
-    content: turn.content,
+    content: turn.content.slice(0, MAX_TURN_CHARS),
     timestamp: validTime(turn.timestamp, Date.now()),
-    sources: turn.sources.filter(isCitation).map(withValidSpans),
-    timings:
-      timings && typeof timings === 'object' && typeof (timings as { total_ms?: unknown }).total_ms === 'number'
-        ? (timings as ChatTurn['timings'])
-        : null,
-    traceId: typeof turn.traceId === 'string' ? turn.traceId : null,
+    sources: turn.sources
+      .filter(isCitation)
+      .slice(0, MAX_TURN_SOURCES)
+      .map((source) => boundedSource(withValidSpans(source))),
+    timings: sanitizeTimings(turn.timings),
+    traceId:
+      typeof turn.traceId === 'string' && turn.traceId.length <= MAX_ID_CHARS ? turn.traceId : null,
   };
-  if (typeof turn.question === 'string') sanitized.question = turn.question;
+  if (typeof turn.question === 'string') sanitized.question = turn.question.slice(0, MAX_QUESTION_CHARS);
   if (turn.feedback === 'up' || turn.feedback === 'down') sanitized.feedback = turn.feedback;
-  if (typeof turn.model === 'string') sanitized.model = turn.model;
+  if (typeof turn.model === 'string') sanitized.model = turn.model.slice(0, 200);
   const flags = [
     'stopped',
     'incomplete',
@@ -193,6 +225,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
     'notFound',
     'uncited',
     'truncated',
+    'promptCut',
     'followUp',
     'weakMatch',
     'autoCited',
@@ -334,14 +367,22 @@ export function sanitizeConversation(value: unknown): Conversation | null {
   }
   return conversation;
 }
+const MAX_SCOPE_TAGS = 20;
 export function sanitizeScope(value: unknown): ConversationScope | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const raw = value as Partial<ConversationScope>;
-  const strings = (list: unknown) =>
-    Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : [];
+  // Deduplicated and held to what a question may carry (500 files, 20 tags): an
+  // imported scope past them made every question in the conversation a 422.
+  const strings = (list: unknown, max: number) =>
+    Array.isArray(list)
+      ? [...new Set(list.filter((item): item is string => typeof item === 'string'))].slice(0, max)
+      : [];
   const page = (item: unknown) =>
     typeof item === 'number' && Number.isInteger(item) && item >= 1 && item <= 1_000_000 ? item : undefined;
-  const scope: ConversationScope = { filenames: strings(raw.filenames), tags: strings(raw.tags) };
+  const scope: ConversationScope = {
+    filenames: strings(raw.filenames, MAX_SCOPE_FILENAMES),
+    tags: strings(raw.tags, MAX_SCOPE_TAGS),
+  };
   const pageMin = page(raw.pageMin);
   const pageMax = page(raw.pageMax);
   if (pageMin !== undefined && (pageMax === undefined || pageMin <= pageMax)) scope.pageMin = pageMin;

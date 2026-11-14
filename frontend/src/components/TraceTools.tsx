@@ -26,10 +26,13 @@ function useFetched<T>(load: (signal: AbortSignal) => Promise<T>, key: string) {
 export function ScoreReportView({
   onClose,
   canApply = false,
+  ratingsAvailable = false,
 }: {
   onClose: () => void;
   /** Offer to set the suggested bar for this workspace (the full key). */
   canApply?: boolean;
+  /** Feedback is on: the sides can come from people's ratings. */
+  ratingsAvailable?: boolean;
 }) {
   const [applied, setApplied] = useState<string | null>(null);
   const apply = async (bar: number) => {
@@ -43,7 +46,13 @@ export function ScoreReportView({
       setApplied(apiErrorMessage(err, 'Could not set it.'));
     }
   };
-  const fetched = useFetched<ScoreReportResponse>((signal) => api.scoreReport(signal), 'report');
+  // People's ratings instead of the model's verdicts, when feedback is on: the model's
+  // labels can only confirm the bar a weak-match-off server already uses.
+  const [byRatings, setByRatings] = useState(false);
+  const fetched = useFetched<ScoreReportResponse>(
+    (signal) => api.scoreReport(signal, byRatings ? 'feedback' : 'model'),
+    byRatings ? 'report-ratings' : 'report',
+  );
   const report = fetched?.value;
   const tallest = report ? Math.max(1, ...report.answered, ...report.unanswered) : 1;
   return (
@@ -54,6 +63,17 @@ export function ScoreReportView({
           ✕
         </button>
       </div>
+      {ratingsAvailable && (
+        <label className="trace-tools__toggle">
+          <input
+            type="checkbox"
+            checked={byRatings}
+            onChange={(event) => setByRatings(event.target.checked)}
+            data-testid="score-report-by-ratings"
+          />{' '}
+          Sides from people’s ratings (helpful / not helpful)
+        </label>
+      )}
       {!fetched && <p>Loading…</p>}
       {fetched?.error && <p role="alert">{fetched.error}</p>}
       {report && (

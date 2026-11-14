@@ -120,6 +120,9 @@ test('Administration lists backups, runs one and checks the index', async ({ pag
   await page.getByTestId('backups-run').click();
   await expect.poll(() => api.backupRuns).toBe(1);
   await page.getByTestId('answer-cache-clear').click();
+  // Asked first (pass 17): nothing is cleared until it is confirmed.
+  expect(api.cacheClears).toBe(0);
+  await page.getByTestId('answer-cache-clear-confirm').click();
   await expect.poll(() => api.cacheClears).toBe(1);
   await page.getByTestId('workspace-settings-min-score').fill('0.3');
   await page.getByTestId('workspace-settings-save').click();

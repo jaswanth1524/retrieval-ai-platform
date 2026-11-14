@@ -1,7 +1,10 @@
-import { memo, useEffect, useRef, useState } from 'react';
-import type { FormEvent } from 'react';
+import { Fragment, memo, useEffect, useRef, useState } from 'react';
+import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { toCsv } from '../utils/csv';
+import { downloadFile } from '../utils/exportChat';
+import { groupByDocument, readRecentSearches, rememberSearch } from '../utils/searchHistory';
 import { ApiClientError, api, apiErrorMessage } from '../api/client';
-import type { PassageNarrowing, SearchResultResponse } from '../api/types';
+import type { PassageNarrowing, SearchExplanationResponse, SearchResultResponse } from '../api/types';
 import MarkedText from './MarkedText';
 import { snippetAround } from '../utils/snippet';
 import { toDateInput } from '../utils/dates';
@@ -89,6 +92,14 @@ function SearchPanel({
   const [searchedScope, setSearchedScope] = useState('');
   // The passage the shown results are like (a "more like this" search), if they are.
   const [like, setLike] = useState<SimilarTo | null>(null);
+  // "Why not found?": each result's rank on the dense and BM25 search, and where an
+  // expected document or passage was lost (POST /search explain).
+  const [explain, setExplain] = useState(false);
+  const [expect, setExpect] = useState('');
+  const [explanation, setExplanation] = useState<SearchExplanationResponse | null>(null);
+  const [grouped, setGrouped] = useState(false);
+  const [recent, setRecent] = useState<string[]>(readRecentSearches);
+  const listRef = useRef<HTMLDivElement>(null);
   const controllerRef = useRef<AbortController | null>(null);
   const scopeKey = JSON.stringify([filenames, tags, narrowing ?? null]);
   const setFilter = (name: keyof SearchFilters) => (value: string) =>
@@ -106,6 +117,7 @@ function SearchPanel({
     setSearching(false);
     setFilters(NO_FILTERS);
     setLike(null);
+    setExplanation(null);
   }, [resetKey]);
 
   const run = useStableHandler(async (text: string, similarTo?: SimilarTo) => {
@@ -119,6 +131,7 @@ function SearchPanel({
     setError(null);
     try {
       const count = positive(filters.count, MAX_RESULTS);
+      const expected = expect.trim();
       const response = await api.searchPassages(
         {
           query: trimmed,
@@ -127,16 +140,25 @@ function SearchPanel({
           ...(searchTags(filters, tags).length > 0 ? { tags: searchTags(filters, tags) } : {}),
           ...searchNarrowing(filters, narrowing),
           ...(count !== undefined ? { rerank_top_k: count } : {}),
+          ...(explain || expected ? { explain: true } : {}),
+          // A file name has an extension; a passage id doesn't.
+          ...(expected
+            ? expected.includes('.')
+              ? { expect_filename: expected }
+              : { expect_chunk_id: expected }
+            : {}),
         },
         controller.signal,
       );
       if (controller.signal.aborted) return;
       setResults(response.results);
+      if (!similarTo) setRecent(rememberSearch(trimmed));
       setPicked(new Set());
       setSearchedQuery(trimmed);
       setLike(similarTo ?? null);
       setSearchedScope(scopeKey);
       setWeak(response.weak_matches === true && response.results.length > 0);
+      setExplanation(response.explanation ?? null);
     } catch (err) {
       if (controller.signal.aborted) return;
       setResults(null);
@@ -154,6 +176,25 @@ function SearchPanel({
       if (controllerRef.current === controller) setSearching(false);
     }
   });
+
+  // j and k between results (focus inside the list), like answers in the thread; kept
+  // from the app's own j/k, which moves between answers.
+  const moveBetweenResults = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'j' && event.key !== 'k') return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const target = event.target as HTMLElement;
+    if (target.tagName === 'INPUT' && (target as HTMLInputElement).type !== 'checkbox') return;
+    const buttons = [
+      ...(listRef.current?.querySelectorAll<HTMLButtonElement>('[data-testid="search-result"]') ?? []),
+    ];
+    if (buttons.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const current = buttons.findIndex((button) => button.contains(target) || button === target);
+    const next =
+      current < 0 ? 0 : Math.max(0, Math.min(buttons.length - 1, current + (event.key === 'j' ? 1 : -1)));
+    buttons[next].focus();
+  };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -302,6 +343,24 @@ function SearchPanel({
               data-testid="search-filter-count"
             />
           </label>
+          <label className="search-panel__explain">
+            <input
+              type="checkbox"
+              checked={explain}
+              onChange={(event) => setExplain(event.target.checked)}
+              data-testid="search-explain"
+            />{' '}
+            Show each result’s dense and BM25 rank
+          </label>
+          <label>
+            Expected file or passage id
+            <input
+              value={expect}
+              onChange={(event) => setExpect(event.target.value)}
+              placeholder="handbook.pdf"
+              data-testid="search-expect"
+            />
+          </label>
           {filterCount > 0 && (
             <button type="button" className="search-panel__ask-clear" onClick={() => setFilters(NO_FILTERS)}>
               Clear filters
@@ -339,6 +398,11 @@ function SearchPanel({
           These results are from another scope. Search again to look in this one.
         </p>
       )}
+      {explanation && (
+        <p className="search-panel__message" role="status" data-testid="search-explanation">
+          <strong>{explanation.target}</strong>: {explanation.detail}
+        </p>
+      )}
       {weak && results !== null && results.length > 0 && (
         <p className="search-panel__message" data-testid="search-weak">
           No strong matches. These are the closest passages — a fuller question usually finds
@@ -371,8 +435,70 @@ function SearchPanel({
           </button>
         </div>
       )}
-      {results?.map((result) => (
-        <div key={result.chunk_id} className="search-panel__item">
+      {results === null && !searching && recent.length > 0 && !query && (
+        <div className="search-panel__recent" data-testid="search-recent">
+          <span className="mono">Recent:</span>{' '}
+          {recent.map((text) => (
+            <button
+              key={text}
+              type="button"
+              className="search-panel__recent-item"
+              onClick={() => {
+                setQuery(text);
+                void run(text);
+              }}
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+      )}
+      {results !== null && results.length > 1 && (
+        <div className="search-panel__tools">
+          <label>
+            <input
+              type="checkbox"
+              checked={grouped}
+              onChange={(event) => setGrouped(event.target.checked)}
+              data-testid="search-group"
+            />{' '}
+            Group by document
+          </label>
+          <button
+            type="button"
+            onClick={() =>
+              downloadFile(
+                'search-results.csv',
+                'text/csv;charset=utf-8',
+                toCsv(
+                  ['rank', 'filename', 'page', 'section', 'score', 'chunk_id', 'text'],
+                  results.map((r) => [
+                    r.rank,
+                    r.filename,
+                    pageLabel(r.page, r.page_end),
+                    r.section,
+                    r.rerank_score.toFixed(3),
+                    r.chunk_id,
+                    r.text,
+                  ]),
+                ),
+              )
+            }
+            data-testid="search-csv"
+          >
+            Download CSV
+          </button>
+        </div>
+      )}
+      <div ref={listRef} onKeyDown={moveBetweenResults}>
+      {(grouped && results ? groupByDocument(results) : results)?.map((result, index, shown) => (
+        <Fragment key={result.chunk_id}>
+        {grouped && (index === 0 || shown[index - 1].filename !== result.filename) && (
+          <h4 className="search-panel__group mono" data-testid="search-group-head">
+            {result.filename}
+          </h4>
+        )}
+        <div className="search-panel__item">
           {onAskAboutPassages && (
             <input
               type="checkbox"
@@ -414,6 +540,9 @@ function SearchPanel({
           <span className="search-panel__where mono">
             {pageLabel(result.page, result.page_end)}
             {result.section ? ` · ${result.section}` : ''}
+            {result.dense_rank !== undefined || result.sparse_rank !== undefined
+              ? ` · dense #${result.dense_rank ?? '–'} · BM25 #${result.sparse_rank ?? '–'}`
+              : ''}
           </span>
           <span className="search-panel__snippet" dir="auto">
             <MarkedText
@@ -439,7 +568,9 @@ function SearchPanel({
             similar
           </button>
         </div>
+        </Fragment>
       ))}
+      </div>
     </>
   );
 }

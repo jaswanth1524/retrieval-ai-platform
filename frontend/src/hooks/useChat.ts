@@ -178,12 +178,21 @@ export interface UseChatResult {
    *  latest history, so call it from an effect or a memo keyed on `conversations`. */
   searchConversations: (query: string) => Map<string, ConversationMatch>;
   /** `undefined` takes a rating back (it could not be sent). */
-  setTurnFeedback: (turnId: string, rating: FeedbackRating | undefined) => void;
+  setTurnFeedback: (
+    turnId: string,
+    rating: FeedbackRating | undefined,
+    conversationId?: string,
+  ) => void;
   /** Every conversation with turns, as one JSON document (Export all conversations);
    *  importConversations reads it back. */
   allConversationsJson: (label?: string) => string;
   /** Mark (or, after a failed send, unmark) one cited source of a turn not relevant. */
-  setSourceIrrelevant: (turnId: string, sourceNumber: number, marked: boolean) => void;
+  setSourceIrrelevant: (
+    turnId: string,
+    sourceNumber: number,
+    marked: boolean,
+    conversationId?: string,
+  ) => void;
   /** Save (or unsave) an answer of ``conversationId`` (the open one when omitted). */
   setTurnSaved: (turnId: string, saved: boolean, conversationId?: string) => void;
   /** Make an answer's earlier version (by index) the answer again. */
@@ -343,6 +352,7 @@ export function answeredTurn(
     ...(status === 'uncited' ? { uncited: true } : {}),
     ...(grounding?.weakMatches ? { weakMatch: true } : {}),
     ...(grounding?.truncated ? { truncated: true } : {}),
+    ...(grounding?.promptCut ? { promptCut: true } : {}),
     ...(grounding?.coverage && coverageWorthShowing(grounding.coverage)
       ? { coverage: grounding.coverage }
       : {}),
@@ -972,12 +982,15 @@ export function useChat(): UseChatResult {
     [],
   );
 
+  // These change one conversation's turn (the active one unless named): an edited
+  // question's copy shares the earlier turns' ids, so matching the id alone rated,
+  // marked or swapped the answer in both conversations.
   const setSourceIrrelevant = useCallback(
-    (turnId: string, sourceNumber: number, marked: boolean) => {
+    (turnId: string, sourceNumber: number, marked: boolean, conversationId?: string) => {
       setStorage((prev) =>
         updateTurn(
           prev,
-          undefined,
+          conversationId ?? prev.activeConversationId ?? '',
           turnId,
           (turn) => {
             const others = (turn.irrelevantSources ?? []).filter((n) => n !== sourceNumber);
@@ -1033,17 +1046,32 @@ export function useChat(): UseChatResult {
   // version, so nothing is lost).
   const restoreAnswerVersion = useCallback((turnId: string, index: number) => {
     setStorage((prev) =>
-      updateTurn(prev, undefined, turnId, (turn) => withVersionRestored(turn, index), Date.now()),
+      updateTurn(
+        prev,
+        prev.activeConversationId ?? '',
+        turnId,
+        (turn) => withVersionRestored(turn, index),
+        Date.now(),
+      ),
     );
   }, []);
 
-  const setTurnFeedback = useCallback((turnId: string, rating: FeedbackRating | undefined) => {
-    // Stored on the turn, so a rating survives a reload or a conversation switch and
-    // the buttons can't send a duplicate row for the same answer.
-    setStorage((prev) =>
-      updateTurn(prev, undefined, turnId, (turn) => ({ ...turn, feedback: rating }), Date.now()),
-    );
-  }, []);
+  const setTurnFeedback = useCallback(
+    (turnId: string, rating: FeedbackRating | undefined, conversationId?: string) => {
+      // Stored on the turn, so a rating survives a reload or a conversation switch and
+      // the buttons can't send a duplicate row for the same answer.
+      setStorage((prev) =>
+        updateTurn(
+          prev,
+          conversationId ?? prev.activeConversationId ?? '',
+          turnId,
+          (turn) => ({ ...turn, feedback: rating }),
+          Date.now(),
+        ),
+      );
+    },
+    [],
+  );
 
   const savedAnswersRef = useRef<SavedAnswer[]>([]);
   const savedAnswers = useMemo(() => {

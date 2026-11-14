@@ -9,6 +9,8 @@ import { useDialog } from '../hooks/useDialog';
 import { CITATION_WINDOW_RADIUS, takePrefetchedContent } from '../utils/contentPrefetch';
 import './DocumentViewer.css';
 import { pageLabel } from '../utils/pages';
+import { copyText } from '../utils/clipboard';
+import ViewerOutline from './ViewerOutline';
 import MarkedText from './MarkedText';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
 
@@ -28,6 +30,8 @@ interface DocumentViewerProps {
   onFindSimilar?: (chunkId: string, label: string) => void;
   /** Copy a link that opens this document (at its cited passage) on this server. */
   onCopyLink?: () => void;
+  /** Open this document at another passage (its contents, "go to page"). */
+  onGoTo?: (chunkId: string) => void;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -75,11 +79,15 @@ function DocumentViewer({
   onAskAboutPassage,
   onFindSimilar,
   onCopyLink,
+  onGoTo,
 }: DocumentViewerProps) {
   // The passage whose question box is open, and what is typed in it.
   const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
   // Find in the loaded passages (⌘F / Ctrl+F while the viewer is open).
   const [findOpen, setFindOpen] = useState(false);
+  const [outlineOpen, setOutlineOpen] = useState(false);
+  // Which passage "Copy with citation" just copied (its button says so).
+  const [copiedChunk, setCopiedChunk] = useState<string | null>(null);
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
   const findInputRef = useRef<HTMLInputElement>(null);
@@ -129,11 +137,17 @@ function DocumentViewer({
     controllerRef.current = controller;
     return (prefetched ?? api.getDocumentContent(filename, controller.signal, options))
       .then((content) => {
-        if (!controller.signal.aborted) apply(content);
+        if (controller.signal.aborted) return false;
+        // A load that worked clears an earlier load's error (a failed "Load later"
+        // left its alert up after the retry succeeded).
+        setError(null);
+        apply(content);
+        return true;
       })
       .catch((err) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted) return false;
         setError(apiErrorMessage(err, 'Could not load document.'));
+        return true;
       });
   };
 
@@ -264,7 +278,10 @@ function DocumentViewer({
               : [...prev.chunks, ...content.chunks];
         return { ...prev, chunks: merged, total: content.total_chunks ?? prev.total };
       });
-    }).finally(() => setLoadingMore(false));
+    }).then((settled) => {
+      // An aborted load (a newer one took its place) leaves the newer one's state be.
+      if (settled) setLoadingMore(false);
+    });
   };
 
   // The original is fetched the first time it is asked for, once per document: the
@@ -455,6 +472,17 @@ function DocumentViewer({
           >
             &times;
           </button>
+          {mode === 'passages' && onGoTo && (
+            <button
+              type="button"
+              className="document-viewer__original"
+              aria-expanded={outlineOpen}
+              onClick={() => setOutlineOpen((open) => !open)}
+              data-testid="viewer-outline-open"
+            >
+              Contents
+            </button>
+          )}
           {mode === 'passages' && !findOpen && (
             <button
               ref={findOpenRef}
@@ -468,6 +496,15 @@ function DocumentViewer({
             </button>
           )}
         </div>
+        {mode === 'passages' && outlineOpen && onGoTo && (
+          <ViewerOutline
+            filename={filename}
+            onGoTo={(target) => {
+              setOutlineOpen(false);
+              onGoTo(target);
+            }}
+          />
+        )}
         {mode === 'original' && (
           <div className="document-viewer__pdf" data-testid="viewer-original">
             {original?.error && (
@@ -576,6 +613,9 @@ function DocumentViewer({
                   isTarget ? ' document-viewer__chunk--target' : ''
                 }${currentMatch?.chunk_id === chunk.chunk_id ? ' document-viewer__chunk--found' : ''}`}
                 data-chunk-id={chunk.chunk_id}
+                data-quote-source={`${filename}, ${pageLabel(chunk.page, chunk.page_end)}${
+                  chunk.section ? `, ${chunk.section}` : ''
+                }`}
                 // Focusable from script only: where focus goes when a load button goes.
                 tabIndex={-1}
                 data-testid="viewer-chunk"
@@ -593,6 +633,20 @@ function DocumentViewer({
                       Ask about this
                     </button>
                   )}
+                  <button
+                    type="button"
+                    className="document-viewer__ask"
+                    onClick={() =>
+                      void copyText(
+                        `${chunk.text.trim()}\n— ${filename}, ${pageLabel(chunk.page, chunk.page_end)}` +
+                          (chunk.section ? `, ${chunk.section}` : ''),
+                      ).then((copied) => setCopiedChunk(copied ? chunk.chunk_id : null))
+                    }
+                    aria-label={`Copy this passage with where it comes from (${pageLabel(chunk.page, chunk.page_end)})`}
+                    data-testid="viewer-copy-quote"
+                  >
+                    {copiedChunk === chunk.chunk_id ? 'Copied' : 'Copy with citation'}
+                  </button>
                   {onFindSimilar && (
                     <button
                       type="button"

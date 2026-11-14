@@ -138,6 +138,20 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
    * corpus is unknown (not empty, which said "Upload a document to start."), and a
    * failure is retried like a failed first listing instead of leaving it empty.
    */
+  /** /config read again (not the whole boot): read once, it went stale for the session
+   *  — a provider unreachable at boot stayed disabled after it came up, and a server
+   *  restarted with other settings kept its old flags. Not re-run through ``onConfig``:
+   *  the provider picked at boot stays the reader's. */
+  const configSequence = useRef(0);
+  const refreshConfig = useStableHandler(async () => {
+    const sequence = ++configSequence.current;
+    try {
+      const fresh = await api.config();
+      if (sequence === configSequence.current) setConfig(fresh);
+    } catch {
+      // The connection monitor reports an unreachable server; the old copy stays.
+    }
+  });
   const relistSequence = useRef(0);
   const relistCorpus = useStableHandler(async () => {
     const sequence = ++relistSequence.current;
@@ -193,6 +207,7 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
     noteAuthRestored,
     refreshAccess,
     relistCorpus,
+    refreshConfig,
     retryBoot,
   };
 }

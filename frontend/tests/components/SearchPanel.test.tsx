@@ -52,6 +52,49 @@ describe('SearchPanel', () => {
     expect(onOpenSource).toHaveBeenCalledWith('policy.pdf', 'c1', undefined);
   });
 
+  it('asks where an expected document was lost and shows each result\'s leg ranks', async () => {
+    const fetchMock = stubSearch(200, {
+      results: [{ ...RESULT, dense_rank: 2, sparse_rank: null }],
+      timings: {},
+      explanation: {
+        target: 'any passage of handbook.pdf',
+        outcome: 'below_min_score',
+        detail: 'The cross-encoder scored it 0.050, under the bar of 0.15 (RERANK_MIN_SCORE).',
+      },
+    });
+    setup();
+    await userEvent.type(screen.getByTestId('search-expect'), 'handbook.pdf');
+    await search('leave');
+
+    expect(await screen.findByTestId('search-explanation')).toHaveTextContent('under the bar');
+    expect(screen.getByText(/dense #2 · BM25 #–/)).toBeInTheDocument();
+    const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown[])[1] && ((fetchMock.mock.calls[0] as unknown[])[1] as RequestInit).body));
+    expect(body).toMatchObject({ explain: true, expect_filename: 'handbook.pdf' });
+  });
+
+  it('groups results by document, remembers the search, and moves with j and k', async () => {
+    localStorage.clear();
+    const results = [
+      { ...RESULT, chunk_id: 'a1', filename: 'a.pdf', rank: 1 },
+      { ...RESULT, chunk_id: 'b1', filename: 'b.pdf', rank: 2 },
+      { ...RESULT, chunk_id: 'a2', filename: 'a.pdf', rank: 3 },
+    ];
+    stubSearch(200, { results, timings: {} });
+    setup();
+    await search('leave');
+    await screen.findAllByTestId('search-result');
+    await userEvent.click(screen.getByTestId('search-group'));
+    expect(screen.getAllByTestId('search-group-head').map((h) => h.textContent)).toEqual(['a.pdf', 'b.pdf']);
+    expect(JSON.parse(localStorage.getItem('docrag-recent-searches') ?? '[]')).toEqual(['leave']);
+
+    const buttons = screen.getAllByTestId('search-result');
+    buttons[0].focus();
+    await userEvent.keyboard('j');
+    expect(document.activeElement).toBe(buttons[1]);
+    await userEvent.keyboard('k');
+    expect(document.activeElement).toBe(buttons[0]);
+  });
+
   it('notes when the passages are only the closest ones', async () => {
     const weak = { results: [{ ...RESULT, rerank_score: 0.11 }], timings: {}, weak_matches: true };
     stubSearch(200, weak);

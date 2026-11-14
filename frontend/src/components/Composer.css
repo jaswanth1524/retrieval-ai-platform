@@ -209,6 +209,10 @@
     right: 0;
     min-width: 0;
     max-width: none;
+    /* The filters above the file list filled 260 px on a phone, leaving room for one
+       file: the list is the only way to scope (or unscope) a document. */
+    max-height: min(60vh, 520px);
+    max-height: min(60dvh, 520px);
   }
 }
 

@@ -3,8 +3,20 @@
 // definition ([1]: url), an image (![1]) or half of a reference link ([1][ref]).
 // Adjacent markers ([1][2]) are two citations, as the server counts them: a `]` before
 // or a `[` after is allowed when it belongs to another numeric marker.
-const MARKER =
-  /(?<![!\\])(?<!(?<!\[\d[\d\s,–-]*)\])\[(\d{1,6}(?:\s*[-–]\s*\d{1,6})?(?:\s*,\s*\d{1,6}(?:\s*[-–]\s*\d{1,6})?)*)\](?![(:])(?!\[(?!\d[\d\s,–-]*\]))/g;
+//
+// Built at run time, not as a literal: Safari before 16.4 has no lookbehind, and a
+// literal failed to parse there — this module threw before React mounted and the page
+// stayed blank. There, citations stay plain "[1]" text instead (MARKER is null).
+const MARKER: RegExp | null = (() => {
+  try {
+    return new RegExp(
+      String.raw`(?<![!\\])(?<!(?<!\[\d[\d\s,–-]*)\])\[(\d{1,6}(?:\s*[-–]\s*\d{1,6})?(?:\s*,\s*\d{1,6}(?:\s*[-–]\s*\d{1,6})?)*)\](?![(:])(?!\[(?!\d[\d\s,–-]*\]))`,
+      'g',
+    );
+  } catch {
+    return null;
+  }
+})();
 const RANGE_SEP = /\s*[-–]\s*/;
 // Fenced code blocks and inline code spans: markers there are code, not citations.
 const CODE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g;
@@ -31,14 +43,15 @@ export function citedNumbers(marker: string, maxNumber: number): number[] {
 /** Rewrite citation markers as links the answer renderer turns into buttons. A marker
  *  citing nothing on offer is left as written. */
 export function linkCitations(markdown: string, sourceCount: number): string {
-  if (sourceCount <= 0) return markdown;
+  if (sourceCount <= 0 || MARKER === null) return markdown;
+  const marker = MARKER;
   return markdown
     .split(CODE)
     .map((part, index) =>
       // split() with a capture group puts the code spans at odd indexes.
       index % 2 === 1
         ? part
-        : part.replace(MARKER, (whole, inner: string) => {
+        : part.replace(marker, (whole, inner: string) => {
             const numbers = citedNumbers(inner, sourceCount);
             if (numbers.length === 0) return whole;
             return numbers.map((n) => `[${n}](${CITATION_HREF_PREFIX}${n})`).join('');

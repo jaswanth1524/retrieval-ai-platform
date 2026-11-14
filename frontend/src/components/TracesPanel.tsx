@@ -17,6 +17,8 @@ interface TracesPanelProps {
   exporting?: boolean;
   /** The full key: the score report's suggested bar can be set for this workspace. */
   canApplySuggestion?: boolean;
+  /** FEEDBACK_ENABLED: the score report can take its sides from ratings. */
+  feedbackEnabled?: boolean;
 }
 
 function latencyClass(totalMs: number | null): string {
@@ -42,6 +44,7 @@ function TracesPanel({
   answerFilter = 'any',
   onAnswerFilter,
   canApplySuggestion = false,
+  feedbackEnabled = false,
 }: TracesPanelProps) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
@@ -143,7 +146,11 @@ function TracesPanel({
         )}
       </div>
       {showReport && (
-        <ScoreReportView onClose={() => setShowReport(false)} canApply={canApplySuggestion} />
+        <ScoreReportView
+          onClose={() => setShowReport(false)}
+          canApply={canApplySuggestion}
+          ratingsAvailable={feedbackEnabled}
+        />
       )}
       {comparing?.length === 2 && (
         <TraceDiffView a={comparing[0]} b={comparing[1]} onClose={() => setComparing(null)} />

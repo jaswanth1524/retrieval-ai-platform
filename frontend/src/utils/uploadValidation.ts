@@ -39,6 +39,13 @@ export const ACCEPTED_EXTENSIONS = [
   '.mbox',
   '.ipynb',
   '.json',
+  '.rtf',
+  '.srt',
+  '.vtt',
+  '.rst',
+  '.adoc',
+  '.asciidoc',
+  '.tex',
   ...CODE_EXTENSIONS,
 ];
 
