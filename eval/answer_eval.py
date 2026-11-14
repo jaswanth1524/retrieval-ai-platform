@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,6 +38,8 @@ class AnswerRow:
     contexts: list[str]
     reference: str | None
     cited_filenames: list[str] = field(default_factory=list)
+    # The passages (chunk ids) the answer cited, for chunk-level citation precision.
+    cited_chunk_ids: list[str] = field(default_factory=list)
     answer_status: str = "answered"
     # Whether the answer states one of the example's ``answer_contains`` facts; None
     # when the example names none.
@@ -46,6 +48,8 @@ class AnswerRow:
     # Answered from below-the-bar passages; citations added by matching, not the model.
     weak_matches: bool = False
     citation_backfilled: bool = False
+    # Citing sentences no passage of their cited sources supports (no span matched).
+    unsupported_claims: int = 0
     # The pipeline failed (a provider timeout, say): the row is kept, so one bad
     # question doesn't end a long run, and counts as not answered.
     error: str | None = None
@@ -56,10 +60,12 @@ class AnswerRow:
             "answer": self.answer,
             "contexts": self.contexts,
             "cited_filenames": self.cited_filenames,
+            "cited_chunk_ids": self.cited_chunk_ids,
             "answer_status": self.answer_status,
             "seconds": round(self.seconds, 1),
             "weak_matches": self.weak_matches,
             "citation_backfilled": self.citation_backfilled,
+            "unsupported_claims": self.unsupported_claims,
         }
         if self.reference is not None:
             row["reference"] = self.reference
@@ -79,11 +85,13 @@ class AnswerRow:
             contexts=[str(c) for c in row.get("contexts", [""])],
             reference=row.get("reference"),
             cited_filenames=[str(f) for f in row.get("cited_filenames", [])],
+            cited_chunk_ids=[str(c) for c in row.get("cited_chunk_ids", [])],
             answer_status=str(row.get("answer_status", "answered")),
             fact_hit=row.get("fact_hit"),
             seconds=float(row.get("seconds", 0.0)),
             weak_matches=bool(row.get("weak_matches", False)),
             citation_backfilled=bool(row.get("citation_backfilled", False)),
+            unsupported_claims=_count(row.get("unsupported_claims")),
             error=row.get("error"),
         )
 
@@ -149,7 +157,13 @@ def answer_for_question(
         for m in example.history
     ]
     started = time.monotonic()
-    grounded = pipeline.answer(example.question, history=history or None, use_cache=False)
+    grounded = pipeline.answer(
+        example.question,
+        filenames=sorted(example.filenames) or None,
+        history=history or None,
+        tags=sorted(example.tags) or None,
+        use_cache=False,
+    )
     contexts = _prompt_contexts(sink.trace, repository, settings, texts)
     return AnswerRow(
         question=example.question,
@@ -157,11 +171,13 @@ def answer_for_question(
         contexts=contexts or [""],  # RAGAS requires a non-empty contexts list
         reference=example.reference,
         cited_filenames=sorted({source.filename for source in grounded.sources}),
+        cited_chunk_ids=sorted({source.chunk_id for source in grounded.sources}),
         answer_status=grounded.answer_status,
         fact_hit=states_facts(grounded.answer, example.fact_groups),
         seconds=time.monotonic() - started,
         weak_matches=grounded.weak_matches,
         citation_backfilled=grounded.citation_backfilled,
+        unsupported_claims=grounded.unsupported_claims,
     )
 
 
@@ -196,7 +212,9 @@ def _prompt_contexts(
 
 
 def answer_metrics(
-    examples: Sequence[RetrievalExample], rows: Sequence[AnswerRow]
+    examples: Sequence[RetrievalExample],
+    rows: Sequence[AnswerRow],
+    passage_ids: Mapping[int, frozenset[str]] | None = None,
 ) -> dict[str, float]:
     """How well the answers were grounded, over the examples that can say:
 
@@ -209,7 +227,13 @@ def answer_metrics(
     - ``fact_hit_rate``: of the questions labeled with ``answer_contains``, the share
       whose answer states one of the facts;
     - ``error_rate``: the share of questions the pipeline failed on (a provider
-      timeout, say).
+      timeout, say);
+    - ``unsupported_claims_mean``: citing sentences per answer that no passage of
+      their cited sources supports;
+    - ``cited_chunk_precision``: of the answers to questions labelled with relevant
+      passages that cite any, the mean share of cited passages that are relevant ones
+      (filename-level ``cited_relevant_rate`` saturates: right file, wrong passage).
+      ``passage_ids`` are the examples' ``relevant_passages`` resolved to chunk ids.
 
     A metric with no examples to measure it is left out.
     """
@@ -234,7 +258,21 @@ def answer_metrics(
     if rows:
         metrics["uncited_rate"] = sum(r.answer_status == "uncited" for r in rows) / len(rows)
         metrics["error_rate"] = sum(r.error is not None for r in rows) / len(rows)
+        metrics["unsupported_claims_mean"] = sum(r.unsupported_claims for r in rows) / len(rows)
+    precisions = []
+    for index, (example, row) in enumerate(zip(examples, rows, strict=True)):
+        relevant = example.relevant_chunk_ids | (passage_ids or {}).get(index, frozenset())
+        if relevant and row.cited_chunk_ids:
+            precisions.append(
+                len(set(row.cited_chunk_ids) & relevant) / len(set(row.cited_chunk_ids))
+            )
+    if precisions:
+        metrics["cited_chunk_precision"] = sum(precisions) / len(precisions)
     return metrics
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def _normalized(text: str) -> str:
@@ -273,7 +311,13 @@ def run_answer_eval(
             except (ValueError, KeyError, TypeError):
                 # The last line of a run killed mid-write: that question is asked again.
                 continue
-            if 0 <= index < len(examples) and examples[index].question == row.question:
+            # A row that failed (a provider timeout) is asked again, not kept: the
+            # re-run is how a transient failure gets fixed.
+            if (
+                0 <= index < len(examples)
+                and examples[index].question == row.question
+                and not row.error
+            ):
                 # Scored against the dataset as it is now (its facts may have changed).
                 saved[index] = replace(
                     row, fact_hit=states_facts(row.answer, examples[index].fact_groups)
@@ -320,7 +364,13 @@ def run_answer_eval(
     output.write_text(json.dumps([r.to_dict() for r in rows], indent=2) + "\n", encoding="utf-8")
     partial.unlink(missing_ok=True)
     print(f"wrote {len(rows)} answer rows to {output}")
-    for name, value in answer_metrics(examples, rows).items():
+    from eval.harness import resolve_passages
+
+    try:
+        passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
+    except Exception:  # noqa: BLE001 - a broken label costs this metric, not the run
+        passage_ids = {}
+    for name, value in answer_metrics(examples, rows, passage_ids).items():
         print(f"{name}: {value:.3f}")
     if rows and all(row.error for row in rows):
         print("error: every question failed (see the error field of each row)", file=sys.stderr)
