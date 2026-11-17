@@ -163,7 +163,15 @@ def test_the_query_log_drafts_labelled_rows_and_a_review_list() -> None:
                 "question": "how long is leave?",
                 "status": "ok",
                 "filenames": ["leave.md"],
+                "filenames_cited": True,
                 "created_at": 2,
+            },
+            # Answered with no citation: its prompt's documents aren't a label.
+            {
+                "question": "Who approves travel?",
+                "status": "ok",
+                "filenames": ["travel.md", "expenses.md"],
+                "created_at": 2.5,
             },
             {"question": "Is there a gym?", "status": "insufficient_context", "created_at": 3},
             {"question": "Broke", "status": "error", "created_at": 4},
@@ -171,8 +179,10 @@ def test_the_query_log_drafts_labelled_rows_and_a_review_list() -> None:
         ]
     )
     assert labelled == [{"question": "how long is leave?", "relevant_filenames": ["leave.md"]}]
-    assert [r["question"] for r in review] == ["Is there a gym?"]
-    assert review[0]["expect_no_context"] is True
+    assert [r["question"] for r in review] == ["Who approves travel?", "Is there a gym?"]
+    assert review[0]["draft_relevant_filenames"] == ["expenses.md", "travel.md"]
+    assert "expect_no_context" not in review[0]
+    assert review[1]["expect_no_context"] is True
 
 
 def test_the_score_report_can_take_its_sides_from_ratings() -> None:

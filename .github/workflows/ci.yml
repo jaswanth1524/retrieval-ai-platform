@@ -114,6 +114,9 @@ jobs:
           uv run python -m eval.harness validate eval/datasets/compare_eval.jsonl
           uv run python -m eval.harness validate eval/datasets/mixed_eval.jsonl
           uv run python -m eval.harness validate eval/datasets/recency_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/recency_history_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/chain_eval.jsonl
+          uv run python -m eval.harness validate eval/datasets/summary_eval.jsonl
           uv run python -m eval.make_mixed_corpus --check
 
       - name: Audit runtime dependencies
@@ -215,6 +218,39 @@ jobs:
             --baseline eval/baselines/handbook_reranked.json --max-regression 0.06 \
             --output eval-results.json
 
+      # Answer-level evals with no LLM: every model call is answered from replies
+      # recorded with qwen2.5 (eval/baselines/replies/), so condense, prompt fitting,
+      # citation retry and backfill, status and spans run for real against the index
+      # above. A prompt the recording doesn't hold (a prompt or retrieval change) makes
+      # that question an error row: record again after an intended change
+      # (`make eval-record`). Recorded on arm64; amd64 scores can reorder one borderline
+      # question, so one question per set (0.06 of 19, less of the larger share for the
+      # smaller sets) is allowed, as for retrieval.
+      - name: Answer evals (recorded replies) vs baselines
+        env:
+          LITELLM_MODE: PRODUCTION
+          QDRANT_URL: http://127.0.0.1:6333
+          QDRANT_COLLECTION: eval_handbook
+          CHUNK_SIZE_TOKENS: "48"
+          CHUNK_OVERLAP_TOKENS: "8"
+          MIN_SECTION_WORDS: "0"
+          LLM_PROVIDER: ollama
+          LLM_MODEL: qwen2.5
+        run: |
+          export FASTEMBED_CACHE_PATH="$HOME/.cache/fastembed"
+          for set in handbook unanswerable; do
+            uv run python -m eval.harness answer "eval/datasets/${set}_eval.jsonl" \
+              --replay "eval/baselines/replies/${set}.jsonl" \
+              --baseline "eval/baselines/answers_${set}.json" --max-regression 0.06 \
+              --output "answers-${set}.json"
+          done
+          for set in followup compare; do
+            uv run python -m eval.harness answer "eval/datasets/${set}_eval.jsonl" \
+              --replay "eval/baselines/replies/${set}.jsonl" \
+              --baseline "eval/baselines/answers_${set}.json" --max-regression 0.1 \
+              --output "answers-${set}.json"
+          done
+
       # The same handbook as PDF, DOCX, HTML, ODT, PPTX and XLSX (eval/corpus_mixed):
       # a parser change that loses text shows up here, broken down by format. Its
       # baseline was measured on arm64; the same one-question allowance applies.
@@ -242,6 +278,7 @@ jobs:
           path: |
             eval-results.json
             eval-mixed-results.json
+            answers-*.json
           if-no-files-found: ignore
           retention-days: 14
 

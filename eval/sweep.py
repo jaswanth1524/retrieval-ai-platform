@@ -67,11 +67,14 @@ def combinations(grid: Mapping[str, Sequence[Any]]) -> list[dict[str, Any]]:
 
 
 def replay(
-    scored: Sequence[RerankedChunk], settings: AppSettings, combo: Mapping[str, Any]
+    scored: Sequence[RerankedChunk],
+    settings: AppSettings,
+    combo: Mapping[str, Any],
+    question: str = "",
 ) -> tuple[list[str], list[str], bool]:
     """(filenames, chunk ids, weak-match) the reranked arm would return under ``combo``."""
 
-    kept, below = select_passages(scored, settings.model_copy(update=dict(combo)))
+    kept, below = select_passages(scored, settings.model_copy(update=dict(combo)), question)
     return [c.filename for c in kept], [c.chunk_id for c in kept], below
 
 
@@ -89,7 +92,7 @@ def score_combo(
     chunk_rows: list[dict[str, float]] = []
     no_context_rows: list[dict[str, float]] = []
     for index, (example, scored) in enumerate(zip(examples, scored_by_question, strict=True)):
-        filenames, chunk_ids, below = replay(scored, settings, combo)
+        filenames, chunk_ids, below = replay(scored, settings, combo, example.question)
         if example.expect_no_context:
             nothing = not chunk_ids or below
             no_context_rows.append({"no_context_rate": 1.0 if nothing else 0.0})

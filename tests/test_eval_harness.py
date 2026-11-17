@@ -527,6 +527,9 @@ def test_answer_metrics_measure_grounding() -> None:
         "uncited_rate": 1 / 3,
         "error_rate": 0.0,
         "unsupported_claims_mean": 0.0,
+        "unsupported_numbers_mean": 0.0,
+        "truncated_rate": 0.0,
+        "prompt_cut_rate": 0.0,
     }
     assert row(["a.md"], "answered").to_dict()["cited_filenames"] == ["a.md"]
 
@@ -626,7 +629,7 @@ def test_answer_rows_are_saved_as_they_finish_and_a_run_resumes(
     # A failing question is kept as an error row; the run goes on — and a run where
     # every question failed exits 1.
     assert run_answer_eval(examples, Collab(Broken("x")), output) == 1  # type: ignore[arg-type]
-    rows = json.loads(output.read_text())
+    rows = json.loads(output.read_text())["examples"]
     assert [r["answer_status"] for r in rows] == ["error", "error"]
     assert "error_rate: 1.000" in capsys.readouterr().out
     assert not partial_path(output).exists()
@@ -639,7 +642,7 @@ def test_answer_rows_are_saved_as_they_finish_and_a_run_resumes(
     )
     generator = ScriptedGenerator("c1 it is [1].")
     run_answer_eval(examples, Collab(generator), output, resume=True)  # type: ignore[arg-type]
-    rows = json.loads(output.read_text())
+    rows = json.loads(output.read_text())["examples"]
     assert [r["answer"] for r in rows] == ["kept c1 [1]", "c1 it is [1]."]
     # The kept row is scored against the dataset's facts as they are now.
     assert rows[0]["fact_hit"] is True
@@ -657,7 +660,7 @@ def test_answer_rows_are_saved_as_they_finish_and_a_run_resumes(
     )
     generator = ScriptedGenerator("c1 again [1].")
     run_answer_eval(examples, Collab(generator), output, resume=True)  # type: ignore[arg-type]
-    rows = json.loads(output.read_text())
+    rows = json.loads(output.read_text())["examples"]
     assert [r["answer"] for r in rows] == ["kept c1 [1]", "c1 again [1]."]
     assert len(generator.prompts) == 1
 
@@ -808,7 +811,9 @@ def test_main_runs_retrieval_and_answer_modes_with_their_options(
         calls.append(("baseline", (path.name, max_regression)))
         return 1
 
-    def fake_answer(examples: Any, collab: Any, output: Path, *, resume: bool) -> int:
+    def fake_answer(
+        examples: Any, collab: Any, output: Path, *, resume: bool, replay: Any = None
+    ) -> int:
         calls.append(("answer", (len(examples), output.name, resume)))
         return 0
 

@@ -134,7 +134,8 @@ def rows_from_queries(
     queries: Sequence[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """(labelled rows, review rows) from query-log rows (``GET /query-log`` shape), the
-    latest of each question (case and spacing ignored); summaries left out."""
+    latest of each question (case and spacing ignored); summaries left out. Only an
+    answer's cited documents become a label; an answer citing none goes to review."""
 
     latest: dict[str, dict[str, Any]] = {}
     for row in sorted(queries, key=lambda r: float(r.get("created_at") or 0.0)):
@@ -149,8 +150,21 @@ def rows_from_queries(
         if row.get("status") == "error":
             continue  # a failure, not a sign the documents lack the answer
         filenames = sorted({str(name) for name in row.get("filenames") or []})
-        if row.get("status") == "ok" and filenames:
+        if row.get("status") == "ok" and filenames and row.get("filenames_cited") is True:
             labelled.append({"question": row["question"], "relevant_filenames": filenames})
+        elif row.get("status") == "ok":
+            # Answered, but its documents are the prompt's (it cited none, or the
+            # server predates recording which): every passage read isn't where the
+            # answer is. A draft to confirm, not a label.
+            review.append(
+                {
+                    "question": row["question"],
+                    "status": row.get("status"),
+                    "top_score": row.get("top_score"),
+                    "draft_relevant_filenames": filenames,
+                    "note": "answered without citations: confirm which documents hold the answer",
+                }
+            )
         else:
             review.append(
                 {

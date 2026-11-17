@@ -57,6 +57,10 @@ def load_run(path: Path) -> Run:
         raise RunFileError(f"{path}: {exc}") from exc
     if isinstance(data, dict) and isinstance(data.get("per_question"), list):
         return Run("retrieval", data)
+    # An answer run: a bare list of rows (older runs), or the rows under ``examples``
+    # beside the run's fingerprint and metrics.
+    if isinstance(data, dict) and isinstance(data.get("examples"), list):
+        data = data["examples"]
     if isinstance(data, list) and all(isinstance(row, dict) and "answer" in row for row in data):
         return Run("answer", data)
     raise RunFileError(f"{path}: not a harness retrieval result or answer run")
