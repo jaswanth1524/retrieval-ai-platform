@@ -5,6 +5,7 @@ import type {
   FeedbackRating,
   HistoryMessage,
   LlmProvider,
+  PassageNarrowing,
   QuestionOptions,
   QuestionOverrides,
 } from '../api/types';
@@ -14,7 +15,7 @@ import { useChatPersistence } from './useChatPersistence';
 import { useConversationActions } from './useConversationActions';
 import { answerStreamHandlers, createDeltaBuffer } from './streamHandlers';
 import { mergeRegenerated, withVersionRestored } from '../utils/answerVersions';
-import { sanitizeStyle } from './chat/sanitize';
+import { MAX_NOTE_CHARS, sanitizeStyle } from './chat/sanitize';
 import type { ImportItem } from './useConversationActions';
 
 /** How often streamed answer text is applied (see createDeltaBuffer's use below). */
@@ -55,6 +56,7 @@ export type {
 // History sent with a question lives in utils/history; re-exported for the components
 // and tests that import it from here.
 import { buildHistory, historyForQuestion } from '../utils/history';
+import { addToTrash } from '../utils/trash';
 export { buildHistory, historyForQuestion };
 
 // Server stage labels mapped to what the reader sees. Anything the server sends that
@@ -67,6 +69,7 @@ const STAGE_LABELS: Record<string, string> = {
   joining_identical_question: 'the same question is being answered — waiting for it…',
   reading: 'reading the passages…',
   verifying_citations: 'checking citations…',
+  continuing: 'continuing the answer…',
   reading_documents: 'reading the document…',
   summarizing: 'taking notes…',
   combining: 'combining notes…',
@@ -91,6 +94,9 @@ export interface UseChatResult {
   turns: ChatTurn[];
   /** False until the full history has loaded from IndexedDB (true where there is none). */
   historyReady: boolean;
+  /** Bumped when this hook put conversations into Recently deleted itself: one the
+   *  history cap let go, or a conversation's turns before a Clear. */
+  trashedVersion: number;
   /** Any answer in flight, in whichever conversation. */
   pending: boolean;
   /** The conversation the answer in flight is written to; null when none is. */
@@ -167,7 +173,7 @@ export interface UseChatResult {
   /** The deleted conversation (null when it couldn't be: an answer streams into it). */
   deleteConversation: (id: string) => Conversation | null;
   /** Put a just-deleted conversation back (the delete's Undo). */
-  restoreConversation: (conversation: Conversation) => void;
+  restoreConversation: (conversation: Conversation, usedNow?: boolean) => void;
   /** Pin or unpin; false (nothing changes) past MAX_PINNED_CONVERSATIONS pins. */
   setPinned: (id: string, pinned: boolean) => boolean;
   /** Replace a conversation's labels (cleaned; an empty list removes them). */
@@ -195,6 +201,8 @@ export interface UseChatResult {
   ) => void;
   /** Save (or unsave) an answer of ``conversationId`` (the open one when omitted). */
   setTurnSaved: (turnId: string, saved: boolean, conversationId?: string) => void;
+  /** The reader's note on a saved answer ("" removes it). */
+  setTurnNote: (conversationId: string, turnId: string, note: string) => void;
   /** Make an answer's earlier version (by index) the answer again. */
   restoreAnswerVersion: (turnId: string, index: number) => void;
   /** Mark an answer looked at in the Needs review panel (or not). */
@@ -224,6 +232,10 @@ export interface SavedAnswer {
   turn: ChatTurn;
   /** The question it answered (the user turn before it), if there is one. */
   question: string | null;
+  /** How that question was narrowed, and whether it was a whole-document task (a
+   *  summary's "question" is a label, not something to search for). */
+  narrowing?: PassageNarrowing;
+  task?: boolean;
 }
 
 interface TurnCounts {
@@ -345,6 +357,9 @@ export function answeredTurn(
       : {}),
     ...(grounding?.autoCited ? { autoCited: true } : {}),
     ...(grounding?.passagesLeftOut ? { passagesLeftOut: grounding.passagesLeftOut } : {}),
+    ...(grounding?.unsupportedClaims ? { unsupportedClaims: grounding.unsupportedClaims } : {}),
+    ...(grounding?.unsupportedNumbers ? { unsupportedNumbers: grounding.unsupportedNumbers } : {}),
+    ...(grounding?.searchedAs ? { searchedAs: grounding.searchedAs } : {}),
     timings,
     traceId,
     ...(cached ? { cached: true } : {}),
@@ -428,6 +443,31 @@ export function useChat(): UseChatResult {
     streamingConversationIdRef,
     bufferedDeltaRef,
   });
+  // Conversations the history cap (MAX_CONVERSATIONS) let go go to Recently deleted, as
+  // a delete does: dropped silently, a month-old conversation was simply gone. One that
+  // left with a tombstone was deleted (here, in another tab, or to make room for an
+  // import the user confirmed) and is the deleter's to trash. Watched only once the
+  // full history has loaded: the first-paint copy is a subset of it.
+  const [trashedVersion, setTrashedVersion] = useState(0);
+  const watchedConversationsRef = useRef<Conversation[] | null>(null);
+  useEffect(() => {
+    if (!historyLoaded) {
+      watchedConversationsRef.current = null;
+      return;
+    }
+    const previous = watchedConversationsRef.current;
+    watchedConversationsRef.current = conversations;
+    if (previous === null || previous === conversations) return;
+    const live = new Set(conversations.map((conversation) => conversation.id));
+    const tombstoned = new Set((storage.deleted ?? []).map((entry) => entry.id));
+    const dropped = previous.filter(
+      (conversation) =>
+        !live.has(conversation.id) && !tombstoned.has(conversation.id) && conversation.turns.length > 0,
+    );
+    if (dropped.length === 0) return;
+    for (const conversation of dropped) addToTrash(conversation);
+    setTrashedVersion((version) => version + 1);
+  }, [conversations, historyLoaded, storage.deleted]);
   const {
     importConversation,
     importPreview,
@@ -525,7 +565,16 @@ export function useChat(): UseChatResult {
         return workspace ? { ...rest, workspace } : rest;
       }),
     }));
-    updateTurns((prev) => {
+    // "Continue": the rest of a cut-off answer is written into that answer itself — no
+    // second copy of its question, no fragment at the end of the thread — and whatever
+    // goes wrong (stopped, failed, its trace gone) leaves the answer as it was.
+    const continued =
+      options?.continueFrom && options.replacesAnswer
+        ? activeConversationRef.current?.turns.find(
+            (turn) => turn.id === options.replacesAnswer && turn.role === 'assistant',
+          )
+        : undefined;
+    if (!continued) updateTurns((prev) => {
       // Asked again after it got no answer (stopped before the first frame, a reload
       // mid-retrieval): it takes the unanswered question's place, not a second copy.
       const last = prev[prev.length - 1];
@@ -553,11 +602,13 @@ export function useChat(): UseChatResult {
 
     // The assistant turn is created lazily on the first `sources`/`delta` event so a
     // mid-stream failure before any event arrives renders as a clean error turn.
-    const assistantTurnId = newId();
+    const assistantTurnId = continued?.id ?? newId();
     streamingTurnIdRef.current = assistantTurnId;
     const updateAssistantTurn = (update: (turn: ChatTurn) => ChatTurn, touch = true) => {
       updateTurns((prev) => {
         const existing = prev.find((turn) => turn.id === assistantTurnId);
+        // The answer being continued was deleted or cleared meanwhile: nothing to add to.
+        if (!existing && continued) return prev;
         if (!existing) {
           const created: ChatTurn = { ...makeTurn('assistant', ''), id: assistantTurnId };
           if (options?.modelLabel) created.model = options.modelLabel;
@@ -647,12 +698,32 @@ export function useChat(): UseChatResult {
                   false,
                 ),
               done: (answer, sources, timings, traceId, cached, grounding) => {
-                updateAssistantTurn((turn) =>
-                  answeredTurn(turn, answer, sources, timings, traceId, cached, grounding),
-                );
+                updateAssistantTurn((turn) => {
+                  if (!continued) {
+                    return answeredTurn(turn, answer, sources, timings, traceId, cached, grounding);
+                  }
+                  // The whole answer now: how its first part ended no longer describes
+                  // it, and what the continuation cost is added to what that part did.
+                  const { truncated: _cut, cannotContinue: _gone, continueFailed: _failed, ...whole } = turn;
+                  const done = answeredTurn(whole, answer, sources, timings, traceId, cached, grounding);
+                  const before = continued.usage;
+                  if (!before || !done.usage) return done;
+                  const cost =
+                    before.costUsd === undefined && done.usage.costUsd === undefined
+                      ? {}
+                      : { costUsd: (before.costUsd ?? 0) + (done.usage.costUsd ?? 0) };
+                  return {
+                    ...done,
+                    usage: {
+                      prompt: before.prompt + done.usage.prompt,
+                      completion: before.completion + done.usage.completion,
+                      ...cost,
+                    },
+                  };
+                });
                 // Regenerated: the answer it replaces becomes its earlier version (only
                 // now — a regenerate that failed leaves the old answer where it was).
-                const replaces = options?.replacesAnswer;
+                const replaces = continued ? undefined : options?.replacesAnswer;
                 if (replaces) {
                   updateTurns((prev) => mergeRegenerated(prev, replaces, assistantTurnId));
                 }
@@ -677,7 +748,25 @@ export function useChat(): UseChatResult {
       // own private controller instead, leaving this one untouched. So the flag is true
       // only for a deliberate cancel — where whatever streamed so far should simply
       // stand, with no error row claiming the request failed.
-      if (controller.signal.aborted) {
+      if (continued) {
+        // As it was before Continue. A trace the server no longer has (a restart, the
+        // buffer moved on) or an older server: it can't be continued at all — said
+        // once, the button gone. Anything else may work on another try.
+        const status = err instanceof ApiClientError ? err.statusCode : undefined;
+        const gone = !controller.signal.aborted && (status === 404 || status === 409);
+        const failed = controller.signal.aborted ? undefined : apiErrorMessage(err, 'Something went wrong.');
+        updateTurns((prev) =>
+          prev.map((turn) =>
+            turn.id === assistantTurnId
+              ? {
+                  ...continued,
+                  ...(gone ? { cannotContinue: true } : {}),
+                  ...(failed && !gone ? { continueFailed: failed } : {}),
+                }
+              : turn,
+          ),
+        );
+      } else if (controller.signal.aborted) {
         // Drop a content-less assistant turn: cancelling after `sources` but before the
         // first delta would otherwise leave an empty answer bubble behind. A partial one
         // is kept but marked, so after a reload it doesn't read as a finished answer.
@@ -921,7 +1010,14 @@ export function useChat(): UseChatResult {
     pendingRef.current && id != null && id === streamingConversationIdRef.current;
 
   const clear = useCallback(() => {
-    if (isStreamingInto(activeConversationRef.current?.id)) return;
+    const active = activeConversationRef.current;
+    if (isStreamingInto(active?.id)) return;
+    if (active && active.turns.length > 0) {
+      // Its turns can be had back from Recently deleted, as a copy of their own (the
+      // conversation itself stays, empty, so its id is live).
+      addToTrash({ ...active, id: newId(), title: `${active.title} (cleared)`, pinned: false });
+      setTrashedVersion((version) => version + 1);
+    }
     setStorage((prev) => ({
       ...prev,
       conversations: prev.conversations.map((conversation) =>
@@ -942,8 +1038,8 @@ export function useChat(): UseChatResult {
     return removed ?? null;
   }, []);
 
-  const restoreConversation = useCallback((conversation: Conversation) => {
-    setStorage((prev) => withConversationRestored(prev, conversation));
+  const restoreConversation = useCallback((conversation: Conversation, usedNow = false) => {
+    setStorage((prev) => withConversationRestored(prev, conversation, usedNow));
   }, []);
 
   const searchConversations = useCallback(
@@ -1023,6 +1119,23 @@ export function useChat(): UseChatResult {
     );
   }, []);
 
+  // The reader's note on a saved answer ("" takes it away).
+  const setTurnNote = useCallback((conversationId: string, turnId: string, note: string) => {
+    setStorage((prev) =>
+      updateTurn(
+        prev,
+        conversationId,
+        turnId,
+        (turn) => {
+          const { note: _previous, ...rest } = turn;
+          const text = note.trim().slice(0, MAX_NOTE_CHARS);
+          return text ? { ...rest, note: text } : rest;
+        },
+        Date.now(),
+      ),
+    );
+  }, []);
+
   // Marked looked at in the Needs review panel (or unmarked).
   const setTurnReviewed = useCallback(
     (conversationId: string, turnId: string, reviewed: boolean) => {
@@ -1091,6 +1204,8 @@ export function useChat(): UseChatResult {
           workspace: conversation.workspace ?? '',
           turn,
           question: asked?.content ?? null,
+          ...(asked?.narrowing ? { narrowing: asked.narrowing } : {}),
+          ...(asked?.task ? { task: true } : {}),
         });
       });
     }
@@ -1199,6 +1314,7 @@ export function useChat(): UseChatResult {
   return {
     turns,
     historyReady,
+    trashedVersion,
     streamingConversationId,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
@@ -1235,6 +1351,7 @@ export function useChat(): UseChatResult {
     setTurnFeedback,
     setSourceIrrelevant,
     setTurnSaved,
+    setTurnNote,
     restoreAnswerVersion,
     setTurnReviewed,
     allConversationsJson,

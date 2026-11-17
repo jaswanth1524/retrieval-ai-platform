@@ -45,6 +45,7 @@ class CachedAnswer:
     weak_matches: bool = False
     citation_backfilled: bool = False
     unsupported_claims: int = 0
+    unsupported_numbers: int = 0
     passages_left_out: int = 0
     # Summaries only: (passages read, passages in the documents).
     coverage: tuple[int, int] | None = None
@@ -66,6 +67,7 @@ class CachedAnswer:
             weak_matches=grounded.weak_matches,
             citation_backfilled=grounded.citation_backfilled,
             unsupported_claims=grounded.unsupported_claims,
+            unsupported_numbers=grounded.unsupported_numbers,
             passages_left_out=grounded.passages_left_out,
             followups=tuple(grounded.followups),
         )
@@ -85,6 +87,7 @@ class CachedAnswer:
             weak_matches=done.get("weak_matches", False),
             citation_backfilled=done.get("citation_backfilled", False),
             unsupported_claims=done.get("unsupported_claims", 0),
+            unsupported_numbers=done.get("unsupported_numbers", 0),
             passages_left_out=done.get("passages_left_out", 0),
             coverage=(done.get("chunks_read", 0), done.get("chunks_total", 0)) if summary else None,
             followups=tuple(followups),
@@ -105,6 +108,7 @@ class CachedAnswer:
             truncated=self.truncated,
             citation_backfilled=self.citation_backfilled,
             unsupported_claims=self.unsupported_claims,
+            unsupported_numbers=self.unsupported_numbers,
             passages_left_out=self.passages_left_out,
             followups=list(self.followups),
         )

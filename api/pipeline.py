@@ -8,6 +8,7 @@ import dataclasses
 import functools
 import hashlib
 import logging
+import re
 import threading
 import time
 import uuid
@@ -317,6 +318,9 @@ class DoneEvent(TypedDict):
     # The answer's citations were added by matching it to the sources (backfill).
     citation_backfilled: NotRequired[bool]
     unsupported_claims: NotRequired[int]
+    unsupported_numbers: NotRequired[int]
+    # A follow-up rewritten into a standalone question: what was searched for.
+    retrieval_query: NotRequired[str]
     prompt_cached: NotRequired[bool]
     prompt_cut: NotRequired[bool]
     # Picked passages (chunk_ids) the prompt had no room for (GroundedAnswer).
@@ -520,12 +524,13 @@ def base_prompt(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
 
 def drop_restart(before: str, after: str) -> str:
     """``after`` without a restart: a model asked to continue that writes the answer
-    again from the top has the part it repeats removed (the rest is the new text)."""
+    again from the top has the part it repeats removed (the rest is the new text), and
+    one that starts again a few words back has those words removed."""
 
     head = after.lstrip()
     probe = before.lstrip()[:40]
     if len(probe) < 20 or not head.startswith(probe):
-        return after
+        return _drop_repeated_tail(before, after)
     original = before.lstrip()
     shared = 0
     while shared < min(len(original), len(head)) and original[shared] == head[shared]:
@@ -533,17 +538,50 @@ def drop_restart(before: str, after: str) -> str:
     return head[shared:]
 
 
+# How far back a continuation is looked at for words it repeats: a whole list item.
+_REPEAT_MAX_CHARS = 400
+
+
+def _drop_repeated_tail(before: str, after: str) -> str:
+    """``after`` without what it repeats from the end of ``before``. Measured on
+    gpt-5-mini continuing by instruction (AUTO_CONTINUE_MAX): "… It also" went on "It
+    also states …", "… expense policies (" on "policies (no …", a cut list item was
+    written again from its "- ", a lone "- " was followed by "- Review …", and "…
+    within" by "within two days". The repeat must start where a word starts and be two
+    words or more, a whole line, or one word of four letters or more — so "… of the"
+    followed by "the policy" keeps its "the"."""
+
+    head = after.lstrip()
+    end = before.rstrip()
+    for size in range(min(len(end), _REPEAT_MAX_CHARS), 0, -1):
+        tail = end[-size:]
+        if tail[:1].isspace() or (size < len(end) and not end[-size - 1].isspace()):
+            continue  # not where a word starts
+        whole_line = size == len(end) or end[-size - 1] == "\n"
+        words = tail.split()
+        if not (len(words) >= 2 or whole_line or (len(tail) >= 4 and tail.isalpha())):
+            continue
+        if head.startswith(tail):
+            rest = head[len(tail) :]
+            # The cut text keeps its own trailing space ("- "): not a second one.
+            return rest.lstrip() if before[-1:].isspace() else rest
+    return after
+
+
 def join_continuation(before: str, after: str, *, prefilled: bool = False) -> str:
     """A cut-off answer and its continuation as one text. Continuing a prefill, the
     model writes its own leading space where a word ends (" can be", or "2]" inside a
     marker): the two are joined as they are. Asked in words, a space goes between them
-    unless either side already has one or the continuation starts with punctuation."""
+    unless either side already has one, the continuation starts with punctuation, or the
+    cut came just after an opening bracket or quote."""
 
     if not after:
         return before
     if prefilled:
         return before.rstrip() + after
     if before[-1:].isspace() or after[:1].isspace() or after[:1] in ".,;:!?)]}'\"":
+        return before + after
+    if before[-1:] in "([{\u201c\u2018":  # cut just after an opening bracket or quote
         return before + after
     return f"{before} {after}"
 
@@ -624,6 +662,7 @@ def replay_cached(hit: CachedAnswer, started: float, **done_fields: Any) -> Iter
         "truncated": hit.truncated,
         "citation_backfilled": hit.citation_backfilled,
         "unsupported_claims": hit.unsupported_claims,
+        "unsupported_numbers": hit.unsupported_numbers,
         "passages_left_out": hit.passages_left_out,
         **done_fields,
     }
@@ -798,14 +837,16 @@ def _select_passages(
 
 
 def select_passages(
-    scored: Sequence[RerankedChunk], settings: AppSettings
+    scored: Sequence[RerankedChunk], settings: AppSettings, question: str = ""
 ) -> tuple[list[RerankedChunk], bool]:
     """The passages an answer would be given from ``scored`` (one rerank pass's scored
     candidates, best first) under ``settings``: the floor and top-K cut as the reranker
     applies them, then ``_select_passages``. With whether they are the weak-match
     fallback. The seam the eval harness's sweep replays settings through without
-    retrieving or reranking again."""
+    retrieving or reranking again (``question`` decides the recency boost, as it does
+    for an answer)."""
 
+    settings = without_recency_for_the_past(settings, question)
     ordered = list(scored)
     floor = float(settings.rerank_min_score)
     kept = [chunk for chunk in ordered if chunk.rerank_score >= floor][: int(settings.rerank_top_k)]
@@ -813,6 +854,37 @@ def select_passages(
         RerankOutcome(scored=ordered, kept=kept), settings, for_generation=True
     )
     return list(selection.outcome.kept), selection.below_min_score
+
+
+# A question about an earlier state of things: a year, or words naming an older version.
+# The recency boost would put the newest document first — the one it isn't asking about.
+# Measured (eval/corpus_recency, jina int8, 48-token chunks, RECENCY_BOOST_WEIGHT 1.0):
+# questions about the past, file hit@1 0.33 boosted, 1.00 with the boost left out for
+# them; the current-state set kept its gain (0.50 unboosted, 1.00 either way). Boosting
+# only questions that say "current" or "latest" lost that gain (0.50): people rarely do.
+_ABOUT_THE_PAST_RE = re.compile(
+    r"\b(?:19|20)\d\d\b|\b(?:old|older|previous|previously|earlier|former|formerly|"
+    r"original|originally|used to|prior|past|outdated|archived|superseded|historic|"
+    r"historical)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_about_the_past(text: str) -> bool:
+    """Whether a question asks about an earlier version or year (no recency boost)."""
+
+    return bool(_ABOUT_THE_PAST_RE.search(text))
+
+
+def without_recency_for_the_past(settings: AppSettings, *questions: str | None) -> AppSettings:
+    """``settings`` with RECENCY_BOOST_WEIGHT 0 when any of ``questions`` (a rewrite and
+    the raw follow-up) asks about the past; as they are otherwise."""
+
+    if float(settings.recency_boost_weight) <= 0:
+        return settings
+    if any(question and asks_about_the_past(question) for question in questions):
+        return settings.model_copy(update={"recency_boost_weight": 0.0})
+    return settings
 
 
 # How far back the recency boost looks: a document this much older than the newest kept
@@ -1282,6 +1354,7 @@ class RagPipeline:
         condense_note: str | None = None,
         citation_backfilled: bool = False,
         unsupported_claims: int = 0,
+        unsupported_numbers: int = 0,
         prompt_cached: bool = False,
         prompt_cut: bool = False,
         narrow: PassageFilter | None = None,
@@ -1323,6 +1396,7 @@ class RagPipeline:
             citation_retry_used=citation_retry_used,
             citation_backfilled=citation_backfilled,
             unsupported_claims=unsupported_claims,
+            unsupported_numbers=unsupported_numbers,
             prompt_cached=prompt_cached,
             prompt_cut=prompt_cut,
             request_id=current_request_id(),
@@ -1663,7 +1737,10 @@ class RagPipeline:
         # picked, and the question was asked about these alone.
         picked_only = for_generation and narrow is not None and bool(narrow.chunk_ids)
         selection = _select_passages(
-            outcome, effective_settings, for_generation=for_generation, picked_only=picked_only
+            outcome,
+            without_recency_for_the_past(effective_settings, question, extra_query),
+            for_generation=for_generation,
+            picked_only=picked_only,
         )
         diverse_outcome = selection.outcome
         rerank_ms = (time.monotonic() - rerank_start) * 1000
@@ -1963,6 +2040,9 @@ class RagPipeline:
             )
         if trace is None or trace.workspace != workspace_of(settings):
             raise ContinueRefused(404, f"No trace found with id '{trace_id}'.")
+        if trace.kind != "question":
+            # A summary's trace holds no passages to check citations against.
+            raise ContinueRefused(409, "Only a question's answer can be continued.")
         if not trace.truncated or not trace.answer or not trace.prompt_messages:
             raise ContinueRefused(409, "That answer wasn't cut off; there is nothing to continue.")
         prompt_sources = sorted(
@@ -2081,6 +2161,9 @@ class RagPipeline:
                     trace,
                     trace_id=new_trace_id,
                     created_at=time.time(),
+                    request_id=current_request_id(),
+                    mode="stream",
+                    continues=trace.trace_id,
                     candidates=[
                         replace(c, cited=c.source_number in cited_numbers) for c in trace.candidates
                     ],
@@ -2094,6 +2177,7 @@ class RagPipeline:
                     citation_retry_used=outcome.retry_used,
                     citation_backfilled=outcome.backfilled,
                     unsupported_claims=outcome.unsupported_claims,
+                    unsupported_numbers=outcome.unsupported_numbers,
                     prompt_cached=False,
                     prompt_cut=was_prompt_cut(),
                     usage=usage,
@@ -2117,6 +2201,7 @@ class RagPipeline:
             "truncated": truncated,
             "citation_backfilled": outcome.backfilled,
             "unsupported_claims": outcome.unsupported_claims,
+            "unsupported_numbers": outcome.unsupported_numbers,
             "prompt_cut": was_prompt_cut(),
             "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
         }
@@ -2336,6 +2421,7 @@ class RagPipeline:
             citation_retry_used=grounded.citation_retry_used,
             citation_backfilled=grounded.citation_backfilled,
             unsupported_claims=grounded.unsupported_claims,
+            unsupported_numbers=grounded.unsupported_numbers,
             prompt_cached=self._prompt_cached(run),
             prompt_cut=was_prompt_cut(),
             usage=usage,
@@ -2383,11 +2469,14 @@ class RagPipeline:
 
     def _answer_generator(self, run: AnswerRun, settings: AppSettings) -> ChatGenerator:
         """The generator for ``run``'s answer, citation retry and follow-ups: through the
-        prompt cache (PROMPT_CACHE_SIZE) unless it is off or this is a Regenerate."""
+        prompt cache (PROMPT_CACHE_SIZE) unless it is off. A Regenerate reuses nothing
+        but stores its reply over the one it replaces."""
 
-        cache = shared_prompt_cache(settings) if run.use_memo else None
+        cache = shared_prompt_cache(settings)
         run.generator = (
-            CachingGenerator(self._generator, cache) if cache is not None else self._generator
+            CachingGenerator(self._generator, cache, lookup=run.use_memo)
+            if cache is not None
+            else self._generator
         )
         return run.generator
 
@@ -2633,11 +2722,54 @@ class RagPipeline:
                 first_token_ms = (time.monotonic() - run.started) * 1000
             run.parts.append(delta)
             yield {"type": "delta", "text": delta}
+        yield from self._auto_continue(run, settings, generator, messages, should_stop)
         generate_ms = (time.monotonic() - generate_start) * 1000
         answer = "".join(run.parts).strip()
         if not answer:
             raise GenerationError("Generation provider returned an empty answer.")
         return _Streamed(messages, all_sources, answer, generate_ms, first_token_ms)
+
+    def _auto_continue(
+        self,
+        run: AnswerRun,
+        settings: AppSettings,
+        generator: ChatGenerator,
+        messages: Sequence[ChatMessage],
+        should_stop: Callable[[], bool] | None,
+    ) -> Iterator[StreamEvent]:
+        """AUTO_CONTINUE_MAX: an answer cut off at the output limit is continued in the
+        same stream, as a Continue would, up to that many times. A provider that takes a
+        prefill streams the rest live; one asked in words is read whole first, so a
+        restart from the top can be dropped before anything is sent."""
+
+        for _ in range(int(settings.auto_continue_max)):
+            if not run.parts or not stopped_at_token_limit():
+                return
+            if should_stop is not None and should_stop():
+                return
+            so_far = "".join(run.parts)
+            follow = continuation_messages(messages, so_far, settings)
+            prefilled = follow[-1]["role"] == "assistant"
+            yield {"type": "stage", "stage": "continuing"}
+            reset_finish_reason()
+            if prefilled:
+                first = True
+                for delta in generator.stream(follow, settings):
+                    if first and so_far[-1:].isspace():
+                        # The prefill was sent without its trailing space; the model
+                        # writes its own (join_continuation's rule).
+                        delta = delta.lstrip()
+                    first = False
+                    if delta:
+                        run.parts.append(delta)
+                        yield {"type": "delta", "text": delta}
+                continue
+            more = drop_restart(so_far, "".join(generator.stream(follow, settings)))
+            if not more.strip():
+                return
+            addition = join_continuation(so_far, more)[len(so_far) :]
+            run.parts.append(addition)
+            yield {"type": "delta", "text": addition}
 
     def _stream_finish(
         self,
@@ -2708,6 +2840,7 @@ class RagPipeline:
             citation_retry_used=outcome.retry_used,
             citation_backfilled=outcome.backfilled,
             unsupported_claims=outcome.unsupported_claims,
+            unsupported_numbers=outcome.unsupported_numbers,
             prompt_cached=self._prompt_cached(run),
             prompt_cut=was_prompt_cut(),
             usage=usage,
@@ -2716,7 +2849,7 @@ class RagPipeline:
             dropped_history_messages=fitted.dropped_history_messages,
         )
         run.finalized = True
-        yield {
+        done: DoneEvent = {
             "type": "done",
             "answer": answer,
             "sources": [_citation_dict(source) for source in cited],
@@ -2729,11 +2862,15 @@ class RagPipeline:
             "truncated": truncated,
             "citation_backfilled": outcome.backfilled,
             "unsupported_claims": outcome.unsupported_claims,
+            "unsupported_numbers": outcome.unsupported_numbers,
             "prompt_cached": self._prompt_cached(run),
             "prompt_cut": was_prompt_cut(),
             "passages_left_out": _picked_left_out(run.narrow, selected),
             "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
         }
+        if run.condensed_question:
+            done["retrieval_query"] = run.condensed_question
+        yield done
         if (
             settings.followups_enabled
             and status == "answered"

@@ -9,6 +9,7 @@ here; split out so the harness module holds retrieval scoring and the CLI.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -50,6 +51,19 @@ class AnswerRow:
     citation_backfilled: bool = False
     # Citing sentences no passage of their cited sources supports (no span matched).
     unsupported_claims: int = 0
+    # Citing sentences stating a number none of their cited passages contains.
+    unsupported_numbers: int = 0
+    # Whether the answer states one of the example's ``answer_excludes`` (a stale or
+    # wrong value); None when the example names none.
+    excluded_hit: bool | None = None
+    # The answer stopped at the output limit; the model server read only part of the
+    # prompt. Either explains a missed fact better than "retrieval failed".
+    truncated: bool = False
+    prompt_cut: bool = False
+    top_rerank_score: float | None = None
+    # (prompt, completion) tokens and their price, when the provider reported them.
+    usage: tuple[int, int] | None = None
+    cost_usd: float | None = None
     # The pipeline failed (a provider timeout, say): the row is kept, so one bad
     # question doesn't end a long run, and counts as not answered.
     error: str | None = None
@@ -66,11 +80,22 @@ class AnswerRow:
             "weak_matches": self.weak_matches,
             "citation_backfilled": self.citation_backfilled,
             "unsupported_claims": self.unsupported_claims,
+            "unsupported_numbers": self.unsupported_numbers,
+            "truncated": self.truncated,
+            "prompt_cut": self.prompt_cut,
         }
+        if self.top_rerank_score is not None:
+            row["top_rerank_score"] = round(self.top_rerank_score, 4)
+        if self.usage is not None:
+            row["usage"] = list(self.usage)
+        if self.cost_usd is not None:
+            row["cost_usd"] = self.cost_usd
         if self.reference is not None:
             row["reference"] = self.reference
         if self.fact_hit is not None:
             row["fact_hit"] = self.fact_hit
+        if self.excluded_hit is not None:
+            row["excluded_hit"] = self.excluded_hit
         if self.error is not None:
             row["error"] = self.error
         return row
@@ -92,6 +117,13 @@ class AnswerRow:
             weak_matches=bool(row.get("weak_matches", False)),
             citation_backfilled=bool(row.get("citation_backfilled", False)),
             unsupported_claims=_count(row.get("unsupported_claims")),
+            unsupported_numbers=_count(row.get("unsupported_numbers")),
+            excluded_hit=row.get("excluded_hit"),
+            truncated=bool(row.get("truncated", False)),
+            prompt_cut=bool(row.get("prompt_cut", False)),
+            top_rerank_score=_number(row.get("top_rerank_score")),
+            usage=_usage(row.get("usage")),
+            cost_usd=_number(row.get("cost_usd")),
             error=row.get("error"),
         )
 
@@ -114,6 +146,34 @@ def states_fact(answer: str, facts: Sequence[str]) -> bool | None:
         return None
     text = _normalized(strip_citation_markers(answer))
     return any(_normalized(fact) in text for fact in facts)
+
+
+def states_excluded(answer: str, excludes: Sequence[str]) -> bool | None:
+    """Whether ``answer`` states one of ``excludes``: a phrase as a case/space-
+    insensitive substring, a number (or a phrase starting with one) only as whole words
+    — "30 days" must not match "130 days". None when there are none."""
+
+    if not excludes:
+        return None
+    text = _normalized(strip_citation_markers(answer))
+    for value in excludes:
+        wanted = _normalized(value)
+        if wanted[:1].isdigit() or wanted[-1:].isdigit():
+            if re.search(rf"(?<![\w.,]){re.escape(wanted)}(?![\w]|[.,]\d)", text):
+                return True
+        elif wanted in text:
+            return True
+    return False
+
+
+def scored_facts(answer: str, example: RetrievalExample) -> tuple[bool | None, bool | None]:
+    """(fact_hit, excluded_hit): stating an excluded value fails the facts too."""
+
+    excluded = states_excluded(answer, example.answer_excludes)
+    facts = states_facts(answer, example.fact_groups)
+    if facts and excluded:
+        facts = False
+    return facts, excluded
 
 
 def states_facts(answer: str, groups: Sequence[Sequence[str]]) -> bool | None:
@@ -152,6 +212,8 @@ def answer_for_question(
         settings=settings,
         trace_store=sink,
     )
+    if example.task:
+        return _summary_row(example, repository=repository, generator=generator, settings=settings)
     history: list[ChatMessage] = [
         {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
         for m in example.history
@@ -165,6 +227,7 @@ def answer_for_question(
         use_cache=False,
     )
     contexts = _prompt_contexts(sink.trace, repository, settings, texts)
+    fact_hit, excluded_hit = scored_facts(grounded.answer, example)
     return AnswerRow(
         question=example.question,
         answer=grounded.answer,
@@ -173,11 +236,55 @@ def answer_for_question(
         cited_filenames=sorted({source.filename for source in grounded.sources}),
         cited_chunk_ids=sorted({source.chunk_id for source in grounded.sources}),
         answer_status=grounded.answer_status,
-        fact_hit=states_facts(grounded.answer, example.fact_groups),
+        fact_hit=fact_hit,
+        excluded_hit=excluded_hit,
         seconds=time.monotonic() - started,
         weak_matches=grounded.weak_matches,
         citation_backfilled=grounded.citation_backfilled,
         unsupported_claims=grounded.unsupported_claims,
+        unsupported_numbers=grounded.unsupported_numbers,
+        truncated=grounded.truncated,
+        prompt_cut=grounded.prompt_cut,
+        top_rerank_score=grounded.top_rerank_score,
+        usage=grounded.usage,
+        cost_usd=grounded.cost_usd,
+    )
+
+
+def _summary_row(
+    example: RetrievalExample, *, repository: Any, generator: ChatGenerator, settings: AppSettings
+) -> AnswerRow:
+    """A summary task, through the API's own summarizer (``POST /questions/summary``)."""
+
+    from api.summarize import DocumentSummarizer, SummaryRequest
+
+    instruction = example.question
+    request = SummaryRequest(
+        mode=example.task,  # type: ignore[arg-type]
+        filenames=tuple(sorted(example.filenames)),
+        instruction=instruction if instruction.casefold() not in ("summary", "summarize") else None,
+    )
+    started = time.monotonic()
+    result = DocumentSummarizer(repository, generator, settings).summarize(request, use_cache=False)
+    grounded = result.grounded
+    fact_hit, excluded_hit = scored_facts(grounded.answer, example)
+    return AnswerRow(
+        question=example.question,
+        answer=grounded.answer,
+        contexts=[""],
+        reference=example.reference,
+        cited_filenames=sorted({source.filename for source in grounded.sources}),
+        cited_chunk_ids=sorted({source.chunk_id for source in grounded.sources}),
+        answer_status=grounded.answer_status,
+        fact_hit=fact_hit,
+        excluded_hit=excluded_hit,
+        seconds=time.monotonic() - started,
+        citation_backfilled=grounded.citation_backfilled,
+        unsupported_claims=grounded.unsupported_claims,
+        truncated=grounded.truncated,
+        prompt_cut=grounded.prompt_cut,
+        usage=grounded.usage,
+        cost_usd=grounded.cost_usd,
     )
 
 
@@ -229,7 +336,13 @@ def answer_metrics(
     - ``error_rate``: the share of questions the pipeline failed on (a provider
       timeout, say);
     - ``unsupported_claims_mean``: citing sentences per answer that no passage of
-      their cited sources supports;
+      their cited sources supports; ``unsupported_numbers_mean``: citing sentences per
+      answer stating a number none of their cited passages contains;
+    - ``excluded_rate``: of the questions labeled with ``answer_excludes``, the share
+      whose answer states one (a stale or wrong value);
+    - ``truncated_rate`` / ``prompt_cut_rate``: the share of answers that stopped at the
+      output limit, or whose prompt the model server cut (a missed fact in such a row
+      is the budget's doing, not retrieval's);
     - ``cited_chunk_precision``: of the answers to questions labelled with relevant
       passages that cite any, the mean share of cited passages that are relevant ones
       (filename-level ``cited_relevant_rate`` saturates: right file, wrong passage).
@@ -255,10 +368,16 @@ def answer_metrics(
     facts = [r for e, r in zip(examples, rows, strict=True) if e.fact_groups]
     if facts:
         metrics["fact_hit_rate"] = sum(bool(r.fact_hit) for r in facts) / len(facts)
+    excluded = [r for e, r in zip(examples, rows, strict=True) if e.answer_excludes]
+    if excluded:
+        metrics["excluded_rate"] = sum(bool(r.excluded_hit) for r in excluded) / len(excluded)
     if rows:
         metrics["uncited_rate"] = sum(r.answer_status == "uncited" for r in rows) / len(rows)
         metrics["error_rate"] = sum(r.error is not None for r in rows) / len(rows)
         metrics["unsupported_claims_mean"] = sum(r.unsupported_claims for r in rows) / len(rows)
+        metrics["unsupported_numbers_mean"] = sum(r.unsupported_numbers for r in rows) / len(rows)
+        metrics["truncated_rate"] = sum(r.truncated for r in rows) / len(rows)
+        metrics["prompt_cut_rate"] = sum(r.prompt_cut for r in rows) / len(rows)
     precisions = []
     for index, (example, row) in enumerate(zip(examples, rows, strict=True)):
         relevant = example.relevant_chunk_ids | (passage_ids or {}).get(index, frozenset())
@@ -269,6 +388,16 @@ def answer_metrics(
     if precisions:
         metrics["cited_chunk_precision"] = sum(precisions) / len(precisions)
     return metrics
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _usage(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return _count(value[0]), _count(value[1])
+    return None
 
 
 def _count(value: Any) -> int:
@@ -291,6 +420,7 @@ def run_answer_eval(
     output: Path,
     *,
     resume: bool = False,
+    replay: Any = None,
 ) -> int:
     """Answer every example, saving each row as it finishes, then write ``output``.
 
@@ -319,20 +449,35 @@ def run_answer_eval(
                 and not row.error
             ):
                 # Scored against the dataset as it is now (its facts may have changed).
-                saved[index] = replace(
-                    row, fact_hit=states_facts(row.answer, examples[index].fact_groups)
-                )
+                fact_hit, excluded_hit = scored_facts(row.answer, examples[index])
+                saved[index] = replace(row, fact_hit=fact_hit, excluded_hit=excluded_hit)
         print(f"resuming: {len(saved)} of {len(examples)} rows already answered")
     else:
         partial.unlink(missing_ok=True)
     rows: list[AnswerRow] = []
     texts: dict[str, dict[str, str]] = {}  # passage text by file, read once per run
+    # Each chain's turns so far: the questions and the answers this run gave them.
+    chains: dict[str, list[dict[str, str]]] = {}
+
+    def remember_turn(example: RetrievalExample, row: AnswerRow) -> None:
+        if example.chain:
+            chains.setdefault(example.chain, []).extend(
+                [
+                    {"role": "user", "content": example.question},
+                    {"role": "assistant", "content": row.answer},
+                ]
+            )
+
     with partial.open("a", encoding="utf-8") as sink:
         for index, example in enumerate(examples):
             if index in saved:
                 rows.append(saved[index])
+                remember_turn(example, saved[index])
                 continue
+            if example.chain:
+                example = replace(example, history=tuple(chains.get(example.chain, [])))
             started = time.monotonic()
+            missed = len(replay.misses) if replay is not None else 0
             try:
                 row = answer_for_question(
                     example,
@@ -354,24 +499,50 @@ def run_answer_eval(
                     seconds=time.monotonic() - started,
                     error=f"{type(exc).__name__}: {exc}",
                 )
+            if replay is not None and len(replay.misses) > missed and row.error is None:
+                # A call the recording lacks (a condense the pipeline fell back from,
+                # say): the answer isn't the recorded one, so it isn't scored as one.
+                row = replace(row, answer_status="error", error="replay miss")
             sink.write(json.dumps({"index": index, "row": row.to_dict()}) + "\n")
             sink.flush()
             rows.append(row)
+            remember_turn(example, row)
             print(
                 f"[{index + 1}/{len(examples)}] {row.answer_status} {row.seconds:.1f}s",
                 flush=True,
             )
-    output.write_text(json.dumps([r.to_dict() for r in rows], indent=2) + "\n", encoding="utf-8")
-    partial.unlink(missing_ok=True)
-    print(f"wrote {len(rows)} answer rows to {output}")
-    from eval.harness import resolve_passages
+    from eval.harness import resolve_passages, settings_fingerprint
 
     try:
         passage_ids = resolve_passages(examples, collaborators.repository, collaborators.settings)
     except Exception:  # noqa: BLE001 - a broken label costs this metric, not the run
         passage_ids = {}
-    for name, value in answer_metrics(examples, rows, passage_ids).items():
+    metrics = answer_metrics(examples, rows, passage_ids)
+    settings = collaborators.settings
+    # With the rows: what they were measured with and how they scored, so a later run
+    # can be compared without re-deriving either. ``examples`` is the key the RAGAS
+    # runner reads.
+    result = {
+        "fingerprint": {
+            **settings_fingerprint(settings, "reranked", follow_ups=True),
+            "llm_temperature": float(settings.llm_temperature),
+            "llm_max_tokens": int(settings.llm_max_tokens),
+            "citation_retry_mode": settings.citation_retry_mode,
+            "prompt_token_budget": int(settings.prompt_token_budget),
+        },
+        "metrics": {name: round(value, 4) for name, value in metrics.items()},
+        "examples": [r.to_dict() for r in rows],
+    }
+    output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    partial.unlink(missing_ok=True)
+    print(f"wrote {len(rows)} answer rows to {output}")
+    for name, value in metrics.items():
         print(f"{name}: {value:.3f}")
+    if replay is not None and replay.loose_hits:
+        print(
+            f"replay: {replay.loose_hits} call(s) answered from a reply recorded for the "
+            "same question with other passages"
+        )
     if rows and all(row.error for row in rows):
         print("error: every question failed (see the error field of each row)", file=sys.stderr)
         return 1

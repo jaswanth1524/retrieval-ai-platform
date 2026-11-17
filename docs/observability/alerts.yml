@@ -19,6 +19,17 @@ groups:
         annotations:
           summary: "No backup of workspace {{ $labels.workspace }} for two days"
 
+      - alert: DocragBackupNeverRecorded
+        # BACKUP_DIR is set, yet no workspace has a backup on record: the loop never
+        # wrote one (or never ran). Only where backups are on: docrag_backup_enabled
+        # is 1 only then, so a server without BACKUP_DIR stays quiet.
+        expr: docrag_backup_enabled == 1 unless on() count(docrag_backup_last_success_timestamp_seconds) > 0
+        for: 3h
+        labels: {severity: warning}
+        annotations:
+          summary: "Scheduled backups are on but none has been recorded"
+          description: "Check the server log and GET /health/ready's last_backup."
+
       - alert: DocragDiskLow
         expr: docrag_storage_free_bytes < 1e9
         for: 15m
@@ -72,3 +83,24 @@ groups:
         annotations:
           summary: "Background {{ $labels.kind }} indexing jobs keep failing"
           description: "GET /documents/jobs?state=failed lists them with their errors."
+
+      - alert: DocragIndexEmptied
+        # The collection holds nothing while documents were listed an hour ago: a lost
+        # Qdrant volume or a deleted collection. With originals kept, Administration →
+        # Rebuild (docrag rebuild) indexes them again.
+        expr: docrag_index_points == 0 and on() max_over_time(docrag_index_points[1h]) > 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "The index lost every passage"
+          description: "POST /admin/rebuild (docrag rebuild) restores it from the stored originals."
+
+      - alert: DocragAnswersWithWrongNumbers
+        expr: >
+          sum(increase(docrag_unsupported_numbers_total[1d]))
+          / clamp_min(sum(increase(docrag_answers_total[1d])), 1) > 0.1
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "Over 10% of answers state numbers their sources don't contain"
+          description: "Check a few in Needs review; a weaker model or a cut prompt is the usual cause."

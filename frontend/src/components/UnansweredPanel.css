@@ -52,7 +52,10 @@
   gap: 6px;
 }
 
-.unanswered-panel__actions button {
+/* :where() keeps the controls' rule from outranking a button's own class
+   (.unanswered-panel__view's pressed/unpressed look). */
+.unanswered-panel__actions button,
+.unanswered-panel__controls :where(button) {
   border: 1px solid var(--rail-rule);
   border-radius: var(--radius-sm);
   background: transparent;
@@ -63,7 +66,13 @@
   cursor: pointer;
 }
 
-.unanswered-panel__actions button:hover {
+.unanswered-panel__controls :where(button):disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.unanswered-panel__actions button:hover,
+.unanswered-panel__controls :where(button):not(:disabled):hover {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -135,4 +144,36 @@
   font: inherit;
   cursor: pointer;
   text-align: start;
+}
+
+/* Quotes & passages: the two lists' headings. */
+.collected-panel__heading {
+  margin: 12px 12px 4px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--rail-dim);
+}
+
+.saved-panel__note {
+  font-style: italic;
+  color: var(--rail-text);
+}
+
+.saved-panel__note-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.saved-panel__note-form textarea {
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--rail-text);
+  background: var(--sunk);
+  border: 1px solid var(--rail-rule);
+  border-radius: 4px;
+  padding: 4px 6px;
+  resize: vertical;
 }

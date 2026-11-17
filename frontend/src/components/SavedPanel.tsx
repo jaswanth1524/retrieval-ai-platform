@@ -4,7 +4,7 @@ import {
   checkable,
   judgeSaved,
   SAVED_CHECK_LABELS,
-  SAVED_CHECK_TOP_K,
+  savedCheckRequest,
   type SavedCheck,
 } from '../utils/savedCheck';
 import type { SavedAnswer } from '../hooks/useChat';
@@ -19,6 +19,10 @@ interface SavedPanelProps {
   /** Open the conversation at that answer. */
   onOpen: (conversationId: string, turnId: string) => void;
   onUnsave: (conversationId: string, turnId: string) => void;
+  /** Keep (or, with "", remove) the reader's note on a saved answer. */
+  onSetNote?: (conversationId: string, turnId: string, note: string) => void;
+  /** Ask the answer's question again in place: the old answer stays as a version. */
+  onAskAgain?: (item: SavedAnswer) => void;
   /** Whether a cited document was deleted or uploaded again after an answer. */
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
   /** The workspace whose documents ``sourceChangeOf`` knows: another's answers are
@@ -55,12 +59,35 @@ function excerpt(content: string): string {
   return flat.length > EXCERPT_CHARS ? `${sliceWhole(flat, EXCERPT_CHARS).trimEnd()}…` : flat;
 }
 
+// The last check's verdicts, by workspace (this page load only).
+let keptChecks: { workspace: string; checks: Record<string, SavedCheck> } = { workspace: '', checks: {} };
+
 /** Every saved answer (★ on an answer), across the conversations: found again here
  *  rather than by remembering which conversation it was in. */
-function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' }: SavedPanelProps) {
+function SavedPanel({
+  answers,
+  onOpen,
+  onUnsave,
+  onSetNote,
+  onAskAgain,
+  sourceChangeOf,
+  workspace = '',
+}: SavedPanelProps) {
   const [filter, setFilter] = useState('');
+  // The note being written: which answer, and its text so far.
+  const [editing, setEditing] = useState<{ key: string; text: string } | null>(null);
   // "Check against the documents": each checkable answer's question searched again.
-  const [checks, setChecks] = useState<Record<string, SavedCheck>>({});
+  const [checks, setChecksState] = useState<Record<string, SavedCheck>>(() =>
+    keptChecks.workspace === workspace ? keptChecks.checks : {},
+  );
+  // Kept while the panel is closed (it unmounts): a check of many answers isn't
+  // thrown away by a look at another panel.
+  const setChecks = (update: (prev: Record<string, SavedCheck>) => Record<string, SavedCheck>) =>
+    setChecksState((prev) => {
+      const next = update(prev);
+      keptChecks = { workspace, checks: next };
+      return next;
+    });
   const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
   const checkRef = useRef<AbortController | null>(null);
@@ -70,15 +97,17 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
     const controller = new AbortController();
     checkRef.current = controller;
     const items = answers.filter((item) => checkable(item, workspace));
-    setChecks({});
+    setChecks(() => ({}));
     setCheckError(null);
     setChecking({ done: 0, total: items.length });
     // One at a time: each search takes one of the server's question slots.
     for (const [index, item] of items.entries()) {
       try {
+        // In the workspace the check began in, whatever is opened meanwhile.
         const response = await api.searchPassages(
-          { query: item.question ?? '', rerank_top_k: SAVED_CHECK_TOP_K },
+          savedCheckRequest(item),
           controller.signal,
+          workspace,
         );
         if (controller.signal.aborted) return;
         const verdict = judgeSaved(item, response);
@@ -92,6 +121,30 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
     }
     setChecking(null);
   };
+  // After Unsave the row goes, and focus with it: it moves to the next row's Open (the
+  // one before when it was the last), else to the panel's message or filter.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const focusAfterUnsave = useRef<string | null | undefined>(undefined);
+  const unsave = (item: SavedAnswer, rows: readonly SavedAnswer[]) => {
+    const index = rows.indexOf(item);
+    const neighbour = rows[index + 1] ?? rows[index - 1];
+    focusAfterUnsave.current = neighbour ? `${neighbour.conversationId}:${neighbour.turn.id}` : null;
+    onUnsave(item.conversationId, item.turn.id);
+  };
+  useEffect(() => {
+    const key = focusAfterUnsave.current;
+    if (key === undefined) return;
+    focusAfterUnsave.current = undefined;
+    const root = listRef.current;
+    if (!root) return;
+    const target =
+      (key !== null &&
+        [...root.querySelectorAll<HTMLElement>('[data-saved-key]')]
+          .find((row) => row.dataset.savedKey === key)
+          ?.querySelector<HTMLElement>('[data-testid="saved-open"]')) ||
+      root.querySelector<HTMLElement>('[data-testid="saved-filter"], [data-testid="saved-empty"]');
+    target?.focus();
+  }, [answers]);
   const checkableCount = answers.filter((item) => checkable(item, workspace)).length;
   const needle = normalized(useDeferredValue(filter));
   const shown = useMemo(
@@ -108,13 +161,15 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
 
   if (answers.length === 0) {
     return (
-      <p className="unanswered-panel__message">
-        Nothing saved yet. Save an answer with ☆ under it to find it here.
-      </p>
+      <div ref={listRef}>
+        <p className="unanswered-panel__message" tabIndex={-1} data-testid="saved-empty">
+          Nothing saved yet. Save an answer with ☆ under it to find it here.
+        </p>
+      </div>
     );
   }
   return (
-    <>
+    <div ref={listRef}>
       <div className="unanswered-panel__controls">
         <input
           type="search"
@@ -147,7 +202,12 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
       ) : (
         <ul className="unanswered-panel__list">
           {shown.map((item) => (
-            <li key={`${item.conversationId}:${item.turn.id}`} className="unanswered-panel__row" data-testid="saved-row">
+            <li
+              key={`${item.conversationId}:${item.turn.id}`}
+              className="unanswered-panel__row"
+              data-saved-key={`${item.conversationId}:${item.turn.id}`}
+              data-testid="saved-row"
+            >
               <span className="unanswered-panel__question" dir="auto">
                 {item.question ?? 'Answer'}
               </span>
@@ -176,6 +236,43 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
                   {SAVED_CHECK_LABELS[checks[`${item.conversationId}:${item.turn.id}`]]}
                 </span>
               )}
+              {editing?.key === `${item.conversationId}:${item.turn.id}` ? (
+                <form
+                  className="saved-panel__note-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    onSetNote?.(item.conversationId, item.turn.id, editing.text);
+                    setEditing(null);
+                  }}
+                >
+                  <textarea
+                    value={editing.text}
+                    onChange={(event) => setEditing({ ...editing, text: event.target.value })}
+                    maxLength={2000}
+                    rows={3}
+                    aria-label="Your note on this answer"
+                    autoFocus
+                    onKeyDown={(event) => {
+                      if (event.key === 'Escape') setEditing(null);
+                    }}
+                    data-testid="saved-note-input"
+                  />
+                  <span className="unanswered-panel__actions">
+                    <button type="submit" data-testid="saved-note-save">
+                      Save note
+                    </button>
+                    <button type="button" onClick={() => setEditing(null)}>
+                      Cancel
+                    </button>
+                  </span>
+                </form>
+              ) : (
+                item.turn.note && (
+                  <span className="unanswered-panel__meta saved-panel__note" dir="auto" data-testid="saved-note">
+                    Note: {item.turn.note}
+                  </span>
+                )
+              )}
               <span className="unanswered-panel__meta mono">
                 <span>{item.conversationTitle}</span>
                 <span className="unanswered-panel__spacer" />
@@ -190,9 +287,35 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
                 >
                   Open
                 </button>
+                {/* In the workspace in use only: it is asked against these documents. */}
+                {onAskAgain && item.question && !item.task && item.workspace === workspace && (
+                  <button
+                    type="button"
+                    onClick={() => onAskAgain(item)}
+                    title="Ask it again now; the current answer is kept as an earlier version to compare"
+                    data-testid="saved-ask-again"
+                  >
+                    Ask again
+                  </button>
+                )}
+                {onSetNote && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEditing({
+                        key: `${item.conversationId}:${item.turn.id}`,
+                        text: item.turn.note ?? '',
+                      })
+                    }
+                    aria-label={`${item.turn.note ? 'Edit the note on' : 'Add a note to'} the answer to “${item.question ?? item.conversationTitle}”`}
+                    data-testid="saved-note-edit"
+                  >
+                    {item.turn.note ? 'Edit note' : 'Note'}
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => onUnsave(item.conversationId, item.turn.id)}
+                  onClick={() => unsave(item, shown)}
                   aria-label={`Unsave the answer to “${item.question ?? item.conversationTitle}”`}
                   data-testid="saved-unsave"
                 >
@@ -203,7 +326,7 @@ function SavedPanel({ answers, onOpen, onUnsave, sourceChangeOf, workspace = '' 
           ))}
         </ul>
       )}
-    </>
+    </div>
   );
 }
 

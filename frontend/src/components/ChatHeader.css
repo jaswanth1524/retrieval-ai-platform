@@ -220,3 +220,15 @@
     display: none;
   }
 }
+
+.chat-header__workspace select {
+  max-width: 14ch;
+  min-height: 24px;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 1px 4px;
+}

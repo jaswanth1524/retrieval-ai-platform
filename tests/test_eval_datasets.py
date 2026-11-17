@@ -25,6 +25,9 @@ PAIRS = [
     ("compare_eval.jsonl", "corpus_handbook"),
     ("mixed_eval.jsonl", "corpus_mixed"),
     ("recency_eval.jsonl", "corpus_recency"),
+    ("recency_history_eval.jsonl", "corpus_recency"),
+    ("chain_eval.jsonl", "corpus_handbook"),
+    ("summary_eval.jsonl", "corpus_handbook"),
 ]
 
 

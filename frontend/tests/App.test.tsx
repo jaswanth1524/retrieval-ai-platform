@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App';
@@ -1489,7 +1489,7 @@ describe('App workspaces', () => {
 
     await openCorpusPanel();
     const select = await screen.findByTestId('workspace-select');
-    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await waitFor(() => expect(within(screen.getByTestId('workspace-bar')).getByRole('option', { name: 'legal' })).toBeInTheDocument());
     await userEvent.selectOptions(select, 'legal');
 
     // The guide conversation stays in the default workspace: a new chat opens here.
@@ -1600,7 +1600,7 @@ describe('App workspace switching', () => {
     await waitFor(() => expect(card('guide.md')).toBeDefined());
     await userEvent.click(screen.getByLabelText('Select shared.md'));
     expect(screen.getByTestId('corpus-bulk')).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await waitFor(() => expect(within(screen.getByTestId('workspace-bar')).getByRole('option', { name: 'legal' })).toBeInTheDocument());
 
     await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
 
@@ -1627,7 +1627,7 @@ describe('App workspace switching', () => {
     render(<App />);
     await screen.findByText('api ok');
     await openCorpusPanel();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await waitFor(() => expect(within(screen.getByTestId('workspace-bar')).getByRole('option', { name: 'legal' })).toBeInTheDocument());
 
     await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
 
@@ -1645,7 +1645,7 @@ describe('App workspace switching', () => {
     expect(await screen.findByTestId('search-result')).toBeInTheDocument();
 
     await openCorpusPanel();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'legal' })).toBeInTheDocument());
+    await waitFor(() => expect(within(screen.getByTestId('workspace-bar')).getByRole('option', { name: 'legal' })).toBeInTheDocument());
     await userEvent.selectOptions(screen.getByTestId('workspace-select'), 'legal');
     await userEvent.click(screen.getByTestId('rail-search'));
 

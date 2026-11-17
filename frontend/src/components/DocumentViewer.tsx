@@ -2,8 +2,9 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import type { ReactNode } from 'react';
 import { matchRanges } from '../utils/find';
 import { isShortcutModifier } from '../utils/platform';
-import { ApiClientError, api, apiErrorMessage } from '../api/client';
+import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { ContentPage } from '../api/client';
+import { rememberReading } from '../utils/readingMemory';
 import type { DocumentChunkResponse, DocumentContentResponse } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
 import { CITATION_WINDOW_RADIUS, takePrefetchedContent } from '../utils/contentPrefetch';
@@ -32,6 +33,11 @@ interface DocumentViewerProps {
   onCopyLink?: () => void;
   /** Open this document at another passage (its contents, "go to page"). */
   onGoTo?: (chunkId: string) => void;
+  /** Put a passage in the basket (the Quotes & passages panel). */
+  onCollect?: (chunk: DocumentChunkResponse) => void;
+  /** ``chunkId`` is where the reader left off: opened there, not marked as cited, and
+   *  a passage that is gone since just opens the document at the top. */
+  resume?: boolean;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -80,12 +86,15 @@ function DocumentViewer({
   onFindSimilar,
   onCopyLink,
   onGoTo,
+  onCollect,
+  resume = false,
 }: DocumentViewerProps) {
   // The passage whose question box is open, and what is typed in it.
   const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
   // Find in the loaded passages (⌘F / Ctrl+F while the viewer is open).
   const [findOpen, setFindOpen] = useState(false);
   const [outlineOpen, setOutlineOpen] = useState(false);
+  const contentsButtonRef = useRef<HTMLButtonElement>(null);
   // Which passage "Copy with citation" just copied (its button says so).
   const [copiedChunk, setCopiedChunk] = useState<string | null>(null);
   const [findQuery, setFindQuery] = useState('');
@@ -223,6 +232,25 @@ function DocumentViewer({
       ? { chunkId: visible.dataset.chunkId ?? '', top: visible.getBoundingClientRect().top - frameTop }
       : null;
   };
+  // Where the reader is, for reopening the document there (utils/readingMemory):
+  // the first passage in view, read at most once a frame while scrolling.
+  const placeFrameRef = useRef(0);
+  const rememberPlace = () => {
+    if (placeFrameRef.current) return;
+    placeFrameRef.current = requestAnimationFrame(() => {
+      placeFrameRef.current = 0;
+      const body = bodyRef.current;
+      if (!body) return;
+      const frameTop = body.getBoundingClientRect().top;
+      const visible = [...body.querySelectorAll<HTMLElement>('[data-chunk-id]')].find(
+        (element) => element.getBoundingClientRect().bottom > frameTop + 8,
+      );
+      if (visible?.dataset.chunkId) {
+        rememberReading(getWorkspace() ?? '', filename, visible.dataset.chunkId);
+      }
+    });
+  };
+  useEffect(() => () => cancelAnimationFrame(placeFrameRef.current), []);
   // The chunk to focus once a load lands, when the button that asked for it is gone
   // (the last page loaded): focus fell to <body> inside a modal dialog otherwise.
   const focusChunkRef = useRef<string | null>(null);
@@ -476,6 +504,7 @@ function DocumentViewer({
             <button
               type="button"
               className="document-viewer__original"
+              ref={contentsButtonRef}
               aria-expanded={outlineOpen}
               onClick={() => setOutlineOpen((open) => !open)}
               data-testid="viewer-outline-open"
@@ -501,7 +530,12 @@ function DocumentViewer({
             filename={filename}
             onGoTo={(target) => {
               setOutlineOpen(false);
-              onGoTo(target);
+              // The passage already shown as the target: nothing reloads, so scroll
+              // back to it here (the reader may have scrolled away).
+              if (target === chunkId) targetRef.current?.scrollIntoView({ block: 'center' });
+              else onGoTo(target);
+              // The list is gone: focus to the button that opened it, not the page.
+              contentsButtonRef.current?.focus();
             }}
           />
         )}
@@ -580,13 +614,18 @@ function DocumentViewer({
             </button>
           </div>
         )}
-        <div ref={bodyRef} className="document-viewer__body" hidden={mode === 'original'}>
+        <div
+          ref={bodyRef}
+          className="document-viewer__body"
+          hidden={mode === 'original'}
+          onScroll={rememberPlace}
+        >
           {error && <p className="document-viewer__error" role="alert">{error}</p>}
           {!error && chunks === null && <p className="document-viewer__loading">Loading…</p>}
           {/* Chunk ids hash the chunk text, so a re-index or re-upload since the answer
               leaves the citation pointing at a passage that no longer exists. Opening at
               the top with nothing highlighted read as a broken link. */}
-          {chunks && chunkId !== null && loaded?.targetFound === false && (
+          {chunks && chunkId !== null && !resume && loaded?.targetFound === false && (
             <p className="document-viewer__notice" role="status" data-testid="viewer-passage-missing">
               This passage changed since the answer was written — the document has been
               re-indexed. Showing the document from the start.
@@ -604,15 +643,18 @@ function DocumentViewer({
             </button>
           )}
           {(chunks ?? []).map((chunk) => {
-            const isTarget = chunkId !== null && chunk.chunk_id === chunkId;
+            // Scrolled to either way; marked as the cited passage only when it is one.
+            const isAnchor = chunkId !== null && chunk.chunk_id === chunkId;
+            const isTarget = isAnchor && !resume;
             return (
               <div
                 key={chunk.chunk_id}
-                ref={isTarget ? targetRef : undefined}
+                ref={isAnchor ? targetRef : undefined}
                 className={`document-viewer__chunk${
                   isTarget ? ' document-viewer__chunk--target' : ''
                 }${currentMatch?.chunk_id === chunk.chunk_id ? ' document-viewer__chunk--found' : ''}`}
                 data-chunk-id={chunk.chunk_id}
+                data-quote-filename={filename}
                 data-quote-source={`${filename}, ${pageLabel(chunk.page, chunk.page_end)}${
                   chunk.section ? `, ${chunk.section}` : ''
                 }`}
@@ -647,6 +689,17 @@ function DocumentViewer({
                   >
                     {copiedChunk === chunk.chunk_id ? 'Copied' : 'Copy with citation'}
                   </button>
+                  {onCollect && (
+                    <button
+                      type="button"
+                      className="document-viewer__ask"
+                      onClick={() => onCollect(chunk)}
+                      aria-label={`Add this passage to the basket (${pageLabel(chunk.page, chunk.page_end)})`}
+                      data-testid="viewer-collect"
+                    >
+                      Add to basket
+                    </button>
+                  )}
                   {onFindSimilar && (
                     <button
                       type="button"

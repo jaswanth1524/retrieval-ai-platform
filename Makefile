@@ -2,7 +2,7 @@
 # `make check` runs the backend and frontend gates as CI does (coverage floor and
 # dependency audits included); e2e and Docker stay separate.
 
-.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-mixed eval-answer eval-ragas eval-diff eval-report
+.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-mixed eval-answer eval-record eval-replay eval-ragas eval-diff eval-report
 
 check: backend frontend
 
@@ -30,6 +30,9 @@ backend:
 	uv run python -m eval.harness validate eval/datasets/compare_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/mixed_eval.jsonl
 	uv run python -m eval.harness validate eval/datasets/recency_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/recency_history_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/chain_eval.jsonl
+	uv run python -m eval.harness validate eval/datasets/summary_eval.jsonl
 	uv run python -m eval.make_mixed_corpus --check
 	req=$$(mktemp) && uv export --frozen --extra ocr --extra mcp --no-hashes --no-emit-project > "$$req" \
 		&& uvx pip-audit==2.10.1 --disable-pip --no-deps -r "$$req"; \
@@ -83,6 +86,25 @@ eval-mixed:
 # e.g. make eval-answer EVAL_DATASET=eval/datasets/followup_eval.jsonl EVAL_ARGS="--resume"
 eval-answer: eval-ingest
 	$(EVAL_ENV) uv run python -m eval.harness answer $(EVAL_DATASET) --output $(EVAL_OUT) $(EVAL_ARGS)
+
+# The answer sets CI replays: record every model reply again with the configured LLM
+# (qwen2.5 for the committed ones) after an intended prompt or retrieval change, and
+# rewrite their answer baselines; eval-replay runs them with no LLM, as CI does.
+ANSWER_SETS = handbook followup compare unanswerable chain summary
+eval-record: eval-ingest
+	for set in $(ANSWER_SETS); do \
+		$(EVAL_ENV) uv run python -m eval.harness answer eval/datasets/$${set}_eval.jsonl \
+			--output answers-$$set.json --record eval/baselines/replies/$$set.jsonl || exit 1; \
+		uv run python -m eval.harness baseline-from answers-$$set.json \
+			eval/baselines/answers_$$set.json || exit 1; \
+	done
+
+eval-replay: eval-ingest
+	for set in $(ANSWER_SETS); do \
+		$(EVAL_ENV) uv run python -m eval.harness answer eval/datasets/$${set}_eval.jsonl \
+			--replay eval/baselines/replies/$$set.jsonl \
+			--baseline eval/baselines/answers_$$set.json --output answers-$$set.json || exit 1; \
+	done
 
 # Scores eval-answer's output with a local judge by default (needs the eval extra).
 eval-ragas:

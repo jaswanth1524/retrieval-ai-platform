@@ -372,7 +372,9 @@ def clip_text(text: str, limit: int) -> str:
 
     if len(text) <= limit:
         return text
-    cut = text[:limit].rsplit(None, 1)[0] if " " in text[:limit] else text[:limit]
+    head = text[:limit]
+    # Cut at the last word break; a head with none (one long word, or all blank) whole.
+    cut = head.rsplit(None, 1)[0] if len(head.split()) > 1 else head.rstrip()
     return f"{cut}…"
 
 

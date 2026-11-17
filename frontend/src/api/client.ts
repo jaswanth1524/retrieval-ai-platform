@@ -1,5 +1,9 @@
 import type {
   AccessResponse,
+  AuditResponse,
+  MigrateImportResponse,
+  NotifyTestResponse,
+  RebuildResponse,
   AnswerStatus,
   CitationResponse,
   DocumentContentResponse,
@@ -70,6 +74,12 @@ export { ApiClientError };
 
 /** The API's own message for a failed call (already client-safe), else ``fallback``
  *  for anything that isn't an API error (a bug, a network stack's raw text). */
+/** A document's name in a URL path: each part encoded, the `/` between folders kept
+ * (a name may carry them: `reports/2024/q1.pdf`). */
+export function documentPath(name: string): string {
+  return name.split('/').map(encodeURIComponent).join('/')
+}
+
 export function apiErrorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiClientError ? err.message : fallback;
 }
@@ -440,6 +450,11 @@ export interface QuestionStreamHandlers {
       autoCited?: boolean;
       /** Picked passages the answer went without (no room in the prompt). */
       passagesLeftOut?: number;
+      /** Citing sentences no cited passage supports; stating a number none contains. */
+      unsupportedClaims?: number;
+      unsupportedNumbers?: number;
+      /** A follow-up's rewrite: what was searched for. */
+      searchedAs?: string;
       /** Summaries only: passages read, of the passages the documents hold. */
       coverage?: SummaryCoverage;
       /** Tokens the provider reported for this answer; absent when it reported none. */
@@ -499,9 +514,12 @@ export const api = {
     request<FeedbackListResponse>(`/feedback?limit=${limit}`, { signal }),
 
   // Restores a backup zip from exportCorpus: each document is re-indexed as a job.
-  importBackup: (file: File, signal?: AbortSignal, workspace?: string) => {
+  // With ``background``, every document is queued as room frees (none deferred) and the
+  // response carries an import id to follow in the import list.
+  importBackup: (file: File, signal?: AbortSignal, workspace?: string, background = false) => {
     const form = new FormData();
     form.append('file', file);
+    if (background) form.append('background', 'true');
     return request<ImportResponse>('/import', {
       method: 'POST',
       body: form,
@@ -516,7 +534,7 @@ export const api = {
   // The exact uploaded bytes (RAW_DOCUMENT_DIR on). Fetched, not linked: a plain link
   // can't carry the X-API-Key header.
   getDocumentOriginal: async (filename: string, signal?: AbortSignal): Promise<Blob> =>
-    (await downloadBlob(`/documents/${encodeURIComponent(filename)}/original`, signal)).blob,
+    (await downloadBlob(`/documents/${documentPath(filename)}/original`, signal)).blob,
 
   // `workspace` on the corpus calls below: the workspace the operation was started in
   // (see authHeaders); the one in use when absent.
@@ -583,7 +601,7 @@ export const api = {
   // Re-chunks and re-embeds a document from its stored original; poll the job like an
   // upload's. 409 when the server keeps no originals, 404 when this one has none.
   reindexDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
-    request<DocumentJobAcceptedResponse>(`/documents/${encodeURIComponent(filename)}/reindex`, {
+    request<DocumentJobAcceptedResponse>(`/documents/${documentPath(filename)}/reindex`, {
       method: 'POST',
       signal,
       workspace,
@@ -618,7 +636,7 @@ export const api = {
     workspace?: string,
   ) =>
     request<DocumentRefreshSettingsResponse>(
-      `/documents/${encodeURIComponent(filename)}/refresh-settings`,
+      `/documents/${documentPath(filename)}/refresh-settings`,
       {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -634,7 +652,7 @@ export const api = {
 
   // Replaces a document's tags (an empty list clears them). Payload-only on the server.
   setDocumentTags: (filename: string, tags: string[], signal?: AbortSignal, workspace?: string) =>
-    request<DocumentTagsResponse>(`/documents/${encodeURIComponent(filename)}/tags`, {
+    request<DocumentTagsResponse>(`/documents/${documentPath(filename)}/tags`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags }),
@@ -654,7 +672,7 @@ export const api = {
   },
 
   deleteDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
-    request<DocumentDeleteResponse>(`/documents/${encodeURIComponent(filename)}`, {
+    request<DocumentDeleteResponse>(`/documents/${documentPath(filename)}`, {
       method: 'DELETE',
       signal,
       workspace,
@@ -666,7 +684,7 @@ export const api = {
   // of a cited one, or `start`/`end` (1-based ordinals, inclusive) for a range.
   // A document's sections and page starts (no text), for the viewer's contents.
   documentOutline: (filename: string, signal?: AbortSignal) =>
-    request<DocumentOutlineResponse>(`/documents/${encodeURIComponent(filename)}/outline`, {
+    request<DocumentOutlineResponse>(`/documents/${documentPath(filename)}/outline`, {
       signal,
     }),
 
@@ -681,7 +699,7 @@ export const api = {
     const encoded = query.toString();
     const suffix = encoded ? `?${encoded}` : '';
     return request<DocumentContentResponse>(
-      `/documents/${encodeURIComponent(filename)}/content${suffix}`,
+      `/documents/${documentPath(filename)}/content${suffix}`,
       { signal },
     );
   },
@@ -709,19 +727,20 @@ export const api = {
   // Fetches a URL-ingested document again: a job to poll, or `unchanged` (304).
   refreshDocument: (filename: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobAcceptedResponse | DocumentRefreshResponse>(
-      `/documents/${encodeURIComponent(filename)}/refresh`,
+      `/documents/${documentPath(filename)}/refresh`,
       { method: 'POST', timeoutMs: LONG_RUNNING_TIMEOUT_MS, signal, workspace },
     ),
 
   // Ranked passages without an answer: works with no LLM reachable. 429 when the server
   // is answering its maximum number of questions (it shares their slots).
-  searchPassages: (body: SearchRequest, signal?: AbortSignal) =>
+  searchPassages: (body: SearchRequest, signal?: AbortSignal, workspace?: string) =>
     request<SearchResponse>('/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
       signal,
+      ...(workspace !== undefined ? { workspace } : {}),
     }),
 
   submitFeedback: (body: FeedbackRequest, signal?: AbortSignal) =>
@@ -826,10 +845,11 @@ export const api = {
 
   runBackup: () => request<{ workspace: string }>('/backups/run', { method: 'POST' }),
 
-  verifyStoredBackup: (name: string) =>
+  verifyStoredBackup: (name: string, signal?: AbortSignal) =>
     request<BackupCheckResponse>(`/backups/${encodeURIComponent(name)}/verify`, {
       method: 'POST',
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
     }),
 
   // A stored backup downloaded (to keep it elsewhere), or deleted.
@@ -860,8 +880,8 @@ export const api = {
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
     }),
 
-  restoreStoredBackup: (name: string) =>
-    request<ImportResponse>(`/backups/${encodeURIComponent(name)}/restore`, {
+  restoreStoredBackup: (name: string, background = false) =>
+    request<ImportResponse>(`/backups/${encodeURIComponent(name)}/restore${background ? '?background=true' : ''}`, {
       method: 'POST',
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
     }),
@@ -870,15 +890,59 @@ export const api = {
   consistency: (signal?: AbortSignal) =>
     request<ConsistencyResponse>('/admin/consistency', { signal }),
 
+  // Stored audit events, newest first (AUDIT_LOG_PATH; 404 when it is off).
+  audit: (options: { event?: string; limit?: number } = {}, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ limit: String(options.limit ?? 100) });
+    if (options.event) params.set('event', options.event);
+    return request<AuditResponse>(`/admin/audit?${params.toString()}`, { signal });
+  },
+
+  // Every stored original with no document indexed again, in the background.
+  rebuild: () =>
+    request<RebuildResponse>('/admin/rebuild', { method: 'POST', timeoutMs: LONG_RUNNING_TIMEOUT_MS }),
+
+  // One notification through NOTIFY_URL now (404 when notifications are off).
+  notifyTest: () =>
+    request<NotifyTestResponse>('/admin/notify-test', { method: 'POST', timeoutMs: LONG_RUNNING_TIMEOUT_MS }),
+
+  // The whole server (every workspace, with index snapshots) as one file.
+  migrateExport: async (signal?: AbortSignal): Promise<{ blob: Blob; filename: string }> => {
+    const { response, blob } = await downloadBlob('/admin/migrate/export', signal);
+    const disposition = response.headers.get('Content-Disposition') ?? '';
+    const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'docrag-migrate.zip';
+    return { blob, filename };
+  },
+
+  migrateImport: (file: File, signal?: AbortSignal) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<MigrateImportResponse>('/admin/migrate/import', {
+      method: 'POST',
+      body: form,
+      timeoutMs: uploadTimeoutMs(file.size),
+      signal,
+      // Every workspace: followed from the default one's imports.
+      workspace: '',
+    });
+  },
+
   // Risky settings: backups with nothing in them, a full disk, a memory budget the
   // models and the ingest backlog can exceed, an open server.
   doctor: (signal?: AbortSignal) => request<DoctorResponse>('/admin/doctor', { signal }),
 
   // A zip of documents, each indexed as its own.
-  uploadArchive: (file: File, tags?: string[], signal?: AbortSignal, workspace?: string) => {
+  uploadArchive: (
+    file: File,
+    tags?: string[],
+    signal?: AbortSignal,
+    workspace?: string,
+    options: { keepPaths?: boolean; background?: boolean } = {},
+  ) => {
     const form = new FormData();
     form.append('file', file);
     for (const tag of tags ?? []) form.append('tags', tag);
+    if (options.keepPaths) form.append('keep_paths', 'true');
+    if (options.background) form.append('background', 'true');
     return request<ArchiveUploadResponse>('/documents/archive', {
       method: 'POST',
       body: form,
@@ -928,7 +992,7 @@ export const api = {
 
   // Earlier originals of a document kept when it was replaced (RAW_DOCUMENT_VERSIONS).
   listDocumentVersions: (filename: string, signal?: AbortSignal, workspace?: string) =>
-    request<DocumentVersionsResponse>(`/documents/${encodeURIComponent(filename)}/versions`, {
+    request<DocumentVersionsResponse>(`/documents/${documentPath(filename)}/versions`, {
       signal,
       workspace,
     }),
@@ -936,7 +1000,7 @@ export const api = {
   // Puts an earlier version back: indexed like an upload of those bytes; poll the job.
   restoreDocumentVersion: (filename: string, version: string, signal?: AbortSignal, workspace?: string) =>
     request<DocumentJobAcceptedResponse>(
-      `/documents/${encodeURIComponent(filename)}/versions/${encodeURIComponent(version)}/restore`,
+      `/documents/${documentPath(filename)}/versions/${encodeURIComponent(version)}/restore`,
       { method: 'POST', signal, workspace },
     ),
 
@@ -1094,6 +1158,15 @@ export const api = {
                   ...(event.citation_backfilled === true ? { autoCited: true } : {}),
                   ...(typeof event.passages_left_out === 'number' && event.passages_left_out > 0
                     ? { passagesLeftOut: event.passages_left_out }
+                    : {}),
+                  ...(typeof event.unsupported_claims === 'number' && event.unsupported_claims > 0
+                    ? { unsupportedClaims: event.unsupported_claims }
+                    : {}),
+                  ...(typeof event.unsupported_numbers === 'number' && event.unsupported_numbers > 0
+                    ? { unsupportedNumbers: event.unsupported_numbers }
+                    : {}),
+                  ...(typeof event.retrieval_query === 'string' && event.retrieval_query
+                    ? { searchedAs: event.retrieval_query }
                     : {}),
                   truncated: event.truncated,
                   ...(event.prompt_cut === true ? { promptCut: true } : {}),

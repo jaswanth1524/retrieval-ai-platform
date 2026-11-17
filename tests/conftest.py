@@ -75,6 +75,24 @@ def _settings_without_dotenv(monkeypatch: pytest.MonkeyPatch) -> Generator[None]
 
 
 @pytest.fixture(autouse=True)
+def _cli_cache_in_a_temp_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """``docrag sync`` remembers file hashes under the user's cache directory: never the
+    developer's own."""
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path_factory.mktemp("cache")))
+
+
+@pytest.fixture(autouse=True)
+def _no_ollama_model_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The settings check asks Ollama which models it has: never the developer's own
+    (a test that wants an answer passes ``ollama_models=``)."""
+
+    monkeypatch.setattr("api.doctor._ollama_models", lambda settings: None)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_llm_process_state() -> Generator[None]:
     """Each test starts with no measured prompt-read rate and free Ollama slots.
 
@@ -95,6 +113,9 @@ def _fresh_llm_process_state() -> Generator[None]:
         from api import prompt_cache
 
         prompt_cache.reset_shared_prompt_cache()
+        from api import ingestion
+
+        ingestion._embed_rate = None  # the preview's estimate, measured by any ingest
         from api import imports
 
         with imports._lock:

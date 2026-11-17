@@ -257,6 +257,7 @@ def register(app: FastAPI) -> None:
                     filenames=list(row.filenames),
                     kind=row.kind,
                     cached=row.cached,
+                    filenames_cited=row.cited,
                 )
                 for row in rows
             ]

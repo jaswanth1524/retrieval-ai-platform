@@ -1,5 +1,7 @@
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { MAX_PINNED_CONVERSATIONS } from '../hooks/chatPersistence';
+import { useCompactActions } from '../hooks/useCompactActions';
+import OverflowMenu from './OverflowMenu';
 import type { ConversationMatch, ConversationSummary } from '../hooks/useChat';
 import { formatRelativeTimeAgo } from '../utils/relativeTime';
 import { ALL_WORKSPACES, type ListFilter, dateGroup, listedConversations } from '../utils/conversationList';
@@ -48,6 +50,7 @@ function ConversationList({
   streamingId = null,
   onVisibleOrder,
 }: ConversationListProps) {
+  const compactActions = useCompactActions();
   const [filter, setFilter] = useState<ListFilter>('all');
   const [workspaceFilter, setWorkspaceFilter] = useState(ALL_WORKSPACES);
   const workspaces = useMemo(
@@ -481,60 +484,112 @@ function ConversationList({
                   </span>
                 </button>
                 <span className="conversation-list__row-actions">
-                  {onPin && (
-                    <button
-                      type="button"
-                      className="conversation-list__row-action"
-                      onClick={() => onPin(conversation.id, !conversation.pinned)}
-                      disabled={!conversation.pinned && pinLimitReached}
-                      title={
-                        !conversation.pinned && pinLimitReached
-                          ? `At most ${MAX_PINNED_CONVERSATIONS} pinned conversations`
-                          : undefined
-                      }
-                      aria-label={`${conversation.pinned ? 'Unpin' : 'Pin'} ${conversation.title}`}
-                      aria-pressed={conversation.pinned ? 'true' : 'false'}
-                      data-testid="conversation-pin"
-                    >
-                      {conversation.pinned ? '★' : '☆'}
-                    </button>
+                  {compactActions ? (
+                    <OverflowMenu
+                      tone="rail"
+                      label={`Actions for ${conversation.title}`}
+                      testId="conversation-menu"
+                      items={[
+                        ...(onPin
+                          ? [
+                              {
+                                label: conversation.pinned ? 'Unpin' : 'Pin',
+                                onSelect: () => onPin(conversation.id, !conversation.pinned),
+                                disabled: !conversation.pinned && pinLimitReached,
+                                title:
+                                  !conversation.pinned && pinLimitReached
+                                    ? `At most ${MAX_PINNED_CONVERSATIONS} pinned conversations`
+                                    : undefined,
+                                testId: 'conversation-menu-pin',
+                              },
+                            ]
+                          : []),
+                        {
+                          label: 'Rename',
+                          onSelect: () => startEditing(conversation),
+                          disabled,
+                          testId: 'conversation-menu-rename',
+                        },
+                        ...(onSetLabels
+                          ? [
+                              {
+                                label: 'Labels…',
+                                onSelect: () => {
+                                  setLabelingId(conversation.id);
+                                  setLabelDraft((conversation.labels ?? []).join(', '));
+                                },
+                                testId: 'conversation-menu-labels',
+                              },
+                            ]
+                          : []),
+                        {
+                          label: 'Delete',
+                          onSelect: () => setConfirmingDeleteId(conversation.id),
+                          disabled: disabled || conversation.id === streamingId,
+                          title:
+                            conversation.id === streamingId ? 'An answer is still being written here' : undefined,
+                          testId: 'conversation-menu-delete',
+                        },
+                      ]}
+                    />
+                  ) : (
+                    <>
+                      {onPin && (
+                        <button
+                          type="button"
+                          className="conversation-list__row-action"
+                          onClick={() => onPin(conversation.id, !conversation.pinned)}
+                          disabled={!conversation.pinned && pinLimitReached}
+                          title={
+                            !conversation.pinned && pinLimitReached
+                              ? `At most ${MAX_PINNED_CONVERSATIONS} pinned conversations`
+                              : undefined
+                          }
+                          aria-label={`${conversation.pinned ? 'Unpin' : 'Pin'} ${conversation.title}`}
+                          aria-pressed={conversation.pinned ? 'true' : 'false'}
+                          data-testid="conversation-pin"
+                        >
+                          {conversation.pinned ? '★' : '☆'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="conversation-list__row-action"
+                        onClick={() => startEditing(conversation)}
+                        disabled={disabled}
+                        aria-label={`Rename ${conversation.title}`}
+                      >
+                        ✎
+                      </button>
+                      {onSetLabels && (
+                        <button
+                          type="button"
+                          className="conversation-list__row-action"
+                          onClick={() => {
+                            setLabelingId(conversation.id);
+                            setLabelDraft((conversation.labels ?? []).join(', '));
+                          }}
+                          aria-label={`Label ${conversation.title}`}
+                          title="Labels, to filter the list by"
+                          data-testid="conversation-label"
+                        >
+                          #
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="conversation-list__row-action"
+                        onClick={() => setConfirmingDeleteId(conversation.id)}
+                        disabled={disabled || conversation.id === streamingId}
+                        title={
+                          conversation.id === streamingId ? 'An answer is still being written here' : undefined
+                        }
+                        aria-label={`Delete ${conversation.title}`}
+                      >
+                        ✕
+                      </button>
+                    </>
                   )}
-                  <button
-                    type="button"
-                    className="conversation-list__row-action"
-                    onClick={() => startEditing(conversation)}
-                    disabled={disabled}
-                    aria-label={`Rename ${conversation.title}`}
-                  >
-                    ✎
-                  </button>
-                  {onSetLabels && (
-                    <button
-                      type="button"
-                      className="conversation-list__row-action"
-                      onClick={() => {
-                        setLabelingId(conversation.id);
-                        setLabelDraft((conversation.labels ?? []).join(', '));
-                      }}
-                      aria-label={`Label ${conversation.title}`}
-                      title="Labels, to filter the list by"
-                      data-testid="conversation-label"
-                    >
-                      #
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="conversation-list__row-action"
-                    onClick={() => setConfirmingDeleteId(conversation.id)}
-                    disabled={disabled || conversation.id === streamingId}
-                    title={
-                      conversation.id === streamingId ? 'An answer is still being written here' : undefined
-                    }
-                    aria-label={`Delete ${conversation.title}`}
-                  >
-                    ✕
-                  </button>
                 </span>
               </div>
             )}

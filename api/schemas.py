@@ -45,6 +45,10 @@ SEARCH_SECTION_MAX_CHARS = 200
 # question tags are whitespace-collapsed before matching, so a padded one still works.
 REQUEST_FILENAME_MAX_CHARS = 1024
 REQUEST_TAG_MAX_CHARS = 128
+# Names one POST /documents/missing may ask about (the body stays under the JSON cap).
+MISSING_DOCUMENTS_MAX = 2000
+# The most documents one page of GET /documents returns.
+DOCUMENT_PAGE_MAX = 5000
 # Trace ids are 32 hex characters (uuid4().hex).
 REQUEST_TRACE_ID_MAX_CHARS = 64
 # Feedback limits, shared with a backup restore (api/restore.py) so a restored row is one
@@ -315,6 +319,29 @@ class DocumentListResponse(BaseModel):
     # Documents holding exactly the same bytes under different names (each group in
     # name order). Both copies are searched, and citations split between them.
     duplicate_groups: list[list[str]] = []
+    # Only with limit/cursor/prefix/tag: how many documents matched the filters, and the
+    # cursor of the next page (null on the last). Without them the whole listing is
+    # returned, as it always was, and both are null.
+    total: int | None = None
+    next_cursor: str | None = None
+
+
+class LocalDocument(BaseModel):
+    name: RequestFilename
+    sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
+class MissingDocumentsRequest(BaseModel):
+    """Files a client holds (POST /documents/missing): which of them aren't indexed
+    with exactly these bytes?"""
+
+    documents: Annotated[list[LocalDocument], Field(max_length=MISSING_DOCUMENTS_MAX)]
+
+
+class MissingDocumentsResponse(BaseModel):
+    # Not indexed under that name, or indexed with other bytes (or from before hashes
+    # were recorded): worth sending.
+    missing: list[str]
 
 
 class UrlRefreshStatusResponse(BaseModel):
@@ -772,6 +799,9 @@ class QueryLogEntryResponse(BaseModel):
     kind: str = "question"
     # Served from the answer cache (or by joining the same question in flight).
     cached: bool = False
+    # True when ``filenames`` are the documents the answer cited; False when they are
+    # the prompt's (an answer citing none), a summary's, or the row predates this.
+    filenames_cited: bool = False
 
 
 class QueryLogResponse(BaseModel):
@@ -822,6 +852,7 @@ class TraceDetailResponse(BaseModel):
     # the sources (CITATION_RETRY_MODE), without a second LLM call.
     citation_backfilled: bool = False
     unsupported_claims: int = 0
+    unsupported_numbers: int = 0
     # The answer's LLM reply was reused from an identical earlier call (PROMPT_CACHE_SIZE).
     prompt_cached: bool = False
     # The provider read far less of the prompt than was sent: cut to fit its context
@@ -967,6 +998,7 @@ class QuestionResponse(BaseModel):
     # sources (CITATION_RETRY_MODE), so check them ("auto-cited" in the UI).
     citation_backfilled: bool = False
     unsupported_claims: int = 0
+    unsupported_numbers: int = 0
     # The answer's LLM reply was reused from an identical earlier call (PROMPT_CACHE_SIZE).
     prompt_cached: bool = False
     # The provider read far less of the prompt than was sent: cut to fit its context
@@ -1071,6 +1103,16 @@ class UrlIngestRequest(BaseModel):
     replace: bool = False
 
 
+class ArchiveUrlIngestRequest(BaseModel):
+    """Index the documents of a zip fetched from a URL, in the background
+    (POST /documents/archive-from-url)."""
+
+    url: str = Field(min_length=1, max_length=2048)
+    tags: list[RequestTag] | None = Field(default=None, max_length=MAX_TAGS_PER_DOCUMENT)
+    # Name each document by its path in the zip, not its base name.
+    keep_paths: bool = False
+
+
 class SitemapIngestRequest(BaseModel):
     """Add a site's pages from its sitemap, sitemap index, RSS or Atom feed
     (POST /documents/from-sitemap)."""
@@ -1104,7 +1146,8 @@ class BackgroundImportResponse(BaseModel):
     # "archive" (a zip of documents) or "restore" (a backup); extensible.
     kind: str
     name: str
-    # running / cancelling / done / cancelled.
+    # running / cancelling / done / cancelled / failed (it ended on an error: see
+    # problems); extensible.
     state: str
     started_at: float
     finished_at: float | None = None
@@ -1113,6 +1156,8 @@ class BackgroundImportResponse(BaseModel):
     skipped: int = 0
     failed: int = 0
     problems: list[str] = []
+    # Started again at startup after a restart cut it off (IMPORT_SPOOL_DIR).
+    resumed: bool = False
 
 
 class BackgroundImportListResponse(BaseModel):
@@ -1166,6 +1211,11 @@ class DocumentPreviewResponse(BaseModel):
     section_labels: list[str]
     # The first passages, in order (at most 20).
     first_chunks: list[PreviewChunkResponse]
+    # About how long indexing it would take here, from the embedding speed this server
+    # has measured; None before it has indexed anything since it started.
+    estimated_seconds: float | None = None
+    # More passages than MAX_CHUNKS_PER_DOCUMENT allows: indexing it would fail.
+    over_chunk_limit: bool = False
 
 
 class DocumentRefreshSettingsRequest(BaseModel):
@@ -1415,6 +1465,9 @@ class ConsistencyRepairRequest(BaseModel):
     delete_orphan_originals: bool = False
     delete_orphan_versions: bool = False
     reindex_incomplete: bool = False
+    # Delete orphan originals even when most originals are orphans (which is what a
+    # lost index looks like, and then they are the only copies): 409 without it.
+    delete_despite_lost_index: bool = False
 
 
 class ConsistencyRepairResponse(BaseModel):
@@ -1424,6 +1477,32 @@ class ConsistencyRepairResponse(BaseModel):
     # Not touched: indexed again meanwhile, in flight, couldn't be removed, or couldn't
     # be queued for a re-index now (a full queue: try again).
     left: list[str]
+
+
+class MigrateImportResponse(BaseModel):
+    """POST /admin/migrate/import: the bundle is being unpacked in the background."""
+
+    # Follow it with GET /documents/imports/{import_id} (in the default workspace).
+    import_id: str
+    # The workspaces the bundle holds, in the order they are unpacked.
+    workspaces: list[str]
+
+
+class NotifyTestResponse(BaseModel):
+    """POST /admin/notify-test: whether the test notification was delivered."""
+
+    sent: bool
+    # Why not, when it wasn't (never the webhook's path, which is its secret).
+    error: str | None = None
+
+
+class RebuildResponse(BaseModel):
+    """POST /admin/rebuild: stored originals with no document, being indexed again."""
+
+    # Follow it with GET /documents/imports/{import_id}; None when there was nothing
+    # to rebuild.
+    import_id: str | None = None
+    originals: int
 
 
 class AuditEntryResponse(BaseModel):

@@ -156,7 +156,7 @@ function SettingsModal({
 
   const save = () => {
     onOverridesChange(draftOverrides);
-    setApiKey(apiKeyDraft);
+    setApiKey(apiKeyDraft.trim());
     setSingleKeyShortcuts(singleKeysDraft);
     onNotifyOnAnswerChange?.(notifyDraft);
     onSaved();
@@ -425,7 +425,7 @@ function SettingsModal({
                 onChange={(event) => setSingleKeysDraft(event.target.checked)}
                 data-testid="settings-single-keys"
               />
-              Single-key shortcuts (? [ ] j k 1-9)
+              Single-key shortcuts (/ ? [ ] j k 1-9)
             </label>
             <p className="settings__hint">
               Off if speech input or a switch sets them off by accident; the ⌘ shortcuts stay.

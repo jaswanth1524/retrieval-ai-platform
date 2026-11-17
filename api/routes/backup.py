@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-import shutil
 import tempfile
 import threading
 import time
@@ -19,7 +18,7 @@ from fastapi.responses import FileResponse
 
 from api.audit import audit
 from api.audit_log import AuditLog
-from api.consistency import consistency_report, repair
+from api.consistency import LostIndexError, consistency_report, repair
 from api.dependencies import (
     get_audit_log,
     require_full_key,
@@ -34,12 +33,20 @@ from api.documents import (
 )
 from api.export import build_export
 from api.feedback import FeedbackStore
-from api.imports import BackgroundImport, wait_for_room
+from api.imports import BackgroundImport, remember, spool_directory, spool_upload, wait_for_room
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
+from api.notify import TEST_EVENT, NotifyError, current_notifier
 from api.raw_documents import RawDocumentStore
+from api.rebuild import originals_to_rebuild, rebuild
 from api.repository import VectorRepository
-from api.restore import BackupCheck, BackupImportError, restore_backup, verify_backup
+from api.restore import (
+    MAX_MEMBERS,
+    BackupCheck,
+    BackupImportError,
+    restore_backup,
+    verify_backup,
+)
 from api.routes.deps import (
     FeedbackStoreDep,
     IngestQueueDep,
@@ -71,10 +78,14 @@ from api.schemas import (
     DoctorResponse,
     DocumentJobAcceptedResponse,
     ImportResponse,
+    NotifyTestResponse,
+    RebuildResponse,
 )
 from api.settings import AppSettings
+from api.storage import require_free_space
 from api.streaming import ClosingStreamingResponse
 from api.workspaces import workspace_of
+from api.zip_safety import too_many_entries
 
 logger = logging.getLogger("api.routes.documents")
 
@@ -170,28 +181,42 @@ def import_backup(
         ),
     ] = False,
 ) -> ImportResponse:
+    # Before anything is copied or its directory read into memory.
+    if too_many_entries(file.file, MAX_MEMBERS):
+        raise HTTPException(
+            status_code=400, detail=f"The archive has more than {MAX_MEMBERS} entries."
+        )
+    require_free_space(settings, settings.raw_document_dir)
     if background:
-        spool = _spool_upload(file)
+        directory = spool_directory(settings.import_spool_dir)
+        require_free_space(settings, directory or tempfile.gettempdir())
+        spool = spool_upload(file.file, "docrag-restore-", directory)
+        name = file.filename or "backup.zip"
+        record = None
+        if directory is not None:
+            record = remember(
+                directory,
+                {"kind": "restore", "name": name, "workspace": workspace_of(settings)},
+                spool,
+            )
+
+        def cleanup() -> None:
+            spool.unlink(missing_ok=True)
+            if record is not None:
+                record.unlink(missing_ok=True)
+
         return _restore_in_background(
             spool,
-            file.filename or "backup.zip",
+            name,
             repository,
             settings,
             queue,
             raw_store,
             feedback_store,
-            cleanup=lambda: spool.unlink(missing_ok=True),
+            cleanup=cleanup,
+            resumable=record is not None,
         )
     return _restore(file.file, repository, settings, queue, raw_store, feedback_store)
-
-
-def _spool_upload(file: UploadFile) -> Path:
-    """The upload copied to a temporary file the import thread reads after the request."""
-
-    handle = tempfile.NamedTemporaryFile(prefix="docrag-restore-", suffix=".zip", delete=False)
-    with handle:
-        shutil.copyfileobj(file.file, handle, length=1 << 20)
-    return Path(handle.name)
 
 
 def _restore_in_background(
@@ -205,6 +230,8 @@ def _restore_in_background(
     *,
     cleanup: Callable[[], None] = lambda: None,
     source: str | None = None,
+    resumable: bool = False,
+    resumed: bool = False,
 ) -> ImportResponse:
     """Check the backup's manifest now (a bad one is a 400 here, not a failed import),
     then restore it on the import thread, waiting for room instead of deferring."""
@@ -219,7 +246,11 @@ def _restore_in_background(
             str(exc) if isinstance(exc, BackupImportError) else "That file isn't a zip archive."
         )
         raise HTTPException(status_code=400, detail=detail) from exc
-    repository.ensure_writable(settings)
+    try:
+        repository.ensure_writable(settings)
+    except BaseException:
+        cleanup()  # a 409 (index built for another embedding setup): nothing will run
+        raise
 
     def run(status: BackgroundImport) -> None:
         with path.open("rb") as handle:
@@ -234,7 +265,9 @@ def _restore_in_background(
                 status=status,
             )
         status.skipped += len(outcome.skipped) + len(outcome.missing_originals)
-        status.failed += len(outcome.rejected) + len(outcome.deferred)
+        # Cancelled: a document it was waiting to queue was left out, not refused.
+        left_out = [] if status.cancel.is_set() else outcome.deferred
+        status.failed += len(outcome.rejected) + len(left_out)
         for filename in outcome.rejected:
             status.note(f"{filename}: refused by restore's rules (or damaged)")
         for filename in outcome.missing_originals:
@@ -247,6 +280,8 @@ def _restore_in_background(
         str(settings.qdrant_collection),
         run,
         cleanup=cleanup,
+        resumable=resumable,
+        resumed=resumed,
     )
     return ImportResponse(
         jobs=[],
@@ -312,7 +347,7 @@ def _restore(
     def has_room(size: int) -> bool:
         if status is None:
             return queue.backlog.has_room(size)
-        return wait_for_room(queue.backlog.has_room, size, status)
+        return wait_for_room(queue.backlog.has_spare_room, size, status)
 
     # The last step of recovering from an embedding change (export, delete all,
     # import): an emptied collection is rebuilt here; a non-empty one is a 409.
@@ -329,6 +364,9 @@ def _restore(
             feedback_store=feedback_store,
             workspace=workspace_of(settings),
             keep_version=raw_store.add_version if raw_store is not None else None,
+            # One of BACKUP_DIR's own (``source`` names it): no upload caps.
+            stored=source is not None,
+            stop=status.cancel.is_set if status is not None else None,
         )
     except BackupImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -461,7 +499,7 @@ def list_stored_backups(request: Request, settings: SettingsDep) -> BackupListRe
     responses={404: {"description": "Scheduled backups are off (BACKUP_DIR)."}},
 )
 def run_backup_now(request: Request, settings: SettingsDep) -> BackupRunResponse:
-    _backup_dir(settings)
+    require_free_space(settings, _backup_dir(settings))
     loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
     if loop is None:
         raise HTTPException(status_code=404, detail="Scheduled backups are not running.")
@@ -511,7 +549,7 @@ def verify_uploaded_backup(
 def verify_stored_backup(name: str, request: Request, settings: SettingsDep) -> BackupCheckResponse:
     path = _stored_backup(settings, name)
     with _one_verify(), path.open("rb") as handle:
-        check = verify_backup(handle, int(settings.max_upload_bytes))
+        check = verify_backup(handle, int(settings.max_upload_bytes), stored=True)
     # Listed with this result from now on, after a restart too.
     loop: ScheduledBackup | None = getattr(request.app.state, "backup", None)
     if loop is not None:
@@ -540,9 +578,33 @@ def restore_stored_backup(
     background: bool = False,
 ) -> ImportResponse:
     path = _stored_backup(settings, name)
+    require_free_space(settings, settings.raw_document_dir)
     if background:
+        directory = spool_directory(settings.import_spool_dir)
+        record = None
+        if directory is not None:
+            # No copy: the backup stays where it is; the record says which one it was.
+            record = remember(
+                directory,
+                {
+                    "kind": "restore",
+                    "name": name,
+                    "workspace": workspace_of(settings),
+                    "stored": name,
+                },
+            )
+        kept = record
         return _restore_in_background(
-            path, name, repository, settings, queue, raw_store, feedback_store, source=name
+            path,
+            name,
+            repository,
+            settings,
+            queue,
+            raw_store,
+            feedback_store,
+            source=name,
+            cleanup=(lambda: kept.unlink(missing_ok=True)) if kept is not None else lambda: None,
+            resumable=record is not None,
         )
     with path.open("rb") as handle:
         return _restore(handle, repository, settings, queue, raw_store, feedback_store, source=name)
@@ -599,7 +661,9 @@ def run_doctor(repository: VectorRepositoryDep, settings: SettingsDep) -> Doctor
     return DoctorResponse(
         findings=[
             DoctorFindingResponse(**dataclasses.asdict(finding))
-            for finding in diagnose(settings, chunk_counts=counts)
+            for finding in diagnose(
+                settings, chunk_counts=counts, index=repository.index_size(settings)
+            )
         ]
     )
 
@@ -636,16 +700,20 @@ def repair_consistency(
     queue: IngestQueueDep,
     token_counter: TokenCounterDep,
 ) -> ConsistencyRepairResponse:
-    outcome = repair(
-        repository,
-        settings,
-        raw_store,
-        queue,
-        token_counter,
-        delete_orphan_originals=request.delete_orphan_originals,
-        delete_orphan_versions=request.delete_orphan_versions,
-        reindex_incomplete=request.reindex_incomplete,
-    )
+    try:
+        outcome = repair(
+            repository,
+            settings,
+            raw_store,
+            queue,
+            token_counter,
+            delete_orphan_originals=request.delete_orphan_originals,
+            delete_orphan_versions=request.delete_orphan_versions,
+            reindex_incomplete=request.reindex_incomplete,
+            delete_despite_lost_index=request.delete_despite_lost_index,
+        )
+    except LostIndexError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit(
         "admin.repair",
         workspace=workspace_of(settings),
@@ -654,3 +722,61 @@ def repair_consistency(
         reindexed=[job.filename for job in outcome.reindex_jobs],
     )
     return ConsistencyRepairResponse(**dataclasses.asdict(outcome))
+
+
+# The way back from a lost index (api/rebuild.py): every stored original with no
+# document is indexed again, in the background, with the tags and source kept beside it.
+@router.post(
+    "/admin/rebuild",
+    response_model=RebuildResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={409: {"description": "Originals aren't kept, or the index can't be written."}},
+)
+def rebuild_from_originals(
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    raw_store: RawDocumentStoreDep,
+    queue: IngestQueueDep,
+) -> RebuildResponse:
+    if raw_store is None:
+        raise HTTPException(
+            status_code=409,
+            detail="A rebuild reads stored originals, and none are kept (RAW_DOCUMENT_DIR).",
+        )
+    # An emptied collection built for another embedding setup is recreated here; one
+    # that still holds documents is a 409.
+    repository.ensure_writable(settings)
+    names = originals_to_rebuild(repository, settings, raw_store)
+    if not names:
+        return RebuildResponse(originals=0)
+    store = raw_store
+    started = start_import(
+        "rebuild",
+        f"{len(names)} originals",
+        workspace_of(settings),
+        str(settings.qdrant_collection),
+        lambda status: rebuild(names, repository, settings, store, queue, status),
+    )
+    audit("admin.rebuild", workspace=workspace_of(settings), originals=len(names))
+    return RebuildResponse(import_id=started.id, originals=len(names))
+
+
+# One notification now, to check NOTIFY_URL end to end (sent on the request, so the
+# answer says whether the webhook took it).
+@router.post(
+    "/admin/notify-test",
+    response_model=NotifyTestResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "Notifications are off (NOTIFY_URL)."}},
+)
+def send_test_notification() -> NotifyTestResponse:
+    notifier = current_notifier()
+    if notifier is None:
+        raise HTTPException(status_code=404, detail="Notifications are off (NOTIFY_URL).")
+    try:
+        notifier.send(TEST_EVENT, "This is a test: notifications from this server reach you.")
+    except NotifyError as exc:
+        return NotifyTestResponse(sent=False, error=str(exc))
+    audit("admin.notify_test", workspace="")
+    return NotifyTestResponse(sent=True)

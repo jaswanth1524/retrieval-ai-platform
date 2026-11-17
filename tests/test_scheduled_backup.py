@@ -91,3 +91,18 @@ def test_the_last_backup_says_how_many_documents_it_cannot_restore(tmp_path: Pat
     backup.run_once()
 
     assert backup.last is not None and backup.last.originals_missing == 1
+
+
+def test_after_a_restart_the_newest_backup_on_disk_is_the_last_success(tmp_path: Path) -> None:
+    from api.metrics import backup_last_success_timestamp
+
+    backup, clock, _ = _setup(tmp_path)
+    (first,) = backup.run_once()
+    written_at = os.stat(first).st_mtime
+    backup_last_success_timestamp.clear()  # a new process: no gauge yet
+
+    restarted, _, _ = _setup(tmp_path)
+    restarted._clock = clock  # the same moment, within the interval
+    assert restarted.run_once() == []
+    gauge = backup_last_success_timestamp.labels(workspace="default")
+    assert gauge._value.get() == written_at

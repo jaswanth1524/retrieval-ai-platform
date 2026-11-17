@@ -239,7 +239,8 @@
 .conversation-list__trash {
   margin: 8px 12px 12px;
   font-size: 12px;
-  color: var(--muted);
+  /* The rail's own colours: the panel is dark in both themes. */
+  color: var(--rail-dim);
 }
 
 .conversation-list__trash summary {
@@ -256,7 +257,7 @@
 }
 
 .conversation-list__trash-title {
-  color: var(--ink);
+  color: var(--rail-text);
   overflow-wrap: anywhere;
 }
 

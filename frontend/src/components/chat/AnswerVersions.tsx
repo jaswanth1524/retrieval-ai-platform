@@ -120,10 +120,8 @@ export default function AnswerVersions({
             type="button"
             className="chat-message__action"
             aria-pressed={sideBySide}
-            onClick={() => {
-              setSideBySide(!sideBySide);
-              setComparing(false);
-            }}
+            // Comparing stays on: side by side, each column marks its own differences.
+            onClick={() => setSideBySide(!sideBySide)}
             data-testid="answer-version-side-by-side"
           >
             {sideBySide ? 'One at a time' : 'Side by side'}
@@ -147,11 +145,23 @@ export default function AnswerVersions({
         <div className="chat-message__versions-side" data-testid="answer-version-side">
           <div className="chat-message__markdown" dir="auto">
             <p className="chat-message__versions-meta">This version{version.model ? ` · ${version.model}` : ''}</p>
-            {Markdown ? <Markdown text={version.content} components={components} /> : <p className="chat-message__plain">{version.content}</p>}
+            {comparing ? (
+              <VersionDiff before={version.content} after={current} side="before" />
+            ) : Markdown ? (
+              <Markdown text={version.content} components={components} />
+            ) : (
+              <p className="chat-message__plain">{version.content}</p>
+            )}
           </div>
           <div className="chat-message__markdown" dir="auto">
             <p className="chat-message__versions-meta">The current answer</p>
-            {Markdown ? <Markdown text={current} components={components} /> : <p className="chat-message__plain">{current}</p>}
+            {comparing ? (
+              <VersionDiff before={version.content} after={current} side="after" />
+            ) : Markdown ? (
+              <Markdown text={current} components={components} />
+            ) : (
+              <p className="chat-message__plain">{current}</p>
+            )}
           </div>
         </div>
       ) : comparing && current !== undefined ? (
@@ -181,15 +191,31 @@ export default function AnswerVersions({
 }
 
 /** The version (before) against the current answer (after): removed words struck,
- *  added ones marked. */
-function VersionDiff({ before, after }: { before: string; after: string }) {
+ *  added ones marked. Side by side, a column shows only its own text: the version's
+ *  column its removed words, the current answer's its added ones. */
+function VersionDiff({
+  before,
+  after,
+  side,
+}: {
+  before: string;
+  after: string;
+  side?: 'before' | 'after';
+}) {
   const parts = useMemo(() => wordDiff(before, after), [before, after]);
   if (parts === null) {
     return <p className="settings__hint">These answers are too long to compare word by word.</p>;
   }
+  const shown = parts.filter(
+    (part) => !side || part.kind === 'same' || (side === 'before') === (part.kind === 'removed'),
+  );
   return (
-    <p className="chat-message__diff" dir="auto" data-testid="answer-version-diff">
-      {parts.map((part, index) =>
+    <p
+      className="chat-message__diff"
+      dir="auto"
+      data-testid={side ? `answer-version-diff-${side}` : 'answer-version-diff'}
+    >
+      {shown.map((part, index) =>
         part.kind === 'same' ? (
           <span key={index}>{part.text}</span>
         ) : part.kind === 'removed' ? (

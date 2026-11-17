@@ -12,6 +12,8 @@ interface ReviewPanelProps {
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
   /** Mark an answer looked at (hidden from the list unless reviewed ones are shown). */
   onMarkReviewed?: (conversationId: string, turnId: string, reviewed: boolean) => void;
+  /** Ask the answer's question again in place: the old answer stays as a version. */
+  onAskAgain?: (item: SavedAnswer) => void;
 }
 
 // At most this many rows: the oldest problems matter least.
@@ -20,7 +22,13 @@ const MAX_ROWS = 200;
 /** Answers worth a second look, across this workspace's conversations: not found, weak
  *  matches, uncited or auto-cited, cut off, or resting on a document that changed or was
  *  deleted since. */
-function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: ReviewPanelProps) {
+function ReviewPanel({
+  answers,
+  onOpen,
+  sourceChangeOf,
+  onMarkReviewed,
+  onAskAgain,
+}: ReviewPanelProps) {
   const [showReviewed, setShowReviewed] = useState(false);
   // "Mark reviewed" removes its row (and the focused button with it): focus goes to the
   // row that took its place, else the empty message, not to the page.
@@ -102,6 +110,16 @@ function ReviewPanel({ answers, onOpen, sourceChangeOf, onMarkReviewed }: Review
             >
               Open
             </button>
+            {onAskAgain && item.question && !item.task && (
+              <button
+                type="button"
+                onClick={() => onAskAgain(item)}
+                title="Ask it again now; the current answer is kept as an earlier version to compare"
+                data-testid="review-ask-again"
+              >
+                Ask again
+              </button>
+            )}
             {onMarkReviewed && (
               <button
                 type="button"

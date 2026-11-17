@@ -41,7 +41,9 @@ function writeTrash(entries: TrashedConversation[]): void {
     try {
       localStorage.setItem(
         TRASH_STORAGE_KEY,
-        JSON.stringify(entries.slice(0, Math.floor(entries.length / 2))),
+        // Never none: the newest entry is the one just deleted, whose Undo toast is
+        // about to go.
+        JSON.stringify(entries.slice(0, Math.max(1, Math.floor(entries.length / 2)))),
       );
     } catch {
       // Kept only as long as the Undo toast.

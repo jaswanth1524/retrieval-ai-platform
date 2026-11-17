@@ -269,11 +269,23 @@ class AppSettings(BaseSettings):
     # POST /import: the largest backup zip (GET /export) accepted. Each original inside
     # is still held to max_upload_bytes.
     max_import_bytes: PositiveInt = 256 * 1024 * 1024
+    # Largest migration bundle POST /admin/migrate/import accepts (every workspace's
+    # originals and index snapshot in one file).
+    max_migrate_bytes: PositiveInt = 8 * 1024 * 1024 * 1024
     # POST /documents/archive: a zip of documents, each indexed as its own. At most this
     # many members are looked at; what they expand to in all is held to
     # MAX_IMPORT_BYTES, and each one to MAX_UPLOAD_BYTES. The zip itself may be up to
     # MAX_IMPORT_BYTES too (request_guard.body_limit).
     max_archive_members: PositiveInt = 500
+    # Refuse uploads, imports and backups (507) while the disk they write to has less
+    # than this free; 0 = no check.
+    min_free_bytes: int = Field(default=0, ge=0)
+    # Fail a document that chunks into more passages than this (0 = no limit): one
+    # enormous file otherwise holds an indexing worker for hours.
+    max_chunks_per_document: int = Field(default=0, ge=0)
+    # A Markdown file's front matter ``tags:`` become its document's tags when it is
+    # indexed (new or changed) without tags of its own.
+    front_matter_tags: bool = False
     # POST /documents/from-sitemap: the most pages one sitemap or feed adds.
     sitemap_max_pages: PositiveInt = 100
     # Real dense-model subword tokens (api/chunking.py counts with the model's own
@@ -347,6 +359,20 @@ class AppSettings(BaseSettings):
     backup_dir: str = ""
     backup_interval_hours: PositiveFloat = 24
     backup_keep: PositiveInt = 7
+    # Where background imports keep their uploaded zip while they run; with it set, an
+    # import a restart cut off runs again at startup. Empty: the system temp directory,
+    # and a restart forgets them.
+    import_spool_dir: str = ""
+    # A webhook told when unattended work fails (api/notify.py); empty = off.
+    notify_url: str = ""
+    # Which events (comma-separated; empty = all): backup_failed, watch_gave_up,
+    # reindex_failed, url_refresh_failed, config_warning.
+    notify_events: str = ""
+    # "json": {"text": ...} (Slack-compatible); "text": plain text + a Title header (ntfy).
+    notify_format: Literal["json", "text"] = "json"
+    notify_allow_private: bool = False
+    # At most one notification per event in this many seconds (repeats are counted).
+    notify_min_interval_seconds: int = Field(default=3600, ge=0)
     # Upload bytes allowed to sit queued or in progress at once. Every accepted upload
     # holds its full content in memory until its ingest job finishes, and the executor
     # queue itself is unbounded — past this budget uploads get 503 + Retry-After
@@ -519,6 +545,9 @@ class AppSettings(BaseSettings):
     # when nothing matched; the LLM retry for hosted providers. "off": neither (as
     # CITATION_RETRY_ENABLED=false).
     citation_retry_mode: Literal["auto", "llm", "backfill", "off"] = "auto"
+    # A streamed answer cut off at the output limit is continued in the same stream,
+    # up to this many times (0 = off: the reader presses Continue).
+    auto_continue_max: int = Field(default=0, ge=0, le=5)
 
     # Suggested follow-up questions (default OFF: one more LLM call per answer, which on
     # a local model is seconds). When on, an answer that cited its sources gets up to
@@ -555,6 +584,9 @@ class AppSettings(BaseSettings):
     watch_dir: str = ""
     watch_interval_seconds: float = Field(default=30.0, ge=2.0, le=86_400.0)
     watch_delete_missing: bool = False
+    # Name a watched file by its path under the folder ("reports/2024/q1.pdf") instead
+    # of its base name, so same-named files in different folders are all indexed.
+    watch_keep_paths: bool = False
     watch_workspace: str = ""
     # A watched file whose read fails, or whose indexing job fails, is tried again after
     # WATCH_INTERVAL_SECONDS x 2^n (at most WATCH_RETRY_MAX_SECONDS), up to

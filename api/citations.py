@@ -236,34 +236,9 @@ def cited_numbers(text: str, max_number: int) -> set[int]:
             start = int(bounds[0])
             end = int(bounds[-1])
             if start <= end:
-                numbers.update(range(start, min(end, max_number) + 1))
+                # Sources are numbered from 1: "[0]" names none of them.
+                numbers.update(range(max(start, 1), min(end, max_number) + 1))
     return numbers
-
-
-# A marker naming only sources past the last one on offer is a miscount ("[7]" with
-# four sources), not a reference — below this. At or above it ("[2019]", "[120]") it is
-# more likely the document's own bracketed number, quoted, and is left alone.
-_STRAY_MARKER_MAX = 100
-
-
-def strip_stray_markers(answer: str, max_number: int) -> str:
-    """``answer`` without markers that cite only sources past ``max_number``.
-
-    Left in, a dead ``[9]`` stayed in the text with nothing to open, and an answer
-    whose only markers were dead counted as citing (so no retry or backfill ran) while
-    its status said uncited. A marker with any number on offer is kept whole.
-    """
-
-    def keep_or_drop(match: re.Match[str]) -> str:
-        numbers: list[int] = []
-        for part in match.group(1).split(","):
-            bounds = _CITATION_RANGE_SEP.split(part.strip())
-            numbers.extend((int(bounds[0]), int(bounds[-1])))
-        if all(max_number < number < _STRAY_MARKER_MAX for number in numbers):
-            return ""
-        return match.group(0)  # the space before it included
-
-    return _MARKER_WITH_SPACE_RE.sub(keep_or_drop, answer)
 
 
 # Exact spans. No model involved: each answer sentence's content words are matched
@@ -450,6 +425,92 @@ def unsupported_claims(answer: str, chunks: Sequence[RerankedChunk]) -> int:
     return unsupported
 
 
+_HYPHENS = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-"})
+_THOUSANDS_RE = re.compile(r"(?<=\d)[,\u202f\u00a0'](?=\d{3}\b)")
+_LIST_MARKER_RE = re.compile(r"^\s*(?:\d{1,3}[.)]|[-*\u2022])\s+")
+
+
+def _numbers(text: str) -> set[str]:
+    """The numbers ``text`` states, as digits: "forty-five" and "45" alike, and
+    "1,000" as "1000"."""
+
+    # Typographic hyphens join number words too: gpt-5-mini wrote "forty\u2011five".
+    plain = _THOUSANDS_RE.sub("", text).translate(_HYPHENS)
+    return {word for word in _words(plain) if word.isdigit()}
+
+
+# A count of the sources themselves ("all three policies", "the two documents", "both"),
+# as summaries and comparisons write: no figure from a passage (gpt-5-mini's brief of
+# three policies was flagged three times for "All three …").
+_SOURCE_COUNT_RE = re.compile(
+    r"\b(?:all|the|these|those|each of the)\s+"
+    r"(?:two|three|four|five|six|seven|eight|nine|ten|[2-9]|10)\b"
+    r"(?=\s+(?:documents?|polic(?:y|ies)|files?|sources?|passages?|texts?|versions?|say|"
+    r"agree|share|cover|state|describe)\b)",
+    re.IGNORECASE,
+)
+# An amount in cents is the same figure as a fraction of the unit: "thirty cents" is
+# what "€0.30" says (gpt-5-mini wrote that, flagged for its 0).
+_SUBUNIT_RE = re.compile(r"\b(?:cents?|pence|paise|centimes?)\b", re.IGNORECASE)
+
+
+def _claim_numbers(claim: str) -> set[str]:
+    return _numbers(_SOURCE_COUNT_RE.sub(" ", claim))
+
+
+def _source_numbers(text: str) -> set[str]:
+    found = _numbers(text)
+    if _SUBUNIT_RE.search(text):
+        found.add("0")
+    return found
+
+
+def _header_numbers(chunk: RerankedChunk) -> set[str]:
+    """The numbers in what the prompt's source line shows the model besides the text:
+    the file name and section ("the 2019 file … [7]" names the document, as gpt-5-mini
+    wrote of travel_policy_2019_archived.md, and was flagged). Not the page: page 1
+    would let a figure wrongly changed to 1 through."""
+
+    header = f"{chunk.filename} {chunk.section or ''}"
+    # Underscores and dots join words: "policy_2019_archived" has no number on its own.
+    return _numbers(re.sub(r"[_\W]+", " ", header))
+
+
+def unsupported_numbers(answer: str, chunks: Sequence[RerankedChunk]) -> int:
+    """How many of ``answer``'s citing sentences state a number that none of the
+    passages they cite contains — a figure the model got wrong, or took from another
+    passage. A cited passage counts with the neighbour text the prompt gave it (what the
+    model read). A list item's own number ("2. Submit…") isn't a claim, nor is a
+    sentence declining to answer (it repeats the question's numbers); out-of-range
+    citations are ignored."""
+
+    found = 0
+    previous: tuple[set[str], set[int]] | None = None
+    sentences: list[tuple[set[str], set[int]]] = []
+    for piece in _ANSWER_SENTENCE_RE.split(answer):
+        if not piece.strip():
+            continue
+        leading = _LEADING_MARKERS_RE.match(piece)
+        if leading is not None and previous is not None:
+            previous[1].update(cited_numbers(leading.group(0), len(chunks)))
+            piece = piece[leading.end() :]
+        claim = _LIST_MARKER_RE.sub("", _CITATION_RE.sub(" ", piece))
+        stated = set() if opens_with_a_refusal(claim) else _claim_numbers(claim)
+        current = (stated, cited_numbers(piece, len(chunks)))
+        sentences.append(current)
+        previous = current
+    for numbers, cited in sentences:
+        if not numbers or not cited:
+            continue
+        available: set[str] = set()
+        for number in cited:
+            chunk = chunks[number - 1]
+            available |= _source_numbers(chunk.expanded_text or chunk.text) | _header_numbers(chunk)
+        if numbers - available:
+            found += 1
+    return found
+
+
 class _SpanIndex:
     """A source text's sentences, with the content words of each sentence (or pair of
     sentences) worked out once: every claim of an answer is matched against every
@@ -617,7 +678,10 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
     answer did not already declare the context insufficient (a valid uncited answer).
     """
 
-    if source_count <= 0 or _CITATION_RE.search(answer):
+    # A marker naming only sources past the last one ("[7]" with four sources, or a
+    # document's own "[12]" quoted) cites nothing: such an answer is still uncited. The
+    # text itself is left as written.
+    if source_count <= 0 or cited_numbers(answer, source_count):
         return False
     return not states_insufficiency(answer)
 
@@ -916,6 +980,8 @@ class CitationOutcome:
     # Citing sentences none of whose sources holds a passage they rest on (no span
     # matched): a number to watch, not a verdict on the citation (finish_answer).
     unsupported_claims: int = 0
+    # Citing sentences stating a number none of their cited passages contains.
+    unsupported_numbers: int = 0
 
 
 def _citation_steps(settings: AppSettings) -> tuple[bool, bool]:
@@ -1003,7 +1069,7 @@ def backfill_citations(answer: str, chunks: Sequence[RerankedChunk]) -> str | No
     best one's number. A sentence saying the sources lack something is left alone.
     """
 
-    if not chunks or _CITATION_RE.search(answer):
+    if not chunks or cited_numbers(answer, len(chunks)):
         return None
     # Asked twice per answer (will_call_llm_for_citations, then finalize_citations).
     return _backfill(answer, tuple(chunk.expanded_text or chunk.text for chunk in chunks))
@@ -1087,18 +1153,15 @@ def finalize_citations(
     non-empty when a marker matched — so it never changes the outcome. It's kept as a
     cheap, explicit statement of the intent ("only retry when we ended up with zero
     sources"). A marker citing only sources past the last one (``[9]`` with 3 sources)
-    is stripped first (``strip_stray_markers``), so such an answer takes the uncited
-    path — backfill, or the retry — instead of keeping a dead marker.
+    cites nothing, so such an answer takes the uncited path — backfill, or the retry.
+    Its text is left alone: it may be the document's own bracketed number, quoted.
 
     ``context_chunks`` (the prompt's sources, in order) let an uncited answer be
     backfilled without an LLM call (CITATION_RETRY_MODE); ``weak_matches`` skips adding
     citations to a refusal the weak-match prompt asked to be uncited.
     """
 
-    answer = strip_stray_markers(
-        strip_echoed_source_headers(answer),
-        max((source.source_number for source in all_sources), default=0),
-    )
+    answer = strip_echoed_source_headers(answer)
     cited = cited_sources(answer, all_sources)
     final_messages = list(prompt_messages)
     retry_used = False

@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from api.repository import IndexSize
 from api.settings import AppSettings
 from api.storage import enabled_store_directories
 
@@ -58,6 +61,24 @@ def _memory_limit() -> int | None:
         return None
 
 
+def _ollama_models(settings: AppSettings) -> list[str] | None:
+    """The models Ollama has, or None when it can't be asked (readiness reports that)."""
+
+    try:
+        response = httpx.get(f"{settings.ollama_base_url.rstrip('/')}/api/tags", timeout=2.0)
+        response.raise_for_status()
+        return [str(model.get("name", "")) for model in response.json().get("models", [])]
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _is_pulled(wanted: str, pulled: list[str]) -> bool:
+    """``wanted`` as Ollama resolves it: a name without a tag means ``:latest``."""
+
+    full = wanted if ":" in wanted else f"{wanted}:latest"
+    return any(name in (wanted, full) for name in pulled)
+
+
 def _device(path: Path) -> int | None:
     for candidate in (path, *path.parents):
         try:
@@ -75,6 +96,8 @@ def diagnose(
     disk_usage: Callable[[str], Any] = shutil.disk_usage,
     environ: dict[str, str] | None = None,
     cpu_count: int | None = None,
+    ollama_models: Callable[[AppSettings], list[str] | None] | None = None,
+    index: IndexSize | None = None,
 ) -> list[Finding]:
     """Every finding for ``settings`` on this machine; ``chunk_counts`` (document ->
     passages) adds the index's."""
@@ -124,7 +147,11 @@ def diagnose(
         models = (
             _MODELS_BYTES_FP32 if not settings.reranker_onnx_file.strip() else _MODELS_BYTES_INT8
         )
-        ingest = int(settings.ingest_max_pending_bytes) * _INGEST_EXPANSION
+        # The backlog is held as uploaded; only the documents being indexed at once
+        # (INGEST_WORKERS of them, each at most MAX_UPLOAD_BYTES) are held parsed.
+        pending = int(settings.ingest_max_pending_bytes)
+        parsing = int(settings.ingest_workers) * min(int(settings.max_upload_bytes), pending)
+        ingest = pending + parsing * (_INGEST_EXPANSION - 1)
         needed = models + ingest
         if needed > limit * 0.9:
             found.append(
@@ -132,7 +159,8 @@ def diagnose(
                     "warning",
                     "INGEST_MAX_PENDING_BYTES",
                     f"The models (~{models // 1024**2} MB) and a full ingest backlog "
-                    f"(~{ingest // 1024**2} MB once parsed) can need ~{needed // 1024**2} MB, "
+                    f"(~{ingest // 1024**2} MB with {settings.ingest_workers} documents "
+                    f"being parsed) can need ~{needed // 1024**2} MB, "
                     f"against {limit // 1024**2} MB available: the process may be killed "
                     "for memory. Lower INGEST_MAX_PENDING_BYTES or raise the limit.",
                 )
@@ -186,6 +214,24 @@ def diagnose(
             )
         )
 
+    if settings.llm_provider == "ollama":
+        pulled = (ollama_models or _ollama_models)(settings)
+        wanted = settings.llm_model.strip()
+        if pulled is not None and wanted and not _is_pulled(wanted, pulled):
+            found.append(
+                Finding(
+                    "warning",
+                    "LLM_MODEL",
+                    f"Ollama is reachable but has no model '{wanted}': every question "
+                    f"will fail until it is pulled (`ollama pull {wanted}`) or LLM_MODEL "
+                    "names one it has"
+                    + (f" ({', '.join(sorted(pulled)[:5])})." if pulled else "."),
+                )
+            )
+
+    if index is not None:
+        found.extend(_index_findings(index, memory_limit()))
+
     for name, count in sorted((chunk_counts or {}).items()):
         if count > LARGE_DOCUMENT_CHUNKS:
             found.append(
@@ -196,4 +242,45 @@ def diagnose(
                     "and a summary reads a sample of it. Splitting it may serve better.",
                 )
             )
+    return found
+
+
+# A share of the machine's memory the vectors alone take that is worth saying.
+_VECTOR_MEMORY_SHARE = 0.25
+
+
+def _index_findings(index: IndexSize, memory: int | None) -> list[Finding]:
+    found: list[Finding] = []
+    megabytes = index.vector_bytes // (1024 * 1024)
+    if index.status == "red":
+        found.append(
+            Finding(
+                "warning",
+                "QDRANT",
+                "Qdrant reports the collection as red: an operation on it failed (a full "
+                "disk is the usual cause). Its log says which; searches may miss passages "
+                "until it recovers.",
+            )
+        )
+    if memory and index.vector_bytes > memory * _VECTOR_MEMORY_SHARE:
+        found.append(
+            Finding(
+                "warning",
+                "QDRANT",
+                f"{index.points} passages: their vectors alone take about {megabytes} MB, "
+                f"over a quarter of this machine's {memory // (1024 * 1024)} MB. Qdrant "
+                "needs that much memory or reads them from disk on every search; "
+                "QDRANT_QUANTIZATION=scalar searches a copy a quarter the size.",
+            )
+        )
+    else:
+        found.append(
+            Finding(
+                "note",
+                "QDRANT",
+                f"{index.points} passages in {index.segments} segment(s), status "
+                f"{index.status}; their vectors take about {megabytes} MB (an estimate "
+                "from the count: Qdrant reports no sizes per collection).",
+            )
+        )
     return found

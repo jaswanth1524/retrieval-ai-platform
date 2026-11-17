@@ -33,6 +33,7 @@ from api.document_ops import enqueue_refreshed
 from api.ingest_jobs import IngestQueue
 from api.jobs import IngestJob
 from api.metrics import url_refresh_overdue, url_refresh_total
+from api.notify import notify
 from api.qdrant_schema import CollectionSchemaError
 from api.repository import DocumentMetadata, VectorRepository
 from api.settings import AppSettings
@@ -42,6 +43,10 @@ from api.workspace_target import WorkspaceTarget
 from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
+
+# A source that failed this many checks in a row is worth telling the operator about
+# (one blip isn't).
+NOTIFY_AFTER_FAILURES = 3
 
 URL_REFRESH_PASS_SECONDS = 60.0
 # The longest a failing document waits between checks (unless its interval is longer).
@@ -140,6 +145,11 @@ class UrlRefresher(BackgroundLoop):
             dataclasses.replace(checked, next_due=refresh_due(meta, checked, self._every) or 0.0),
         )
         url_refresh_total.labels(outcome="failed").inc()
+        notify(
+            "url_refresh_failed",
+            f"The scheduled refresh of '{name}' fetched a file that couldn't be indexed; "
+            "the indexed version is unchanged.",
+        )
 
     def run_once(self) -> dict[str, int]:
         """Check what is due in every workspace, earliest due first; how many of each
@@ -209,6 +219,13 @@ class UrlRefresher(BackgroundLoop):
                     if outcome == "failed"
                     else 0
                 )
+                if failures == NOTIFY_AFTER_FAILURES:
+                    notify(
+                        "url_refresh_failed",
+                        f"The scheduled refresh of '{name}' has failed {failures} times in "
+                        "a row; the indexed version is unchanged. It keeps trying, less "
+                        "often.",
+                    )
                 checked = RefreshState(now, outcome, failures, 0.0)
                 self._state.record(
                     collection,

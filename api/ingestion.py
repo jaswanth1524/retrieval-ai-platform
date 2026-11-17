@@ -104,6 +104,27 @@ _filename_locks_guard = Lock()
 _filename_locks: dict[str, _LockEntry] = {}
 
 
+# Passages embedded per second, smoothed over this process's ingests: what a preview's
+# time estimate divides by. Small documents say little (fixed costs dominate).
+_EMBED_RATE_MIN_CHUNKS = 8
+_embed_rate: float | None = None
+_embed_rate_lock = Lock()
+
+
+def _note_embed_rate(chunks: int, seconds: float) -> None:
+    global _embed_rate
+    if chunks < _EMBED_RATE_MIN_CHUNKS or seconds <= 0:
+        return
+    rate = chunks / seconds
+    with _embed_rate_lock:
+        _embed_rate = rate if _embed_rate is None else 0.7 * _embed_rate + 0.3 * rate
+
+
+def measured_embed_rate() -> float | None:
+    with _embed_rate_lock:
+        return _embed_rate
+
+
 @contextmanager
 def filename_write_lock(filename: str) -> Iterator[None]:
     """Hold the process-wide write lock for ``filename`` for the duration of the block.
@@ -322,7 +343,9 @@ def ingest_chunks(
         )
     embed_start = time.monotonic()
     embeddings = _embed_all(chunks, settings, embedding_provider, precondition, on_progress, reused)
-    ingest_stage_seconds.labels(stage="embed").observe(time.monotonic() - embed_start)
+    embed_seconds = time.monotonic() - embed_start
+    ingest_stage_seconds.labels(stage="embed").observe(embed_seconds)
+    _note_embed_rate(total - len(reused), embed_seconds)
 
     # Filenames are locked in sorted order so two multi-file ingests that share more
     # than one filename can never deadlock on each other.

@@ -8,6 +8,7 @@ vi.mock('../../src/api/client', async () => {
   return { ...actual, api };
 });
 
+import { setWorkspace } from '../../src/api/client';
 import {
   CITATION_WINDOW_RADIUS,
   clearPrefetchedContent,
@@ -37,6 +38,20 @@ describe('citation content prefetch', () => {
     await expect(takePrefetchedContent('a.md', 'c1')).resolves.toBe(page);
     expect(takePrefetchedContent('a.md', 'c1')).toBeUndefined();
     expect(takePrefetchedContent('a.md', 'c2')).toBeUndefined();
+  });
+
+  it('never hands one workspace’s prefetch to another', async () => {
+    try {
+      setWorkspace('legal');
+      prefetchCitationContent('a.md', 'c1');
+      setWorkspace('');
+      expect(takePrefetchedContent('a.md', 'c1')).toBeUndefined();
+      setWorkspace('legal');
+      prefetchCitationContent('a.md', 'c1');
+      await expect(takePrefetchedContent('a.md', 'c1')).resolves.toBe(page);
+    } finally {
+      setWorkspace('');
+    }
   });
 
   it('does not hand over a prefetch older than 30 seconds', () => {

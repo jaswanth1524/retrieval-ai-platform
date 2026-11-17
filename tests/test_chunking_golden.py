@@ -168,6 +168,15 @@ def _documents() -> dict[str, bytes]:
         b"Security training comes first.\n"
     )
     documents["guide.rst"] = b"Guide\n=====\n\nInstall the package first.\n\nThen run it.\n"
+    documents["rates.tsv"] = b"city\tnightly cap\nParis\t180\nOslo, Norway\t210\n"
+    documents["tickets.jsonl"] = (
+        b'{"id": 1, "title": "Laptop broken", "status": "open"}\n\n'
+        b'{"id": 2, "title": "VPN slow", "tags": ["network", "remote"]}\n'
+    )
+    documents["feed.xml"] = (
+        b'<?xml version="1.0"?><policy><title>Travel</title>'
+        b"<rule>Book fourteen days ahead.</rule><rule>Economy by default.</rule></policy>"
+    )
     return documents
 
 

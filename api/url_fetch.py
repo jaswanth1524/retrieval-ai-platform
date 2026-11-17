@@ -48,7 +48,12 @@ from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
-from api.documents import SUPPORTED_EXTENSIONS, DocumentError, validate_upload_filename
+from api.documents import (
+    SUPPORTED_EXTENSIONS,
+    DocumentError,
+    normalize_filename,
+    validate_upload_filename,
+)
 from api.settings import AppSettings
 
 MAX_REDIRECTS = 3
@@ -66,6 +71,12 @@ _TYPE_EXTENSIONS = {
     "text/plain": ".txt",
     "text/markdown": ".md",
     "text/csv": ".csv",
+    "text/tab-separated-values": ".tsv",
+    "application/xml": ".xml",
+    "text/xml": ".xml",
+    "application/x-ndjson": ".jsonl",
+    "application/jsonl": ".jsonl",
+    "text/css": ".css",
     "application/epub+zip": ".epub",
     "message/rfc822": ".eml",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
@@ -82,6 +93,8 @@ _TYPE_EXTENSIONS = {
     "application/x-subrip": ".srt",
     "application/json": ".json",
     "application/yaml": ".yaml",
+    "application/zip": ".zip",
+    "application/x-zip-compressed": ".zip",
     "image/png": ".png",
     "image/jpeg": ".jpg",
     "image/tiff": ".tiff",
@@ -427,7 +440,14 @@ def _name_from_disposition(value: str | None) -> str | None:
     return name.strip() or None if name else None
 
 
-def choose_filename(url: str, content_type: str, disposition: str | None, given: str | None) -> str:
+def choose_filename(
+    url: str,
+    content_type: str,
+    disposition: str | None,
+    given: str | None,
+    *,
+    archive: bool = False,
+) -> str:
     """The stored name: the one asked for, else the server's, else the URL's last path
     segment — with an extension from the content type when that names no supported one."""
 
@@ -437,15 +457,20 @@ def choose_filename(url: str, content_type: str, disposition: str | None, given:
         path = PurePosixPath(unquote(urlsplit(url).path))
         candidate = path.name or (urlsplit(url).hostname or "document")
     candidate = re.sub(r"[\x00-\x1f/\\]+", "_", candidate)
-    if PurePosixPath(candidate).suffix.lower() not in SUPPORTED_EXTENSIONS:
+    # A zip of documents (POST /documents/archive-from-url) is the one type accepted
+    # then, and only then.
+    wanted = frozenset({".zip"}) if archive else SUPPORTED_EXTENSIONS
+    if PurePosixPath(candidate).suffix.lower() not in wanted:
         extension = _TYPE_EXTENSIONS.get(content_kind)
         # An image without the ocr extra installed: not a type this server indexes.
-        if extension is None or extension not in SUPPORTED_EXTENSIONS:
+        if extension is None or extension not in wanted:
             raise UrlFetchError(
                 f"The URL returned '{content_kind or 'no content type'}', which DocRAG "
                 "can't index; name the file with a supported extension to override."
             )
         candidate = f"{candidate}{extension}"
+    if archive:
+        return normalize_filename(candidate)
     return validate_upload_filename(candidate)
 
 
@@ -460,6 +485,7 @@ def fetch_document(
     clock: Callable[[], float] = time.monotonic,
     etag: str | None = None,
     last_modified: str | None = None,
+    archive: bool = False,
 ) -> FetchedDocument:
     """Download ``url`` within the guards above; blocking (run it off the event loop).
 
@@ -472,7 +498,8 @@ def fetch_document(
     returns a ``not_modified`` document with no content.
     """
 
-    limit = int(settings.max_upload_bytes)
+    # ``archive``: a zip of documents, held to MAX_IMPORT_BYTES as an uploaded one is.
+    limit = int(settings.max_import_bytes if archive else settings.max_upload_bytes)
     allow_private = bool(settings.url_ingest_allow_private)
     deadline = clock() + float(settings.url_ingest_timeout_seconds)
     current = url.strip()
@@ -500,6 +527,7 @@ def fetch_document(
             remaining,
             watchdog,
             _conditional_headers(etag, last_modified),
+            archive=archive,
         )
     except (UrlFetchError, httpx.HTTPError) as exc:
         if not watchdog.fired:
@@ -522,6 +550,8 @@ def _fetch(
     remaining: Callable[[str], float],
     watchdog: _Watchdog,
     conditional: dict[str, str] | None = None,
+    *,
+    archive: bool = False,
 ) -> FetchedDocument:
     with httpx.Client(follow_redirects=False, transport=transport) as client:
         for _ in range(MAX_REDIRECTS + 1):
@@ -576,7 +606,11 @@ def _fetch(
                 )
                 disposition = response.headers.get("content-disposition")
                 name = choose_filename(
-                    current, response.headers.get("content-type", ""), disposition, filename
+                    current,
+                    response.headers.get("content-type", ""),
+                    disposition,
+                    filename,
+                    archive=archive,
                 )
                 remote_named = not (filename or "").strip() and name != _requested_name(
                     url, response.headers.get("content-type", "")

@@ -1,6 +1,12 @@
 import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, apiErrorMessage, getWorkspace } from './api/client';
-import type { LlmProvider, PublicConfigResponse, QuestionOverrides } from './api/types';
+import type {
+  CitationResponse,
+  DocumentChunkResponse,
+  LlmProvider,
+  PublicConfigResponse,
+  QuestionOverrides,
+} from './api/types';
 import ChatHeader from './components/ChatHeader';
 import type { ChatMode } from './components/ChatHeader';
 import ChatThread from './components/ChatThread';
@@ -22,11 +28,29 @@ import ToastRow from './components/ToastRow';
 import SearchPanel, { type SearchRequestFromElsewhere } from './components/SearchPanel';
 import TracesPanel from './components/TracesPanel';
 import SavedPanel from './components/SavedPanel';
+import CollectedPanel from './components/CollectedPanel';
+import {
+  BASKET_STORAGE_KEY,
+  QUOTES_STORAGE_KEY,
+  addToBasket,
+  clearBasket,
+  quotesToMarkdown,
+  readBasket,
+  readQuotes,
+  removeFromBasket,
+  removeQuote,
+  saveQuote,
+  type BasketPassage,
+} from './utils/collected';
+import { downloadFile } from './utils/exportChat';
+import { newId } from './utils/id';
+import { recallReading } from './utils/readingMemory';
+import type { SelectedQuote } from './components/SelectionActions';
 import ReviewPanel from './components/ReviewPanel';
 import FeedbackPanel from './components/FeedbackPanel';
 import UnansweredPanel from './components/UnansweredPanel';
 import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
-import { useChat } from './hooks/useChat';
+import { useChat, type SavedAnswer } from './hooks/useChat';
 import { useScopePresets } from './hooks/useScopePresets';
 import { useStableHandler } from './hooks/useStableHandler';
 import { useCommands } from './hooks/useCommands';
@@ -114,6 +138,18 @@ function App() {
   const [mode, setModeState] = useState<ChatMode>(loadPersistedMode);
   const [rail, setRail] = useState<RailPanel>('chat');
   const [searchOpened, setSearchOpened] = useState(false);
+  // Quotes and the passage basket, kept in this browser (utils/collected.ts) and
+  // followed across tabs.
+  const [quotes, setQuotes] = useState(readQuotes);
+  const [basket, setBasket] = useState(readBasket);
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === QUOTES_STORAGE_KEY) setQuotes(readQuotes());
+      if (event.key === BASKET_STORAGE_KEY) setBasket(readBasket());
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
   if (rail === 'search' && !searchOpened) setSearchOpened(true);
   // Kept once opened, like Search: files staged for upload, a selection and the filter
   // were lost on every switch to another panel and back.
@@ -162,6 +198,8 @@ function App() {
     filename: string;
     chunkId: string | null;
     highlights?: string[];
+    /** ``chunkId`` is where the reader left off (Read), not a cited passage. */
+    resume?: boolean;
   } | null>(null);
   const corpusBrowseInputRef = useRef<HTMLInputElement>(null);
   const {
@@ -193,6 +231,7 @@ function App() {
     setTurnFeedback,
     setSourceIrrelevant,
     setTurnSaved,
+    setTurnNote,
     restoreAnswerVersion,
     setTurnReviewed,
     scope,
@@ -205,6 +244,7 @@ function App() {
     importConversations,
     importPreview,
     historyReady,
+    trashedVersion,
     allConversationsJson,
   } = useChat();
   // A deleted conversation's unsent draft goes with it, whichever tab deleted it. After
@@ -437,9 +477,16 @@ function App() {
     (conversation: Conversation) => {
       setPinnedTraceId(null);
       setHoveredCitation(null);
-      restoreConversation(conversation);
+      restoreConversation(conversation, true);
+      // As opening it from the list does: on a phone the drawer would stay over it.
+      setPanelDrawerOpen(false);
+      pushToast({ tone: 'good', title: 'Conversation restored', body: conversation.title });
     },
-    [restoreConversation, setPinnedTraceId, setHoveredCitation],
+    [restoreConversation, setPinnedTraceId, setHoveredCitation, pushToast],
+  );
+  const liveConversationIds = useMemo(
+    () => new Set(conversations.map((conversation) => conversation.id)),
+    [conversations],
   );
   const deleteConversation = useCallback(
     (id: string) => {
@@ -473,6 +520,10 @@ function App() {
   );
   // A conversation search hit names the turn it matched: the thread scrolls to it.
   const [focusTurn, setFocusTurn] = useState<{ turnId: string } | null>(null);
+  // "Ask again" from Saved answers or Needs review: the conversation is opened, then
+  // the question asked again in place once it is the open one (the answer it replaces
+  // stays as an earlier version, with its word diff).
+  const [askAgainPending, setAskAgainPending] = useState<SavedAnswer | null>(null);
   const switchConversationFromList = useCallback(
     (id: string, turnId?: string) => {
       switchConversation(id);
@@ -761,8 +812,9 @@ function App() {
   // What an answer can be asked again of (Reformat → "Ask …"): one array per change of
   // config or provider, so the memoized messages don't re-render per frame.
   const otherProviders = useMemo(
-    () => (config && !readOnly ? otherUsableProviders(selectedProvider, config) : []),
-    [config, selectedProvider, readOnly],
+    // A read-only key may ask questions, of any usable model.
+    () => (config ? otherUsableProviders(selectedProvider, config) : []),
+    [config, selectedProvider],
   );
   const currentModelLabel = config
     ? selectedProvider === 'ollama'
@@ -779,6 +831,16 @@ function App() {
     setSearchRequest({ query: question, id: Date.now() });
     setRail('search');
     if (panelCollapsed) setPanelDrawerOpen(true);
+  });
+  // Text selected in an answer or in the viewer: the viewer covers the whole window,
+  // so it is closed first — the question box and the Search panel are behind it.
+  const askAboutSelection = useStableHandler((text: string) => {
+    setSourceView(null);
+    suggestQuestion(text);
+  });
+  const searchForSelection = useStableHandler((text: string) => {
+    setSourceView(null);
+    searchForPassages(text);
   });
   // ...or the passages most like one the viewer shows ("more like this").
   const findSimilarPassages = useStableHandler((chunkId: string, label: string) => {
@@ -839,7 +901,9 @@ function App() {
     [],
   );
   const handleReadDocument = useCallback((filename: string) => {
-    setSourceView({ filename, chunkId: null });
+    // Where the reader left it last time, else the top.
+    const place = recallReading(getWorkspace() ?? '', filename);
+    setSourceView({ filename, chunkId: place, ...(place ? { resume: true } : {}) });
     // On a narrow screen the panel is a drawer over the viewer's opener.
     setPanelDrawerOpen(false);
   }, []);
@@ -921,6 +985,7 @@ function App() {
     allConversationsJson,
     pushToast,
     noteAuthFailure,
+    conversationWorkspace ?? workspace,
   );
   // The print stylesheet (global.css) leaves only the conversation on the page.
   const printConversation = useStableHandler(() => window.print());
@@ -1256,9 +1321,95 @@ function App() {
     else if (rail === 'feedback') loadFeedback();
     else if (rail === 'unanswered') loadUnanswered();
     else if (rail === 'saved') exportSavedAnswers();
+    else if (rail === 'collected') {
+      downloadFile(
+        `quotes-${new Date().toISOString().slice(0, 10)}.md`,
+        'text/markdown',
+        quotesToMarkdown(quotes, window.location),
+      );
+    }
     // Its "changed since" flags come from the corpus listing: read it again.
     else if (rail === 'review') void refreshDocuments().catch(noteAuthFailure);
     else loadTraces();
+  });
+
+  const keepQuote = useStableHandler((quote: SelectedQuote) => {
+    setQuotes(
+      saveQuote({
+        id: newId(),
+        ...quote,
+        workspace: getWorkspace() ?? '',
+        savedAt: Date.now(),
+      }),
+    );
+  });
+  const collectPassages = useStableHandler(
+    (passages: Omit<BasketPassage, 'workspace' | 'addedAt'>[]) => {
+      const next = addToBasket(
+        passages.map((passage) => ({
+          ...passage,
+          workspace: getWorkspace() ?? '',
+          addedAt: Date.now(),
+        })),
+      );
+      setBasket(next);
+      pushToast({ tone: 'good', title: `${passages.length === 1 ? 'Passage' : `${passages.length} passages`} in the basket` });
+    },
+  );
+  const openCollected = useStableHandler(
+    (filename: string, chunkId: string | null, inWorkspace: string) => {
+      if (inWorkspace !== (getWorkspace() ?? '')) chooseWorkspaceRef.current(inWorkspace);
+      setSourceView({ filename, chunkId });
+      setPanelDrawerOpen(false);
+    },
+  );
+  // Stable: the memoized viewer re-renders only when what it shows changes.
+  const collectViewedPassage = useStableHandler((chunk: DocumentChunkResponse) => {
+    if (!sourceView) return;
+    collectPassages([
+      {
+        chunkId: chunk.chunk_id,
+        filename: sourceView.filename,
+        page: chunk.page,
+        pageEnd: chunk.page_end ?? null,
+        section: chunk.section,
+        snippet: chunk.text.replace(/\s+/g, ' ').slice(0, 200),
+      },
+    ]);
+  });
+  const [basketFocusKey, setBasketFocusKey] = useState(0);
+  const askWithinSources = useStableHandler((sources: CitationResponse[]) => {
+    collectPassages(
+      sources.map((source) => ({
+        chunkId: source.chunk_id,
+        filename: source.filename,
+        page: source.page,
+        pageEnd: source.page_end ?? null,
+        section: source.section,
+        snippet: (source.text ?? '').replace(/\s+/g, ' ').slice(0, 200),
+      })),
+    );
+    showPanel('collected');
+    setBasketFocusKey((key) => key + 1);
+  });
+  const askSavedAgain = useStableHandler((item: SavedAnswer) => {
+    if (streamingConversationId !== null) {
+      pushToast({ tone: 'warn', title: 'An answer is still being written', body: 'Ask again once it is done.' });
+      return;
+    }
+    switchConversationFromList(item.conversationId, item.turn.id);
+    setAskAgainPending(item);
+  });
+  useEffect(() => {
+    if (!askAgainPending || activeConversationId !== askAgainPending.conversationId) return;
+    const item = askAgainPending;
+    setAskAgainPending(null);
+    if (item.question) {
+      void regenerateQuestion(item.question, undefined, item.narrowing, item.turn.id);
+    }
+  }, [askAgainPending, activeConversationId, regenerateQuestion]);
+  const askAboutBasket = useStableHandler((question: string, chunkIds: string[]) => {
+    askAboutPassages(question, chunkIds);
   });
 
   return (
@@ -1340,7 +1491,11 @@ function App() {
           />
         )}
         {rail === 'chat' && (
-          <RecentlyDeleted version={trashVersion} onRestore={restoreFromTrash} />
+          <RecentlyDeleted
+            version={trashVersion + trashedVersion}
+            liveIds={liveConversationIds}
+            onRestore={restoreFromTrash}
+          />
         )}
         {rail === 'corpus' && workspacesEnabled && (
           <WorkspaceBar
@@ -1428,6 +1583,18 @@ function App() {
               onAuthFailure={noteAuthFailure}
               onAskAboutPassages={askAboutPassages}
               askDisabled={summarizeDisabled}
+              onCollect={(results) =>
+                collectPassages(
+                  results.map((result) => ({
+                    chunkId: result.chunk_id,
+                    filename: result.filename,
+                    page: result.page,
+                    pageEnd: result.page_end ?? null,
+                    section: result.section,
+                    snippet: result.text.replace(/\s+/g, ' ').slice(0, 200),
+                  })),
+                )
+              }
             />
           </div>
         )}
@@ -1456,7 +1623,9 @@ function App() {
             answers={reviewAnswers}
             onOpen={switchConversationFromList}
             sourceChangeOf={sourceChangeOf}
-            onMarkReviewed={readOnly ? undefined : markReviewed}
+            // Kept in this browser: nothing a read-only key is refused.
+            onMarkReviewed={markReviewed}
+            onAskAgain={summarizeDisabled ? undefined : askSavedAgain}
           />
         )}
         {rail === 'saved' && (
@@ -1464,8 +1633,24 @@ function App() {
             answers={savedAnswers}
             onOpen={switchConversationFromList}
             onUnsave={unsaveAnswer}
+            onSetNote={setTurnNote}
+            onAskAgain={summarizeDisabled ? undefined : askSavedAgain}
             sourceChangeOf={sourceChangeOf}
             workspace={workspace}
+          />
+        )}
+        {rail === 'collected' && (
+          <CollectedPanel
+            quotes={quotes}
+            basket={basket}
+            workspace={workspace}
+            onOpenPassage={openCollected}
+            onRemoveQuote={(id) => setQuotes(removeQuote(id))}
+            onRemovePassages={(ids) => setBasket(removeFromBasket(ids))}
+            onClearBasket={() => setBasket(clearBasket())}
+            onAskAbout={askAboutBasket}
+            onScopeTo={askAbout}
+            focusQuestionKey={basketFocusKey}
           />
         )}
         {rail === 'unanswered' && (
@@ -1504,6 +1689,9 @@ function App() {
               key={activeConversationId ?? 'none'}
               onCopyLink={activeConversationId ? () => copyLink() : undefined}
               usageLabel={usageLabel}
+              workspace={workspace}
+              workspaces={workspacesEnabled ? workspaces : undefined}
+              onSwitchWorkspace={workspacesEnabled ? chooseWorkspace : undefined}
               title={activeConversation?.title ?? 'New chat'}
               scopeLabel={currentScopeLabel}
               mode={mode}
@@ -1531,6 +1719,7 @@ function App() {
               onSearchPassages={searchForPassages}
               onToggleSaved={setTurnSaved}
               onCopyLink={copyLink}
+              onAskWithin={summarizeDisabled ? undefined : askWithinSources}
               onReformat={reformatAnswer}
               onContinue={continueAnswer}
               otherProviders={otherProviders}
@@ -1688,12 +1877,14 @@ function App() {
             <DocumentViewer
               filename={sourceView.filename}
               chunkId={sourceView.chunkId}
+              resume={sourceView.resume}
               highlights={sourceView.highlights}
               onClose={closeSourceView}
               onAskAboutPassage={summarizeDisabled ? undefined : askAboutViewedPassage}
               onFindSimilar={findSimilarPassages}
               onCopyLink={copyPassageLink}
               onGoTo={goToViewedPassage}
+              onCollect={collectViewedPassage}
               onDownloadOriginal={
                 config?.raw_documents_enabled && documents[sourceView.filename]?.reindexable
                   ? downloadViewedOriginal
@@ -1708,7 +1899,11 @@ function App() {
           )}
         </Suspense>
       </LazyChunkBoundary>
-      <SelectionActions onAsk={suggestQuestion} onSearch={searchForPassages} />
+      <SelectionActions
+        onAsk={askAboutSelection}
+        onSearch={searchForSelection}
+        onSave={keepQuote}
+      />
     </div>
   );
 }

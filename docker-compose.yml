@@ -144,8 +144,43 @@ services:
       qdrant:
         condition: service_healthy
 
+  # Optional: Ollama inside compose instead of on the host.
+  #   docker compose --profile ollama up
+  # with OLLAMA_BASE_URL=http://ollama:11434 in .env (`docrag init --ollama-in-compose`
+  # writes it). `ollama-pull` fetches LLM_MODEL once, then exits; the model stays in the
+  # ollama_models volume. CPU only as written: for a GPU, add your runtime's device
+  # reservation to the ollama service.
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    profiles: ["ollama"]
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-pull:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    profiles: ["ollama"]
+    restart: "no"
+    logging: *default-logging
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${LLM_MODEL:-llama3.1:8b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
 volumes:
   qdrant_storage:
   model_cache:
+  # Models pulled by the optional `ollama` profile.
+  ollama_models:
   # The api service's /app/data (job store, kept originals, feedback).
   docrag_data:

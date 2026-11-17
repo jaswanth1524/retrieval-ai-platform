@@ -329,7 +329,7 @@ def test_a_leftover_temp_file_does_not_keep_a_workspace_and_rmdir_failure_is_a_4
     directory = ws.raw_dir / "workspaces" / "legal"
     (directory / ".upload-abcd1234").write_bytes(b"half a save")
 
-    def refuse(path: object) -> None:
+    def refuse(path: object, **kwargs: object) -> None:
         raise PermissionError(13, "Permission denied")
 
     # Its own context: undoing the whole monkeypatch would also undo the fixture's.

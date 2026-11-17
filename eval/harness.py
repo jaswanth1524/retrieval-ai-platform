@@ -65,7 +65,8 @@ from eval.feedback_dataset import (
 )
 from eval.metrics import aggregate, baseline_shape_problems, compare_to_baseline, score_ranking
 
-DEFAULT_KS: tuple[int, ...] = (1, 3, 5, 8)
+# 6 is MAX_CONTEXT_CHUNKS's default: hit@6 is what the model was given to read.
+DEFAULT_KS: tuple[int, ...] = (1, 3, 5, 6, 8)
 # reranked is what the API serves; the others score one earlier stage on its own.
 ARMS: tuple[str, ...] = ("reranked", "fused", "dense", "sparse")
 
@@ -114,6 +115,15 @@ class RetrievalExample:
     # only those documents are searched (an empty set: the whole corpus).
     filenames: frozenset[str] = frozenset()
     tags: frozenset[str] = frozenset()
+    # Answer mode: what the answer must NOT state (a superseded value, a figure from the
+    # wrong policy). A number matches as a whole word ("30" is not in "300").
+    answer_excludes: tuple[str, ...] = ()
+    # Answer mode: a conversation. Rows with the same chain id are asked in file order,
+    # each with the earlier ones' questions and the answers this run gave as history.
+    chain: str | None = None
+    # Answer mode: a summary instead of a question (summarize one of ``filenames``,
+    # compare two, or a brief over several); ``question`` is its instruction.
+    task: str | None = None
 
     @property
     def fact_groups(self) -> tuple[tuple[str, ...], ...]:
@@ -395,7 +405,23 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
         answer_contains_all=_fact_groups(data.get("answer_contains_all"), index),
         filenames=_string_set(data.get("filenames"), index, "filenames"),
         tags=_string_set(data.get("tags"), index, "tags"),
+        answer_excludes=tuple(
+            sorted(_string_set(data.get("answer_excludes"), index, "answer_excludes"))
+        ),
+        chain=_optional_text(data.get("chain"), index, "chain"),
+        task=_task(data.get("task"), index),
     )
+    if example.chain and example.history:
+        raise HarnessDataError(
+            f"Example {index}: a 'chain' row's history is the chain's earlier rows; "
+            "it can't also give 'history'."
+        )
+    if example.task and not example.filenames:
+        raise HarnessDataError(
+            f"Example {index}: a '{example.task}' task names its documents in 'filenames'."
+        )
+    if example.task and example.chain:
+        raise HarnessDataError(f"Example {index}: a summary task can't be part of a chain.")
     if expect_no_context and example.fact_groups:
         raise HarnessDataError(
             f"Example {index}: an 'expect_no_context' question has no fact to state "
@@ -409,6 +435,27 @@ def _example_from_mapping(data: dict[str, Any], index: int) -> RetrievalExample:
             "files, chunks or passages."
         )
     return example
+
+
+SUMMARY_TASKS = ("summarize", "compare", "brief")
+
+
+def _optional_text(value: Any, index: int, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise HarnessDataError(f"Example {index}: '{field}' must be a non-empty string.")
+    return value.strip()
+
+
+def _task(value: Any, index: int) -> str | None:
+    if value is None:
+        return None
+    if value not in SUMMARY_TASKS:
+        raise HarnessDataError(
+            f"Example {index}: 'task' must be one of {', '.join(SUMMARY_TASKS)}."
+        )
+    return str(value)
 
 
 def _fact_groups(value: Any, index: int) -> tuple[tuple[str, ...], ...]:
@@ -813,7 +860,8 @@ def build_parser() -> argparse.ArgumentParser:
     queries.add_argument(
         "--review",
         type=Path,
-        help="Unanswered questions, drafted as expect_no_context rows to check (.jsonl).",
+        help="Rows to check by hand (.jsonl): unanswered questions drafted as "
+        "expect_no_context, and answers that cited nothing with their documents as a draft.",
     )
 
     ingest = sub.add_parser("ingest", help="Index every document in a directory.")
@@ -834,6 +882,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep the rows a previous run of this dataset and output already saved "
         "(OUTPUT.partial.jsonl) and answer only the rest.",
     )
+    recorded = answer.add_mutually_exclusive_group()
+    recorded.add_argument(
+        "--record", type=Path, help="Also append every model reply to this file (JSONL)."
+    )
+    recorded.add_argument(
+        "--replay",
+        type=Path,
+        help="Answer every model call from a recording instead (no LLM); a call it "
+        "doesn't hold makes that question an error row.",
+    )
+    answer.add_argument(
+        "--baseline", type=Path, help="Fail when an answer metric is worse than this run's."
+    )
+    answer.add_argument(
+        "--max-regression",
+        type=float,
+        default=0.0,
+        help="How far a metric may fall short of --baseline (default 0).",
+    )
+    answer.add_argument("--provider", help="LLM_PROVIDER for this run (a model comparison).")
+    answer.add_argument("--model", help="The model for --provider (LLM_MODEL, OPENAI_MODEL...).")
+
+    from_run = sub.add_parser(
+        "baseline-from", help="An answer run's fingerprint and metrics as its baseline."
+    )
+    from_run.add_argument("run", type=Path)
+    from_run.add_argument("output", type=Path)
+
+    table = sub.add_parser(
+        "models", help="One table of several answer runs: facts, uncited, seconds, cost."
+    )
+    table.add_argument("runs", type=Path, nargs="+")
+
+    calibrate = sub.add_parser(
+        "calibrate", help="The rerank bar that best separates answerable questions."
+    )
+    calibrate.add_argument("datasets", type=Path, nargs="+")
 
     diff = sub.add_parser(
         "diff", help="List the questions that got better or worse between two runs (no Qdrant)."
@@ -941,6 +1026,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return ingest_directory(args.directory, get_settings())
     if args.command == "from-feedback":
         return dataset_from_feedback(args)
+    if args.command == "baseline-from":
+        data = json.loads(args.run.read_text(encoding="utf-8"))
+        baseline = {"fingerprint": data["fingerprint"], "metrics": data["metrics"]}
+        args.output.write_text(json.dumps(baseline, indent=2) + "\n", encoding="utf-8")
+        return 0
+    if args.command == "models":
+        print(models_table(args.runs))
+        return 0
     if args.command in ("diff", "report"):
         return compare_runs(args)
     if args.command == "generate":
@@ -949,7 +1042,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return dataset_from_queries(args)
 
     try:
-        examples = load_retrieval_dataset(args.dataset)
+        datasets = args.datasets if args.command == "calibrate" else [args.dataset]
+        examples = [e for dataset in datasets for e in load_retrieval_dataset(dataset)]
     except HarnessDataError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -993,10 +1087,138 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _check_baseline(results, args.baseline, args.max_regression)
         return 0
 
+    if args.command == "calibrate":
+        return run_calibrate(examples, Collaborators(settings))
+
     # answer mode
     if args.limit > 0:
         examples = examples[: args.limit]
-    return run_answer_eval(examples, Collaborators(settings), args.output, resume=args.resume)
+    settings = with_model(settings, args.provider, args.model)
+    collaborators = Collaborators(settings)
+    replay = None
+    if args.replay is not None:
+        from eval.replay import ReplayGenerator
+
+        replay = ReplayGenerator(args.replay)
+        collaborators.generator = replay
+    elif args.record is not None:
+        from eval.replay import RecordingGenerator
+
+        if not args.resume:
+            # A new recording: the replies of an earlier one would be kept beside
+            # this one's (the last for a call wins, but stale ones would linger).
+            args.record.parent.mkdir(parents=True, exist_ok=True)
+            args.record.write_text("", encoding="utf-8")
+        collaborators.generator = RecordingGenerator(collaborators.generator, args.record)
+    code = run_answer_eval(examples, collaborators, args.output, resume=args.resume, replay=replay)
+    if code or args.baseline is None:
+        return code
+    return _check_answer_baseline(args.output, args.baseline, args.max_regression)
+
+
+_MODEL_SETTINGS = {
+    "ollama": "llm_model",
+    "openai": "openai_model",
+    "anthropic": "anthropic_model",
+    "openai_compatible": "openai_compatible_model",
+}
+
+
+def with_model(settings: AppSettings, provider: str | None, model: str | None) -> AppSettings:
+    """``settings`` answering with ``provider``'s ``model`` (either may be left out)."""
+
+    update: dict[str, Any] = {}
+    if provider:
+        if provider not in _MODEL_SETTINGS:
+            raise SystemExit(f"error: unknown provider {provider!r}")
+        update["llm_provider"] = provider
+    if model:
+        update[_MODEL_SETTINGS[provider or settings.llm_provider]] = model
+    return settings.model_copy(update=update) if update else settings
+
+
+def _check_answer_baseline(output: Path, baseline_path: Path, tolerance: float) -> int:
+    from eval.replay import answer_regressions
+
+    try:
+        metrics = json.loads(output.read_text(encoding="utf-8"))["metrics"]
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))["metrics"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"error: could not read the answer baseline: {exc}", file=sys.stderr)
+        return 2
+    problems = answer_regressions(metrics, baseline, tolerance)
+    for problem in problems:
+        print(f"regression: {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def run_calibrate(examples: Sequence[RetrievalExample], collaborators: Collaborators) -> int:
+    """Each labeled question's best rerank score, then the bar that separates them."""
+
+    from eval.calibrate import best_bar, judge
+
+    settings = collaborators.settings
+    pipeline = _pipeline(
+        collaborators.repository,
+        collaborators.embedding_provider,
+        collaborators.reranker,
+        settings,
+        None,
+    )
+    answerable: list[float] = []
+    unanswerable: list[float] = []
+    for example in examples:
+        if not example.labeled or example.task:
+            continue
+        phase = pipeline.retrieve(
+            example.question,
+            filenames=sorted(example.filenames) or None,
+            tags=sorted(example.tags) or None,
+        )
+        scores = [c.rerank_score for c in phase.scored_chunks]
+        top = max(scores, default=float("-inf"))
+        (unanswerable if example.expect_no_context else answerable).append(top)
+        print(f"{top:8.4f}  {'no  ' if example.expect_no_context else 'yes '} {example.question}")
+    current = judge(float(settings.rerank_min_score), answerable, unanswerable)
+    print(
+        f"\n{len(answerable)} answerable, {len(unanswerable)} not. RERANK_MIN_SCORE="
+        f"{current.bar}: {current.refused_answerable} answerable below it, "
+        f"{current.answered_unanswerable} unanswerable above it."
+    )
+    suggested = best_bar(answerable, unanswerable)
+    if suggested is None:
+        print("A suggestion needs questions of both kinds (labels and expect_no_context).")
+        return 0
+    print(
+        f"Best bar: {suggested.bar:.4f} ({suggested.refused_answerable} answerable below, "
+        f"{suggested.answered_unanswerable} unanswerable above)."
+    )
+    return 0
+
+
+def models_table(runs: Sequence[Path]) -> str:
+    """One row per answer run: its model and how it did."""
+
+    lines = [
+        f"{'run':30} {'model':24} {'facts':>6} {'uncited':>8} {'unsupp.':>8} "
+        f"{'sec/q':>6} {'cost $':>8}"
+    ]
+    for path in runs:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows = data.get("examples", [])
+        metrics = data.get("metrics", {})
+        fingerprint = data.get("fingerprint", {})
+        seconds = sum(r.get("seconds", 0.0) for r in rows) / max(len(rows), 1)
+        cost = sum(r.get("cost_usd") or 0.0 for r in rows)
+        model = f"{fingerprint.get('llm_provider', '?')}/{fingerprint.get('llm_model', '?')}"
+        lines.append(
+            f"{path.stem[:30]:30} {model[:24]:24} "
+            f"{metrics.get('fact_hit_rate', float('nan')):6.2f} "
+            f"{metrics.get('uncited_rate', float('nan')):8.2f} "
+            f"{metrics.get('unsupported_claims_mean', float('nan')):8.2f} "
+            f"{seconds:6.1f} {cost:8.4f}"
+        )
+    return "\n".join(lines)
 
 
 def generate_dataset(args: argparse.Namespace) -> int:
@@ -1042,7 +1264,7 @@ def dataset_from_queries(args: argparse.Namespace) -> int:
         write_jsonl(args.review, review)
     print(
         f"{len(labelled)} answered questions written to {args.output}; "
-        f"{len(review)} unanswered" + (f" in {args.review}" if args.review else "")
+        f"{len(review)} to review" + (f" in {args.review}" if args.review else "")
     )
     return 0
 

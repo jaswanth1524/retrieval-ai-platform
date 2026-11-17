@@ -523,7 +523,9 @@ def test_failed_ingest_does_not_store_or_replace_the_original(
         # The still-indexed version keeps its original; the failed upload left none.
         assert client.get("/documents/guide.txt/original").content == b"version one"
         assert client.get("/documents/empty.txt/original").status_code == 404
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["guide.txt"]
+    # ".meta" holds the kept document's details (tags, upload time) for a rebuild.
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".meta", "guide.txt"]
+    assert [path.name for path in (tmp_path / ".meta").iterdir()] == ["guide.txt"]
 
 
 def test_failed_original_save_drops_the_previous_original_instead_of_serving_it(

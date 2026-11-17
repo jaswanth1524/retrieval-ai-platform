@@ -9,6 +9,7 @@ import { enterAddsNewline } from '../utils/platform';
 import { readDraft, writeDraft } from '../utils/drafts';
 import { QUESTION_INPUT_ID } from '../utils/id';
 import { MAX_QUESTION_CHARS } from '../utils/limits';
+import { singleKeyShortcutsOn } from '../utils/shortcuts';
 import { isProviderAllowed, isProviderUsable } from '../utils/providers';
 
 // The most of the window the question box grows to before it scrolls.
@@ -128,7 +129,11 @@ function Composer({
   // Put in to edit or send, never sent by itself; focused so Enter sends it as is.
   useEffect(() => {
     if (!prefill) return;
-    setValue(prefill.text);
+    // Beside what is already typed, never over it: a quote picked while drafting a
+    // question used to wipe the draft.
+    setValue((current) =>
+      current.trim() ? `${current.replace(/\s+$/, '')}\n${prefill.text}`.slice(0, MAX_QUESTION_CHARS) : prefill.text,
+    );
     textareaRef.current?.focus();
   }, [prefill]);
   const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
@@ -158,6 +163,7 @@ function Composer({
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (!singleKeyShortcutsOn()) return; // Settings → Keyboard
       const target = event.target as HTMLElement | null;
       if (
         target?.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]') ||

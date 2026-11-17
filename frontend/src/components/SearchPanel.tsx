@@ -2,7 +2,8 @@ import { Fragment, memo, useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { toCsv } from '../utils/csv';
 import { downloadFile } from '../utils/exportChat';
-import { groupByDocument, readRecentSearches, rememberSearch } from '../utils/searchHistory';
+import { clearRecentSearches, groupByDocument, readRecentSearches, rememberSearch } from '../utils/searchHistory';
+import { singleKeyShortcutsOn } from '../utils/shortcuts';
 import { ApiClientError, api, apiErrorMessage } from '../api/client';
 import type { PassageNarrowing, SearchExplanationResponse, SearchResultResponse } from '../api/types';
 import MarkedText from './MarkedText';
@@ -41,6 +42,8 @@ interface SearchPanelProps {
   onAskAboutPassages?: (question: string, chunkIds: string[]) => void;
   /** Asking can't start now (booting, an answer streaming): the bar's button waits. */
   askDisabled?: boolean;
+  /** Put the ticked passages in the basket (the Quotes & passages panel). */
+  onCollect?: (passages: SearchResultResponse[]) => void;
 }
 
 /** A query to search for, or a passage to find passages like. */
@@ -77,6 +80,7 @@ function SearchPanel({
   request = null,
   onAskAboutPassages,
   askDisabled = false,
+  onCollect,
 }: SearchPanelProps) {
   const [query, setQuery] = useState('');
   // Ticked passages, by chunk id, and the query that found them (asked about them).
@@ -118,6 +122,8 @@ function SearchPanel({
     setFilters(NO_FILTERS);
     setLike(null);
     setExplanation(null);
+    // A workspace switch resets the panel: its recent searches are that workspace's.
+    setRecent(readRecentSearches());
   }, [resetKey]);
 
   const run = useStableHandler(async (text: string, similarTo?: SimilarTo) => {
@@ -182,6 +188,7 @@ function SearchPanel({
   const moveBetweenResults = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key !== 'j' && event.key !== 'k') return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!singleKeyShortcutsOn()) return; // Settings → Keyboard
     const target = event.target as HTMLElement;
     if (target.tagName === 'INPUT' && (target as HTMLInputElement).type !== 'checkbox') return;
     const buttons = [
@@ -190,7 +197,11 @@ function SearchPanel({
     if (buttons.length === 0) return;
     event.preventDefault();
     event.stopPropagation();
-    const current = buttons.findIndex((button) => button.contains(target) || button === target);
+    // From the result itself, or from its pick box or "similar" button beside it.
+    const row = target.closest('.search-panel__item');
+    const current = buttons.findIndex(
+      (button) => button === target || button.contains(target) || Boolean(row?.contains(button)),
+    );
     const next =
       current < 0 ? 0 : Math.max(0, Math.min(buttons.length - 1, current + (event.key === 'j' ? 1 : -1)));
     buttons[next].focus();
@@ -409,7 +420,7 @@ function SearchPanel({
           better ones.
         </p>
       )}
-      {onAskAboutPassages && picked.size > 0 && searchedQuery && (
+      {(onAskAboutPassages || onCollect) && picked.size > 0 && (searchedQuery || like) && (
         <div className="search-panel__ask-bar" data-testid="search-ask-bar">
           <span className="mono">
             {picked.size} passage{picked.size === 1 ? '' : 's'} picked
@@ -421,18 +432,34 @@ function SearchPanel({
           >
             Clear
           </button>
+          {onCollect && (
+            <button
+              type="button"
+              className="search-panel__ask-clear"
+              onClick={() => {
+                onCollect((results ?? []).filter((result) => picked.has(result.chunk_id)));
+                setPicked(new Set());
+              }}
+              data-testid="search-collect"
+            >
+              Add to basket
+            </button>
+          )}
+          {onAskAboutPassages && (
           <button
             type="button"
             className="search-panel__ask"
             aria-disabled={askDisabled}
             onClick={() => {
               if (askDisabled) return;
-              onAskAboutPassages(searchedQuery, [...picked]);
+              // A "similar passages" search has no question of its own.
+              onAskAboutPassages(searchedQuery || 'What do these passages say?', [...picked]);
             }}
             data-testid="search-ask-picked"
           >
             Ask about {picked.size === 1 ? 'it' : 'these'}
           </button>
+          )}
         </div>
       )}
       {results === null && !searching && recent.length > 0 && !query && (
@@ -451,6 +478,14 @@ function SearchPanel({
               {text}
             </button>
           ))}
+          <button
+            type="button"
+            className="search-panel__recent-clear"
+            onClick={() => setRecent(clearRecentSearches())}
+            data-testid="search-recent-clear"
+          >
+            Clear
+          </button>
         </div>
       )}
       {results !== null && results.length > 1 && (

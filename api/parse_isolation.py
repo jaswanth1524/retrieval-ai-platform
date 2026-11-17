@@ -164,6 +164,11 @@ def _parse_in_child(
         result = ("document_error", exc)
     except MemoryError:
         result = ("memory", None)
+    except (OSError, ImportError) as exc:
+        # The process's surroundings (a full temp directory, a missing module).
+        result = ("error", f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - a parser tripping over this file's content
+        result = ("parser_fault", f"{type(exc).__name__}: {exc}")
     except BaseException as exc:  # noqa: BLE001 - reported to the parent, never raised here
         result = ("error", f"{type(exc).__name__}: {exc}")
     try:
@@ -240,7 +245,13 @@ def parse_with_limit(
             f"({settings.parse_memory_limit_mb} MB) allows."
         )
     logger.warning("Parsing %s failed in the parser process: %s", filename, payload)
-    # A document's own faults arrive as "document_error" (the parsers turn ValueError,
-    # RecursionError and their kind into DocumentParseError); what is left is the
-    # process's environment.
+    if status == "parser_fault":
+        # A parser broke on this file's content (an IndexError deep in a PDF or DOCX
+        # library): the same bytes break it again, so it is the document's fault and
+        # permanent — the watcher and the re-indexer used to retry it for ever.
+        raise DocumentParseError(
+            f"Could not read '{filename}': its content isn't something the parser can "
+            "handle (it may be damaged)."
+        )
+    # What is left is the process's environment (an OSError, a missing module).
     raise ParseEnvironmentError(f"Could not read '{filename}' (a server-side problem).")

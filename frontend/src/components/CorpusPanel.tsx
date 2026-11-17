@@ -13,6 +13,7 @@ import {
   validateUploads,
 } from '../utils/uploadValidation';
 import type { RejectedFile } from '../utils/uploadValidation';
+import { readZipOptions, writeZipOptions, type ZipOptions } from '../utils/zipOptions';
 import BulkBar from './corpus/BulkBar';
 import { progressPercent } from './corpus/cardHelpers';
 import DocumentCard from './corpus/DocumentCard';
@@ -128,6 +129,37 @@ function UploadTagsField({ tags, onChange }: { tags: string[]; onChange: (tags: 
         data-testid="upload-tags"
       />
     </label>
+  );
+}
+
+/** How zips are uploaded (remembered in this browser): by path, and in the background. */
+function ZipOptionsField() {
+  const [options, setOptions] = useState(readZipOptions);
+  const change = (next: ZipOptions) => {
+    setOptions(next);
+    writeZipOptions(next);
+  };
+  return (
+    <div className="corpus-panel__zip-options" role="group" aria-label="Zip uploads">
+      <label title="Name each document by its folder path inside the zip (reports/2024/q1.pdf), so same-named files in different folders all come in">
+        <input
+          type="checkbox"
+          checked={options.keepPaths}
+          onChange={(event) => change({ ...options, keepPaths: event.target.checked })}
+          data-testid="zip-keep-paths"
+        />{' '}
+        Zips: keep folder names
+      </label>
+      <label title="Queue every document in a zip as the indexing queue frees, instead of the first batch">
+        <input
+          type="checkbox"
+          checked={options.background}
+          onChange={(event) => change({ ...options, background: event.target.checked })}
+          data-testid="zip-background"
+        />{' '}
+        Zips: import in the background
+      </label>
+    </div>
   );
 }
 
@@ -539,6 +571,7 @@ function CorpusPanel({
           {onUploadTagsChange && (
             <UploadTagsField tags={uploadTags ?? NO_TAGS} onChange={onUploadTagsChange} />
           )}
+          <ZipOptionsField />
           <button
             type="button"
             className="corpus-panel__folder-button"

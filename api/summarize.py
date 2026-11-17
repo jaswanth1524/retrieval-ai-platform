@@ -42,6 +42,7 @@ from api.llm import (
     GenerationSlot,
     add_usage,
     begin_usage,
+    carry_prompt_cut,
     completion_model_and_kwargs,
     effective_max_tokens,
     is_local_provider,
@@ -49,6 +50,7 @@ from api.llm import (
     stopped_at_token_limit,
     usage_cost_usd,
     usage_totals,
+    was_prompt_cut,
 )
 from api.pipeline import (
     DoneEvent,
@@ -774,11 +776,11 @@ class DocumentSummarizer:
             if stop_requested():
                 raise QuestionAbandoned  # its turn came after the reader left
             begin_usage()
-            return note(job), usage_totals()
+            return note(job), usage_totals(), was_prompt_cut()
 
         results: dict[int, _PartNote] = {}
         pool = ThreadPoolExecutor(max_workers=min(width, len(jobs)))
-        futures: dict[Future[tuple[_PartNote, tuple[int, int] | None]], int] = {}
+        futures: dict[Future[tuple[_PartNote, tuple[int, int] | None, bool]], int] = {}
         try:
             for position, job in enumerate(jobs):
                 futures[submit_in_context(pool, functools.partial(counted, job))] = position
@@ -791,8 +793,9 @@ class DocumentSummarizer:
                     pending, timeout=_STOP_POLL_SECONDS, return_when=FIRST_COMPLETED
                 )
                 for future in finished:
-                    text, usage = future.result()
+                    text, usage, cut = future.result()
                     add_usage(usage)
+                    carry_prompt_cut(cut)
                     results[futures[future]] = text
                     finished_count += 1
                     yield {
@@ -821,13 +824,24 @@ class DocumentSummarizer:
         )
         return [chunk for chunk in map(payload_chunk, payloads) if chunk is not None]
 
-    def summarize(self, request: SummaryRequest, *, use_cache: bool = True) -> SummaryResult:
-        """The whole summary at once (``POST /questions/summary``)."""
+    def summarize(
+        self,
+        request: SummaryRequest,
+        *,
+        use_cache: bool = True,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> SummaryResult:
+        """The whole summary at once (``POST /questions/summary``). ``should_stop`` (the
+        client left) ends it before its next part or call: ``QuestionAbandoned``."""
 
         done: DoneEvent | None = None
-        for event in self.summarize_stream(request, use_cache=use_cache, mode="sync"):
+        for event in self.summarize_stream(
+            request, use_cache=use_cache, should_stop=should_stop, mode="sync"
+        ):
             if event["type"] == "done":
                 done = event
+        if done is None and should_stop is not None and should_stop():
+            raise QuestionAbandoned
         if done is None:  # pragma: no cover - the stream always ends with done or raises
             raise GenerationError("The summary ended without an answer.")
         grounded = GroundedAnswer(
@@ -838,10 +852,12 @@ class DocumentSummarizer:
             cached=done.get("cached", False),
             answer_status=done.get("answer_status", "answered"),
             truncated=done.get("truncated", False),
+            prompt_cut=done.get("prompt_cut", False),
             usage=usage_tuple(done.get("usage")),
             cost_usd=usage_cost(done.get("usage")),
             citation_backfilled=done.get("citation_backfilled", False),
             unsupported_claims=done.get("unsupported_claims", 0),
+            unsupported_numbers=done.get("unsupported_numbers", 0),
         )
         return SummaryResult(
             grounded,
@@ -897,10 +913,12 @@ class DocumentSummarizer:
             run=lambda: self._run(request, settings, should_stop, mode, stream=mode == "stream"),
             # One that left a part out or had notes cut off isn't kept: asked again, it
             # may come out whole.
+            # Nor one whose prompt the model server cut: it read only part of it.
             keep=lambda done: (
                 not done.get("parts_skipped")
                 and not done.get("notes_truncated")
                 and not done.get("truncated")
+                and not done.get("prompt_cut")
             ),
             on_hit=lambda hit: log_served(
                 self._trace_store,
@@ -979,8 +997,10 @@ class DocumentSummarizer:
         citation_retry_used: bool = False,
         citation_backfilled: bool = False,
         unsupported_claims: int = 0,
+        unsupported_numbers: int = 0,
         status_of_answer: str | None = None,
         truncated: bool = False,
+        prompt_cut: bool = False,
     ) -> None:
         """Record ``run``'s trace; it is finalized after (none is recorded again)."""
 
@@ -1024,8 +1044,10 @@ class DocumentSummarizer:
                 citation_retry_used=citation_retry_used,
                 citation_backfilled=citation_backfilled,
                 unsupported_claims=unsupported_claims,
+                unsupported_numbers=unsupported_numbers,
                 answer_status=status_of_answer,
                 truncated=truncated,
+                prompt_cut=prompt_cut,
             )
         )
         run.finalized = True
@@ -1148,6 +1170,8 @@ class DocumentSummarizer:
         answer = outcome.answer
         run.final_messages = list(outcome.prompt_messages)
         truncated = stopped_at_token_limit()
+        # Any call of this summary (a part, the final one, the citation retry).
+        prompt_cut = was_prompt_cut()
         usage = usage_totals()
         timings = _elapsed_timings(
             run.started,
@@ -1169,8 +1193,10 @@ class DocumentSummarizer:
             citation_retry_used=outcome.retry_used,
             citation_backfilled=outcome.backfilled,
             unsupported_claims=outcome.unsupported_claims,
+            unsupported_numbers=outcome.unsupported_numbers,
             status_of_answer=status,
             truncated=truncated,
+            prompt_cut=prompt_cut,
         )
         yield {
             "type": "done",
@@ -1180,8 +1206,10 @@ class DocumentSummarizer:
             "trace_id": run.trace_id,
             "answer_status": status,
             "truncated": truncated,
+            "prompt_cut": prompt_cut,
             "citation_backfilled": outcome.backfilled,
             "unsupported_claims": outcome.unsupported_claims,
+            "unsupported_numbers": outcome.unsupported_numbers,
             "chunks_read": len(reading.selected),
             "chunks_total": reading.chunks_total,
             "usage": usage_dict(usage, usage_cost_usd(run.settings, usage)),

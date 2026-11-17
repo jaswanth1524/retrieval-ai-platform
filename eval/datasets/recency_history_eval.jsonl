@@ -1,0 +1,6 @@
+{"question": "What minimum password length did the 2019 password standard require?", "relevant_filenames": ["password_standard.md"], "relevant_passages": ["at least eight characters long"]}
+{"question": "How often did the old password standard make people change their passwords?", "relevant_filenames": ["password_standard.md"], "relevant_passages": ["Passwords must be changed every 90 days"]}
+{"question": "Under the 2021 remote work policy, how many days a week could employees work remotely?", "relevant_filenames": ["remote_work_policy.md"], "relevant_passages": ["up to two days a week"]}
+{"question": "What was the daily meal allowance abroad in the 2020 travel expense rules?", "relevant_filenames": ["travel_expense_rules.md"], "relevant_passages": ["The daily meal allowance for business travel abroad is sixty euros"]}
+{"question": "What mileage rate did the previous travel expense rules pay per kilometre?", "relevant_filenames": ["travel_expense_rules.md"], "relevant_passages": ["0.35 euros per kilometre"]}
+{"question": "Which equipment did the earlier remote work policy say was not reimbursed?", "relevant_filenames": ["remote_work_policy.md"], "relevant_passages": ["Monitors and chairs for home offices are not reimbursed"]}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { BACKGROUND_IMPORT_STARTED_EVENT, readZipOptions } from '../utils/zipOptions';
 import { api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { DocumentJobAcceptedResponse } from '../api/types';
 import { downloadFile } from '../utils/exportChat';
@@ -73,9 +74,12 @@ export function useBackupActions({
     pushToast({ tone: 'info', title: 'Restoring backup…', body: file.name });
     // Restored into the workspace in use now; a big zip can take a switch to send.
     const workspace = getWorkspace();
+    // As zip uploads are (the corpus panel's zip options): in the background, every
+    // document is queued as room frees instead of the queue's worth and the rest deferred.
+    const background = readZipOptions().background;
     let result;
     try {
-      result = await api.importBackup(file, undefined, workspace);
+      result = await api.importBackup(file, undefined, workspace, background);
     } catch (err) {
       if (!noteAuthFailure(err)) {
         pushToast({
@@ -87,6 +91,15 @@ export function useBackupActions({
       return;
     } finally {
       setRestoring(false);
+    }
+    if (result.import_id) {
+      window.dispatchEvent(new Event(BACKGROUND_IMPORT_STARTED_EVENT));
+      pushToast({
+        tone: 'good',
+        title: 'Restoring in the background',
+        body: `${file.name}: its documents are queued as the indexing queue has room — follow it under Imports in the corpus panel.`,
+      });
+      return;
     }
     const notes = [
       result.skipped.length > 0 && `${result.skipped.length} already indexed (kept as is)`,

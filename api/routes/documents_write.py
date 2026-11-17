@@ -4,9 +4,9 @@ delete, tags and refresh settings."""
 from __future__ import annotations
 
 import functools
+import io
 import logging
 import lzma
-import shutil
 import tempfile
 import threading
 import zipfile
@@ -49,12 +49,20 @@ from api.documents import (
     DocumentSource,
     chunk_sections,
     normalize_tags,
+    validate_document_name,
     validate_upload_filename,
 )
-from api.imports import BackgroundImport, wait_for_room
+from api.imports import (
+    BackgroundImport,
+    remember,
+    spool_directory,
+    spool_upload,
+    wait_for_room,
+)
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue, backlog_full_error
-from api.ingestion import filename_write_lock
+from api.ingestion import filename_write_lock, measured_embed_rate
+from api.original_details import record_details
 from api.parse_isolation import parse_with_limit
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
@@ -70,8 +78,10 @@ from api.routes.documents_common import (
     _url_fetch_slots,
 )
 from api.schemas import (
+    REQUEST_FILENAME_MAX_CHARS,
     ArchiveSkipResponse,
     ArchiveUploadResponse,
+    ArchiveUrlIngestRequest,
     DocumentDeleteResponse,
     DocumentJobAcceptedResponse,
     DocumentPreviewResponse,
@@ -88,6 +98,7 @@ from api.schemas import (
 )
 from api.settings import AppSettings
 from api.sitemap import KnownPage, PageImport, read_sitemap, start_page_import
+from api.storage import require_free_space
 from api.upload import read_upload_within_limit
 from api.url_fetch import (
     FetchedDocument,
@@ -95,6 +106,7 @@ from api.url_fetch import (
     loggable_url,
 )
 from api.workspaces import document_key, workspace_of
+from api.zip_safety import too_many_entries
 
 logger = logging.getLogger("api.routes.documents")
 
@@ -127,14 +139,26 @@ async def upload_document(
             "re-indexes the same bytes rather than leaving them as indexed.",
         ),
     ] = None,
+    name: Annotated[
+        str | None,
+        Form(
+            max_length=REQUEST_FILENAME_MAX_CHARS,
+            description="The name to store the document under, when it isn't the "
+            "file's own: it may carry folders (reports/2024/q1.pdf). Without it the "
+            "file's base name is used, as always.",
+        ),
+    ] = None,
 ) -> DocumentJobAcceptedResponse:
     # Rejected here, not in the background job: an unusable name or type used to
     # be accepted with a 202 and only fail once the client polled the job.
-    filename = validate_upload_filename(file.filename or "")
+    filename = (
+        validate_document_name(name) if name else validate_upload_filename(file.filename or "")
+    )
     given_tags = normalize_tags(tags) if tags else None
     # 409 now, as /reindex and /import do, rather than a 202 for a job that can
     # only fail on a collection built for another embedding setup.
     await run_in_threadpool(repository.ensure_writable, settings)
+    require_free_space(settings, settings.raw_document_dir)
     if raw_store is not None:
         known = await run_in_threadpool(known_filenames, repository, settings)
         try:
@@ -212,6 +236,7 @@ async def add_from_sitemap(
         raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
     given_tags = normalize_tags(request.tags) if request.tags else None
     await run_in_threadpool(repository.ensure_writable, settings)
+    require_free_space(settings, settings.raw_document_dir)
     limit = min(
         request.max_pages or int(settings.sitemap_max_pages), int(settings.sitemap_max_pages)
     )
@@ -291,11 +316,30 @@ def upload_archive(
             "frees (none deferred); follow it with GET /documents/imports/{import_id}."
         ),
     ] = False,
+    keep_paths: Annotated[
+        bool,
+        Form(
+            description="Name each document by its path in the zip (reports/2024/q1.pdf) "
+            "instead of its base name, so same-named files in different folders all "
+            "come in."
+        ),
+    ] = False,
 ) -> ArchiveUploadResponse:
     given_tags = normalize_tags(tags) if tags else None
     repository.ensure_writable(settings)
+    require_free_space(settings, settings.raw_document_dir)
+    # Before the zip's directory is read into memory: a few hundred documents, with
+    # room for the entries skipped silently (folders, __MACOSX, dotfiles).
+    if too_many_entries(file.file, int(settings.max_archive_members) * _ENTRIES_PER_DOCUMENT):
+        raise HTTPException(
+            status_code=400,
+            detail=f"The zip lists far more entries than {settings.max_archive_members} "
+            "documents could need (MAX_ARCHIVE_MEMBERS); split it.",
+        )
     if background:
-        return _archive_in_background(repository, settings, queue, raw_store, file, given_tags)
+        return _archive_in_background(
+            repository, settings, queue, raw_store, file, given_tags, keep_paths
+        )
     try:
         archive = zipfile.ZipFile(file.file)
     except (zipfile.BadZipFile, OSError) as exc:
@@ -303,7 +347,14 @@ def upload_archive(
     with archive:
         members = _archive_members(archive, settings)
         jobs, skipped, deferred = _queue_archive_members(
-            archive, members, repository, settings, queue, raw_store, given_tags
+            archive,
+            members,
+            repository,
+            settings,
+            queue,
+            raw_store,
+            given_tags,
+            keep_paths=keep_paths,
         )
     _audit_archive(
         settings, file.filename or "", given_tags, len(jobs), len(skipped), len(deferred)
@@ -333,6 +384,11 @@ def _audit_archive(
     )
 
 
+# Zip entries allowed per document of MAX_ARCHIVE_MEMBERS (a Finder zip has two per
+# file, plus folders).
+_ENTRIES_PER_DOCUMENT = 20
+
+
 def _archive_members(archive: zipfile.ZipFile, settings: AppSettings) -> list[zipfile.ZipInfo]:
     """The zip's file members; 400 past MAX_ARCHIVE_MEMBERS."""
 
@@ -358,6 +414,8 @@ def _queue_archive_members(
     raw_store: RawDocumentStore | None,
     given_tags: tuple[str, ...] | None,
     status: BackgroundImport | None = None,
+    *,
+    keep_paths: bool = False,
 ) -> tuple[list[DocumentJobAcceptedResponse], list[ArchiveSkipResponse], list[str]]:
     """Queue ``members``: (jobs, skipped, deferred). With ``status`` (a background
     import) a full queue is waited out instead of deferring the rest, the import's
@@ -380,11 +438,15 @@ def _queue_archive_members(
     for info in members:
         if status is not None and status.cancel.is_set():
             break
-        base = PurePosixPath(info.filename.replace("\\", "/")).name
+        member_path = info.filename.replace("\\", "/").lstrip("/")
+        # Its base name, or with keep_paths its whole path in the zip.
+        base = member_path if keep_paths else PurePosixPath(member_path).name
         reason = _archive_skip_reason(info, base, seen, limit)
         if reason is None:
             try:
-                name = validate_upload_filename(base)
+                name = (
+                    validate_document_name(base) if keep_paths else validate_upload_filename(base)
+                )
             except DocumentError as exc:
                 reason = str(exc)
             else:
@@ -399,7 +461,7 @@ def _queue_archive_members(
             continue
         seen.add(base.casefold())
         if status is not None:
-            if not wait_for_room(queue.backlog.has_room, info.file_size, status):
+            if not wait_for_room(queue.backlog.has_spare_room, info.file_size, status):
                 break
         elif deferred or not queue.backlog.has_room(info.file_size):
             deferred.append(name)
@@ -437,7 +499,7 @@ def _queue_archive_members(
             except HTTPException as exc:
                 if exc.status_code == 503 and status is not None:
                     # Room went to an upload meanwhile: wait for it again.
-                    if wait_for_room(queue.backlog.has_room, len(content), status):
+                    if wait_for_room(queue.backlog.has_spare_room, len(content), status):
                         continue
                     accepted = None
                 elif exc.status_code == 503:
@@ -463,47 +525,172 @@ def _archive_in_background(
     raw_store: RawDocumentStore | None,
     file: UploadFile,
     given_tags: tuple[str, ...] | None,
+    keep_paths: bool = False,
 ) -> ArchiveUploadResponse:
     """Spool the zip, check it, and queue its documents on the import thread."""
 
-    spool = _spool(file)
+    directory = spool_directory(settings.import_spool_dir)
+    require_free_space(settings, directory or tempfile.gettempdir())
+    spool = spool_upload(file.file, "docrag-import-", directory)
+    name = file.filename or "archive.zip"
+    record = None
+    if directory is not None:
+        record = remember(
+            directory,
+            {
+                "kind": "archive",
+                "name": name,
+                "workspace": workspace_of(settings),
+                "tags": list(given_tags) if given_tags is not None else None,
+                "keep_paths": keep_paths,
+            },
+            spool,
+        )
+    started = start_archive_import(
+        spool,
+        name,
+        repository,
+        settings,
+        queue,
+        raw_store,
+        given_tags,
+        record=record,
+        keep_paths=keep_paths,
+    )
+    return ArchiveUploadResponse(jobs=[], skipped=[], deferred=[], import_id=started.id)
+
+
+# A zip of documents at a URL: fetched within the URL-ingest guards (public addresses,
+# MAX_IMPORT_BYTES, the deadline), then imported in the background as an uploaded one
+# sent with background=true is. Follow it with GET /documents/imports/{import_id}.
+@router.post(
+    "/documents/archive-from-url",
+    response_model=ArchiveUploadResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+    responses={
+        400: {"description": "The URL couldn't be fetched, or isn't a zip."},
+        404: {"description": "URL ingest is off (URL_INGEST_ENABLED)."},
+    },
+)
+async def upload_archive_from_url(
+    request: ArchiveUrlIngestRequest,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+    queue: IngestQueueDep,
+    raw_store: RawDocumentStoreDep,
+) -> ArchiveUploadResponse:
+    if not settings.url_ingest_enabled:
+        raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+    given_tags = normalize_tags(request.tags) if request.tags else None
+    await run_in_threadpool(repository.ensure_writable, settings)
+    directory = spool_directory(settings.import_spool_dir)
+    require_free_space(settings, directory or tempfile.gettempdir())
+    fetched = await _fetch_for_ingest(
+        queue,
+        functools.partial(
+            fetch_document, request.url, settings, has_room=lambda size: True, archive=True
+        ),
+    )
+    if too_many_entries(
+        io.BytesIO(fetched.content), int(settings.max_archive_members) * _ENTRIES_PER_DOCUMENT
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"The zip lists far more entries than {settings.max_archive_members} "
+            "documents could need (MAX_ARCHIVE_MEMBERS); split it.",
+        )
+    spool = await run_in_threadpool(
+        spool_upload, io.BytesIO(fetched.content), "docrag-import-", directory
+    )
+    record = None
+    if directory is not None:
+        record = remember(
+            directory,
+            {
+                "kind": "archive",
+                "name": fetched.filename,
+                "workspace": workspace_of(settings),
+                "tags": list(given_tags) if given_tags is not None else None,
+                "keep_paths": request.keep_paths,
+            },
+            spool,
+        )
+    started = await run_in_threadpool(
+        functools.partial(
+            start_archive_import,
+            spool,
+            fetched.filename,
+            repository,
+            settings,
+            queue,
+            raw_store,
+            given_tags,
+            record=record,
+            keep_paths=request.keep_paths,
+        )
+    )
+    return ArchiveUploadResponse(jobs=[], skipped=[], deferred=[], import_id=started.id)
+
+
+def start_archive_import(
+    spool: Path,
+    name: str,
+    repository: VectorRepository,
+    settings: AppSettings,
+    queue: IngestQueue,
+    raw_store: RawDocumentStore | None,
+    given_tags: tuple[str, ...] | None,
+    *,
+    record: Path | None = None,
+    resumed: bool = False,
+    keep_paths: bool = False,
+) -> BackgroundImport:
+    """Queue a spooled zip's documents on the import thread (a request's, or one a
+    restart cut off: ``record`` is what lets the next start run it again). A file that
+    isn't a zip is a 400, with the spool removed."""
+
+    def cleanup() -> None:
+        spool.unlink(missing_ok=True)
+        if record is not None:
+            record.unlink(missing_ok=True)
+
     try:
         with zipfile.ZipFile(spool) as archive:
             _archive_members(archive, settings)
     except (zipfile.BadZipFile, OSError) as exc:
-        spool.unlink(missing_ok=True)
+        cleanup()
         raise HTTPException(status_code=400, detail="That file isn't a zip archive.") from exc
     except HTTPException:
-        spool.unlink(missing_ok=True)
+        cleanup()
         raise
-    name = file.filename or "archive.zip"
 
     def run(status: BackgroundImport) -> None:
         with zipfile.ZipFile(spool) as archive:
             members = _archive_members(archive, settings)
             jobs, skipped, _ = _queue_archive_members(
-                archive, members, repository, settings, queue, raw_store, given_tags, status
+                archive,
+                members,
+                repository,
+                settings,
+                queue,
+                raw_store,
+                given_tags,
+                status,
+                keep_paths=keep_paths,
             )
         _audit_archive(settings, name, given_tags, len(jobs), len(skipped), 0, import_id=status.id)
 
-    started = start_import(
+    return start_import(
         "archive",
         name,
         workspace_of(settings),
         str(settings.qdrant_collection),
         run,
-        cleanup=lambda: spool.unlink(missing_ok=True),
+        cleanup=cleanup,
+        resumable=record is not None,
+        resumed=resumed,
     )
-    return ArchiveUploadResponse(jobs=[], skipped=[], deferred=[], import_id=started.id)
-
-
-def _spool(file: UploadFile) -> Path:
-    """The upload copied to a temporary file the import thread reads after the request."""
-
-    handle = tempfile.NamedTemporaryFile(prefix="docrag-import-", suffix=".zip", delete=False)
-    with handle:
-        shutil.copyfileobj(file.file, handle, length=1 << 20)
-    return Path(handle.name)
 
 
 def _silently_skipped(info: zipfile.ZipInfo) -> bool:
@@ -576,10 +763,14 @@ async def preview_document(
     finally:
         _preview_slots.release()
     labels = list(dict.fromkeys(section.section for section in sections))
+    rate = measured_embed_rate()
+    limit = int(settings.max_chunks_per_document)
     return DocumentPreviewResponse(
         filename=filename,
         section_count=len(sections),
         chunk_count=len(chunks),
+        estimated_seconds=round(len(chunks) / rate, 1) if rate else None,
+        over_chunk_limit=bool(limit) and len(chunks) > limit,
         page_count=max((chunk.page_end or chunk.page for chunk in chunks), default=1),
         section_labels=labels[:PREVIEW_SECTION_LABELS],
         first_chunks=[
@@ -623,6 +814,7 @@ async def upload_document_from_url(
         raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
     given_tags = normalize_tags(request.tags) if request.tags else None
     await run_in_threadpool(repository.ensure_writable, settings)
+    require_free_space(settings, settings.raw_document_dir)
     fetched = await _fetch_for_ingest(
         queue,
         functools.partial(
@@ -649,16 +841,24 @@ async def upload_document_from_url(
     if raw_store is not None or fetched.remote_named:
         known = await run_in_threadpool(known_filenames, repository, settings)
         # A name the remote server picked (Content-Disposition, a redirect) must not
-        # replace a document already here: re-adding the same URL keeps its own
-        # name and replaces it as an upload would; a page calling itself
-        # "handbook.pdf" doesn't.
-        if fetched.remote_named and fetched.filename in known:
+        # replace a document already here. One indexed from another source was refused
+        # above; what is left is a name being indexed right now, whose source isn't
+        # known yet. The same URL added again keeps its name and is replaced as an
+        # upload would be, and `replace` says to go ahead either way.
+        indexed = await run_in_threadpool(repository.content_identity, settings, fetched.filename)
+        if (
+            fetched.remote_named
+            and not request.replace
+            and indexed is None
+            and fetched.filename in known
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=f"The server at that URL names the document "
-                f"'{fetched.filename}', and a document with that name is already "
-                "indexed; it was not replaced. Delete or rename that document first, "
-                "or give this one a name (`filename` in the API, --name on the CLI).",
+                f"'{fetched.filename}', and a document with that name is being "
+                "indexed; it was not replaced. Wait for it, give this one a name "
+                "(`filename` in the API, --name on the CLI), or replace it (`replace`, "
+                "--replace).",
             )
         if raw_store is not None:
             try:
@@ -701,7 +901,7 @@ async def upload_document_from_url(
 # Puts an earlier version back: it is indexed as an upload of those bytes would be,
 # and the version replaced is kept in its turn.
 @router.post(
-    "/documents/{filename}/versions/{version}/restore",
+    "/documents/{filename:path}/versions/{version}/restore",
     response_model=DocumentJobAcceptedResponse,
     status_code=202,
     dependencies=[Depends(require_full_key)],
@@ -757,7 +957,7 @@ def restore_document_version(
 # Fetches a URL-ingested document again from where it came from, conditionally: a
 # server that says nothing changed (304) costs no download and no job.
 @router.post(
-    "/documents/{filename}/refresh",
+    "/documents/{filename:path}/refresh",
     response_model=DocumentJobAcceptedResponse | DocumentRefreshResponse,
     status_code=202,
     dependencies=[Depends(require_full_key)],
@@ -868,7 +1068,7 @@ def reindex_stale_documents(
 
 
 @router.post(
-    "/documents/{filename}/reindex",
+    "/documents/{filename:path}/reindex",
     response_model=DocumentJobAcceptedResponse,
     status_code=202,
     dependencies=[Depends(require_full_key)],
@@ -890,7 +1090,7 @@ def reindex_document(
 
 
 @router.delete(
-    "/documents/{filename}",
+    "/documents/{filename:path}",
     response_model=DocumentDeleteResponse,
     dependencies=[Depends(require_full_key)],
     responses={
@@ -906,10 +1106,8 @@ def delete_document(
     settings: SettingsDep,
     raw_store: RawDocumentStoreDep,
 ) -> DocumentDeleteResponse:
-    # Filenames are always basenames (normalize_filename strips any path
-    # component at upload time), so a plain path segment is sufficient — a
-    # filename containing "/" simply can't match this route, which is fine
-    # since one can never have been uploaded.
+    # A stored name may carry folders (reports/2024/q1.pdf: ``{filename:path}``);
+    # stored_filename 404s any name normalize_document_name would change.
     #
     # Same lock the ingest path takes: snapshot-then-delete is a read-modify-write,
     # so without it a delete landing between a concurrent ingest's upsert and its
@@ -923,7 +1121,7 @@ def delete_document(
 
 # Payload-only: no re-embedding, so it is instant even for a large document.
 @router.patch(
-    "/documents/{filename}/tags",
+    "/documents/{filename:path}/tags",
     response_model=DocumentTagsResponse,
     dependencies=[Depends(require_full_key)],
 )
@@ -932,6 +1130,7 @@ def set_document_tags(
     request: DocumentTagsRequest,
     repository: VectorRepositoryDep,
     settings: SettingsDep,
+    raw_store: RawDocumentStoreDep,
 ) -> DocumentTagsResponse:
     filename = stored_filename(filename)
     tags = normalize_tags(request.tags)
@@ -943,6 +1142,7 @@ def set_document_tags(
         if repository.chunk_count_for_filename(settings, filename) == 0:
             raise DocumentNotFoundError(f"No indexed document named '{filename}'.")
         repository.set_tags(settings, filename, tags)
+        record_details(repository, settings, raw_store, filename)
     bump_corpus_generation([filename], collection=settings.qdrant_collection)
     audit("document.tags", workspace=workspace_of(settings), filename=filename, tags=list(tags))
     return DocumentTagsResponse(filename=filename, tags=list(tags))
@@ -950,7 +1150,7 @@ def set_document_tags(
 
 # A fetched document's own refresh interval; payload-only, like tags.
 @router.patch(
-    "/documents/{filename}/refresh-settings",
+    "/documents/{filename:path}/refresh-settings",
     response_model=DocumentRefreshSettingsResponse,
     dependencies=[Depends(require_full_key)],
     responses={404: {"description": "No such document, or it wasn't fetched from a URL."}},
@@ -960,6 +1160,7 @@ def set_document_refresh_settings(
     request: DocumentRefreshSettingsRequest,
     repository: VectorRepositoryDep,
     settings: SettingsDep,
+    raw_store: RawDocumentStoreDep,
 ) -> DocumentRefreshSettingsResponse:
     filename = stored_filename(filename)
     # Under the filename lock: a refresh or re-upload in flight writes the setting it
@@ -981,6 +1182,7 @@ def set_document_refresh_settings(
         )
         # Only the listing shows it: no answer depends on the refresh interval.
         repository.refresh_listed(settings, [filename])
+        record_details(repository, settings, raw_store, filename)
     audit(
         "document.refresh_settings",
         workspace=workspace_of(settings),

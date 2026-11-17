@@ -73,6 +73,8 @@ def test_an_archive_with_too_many_entries_is_refused(monkeypatch: pytest.MonkeyP
 
 
 def test_names_that_would_land_elsewhere_are_rejected_not_written() -> None:
+    # A name with folders ("nested/b.txt") is a valid stored name since pass 18 (it
+    # stays inside the originals store); "../" and control characters never are.
     documents = [
         _document("../evil.txt"),
         _document("nested/b.txt"),
@@ -89,8 +91,8 @@ def test_names_that_would_land_elsewhere_are_rejected_not_written() -> None:
 
     outcome = _restore(_zip(documents, members), recorder)
 
-    assert recorder.queued == [("ok.txt", b"fine")]
-    assert set(outcome.rejected) == {"../evil.txt", "nested/b.txt", "bad\x00name.txt"}
+    assert recorder.queued == [("nested/b.txt", b"b"), ("ok.txt", b"fine")]
+    assert set(outcome.rejected) == {"../evil.txt", "bad\x00name.txt"}
 
 
 def test_a_damaged_or_oversized_original_is_rejected_and_the_rest_restored() -> None:

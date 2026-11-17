@@ -30,10 +30,11 @@ class Recorder:
         self.enqueued: list[tuple[str, bytes]] = []
         self.deleted: list[str] = []
         self.full = False
+        self.full_status = 503
 
     def enqueue(self, name: str, content: bytes, mtime: float) -> None:
         if self.full:
-            raise HTTPException(status_code=503, detail="full")
+            raise HTTPException(status_code=self.full_status, detail="full")
         self.enqueued.append((name, content))
         # What the app does: the document is stamped with the file's mtime.
         self.indexed[name] = mtime
@@ -91,6 +92,20 @@ def test_a_full_backlog_defers_to_the_next_pass(tmp_path: Path) -> None:
 
     folder.scan_once()
     assert folder.scan_once()["deferred"] == ["a.txt"]
+    recorder.full = False
+    assert folder.scan_once()["indexed"] == ["a.txt"]
+
+
+def test_a_nearly_full_disk_defers_like_a_full_backlog(tmp_path: Path) -> None:
+    # MIN_FREE_BYTES refuses with a 507: the file waits, it is not given up on.
+    write(tmp_path / "a.txt", "A")
+    recorder = Recorder()
+    recorder.full, recorder.full_status = True, 507
+    folder = watcher(tmp_path, recorder)
+
+    folder.scan_once()
+    done = folder.scan_once()
+    assert done["deferred"] == ["a.txt"] and done["gave_up"] == []
     recorder.full = False
     assert folder.scan_once()["indexed"] == ["a.txt"]
 
@@ -746,3 +761,28 @@ def test_documents_owned_from_an_earlier_run_follow_the_stand_down_rules(
     # Once it lists files: only what this folder indexed goes, never an upload.
     assert folder.scan_once()["deleted"] == ["old.txt"]
     assert recorder.deleted == ["old.txt"]
+
+
+def test_a_file_still_on_disk_but_no_longer_watched_keeps_its_document(tmp_path: Path) -> None:
+    write(tmp_path / "keep.txt", "K")
+    write(tmp_path / "grows.txt", "small")
+    write(tmp_path / "linked.txt", "L")
+    write(tmp_path / "goes.txt", "G")
+    recorder = Recorder()
+    folder = watcher(tmp_path, recorder, watch_delete_missing=True, max_upload_bytes=20)
+    folder.scan_once()
+    folder.scan_once()
+    assert sorted(recorder.indexed) == ["goes.txt", "grows.txt", "keep.txt", "linked.txt"]
+
+    # Out of the scan, each for another reason — and all three still in the folder.
+    write(tmp_path / "grows.txt", "x" * 50)  # over the limit now
+    (tmp_path / "linked.txt").unlink()
+    (tmp_path / "linked.txt").symlink_to(tmp_path / "keep.txt")  # a link now
+    (tmp_path / "goes.txt").unlink()  # really gone
+
+    assert folder.scan_once()["deleted"] == ["goes.txt"]
+    assert sorted(recorder.indexed) == ["grows.txt", "keep.txt", "linked.txt"]
+    # Still kept on later passes; gone for real, it is deleted then.
+    assert folder.scan_once()["deleted"] == []
+    (tmp_path / "grows.txt").unlink()
+    assert folder.scan_once()["deleted"] == ["grows.txt"]

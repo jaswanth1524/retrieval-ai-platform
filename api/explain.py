@@ -2,7 +2,7 @@
 with ``explain`` and ``expect_chunk_id`` / ``expect_filename``).
 
 Each stage of the search is checked in order and the first one that left the passage
-out is named: neither search leg returned it, fusion ranked it past what the reranker
+out is named: the search legs didn't bring it in, fusion ranked it past what the reranker
 scores (RERANK_CANDIDATES), the cross-encoder scored it under the bar, the diversity
 filter dropped it as a near-duplicate of a kept one, or the top-K cut left it out.
 """
@@ -41,16 +41,16 @@ class Explanation:
 
 
 def _first(
-    chunks: Sequence[RetrievedChunk | RerankedChunk],
-    chunk_id: str | None,
-    filename: str | None,
+    chunks: Sequence[RetrievedChunk | RerankedChunk], chunk_id: str
 ) -> tuple[int, RetrievedChunk | RerankedChunk] | None:
     for index, chunk in enumerate(chunks, start=1):
-        if (chunk_id is not None and chunk.chunk_id == chunk_id) or (
-            chunk_id is None and chunk.filename == filename
-        ):
+        if chunk.chunk_id == chunk_id:
             return index, chunk
     return None
+
+
+# How far a passage got, best first: a file is judged by its passage that got furthest.
+_PROGRESS = (RETURNED, PAST_TOP_K, NEAR_DUPLICATE, BELOW_MIN_SCORE, NOT_SCORED)
 
 
 def explain(
@@ -59,22 +59,57 @@ def explain(
     *,
     chunk_id: str | None = None,
     filename: str | None = None,
+    narrowed: bool = False,
 ) -> Explanation:
-    """What became of ``chunk_id`` (or the best passage of ``filename``) in ``phase``."""
+    """What became of ``chunk_id`` (or the passage of ``filename`` that got furthest) in
+    ``phase``. ``narrowed``: the search was limited (documents, tags, pages, dates…),
+    which is then the likelier reason a passage never came up."""
 
     target = chunk_id if chunk_id is not None else f"any passage of {filename}"
-    fused = _first(phase.fused_candidates, chunk_id, filename)
-    if fused is None:
-        return Explanation(
-            target,
-            NOT_RETRIEVED,
-            "Neither the dense nor the BM25 search returned it among their top "
-            f"{settings.dense_retrieval_limit}/{settings.sparse_retrieval_limit}: the "
-            "question shares too little with it (in words or meaning). Rephrase it with "
-            "the passage's own terms.",
-            chunk_id=chunk_id,
+    candidates = [
+        (rank, candidate)
+        for rank, candidate in enumerate(phase.fused_candidates, start=1)
+        if (
+            candidate.chunk_id == chunk_id
+            if chunk_id is not None
+            else candidate.filename == filename
         )
-    fused_rank, candidate = fused
+    ]
+    if not candidates:
+        limits = f"{settings.dense_retrieval_limit}/{settings.sparse_retrieval_limit}"
+        detail = (
+            f"It is not among the {settings.fused_top_n} candidates the search kept "
+            f"(FUSED_TOP_N): the dense and the BM25 search (top {limits}) ranked it too "
+            "low or not at all — the question shares too little with it, in words or "
+            "meaning. Rephrase it with the passage's own terms."
+        )
+        if narrowed:
+            detail += (
+                " This search was also limited (documents, tags, pages or dates): a "
+                "passage outside those limits is never searched."
+            )
+        return Explanation(target, NOT_RETRIEVED, detail, chunk_id=chunk_id)
+    found = [_followed(phase, settings, target, rank, candidate) for rank, candidate in candidates]
+    return min(
+        found,
+        key=lambda item: (
+            _PROGRESS.index(item.outcome),
+            item.returned_rank or 0,
+            -(item.rerank_score or 0.0),
+            item.fused_rank or 0,
+        ),
+    )
+
+
+def _followed(
+    phase: RetrievalPhase,
+    settings: AppSettings,
+    target: str,
+    fused_rank: int,
+    candidate: RetrievedChunk,
+) -> Explanation:
+    """One fused candidate followed through scoring and selection."""
+
     ranks = phase.leg_ranks.get(candidate.point_id, [None, None])
     found = Explanation(
         target,
@@ -85,7 +120,7 @@ def explain(
         sparse_rank=ranks[1],
         fused_rank=fused_rank,
     )
-    scored = _first(phase.scored_chunks, candidate.chunk_id, None)
+    scored = _first(phase.scored_chunks, candidate.chunk_id)
     if scored is None:
         return replace(
             found,
@@ -97,7 +132,7 @@ def explain(
     assert isinstance(scored_chunk, RerankedChunk)
     score = scored_chunk.rerank_score
     found = replace(found, rerank_rank=rerank_rank, rerank_score=score)
-    returned = _first(phase.context_chunks, candidate.chunk_id, None)
+    returned = _first(phase.context_chunks, candidate.chunk_id)
     if returned is not None:
         return replace(
             found,

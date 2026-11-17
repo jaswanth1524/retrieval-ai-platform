@@ -76,7 +76,7 @@ def is_rate_limited(method: str, path: str) -> bool:
     return method in RATE_LIMITED_METHODS or (
         method == "GET"
         and (
-            path in ("/export", "/traces/export")
+            path in ("/export", "/traces/export", "/admin/migrate/export")
             # A stored backup's download reads a whole archive, like /export.
             or (path.startswith("/backups/") and path.count("/") == 2)
         )
@@ -90,7 +90,7 @@ def is_guarded_path(path: str) -> bool:
 
 
 _REINDEX_OR_TAGS = re.compile(
-    r"^/documents/[^/]+/(?:reindex|tags|refresh|refresh-settings|versions/[^/]+/restore)$"
+    r"^/documents/.+/(?:reindex|tags|refresh|refresh-settings|versions/[^/]+/restore)$"
 )
 
 _JOB_RETRY = re.compile(r"^/documents/jobs/[^/]+/retry$")
@@ -121,6 +121,7 @@ def needs_full_key(method: str, path: str) -> bool:
         "/documents/from-url",
         "/documents/from-sitemap",
         "/documents/archive",
+        "/documents/archive-from-url",
         "/documents/preview",
     ):
         return True
@@ -136,6 +137,8 @@ def body_limit(method: str, path: str, settings: AppSettings) -> int:
     # MAX_UPLOAD_BYTES by the route).
     if method == "POST" and path in ("/import", "/backups/verify", "/documents/archive"):
         return int(settings.max_import_bytes) + UPLOAD_OVERHEAD_BYTES
+    if method == "POST" and path == "/admin/migrate/import":
+        return int(settings.max_migrate_bytes) + UPLOAD_OVERHEAD_BYTES
     return MAX_JSON_BODY_BYTES
 
 

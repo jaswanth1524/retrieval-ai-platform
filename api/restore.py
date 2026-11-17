@@ -30,7 +30,7 @@ from api.documents import (
     DocumentError,
     DocumentSource,
     normalize_tags,
-    validate_upload_filename,
+    validate_document_name,
 )
 from api.export import MANIFEST_VERSION
 from api.feedback import FEEDBACK_KINDS, Feedback, FeedbackStore
@@ -46,11 +46,17 @@ from api.schemas import (
 )
 from api.url_fetch import usable_validator
 from api.workspaces import WorkspaceClosingError
+from api.zip_safety import too_many_entries
 
 logger = logging.getLogger(__name__)
 
-MAX_MEMBERS = 10_000
-_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+# An uploaded backup's entries, at most (each document is one, plus one per kept
+# version): checked from the zip's end record before its directory is read
+# (api/zip_safety.py). A backup this server wrote (BACKUP_DIR) has no such cap — it is
+# as large as the corpus is.
+MAX_MEMBERS = 200_000
+_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
+_STORED_MANIFEST_MAX_BYTES = 1 << 30
 _FEEDBACK_MAX_BYTES = 256 * 1024 * 1024
 # A feedback row is a few KB at most (the request caps below); a longer line is junk.
 _FEEDBACK_LINE_MAX_CHARS = 64 * 1024
@@ -139,19 +145,29 @@ def restore_backup(
     feedback_store: FeedbackStore | None,
     workspace: str = "",
     keep_version: KeepVersion | None = None,
+    stored: bool = False,
+    stop: Callable[[], bool] | None = None,
 ) -> ImportOutcome:
+    """``stored``: one of BACKUP_DIR's own backups (written by this server), which the
+    upload caps on entries and manifest size don't apply to."""
+
+    if not stored and too_many_entries(upload, MAX_MEMBERS):
+        raise BackupImportError(f"The archive has more than {MAX_MEMBERS} entries.")
     try:
         archive = zipfile.ZipFile(upload)
     except (zipfile.BadZipFile, OSError) as exc:
         raise BackupImportError("That file isn't a zip archive.") from exc
     with archive:
         infos = archive.infolist()
-        if len(infos) > MAX_MEMBERS:
-            raise BackupImportError(f"The archive has more than {MAX_MEMBERS} entries.")
         members = {info.filename: info for info in infos}
-        manifest = _manifest(archive, members)
+        manifest = _manifest(archive, members, stored=stored)
         outcome = ImportOutcome()
+        stopped = False
         for document in manifest["documents"]:
+            # A cancelled background import: what is queued stays, nothing more is.
+            if stop is not None and stop():
+                stopped = True
+                break
             _restore_document(
                 archive,
                 members,
@@ -163,7 +179,7 @@ def restore_backup(
                 enqueue=enqueue,
                 keep_version=keep_version,
             )
-        if feedback_store is not None and "feedback.jsonl" in members:
+        if not stopped and feedback_store is not None and "feedback.jsonl" in members:
             try:
                 _restore_feedback(
                     archive, members["feedback.jsonl"], feedback_store, outcome, workspace
@@ -175,12 +191,16 @@ def restore_backup(
     return outcome
 
 
-def _manifest(archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo]) -> dict[str, Any]:
+def _manifest(
+    archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo], *, stored: bool = False
+) -> dict[str, Any]:
     info = members.get("manifest.json")
     if info is None:
         raise BackupImportError("The archive has no manifest.json; is it a DocRAG backup?")
     try:
-        raw = _read_capped(archive, info, _MANIFEST_MAX_BYTES)
+        raw = _read_capped(
+            archive, info, _STORED_MANIFEST_MAX_BYTES if stored else _MANIFEST_MAX_BYTES
+        )
     except _UnreadableMemberError:
         raise BackupImportError("manifest.json in the archive is damaged or encrypted.") from None
     try:
@@ -213,7 +233,7 @@ def _restore_document(
         return
     raw_name = document["filename"]
     try:
-        filename = validate_upload_filename(raw_name)
+        filename = validate_document_name(raw_name)
     except DocumentError:
         outcome.rejected.append(raw_name)
         return
@@ -531,13 +551,21 @@ VERIFY_MAX_MEMBER_BYTES = 1 << 30
 VERIFY_MAX_EXPANDED_BYTES = 16 << 30
 
 
-def verify_backup(upload: IO[bytes], max_original_bytes: int | None = None) -> BackupCheck:
+def verify_backup(
+    upload: IO[bytes], max_original_bytes: int | None = None, *, stored: bool = False
+) -> BackupCheck:
     """Check a backup without restoring anything: the manifest, every member's checksum
     (each one read once, nothing kept), that every original and version the manifest
     lists is in the archive, and — by restore's own rules — which documents a restore
-    would queue and which it would refuse (``max_original_bytes``: MAX_UPLOAD_BYTES)."""
+    would queue and which it would refuse (``max_original_bytes``: MAX_UPLOAD_BYTES).
+
+    ``stored``: one of BACKUP_DIR's own backups. An upload's caps (entries, the whole
+    archive's expanded size) don't apply: it is as large as the corpus it holds."""
 
     check = BackupCheck()
+    if not stored and too_many_entries(upload, MAX_MEMBERS):
+        check.problems.append(f"The archive has more than {MAX_MEMBERS} entries.")
+        return check
     try:
         archive = zipfile.ZipFile(upload)
     except (zipfile.BadZipFile, OSError):
@@ -545,18 +573,15 @@ def verify_backup(upload: IO[bytes], max_original_bytes: int | None = None) -> B
         return check
     with archive:
         infos = archive.infolist()
-        if len(infos) > MAX_MEMBERS:
-            check.problems.append(f"The archive has more than {MAX_MEMBERS} entries.")
-            return check
         members = {info.filename: info for info in infos}
         try:
-            manifest = _manifest(archive, members)
+            manifest = _manifest(archive, members, stored=stored)
         except BackupImportError as exc:
             check.problems.append(str(exc))
             return check
         sizes: dict[str, int] = {}
         damaged: set[str] = set()
-        budget = VERIFY_MAX_EXPANDED_BYTES
+        budget = sum(info.file_size for info in infos) if stored else VERIFY_MAX_EXPANDED_BYTES
         for info in infos:
             size = 0
             # Read to the size each member declares (zipfile stops there): one that
@@ -629,7 +654,7 @@ def _refused_by_restore(
 
     raw_name = document["filename"]
     try:
-        filename = validate_upload_filename(raw_name)
+        filename = validate_document_name(raw_name)
     except DocumentError as exc:
         return str(exc)
     if filename != raw_name:

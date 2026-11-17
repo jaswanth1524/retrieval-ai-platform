@@ -17,6 +17,9 @@ import {
   deriveTitle,
 } from './model';
 
+/** A note on a saved answer, at most this long. */
+export const MAX_NOTE_CHARS = 2000;
+
 export function isChatTurn(value: unknown): value is ChatTurn {
   if (!value || typeof value !== 'object') return false;
   const turn = value as Partial<ChatTurn>;
@@ -157,6 +160,19 @@ export function sanitizeNarrowing(value: unknown): PassageNarrowing | null {
   if (before !== undefined && !(after !== undefined && after > before)) narrowing.uploaded_before = before;
   return Object.keys(narrowing).length > 0 ? narrowing : null;
 }
+function sanitizeUsage(
+  value: unknown,
+): { prompt: number; completion: number; costUsd?: number } | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const { prompt, completion, costUsd } = value as Record<string, unknown>;
+  if (!isCount(prompt) || !isCount(completion)) return undefined;
+  return {
+    prompt,
+    completion,
+    ...(typeof costUsd === 'number' && Number.isFinite(costUsd) && costUsd >= 0 ? { costUsd } : {}),
+  };
+}
+
 /** A summary's coverage is kept on its turn only when it says something: a sampled
  *  read, a part left out, notes cut off. */
 export function coverageWorthShowing(coverage: SummaryCoverage): boolean {
@@ -226,6 +242,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
     'uncited',
     'truncated',
     'promptCut',
+    'cannotContinue',
     'followUp',
     'weakMatch',
     'autoCited',
@@ -241,10 +258,11 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (Array.isArray(turn.versions) && turn.role === 'assistant') {
     const versions = turn.versions.flatMap((version: unknown) => {
       if (!version || typeof version !== 'object') return [];
-      const { content, sources, timestamp, model, style, traceId } = version as Record<
+      const { content, sources, timestamp, model, style, traceId, usage } = version as Record<
         string,
         unknown
       >;
+      const used = sanitizeUsage(usage);
       if (typeof content !== 'string' || !Array.isArray(sources)) return [];
       const versionStyle = sanitizeStyle(style);
       return [
@@ -255,6 +273,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
           ...(typeof model === 'string' && model ? { model: model.slice(0, 200) } : {}),
           ...(versionStyle ? { style: versionStyle } : {}),
           ...(typeof traceId === 'string' && traceId && traceId.length <= 100 ? { traceId } : {}),
+          ...(used ? { usage: used } : {}),
         },
       ];
     });
@@ -286,6 +305,18 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   ) {
     sanitized.passagesLeftOut = turn.passagesLeftOut;
   }
+  for (const field of ['unsupportedClaims', 'unsupportedNumbers'] as const) {
+    const count = turn[field];
+    if (typeof count === 'number' && Number.isInteger(count) && count > 0 && count <= 1000) {
+      sanitized[field] = count;
+    }
+  }
+  if (turn.role === 'assistant' && typeof turn.note === 'string' && turn.note.trim()) {
+    sanitized.note = turn.note.slice(0, MAX_NOTE_CHARS);
+  }
+  if (typeof turn.searchedAs === 'string' && turn.searchedAs.trim()) {
+    sanitized.searchedAs = turn.searchedAs.slice(0, 2000);
+  }
   if (Array.isArray(turn.irrelevantSources)) {
     const numbers = turn.irrelevantSources.filter(
       (value): value is number => Number.isInteger(value) && value >= 1 && value <= 1000,
@@ -298,16 +329,8 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   if (typeof turn.rerankMinScore === 'number' && turn.rerankMinScore >= 0 && turn.rerankMinScore <= 1) {
     sanitized.rerankMinScore = turn.rerankMinScore;
   }
-  const usage = turn.usage as unknown;
-  if (usage && typeof usage === 'object') {
-    const { prompt, completion, costUsd } = usage as Record<string, unknown>;
-    if (isCount(prompt) && isCount(completion)) {
-      sanitized.usage = { prompt, completion };
-      if (typeof costUsd === 'number' && Number.isFinite(costUsd) && costUsd >= 0) {
-        sanitized.usage.costUsd = costUsd;
-      }
-    }
-  }
+  const usage = sanitizeUsage(turn.usage);
+  if (usage) sanitized.usage = usage;
   const coverage = turn.coverage as unknown;
   if (coverage && typeof coverage === 'object') {
     const { read, total, skipped, cutOff } = coverage as Record<string, unknown>;

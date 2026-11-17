@@ -107,6 +107,7 @@ def trace_detail_response(trace: QueryTrace) -> TraceDetailResponse:
         citation_retry_used=trace.citation_retry_used,
         citation_backfilled=trace.citation_backfilled,
         unsupported_claims=trace.unsupported_claims,
+        unsupported_numbers=trace.unsupported_numbers,
         prompt_cached=trace.prompt_cached,
         prompt_cut=trace.prompt_cut,
         request_id=trace.request_id,

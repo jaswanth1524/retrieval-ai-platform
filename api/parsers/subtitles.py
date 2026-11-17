@@ -39,7 +39,9 @@ def parse_subtitles_document(filename: str, text: str) -> list[DocumentSection]:
             continue
         if in_note:
             continue
-        if line.startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+        # A block's first line only: inside a cue, "NOTE THAT…" or "STYLE IS…" (all-caps
+        # captions) is speech.
+        if current is None and line.startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
             in_note = line.startswith(("NOTE", "STYLE", "REGION"))
             continue
         timing = _TIMING_RE.match(line)

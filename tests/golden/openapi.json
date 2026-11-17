@@ -137,6 +137,43 @@
     "title": "ArchiveUploadResponse",
     "type": "object"
    },
+   "ArchiveUrlIngestRequest": {
+    "description": "Index the documents of a zip fetched from a URL, in the background\n(POST /documents/archive-from-url).",
+    "properties": {
+     "keep_paths": {
+      "default": false,
+      "title": "Keep Paths",
+      "type": "boolean"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 128,
+         "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tags"
+     },
+     "url": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Url",
+      "type": "string"
+     }
+    },
+    "required": [
+     "url"
+    ],
+    "title": "ArchiveUrlIngestRequest",
+    "type": "object"
+   },
    "AuditEntryResponse": {
     "properties": {
      "client": {
@@ -258,6 +295,11 @@
       "default": 0,
       "title": "Queued",
       "type": "integer"
+     },
+     "resumed": {
+      "default": false,
+      "title": "Resumed",
+      "type": "boolean"
      },
      "skipped": {
       "default": 0,
@@ -460,6 +502,20 @@
     "title": "Body_import_backup_import_post",
     "type": "object"
    },
+   "Body_migrate_import_admin_migrate_import_post": {
+    "properties": {
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_migrate_import_admin_migrate_import_post",
+    "type": "object"
+   },
    "Body_preview_document_documents_preview_post": {
     "properties": {
      "file": {
@@ -486,6 +542,12 @@
       "contentMediaType": "application/octet-stream",
       "title": "File",
       "type": "string"
+     },
+     "keep_paths": {
+      "default": false,
+      "description": "Name each document by its path in the zip (reports/2024/q1.pdf) instead of its base name, so same-named files in different folders all come in.",
+      "title": "Keep Paths",
+      "type": "boolean"
      },
      "tags": {
       "anyOf": [
@@ -515,6 +577,19 @@
       "contentMediaType": "application/octet-stream",
       "title": "File",
       "type": "string"
+     },
+     "name": {
+      "anyOf": [
+       {
+        "maxLength": 1024,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "The name to store the document under, when it isn't the file's own: it may carry folders (reports/2024/q1.pdf). Without it the file's base name is used, as always.",
+      "title": "Name"
      },
      "tags": {
       "anyOf": [
@@ -666,6 +741,11 @@
    "ConsistencyRepairRequest": {
     "description": "POST /admin/consistency/repair: which of the report's findings to put right\n(each off unless asked for).",
     "properties": {
+     "delete_despite_lost_index": {
+      "default": false,
+      "title": "Delete Despite Lost Index",
+      "type": "boolean"
+     },
      "delete_orphan_originals": {
       "default": false,
       "title": "Delete Orphan Originals",
@@ -1229,6 +1309,17 @@
       "title": "Incomplete Filenames",
       "type": "array"
      },
+     "next_cursor": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Next Cursor"
+     },
      "page_counts": {
       "additionalProperties": {
        "type": "integer"
@@ -1271,6 +1362,17 @@
       "default": {},
       "title": "Tags",
       "type": "object"
+     },
+     "total": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Total"
      },
      "uploaded_ats": {
       "additionalProperties": {
@@ -1342,6 +1444,17 @@
       "title": "Chunk Count",
       "type": "integer"
      },
+     "estimated_seconds": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Estimated Seconds"
+     },
      "filename": {
       "title": "Filename",
       "type": "string"
@@ -1352,6 +1465,11 @@
       },
       "title": "First Chunks",
       "type": "array"
+     },
+     "over_chunk_limit": {
+      "default": false,
+      "title": "Over Chunk Limit",
+      "type": "boolean"
      },
      "page_count": {
       "title": "Page Count",
@@ -1896,6 +2014,107 @@
     "title": "ImportResponse",
     "type": "object"
    },
+   "LocalDocument": {
+    "properties": {
+     "name": {
+      "maxLength": 1024,
+      "title": "Name",
+      "type": "string"
+     },
+     "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name",
+     "sha256"
+    ],
+    "title": "LocalDocument",
+    "type": "object"
+   },
+   "MigrateImportResponse": {
+    "description": "POST /admin/migrate/import: the bundle is being unpacked in the background.",
+    "properties": {
+     "import_id": {
+      "title": "Import Id",
+      "type": "string"
+     },
+     "workspaces": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Workspaces",
+      "type": "array"
+     }
+    },
+    "required": [
+     "import_id",
+     "workspaces"
+    ],
+    "title": "MigrateImportResponse",
+    "type": "object"
+   },
+   "MissingDocumentsRequest": {
+    "description": "Files a client holds (POST /documents/missing): which of them aren't indexed\nwith exactly these bytes?",
+    "properties": {
+     "documents": {
+      "items": {
+       "$ref": "#/components/schemas/LocalDocument"
+      },
+      "maxItems": 2000,
+      "title": "Documents",
+      "type": "array"
+     }
+    },
+    "required": [
+     "documents"
+    ],
+    "title": "MissingDocumentsRequest",
+    "type": "object"
+   },
+   "MissingDocumentsResponse": {
+    "properties": {
+     "missing": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Missing",
+      "type": "array"
+     }
+    },
+    "required": [
+     "missing"
+    ],
+    "title": "MissingDocumentsResponse",
+    "type": "object"
+   },
+   "NotifyTestResponse": {
+    "description": "POST /admin/notify-test: whether the test notification was delivered.",
+    "properties": {
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "sent": {
+      "title": "Sent",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "sent"
+    ],
+    "title": "NotifyTestResponse",
+    "type": "object"
+   },
    "OutlineEntryResponse": {
     "description": "Where a section (or a page) starts: open the viewer around ``chunk_id``.",
     "properties": {
@@ -2211,6 +2430,11 @@
       },
       "title": "Filenames",
       "type": "array"
+     },
+     "filenames_cited": {
+      "default": false,
+      "title": "Filenames Cited",
+      "type": "boolean"
      },
      "kind": {
       "default": "question",
@@ -2766,6 +2990,11 @@
       "title": "Unsupported Claims",
       "type": "integer"
      },
+     "unsupported_numbers": {
+      "default": 0,
+      "title": "Unsupported Numbers",
+      "type": "integer"
+     },
      "usage": {
       "anyOf": [
        {
@@ -2787,6 +3016,31 @@
      "sources"
     ],
     "title": "QuestionResponse",
+    "type": "object"
+   },
+   "RebuildResponse": {
+    "description": "POST /admin/rebuild: stored originals with no document, being indexed again.",
+    "properties": {
+     "import_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Import Id"
+     },
+     "originals": {
+      "title": "Originals",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "originals"
+    ],
+    "title": "RebuildResponse",
     "type": "object"
    },
    "ScoreReportResponse": {
@@ -3804,6 +4058,11 @@
       "title": "Unsupported Claims",
       "type": "integer"
      },
+     "unsupported_numbers": {
+      "default": 0,
+      "title": "Unsupported Numbers",
+      "type": "integer"
+     },
      "usage": {
       "anyOf": [
        {
@@ -4576,6 +4835,11 @@
      "unsupported_claims": {
       "default": 0,
       "title": "Unsupported Claims",
+      "type": "integer"
+     },
+     "unsupported_numbers": {
+      "default": 0,
+      "title": "Unsupported Numbers",
       "type": "integer"
      },
      "usage": {
@@ -5996,6 +6260,226 @@
     "summary": "Run Doctor"
    }
   },
+  "/admin/migrate/export": {
+   "get": {
+    "operationId": "migrate_export_admin_migrate_export_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "409": {
+      "description": "Another export or backup is being written."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Migrate Export"
+   }
+  },
+  "/admin/migrate/import": {
+   "post": {
+    "operationId": "migrate_import_admin_migrate_import_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_migrate_import_admin_migrate_import_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MigrateImportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Not a migration bundle."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Migrate Import"
+   }
+  },
+  "/admin/notify-test": {
+   "post": {
+    "operationId": "send_test_notification_admin_notify_test_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/NotifyTestResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "Notifications are off (NOTIFY_URL)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Send Test Notification"
+   }
+  },
+  "/admin/rebuild": {
+   "post": {
+    "operationId": "rebuild_from_originals_admin_rebuild_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RebuildResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "409": {
+      "description": "Originals aren't kept, or the index can't be written."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Rebuild From Originals"
+   }
+  },
   "/answer-cache": {
    "delete": {
     "operationId": "clear_answer_cache_answer_cache_delete",
@@ -6643,6 +7127,75 @@
     "operationId": "list_documents_documents_get",
     "parameters": [
      {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maximum": 5000,
+         "minimum": 1,
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Limit"
+      }
+     },
+     {
+      "in": "query",
+      "name": "cursor",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Cursor"
+      }
+     },
+     {
+      "in": "query",
+      "name": "prefix",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Prefix"
+      }
+     },
+     {
+      "in": "query",
+      "name": "tag",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 128,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Tag"
+      }
+     },
+     {
       "in": "header",
       "name": "X-API-Key",
       "required": false,
@@ -6846,6 +7399,84 @@
      }
     },
     "summary": "Upload Archive"
+   }
+  },
+  "/documents/archive-from-url": {
+   "post": {
+    "operationId": "upload_archive_from_url_documents_archive_from_url_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ArchiveUrlIngestRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ArchiveUploadResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "The URL couldn't be fetched, or isn't a zip."
+     },
+     "404": {
+      "description": "URL ingest is off (URL_INGEST_ENABLED)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Upload Archive From Url"
    }
   },
   "/documents/from-sitemap": {
@@ -7514,6 +8145,78 @@
      }
     },
     "summary": "Retry Document Job"
+   }
+  },
+  "/documents/missing": {
+   "post": {
+    "operationId": "missing_documents_documents_missing_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/MissingDocumentsRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MissingDocumentsResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Missing Documents"
    }
   },
   "/documents/preview": {

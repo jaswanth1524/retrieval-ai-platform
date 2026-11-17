@@ -284,3 +284,16 @@
 .settings__backups li {
   margin-bottom: 4px;
 }
+
+/* A field and its buttons on one line (wrapping on a phone). */
+.settings__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings__row input:not([hidden]) {
+  flex: 1 1 180px;
+  min-width: 0;
+}

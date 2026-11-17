@@ -78,6 +78,8 @@ def register(app: FastAPI) -> None:
                 pipeline.effective_settings(overrides),
                 chunk_id=request.expect_chunk_id,
                 filename=request.expect_filename,
+                narrowed=bool(request.filenames or request.tags)
+                or passage_narrowing(request) is not None,
             )
             explanation = SearchExplanationResponse(**dataclasses.asdict(found))
         ranks = phase.leg_ranks if request.explain else {}

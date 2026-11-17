@@ -46,7 +46,13 @@ from api.parsers.odt import parse_odt_document
 from api.parsers.pdf import parse_pdf_document
 from api.parsers.pptx import parse_pptx_document
 from api.parsers.rtf import parse_rtf_document
-from api.parsers.structured import CODE_EXTENSIONS, parse_code_document, parse_json_document
+from api.parsers.structured import (
+    CODE_EXTENSIONS,
+    parse_code_document,
+    parse_json_document,
+    parse_jsonl_document,
+    parse_xml_document,
+)
 from api.parsers.subtitles import parse_subtitles_document
 from api.parsers.text import (
     declared_html_charset,
@@ -84,7 +90,9 @@ __all__ = [
     "infer_section",
     "looks_like_markdown",
     "merge_tiny_semantic_sections",
+    "normalize_document_name",
     "normalize_filename",
+    "validate_document_name",
     "normalize_tags",
     "normalize_text",
     "parse_document_bytes",
@@ -182,6 +190,26 @@ def _parse_json(
     return parse_json_document(filename, decode_text_document(filename, content))
 
 
+def _parse_jsonl(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_jsonl_document(filename, decode_text_document(filename, content))
+
+
+def _parse_tsv(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_csv_document(
+        filename, decode_text_document(filename, content), settings, delimiter="\t"
+    )
+
+
+def _parse_xml(
+    filename: str, content: bytes, settings: AppSettings | None
+) -> list[DocumentSection]:
+    return parse_xml_document(filename, content, decode_text_document(filename, content))
+
+
 def _parse_code(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
@@ -209,7 +237,7 @@ def _parse_markup_text(
 
 
 # Text formats with markup of their own, indexed as plain text.
-MARKUP_TEXT_EXTENSIONS = frozenset({".rst", ".adoc", ".asciidoc", ".tex"})
+MARKUP_TEXT_EXTENSIONS = frozenset({".rst", ".adoc", ".asciidoc", ".tex", ".org"})
 
 
 # One parser per supported suffix (api/parsers/*); adding a format is one entry here.
@@ -225,6 +253,7 @@ PARSERS: dict[str, Parser] = {
     ".html": _parse_html,
     ".htm": _parse_html,
     ".csv": _parse_csv,
+    ".tsv": _parse_tsv,
     ".txt": _parse_txt,
     ".odt": _parse_odt,
     ".ods": parse_ods_document,
@@ -232,6 +261,8 @@ PARSERS: dict[str, Parser] = {
     ".mbox": _parse_mbox,
     ".ipynb": _parse_ipynb,
     ".json": _parse_json,
+    ".jsonl": _parse_jsonl,
+    ".xml": _parse_xml,
     ".rtf": _parse_rtf,
     ".srt": _parse_subtitles,
     ".vtt": _parse_subtitles,
@@ -462,7 +493,11 @@ def parse_document_bytes(
     uses the defaults, keeping the two-argument call working.
     """
 
-    safe_filename = validate_upload_filename(filename)
+    try:
+        safe_filename = validate_document_name(filename)
+    except UnsupportedDocumentError:
+        # A client's path ("../notes.txt") is named by its base name, as it always was.
+        safe_filename = validate_upload_filename(filename)
     suffix = PurePosixPath(safe_filename).suffix.lower()
     try:
         parsed = PARSERS[suffix](safe_filename, content, settings)
@@ -638,6 +673,80 @@ def normalize_filename(filename: str) -> str:
     if safe_filename in {".", ".."} or any(ord(char) < 32 for char in safe_filename):
         raise UnsupportedDocumentError("Document filename is not valid.")
     return safe_filename
+
+
+# A stored name may carry folders ("reports/2024/q1.pdf") when its source asked for
+# them (WATCH_KEEP_PATHS, `docrag sync --keep-paths`, a zip imported with keep_paths).
+# First folders that would read as one of the API's own routes under /documents, or as
+# the originals store's own directories.
+RESERVED_FIRST_FOLDERS = frozenset(
+    {
+        "jobs",
+        "imports",
+        "sitemap-imports",
+        "reindex",
+        "from-url",
+        "from-sitemap",
+        "archive",
+        "preview",
+        "missing",
+        "workspaces",
+    }
+)
+MAX_NAME_FOLDERS = 16
+MAX_NAME_BYTES = 1024
+
+
+def normalize_document_name(name: str) -> str:
+    """A stored document name: a filename (``normalize_filename``), or folders and a
+    filename joined by ``/`` — each part a valid filename on its own, no part empty,
+    ``.`` or ``..``, and no hidden folder. Never changes a valid name: one it would
+    have to change is refused, so a path can't be made to mean another."""
+
+    if "/" not in name:
+        return normalize_filename(name)
+    parts = name.split("/")
+    if len(parts) - 1 > MAX_NAME_FOLDERS:
+        raise UnsupportedDocumentError(f"Document name has more than {MAX_NAME_FOLDERS} folders.")
+    for index, part in enumerate(parts):
+        try:
+            valid = bool(part) and normalize_filename(part) == part
+        except UnsupportedDocumentError:
+            valid = False
+        if not valid or (index < len(parts) - 1 and part.startswith(".")):
+            raise UnsupportedDocumentError("Document name is not valid.")
+    if parts[0].casefold() in RESERVED_FIRST_FOLDERS:
+        raise UnsupportedDocumentError(
+            f"A document can't be in a top folder named '{parts[0]}' (reserved)."
+        )
+    return name
+
+
+def is_supported_document_name(name: str) -> bool:
+    return PurePosixPath(name).suffix.lower() in SUPPORTED_EXTENSIONS
+
+
+def validate_document_name(name: str) -> str:
+    """``normalize_document_name`` plus what an upload checks: each part's length and
+    the type. A plain filename is checked exactly as ``validate_upload_filename`` does
+    (which also takes the basename of a client's path)."""
+
+    if "/" not in name:
+        return validate_upload_filename(name)
+    safe = normalize_document_name(name)
+    if any(len(part.encode("utf-8")) > MAX_FILENAME_BYTES for part in safe.split("/")):
+        raise UnsupportedDocumentError(
+            f"A part of the document name is longer than {MAX_FILENAME_BYTES} bytes."
+        )
+    if len(safe.encode("utf-8")) > MAX_NAME_BYTES:
+        raise UnsupportedDocumentError(f"Document name is longer than {MAX_NAME_BYTES} bytes.")
+    suffix = PurePosixPath(safe).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise UnsupportedDocumentError(
+            f"Unsupported document type '{suffix or '<none>'}'. "
+            f"Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}."
+        )
+    return safe
 
 
 def validate_upload_filename(filename: str) -> str:
