@@ -66,15 +66,21 @@ export function passageLinkUrl(
   return `${location.origin}${location.pathname}#${params.toString()}`;
 }
 
+interface Used {
+  usage?: { prompt: number; completion: number; costUsd?: number };
+}
+
 /** Tokens and estimated cost of a conversation's answers (null when none reported). */
 export function usageTotal(
-  turns: ReadonlyArray<{ usage?: { prompt: number; completion: number; costUsd?: number } }>,
+  turns: ReadonlyArray<Used & { versions?: ReadonlyArray<Used> }>,
 ): { tokens: number; costUsd?: number } | null {
   let tokens = 0;
   let cost = 0;
   let priced = false;
   let any = false;
-  for (const turn of turns) {
+  // An answer replaced by Regenerate or Reformat was still paid for: its earlier
+  // versions count too.
+  for (const turn of turns.flatMap((answer) => [answer, ...(answer.versions ?? [])])) {
     if (!turn.usage) continue;
     any = true;
     tokens += turn.usage.prompt + turn.usage.completion;

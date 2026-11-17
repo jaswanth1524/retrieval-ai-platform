@@ -9,9 +9,31 @@ const SELECTABLE = '.chat-message__markdown, [data-quote-source]';
 const MIN_SELECTION_CHARS = 3;
 const MAX_SELECTION_CHARS = 2000;
 
+// The bar's size, for keeping it on screen (three buttons, or wrapped on a phone).
+const BAR_WIDTH = 400;
+const BAR_HEIGHT = 36;
+
+/** The range's text without the citation buttons' digits ("retrieval 1 …"), spacing
+ *  collapsed. */
+function selectedText(range: Range): string {
+  const copy = range.cloneContents();
+  copy.querySelectorAll('[data-testid="inline-citation"]').forEach((marker) => marker.remove());
+  return (copy.textContent ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/** A quote to keep: its text and, from a viewer passage, where it comes from. */
+export interface SelectedQuote {
+  text: string;
+  source: string | null;
+  filename: string | null;
+  chunkId: string | null;
+}
+
 interface Selected {
   text: string;
   source: string | null;
+  filename: string | null;
+  chunkId: string | null;
   top: number;
   left: number;
 }
@@ -23,10 +45,14 @@ interface Selected {
 export default function SelectionActions({
   onAsk,
   onSearch,
+  onSave,
 }: {
   onAsk: (text: string) => void;
   onSearch: (text: string) => void;
+  /** Keep the selection as a quote (the Quotes & passages panel). */
+  onSave?: (quote: SelectedQuote) => void;
 }) {
+  const [saved, setSaved] = useState(false);
   const [selected, setSelected] = useState<Selected | null>(null);
   const [copied, setCopied] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
@@ -36,7 +62,14 @@ export default function SelectionActions({
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         const selection = document.getSelection();
-        const text = selection?.toString().replace(/\s+/g, ' ').trim() ?? '';
+        // Text selected inside a field (the viewer's "ask about this passage" box) is
+        // the reader's own typing, not a quote.
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+          setSelected(null);
+          return;
+        }
+        const text = selection && selection.rangeCount > 0 ? selectedText(selection.getRangeAt(0)) : '';
         if (!selection || selection.rangeCount === 0 || text.length < MIN_SELECTION_CHARS) {
           // A click on the bar itself clears the selection first: keep the bar then.
           if (!barRef.current?.contains(document.activeElement)) setSelected(null);
@@ -50,21 +83,46 @@ export default function SelectionActions({
           return;
         }
         const box = range.getBoundingClientRect();
+        // A window narrower than the bar wraps it to two rows.
+        const barHeight = window.innerWidth < BAR_WIDTH + 16 ? BAR_HEIGHT * 2 : BAR_HEIGHT;
         setCopied(false);
+        setSaved(false);
         setSelected({
           text: text.slice(0, MAX_SELECTION_CHARS),
           source: host.getAttribute('data-quote-source'),
-          top: Math.max(8, box.top - 44),
-          left: Math.min(Math.max(8, box.left), window.innerWidth - 280),
+          filename: host.getAttribute('data-quote-filename'),
+          chunkId: host.getAttribute('data-chunk-id'),
+          // Above the selection; below it when there is no room above (the bar would
+          // cover the text it is about).
+          top: box.top >= barHeight + 12 ? box.top - barHeight - 8 : box.bottom + 8,
+          left: Math.max(8, Math.min(box.left, window.innerWidth - BAR_WIDTH - 8)),
         });
       });
     };
+    // Escape puts the bar away (the selection stays, to copy the usual way).
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelected(null);
+    };
     document.addEventListener('selectionchange', read);
+    // The bar is fixed to the window: it follows the text when the thread or the
+    // viewer scrolls, and when the window is resized.
+    document.addEventListener('scroll', read, true);
+    window.addEventListener('resize', read);
+    document.addEventListener('keydown', onKeyDown);
     return () => {
       cancelAnimationFrame(frame);
       document.removeEventListener('selectionchange', read);
+      document.removeEventListener('scroll', read, true);
+      window.removeEventListener('resize', read);
+      document.removeEventListener('keydown', onKeyDown);
     };
   }, []);
+  // "Copied" is said for a moment, not until the next selection.
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
 
   if (!selected) return null;
   const quote = `> ${selected.text}${selected.source ? `\n— ${selected.source}` : ''}`;
@@ -107,6 +165,28 @@ export default function SelectionActions({
       >
         {copied ? 'Copied' : 'Copy as quote'}
       </button>
+      {onSave && (
+        <button
+          type="button"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            onSave({
+              text: selected.text,
+              source: selected.source,
+              filename: selected.filename,
+              chunkId: selected.chunkId,
+            });
+            setSaved(true);
+          }}
+          disabled={saved}
+          data-testid="selection-save"
+        >
+          {saved ? 'Saved' : 'Save quote'}
+        </button>
+      )}
+      <span className="visually-hidden" role="status">
+        {copied ? 'Quote copied.' : saved ? 'Quote saved.' : ''}
+      </span>
     </div>
   );
 }

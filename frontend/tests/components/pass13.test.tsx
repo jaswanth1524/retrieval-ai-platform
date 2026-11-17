@@ -251,7 +251,7 @@ describe('file preview', () => {
       'policy.md: 3 passages in 2 sections — not indexed',
     );
     expect(screen.getByText('Annual leave is twenty days.')).toBeInTheDocument();
-    expect(preview).toHaveBeenCalledWith(file, undefined, '');
+    expect(preview).toHaveBeenCalledWith(file, expect.any(AbortSignal), '');
     expect(upload).not.toHaveBeenCalled();
   });
 });

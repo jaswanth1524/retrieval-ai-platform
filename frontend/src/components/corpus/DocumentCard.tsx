@@ -1,5 +1,7 @@
 import { memo, useState } from 'react';
 import ConfirmInline from '../ConfirmInline';
+import OverflowMenu from '../OverflowMenu';
+import { useCompactActions } from '../../hooks/useCompactActions';
 import TagEditor from './TagEditor';
 import DocumentUsage from './DocumentUsage';
 import VersionHistory from './VersionHistory';
@@ -98,6 +100,7 @@ const DocumentCard = memo(function DocumentCard({
   queryLogEnabled = false,
   onOpenAnswer,
 }: DocumentCardProps) {
+  const compactActions = useCompactActions();
   const [showVersions, setShowVersions] = useState(false);
   const [resolving, setResolving] = useState<'confirm' | 'busy' | null>(null);
   // Read when opened: the answers citing it, as they were then.
@@ -157,87 +160,148 @@ const DocumentCard = memo(function DocumentCard({
                 ?
               </button>
             )}
-            {onSummarize && (
-              <button
-                type="button"
-                className="corpus-panel__read"
-                // aria-disabled, not disabled: the summary dialog returns focus here as
-                // the summary starts (which disables summarizing), and a disabled button
-                // can't take it — focus fell to the page.
-                onClick={() => !(disabled || summarizeDisabled) && onSummarize([card.filename])}
-                aria-disabled={disabled || summarizeDisabled || undefined}
-                aria-label={`Summarize ${card.filename}`}
-                title="Summarize the whole document"
-                data-testid="corpus-summarize"
-              >
-                ∑
-              </button>
-            )}
-            {card.hasOriginal && onOpenOriginal && (
-              <button
-                type="button"
-                className="corpus-panel__open-original"
-                onClick={() => onOpenOriginal(card.filename)}
-                aria-label={`Download the original of ${card.filename}`}
-                title="Download the uploaded file"
-              >
-                ⇱
-              </button>
-            )}
-            {card.status === 'indexed' && findAnswersCiting && onOpenAnswer && (
-              <button
-                type="button"
-                className="corpus-panel__read"
-                onClick={() => setUsage((open) => (open ? null : findAnswersCiting(card.filename)))}
-                aria-expanded={usage !== null}
-                aria-label={`Questions that cited ${card.filename}`}
-                title="Questions that cited this document"
-                data-testid="corpus-usage-toggle"
-              >
-                ❝
-              </button>
-            )}
-            {card.hasOriginal && onRestoreVersion && (
-              <button
-                type="button"
-                className="corpus-panel__read"
-                onClick={() => setShowVersions((open) => !open)}
-                aria-expanded={showVersions}
-                aria-label={`Earlier versions of ${card.filename}`}
-                title="Earlier versions of the original"
-                data-testid="corpus-versions-toggle"
-              >
-                ⧗
-              </button>
-            )}
-            {card.canReindex && (
-              <button
-                type="button"
-                className={`corpus-panel__reindex${card.stale ? ' corpus-panel__reindex--stale' : ''}`}
-                onClick={() => onReindex?.(card.filename)}
-                disabled={disabled}
-                aria-label={`Re-index ${card.filename}`}
-                title={
-                  card.incomplete
-                    ? 'Some passages are missing or left from an earlier version — re-index from the stored original'
-                    : card.stale
-                      ? 'Indexed by an older chunker — re-index from the stored original'
-                      : 'Re-index from the stored original'
-                }
-              >
-                ↻
-              </button>
-            )}
-            {!readOnly && (
-              <button
-                type="button"
-                className="corpus-panel__remove"
-                onClick={() => onAskDelete(card.key)}
-                disabled={disabled}
-                aria-label={`Delete ${card.filename}`}
-              >
-                ✕
-              </button>
+            {compactActions ? (
+              <OverflowMenu
+                tone="rail"
+                label={`More actions for ${card.filename}`}
+                testId="corpus-menu"
+                items={[
+                  ...(onSummarize
+                    ? [
+                        {
+                          label: 'Summarize',
+                          onSelect: () => onSummarize([card.filename]),
+                          disabled: disabled || summarizeDisabled,
+                          testId: 'corpus-menu-summarize',
+                        },
+                      ]
+                    : []),
+                  ...(card.hasOriginal && onOpenOriginal
+                    ? [{ label: 'Download the original', onSelect: () => onOpenOriginal(card.filename) }]
+                    : []),
+                  ...(findAnswersCiting && onOpenAnswer
+                    ? [
+                        {
+                          label: usage !== null ? 'Hide the questions that cited it' : 'Questions that cited it',
+                          onSelect: () => setUsage((open) => (open ? null : findAnswersCiting(card.filename))),
+                        },
+                      ]
+                    : []),
+                  ...(card.hasOriginal && onRestoreVersion
+                    ? [
+                        {
+                          label: showVersions ? 'Hide earlier versions' : 'Earlier versions',
+                          onSelect: () => setShowVersions((open) => !open),
+                        },
+                      ]
+                    : []),
+                  ...(card.canReindex
+                    ? [
+                        {
+                          label: card.stale || card.incomplete ? 'Re-index (out of date)' : 'Re-index',
+                          onSelect: () => onReindex?.(card.filename),
+                          disabled,
+                          testId: 'corpus-menu-reindex',
+                        },
+                      ]
+                    : []),
+                  ...(!readOnly
+                    ? [
+                        {
+                          label: 'Delete',
+                          onSelect: () => onAskDelete(card.key),
+                          disabled,
+                          testId: 'corpus-menu-delete',
+                        },
+                      ]
+                    : []),
+                ]}
+              />
+            ) : (
+              <>
+              {onSummarize && (
+                <button
+                  type="button"
+                  className="corpus-panel__read"
+                  // aria-disabled, not disabled: the summary dialog returns focus here as
+                  // the summary starts (which disables summarizing), and a disabled button
+                  // can't take it — focus fell to the page.
+                  onClick={() => !(disabled || summarizeDisabled) && onSummarize([card.filename])}
+                  aria-disabled={disabled || summarizeDisabled || undefined}
+                  aria-label={`Summarize ${card.filename}`}
+                  title="Summarize the whole document"
+                  data-testid="corpus-summarize"
+                >
+                  ∑
+                </button>
+              )}
+              {card.hasOriginal && onOpenOriginal && (
+                <button
+                  type="button"
+                  className="corpus-panel__open-original"
+                  onClick={() => onOpenOriginal(card.filename)}
+                  aria-label={`Download the original of ${card.filename}`}
+                  title="Download the uploaded file"
+                >
+                  ⇱
+                </button>
+              )}
+              {card.status === 'indexed' && findAnswersCiting && onOpenAnswer && (
+                <button
+                  type="button"
+                  className="corpus-panel__read"
+                  onClick={() => setUsage((open) => (open ? null : findAnswersCiting(card.filename)))}
+                  aria-expanded={usage !== null}
+                  aria-label={`Questions that cited ${card.filename}`}
+                  title="Questions that cited this document"
+                  data-testid="corpus-usage-toggle"
+                >
+                  ❝
+                </button>
+              )}
+              {card.hasOriginal && onRestoreVersion && (
+                <button
+                  type="button"
+                  className="corpus-panel__read"
+                  onClick={() => setShowVersions((open) => !open)}
+                  aria-expanded={showVersions}
+                  aria-label={`Earlier versions of ${card.filename}`}
+                  title="Earlier versions of the original"
+                  data-testid="corpus-versions-toggle"
+                >
+                  ⧗
+                </button>
+              )}
+              {card.canReindex && (
+                <button
+                  type="button"
+                  className={`corpus-panel__reindex${card.stale ? ' corpus-panel__reindex--stale' : ''}`}
+                  onClick={() => onReindex?.(card.filename)}
+                  disabled={disabled}
+                  aria-label={`Re-index ${card.filename}`}
+                  title={
+                    card.incomplete
+                      ? 'Some passages are missing or left from an earlier version — re-index from the stored original'
+                      : card.stale
+                        ? 'Indexed by an older chunker — re-index from the stored original'
+                        : 'Re-index from the stored original'
+                  }
+                >
+                  ↻
+                </button>
+              )}
+              {!readOnly && (
+                <button
+                  type="button"
+                  className="corpus-panel__remove"
+                  onClick={() => onAskDelete(card.key)}
+                  disabled={disabled}
+                  aria-label={`Delete ${card.filename}`}
+                >
+                  ✕
+                </button>
+              )}
+              </>
             )}
           </div>
         ) : card.status === 'indexing' ? (

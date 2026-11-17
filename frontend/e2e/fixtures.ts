@@ -139,6 +139,9 @@ export class MockApi {
       rerank_score: 0.93,
     },
   ];
+  /** POST /admin/rebuild calls, and what GET /admin/audit lists. */
+  rebuilds = 0;
+  auditEntries: object[] = [];
   /** Bodies of every POST /search, for a spec to inspect. */
   readonly searches: object[] = [];
   /** Filenames a POST /import restores (each becomes a job). */
@@ -306,6 +309,14 @@ export class MockApi {
     if (path === '/backups/run' && method === 'POST') {
       this.backupRuns += 1;
       return this.json(route, 202, { workspace: 'default' });
+    }
+    if (path === '/admin/rebuild' && method === 'POST') {
+      this.rebuilds += 1;
+      return this.json(route, 202, { import_id: 'rebuild-1', originals: 2 });
+    }
+    if (path === '/admin/audit') return this.json(route, 200, { entries: this.auditEntries });
+    if (path === '/admin/notify-test' && method === 'POST') {
+      return this.configured(route, 404, { detail: 'Notifications are off (NOTIFY_URL).' });
     }
     if (path === '/admin/consistency') {
       return this.json(route, 200, this.consistency ?? {

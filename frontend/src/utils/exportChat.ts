@@ -1,4 +1,4 @@
-import { usageTotal } from './deepLink';
+import { passageLinkUrl, usageTotal } from './deepLink';
 import { formatCost } from './cost';
 import type { CitationResponse } from '../api/types';
 import type { ChatTurn } from '../components/ChatMessage';
@@ -44,11 +44,28 @@ export function withCitationFootnotes(content: string, sources: CitationResponse
   return [content, citationLines(sources)].filter(Boolean).join('\n\n');
 }
 
-/** Each source line followed by the passages its answer rests on, as quotes. */
-function citationLinesWithQuotes(sources: CitationResponse[]): string {
+/** A link back to a cited passage (it opens the viewer there), or none. */
+export type PassageLinkOf = (source: CitationResponse) => string | null;
+
+/** Passage links into this server for the sources of ``workspace``'s answers. */
+export function passageLinksIn(
+  workspace: string,
+  here: Pick<Location, 'origin' | 'pathname'> = window.location,
+): PassageLinkOf {
+  return (source) =>
+    source.chunk_id
+      ? passageLinkUrl({ filename: source.filename, chunkId: source.chunk_id, workspace }, here)
+      : null;
+}
+
+/** Each source line followed by the passages its answer rests on, as quotes; with
+ *  ``linkOf``, each line links back to its passage. */
+function citationLinesWithQuotes(sources: CitationResponse[], linkOf?: PassageLinkOf): string {
   return sources
     .map((source) => {
-      const line = `[${source.source_number}] ${source.filename} · ${pageLabel(source.page, source.page_end)} · ${source.section}`;
+      const where = `${source.filename} · ${pageLabel(source.page, source.page_end)} · ${source.section}`;
+      const url = linkOf?.(source);
+      const line = `[${source.source_number}] ${url ? `[${where}](${url})` : where}`;
       const quotes = (source.spans ?? []).map((span) => `> ${span.quote.replace(/\s+/g, ' ').trim()}`);
       return [line, ...quotes].join('\n');
     })
@@ -57,11 +74,11 @@ function citationLinesWithQuotes(sources: CitationResponse[]): string {
 
 /** A conversation as Markdown: its title, then each turn (dated), its sources and the
  *  quotes they rest on. */
-export function chatToMarkdown(turns: ChatTurn[], title?: string): string {
+export function chatToMarkdown(turns: ChatTurn[], title?: string, linkOf?: PassageLinkOf): string {
   const blocks = turns.map((turn) => {
     // Always dated: an export is read later, away from the conversation.
     const heading = `## ${speakerLabel(turn.role)} (${DATE_TIME_FORMATTER.format(turn.timestamp)})`;
-    return [heading, turn.content, citationLinesWithQuotes(turn.sources)]
+    return [heading, turn.content, citationLinesWithQuotes(turn.sources, linkOf)]
       .filter(Boolean)
       .join('\n\n');
   });
@@ -79,14 +96,17 @@ export function chatToMarkdown(turns: ChatTurn[], title?: string): string {
 /** Saved answers as one Markdown file: each with its question, conversation, sources
  *  and the quotes they rest on. */
 export function savedAnswersToMarkdown(
-  items: { conversationTitle: string; question: string | null; turn: ChatTurn }[],
+  items: { conversationTitle: string; question: string | null; turn: ChatTurn; workspace?: string }[],
+  withLinks = false,
 ): string {
-  const blocks = items.map(({ conversationTitle, question, turn }) =>
+  const blocks = items.map(({ conversationTitle, question, turn, workspace }) =>
     [
       `## ${question ?? 'Answer'}`,
       `_${conversationTitle} · ${DATE_TIME_FORMATTER.format(turn.timestamp)}_`,
+      // The reader's own note on it, first.
+      turn.note ? `**Note:** ${turn.note}` : '',
       turn.content,
-      citationLinesWithQuotes(turn.sources),
+      citationLinesWithQuotes(turn.sources, withLinks ? passageLinksIn(workspace ?? '') : undefined),
     ]
       .filter(Boolean)
       .join('\n\n'),

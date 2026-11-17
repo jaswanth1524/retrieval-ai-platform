@@ -1,4 +1,5 @@
 import { SITEMAP_STARTED_EVENT } from '../components/corpus/SitemapImports';
+import { BACKGROUND_IMPORT_STARTED_EVENT, readZipOptions } from '../utils/zipOptions';
 import { useMemo, useRef, useState } from 'react';
 import { ApiClientError, api, apiErrorMessage, getWorkspace } from '../api/client';
 import type { DocumentJobAcceptedResponse, DocumentListResponse } from '../api/types';
@@ -626,9 +627,10 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         ...prev,
         { id: zipId, filename: file.name, status: 'uploading', workspace, tags },
       ]);
+      const zipOptions = readZipOptions();
       let report;
       try {
-        report = await api.uploadArchive(file, tags, controller.signal, workspace);
+        report = await api.uploadArchive(file, tags, controller.signal, workspace, zipOptions);
       } catch (err) {
         removeUpload(zipId);
         if (controller.signal.aborted || deps.current.onAuthFailure(err)) return;
@@ -642,6 +644,16 @@ export function useCorpus(callbacks: CorpusCallbacks) {
         sending.delete(zipId);
       }
       removeUpload(zipId);
+      if (report.import_id) {
+        // In the background: the corpus panel's import list follows it.
+        window.dispatchEvent(new Event(BACKGROUND_IMPORT_STARTED_EVENT));
+        deps.current.pushToast({
+          tone: 'good',
+          title: `Importing ${file.name} in the background`,
+          body: 'Every document in it is queued as room frees; the corpus panel shows how far it got.',
+        });
+        return;
+      }
       if (report.jobs.length === 0 && report.skipped.length === 0 && report.deferred.length === 0) {
         deps.current.pushToast({
           tone: 'warn',

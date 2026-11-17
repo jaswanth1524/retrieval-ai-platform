@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, apiErrorMessage, getWorkspace } from '../../api/client';
 import type {
+  AuditEntryResponse,
   DoctorFindingResponse,
   AnswerCacheResponse,
   AnswerFormat,
@@ -13,6 +14,8 @@ import type {
 } from '../../api/types';
 import { formatRelativeTime } from '../../utils/relativeTime';
 import ConfirmInline from '../ConfirmInline';
+import { useRequestSignal } from '../../hooks/useRequestSignal';
+import { BACKGROUND_IMPORT_STARTED_EVENT, readZipOptions } from '../../utils/zipOptions';
 import { downloadFile } from '../../utils/exportChat';
 
 /** The full key's tools for this workspace: its own relevance settings, its cached
@@ -35,6 +38,10 @@ export default function AdminTools({
       <CheckUploadedBackup />
       <SettingsCheck />
       <Consistency />
+      <Rebuild />
+      <AuditLog />
+      <NotifyTest />
+      <MoveServer />
     </div>
   );
 }
@@ -267,7 +274,8 @@ function AnswerCache({ version = 0 }: { version?: number }) {
       {cache.entries.length > 0 &&
         (clearing ? (
           <ConfirmInline
-            prompt="Clear every cached answer in this workspace?"
+            tone="main"
+                  prompt="Clear every cached answer in this workspace?"
             confirmLabel="Clear"
             onCancel={() => setClearing(false)}
             onConfirm={() => {
@@ -300,6 +308,12 @@ function Backups({
   const [confirming, setConfirming] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [checks, setChecks] = useState<Record<string, BackupCheckResponse>>({});
+  // The stored backup being checked (one at a time: the server checks one at a time).
+  const [checking, setChecking] = useState<string | null>(null);
+  // A restore in the background queues every document as room frees (followed under
+  // Imports in the corpus panel); now, it queues the queue's worth and defers the rest.
+  const [inBackground, setInBackground] = useState(() => readZipOptions().background);
+  const checkRequest = useRequestSignal();
   const alive = useRef(true);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
@@ -372,6 +386,16 @@ function Backups({
           {message}
         </p>
       )}
+      <label className="settings__row">
+        <input
+          type="checkbox"
+          checked={inBackground}
+          onChange={(event) => setInBackground(event.target.checked)}
+          data-testid="backups-restore-background"
+        />{' '}
+        Restore in the background (every document queued as room frees, instead of the
+        queue&apos;s worth now and the rest deferred)
+      </label>
       <ul className="settings__backups">
         {listing.backups.map((backup) => {
           const check = checks[backup.name];
@@ -381,18 +405,40 @@ function Backups({
               <span className="mono">{backup.name}</span> ·{' '}
               {formatRelativeTime(backup.created_at * 1000)} ·{' '}
               {verified === true ? 'verified' : verified === false ? 'damaged' : 'not checked'}{' '}
-              <button
-                type="button"
-                onClick={() =>
-                  void api
-                    .verifyStoredBackup(backup.name)
-                    .then((result) => setChecks((prev) => ({ ...prev, [backup.name]: result })))
-                    .catch((err) => setMessage(apiErrorMessage(err, 'Could not check it.')))
-                }
-                data-testid="backup-verify"
-              >
-                Check
-              </button>{' '}
+              {checking === backup.name ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    checkRequest.cancel();
+                    setChecking(null);
+                    setMessage('Check cancelled.');
+                  }}
+                  data-testid="backup-verify-cancel"
+                >
+                  Checking… Cancel
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={checking !== null}
+                  onClick={() => {
+                    const signal = checkRequest.start();
+                    setChecking(backup.name);
+                    void api
+                      .verifyStoredBackup(backup.name, signal)
+                      .then((result) => setChecks((prev) => ({ ...prev, [backup.name]: result })))
+                      .catch((err) => {
+                        if (!signal.aborted) setMessage(apiErrorMessage(err, 'Could not check it.'));
+                      })
+                      .finally(() => {
+                        if (!signal.aborted) setChecking(null);
+                      });
+                  }}
+                  data-testid="backup-verify"
+                >
+                  Check
+                </button>
+              )}{' '}
               <button
                 type="button"
                 onClick={() =>
@@ -407,6 +453,7 @@ function Backups({
               </button>{' '}
               {deleting === backup.name ? (
                 <ConfirmInline
+                  tone="main"
                   prompt="Delete this backup?"
                   confirmLabel="Delete"
                   onCancel={() => setDeleting(null)}
@@ -436,10 +483,29 @@ function Backups({
                   onConfirm={() => {
                     setConfirming(null);
                     void api
-                      .restoreStoredBackup(backup.name)
+                      .restoreStoredBackup(backup.name, inBackground)
                       .then((outcome) => {
+                        if (outcome.import_id) {
+                          window.dispatchEvent(new Event(BACKGROUND_IMPORT_STARTED_EVENT));
+                          setMessage(
+                            `Restoring ${backup.name} in the background: its documents are queued as there is room. Follow it under Imports in the corpus panel.`,
+                          );
+                          return;
+                        }
+                        // What didn't come back is said too: a partial restore read
+                        // as a whole one.
+                        const left = [
+                          outcome.deferred?.length
+                            ? `${outcome.deferred.length} not queued (the indexing queue was full: restore again later)`
+                            : '',
+                          outcome.rejected?.length ? `${outcome.rejected.length} refused` : '',
+                          outcome.missing_originals?.length
+                            ? `${outcome.missing_originals.length} with no original in the backup`
+                            : '',
+                        ].filter(Boolean);
                         setMessage(
-                          `${outcome.jobs.length} document(s) queued, ${outcome.skipped.length} already here.`,
+                          `${outcome.jobs.length} document(s) queued, ${outcome.skipped.length} already here` +
+                            (left.length ? `; ${left.join(', ')}.` : '.'),
                         );
                         onRestored?.(outcome.jobs);
                       })
@@ -599,6 +665,7 @@ function Consistency() {
               ))}
               {confirming ? (
                 <ConfirmInline
+                  tone="main"
                   prompt="Deleted originals can't be brought back. Go ahead?"
                   confirmLabel="Repair"
                   onCancel={() => setConfirming(false)}
@@ -651,6 +718,7 @@ function CheckUploadedBackup() {
   const [result, setResult] = useState<{ name: string; check: BackupCheckResponse } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const checkRequest = useRequestSignal();
   return (
     <section aria-label="Check a backup file" data-testid="backup-check-upload">
       <h4 className="settings__subhead">Check a backup file</h4>
@@ -665,15 +733,34 @@ function CheckUploadedBackup() {
           if (!file) return;
           setBusy(true);
           setError(null);
+          const signal = checkRequest.start();
           api
-            .verifyBackup(file)
+            .verifyBackup(file, signal)
             .then((check) => setResult({ name: file.name, check }))
-            .catch((err) => setError(apiErrorMessage(err, 'Could not check it.')))
-            .finally(() => setBusy(false));
+            .catch((err) => {
+              if (!signal.aborted) setError(apiErrorMessage(err, 'Could not check it.'));
+            })
+            .finally(() => {
+              if (!signal.aborted) setBusy(false);
+            });
         }}
         data-testid="backup-check-file"
       />
-      {busy && <p className="settings__hint">Reading it…</p>}
+      {busy && (
+        <p className="settings__hint">
+          Reading it…{' '}
+          <button
+            type="button"
+            onClick={() => {
+              checkRequest.cancel();
+              setBusy(false);
+            }}
+            data-testid="backup-check-cancel"
+          >
+            Cancel
+          </button>
+        </p>
+      )}
       {error && <p className="settings__hint">{error}</p>}
       {result && (
         <p className="settings__hint" role="status" data-testid="backup-check-result">
@@ -682,6 +769,237 @@ function CheckUploadedBackup() {
             ? `, ${result.check.would_restore} a restore would bring back`
             : ''}
           {checkProblems(result.check) ? ` — ${checkProblems(result.check)}` : ' — restores as written.'}
+        </p>
+      )}
+    </section>
+  );
+}
+
+
+/** Index every stored original with no document again: after a lost index. */
+function Rebuild() {
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const run = () => {
+    setConfirming(false);
+    setRunning(true);
+    setError(null);
+    api
+      .rebuild()
+      .then((started) =>
+        setResult(
+          started.import_id
+            ? `Indexing ${started.originals} document${started.originals === 1 ? '' : 's'} from their originals — the corpus panel’s background imports follow it.`
+            : 'Nothing to rebuild: every stored original has its document.',
+        ),
+      )
+      .catch((err) => setError(apiErrorMessage(err, 'Could not start the rebuild.')))
+      .finally(() => setRunning(false));
+  };
+  return (
+    <section aria-label="Rebuild from originals" data-testid="rebuild">
+      <h4 className="settings__subhead">Rebuild from originals</h4>
+      <p className="settings__hint">
+        After a lost index (a wiped Qdrant volume, a move): every kept original with no
+        document is indexed again, with its tags and source.
+      </p>
+      {confirming ? (
+        <ConfirmInline
+          prompt="Index every original that has no document?"
+          confirmLabel="Rebuild"
+          tone="main"
+          onConfirm={run}
+          onCancel={() => setConfirming(false)}
+        />
+      ) : (
+        <button type="button" onClick={() => setConfirming(true)} disabled={running} data-testid="rebuild-run">
+          {running ? 'Starting…' : 'Rebuild'}
+        </button>
+      )}
+      {error && (
+        <p className="settings__hint" role="alert">
+          {error}
+        </p>
+      )}
+      {result && (
+        <p className="settings__hint" role="status" data-testid="rebuild-result">
+          {result}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** The audit log (AUDIT_LOG_PATH): who changed what, newest first. */
+function AuditLog() {
+  const [entries, setEntries] = useState<AuditEntryResponse[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [event, setEvent] = useState('');
+  const [loading, setLoading] = useState(false);
+  const load = () => {
+    setLoading(true);
+    setError(null);
+    api
+      .audit({ event: event.trim() || undefined, limit: 200 })
+      .then((report) => setEntries(report.entries))
+      .catch((err) => setError(apiErrorMessage(err, 'Could not read the audit log.')))
+      .finally(() => setLoading(false));
+  };
+  return (
+    <section aria-label="Audit log" data-testid="audit-log">
+      <h4 className="settings__subhead">Audit log</h4>
+      <p className="settings__hint">
+        Uploads, deletes, tag changes, restores and settings, with the kind of key used.
+      </p>
+      <form
+        className="settings__row"
+        onSubmit={(formEvent) => {
+          formEvent.preventDefault();
+          load();
+        }}
+      >
+        <input
+          className="settings__input"
+          value={event}
+          onChange={(change) => setEvent(change.target.value)}
+          placeholder="Event, or a prefix like document."
+          aria-label="Only this event (or prefix ending in a dot)"
+          data-testid="audit-event"
+        />
+        <button type="submit" disabled={loading} data-testid="audit-load">
+          {loading ? 'Loading…' : entries ? 'Reload' : 'Show'}
+        </button>
+      </form>
+      {error && (
+        <p className="settings__hint" role="alert">
+          {error}
+        </p>
+      )}
+      {entries !== null &&
+        (entries.length === 0 ? (
+          <p className="settings__hint">No events.</p>
+        ) : (
+          <ul className="settings__backups" data-testid="audit-entries">
+            {entries.map((entry, index) => (
+              <li key={`${entry.created_at}:${index}`} data-testid="audit-entry">
+                <span className="mono">{formatRelativeTime(entry.created_at * 1000)}</span>{' '}
+                <strong>{entry.event}</strong> <span className="mono">({entry.key})</span>{' '}
+                {auditDetail(entry)}
+              </li>
+            ))}
+          </ul>
+        ))}
+    </section>
+  );
+}
+
+/** An audit event's fields in one line ("filename=guide.pdf, tags=hr"). */
+function auditDetail(entry: AuditEntryResponse): string {
+  return Object.entries(entry.fields ?? {})
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .slice(0, 6)
+    .map(([name, value]) => `${name}=${Array.isArray(value) ? value.join(' ') : String(value)}`)
+    .join(', ')
+    .slice(0, 300);
+}
+
+/** Send one notification through NOTIFY_URL, to check it reaches the operator. */
+function NotifyTest() {
+  const [result, setResult] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const run = () => {
+    setRunning(true);
+    api
+      .notifyTest()
+      .then((sent) =>
+        setResult(sent.sent ? 'Sent — check where notifications arrive.' : `Not sent: ${sent.error ?? 'no reason given'}`),
+      )
+      .catch((err) => setResult(apiErrorMessage(err, 'Notifications are off (NOTIFY_URL).')))
+      .finally(() => setRunning(false));
+  };
+  return (
+    <section aria-label="Failure notifications" data-testid="notify-test">
+      <h4 className="settings__subhead">Failure notifications</h4>
+      <p className="settings__hint">
+        A failed backup, a file the watcher gave up on or a failed scheduled re-index is
+        posted to NOTIFY_URL.
+      </p>
+      <button type="button" onClick={run} disabled={running} data-testid="notify-test-run">
+        {running ? 'Sending…' : 'Send a test notification'}
+      </button>
+      {result && (
+        <p className="settings__hint" role="status" data-testid="notify-test-result">
+          {result}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** The whole server as one file (every workspace, with index snapshots), and back. */
+function MoveServer() {
+  const [busy, setBusy] = useState<'pack' | 'unpack' | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const pack = () => {
+    setBusy('pack');
+    setMessage(null);
+    api
+      .migrateExport()
+      .then(({ blob, filename }) => downloadFile(filename, 'application/zip', blob))
+      .catch((err) => setMessage(apiErrorMessage(err, 'Could not write the bundle.')))
+      .finally(() => setBusy(null));
+  };
+  const unpack = (file: File) => {
+    setBusy('unpack');
+    setMessage(null);
+    api
+      .migrateImport(file)
+      .then((started) =>
+        setMessage(
+          `Unpacking ${started.workspaces.join(', ') || 'nothing'} — the default workspace’s background imports follow it.`,
+        ),
+      )
+      .catch((err) => setMessage(apiErrorMessage(err, 'Could not unpack the bundle.')))
+      .finally(() => setBusy(null));
+  };
+  return (
+    <section aria-label="Move this server" data-testid="move-server">
+      <h4 className="settings__subhead">Move this server</h4>
+      <p className="settings__hint">
+        One file with every workspace’s documents, history, settings and index. Unpacked on
+        a server with the same embedding setup, nothing is embedded again.
+      </p>
+      <div className="settings__row">
+        <button type="button" onClick={pack} disabled={busy !== null} data-testid="migrate-pack">
+          {busy === 'pack' ? 'Writing…' : 'Download bundle'}
+        </button>
+        <button
+          type="button"
+          onClick={() => fileRef.current?.click()}
+          disabled={busy !== null}
+          data-testid="migrate-unpack"
+        >
+          {busy === 'unpack' ? 'Uploading…' : 'Unpack a bundle…'}
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".zip,application/zip"
+          hidden
+          onChange={(change) => {
+            const file = change.target.files?.[0];
+            change.target.value = '';
+            if (file) unpack(file);
+          }}
+          data-testid="migrate-file"
+        />
+      </div>
+      {message && (
+        <p className="settings__hint" role="status" data-testid="migrate-result">
+          {message}
         </p>
       )}
     </section>

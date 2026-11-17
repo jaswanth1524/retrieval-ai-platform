@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { api, apiErrorMessage } from '../../api/client';
+import { BACKGROUND_IMPORT_STARTED_EVENT } from '../../utils/zipOptions';
+import { ApiClientError, api, apiErrorMessage } from '../../api/client';
 import type { BackgroundImportResponse } from '../../api/types';
 
 const RUNNING_POLL_MS = 2_000;
@@ -9,6 +10,13 @@ const FINISHED_SHOWN_MS = 10 * 60_000;
 
 /** Zips and backups the server imports in the background (`background=true`): how many
  *  documents it has queued, skipped and failed so far — and Cancel. */
+const IMPORT_KINDS: Record<string, string> = {
+  restore: 'backup',
+  archive: 'zip',
+  rebuild: 'rebuild',
+  migrate: 'server bundle',
+};
+
 export default function BackgroundImports({
   workspace,
   canCancel,
@@ -33,17 +41,28 @@ export default function BackgroundImports({
           );
           setImports(shown);
           running = shown.some((item) => item.finished_at == null);
-        } catch {
+        } catch (err) {
           if (controller.signal.aborted) return;
-          setImports([]); // an older server, or a refused key
+          // An older server (404) or a refused key: nothing to show. A dropped
+          // connection keeps what is shown — a running import and its Cancel button
+          // used to vanish on one failed poll.
+          const status = err instanceof ApiClientError ? err.statusCode : undefined;
+          if (status !== undefined && status < 500) setImports([]);
         }
       }
       timer = setTimeout(() => void poll(), running ? RUNNING_POLL_MS : IDLE_POLL_MS);
     };
     void poll();
+    // An import started here: shown now, not at the next idle poll.
+    const now = () => {
+      clearTimeout(timer);
+      void poll();
+    };
+    window.addEventListener(BACKGROUND_IMPORT_STARTED_EVENT, now);
     return () => {
       controller.abort();
       clearTimeout(timer);
+      window.removeEventListener(BACKGROUND_IMPORT_STARTED_EVENT, now);
     };
   }, [workspace]);
 
@@ -52,7 +71,7 @@ export default function BackgroundImports({
     <div className="corpus-panel__sitemaps" data-testid="background-imports">
       {imports.map((item) => (
         <p key={item.id} className="corpus-panel__watch-note" data-testid="background-import">
-          <span className="mono">{item.name}</span> ({item.kind === 'restore' ? 'backup' : 'zip'}):{' '}
+          <span className="mono">{item.name}</span> ({IMPORT_KINDS[item.kind] ?? item.kind}):{' '}
           {item.queued ?? 0} queued
           {item.skipped ? `, ${item.skipped} skipped` : ''}
           {item.failed ? `, ${item.failed} failed` : ''}

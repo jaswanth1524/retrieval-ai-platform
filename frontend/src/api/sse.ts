@@ -34,8 +34,10 @@ export type QuestionStreamEvent =
       prompt_cached?: boolean;
       /** Citing sentences no passage of their sources supports. */
       unsupported_claims?: number;
+      unsupported_numbers?: number;
       /** Picked passages the prompt had no room for (absent from older servers). */
       passages_left_out?: number;
+      retrieval_query?: string;
       chunks_read?: number;
       chunks_total?: number;
       /** Summaries: parts left out after failing twice, and notes cut off at the limit. */

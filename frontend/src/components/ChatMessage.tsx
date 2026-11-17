@@ -21,6 +21,7 @@ import { pageLabel } from '../utils/pages';
 import { useMarkdownRenderer } from './markdownLoader';
 import StreamingSkeleton from './StreamingSkeleton';
 import AnswerFlags from './chat/AnswerFlags';
+import WhyThisAnswer from './chat/WhyThisAnswer';
 import AnswerVersions from './chat/AnswerVersions';
 import ReformatMenu, { type ReformatStyle } from './chat/ReformatMenu';
 import AnswerSources from './chat/AnswerSources';
@@ -152,6 +153,10 @@ export interface ChatTurn {
   truncated?: boolean;
   // The provider read far less of the prompt than was sent: cut to fit its window.
   promptCut?: boolean;
+  // A cut-off answer whose trace the server no longer has: Continue isn't offered again.
+  cannotContinue?: boolean;
+  // Why the last Continue didn't work (this session only); the answer is as it was.
+  continueFailed?: string;
   // A whole-document task (summary, comparison) rather than a question: on the user
   // turn that asked it, and on its error turn, so Retry and Regenerate repeat the task.
   task?: DocumentTask;
@@ -194,6 +199,14 @@ export interface ChatTurn {
   // Picked passages ("Ask about these") the answer went without: more than the
   // prompt had room for.
   passagesLeftOut?: number;
+  /** Citing sentences no cited passage supports (no matching sentence in them). */
+  unsupportedClaims?: number;
+  /** Citing sentences stating a number none of their cited passages contains. */
+  unsupportedNumbers?: number;
+  /** A follow-up's rewrite into a standalone question: what was searched for. */
+  searchedAs?: string;
+  /** The reader's own note on a saved answer (Saved answers panel). */
+  note?: string;
   // Asked within some documents or tags, not the whole corpus.
   scoped?: boolean;
   // Earlier answers to the same question, oldest first (Regenerate, Reformat keep them).
@@ -215,6 +228,8 @@ export interface AnswerVersion {
   style?: AnswerStyle;
   /** The trace it was answered under (a pinned trace of it finds the answer now). */
   traceId?: string;
+  /** What writing it used: still part of what the conversation cost. */
+  usage?: { prompt: number; completion: number; costUsd?: number };
 }
 
 interface ChatMessageProps {
@@ -273,6 +288,8 @@ interface ChatMessageProps {
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
   /** Copy a link back to this answer (it opens in this browser). */
   onCopyLink?: (turnId: string) => void;
+  /** Ask a next question within this answer's cited passages (they go to the basket). */
+  onAskWithin?: (sources: CitationResponse[]) => void;
   /** Ask this answer's question again in another shape or language (Reformat). */
   onReformat?: (
     question: string,
@@ -317,9 +334,27 @@ function groundingNotes(turn: ChatTurn): string[] {
     );
   }
   if (turn.truncated) notes.push('The model reached its output limit and stopped mid-answer.');
+  if (turn.cannotContinue) {
+    notes.push("This answer can't be continued any more (the server no longer has its prompt). Regenerate asks it again.");
+  } else if (turn.continueFailed) {
+    notes.push(`Continuing didn't work: ${turn.continueFailed}`);
+  }
   if (turn.promptCut) {
     notes.push(
       "The model read only part of what it was sent (its context window is too small), so it may have missed its sources or its instructions — check this answer.",
+    );
+  }
+  if (turn.unsupportedNumbers) {
+    const count = turn.unsupportedNumbers;
+    notes.push(
+      `${count === 1 ? 'One sentence states a number' : `${count} sentences state numbers`} ` +
+        'that the passages it cites don’t contain — check the figures against the sources.',
+    );
+  } else if (turn.unsupportedClaims) {
+    const count = turn.unsupportedClaims;
+    notes.push(
+      `${count === 1 ? 'One cited sentence matches' : `${count} cited sentences match`} ` +
+        'nothing in the passages it cites — check it against the sources.',
     );
   }
   if (turn.passagesLeftOut) {
@@ -338,6 +373,11 @@ function formatDuration(totalMs: number): string {
   return `${(totalMs / 1000).toFixed(2)}s`;
 }
 
+
+/** The browser offers a share sheet (phones, Safari): a Share button is worth showing. */
+function canShare(): boolean {
+  return typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+}
 
 function ChatMessage({
   turn,
@@ -368,6 +408,7 @@ function ChatMessage({
   sourceChangeOf,
   answerNumber,
   onCopyLink,
+  onAskWithin,
   onReformat,
   onContinue,
   otherProviders,
@@ -534,6 +575,21 @@ function ChatMessage({
                   {copied ? 'Copied' : copyFailed ? 'Copy failed' : 'Copy'}
                 </button>
               )}
+              {turn.content && !streamStage && canShare() && (
+                <button
+                  type="button"
+                  className="chat-message__copy"
+                  onClick={() =>
+                    void navigator
+                      .share({ text: withCitationFootnotes(turn.content, turn.sources) })
+                      .catch(() => undefined)
+                  }
+                  title="Share this answer with its sources (the system share sheet)"
+                  data-testid="chat-message-share"
+                >
+                  Share
+                </button>
+              )}
               {turn.content && onCopyLink && !streamStage && (
                 <button
                   type="button"
@@ -543,6 +599,17 @@ function ChatMessage({
                   data-testid="chat-message-link"
                 >
                   Link
+                </button>
+              )}
+              {onAskWithin && !streamStage && turn.sources.length > 0 && (
+                <button
+                  type="button"
+                  className="chat-message__copy"
+                  onClick={() => onAskWithin(turn.sources)}
+                  title="Put this answer’s cited passages in the basket and ask about only them"
+                  data-testid="chat-message-ask-within"
+                >
+                  Ask within these sources
                 </button>
               )}
               {turn.content && onToggleSaved && !streamStage && !turn.incomplete && (
@@ -583,6 +650,7 @@ function ChatMessage({
               {/* Cut off at the token limit: the rest, from the same prompt (its trace). */}
               {turn.content &&
                 turn.truncated &&
+                !turn.cannotContinue &&
                 turn.traceId &&
                 regenerateQuestion &&
                 onContinue &&
@@ -655,6 +723,11 @@ function ChatMessage({
                 </div>
               )}
             </div>
+            {!streamStage && turn.searchedAs && (
+              <p className="chat-message__searched-as mono" data-testid="chat-message-searched-as">
+                Searched as: <span dir="auto">{turn.searchedAs}</span>
+              </p>
+            )}
             {!streamStage && groundingNotes(turn).length > 0 && (
               <div className="chat-message__notes" data-testid="chat-message-notes">
                 <p>{groundingNotes(turn).join(' ')}</p>
@@ -734,6 +807,9 @@ function ChatMessage({
                   </button>
                 ))}
               </div>
+            )}
+            {!engineerMode && !showSkeleton && streamStage === undefined && turn.content && !turn.incomplete && (
+              <WhyThisAnswer turn={turn} weakSupportBelow={weakSupportBelow} />
             )}
             {showMeta && timings && (
               <div className="chat-message__engineer-meta mono">

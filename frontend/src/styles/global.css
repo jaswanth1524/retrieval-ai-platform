@@ -275,6 +275,8 @@ a {
   position: fixed;
   z-index: 60;
   display: flex;
+  flex-wrap: wrap;
+  max-width: calc(100vw - 16px);
   gap: 4px;
   padding: 4px;
   background: var(--card);

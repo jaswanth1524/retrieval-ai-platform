@@ -146,12 +146,16 @@ export function withoutConversation(
 export function withConversationRestored(
   storage: ChatStorageV2,
   conversation: Conversation,
+  /** Out of Recently deleted (not the delete's own Undo): counted as used now, so a
+   *  full history doesn't drop it again at the next new chat. */
+  usedNow = false,
 ): ChatStorageV2 {
   const deleted = (storage.deleted ?? []).filter((entry) => entry.id !== conversation.id);
   const others = storage.conversations.filter((candidate) => candidate.id !== conversation.id);
   // Re-stamped as edited now: a merge with another tab must take it over the
   // tombstone that tab may already have.
-  const restored = { ...conversation, editedAt: Date.now() };
+  const now = Date.now();
+  const restored = { ...conversation, editedAt: now, ...(usedNow ? { updatedAt: now } : {}) };
   return {
     ...storage,
     conversations: [...others, restored],

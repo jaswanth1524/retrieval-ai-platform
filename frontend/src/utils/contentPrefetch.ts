@@ -1,4 +1,4 @@
-import { api } from '../api/client';
+import { api, getWorkspace } from '../api/client';
 import type { DocumentContentResponse } from '../api/types';
 
 // Chunks either side of a cited chunk the viewer opens on (DocumentViewer).
@@ -15,7 +15,9 @@ interface Entry {
 
 const entries = new Map<string, Entry>();
 
-const keyFor = (filename: string, chunkId: string) => `${filename}\n${chunkId}`;
+// The workspace too: two workspaces can hold a document of one name (and a chunk id is
+// derived from the name and text), and a switch must not show the other one's page.
+const keyFor = (filename: string, chunkId: string) => `${getWorkspace()}\n${filename}\n${chunkId}`;
 
 /** Start loading the viewer's first page for a citation the pointer or focus is on, so
  *  a click opens it straight away instead of after a round trip. */

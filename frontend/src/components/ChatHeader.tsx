@@ -26,6 +26,10 @@ interface ChatHeaderProps {
   onCopyLink?: () => void;
   /** What the conversation's answers used, as one label ("4,210 tokens · $0.0123"). */
   usageLabel?: string | null;
+  /** With workspaces on: the one in use ("" = default), the others, and a switch. */
+  workspace?: string;
+  workspaces?: string[];
+  onSwitchWorkspace?: (name: string) => void;
 }
 
 function ChatHeader({
@@ -42,6 +46,9 @@ function ChatHeader({
   onToggleInspector,
   onCopyLink,
   usageLabel = null,
+  workspace = '',
+  workspaces,
+  onSwitchWorkspace,
 }: ChatHeaderProps) {
   // App keys this component by conversation, so a pending confirm can't carry over to
   // a different conversation.
@@ -60,6 +67,24 @@ function ChatHeader({
   return (
     <header className="chat-header">
       <h1 className="chat-header__title" dir="auto">{title}</h1>
+      {workspaces && onSwitchWorkspace && (
+        <label className="chat-header__workspace" title="The workspace this conversation asks in">
+          <span className="visually-hidden">Workspace</span>
+          <select
+            value={workspace}
+            onChange={(event) => onSwitchWorkspace(event.target.value)}
+            disabled={disabled}
+            data-testid="chat-header-workspace"
+          >
+            <option value="">default</option>
+            {workspaces.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       <span className="chat-header__scope">{scopeLabel}</span>
       {hasTurns && (
         <div className="chat-header__actions">

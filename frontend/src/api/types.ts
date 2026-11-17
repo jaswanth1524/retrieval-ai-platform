@@ -141,6 +141,8 @@ export interface ImportResponse {
   feedback_skipped: number;
   /** Earlier versions put back (a backup with versions; absent from older servers). */
   versions_restored?: number;
+  /** Restored in the background (background=true): follow it in the import list. */
+  import_id?: string | null;
 }
 
 /** POST /search: the passages a question would be answered from, with no LLM involved. */
@@ -367,6 +369,10 @@ export interface DocumentPreviewResponse {
   page_count: number;
   section_labels: string[];
   first_chunks: PreviewChunkResponse[];
+  /** About how long indexing it would take here; absent before the server has measured. */
+  estimated_seconds?: number | null;
+  /** More passages than MAX_CHUNKS_PER_DOCUMENT allows: indexing it would fail. */
+  over_chunk_limit?: boolean;
 }
 
 export interface DocumentTagsResponse {
@@ -705,6 +711,8 @@ export interface TraceDetailResponse {
   prompt_cached?: boolean;
   /** Citing sentences no passage of their cited sources supports. */
   unsupported_claims?: number;
+  /** Citing sentences stating a number none of their cited passages contains. */
+  unsupported_numbers?: number;
   /** History messages left out of the prompt to fit the context window. */
   dropped_history_messages?: number;
   /** "question", or "summary" (whose question is its task line). */
@@ -859,6 +867,8 @@ export interface ArchiveUploadResponse {
   jobs: DocumentJobAcceptedResponse[];
   skipped: ArchiveSkipResponse[];
   deferred: string[];
+  /** Imported in the background (background=true): follow it in the import list. */
+  import_id?: string | null;
 }
 
 /** POST /documents/from-sitemap: the pages being fetched in the background. */
@@ -901,6 +911,38 @@ export interface DoctorFindingResponse {
 
 export interface DoctorResponse {
   findings: DoctorFindingResponse[];
+}
+
+/** One stored audit event (GET /admin/audit). */
+export interface AuditEntryResponse {
+  created_at: number;
+  workspace: string;
+  event: string;
+  /** full, read, open (no API key) or system (the server's own background work). */
+  key: string;
+  client?: string | null;
+  fields?: Record<string, unknown>;
+}
+
+export interface AuditResponse {
+  entries: AuditEntryResponse[];
+}
+
+/** POST /admin/rebuild: stored originals with no document, indexed again. */
+export interface RebuildResponse {
+  import_id?: string | null;
+  originals: number;
+}
+
+export interface NotifyTestResponse {
+  sent: boolean;
+  error?: string | null;
+}
+
+/** POST /admin/migrate/import: a bundle being unpacked in the background. */
+export interface MigrateImportResponse {
+  import_id: string;
+  workspaces: string[];
 }
 
 /** A zip or backup being imported in the background (GET /documents/imports/{id}). */

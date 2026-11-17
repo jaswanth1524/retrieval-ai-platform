@@ -42,6 +42,11 @@ class RootErrorBoundary extends Component<{ children: ReactNode }, RootErrorBoun
   private clearHistory = async () => {
     try {
       localStorage.removeItem(CHAT_STORAGE_KEY);
+      // What else holds conversation text: the recently deleted ones, unsent drafts
+      // and recent searches.
+      for (const key of ['docrag-trash', 'docrag-drafts', 'docrag-recent-searches']) {
+        localStorage.removeItem(key);
+      }
     } catch {
       // Nothing more to try; IndexedDB below is the copy that matters.
     }

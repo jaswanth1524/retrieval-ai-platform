@@ -6,6 +6,7 @@ import {
   chatToMarkdown,
   citedSourcesCsv,
   downloadFile,
+  passageLinksIn,
   safeFilename,
   savedAnswersToMarkdown,
 } from '../utils/exportChat';
@@ -23,7 +24,11 @@ export function useConversationExports(
   allConversationsJson: (label?: string) => string,
   pushToast: (toast: ToastInput) => string,
   noteAuthFailure: (err: unknown) => boolean,
+  /** The open conversation's workspace, for its passage links. */
+  workspace = '',
 ) {
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
   // Read when clicked or exported rather than closed over: the header's Export and the
   // palette keep one identity while an answer streams in.
   const turnsRef = useRef(turns);
@@ -38,7 +43,11 @@ export function useConversationExports(
     downloadFile(
       safeFilename(`docrag-${conversationTitleRef.current ?? 'chat'}.md`),
       'text/markdown',
-      chatToMarkdown(turnsRef.current, conversationTitleRef.current),
+      chatToMarkdown(
+        turnsRef.current,
+        conversationTitleRef.current,
+        passageLinksIn(workspaceRef.current),
+      ),
     );
   }, []);
   const exportHtml = useStableHandler(() => {
@@ -98,7 +107,7 @@ export function useConversationExports(
       pushToast({ tone: 'warn', title: 'Nothing saved yet', body: 'Save an answer with ☆ first.' });
       return;
     }
-    downloadFile('docrag-saved-answers.md', 'text/markdown', savedAnswersToMarkdown(items));
+    downloadFile('docrag-saved-answers.md', 'text/markdown', savedAnswersToMarkdown(items, true));
   }, [pushToast]);
 
   return {

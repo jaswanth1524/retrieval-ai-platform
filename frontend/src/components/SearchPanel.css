@@ -125,6 +125,33 @@
   accent-color: var(--accent);
 }
 
+@media (pointer: coarse) {
+  .search-panel__pick {
+    width: 24px;
+    height: 24px;
+    margin-top: 6px;
+  }
+}
+
+.search-panel__recent-item,
+.search-panel__recent-clear {
+  min-height: 24px;
+  padding: 2px 8px;
+  margin: 2px 4px 2px 0;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--rail-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.search-panel__recent-clear {
+  border-color: transparent;
+  color: var(--rail-dim);
+  text-decoration: underline;
+}
+
 .search-panel__ask-bar {
   position: sticky;
   top: 0;

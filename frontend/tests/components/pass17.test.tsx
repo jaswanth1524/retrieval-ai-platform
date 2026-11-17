@@ -170,7 +170,7 @@ describe('recently deleted', () => {
     expect(readTrash().map((entry) => entry.conversation.id)).toEqual(['c1']);
 
     const onRestore = vi.fn();
-    render(<RecentlyDeleted version={0} onRestore={onRestore} />);
+    render(<RecentlyDeleted version={0} liveIds={new Set()} onRestore={onRestore} />);
     await userEvent.click(screen.getByText(/Recently deleted \(1\)/));
     await userEvent.click(screen.getByTestId('recently-deleted-restore'));
     expect(onRestore).toHaveBeenCalledWith(expect.objectContaining({ id: 'c1' }));

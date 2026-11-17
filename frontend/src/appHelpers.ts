@@ -104,6 +104,7 @@ export const NO_SOURCES: CitationResponse[] = [];
 export const PANEL_META: Record<RailPanel, { title: string; actionLabel: string }> = {
   chat: { title: 'Conversations', actionLabel: 'New' },
   saved: { title: 'Saved answers', actionLabel: 'Export' },
+  collected: { title: 'Quotes & passages', actionLabel: 'Export quotes' },
   review: { title: 'Needs review', actionLabel: 'Refresh' },
   corpus: { title: 'Corpus', actionLabel: 'Upload' },
   search: { title: 'Search passages', actionLabel: 'Clear' },

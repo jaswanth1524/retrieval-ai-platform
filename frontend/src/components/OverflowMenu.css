@@ -1,0 +1,82 @@
+.overflow-menu {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+/* 24 px at least: a touch target (WCAG 2.5.8). */
+.overflow-menu__toggle {
+  min-width: 32px;
+  min-height: 32px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.overflow-menu--page .overflow-menu__toggle {
+  color: var(--muted);
+}
+
+.overflow-menu--rail .overflow-menu__toggle {
+  color: var(--rail-dim);
+  background: var(--rail-2);
+}
+
+.overflow-menu__list {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 180px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+
+.overflow-menu--page .overflow-menu__list {
+  background: var(--card);
+  border: 1px solid var(--rule);
+}
+
+.overflow-menu--rail .overflow-menu__list {
+  background: var(--rail-2);
+  border: 1px solid var(--rail-rule);
+}
+
+.overflow-menu__item {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
+  font-size: 14px;
+  text-align: start;
+  cursor: pointer;
+}
+
+.overflow-menu--page .overflow-menu__item {
+  color: var(--ink);
+}
+
+.overflow-menu--rail .overflow-menu__item {
+  color: var(--rail-text);
+}
+
+.overflow-menu__item:hover:not(:disabled),
+.overflow-menu__item:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.overflow-menu__item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

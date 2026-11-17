@@ -17,6 +17,7 @@ export function asVersion(turn: ChatTurn): AnswerVersion {
     ...(turn.model ? { model: turn.model } : {}),
     ...(turn.style ? { style: turn.style } : {}),
     ...(turn.traceId ? { traceId: turn.traceId } : {}),
+    ...(turn.usage ? { usage: turn.usage } : {}),
   };
 }
 

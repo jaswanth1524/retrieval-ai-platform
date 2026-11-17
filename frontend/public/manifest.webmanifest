@@ -1,0 +1,11 @@
+{
+  "name": "DocRAG",
+  "short_name": "DocRAG",
+  "description": "Questions answered from your own documents, with citations.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#141211",
+  "theme_color": "#141211",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

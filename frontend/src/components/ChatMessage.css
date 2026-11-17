@@ -399,6 +399,16 @@
   border-color: var(--accent);
 }
 
+/* A finger needs a 24 px target (WCAG 2.5.8); the chip keeps its look, its box grows. */
+@media (pointer: coarse) {
+  .chat-message__cite {
+    min-width: 24px;
+    min-height: 24px;
+    line-height: 22px;
+    vertical-align: 0;
+  }
+}
+
 .chat-message__unanswered {
   display: flex;
   align-items: center;
@@ -559,5 +569,32 @@
 
 .chat-message__versions-side > div {
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A follow-up's rewrite: what retrieval searched for. */
+.chat-message__searched-as {
+  margin: 6px 0 0;
+  font-size: 0.74rem;
+  color: var(--dim);
+}
+
+/* "Why this answer?" (Reader mode): a quiet disclosure under the answer. */
+.chat-message__why {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.chat-message__why summary {
+  cursor: pointer;
+  width: fit-content;
+  min-height: 24px;
+  display: list-item;
+}
+
+.chat-message__why ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
   overflow-wrap: anywhere;
 }

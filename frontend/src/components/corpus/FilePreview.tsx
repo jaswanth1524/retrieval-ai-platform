@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { api, apiErrorMessage } from '../../api/client';
 import type { DocumentPreviewResponse } from '../../api/types';
 import { pageLabel } from '../../utils/pages';
+import { useRequestSignal } from '../../hooks/useRequestSignal';
 
 interface FilePreviewProps {
   /** Extensions the server reads (for the file picker). */
@@ -21,17 +22,20 @@ export default function FilePreview({ accept, workspace, disabled = false }: Fil
   const [preview, setPreview] = useState<DocumentPreviewResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const previewRequest = useRequestSignal();
 
   const read = (file: File) => {
     setLoading(true);
     setError(null);
     setPreview(null);
-    api.previewDocument(file, undefined, workspace).then(
+    const signal = previewRequest.start();
+    api.previewDocument(file, signal, workspace).then(
       (result) => {
         setPreview(result);
         setLoading(false);
       },
       (err) => {
+        if (signal.aborted) return;
         setError(apiErrorMessage(err, `Could not preview ${file.name}.`));
         setLoading(false);
       },
@@ -49,6 +53,19 @@ export default function FilePreview({ accept, workspace, disabled = false }: Fil
       >
         {loading ? 'Reading…' : 'Preview a file…'}
       </button>
+      {loading && (
+        <button
+          type="button"
+          className="corpus-panel__job-cancel"
+          onClick={() => {
+            previewRequest.cancel();
+            setLoading(false);
+          }}
+          data-testid="preview-cancel"
+        >
+          cancel
+        </button>
+      )}
       <input
         ref={inputRef}
         type="file"
@@ -68,6 +85,12 @@ export default function FilePreview({ accept, workspace, disabled = false }: Fil
           {error}
         </p>
       )}
+      {preview?.over_chunk_limit && (
+        <p className="corpus-panel__watch-note" role="alert" data-testid="preview-over-limit">
+          {preview.filename} makes more passages than this server allows for one document
+          (MAX_CHUNKS_PER_DOCUMENT): uploading it would fail. Split it first.
+        </p>
+      )}
       {preview && (
         <section
           className="corpus-panel__preview"
@@ -79,6 +102,8 @@ export default function FilePreview({ accept, workspace, disabled = false }: Fil
               {preview.filename}: {preview.chunk_count} passage{preview.chunk_count === 1 ? '' : 's'} in{' '}
               {preview.section_count} section{preview.section_count === 1 ? '' : 's'}
               {preview.page_count > 1 ? `, ${preview.page_count} pages` : ''} — not indexed
+              {typeof preview.estimated_seconds === 'number' &&
+                ` · about ${formatDuration(preview.estimated_seconds)} to index here`}
             </span>
             <button
               type="button"
@@ -103,4 +128,10 @@ export default function FilePreview({ accept, workspace, disabled = false }: Fil
       )}
     </>
   );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
 }

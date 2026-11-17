@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import ChatMessage, { type ChatTurn } from '../../src/components/ChatMessage';
@@ -478,7 +478,9 @@ describe('ChatMessage', () => {
 
     rerender(<ChatMessage turn={makeTurn({ role: 'assistant', content })} engineerMode={false} />);
     expect(screen.getByText('bold').tagName).toBe('STRONG');
-    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    // The answer's own list (Reader mode adds "Why this answer?" under it).
+    const answer = document.querySelector('.chat-message__markdown') as HTMLElement;
+    expect(within(answer).getAllByRole('listitem')).toHaveLength(2);
   });
 
   it('turns [n] markers into buttons that open and preview the cited source', async () => {

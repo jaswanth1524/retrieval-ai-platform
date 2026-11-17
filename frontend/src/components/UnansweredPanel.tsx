@@ -1,6 +1,7 @@
 import { memo, useDeferredValue, useMemo, useState } from 'react';
 import { api, apiErrorMessage } from '../api/client';
 import type { QueryLogEntryResponse, QueryRecheckResponse } from '../api/types';
+import { useRequestSignal } from '../hooks/useRequestSignal';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { isoTime, toCsv } from '../utils/csv';
 import { downloadFile } from '../utils/exportChat';
@@ -36,11 +37,15 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
   const [recheck, setRecheck] = useState<
     { running: true } | { result: QueryRecheckResponse } | { error: string } | null
   >(null);
+  const recheckRequest = useRequestSignal();
   const runRecheck = () => {
     setRecheck({ running: true });
-    api.recheckUnanswered().then(
+    const signal = recheckRequest.start();
+    api.recheckUnanswered(undefined, signal).then(
       (result) => setRecheck({ result }),
-      (err) => setRecheck({ error: apiErrorMessage(err, 'Could not search them again.') }),
+      (err) => {
+        if (!signal.aborted) setRecheck({ error: apiErrorMessage(err, 'Could not search them again.') });
+      },
     );
   };
   const [filter, setFilter] = useState('');
@@ -138,6 +143,19 @@ function UnansweredPanel({ questions, error, onAsk, onSearch, onSelectTrace }: U
         >
           {recheck !== null && 'running' in recheck ? 'Re-checking…' : 'Re-check'}
         </button>
+        {recheck !== null && 'running' in recheck && (
+          <button
+            type="button"
+            className="unanswered-panel__view"
+            onClick={() => {
+              recheckRequest.cancel();
+              setRecheck(null);
+            }}
+            data-testid="questions-recheck-cancel"
+          >
+            Cancel
+          </button>
+        )}
         <input
           type="search"
           className="unanswered-panel__filter"

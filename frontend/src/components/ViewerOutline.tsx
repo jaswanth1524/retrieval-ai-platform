@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, apiErrorMessage } from '../api/client';
 import type { DocumentOutlineResponse } from '../api/types';
 
@@ -14,8 +14,17 @@ export default function ViewerOutline({
   const [outline, setOutline] = useState<DocumentOutlineResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState('');
+  const navRef = useRef<HTMLElement>(null);
+  const loaded = outline !== null;
+  // Opened from the Contents button: the list takes the focus, so the keyboard is in it.
+  useEffect(() => {
+    if (loaded) navRef.current?.focus();
+  }, [loaded]);
   useEffect(() => {
     const controller = new AbortController();
+    // Another document: not the last one's contents (or its error) while this loads.
+    setOutline(null);
+    setError(null);
     api
       .documentOutline(filename, controller.signal)
       .then(setOutline)
@@ -43,7 +52,16 @@ export default function ViewerOutline({
     if (target) onGoTo(target.chunk_id);
   };
   return (
-    <nav className="document-viewer__outline" aria-label="Contents" data-testid="viewer-outline">
+    <nav
+      ref={navRef}
+      tabIndex={-1}
+      className="document-viewer__outline"
+      aria-label="Contents"
+      data-testid="viewer-outline"
+    >
+      {outline.pages.length <= 1 && outline.sections.length <= 1 && (
+        <p className="document-viewer__notice">This document is one section on one page.</p>
+      )}
       {outline.pages.length > 1 && (
         <form
           className="document-viewer__goto"

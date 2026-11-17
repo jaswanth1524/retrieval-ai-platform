@@ -15,6 +15,16 @@ export const CODE_EXTENSIONS = [
   '.yaml',
   '.yml',
   '.toml',
+  '.ini',
+  '.conf',
+  '.cfg',
+  '.log',
+  '.css',
+  '.php',
+  '.cs',
+  '.kt',
+  '.swift',
+  '.lua',
 ];
 
 // api/documents.py CORE_EXTENSIONS (every type but images, which need the server's OCR
@@ -47,6 +57,10 @@ export const ACCEPTED_EXTENSIONS = [
   '.asciidoc',
   '.tex',
   ...CODE_EXTENSIONS,
+  '.tsv',
+  '.jsonl',
+  '.xml',
+  '.org',
 ];
 
 /** A zip of documents: sent to POST /documents/archive, each member its own document. */
