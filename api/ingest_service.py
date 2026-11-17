@@ -10,20 +10,25 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from pathlib import PurePosixPath
 
 from api.chunking import HeuristicTokenCounter, TokenCounter
 from api.corpus import bump_corpus_generation
 from api.documents import (
     CHUNKER_VERSION,
+    MAX_TAGS_PER_DOCUMENT,
+    DocumentError,
     DocumentSource,
     chunk_sections,
     chunking_fingerprint,
-    normalize_filename,
+    normalize_document_name,
+    normalize_tags,
 )
 from api.ingestion import EmbeddingProvider as IngestEmbeddingProvider
 from api.ingestion import IngestResult, filename_write_lock, ingest_chunks
 from api.metrics import ingest_stage_seconds
 from api.parse_isolation import parse_with_limit
+from api.parsers.common import DocumentTooLongError, front_matter_tags
 from api.repository import VectorRepository
 from api.settings import AppSettings
 from api.workspaces import document_key
@@ -72,6 +77,27 @@ class IngestService:
         # Default to the heuristic (no model fetch) so direct constructions in tests
         # stay hermetic; production DI passes the dense model's real tokenizer.
         self._token_counter = token_counter or HeuristicTokenCounter()
+
+    @staticmethod
+    def _front_matter_tags(filename: str, content: bytes) -> tuple[str, ...] | None:
+        """FRONT_MATTER_TAGS: a new or changed Markdown file's ``tags:`` become its
+        document's tags; None (carry the current ones over) when it names none or they
+        can't be used."""
+
+        if PurePosixPath(filename).suffix.lower() not in (".md", ".markdown"):
+            return None
+        found = front_matter_tags(content)
+        if not found:
+            return None
+        try:
+            return normalize_tags(found[:MAX_TAGS_PER_DOCUMENT])
+        except DocumentError:
+            logger.info("Front matter tags of %r left out: not valid tags.", filename)
+            return None
+
+    @property
+    def repository(self) -> VectorRepository:
+        return self._repository
 
     @property
     def settings(self) -> AppSettings:
@@ -124,6 +150,8 @@ class IngestService:
             # waited) fails here instead of after it. The check under the filename lock
             # still decides; this only saves the work.
             precondition()
+        if tags is None and self._settings.front_matter_tags:
+            tags = self._front_matter_tags(filename, content)
         parse_start = time.monotonic()
         sections = parse_with_limit(filename, content, self._settings)
         chunk_start = time.monotonic()
@@ -139,6 +167,13 @@ class IngestService:
         # Read after chunking: the tokenizer loads (or fails to) on first use.
         counter_mode = getattr(self._token_counter, "mode", None)
         chunk_total = len(chunks)
+        limit = int(self._settings.max_chunks_per_document)
+        if limit and chunk_total > limit:
+            raise DocumentTooLongError(
+                f"'{sections[0].filename}' makes {chunk_total} passages, more than the "
+                f"{limit} one document may have (MAX_CHUNKS_PER_DOCUMENT). Split it, or "
+                "raise the limit."
+            )
         chunks = [
             replace(
                 chunk,
@@ -242,7 +277,7 @@ class IngestService:
         current.
         """
 
-        name = normalize_filename(filename)
+        name = normalize_document_name(filename)
         settings = self._settings
         with filename_write_lock(document_key(settings, name)):
             if precondition is not None:

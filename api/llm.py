@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -295,12 +296,30 @@ def _record_finish_reason(response: object) -> None:
 PROMPT_CUT_RATIO = 0.5
 # Below this estimate a short prompt's ratio says nothing.
 _PROMPT_CUT_MIN_ESTIMATE = 500
+# Each word, CJK character and run of punctuation is at least one token. The budgeting
+# estimate (characters / 3) is high on purpose, and padding makes it far too high: a
+# Markdown table of "------------" cells, uncut, reported 3921 tokens against an
+# estimate of 9226, and space-padded cells 1021 against 5626 — both read as cut.
+# (The CJK ranges are prompting._CJK_RE's; api.prompting imports this module.)
+_LEAST_TOKENS_RE = re.compile(
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9f]"
+    r"|\w+|[^\w\s]+"
+)
+
+
+def _fewest_prompt_tokens(messages: Sequence[ChatMessage]) -> int:
+    """A low count of the prompt's tokens: its words, CJK characters and punctuation
+    runs (a tokenizer splits at least there; long runs of one character don't swell
+    it the way they swell a character count)."""
+
+    return sum(len(_LEAST_TOKENS_RE.findall(message["content"])) for message in messages)
 
 
 def _note_prompt_cut(messages: Sequence[ChatMessage] | None, reported: int) -> None:
     if messages is None or reported <= 0:
         return
-    estimate = _estimated_prompt_tokens(messages)
+    # The smaller of the two: a cut shows against both, padding only against the high one.
+    estimate = min(_estimated_prompt_tokens(messages), _fewest_prompt_tokens(messages))
     if estimate >= _PROMPT_CUT_MIN_ESTIMATE and reported < estimate * PROMPT_CUT_RATIO:
         _last_call.prompt_cut = True
         prompt_cuts_total.inc()
@@ -316,6 +335,13 @@ def was_prompt_cut() -> bool:
     """Whether a call on this thread since ``begin_usage`` had its prompt cut."""
 
     return bool(getattr(_last_call, "prompt_cut", False))
+
+
+def carry_prompt_cut(cut: bool) -> None:
+    """Note on this thread a cut seen on another (a summary part's worker)."""
+
+    if cut:
+        _last_call.prompt_cut = True
 
 
 def _count_usage(

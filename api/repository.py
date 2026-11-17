@@ -114,6 +114,20 @@ class SeedPassage:
 
 
 @dataclass(frozen=True)
+class IndexSize:
+    """A collection's size (``VectorRepository.index_size``)."""
+
+    points: int
+    segments: int
+    # Qdrant's own: green, yellow (optimizing), red (an operation failed), grey.
+    status: str
+    # What its dense vectors take, estimated from the point count and vector size:
+    # Qdrant reports no byte sizes per collection. Payloads and the sparse index add
+    # to it.
+    vector_bytes: int
+
+
+@dataclass(frozen=True)
 class DocumentMetadata:
     """Per-filename aggregate derived from its indexed points' payloads."""
 
@@ -873,6 +887,34 @@ class VectorRepository:
             digest if isinstance(digest, str) else None,
             url if isinstance(url, str) else None,
         )
+
+    def index_size(self, settings: AppSettings) -> IndexSize | None:
+        """How large ``settings``' collection is, as Qdrant reports it; None when it
+        doesn't exist or can't be read. Never creates or changes it."""
+
+        try:
+            info = self._client.get_collection(str(settings.qdrant_collection))
+        except Exception:  # noqa: BLE001 - a report, not a request that must fail
+            return None
+        points = int(info.points_count or 0)
+        # Each dense vector is kept as float32; scalar quantization adds an int8 copy
+        # (the one searched, held in RAM) beside it.
+        per_point = int(settings.qdrant_dense_vector_size) * 4
+        if settings.qdrant_quantization == "scalar":
+            per_point += int(settings.qdrant_dense_vector_size)
+        return IndexSize(
+            points=points,
+            segments=int(info.segments_count or 0),
+            status=str(getattr(info.status, "value", info.status)),
+            vector_bytes=points * per_point,
+        )
+
+    def forget_listing(self, settings: AppSettings) -> None:
+        """Drop the cached listing of ``settings``' collection, so the next one is read
+        from Qdrant: for checks that must see the index as it is now (a collection lost
+        behind the API's back stays listed for the cache's lifetime otherwise)."""
+
+        forget_metadata(self._client, str(settings.qdrant_collection))
 
     def document_metadata(self, settings: AppSettings, filename: str) -> DocumentMetadata | None:
         """One document's metadata, read now (not from the cached listing), or None

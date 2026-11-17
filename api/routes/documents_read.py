@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 from collections.abc import Iterator
+from pathlib import PurePosixPath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -24,6 +25,7 @@ from api.documents import (
     DocumentNotFoundError,
 )
 from api.metrics import corpus_documents
+from api.original_details import record_missing_details
 from api.repository import DocumentMetadata
 from api.routes.deps import (
     RawDocumentStoreDep,
@@ -33,11 +35,16 @@ from api.routes.deps import (
 )
 from api.routes.responses import content_chunk
 from api.schemas import (
+    DOCUMENT_PAGE_MAX,
+    REQUEST_FILENAME_MAX_CHARS,
+    REQUEST_TAG_MAX_CHARS,
     DocumentContentResponse,
     DocumentListResponse,
     DocumentOutlineResponse,
     DocumentVersionResponse,
     DocumentVersionsResponse,
+    MissingDocumentsRequest,
+    MissingDocumentsResponse,
     OutlineEntryResponse,
     UrlRefreshStatusResponse,
 )
@@ -79,12 +86,24 @@ def list_documents(
     settings: SettingsDep,
     raw_store: RawDocumentStoreDep,
     token_counter: TokenCounterDep,
+    limit: Annotated[int | None, Query(ge=1, le=DOCUMENT_PAGE_MAX)] = None,
+    cursor: Annotated[str | None, Query(max_length=REQUEST_FILENAME_MAX_CHARS)] = None,
+    prefix: Annotated[str | None, Query(max_length=REQUEST_FILENAME_MAX_CHARS)] = None,
+    tag: Annotated[str | None, Query(max_length=REQUEST_TAG_MAX_CHARS)] = None,
 ) -> DocumentListResponse:
     metadata = repository.filename_metadata(settings)
     corpus_documents.labels(workspace=workspace_of(settings) or "default").set(len(metadata))
     is_stale = staleness(settings, token_counter)
     stored_originals = raw_store.stored_names() if raw_store is not None else set()
+    if raw_store is not None:
+        record_missing_details(metadata, raw_store)
+    total: int | None = None
+    next_cursor: str | None = None
+    if limit is not None or cursor is not None or prefix is not None or tag is not None:
+        metadata, total, next_cursor = _page(metadata, limit, cursor, prefix, tag)
     return DocumentListResponse(
+        total=total,
+        next_cursor=next_cursor,
         url_refresh=_url_refresh_statuses(metadata, settings),
         filenames=sorted(metadata),
         chunk_counts={name: meta.chunk_count for name, meta in metadata.items()},
@@ -113,6 +132,52 @@ def list_documents(
             name: meta.content_sha256 for name, meta in metadata.items() if meta.content_sha256
         },
     )
+
+
+def _page(
+    metadata: dict[str, DocumentMetadata],
+    limit: int | None,
+    cursor: str | None,
+    prefix: str | None,
+    tag: str | None,
+) -> tuple[dict[str, DocumentMetadata], int, str | None]:
+    """One page of the listing, in name order: the documents whose name starts with
+    ``prefix`` and that carry ``tag`` (compared without case), after ``cursor`` (the
+    last name of the page before). With the count of all that matched and the next
+    page's cursor."""
+
+    wanted = tag.casefold() if tag else None
+    names = sorted(
+        name
+        for name, meta in metadata.items()
+        if (not prefix or name.startswith(prefix))
+        and (wanted is None or any(held.casefold() == wanted for held in meta.tags))
+    )
+    after = [name for name in names if cursor is None or name > cursor]
+    page = after if limit is None else after[:limit]
+    more = len(after) > len(page)
+    return {name: metadata[name] for name in page}, len(names), page[-1] if more else None
+
+
+# Which of a client's files aren't indexed with exactly those bytes: what a folder sync
+# asks before sending anything, instead of reading the whole listing.
+@router.post(
+    "/documents/missing",
+    response_model=MissingDocumentsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def missing_documents(
+    request: MissingDocumentsRequest,
+    repository: VectorRepositoryDep,
+    settings: SettingsDep,
+) -> MissingDocumentsResponse:
+    metadata = repository.filename_metadata(settings)
+    missing = []
+    for document in request.documents:
+        meta = metadata.get(document.name)
+        if meta is None or meta.content_sha256 != document.sha256:
+            missing.append(document.name)
+    return MissingDocumentsResponse(missing=missing)
 
 
 def duplicate_groups(metadata: dict[str, DocumentMetadata]) -> list[list[str]]:
@@ -155,7 +220,7 @@ def _url_refresh_statuses(
 # Earlier versions of a document's original, kept by re-uploads when
 # RAW_DOCUMENT_VERSIONS is set; 409 without stored originals, like /reindex.
 @router.get(
-    "/documents/{filename}/versions",
+    "/documents/{filename:path}/versions",
     response_model=DocumentVersionsResponse,
     dependencies=[Depends(require_api_key)],
 )
@@ -183,7 +248,7 @@ OUTLINE_MAX_SECTIONS = 1000
 
 
 @router.get(
-    "/documents/{filename}/outline",
+    "/documents/{filename:path}/outline",
     response_model=DocumentOutlineResponse,
     dependencies=[Depends(require_api_key)],
 )
@@ -223,7 +288,7 @@ def document_outline(
 
 
 @router.get(
-    "/documents/{filename}/content",
+    "/documents/{filename:path}/content",
     response_model=DocumentContentResponse,
     dependencies=[Depends(require_api_key)],
 )
@@ -288,7 +353,7 @@ def document_content(
 # both when raw_document_dir is unset (feature off) and when it's set but this
 # particular filename predates the feature or was never stored — the client sees
 # the same "not found" either way, not a distinct "feature unavailable" state.
-@router.get("/documents/{filename}/original", dependencies=[Depends(require_api_key)])
+@router.get("/documents/{filename:path}/original", dependencies=[Depends(require_api_key)])
 def document_original(filename: str, raw_store: RawDocumentStoreDep) -> Response:
     filename = stored_filename(filename)
     path = raw_store.path(filename) if raw_store is not None else None
@@ -309,7 +374,8 @@ def document_original(filename: str, raw_store: RawDocumentStoreDep) -> Response
     template = FileResponse(
         path,
         media_type=media_type,
-        filename=filename,
+        # A name with folders is downloaded under its last part.
+        filename=PurePosixPath(filename).name,
         stat_result=os.fstat(handle.fileno()),
         headers={"X-Content-Type-Options": "nosniff"},
     )

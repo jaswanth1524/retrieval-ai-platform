@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 from pathlib import Path
+
+from fastapi import HTTPException
 
 from api.settings import AppSettings
 
@@ -28,6 +31,8 @@ def enabled_store_directories(settings: AppSettings) -> list[tuple[str, Path]]:
         directories.append(("URL_REFRESH_STATE_PATH", Path(settings.url_refresh_state_path).parent))
     if settings.backup_dir:
         directories.append(("BACKUP_DIR", Path(settings.backup_dir)))
+    if settings.import_spool_dir:
+        directories.append(("IMPORT_SPOOL_DIR", Path(settings.import_spool_dir)))
     if settings.audit_log_path:
         directories.append(("AUDIT_LOG_PATH", Path(settings.audit_log_path).parent))
     if settings.workspace_settings_path:
@@ -58,3 +63,44 @@ def check_writable_storage(settings: AppSettings) -> None:
                 f"({exc.strerror or exc}). In Docker, keep it under /app/data (the "
                 "docrag_data volume in docker-compose.yml)."
             ) from exc
+
+
+def free_bytes(directory: str | Path) -> int | None:
+    """Free space on the filesystem holding ``directory`` (or its nearest existing
+    parent); None when it can't be read."""
+
+    path = Path(directory)
+    for candidate in (path, *path.parents):
+        try:
+            return shutil.disk_usage(candidate).free
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return None
+
+
+def low_on_space(settings: AppSettings, directory: str | Path | None) -> str | None:
+    """Why nothing more should be written to ``directory`` (MIN_FREE_BYTES), or None:
+    the guard is off, the directory isn't used, or there is room."""
+
+    floor = int(settings.min_free_bytes)
+    if floor <= 0 or not directory:
+        return None
+    free = free_bytes(directory)
+    if free is None or free >= floor:
+        return None
+    return (
+        f"Only {free // (1024 * 1024)} MB are free where {directory} is kept, and "
+        f"MIN_FREE_BYTES keeps {floor // (1024 * 1024)} MB clear. Free some space, then "
+        "try again."
+    )
+
+
+def require_free_space(settings: AppSettings, directory: str | Path | None) -> None:
+    """A 507 before anything is written to a nearly full disk (MIN_FREE_BYTES): a disk
+    that fills mid-write costs a half-written backup or an original that can't be kept."""
+
+    reason = low_on_space(settings, directory)
+    if reason is not None:
+        raise HTTPException(status_code=507, detail=reason)

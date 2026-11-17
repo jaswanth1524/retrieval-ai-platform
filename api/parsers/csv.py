@@ -19,7 +19,11 @@ _FIELD_SIZE_LIMIT = 1 << 27
 
 
 def parse_csv_document(
-    filename: str, text: str, settings: AppSettings | None = None
+    filename: str,
+    text: str,
+    settings: AppSettings | None = None,
+    *,
+    delimiter: str | None = None,
 ) -> list[DocumentSection]:
     """Render CSV rows as self-describing text, grouped into row-range sections."""
 
@@ -30,6 +34,7 @@ def parse_csv_document(
         if settings is not None
         else _DEFAULT_CSV_ROWS_PER_SECTION
     )
+    given = delimiter
     try:
         # Only real separators: left to guess, the sniffer split a one-column file of
         # prose ("title\nalpha beta\ngamma delta") on the letter "l".
@@ -37,6 +42,8 @@ def parse_csv_document(
         delimiter = dialect.delimiter
     except csv.Error:
         delimiter = ","
+    if given is not None:
+        delimiter = given  # .tsv: tab-separated, whatever the first rows look like
     # A stream with newline="", as the csv module requires: str.splitlines() cut quoted
     # multi-line cells apart and also split on \u2028/\x0c inside a cell.
     # The default 128 KiB field limit failed a whole file over one long cell; the

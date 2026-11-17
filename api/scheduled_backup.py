@@ -29,9 +29,11 @@ from api.background import BackgroundLoop
 from api.export import build_export
 from api.feedback import FeedbackStore
 from api.metrics import backup_last_ok, backup_last_success_timestamp
+from api.notify import notify
 from api.repository import VectorRepository
 from api.restore import BackupCheck, verify_backup
 from api.settings import AppSettings
+from api.storage import low_on_space
 from api.workspace_target import WorkspaceTarget
 from api.workspaces import workspace_of
 
@@ -105,6 +107,11 @@ class BackupStatus:
     error: str | None = None
     # Indexed documents the backup holds no original of: a restore can't bring them back.
     originals_missing: int = 0
+
+
+# Where a deleted workspace's backups are moved (never a workspace name: those can't
+# start with a dot).
+DELETED_DIRECTORY = ".deleted"
 
 
 def backups_in(directory: Path) -> list[Path]:
@@ -202,6 +209,12 @@ class ScheduledBackup(BackgroundLoop):
     def _note(self, status: BackupStatus) -> None:
         self.last = status
         self.by_workspace[status.workspace] = status
+        if not status.ok:
+            notify(
+                "backup_failed",
+                f"The scheduled backup of workspace '{status.workspace}' failed: "
+                f"{status.error or 'see the server log'}",
+            )
         backup_last_ok.labels(workspace=status.workspace).set(1 if status.ok else 0)
         if status.ok:
             backup_last_success_timestamp.labels(workspace=status.workspace).set(status.at)
@@ -214,7 +227,15 @@ class ScheduledBackup(BackgroundLoop):
         files written."""
 
         written: list[Path] = []
-        for target in self._targets():
+        try:
+            targets = list(self._targets())
+        except Exception as exc:  # noqa: BLE001 - Qdrant down: no workspace could be listed
+            # Recorded, so readiness and the backup alert see a pass that backed up
+            # nothing (it used to fail before any status was noted).
+            logger.warning("Could not list the workspaces to back up.", exc_info=True)
+            self._note(BackupStatus(self._clock(), "default", False, error=str(exc)[:200]))
+            return written
+        for target in targets:
             name = workspace_of(target.settings) or "default"
             directory = self._root / name
             self._remove_abandoned_parts(directory)
@@ -222,6 +243,11 @@ class ScheduledBackup(BackgroundLoop):
                 forced = name in self._forced
             newest = _modified_at(backups_in(directory))
             if not forced and newest is not None and self._clock() - newest < self._every:
+                # Not due: the newest backup on disk is the last success (after a
+                # restart the gauge had none until the next write, a day away, and
+                # the staleness alert had no series to judge).
+                if name not in self.by_workspace:
+                    backup_last_success_timestamp.labels(workspace=name).set(newest)
                 continue
             if not self._export_lock.acquire(blocking=False):
                 logger.info("A /export is running; backing up %r next pass.", name)
@@ -240,6 +266,9 @@ class ScheduledBackup(BackgroundLoop):
 
     def _write(self, target: WorkspaceTarget, directory: Path, name: str) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
+        low = low_on_space(target.settings, directory)
+        if low is not None:
+            raise OSError(low)
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(self._clock()))
         final = directory / f"docrag-{stamp}.zip"
         partial = directory / f".docrag-{stamp}.zip.part"
@@ -273,7 +302,7 @@ class ScheduledBackup(BackgroundLoop):
         # Read back as a restore would: a backup that can't be is a failure now, not
         # when it is needed.
         with final.open("rb") as written:
-            check = verify_backup(written, int(target.settings.max_upload_bytes))
+            check = verify_backup(written, int(target.settings.max_upload_bytes), stored=True)
         self.record_check(final, check)
         if not check.ok:
             logger.warning("The backup %s did not check out: %s", final, "; ".join(check.problems))
@@ -307,9 +336,27 @@ class ScheduledBackup(BackgroundLoop):
                 continue
 
     def forget_workspace(self, name: str) -> None:
-        """A deleted workspace: its last attempt no longer counts as failing (readiness)."""
+        """A deleted workspace: its last attempt no longer counts as failing (readiness),
+        and its backups are set aside — kept (BACKUP_DIR/.deleted/<name>-<time>), but no
+        longer where a workspace created later under the same name would list them,
+        restore the old one's documents from them, or count them as its own latest."""
 
         self.by_workspace.pop(name, None)
+        directory = self._root / (name or "default")
+        if not directory.is_dir():
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(self._clock()))
+        aside = self._root / DELETED_DIRECTORY
+        try:
+            aside.mkdir(parents=True, exist_ok=True)
+            directory.rename(aside / f"{name or 'default'}-{stamp}")
+        except OSError:
+            logger.warning(
+                "Could not set aside the backups of deleted workspace %r (%s).",
+                name,
+                directory,
+                exc_info=True,
+            )
 
     def _prune(self, directory: Path) -> None:
         backups = backups_in(directory)

@@ -37,7 +37,8 @@ _CREATE_TABLE = """
         retrieval_query TEXT,
         top_filename TEXT,
         scope_json TEXT,
-        cached INTEGER NOT NULL DEFAULT 0
+        cached INTEGER NOT NULL DEFAULT 0,
+        cited INTEGER NOT NULL DEFAULT 0
     )
 """
 # Columns added after the first release, with their declarations: an older log gains
@@ -49,6 +50,7 @@ _ADDED_COLUMNS = (
     ("top_filename", "TEXT"),
     ("scope_json", "TEXT"),
     ("cached", "INTEGER NOT NULL DEFAULT 0"),
+    ("cited", "INTEGER NOT NULL DEFAULT 0"),
 )
 # A status that means the documents didn't answer it.
 UNCOVERED_STATUSES = ("insufficient_context",)
@@ -83,6 +85,10 @@ class LoggedQuery:
     # Answered from the answer cache, or by joining an identical question in flight:
     # no trace of its own (``trace_id`` is the one it was served from).
     cached: bool = False
+    # ``filenames`` are the documents the answer cited; False when they are the prompt's
+    # (an answer citing none), a summary's, or the row predates this. A dataset drafted
+    # from the log labels only cited documents as where the answer is.
+    cited: bool = False
 
 
 class QueryLogStore(CappedRowLog):
@@ -108,7 +114,7 @@ class QueryLogStore(CappedRowLog):
             conn.execute(
                 "INSERT INTO queries (created_at, workspace, question, status, top_score, "
                 "mode, trace_id, filenames_json, kind, retrieval_query, top_filename, "
-                "scope_json, cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "scope_json, cached, cited) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     query.created_at,
                     query.workspace,
@@ -123,6 +129,7 @@ class QueryLogStore(CappedRowLog):
                     query.top_filename,
                     None if query.scope is None else json.dumps(query.scope),
                     int(query.cached),
+                    int(query.cited),
                 ),
             )
             self._added_one(conn)
@@ -151,7 +158,7 @@ class QueryLogStore(CappedRowLog):
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT created_at, workspace, question, status, top_score, mode, trace_id, "
-                "filenames_json, kind, retrieval_query, top_filename, scope_json, cached "
+                "filenames_json, kind, retrieval_query, top_filename, scope_json, cached, cited "
                 f"FROM queries WHERE {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
@@ -170,6 +177,7 @@ class QueryLogStore(CappedRowLog):
                 top_filename=None if row[10] is None else str(row[10]),
                 scope=_scope(row[11]),
                 cached=bool(row[12]),
+                cited=bool(row[13]),
             )
             for row in rows
         ]
@@ -186,14 +194,17 @@ def logged_query(trace: QueryTrace) -> LoggedQuery:
     # documents it cited; one citing none (or traced before citations were recorded per
     # candidate) counts the prompt's.
     drawn_from: dict[str, None] = {}
+    cited = False
     # Every summary trace says so (a scoped question with no candidates is a question).
     summary = trace.kind == "summary"
     if trace.status == "ok":
         if summary and trace.config is not None and trace.config.filenames:
             drawn_from = dict.fromkeys(trace.config.filenames)
         else:
-            drawn_from = dict.fromkeys(c.filename for c in trace.candidates if c.cited) or (
-                dict.fromkeys(c.filename for c in trace.candidates if c.selected_for_context)
+            drawn_from = dict.fromkeys(c.filename for c in trace.candidates if c.cited)
+            cited = bool(drawn_from)
+            drawn_from = drawn_from or dict.fromkeys(
+                c.filename for c in trace.candidates if c.selected_for_context
             )
     rewrite = trace.condensed_question
     return LoggedQuery(
@@ -209,6 +220,7 @@ def logged_query(trace: QueryTrace) -> LoggedQuery:
         retrieval_query=rewrite if rewrite and rewrite != trace.question else None,
         top_filename=top.filename if top is not None else None,
         scope=_trace_scope(trace),
+        cited=cited,
     )
 
 
@@ -252,6 +264,8 @@ class QueryLogSink:
         self._store = store
 
     def add(self, trace: QueryTrace) -> None:
+        if trace.continues is not None:
+            return  # the rest of an answer already logged
         self.add_logged(logged_query(trace))
 
     def add_logged(self, query: LoggedQuery) -> None:

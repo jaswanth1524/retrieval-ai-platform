@@ -35,6 +35,7 @@ from api.dependencies import (
     raw_store_for,
     shutdown_executors,
 )
+from api.doctor import diagnose
 from api.document_names import (
     known_filenames,
     refuse_near_duplicate_name,
@@ -46,8 +47,10 @@ from api.document_ops import (
     reindex_from_original,
     retry_refusal,
 )
+from api.documents import normalize_tags
 from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
+from api.imports import leftover, spool_directory
 from api.imports import shutdown as shutdown_background_imports
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
@@ -56,14 +59,16 @@ from api.ingest_jobs import (
 from api.ingest_service import IngestService
 from api.llm import GenerationConfigError, completion_model_and_kwargs
 from api.logging_config import configure_logging
-from api.metrics import build_info, watch_storage
+from api.metrics import backup_enabled, build_info, watch_index, watch_storage
 from api.model_health import ModelHealth, ModelState
+from api.notify import Notifier, notify, set_notifier
 from api.qdrant_schema import check_dense_dimension
 from api.repository import VectorRepository
 from api.request_guard import RequestGuardMiddleware
 from api.request_id import RequestIdMiddleware
 from api.routes import backup as backup_routes
 from api.routes import documents as documents_routes
+from api.routes import documents_write as documents_write_routes
 from api.routes import feedback as feedback_routes
 from api.routes import ops as ops_routes
 from api.routes import questions as questions_routes
@@ -76,7 +81,7 @@ from api.security_headers import SecurityHeadersMiddleware
 from api.settings import AppSettings
 from api.sitemap import shutdown_imports
 from api.static_files import FrontendFiles
-from api.storage import check_writable_storage, enabled_store_directories
+from api.storage import check_writable_storage, enabled_store_directories, require_free_space
 from api.url_fetch import fetch_document, fetch_slots
 from api.url_refresh import UrlRefresher
 from api.version import app_version
@@ -333,6 +338,9 @@ def start_folder_watcher(settings: AppSettings) -> FolderWatcher:
         return {name for name, meta in metadata.items() if meta.watched_from == folder}
 
     def enqueue(filename: str, content: bytes, mtime: float) -> str:
+        # As an upload is: nothing more kept on a nearly full disk (a 507, which the
+        # watcher waits out like a full backlog).
+        require_free_space(settings, settings.raw_document_dir)
         if raw_store is not None:
             # As an upload is: with originals stored, Report.pdf and report.pdf would
             # overwrite each other's original on a case-insensitive disk. The
@@ -425,6 +433,7 @@ def start_scheduled_backup(settings: AppSettings) -> ScheduledBackup:
         settings, repository, targets, get_feedback_store(), backup_routes._export_running
     )
     backup.start()
+    backup_enabled.set(1)
     return backup
 
 
@@ -520,6 +529,103 @@ def start_url_refresher(settings: AppSettings) -> UrlRefresher:
     return refresher
 
 
+def resume_imports(settings: AppSettings) -> list[str]:
+    """Run again each background import a restart cut off (IMPORT_SPOOL_DIR keeps its
+    file and a record of what it was): the new imports' ids. One whose workspace is
+    gone, or that can't start now, is dropped with its file and logged."""
+
+    directory = spool_directory(settings.import_spool_dir)
+    if directory is None:
+        return []
+    repository = VectorRepository(get_qdrant_client())
+    token_counter = get_token_counter()
+    started: list[str] = []
+    for record_path, record, spool in leftover(directory):
+        kind, name = str(record.get("kind")), str(record.get("name") or "import")
+        workspace = str(record.get("workspace") or "")
+
+        def drop(record_path: Path = record_path, spool: Path | None = spool) -> None:
+            record_path.unlink(missing_ok=True)
+            if spool is not None:
+                spool.unlink(missing_ok=True)
+
+        try:
+            target_settings = settings_for(settings, workspace) if workspace else settings
+            target = workspace_target(target_settings, repository, token_counter)
+            assert target.queue is not None
+            if kind == "archive" and spool is not None:
+                raw_tags = record.get("tags")
+                tags = (
+                    normalize_tags([tag for tag in raw_tags if isinstance(tag, str)])
+                    if isinstance(raw_tags, list)
+                    else None
+                )
+                status_id = documents_write_routes.start_archive_import(
+                    spool,
+                    name,
+                    repository,
+                    target_settings,
+                    target.queue,
+                    target.raw_store,
+                    tags,
+                    record=record_path,
+                    resumed=True,
+                    keep_paths=record.get("keep_paths") is True,
+                ).id
+            elif kind == "restore":
+                stored = record.get("stored")
+                path = (
+                    backup_routes._stored_backup(target_settings, str(stored)) if stored else spool
+                )
+                if path is None:
+                    raise ValueError("its record names no file")
+                status_id = (
+                    backup_routes._restore_in_background(
+                        path,
+                        name,
+                        repository,
+                        target_settings,
+                        target.queue,
+                        target.raw_store,
+                        get_feedback_store(),
+                        cleanup=drop,
+                        source=str(stored) if stored else None,
+                        resumable=True,
+                        resumed=True,
+                    ).import_id
+                    or ""
+                )
+            else:
+                raise ValueError(f"unknown kind {kind!r}")
+        except Exception as exc:  # noqa: BLE001 - one bad leftover must not stop the rest
+            logger.warning("Could not resume the %s import %r: %s", kind, name, exc)
+            drop()
+            continue
+        logger.info("Resumed the %s import %r after a restart.", kind, name)
+        started.append(status_id)
+    return started
+
+
+def notify_config_warnings(settings: AppSettings) -> None:
+    """Tell the operator (NOTIFY_URL) what the settings check warns about at startup."""
+
+    try:
+        warnings = [f for f in diagnose(settings) if f.level == "warning"]
+    except Exception:  # noqa: BLE001 - advice only
+        logger.warning("The startup settings check failed.", exc_info=True)
+        return
+    if warnings:
+        notify(
+            "config_warning",
+            "; ".join(f"{finding.subject}: {finding.message}" for finding in warnings[:5]),
+        )
+
+
+def _index_size(settings: AppSettings) -> tuple[int, int] | None:
+    size = VectorRepository(get_qdrant_client()).index_size(settings)
+    return (size.points, size.vector_bytes) if size is not None else None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optionally warm up lazy-loaded models once at startup (see AppSettings.warmup_models)."""
@@ -530,6 +636,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     watch_storage(
         [(name, str(directory)) for name, directory in enabled_store_directories(settings)]
     )
+    watch_index(lambda: _index_size(settings))
+    set_notifier(Notifier(settings) if settings.notify_url.strip() else None)
     # Audit events into AUDIT_LOG_PATH from now on (every action, the watcher's too).
     set_audit_store(app.dependency_overrides.get(get_audit_log, get_audit_log)())
     if settings.warmup_models:
@@ -562,6 +670,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ).start()
         if settings.url_refresh_interval_minutes and settings.url_ingest_enabled:
             refresher = start_url_refresher(settings)
+        if settings.import_spool_dir:
+            threading.Thread(
+                target=resume_imports, args=(settings,), name="docrag-resume", daemon=True
+            ).start()
+        if settings.notify_url.strip():
+            threading.Thread(
+                target=notify_config_warnings, args=(settings,), name="docrag-doctor", daemon=True
+            ).start()
         backup = start_scheduled_backup(settings) if settings.backup_dir else None
         # For GET /health/ready's last_backup.
         app.state.backup = backup
@@ -569,6 +685,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if backup is not None:
             backup.stop()
+            backup_enabled.set(0)
         if refresher is not None:
             refresher.stop()
         if reindexer is not None:
@@ -578,6 +695,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         shutdown_imports()
         shutdown_background_imports()
         set_audit_store(None)
+        set_notifier(None)
     shutdown_executors()
 
 

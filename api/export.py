@@ -77,10 +77,16 @@ class _QueueWriter:
         self.flush()
 
 
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
 def _write_member(archive: zipfile.ZipFile, name: str, source: BinaryIO) -> None:
     """Copy ``source`` into ``archive`` in blocks, never whole into memory."""
 
-    info = zipfile.ZipInfo(name, date_time=time.localtime(os.fstat(source.fileno()).st_mtime)[:6])
+    # Zip dates start at 1980: an original dated before (restored from an archive that
+    # zeroed its times, a share reporting 1970) aborted the whole export.
+    modified = time.localtime(os.fstat(source.fileno()).st_mtime)[:6]
+    info = zipfile.ZipInfo(name, date_time=max(modified, _ZIP_EPOCH))
     # ZIP_STORED: uploads are mostly already compressed (PDF, DOCX).
     info.compress_type = zipfile.ZIP_STORED
     with archive.open(info, "w", force_zip64=True) as member:

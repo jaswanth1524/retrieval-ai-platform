@@ -35,7 +35,7 @@ from api.jobs import JobStore
 from api.metrics import forget_workspace_metrics
 from api.qdrant_schema import forget_collection
 from api.query_log import QueryLogStore
-from api.raw_documents import VERSIONS_DIR, is_temp_file_name
+from api.raw_documents import OWN_DIRECTORIES, is_temp_file_name
 from api.repository import forget_metadata
 from api.routes.deps import QdrantClientDep, VectorRepositoryDep
 from api.schemas import (
@@ -118,7 +118,7 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
     entries = os.listdir(originals) if originals and os.path.isdir(originals) else []
     # Earlier versions belong to documents: with none left, they are history of
     # deleted ones, and an empty workspace stayed undeletable over them.
-    entries = [entry for entry in entries if entry != VERSIONS_DIR]
+    entries = [entry for entry in entries if entry not in OWN_DIRECTORIES]
     # A save a crash interrupted leaves an `.upload-*` temp file behind; it is not a
     # document, and must not keep an empty workspace undeletable.
     temp_files = [entry for entry in entries if is_temp_file_name(entry)]
@@ -134,7 +134,8 @@ def _delete_if_empty(client: QdrantClient, target: AppSettings, name: str) -> No
         try:
             for entry in temp_files:
                 os.unlink(os.path.join(originals, entry))
-            shutil.rmtree(os.path.join(originals, VERSIONS_DIR), ignore_errors=True)
+            for own in OWN_DIRECTORIES:
+                shutil.rmtree(os.path.join(originals, own), ignore_errors=True)
             os.rmdir(originals)
         except OSError as exc:
             raise HTTPException(

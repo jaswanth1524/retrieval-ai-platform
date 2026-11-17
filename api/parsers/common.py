@@ -49,6 +49,10 @@ class EmptyDocumentError(DocumentError):
     """Raised when a document has no extractable text."""
 
 
+class DocumentTooLongError(DocumentError):
+    """Raised when a document chunks into more passages than MAX_CHUNKS_PER_DOCUMENT."""
+
+
 class DocumentParseError(DocumentError):
     """Raised when a supported document cannot be parsed."""
 
@@ -103,11 +107,22 @@ _TEXT_CLEANUP = str.maketrans(
 )
 
 
-def clean_text(text: str) -> str:
-    """``text`` with ligature characters written out and word-splitting invisible
-    characters removed. Applied to every parsed section and to questions alike."""
+# Half of a surrogate pair on its own (a JSON "\\ud83d" with no partner, a cut-off
+# RTF \\uN): not a character, and not encodable — hashing a chunk's id failed on it.
+_LONE_SURROGATE_RE = re.compile(f"[{chr(0xD800)}-{chr(0xDFFF)}]")
 
-    return text.translate(_TEXT_CLEANUP)
+
+def clean_text(text: str) -> str:
+    """``text`` with ligature characters written out, word-splitting invisible
+    characters removed and lone surrogates replaced. Applied to every parsed section
+    and to questions alike."""
+
+    cleaned = text.translate(_TEXT_CLEANUP)
+    try:
+        cleaned.encode("utf-8")
+    except UnicodeEncodeError:
+        cleaned = _LONE_SURROGATE_RE.sub(chr(0xFFFD), cleaned)
+    return cleaned
 
 
 def normalize_text(text: str) -> str:
@@ -290,3 +305,41 @@ def collect_parse_warnings() -> Iterator[list[str]]:
         yield collected
     finally:
         _parse_warnings.reset(token)
+
+
+_FRONT_MATTER_MAX_BYTES = 64 * 1024
+
+
+def front_matter_tags(content: bytes) -> list[str]:
+    """The ``tags:`` of a Markdown file's YAML front matter (``---`` on its first line),
+    as an inline list (``tags: [a, b]`` or ``tags: a, b``) or a block of ``- a`` lines;
+    ``[]`` when there is none. Read without a YAML library: only that one key."""
+
+    head = content[:_FRONT_MATTER_MAX_BYTES].decode("utf-8", errors="replace").lstrip("\ufeff")
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return []
+    found: list[str] = []
+    in_block = False
+    for line in lines[1:]:
+        if line.strip() in ("---", "..."):
+            break
+        if in_block:
+            item = line.strip()
+            if item.startswith("- "):
+                found.append(item[2:])
+                continue
+            if not item:
+                continue
+            in_block = False
+        key, sep, value = line.partition(":")
+        if not sep or key.strip().lower() != "tags" or line[:1].isspace():
+            continue
+        value = value.strip()
+        if not value:
+            in_block = True
+            continue
+        found.extend(value.strip("[]").split(","))
+    else:
+        return []  # no closing line: not front matter
+    return [tag.strip().strip("\"'") for tag in found if tag.strip().strip("\"'")]

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import shutil
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 
 from prometheus_client import Counter, Gauge, Histogram, Info
 
@@ -146,6 +147,11 @@ unsupported_claims_total = Counter(
     "Citing sentences of generated answers that no passage of their cited sources "
     "supports (no span matched).",
 )
+
+unsupported_numbers_total = Counter(
+    "docrag_unsupported_numbers_total",
+    "Citing sentences of generated answers stating a number none of their cited passages contains.",
+)
 citation_backfills_total = Counter(
     "docrag_citation_backfills_total",
     "Answers that cited nothing and had citations added by matching their sentences "
@@ -213,6 +219,11 @@ backup_last_success_timestamp = Gauge(
     "When the workspace's last scheduled backup was written and verified (Unix seconds).",
     ["workspace"],
 )
+backup_enabled = Gauge(
+    "docrag_backup_enabled",
+    "1 while scheduled backups (BACKUP_DIR) run in this process: lets an alert tell "
+    "'no backup ever recorded' from 'backups are off'.",
+)
 backup_last_ok = Gauge(
     "docrag_backup_last_ok",
     "1 when the workspace's last scheduled backup attempt succeeded, 0 when it failed.",
@@ -228,6 +239,38 @@ watch_files = Gauge(
     "Files in a watched folder as of its last pass, by state.",
     ["folder", "state"],
 )
+
+
+index_points = Gauge(
+    "docrag_index_points",
+    "Passages in the default workspace's collection (read at scrape time).",
+)
+index_vector_bytes = Gauge(
+    "docrag_index_vector_bytes",
+    "Estimated bytes of the default collection's dense vectors (points x vector size).",
+)
+
+
+def watch_index(read: Callable[[], tuple[int, int] | None]) -> None:
+    """Report the index's size — ``read()`` gives (points, vector bytes), or None when
+    it can't be read — whenever /metrics is scraped, read at most every 30 seconds."""
+
+    read_at = 0.0
+    found: tuple[int, int] | None = None
+
+    def value(position: int) -> float:
+        nonlocal read_at, found
+        now = time.monotonic()
+        if not read_at or now - read_at > 30.0:
+            read_at = now
+            try:
+                found = read()
+            except Exception:  # noqa: BLE001 - a gauge must not fail the scrape
+                found = None
+        return float(found[position]) if found is not None else float("nan")
+
+    index_points.set_function(lambda: value(0))
+    index_vector_bytes.set_function(lambda: value(1))
 
 
 def watch_storage(directories: Sequence[tuple[str, str]]) -> None:

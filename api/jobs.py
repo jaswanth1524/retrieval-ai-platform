@@ -75,7 +75,11 @@ class IngestJob:
     refresh_minutes: int | None = None
 
 
-JOB_KINDS = ("upload", "url", "reindex", "restore", "import", "watch")
+JOB_KINDS = ("upload", "url", "reindex", "restore", "import", "watch", "rebuild")
+
+
+# The share of the indexing queue background imports (a zip, a backup, a rebuild) fill.
+BACKGROUND_SHARE = 0.75
 
 
 class IngestBacklog:
@@ -114,6 +118,20 @@ class IngestBacklog:
 
         with self._lock:
             return self._fits(size)
+
+    def has_spare_room(self, size: int) -> bool:
+        """Room for ``size`` that leaves ``1 - BACKGROUND_SHARE`` of the budget free: what
+        a background import waits for, so a long one doesn't refill the queue the
+        moment a slot frees and leave uploads, URL fetches and the watcher on 503s."""
+
+        with self._lock:
+            if not self._jobs:
+                return True
+            if self._pending + size > self._max_bytes * BACKGROUND_SHARE:
+                return False
+            return self._max_jobs is None or self._jobs < max(
+                1, int(self._max_jobs * BACKGROUND_SHARE)
+            )
 
     def _fits(self, size: int) -> bool:
         # Under the lock. An empty backlog takes anything, however large.

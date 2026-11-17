@@ -43,9 +43,11 @@ from api.documents import (
     SUPPORTED_EXTENSIONS,
     DocumentError,
     DocumentNotFoundError,
+    validate_document_name,
     validate_upload_filename,
 )
 from api.metrics import watch_files
+from api.notify import notify
 from api.settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -62,8 +64,8 @@ class FileState:
 ListIndexed = Callable[[], dict[str, float | None]]  # filename -> uploaded_at
 # (name, content, mtime) -> the job id: the document is stamped with the file's mtime
 # as its uploaded_at, which is how the next pass knows it is current. Raises
-# HTTPException(503) when the backlog is full, another HTTPException or a DocumentError
-# when the file is refused.
+# HTTPException(503) when the backlog is full (507 when the disk is: MIN_FREE_BYTES),
+# another HTTPException or a DocumentError when the file is refused.
 Enqueue = Callable[[str, bytes, float], "str | None"]
 Delete = Callable[[str], None]
 # The indexed documents this folder indexed (in any run): the ones it may delete when
@@ -252,7 +254,13 @@ class PathFilter:
         return not self._matches(relative, self.exclude)
 
 
-def scan_folder(root: Path, max_bytes: int, path_filter: PathFilter | None = None) -> FolderScan:
+def scan_folder(
+    root: Path,
+    max_bytes: int,
+    path_filter: PathFilter | None = None,
+    *,
+    keep_paths: bool = False,
+) -> FolderScan:
     """Supported regular files under ``root`` by stored name, and the problems found
     (duplicate names, unusable names, links and special files, files over the upload
     limit).
@@ -294,7 +302,12 @@ def scan_folder(root: Path, max_bytes: int, path_filter: PathFilter | None = Non
             path = Path(directory) / name
             try:
                 info = path.lstat()  # the link itself, never what it points at
-                stored = validate_upload_filename(name)
+                # With WATCH_KEEP_PATHS a file is named by its path under the folder.
+                stored = (
+                    validate_document_name(prefix + name)
+                    if keep_paths
+                    else validate_upload_filename(name)
+                )
             except FileNotFoundError:
                 continue  # removed since the directory was listed: it is gone
             except OSError as exc:
@@ -318,6 +331,41 @@ def scan_folder(root: Path, max_bytes: int, path_filter: PathFilter | None = Non
                 continue
             found[stored] = FileState(path, info.st_size, info.st_mtime)
     return FolderScan(found, problems, incomplete)
+
+
+def names_on_disk(root: Path, *, keep_paths: bool = False) -> set[str] | None:
+    """The stored name of every file under ``root`` — whatever its type, its size or
+    WATCH_INCLUDE / WATCH_EXCLUDE say, links included; None when part of the folder
+    can't be listed. Hidden files and folders aren't looked at: moving a file into one
+    takes it out of the watched folder.
+
+    What a deletion is checked against: ``scan_folder`` leaves out a file that is
+    filtered, too large now or replaced by a link, and a document whose file is still
+    there must not be deleted for that."""
+
+    names: set[str] = set()
+    failed = False
+
+    def unreadable(exc: OSError) -> None:
+        nonlocal failed
+        failed = True
+
+    for directory, subdirectories, filenames in os.walk(root, onerror=unreadable):
+        subdirectories[:] = [d for d in subdirectories if not d.startswith(".")]
+        under = Path(directory).relative_to(root).as_posix()
+        prefix = "" if under == "." or not keep_paths else f"{under}/"
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            try:
+                names.add(
+                    validate_document_name(prefix + name)
+                    if keep_paths
+                    else validate_upload_filename(name)
+                )
+            except DocumentError:
+                names.add(prefix + name)
+    return None if failed else names
 
 
 def read_regular_file(path: Path, max_bytes: int) -> bytes:
@@ -365,6 +413,9 @@ class FolderWatcher(BackgroundLoop):
         )
         self._interval = float(settings.watch_interval_seconds)
         self._delete_missing = bool(settings.watch_delete_missing)
+        self._keep_paths = bool(settings.watch_keep_paths)
+        # Seen once, since left out of the scan while still on disk (logged once each).
+        self._kept_present: set[str] = set()
         self._max_bytes = int(settings.max_upload_bytes)
         self._max_retries = int(settings.watch_max_retries)
         self._retry_max_seconds = float(settings.watch_retry_max_seconds)
@@ -435,7 +486,7 @@ class FolderWatcher(BackgroundLoop):
             self._record_status(0, [f"{self._root}: not a directory"], done)
             return done
         self._check_jobs(done)
-        scan = scan_folder(self._root, self._max_bytes, self._filter)
+        scan = scan_folder(self._root, self._max_bytes, self._filter, keep_paths=self._keep_paths)
         files = scan.files
         for problem in scan.problems:
             if problem not in self._reported:  # once, not every interval
@@ -477,7 +528,9 @@ class FolderWatcher(BackgroundLoop):
                 content = read_regular_file(state.path, self._max_bytes)
                 job_id = self._enqueue(name, content, state.mtime)
             except HTTPException as exc:
-                if exc.status_code == 503:  # the backlog is full: the rest wait too
+                # The backlog is full (503) or the disk nearly is (507, MIN_FREE_BYTES):
+                # the rest wait too, and this file is tried again next pass.
+                if exc.status_code in (503, 507):
                     backlog_full = True
                     done["deferred"].append(name)
                     continue
@@ -583,6 +636,11 @@ class FolderWatcher(BackgroundLoop):
         self._gave_up[name] = signature
         self._retry.pop(name, None)
         done["gave_up"].append(name)
+        notify(
+            "watch_gave_up",
+            f"The folder watcher gave up on '{name}' in {self._root}: it will be tried "
+            "again when the file changes (GET /watch lists why).",
+        )
 
     def _record_status(self, files: int, problems: list[str], done: dict[str, list[str]]) -> None:
         now, wall = self._clock(), time.time()
@@ -659,7 +717,29 @@ class FolderWatcher(BackgroundLoop):
             )
             return
         self._standing_down = None
+        # Out of the scan isn't off the disk: a file now filtered out (a tightened
+        # WATCH_EXCLUDE), over a lowered MAX_UPLOAD_BYTES or swapped for a link is
+        # still there, and its document stays.
+        present = names_on_disk(self._root, keep_paths=self._keep_paths)
+        if present is None:
+            self._stand_down(
+                "incomplete",
+                "Watched folder: part of %s could not be read; deleting nothing until it can.",
+                self._root,
+            )
+            return
         for name in missing:
+            if name in present:
+                if name not in self._kept_present:
+                    self._kept_present.add(name)
+                    logger.warning(
+                        "Watched folder: %s is no longer watched (filtered out, too large "
+                        "or not a regular file) but is still in %s; its document is kept.",
+                        name,
+                        self._root,
+                    )
+                continue
+            self._kept_present.discard(name)
             if name in indexed:
                 try:
                     self._delete(name)

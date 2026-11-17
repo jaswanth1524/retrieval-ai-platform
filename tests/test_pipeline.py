@@ -3105,6 +3105,40 @@ def test_the_recency_boost_reorders_kept_passages_and_drops_none() -> None:
     assert [c.chunk_id for c in recency_ordered(close, 0.5)] == ["a", "b"]
 
 
+def test_a_question_about_the_past_gets_no_recency_boost() -> None:
+    from api.pipeline import RECENCY_HORIZON_SECONDS, asks_about_the_past, select_passages
+    from api.reranking import RerankedChunk
+
+    year = RECENCY_HORIZON_SECONDS
+
+    def chunk(chunk_id: str, score: float, uploaded_at: float) -> RerankedChunk:
+        return RerankedChunk(
+            point_id=chunk_id,
+            filename=f"{chunk_id}.md",
+            page=1,
+            section="",
+            chunk_id=chunk_id,
+            text=f"text of {chunk_id}",
+            retrieval_score=0.1,
+            rerank_score=score,
+            uploaded_at=uploaded_at,
+        )
+
+    scored = [chunk("old", 0.80, 0.0), chunk("new", 0.75, 2 * year)]
+    settings = make_settings(recency_boost_weight=1.0, context_diversity_enabled=False)
+
+    def first(question: str) -> str:
+        return select_passages(scored, settings, question)[0][0].chunk_id
+
+    assert first("How long is annual leave?") == "new"
+    assert first("What did the 2019 policy say about leave?") == "old"
+    assert first("How long was leave under the previous handbook?") == "old"
+    assert asks_about_the_past("What was the original rule?")
+    # Words that only sound like the past don't turn it off.
+    assert not asks_about_the_past("What was decided about laptops?")
+    assert not asks_about_the_past("Who did approve travel?")
+
+
 def test_an_odd_history_cap_never_leaves_an_answer_first() -> None:
     settings = make_settings(conversation_max_history_messages=3)
     client = QdrantClient(":memory:")

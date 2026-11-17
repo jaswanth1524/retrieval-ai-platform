@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from api.routes import backup, documents_jobs, documents_read, documents_write
+from api.routes import backup, documents_jobs, documents_read, documents_write, migrate
 
 
 def register(app: FastAPI) -> None:
     """Register the document and export routes."""
 
-    for module in (documents_read, documents_write, documents_jobs, backup):
+    # Jobs first: a document's name may have folders (``/documents/{filename:path}``),
+    # which would otherwise also match ``/documents/jobs/{id}`` and the imports.
+    for module in (documents_jobs, documents_read, documents_write, backup, migrate):
         app.include_router(module.router)

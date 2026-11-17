@@ -67,7 +67,10 @@ def rtf_to_text(source: str) -> str:
             out.append(hex_bytes.decode(encoding, errors="replace"))
             hex_bytes.clear()
 
+    binary_until = 0
     for match in _TOKEN_RE.finditer(source):
+        if match.start() < binary_until:
+            continue  # raw bytes of a \\binN (a picture): braces in them mean nothing
         word, number, hex_pair, symbol, brace, text = match.groups()
         if hex_pair is None:
             flush_hex()
@@ -110,6 +113,8 @@ def rtf_to_text(source: str) -> str:
                 encoding = f"cp{number}"
             elif word == "uc" and number:
                 uc = max(0, int(number))
+            elif word == "bin" and number:
+                binary_until = match.end() + max(0, int(number))
             elif skipping:
                 pass
             elif word == "u" and number:
@@ -126,7 +131,9 @@ def rtf_to_text(source: str) -> str:
         if text and not skipping:
             out.append(text)
     flush_hex()
-    return "".join(out)
+    # A character past U+FFFF is written as two \\uN (a surrogate pair): joined into
+    # the one character here; half a pair alone becomes the replacement character.
+    return "".join(out).encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
 def parse_rtf_document(filename: str, content: bytes) -> list[DocumentSection]:

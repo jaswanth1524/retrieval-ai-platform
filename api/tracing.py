@@ -146,10 +146,14 @@ class QueryTrace:
     # The answer's citations were added by matching it to the sources, not by the model.
     citation_backfilled: bool = False
     unsupported_claims: int = 0
+    unsupported_numbers: int = 0
     prompt_cached: bool = False
     # The provider read far less of the prompt than was sent: cut to fit its context
     # window, grounding rules first (raise OLLAMA_NUM_CTX).
     prompt_cut: bool = False
+    # The trace whose cut-off answer this one continues (POST /questions/continue):
+    # the same question, so it isn't logged as asked again.
+    continues: str | None = None
     # (prompt, completion) tokens reported for the answer's LLM calls, when reported.
     usage: tuple[int, int] | None = None
     cost_usd: float | None = None

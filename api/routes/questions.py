@@ -361,6 +361,7 @@ def register(app: FastAPI) -> None:
             truncated=grounded.truncated,
             citation_backfilled=grounded.citation_backfilled,
             unsupported_claims=grounded.unsupported_claims,
+            unsupported_numbers=grounded.unsupported_numbers,
             prompt_cached=grounded.prompt_cached,
             prompt_cut=grounded.prompt_cut,
             passages_left_out=grounded.passages_left_out,
@@ -467,22 +468,35 @@ def register(app: FastAPI) -> None:
         response_model=SummaryResponse,
         dependencies=[Depends(require_api_key)],
     )
-    def summarize_documents(
+    async def summarize_documents(
         request: SummaryRequest,
+        http_request: Request,
         summarizer: DocumentSummarizerDep,
         slots: QuestionSlotsDep,
         settings: SettingsDep,
     ) -> SummaryResponse:
         check_request_provider(request.llm_provider, settings, request.llm_temperature)
         task = summary_request(request)
-        summarizer.check_documents(task.filenames, task.narrow)
+        await run_in_threadpool(summarizer.check_documents, task.filenames, task.narrow)
         release = question_slot(slots, count_metric=False, kind="summary")
+        # As /questions: a client that leaves stops the summary before its next part,
+        # instead of every part running (and both slots held) for nobody.
+        stop = threading.Event()
+        watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
         try:
-            result = summarizer.summarize(task, use_cache=request.use_cache)
+            result = await run_in_threadpool(
+                lambda: summarizer.summarize(
+                    task, use_cache=request.use_cache, should_stop=stop.is_set
+                )
+            )
+        except QuestionAbandoned:
+            summaries_total.labels(mode=request.mode, outcome="error").inc()
+            raise HTTPException(status_code=499, detail="The client left.") from None
         except Exception:
             summaries_total.labels(mode=request.mode, outcome="error").inc()
             raise
         finally:
+            watcher.cancel()
             release()
         summaries_total.labels(mode=request.mode, outcome="ok").inc()
         count_answer(result.grounded.answer_status, result.grounded.truncated)
@@ -500,6 +514,7 @@ def register(app: FastAPI) -> None:
             usage=usage_response(grounded.usage, grounded.cost_usd),
             citation_backfilled=grounded.citation_backfilled,
             unsupported_claims=grounded.unsupported_claims,
+            unsupported_numbers=grounded.unsupported_numbers,
             prompt_cached=grounded.prompt_cached,
             prompt_cut=grounded.prompt_cut,
             chunks_read=result.chunks_read,

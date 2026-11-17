@@ -284,6 +284,7 @@ def _background_response(status: BackgroundImport) -> BackgroundImportResponse:
         skipped=status.skipped,
         failed=status.failed,
         problems=list(status.problems),
+        resumed=status.resumed,
     )
 
 

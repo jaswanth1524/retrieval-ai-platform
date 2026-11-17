@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import email.utils
 import hashlib
+import io
 import logging
 import re
 import threading
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 # Child sitemaps of a sitemap index read, at most.
 MAX_CHILD_SITEMAPS = 10
+# Entries read from one listing, at most: the sitemap protocol's own limit. Past it a
+# listing is out of spec, and 2 million short entries held as tuples cost ~400 MB.
+MAX_LISTED_ENTRIES = 50_000
 # A full indexing queue is waited out this many times, this long each, per page.
 _BACKLOG_RETRIES = 30
 _BACKLOG_WAIT_SECONDS = 10.0
@@ -112,56 +116,68 @@ def _parse_lastmod(text: str | None) -> float | None:
 
 def listed_entries(xml: bytes, base_url: str) -> tuple[list[tuple[str, float | None]], list[str]]:
     """``listed_urls`` with each page's last change as the listing gives it (sitemap
-    ``<lastmod>``, RSS ``<pubDate>``, Atom ``<updated>``; None without one)."""
+    ``<lastmod>``, RSS ``<pubDate>``, Atom ``<updated>``; None without one).
+
+    Read as a stream, each entry let go once it is read: a whole tree of a 50 MB
+    sitemap of short entries peaked near 1 GB."""
 
     if declares_dtd(xml):
         raise SitemapError("The sitemap declares a DTD or entities; it was not read.")
-    try:
-        root = ElementTree.fromstring(xml)
-    except (ElementTree.ParseError, RecursionError) as exc:
-        raise SitemapError("That URL is not a sitemap or feed (not XML).") from exc
-    kind = _local(root.tag)
     pages: list[str] = []
     changed: list[float | None] = []
     children: list[str] = []
+    kind: str | None = None
+    open_elements: list[ElementTree.Element] = []
 
     def text_of(entry: ElementTree.Element, name: str) -> str | None:
         found = next((child for child in entry if _local(child.tag) == name), None)
         return found.text if found is not None else None
 
-    if kind == "urlset":
-        for entry in root:
-            if _local(entry.tag) != "url":
-                continue
+    def read(entry: ElementTree.Element) -> bool:
+        """Take what ``entry`` lists; True when it was an entry (and can go)."""
+
+        name = _local(entry.tag)
+        if len(pages) + len(children) >= MAX_LISTED_ENTRIES:
+            return name in ("url", "sitemap", "item", "entry")
+        if kind == "urlset" and name == "url" and len(open_elements) == 1:
             pages.append((text_of(entry, "loc") or "").strip())
             changed.append(_parse_lastmod(text_of(entry, "lastmod")))
-    elif kind == "sitemapindex":
-        children = [
-            (loc.text or "").strip()
-            for entry in root
-            if _local(entry.tag) == "sitemap"
-            for loc in entry
-            if _local(loc.tag) == "loc"
-        ]
-    elif kind == "rss":
-        for item in root.iter():
-            if _local(item.tag) != "item":
-                continue
-            for link in item:
+        elif kind == "sitemapindex" and name == "sitemap" and len(open_elements) == 1:
+            children.extend((loc.text or "").strip() for loc in entry if _local(loc.tag) == "loc")
+        elif kind == "rss" and name == "item":
+            for link in entry:
                 if _local(link.tag) == "link":
                     pages.append((link.text or "").strip())
-                    changed.append(_parse_lastmod(text_of(item, "pubDate")))
-    elif kind == "feed":
-        for entry in root:
-            if _local(entry.tag) != "entry":
-                continue
+                    changed.append(_parse_lastmod(text_of(entry, "pubDate")))
+        elif kind == "feed" and name == "entry" and len(open_elements) == 1:
             links = [link for link in entry if _local(link.tag) == "link"]
             chosen = next((link for link in links if link.get("rel") in (None, "alternate")), None)
             if chosen is not None and chosen.get("href"):
                 pages.append(chosen.get("href", "").strip())
                 changed.append(_parse_lastmod(text_of(entry, "updated")))
-    else:
-        raise SitemapError("That URL is not a sitemap, sitemap index, RSS or Atom feed.")
+        else:
+            return False
+        return True
+
+    try:
+        for event, element in ElementTree.iterparse(io.BytesIO(xml), events=("start", "end")):
+            if event == "start":
+                if kind is None:
+                    kind = _local(element.tag)
+                    if kind not in ("urlset", "sitemapindex", "rss", "feed"):
+                        raise SitemapError(
+                            "That URL is not a sitemap, sitemap index, RSS or Atom feed."
+                        )
+                open_elements.append(element)
+                continue
+            open_elements.pop()
+            if read(element) and open_elements:
+                # The entry and the ones before it are read: let them go.
+                open_elements[-1].clear()
+    except ElementTree.ParseError as exc:
+        raise SitemapError("That URL is not a sitemap or feed (not XML).") from exc
+    if kind is None:
+        raise SitemapError("That URL is not a sitemap or feed (not XML).")
     return (
         [(urljoin(base_url, url), when) for url, when in zip(pages, changed, strict=True) if url],
         [urljoin(base_url, url) for url in children if url],
@@ -217,6 +233,11 @@ def read_sitemap(
             children = _robots_sitemaps(robots.content, robots.final_url)
             if not children:
                 raise
+    if same_host:
+        # As for pages: a sitemap index (or robots.txt) on one site naming sitemaps on
+        # others would have this server fetch whatever hosts it lists.
+        host = (urlsplit(listing.final_url).hostname or "").lower()
+        children = [c for c in children if (urlsplit(c).hostname or "").lower() == host]
     for child in children[:MAX_CHILD_SITEMAPS]:
         if len(entries) >= limit:
             break

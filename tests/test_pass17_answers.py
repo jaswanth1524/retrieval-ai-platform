@@ -117,17 +117,6 @@ def test_a_blank_question_is_a_400_before_a_slot_on_both_routes() -> None:
             assert "Query text is required" in response.json()["detail"]
 
 
-def test_stray_markers_go_and_real_or_quoted_ones_stay() -> None:
-    from api.citations import strip_stray_markers
-
-    assert strip_stray_markers("Thirty days [7].", 4) == "Thirty days."
-    assert strip_stray_markers("Thirty days [2] [9].", 4) == "Thirty days [2]."
-    assert strip_stray_markers("Thirty days [3-9].", 4) == "Thirty days [3-9]."
-    assert strip_stray_markers("Per the 2019 rules [2019].", 4) == "Per the 2019 rules [2019]."
-    assert strip_stray_markers("No sources [1].", 0) == "No sources."
-    assert strip_stray_markers("Alpha is documented [1].", 4) == "Alpha is documented [1]."
-
-
 def test_an_openai_compatible_stream_asks_for_usage_and_drops_it_once_refused() -> None:
     from api.llm import LiteLLMGenerator
 

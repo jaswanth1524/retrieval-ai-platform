@@ -103,12 +103,17 @@ class CachingGenerator:
     answered). ``answer_reused`` says whether a call was served from the cache, for the
     answer's ``prompt_cached`` flag."""
 
-    def __init__(self, inner: ChatGenerator, cache: PromptCache) -> None:
+    def __init__(self, inner: ChatGenerator, cache: PromptCache, *, lookup: bool = True) -> None:
         self.inner = inner
         self.cache = cache
+        # False for a Regenerate: nothing is reused, but the new reply replaces the one
+        # kept under its prompt (the reply the reader just turned down).
+        self.lookup = lookup
         self.answer_reused = False
 
     def cached_reply(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str | None:
+        if not self.lookup:
+            return None
         key = prompt_key(messages, settings)
         return self.cache.get(key) if key is not None else None
 

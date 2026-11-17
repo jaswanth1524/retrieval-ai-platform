@@ -33,6 +33,7 @@ from api.backoff import doubled_wait
 from api.document_ops import reindex_stale
 from api.jobs import JobStore
 from api.metrics import stale_documents
+from api.notify import notify
 from api.qdrant_schema import CollectionSchemaError
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository
@@ -129,6 +130,12 @@ class StaleReindexer(BackgroundLoop):
         )
         if error_type == "document":
             retry_at = None
+            notify(
+                "reindex_failed",
+                f"The scheduled re-index of '{queued.filename}' (workspace "
+                f"'{queued.workspace or 'default'}') failed on the file itself: {error}. "
+                "It stays indexed as it was until its original changes.",
+            )
             logger.warning(
                 "Not re-indexing %r (workspace %r) again until its original changes: %s",
                 queued.filename,

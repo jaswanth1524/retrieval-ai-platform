@@ -21,6 +21,7 @@ from api.embeddings import EmbeddingError
 from api.ingestion import (
     ClosedForWorkError,
     IngestionError,
+    filename_write_lock,
     ingest_sequencer,
 )
 from api.jobs import INTERRUPTED_JOB_ERROR, IngestBacklog, JobStore
@@ -31,6 +32,7 @@ from api.metrics import (
     ingest_job_seconds,
     ingest_jobs_total,
 )
+from api.original_details import record_details
 from api.parse_isolation import (
     ParseEnvironmentError,
     ParseInterruptedError,
@@ -292,6 +294,11 @@ def run_ingest_job(
         )
         return
 
+    if raw_store is not None:
+        # What a rebuild from the originals needs and the file doesn't carry. Under the
+        # lock a tag change takes, so neither overwrites the other's with older ones.
+        with filename_write_lock(key):
+            record_details(ingest_service.repository, ingest_service.settings, raw_store, filename)
     ingest_job_seconds.labels(outcome="done").observe(time.monotonic() - started)
     ingest_jobs_total.labels(outcome="done", error_type=NO_ERROR_TYPE).inc()
     if not outcome.unchanged:  # nothing was indexed

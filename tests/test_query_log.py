@@ -121,3 +121,36 @@ def test_only_an_answered_question_is_drawn_from_its_documents() -> None:
     assert logged_query(trace).filenames == ("a.txt",)
     # Declined over weak matches: it read a.txt but drew nothing from it.
     assert logged_query(replace(trace, status="insufficient_context")).filenames == ()
+
+
+def test_a_row_says_whether_its_documents_were_cited(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from api.query_log import logged_query
+    from api.tracing import QueryTrace, TraceCandidate
+
+    read = TraceCandidate("p", "a.txt", 1, "S", "c", 0.1, 0.02, True, None, True, False)
+    trace = QueryTrace(
+        trace_id="t",
+        created_at=1.0,
+        question="q",
+        mode="sync",
+        status="ok",
+        config=None,
+        candidates=[read, replace(read, filename="b.txt", chunk_id="d", cited=True)],
+        prompt_messages=None,
+        answer="A [2].",
+        cited_source_numbers=[2],
+        timings=None,
+        error=None,
+    )
+    cited = logged_query(trace)
+    assert cited.filenames == ("b.txt",) and cited.cited is True
+    # Citing none, its documents are the prompt's: not where the answer is, as such.
+    uncited = logged_query(replace(trace, candidates=[read]))
+    assert uncited.filenames == ("a.txt",) and uncited.cited is False
+
+    store = QueryLogStore(str(tmp_path / "log.db"), max_rows=10)
+    store.add(cited)
+    store.add(replace(uncited, created_at=2.0))
+    assert [row.cited for row in store.recent("", limit=10)] == [False, True]

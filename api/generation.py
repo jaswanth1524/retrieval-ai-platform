@@ -25,6 +25,7 @@ from api.citations import (
     retry_uncited_answer,
     source_citations,
     unsupported_claims,
+    unsupported_numbers,
     will_call_llm_for_citations,
     will_retry_citations,
 )
@@ -43,7 +44,7 @@ from api.llm import (
     redact_url,
     supports_reasoning,
 )
-from api.metrics import unsupported_claims_total
+from api.metrics import unsupported_claims_total, unsupported_numbers_total
 from api.prompting import (
     CONDENSE_SYSTEM_PROMPT,
     EXPANSION_SYSTEM_PROMPT,
@@ -188,6 +189,8 @@ class GroundedAnswer:
     # the sources (citations.backfill_citations), not by the model.
     citation_backfilled: bool = False
     unsupported_claims: int = 0
+    # Citing sentences stating a number none of their cited passages contains.
+    unsupported_numbers: int = 0
     # The reply came from the prompt cache (PROMPT_CACHE_SIZE): no LLM call was made.
     prompt_cached: bool = False
     # The provider read far less of the prompt than was sent: cut to fit its context
@@ -252,10 +255,14 @@ def finish_answer(
         context_chunks=context_chunks,
     )
     outcome = replace(
-        outcome, unsupported_claims=unsupported_claims(outcome.answer, context_chunks)
+        outcome,
+        unsupported_claims=unsupported_claims(outcome.answer, context_chunks),
+        unsupported_numbers=unsupported_numbers(outcome.answer, context_chunks),
     )
     if outcome.unsupported_claims:
         unsupported_claims_total.inc(outcome.unsupported_claims)
+    if outcome.unsupported_numbers:
+        unsupported_numbers_total.inc(outcome.unsupported_numbers)
     return outcome, attach_spans(outcome.answer, outcome.cited, context_chunks)
 
 
@@ -295,6 +302,7 @@ def generate_grounded_answer(
         citation_retry_used=outcome.retry_used,
         citation_backfilled=outcome.backfilled,
         unsupported_claims=outcome.unsupported_claims,
+        unsupported_numbers=outcome.unsupported_numbers,
         citation_retry_ms=outcome.retry_ms,
         prompt_messages=outcome.prompt_messages,
     )

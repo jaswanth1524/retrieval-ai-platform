@@ -68,6 +68,8 @@ def consistency_report(
     from api.routes.documents_read import duplicate_groups
 
     busy = indexing_now(settings)
+    # The index as it is now: a cached listing would hide a lost collection.
+    repository.forget_listing(settings)
     metadata = repository.filename_metadata(settings)
     indexed = set(metadata) - busy
     is_stale = staleness(settings, token_counter)
@@ -84,6 +86,21 @@ def consistency_report(
         duplicate_groups=duplicate_groups({name: metadata[name] for name in indexed}),
         in_flight=sorted(busy),
     )
+
+
+class LostIndexError(Exception):
+    """Most originals have no document: an index that was lost (a wiped Qdrant volume, a
+    collection rebuilt for another embedding setup), not leftovers. Deleting them would
+    remove the only copies — and the only way to rebuild it."""
+
+
+# "Most": more than half of the stored originals, and at least this many.
+LOST_INDEX_MIN_ORPHANS = 5
+
+
+def looks_like_a_lost_index(report: ConsistencyReport, stored: int) -> bool:
+    orphans = len(report.originals_without_document)
+    return orphans >= LOST_INDEX_MIN_ORPHANS and orphans * 2 > stored
 
 
 @dataclass(frozen=True)
@@ -106,6 +123,7 @@ def repair(
     delete_orphan_originals: bool = False,
     delete_orphan_versions: bool = False,
     reindex_incomplete: bool = False,
+    delete_despite_lost_index: bool = False,
 ) -> RepairOutcome:
     """Apply the asked-for remedies to what ``consistency_report`` finds now. An
     original (or a folder of versions) is deleted only when, under its document's
@@ -114,6 +132,18 @@ def repair(
 
     report = consistency_report(repository, settings, raw_store, token_counter)
     outcome = RepairOutcome()
+    if (
+        delete_orphan_originals
+        and raw_store is not None
+        and not delete_despite_lost_index
+        and looks_like_a_lost_index(report, len(raw_store.stored_names()))
+    ):
+        raise LostIndexError(
+            f"{len(report.originals_without_document)} of the stored originals have no "
+            "document: the index looks lost, not these files left over. They are the "
+            "only copies; index them again (POST /admin/rebuild, `docrag rebuild`) "
+            "instead of deleting them."
+        )
     if raw_store is not None:
         targets: list[tuple[str, list[str]]] = []
         if delete_orphan_originals:

@@ -11,7 +11,7 @@ from api.documents import (
     DocumentError,
     DocumentNotFoundError,
     UnsupportedDocumentError,
-    normalize_filename,
+    normalize_document_name,
 )
 from api.ingestion import (
     ingest_sequencer,
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 def stored_filename(filename: str) -> str:
     """``filename`` as a path parameter naming a stored document, or a 404.
 
-    Every stored name went through ``normalize_filename`` at upload, so a name it would
+    Every stored name went through ``normalize_document_name`` at upload, so a name it would
     change (padding spaces, a backslash path, control characters) was never stored. The
     raw-document store normalizes on its own, so passing such a name through let
     ``DELETE /documents/%20a.pdf`` remove ``a.pdf``'s original while holding a lock on,
@@ -34,7 +34,7 @@ def stored_filename(filename: str) -> str:
     """
 
     try:
-        name = normalize_filename(filename)
+        name = normalize_document_name(filename)
     except UnsupportedDocumentError:
         name = ""
     if name != filename:
@@ -62,7 +62,16 @@ def refuse_near_duplicate_name(filename: str, existing: Iterable[str]) -> None:
 
     folded = _folded(filename)
     for other in existing:
-        if other != filename and _folded(other) == folded:
+        # A name with folders kept on disk under them: "a.txt" (a file) and
+        # "a.txt/b.txt" (inside a folder of that name) can't both be stored, nor can
+        # their earlier versions.
+        other_folded = _folded(other)
+        if other_folded.startswith(folded + "/") or folded.startswith(other_folded + "/"):
+            raise FilenameConflictError(
+                f"'{filename}' and the existing document '{other}' would need the same "
+                "name for a file and a folder in the stored originals. Rename one of them."
+            )
+        if other != filename and other_folded == folded:
             raise FilenameConflictError(
                 f"'{filename}' differs from the existing document '{other}' only by "
                 "letter case or accents, and their stored originals would overwrite each "

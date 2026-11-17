@@ -36,6 +36,16 @@ CODE_EXTENSIONS = frozenset(
         ".yaml",
         ".yml",
         ".toml",
+        ".ini",
+        ".conf",
+        ".cfg",
+        ".log",
+        ".css",
+        ".php",
+        ".cs",
+        ".kt",
+        ".swift",
+        ".lua",
     }
 )
 
@@ -85,6 +95,66 @@ def parse_json_document(filename: str, text: str) -> list[DocumentSection]:
     if not sections:
         raise EmptyDocumentError(f"JSON document '{filename}' has no values to index.")
     return sections
+
+
+# Records past this are refused, not truncated: a JSONL file is usually a whole export.
+_MAX_JSONL_RECORDS = 100_000
+
+
+def parse_jsonl_document(filename: str, text: str) -> list[DocumentSection]:
+    """JSON Lines: one section per record, written out as ``parse_json_document``
+    writes a list's items (``Record 3 › key: value``)."""
+
+    records: list[Any] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        if len(records) >= _MAX_JSONL_RECORDS:
+            raise DocumentParseError(
+                f"'{filename}' has more than {_MAX_JSONL_RECORDS} records; split it."
+            )
+        try:
+            records.append(json.loads(line))
+        except (ValueError, RecursionError) as exc:
+            raise DocumentParseError(f"'{filename}' line {number} is not valid JSON.") from exc
+    sections: list[DocumentSection] = []
+    for number, record in enumerate(records, start=1):
+        label = f"Record {number}"
+        body = "\n".join(
+            " ".join(line.split()) for line in _lines(record, label, 0) if line.strip()
+        )
+        if body:
+            sections.append(
+                DocumentSection(
+                    filename=filename,
+                    page=1,
+                    section=label,
+                    text=body,
+                    boundary="semantic",
+                    line_units=True,
+                )
+            )
+    if not sections:
+        raise EmptyDocumentError(f"JSON Lines document '{filename}' has no records to index.")
+    return sections
+
+
+def parse_xml_document(filename: str, content: bytes, text: str) -> list[DocumentSection]:
+    """XML read for its text: every element's text on its own line, the markup gone.
+    A DTD or entity declaration is refused (billion laughs, external entities)."""
+
+    from bs4 import BeautifulSoup
+
+    from api.parsers.common import declares_dtd
+
+    if declares_dtd(content):
+        raise DocumentParseError(f"'{filename}' declares a DTD or entities; it is not read.")
+    soup = BeautifulSoup(text, "html.parser")
+    lines = [" ".join(piece.split()) for piece in soup.get_text("\n").splitlines()]
+    body = "\n\n".join(line for line in lines if line)
+    if not body:
+        raise EmptyDocumentError(f"XML document '{filename}' has no text to index.")
+    return parse_plain_text_document(filename, body)
 
 
 def _scalar(value: Any) -> str:

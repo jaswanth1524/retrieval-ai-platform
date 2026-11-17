@@ -822,5 +822,35 @@
    "section": "Guide",
    "text_sha1": "0f2d767493715574"
   }
+ ],
+ "rates.tsv": [
+  {
+   "chunk_id": "3fa78b78dd69a5e99bb8",
+   "page": 1,
+   "section": "Rows 2-3",
+   "text_sha1": "44461f2bf9f80d8c"
+  }
+ ],
+ "tickets.jsonl": [
+  {
+   "chunk_id": "93109711aaf41d2d4586",
+   "page": 1,
+   "section": "Record 1",
+   "text_sha1": "93912f8fe20a717e"
+  },
+  {
+   "chunk_id": "8e90d41782db269bb4a0",
+   "page": 1,
+   "section": "Record 1",
+   "text_sha1": "b82d6206f2cbcc67"
+  }
+ ],
+ "feed.xml": [
+  {
+   "chunk_id": "524d42a5acb968ddd5f8",
+   "page": 1,
+   "section": "Travel",
+   "text_sha1": "7f50248c020ab167"
+  }
  ]
 }
