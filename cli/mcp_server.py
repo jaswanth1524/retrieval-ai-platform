@@ -25,8 +25,8 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Callable
-from typing import Any, Literal
+from collections.abc import Awaitable, Callable
+from typing import Any, Literal, Protocol
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -198,6 +198,29 @@ def build_server(
     ``allow_writes`` adds the tools that add to the corpus (see the module docstring)."""
 
     server: MCPServer = MCPServer(name="docrag", instructions=INSTRUCTIONS)
+    call = _make_call(client_factory)
+    _add_read_tools(server, call)
+    if allow_writes:
+        _add_write_tools(server, call)
+    return server
+
+
+Call = Callable[..., Any]
+
+
+class ToolCall(Protocol):
+    """``call(work, workspace=None)``: runs ``work(client, should_stop)`` off the event
+    loop and returns its text (``_make_call``)."""
+
+    def __call__(
+        self,
+        work: Callable[[DocragClient, Callable[[], bool]], str],
+        workspace: str | None = None,
+    ) -> Awaitable[str]: ...
+
+
+def _make_call(client_factory: Callable[[], DocragClient]) -> ToolCall:
+    """The coroutine every tool runs its REST work through (see ``call``)."""
 
     async def call(
         work: Callable[[DocragClient, Callable[[], bool]], str], workspace: str | None = None
@@ -237,6 +260,12 @@ def build_server(
         except asyncio.CancelledError:
             cancelled.set()
             raise
+
+    return call
+
+
+def _add_read_tools(server: MCPServer, call: ToolCall) -> None:
+    """The tools that only read: registered on every server, before any write tool."""
 
     @server.tool(annotations=_READ_ONLY)
     async def list_documents(workspace: str | None = None) -> str:
@@ -491,13 +520,6 @@ def build_server(
 
         result: str = await call(work, workspace)
         return result
-
-    if allow_writes:
-        _add_write_tools(server, call)
-    return server
-
-
-Call = Callable[..., Any]
 
 
 def _add_write_tools(server: MCPServer, call: Call) -> None:

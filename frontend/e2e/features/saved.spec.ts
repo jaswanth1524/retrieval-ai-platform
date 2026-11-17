@@ -1,16 +1,44 @@
+// Saved answers, quotes and the passage basket.
+import { readFileSync } from 'node:fs';
 import { answerStream, expect, test } from '../fixtures';
+import { open, ask, askWithButton } from '../helpers';
 
-async function open(page: import('@playwright/test').Page) {
+test('a saved answer survives a reload and is listed under Saved', async ({ page, api }) => {
+  api.documents = ['guide.md', 'notes.md'];
+  api.stream = answerStream();
   await page.goto('/');
-  await expect(page.getByTestId('question-textarea')).toBeEnabled();
-}
+  await askWithButton(page, 'What is DocRAG?');
+  await page.getByTestId('chat-message-save').click();
+  await expect(page.getByTestId('chat-message-save')).toHaveText('★ Saved');
 
-async function ask(page: import('@playwright/test').Page, question = 'What retrieval strategy does DocRAG use?') {
-  const box = page.getByTestId('question-textarea');
-  await box.fill(question);
-  await box.press('Enter');
-  await expect(page.getByTestId('question-submit')).toHaveText('Ask');
-}
+  await page.reload();
+  await expect(page.getByTestId('chat-message-save')).toHaveText('★ Saved');
+  await page.getByTestId('rail-chat').click();
+  await page.getByTestId('conversation-filter-saved').click();
+  await expect(page.getByTestId('conversation-item')).toHaveCount(1);
+  await expect(page.getByTestId('conversation-saved-count')).toContainText('1');
+});
+
+test('a saved answer is listed under Saved answers, opened and exported', async ({ page, api }) => {
+  api.documents = ['guide.md', 'notes.md'];
+  api.stream = answerStream('DocRAG uses hybrid retrieval [1].');
+  await open(page);
+  await ask(page, 'What retrieval strategy does DocRAG use?');
+  await page.getByTestId('chat-message-save').click();
+
+  await page.getByTestId('rail-saved').click();
+  await expect(page.getByTestId('saved-row')).toContainText('What retrieval strategy does DocRAG use?');
+  const download = page.waitForEvent('download');
+  await page.getByTestId('context-panel-action').click();
+  const file = await download;
+  expect(file.suggestedFilename()).toBe('docrag-saved-answers.md');
+  const markdown = readFileSync((await file.path())!, 'utf8');
+  expect(markdown).toContain('## What retrieval strategy does DocRAG use?');
+  expect(markdown).toContain('DocRAG uses hybrid retrieval [1].');
+
+  await page.getByTestId('saved-unsave').click();
+  await expect(page.getByTestId('saved-row')).toHaveCount(0);
+});
 
 test('passages collected in the basket are asked about together', async ({ page, api }) => {
   api.stream = answerStream('DocRAG fuses both searches [1].');
@@ -55,30 +83,4 @@ test('a selection in an answer is saved as a quote, and an answer’s sources go
   await expect(page.getByTestId('basket-question')).toBeFocused();
   await expect(page.getByTestId('quote-row')).toHaveCount(1);
   await expect(page.getByTestId('quote-row')).toContainText('DocRAG uses hybrid retrieval');
-});
-
-test('Administration starts a rebuild and reads the audit log', async ({ page, api }) => {
-  api.auditEntries = [
-    { created_at: Date.now() / 1000, workspace: 'default', event: 'document.delete', key: 'full', fields: { filename: 'old.pdf' } },
-  ];
-  await open(page);
-  await page.getByTestId('open-settings').click();
-  await page.getByTestId('settings-admin-toggle').locator('summary').click();
-  await page.getByTestId('rebuild-run').click();
-  await page.getByRole('button', { name: 'Rebuild', exact: true }).click();
-  await expect(page.getByTestId('rebuild-result')).toContainText('Indexing 2 documents');
-  expect(api.rebuilds).toBe(1);
-  await page.getByTestId('audit-load').click();
-  await expect(page.getByTestId('audit-entry')).toContainText('document.delete (full) filename=old.pdf');
-  await page.getByTestId('notify-test-run').click();
-  await expect(page.getByTestId('notify-test-result')).toContainText('Notifications are off');
-});
-
-test('a follow-up says what it was searched as', async ({ page, api }) => {
-  api.stream = answerStream('Twenty-eight days [1].', { retrieval_query: 'How many vacation days do staff get?' });
-  await open(page);
-  await ask(page, 'And for full-time staff?');
-  await expect(page.getByTestId('chat-message-searched-as')).toContainText(
-    'Searched as: How many vacation days do staff get?',
-  );
 });

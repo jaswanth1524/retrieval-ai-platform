@@ -90,5 +90,14 @@ export default defineConfig({
     globals: true,
     // Playwright specs (npm run e2e) — a different runner.
     exclude: [...configDefaults.exclude, 'e2e/**'],
+    // `npm run test:coverage` (CI and `make check`). The floors sit a little under what
+    // the suite measured when they were set, so a change that drops tests is noticed.
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.d.ts', 'src/main.tsx'],
+      reporter: ['text-summary'],
+      thresholds: { statements: 86, branches: 84, functions: 75, lines: 86 },
+    },
   },
 });

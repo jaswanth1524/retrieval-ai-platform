@@ -1,0 +1,139 @@
+"""Continuing an answer cut off at the output limit (``POST /questions/continue`` and
+``AUTO_CONTINUE_MAX``), moved out of ``api/pipeline.py``; it re-exports these names.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from api.generation import (
+    ChatMessage,
+)
+from api.reranking import (
+    RerankedChunk,
+)
+from api.settings import AppSettings
+from api.tracing import (
+    QueryTrace,
+)
+
+CONTINUE_INSTRUCTION = (
+    "Your answer above was cut off before it finished. Continue it from exactly where it "
+    "stopped: do not repeat anything already written, and keep citing the sources by "
+    "their [n] numbers."
+)
+
+
+class ContinueRefused(Exception):
+    """A cut-off answer that can't be continued, with the HTTP status that says why."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class ContinuePlan:
+    trace: QueryTrace
+    chunks: list[RerankedChunk]
+
+
+# Providers whose chat API continues a trailing assistant message (prefill) — measured
+# on Ollama (qwen2.5); Anthropic documents it. Asked in words instead ("continue where
+# you stopped"), qwen2.5 started its answer over every time. Hosted OpenAI ignores a
+# trailing assistant message, so it is asked in words.
+_PREFILL_PROVIDERS = frozenset({"ollama", "anthropic", "openai_compatible"})
+
+
+def continuation_messages(
+    base: Sequence[ChatMessage], answer_so_far: str, settings: AppSettings
+) -> list[ChatMessage]:
+    """The prompt that asks for the rest of ``answer_so_far``: the answer as a trailing
+    assistant message to continue, or, where the provider can't, followed by a request
+    to go on."""
+
+    if settings.llm_provider.lower().strip() in _PREFILL_PROVIDERS:
+        # Anthropic refuses a prefill ending in whitespace; the join puts it back.
+        return [*base, {"role": "assistant", "content": answer_so_far.rstrip()}]
+    return [
+        *base,
+        {"role": "assistant", "content": answer_so_far},
+        {"role": "user", "content": CONTINUE_INSTRUCTION},
+    ]
+
+
+def base_prompt(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
+    """A trace's prompt without what a Continue added (the answer so far, the request to
+    go on), so continuing again starts from the original prompt, not a nested one."""
+
+    trimmed = list(messages)
+    if trimmed and trimmed[-1]["role"] == "user" and trimmed[-1]["content"] == CONTINUE_INSTRUCTION:
+        trimmed = trimmed[:-1]
+    if trimmed and trimmed[-1]["role"] == "assistant":
+        trimmed = trimmed[:-1]
+    return trimmed
+
+
+def drop_restart(before: str, after: str) -> str:
+    """``after`` without a restart: a model asked to continue that writes the answer
+    again from the top has the part it repeats removed (the rest is the new text), and
+    one that starts again a few words back has those words removed."""
+
+    head = after.lstrip()
+    probe = before.lstrip()[:40]
+    if len(probe) < 20 or not head.startswith(probe):
+        return _drop_repeated_tail(before, after)
+    original = before.lstrip()
+    shared = 0
+    while shared < min(len(original), len(head)) and original[shared] == head[shared]:
+        shared += 1
+    return head[shared:]
+
+
+# How far back a continuation is looked at for words it repeats: a whole list item.
+_REPEAT_MAX_CHARS = 400
+
+
+def _drop_repeated_tail(before: str, after: str) -> str:
+    """``after`` without what it repeats from the end of ``before``. Measured on
+    gpt-5-mini continuing by instruction (AUTO_CONTINUE_MAX): "… It also" went on "It
+    also states …", "… expense policies (" on "policies (no …", a cut list item was
+    written again from its "- ", a lone "- " was followed by "- Review …", and "…
+    within" by "within two days". The repeat must start where a word starts and be two
+    words or more, a whole line, or one word of four letters or more — so "… of the"
+    followed by "the policy" keeps its "the"."""
+
+    head = after.lstrip()
+    end = before.rstrip()
+    for size in range(min(len(end), _REPEAT_MAX_CHARS), 0, -1):
+        tail = end[-size:]
+        if tail[:1].isspace() or (size < len(end) and not end[-size - 1].isspace()):
+            continue  # not where a word starts
+        whole_line = size == len(end) or end[-size - 1] == "\n"
+        words = tail.split()
+        if not (len(words) >= 2 or whole_line or (len(tail) >= 4 and tail.isalpha())):
+            continue
+        if head.startswith(tail):
+            rest = head[len(tail) :]
+            # The cut text keeps its own trailing space ("- "): not a second one.
+            return rest.lstrip() if before[-1:].isspace() else rest
+    return after
+
+
+def join_continuation(before: str, after: str, *, prefilled: bool = False) -> str:
+    """A cut-off answer and its continuation as one text. Continuing a prefill, the
+    model writes its own leading space where a word ends (" can be", or "2]" inside a
+    marker): the two are joined as they are. Asked in words, a space goes between them
+    unless either side already has one, the continuation starts with punctuation, or the
+    cut came just after an opening bracket or quote."""
+
+    if not after:
+        return before
+    if prefilled:
+        return before.rstrip() + after
+    if before[-1:].isspace() or after[:1].isspace() or after[:1] in ".,;:!?)]}'\"":
+        return before + after
+    if before[-1:] in "([{\u201c\u2018":  # cut just after an opening bracket or quote
+        return before + after
+    return f"{before} {after}"

@@ -22,7 +22,7 @@ from api.repository import IndexSize
 from api.settings import AppSettings
 from api.storage import enabled_store_directories
 
-# What the models hold resident, measured (CLAUDE.md: the int8 reranker peaks around
+# What the models hold resident, measured (docs/history/PASSES.md: the int8 reranker peaks around
 # 1.4 GB, fp32 2.7 GB; the embedders add ~0.5 GB).
 _MODELS_BYTES_INT8 = 2 * 1024**3
 _MODELS_BYTES_FP32 = 3_300 * 1024**2

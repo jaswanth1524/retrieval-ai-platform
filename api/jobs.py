@@ -28,7 +28,7 @@ from threading import Lock
 from typing import Any, Literal, Protocol
 
 from api.metrics import ingest_backlog_bytes, ingest_backlog_jobs, ingest_jobs_evicted_total
-from api.sqlite_store import enable_wal, sqlite_transaction
+from api.sqlite_store import add_missing_columns, enable_wal, sqlite_transaction
 
 JobState = Literal["queued", "parsing", "embedding", "done", "failed"]
 
@@ -351,6 +351,19 @@ def _row_to_job(row: tuple[Any, ...]) -> IngestJob:
     )
 
 
+# Columns added after the table was first released, with their declarations: an older
+# file gains them on open. Its jobs were all the default workspace's, and its rows read
+# as uploads — the one kind a retry never re-runs by itself.
+_ADDED_COLUMNS = (
+    ("workspace", "TEXT NOT NULL DEFAULT ''"),
+    ("error_type", "TEXT"),
+    ("kind", "TEXT NOT NULL DEFAULT 'upload'"),
+    ("source_url", "TEXT"),
+    ("tags_json", "TEXT"),
+    ("refresh_minutes", "INTEGER"),
+)
+
+
 class SqliteIngestJobStore:
     """Sqlite-backed job store — same public surface as ``IngestJobStore``, but
     persists across process restarts. Selected via
@@ -385,21 +398,7 @@ class SqliteIngestJobStore:
                 )
                 """
             )
-            # A file from before workspaces: its jobs were all the default workspace's.
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-            if "workspace" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
-            if "error_type" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN error_type TEXT")
-            # Older rows read as uploads: the one kind a retry never re-runs by itself.
-            if "kind" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'upload'")
-            if "source_url" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
-            if "tags_json" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN tags_json TEXT")
-            if "refresh_minutes" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN refresh_minutes INTEGER")
+            add_missing_columns(conn, "jobs", _ADDED_COLUMNS)
             # Only this process runs jobs (one uvicorn worker), so anything still
             # non-terminal at startup belonged to a process that died mid-ingest. Left
             # as-is, a client polling it would wait forever.

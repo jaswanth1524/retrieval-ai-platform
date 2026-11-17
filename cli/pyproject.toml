@@ -10,7 +10,7 @@
 # Inside the repository, `python -m cli` and `python -m cli.mcp_server` work as before.
 [project]
 name = "docrag-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Command line and MCP server for a DocRAG server."
 requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
@@ -33,16 +33,31 @@ build-backend = "hatchling.build"
 
 # This directory is the `cli` package itself: ship its modules under that name.
 [tool.hatch.build.targets.wheel]
-only-include = ["__init__.py", "__main__.py", "client.py", "completion.py", "config.py", "mcp_server.py"]
+only-include = [
+  "__init__.py",
+  "__main__.py",
+  "admin_commands.py",
+  "client.py",
+  "common.py",
+  "completion.py",
+  "config.py",
+  "document_commands.py",
+  "mcp_server.py",
+  "question_commands.py",
+]
 sources = { "" = "cli" }
 
 [tool.hatch.build.targets.sdist]
 only-include = [
   "__init__.py",
   "__main__.py",
+  "admin_commands.py",
   "client.py",
+  "common.py",
   "completion.py",
   "config.py",
+  "document_commands.py",
   "mcp_server.py",
   "pyproject.toml",
+  "question_commands.py",
 ]

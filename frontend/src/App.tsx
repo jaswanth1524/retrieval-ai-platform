@@ -29,29 +29,19 @@ import SearchPanel, { type SearchRequestFromElsewhere } from './components/Searc
 import TracesPanel from './components/TracesPanel';
 import SavedPanel from './components/SavedPanel';
 import CollectedPanel from './components/CollectedPanel';
-import {
-  BASKET_STORAGE_KEY,
-  QUOTES_STORAGE_KEY,
-  addToBasket,
-  clearBasket,
-  quotesToMarkdown,
-  readBasket,
-  readQuotes,
-  removeFromBasket,
-  removeQuote,
-  saveQuote,
-  type BasketPassage,
-} from './utils/collected';
+import { clearBasket, quotesToMarkdown, removeFromBasket, removeQuote } from './utils/collected';
 import { downloadFile } from './utils/exportChat';
-import { newId } from './utils/id';
 import { recallReading } from './utils/readingMemory';
-import type { SelectedQuote } from './components/SelectionActions';
 import ReviewPanel from './components/ReviewPanel';
 import FeedbackPanel from './components/FeedbackPanel';
 import UnansweredPanel from './components/UnansweredPanel';
 import { MAX_CONVERSATIONS, MAX_PINNED_CONVERSATIONS } from './hooks/chatPersistence';
 import { useChat, type SavedAnswer } from './hooks/useChat';
 import { useScopePresets } from './hooks/useScopePresets';
+import { useCollected } from './hooks/useCollected';
+import { useLinks, type SourceView } from './hooks/useLinks';
+import { useConversationNavigation } from './hooks/useConversationNavigation';
+import { useReviewQueue } from './hooks/useReviewQueue';
 import { useStableHandler } from './hooks/useStableHandler';
 import { useCommands } from './hooks/useCommands';
 import { useServerHealth } from './hooks/useServerHealth';
@@ -82,14 +72,7 @@ import { useWindowFileDrop } from './hooks/useWindowFileDrop';
 import { NOTIFY_STORAGE_KEY, useBackgroundNotice } from './hooks/useBackgroundNotice';
 import { sourceChange } from './utils/citationFreshness';
 import { copyText } from './utils/clipboard';
-import { unreviewedCount } from './utils/review';
-import {
-  deepLinkUrl,
-  parseDeepLink,
-  parsePassageLink,
-  passageLinkUrl,
-  usageTotal,
-} from './utils/deepLink';
+import { usageTotal } from './utils/deepLink';
 import { formatCost } from './utils/cost';
 import { withCitationFootnotes } from './utils/exportChat';
 import { folderPickNote, pickFolderFiles } from './utils/folderFiles';
@@ -138,18 +121,6 @@ function App() {
   const [mode, setModeState] = useState<ChatMode>(loadPersistedMode);
   const [rail, setRail] = useState<RailPanel>('chat');
   const [searchOpened, setSearchOpened] = useState(false);
-  // Quotes and the passage basket, kept in this browser (utils/collected.ts) and
-  // followed across tabs.
-  const [quotes, setQuotes] = useState(readQuotes);
-  const [basket, setBasket] = useState(readBasket);
-  useEffect(() => {
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === QUOTES_STORAGE_KEY) setQuotes(readQuotes());
-      if (event.key === BASKET_STORAGE_KEY) setBasket(readBasket());
-    };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
-  }, []);
   if (rail === 'search' && !searchOpened) setSearchOpened(true);
   // Kept once opened, like Search: files staged for upload, a selection and the filter
   // were lost on every switch to another panel and back.
@@ -168,6 +139,9 @@ function App() {
     hold: holdToast,
     release: releaseToast,
   } = useToasts();
+  // Quotes and the passage basket, kept in this browser and followed across tabs.
+  const { quotes, setQuotes, basket, setBasket, keepQuote, collectPassages } =
+    useCollected(pushToast);
   const [notifyOnAnswer, setNotifyOnAnswer] = useState(
     () => readStored(NOTIFY_STORAGE_KEY) === 'true',
   );
@@ -194,13 +168,7 @@ function App() {
   // Source document viewer: which document/chunk a clicked citation opens (null = closed).
   // chunkId null: opened from the corpus panel's Read, at the document's first passage.
   // highlights: the passages a citation rests on, marked in the cited chunk.
-  const [sourceView, setSourceView] = useState<{
-    filename: string;
-    chunkId: string | null;
-    highlights?: string[];
-    /** ``chunkId`` is where the reader left off (Read), not a cited passage. */
-    resume?: boolean;
-  } | null>(null);
+  const [sourceView, setSourceView] = useState<SourceView | null>(null);
   const corpusBrowseInputRef = useRef<HTMLInputElement>(null);
   const {
     turns,
@@ -532,75 +500,18 @@ function App() {
     },
     [switchConversation],
   );
-  // Links back to a conversation or an answer (#c=…&t=…): opened on load and whenever
-  // the hash changes. They work in this browser only — conversations live in its
-  // storage — so one from elsewhere says so instead of doing nothing.
-  const conversationIdsRef = useRef<Set<string>>(new Set());
-  conversationIdsRef.current = new Set(conversations.map((conversation) => conversation.id));
-  useEffect(() => {
-    if (!historyReady) return;
-    const open = () => {
-      // A document or passage on this server (#d=…&k=…): opened in the viewer.
-      const passage = parsePassageLink(window.location.hash);
-      if (passage) {
-        window.history.replaceState(null, '', window.location.pathname + window.location.search);
-        if ((passage.workspace ?? '') !== (getWorkspace() ?? '')) {
-          chooseWorkspaceRef.current(passage.workspace ?? '');
-        }
-        setSourceView({ filename: passage.filename, chunkId: passage.chunkId ?? null });
-        setPanelDrawerOpen(false);
-        return;
-      }
-      const link = parseDeepLink(window.location.hash);
-      if (!link) return;
-      // Taken off the address once read: reloading shouldn't jump back to it.
-      window.history.replaceState(null, '', window.location.pathname + window.location.search);
-      if (!conversationIdsRef.current.has(link.conversationId)) {
-        pushToast({
-          tone: 'warn',
-          title: 'That conversation isn’t in this browser',
-          body: 'Links open conversations saved here; it may have been deleted.',
-        });
-        return;
-      }
-      switchConversationFromList(link.conversationId, link.turnId);
-    };
-    open();
-    window.addEventListener('hashchange', open);
-    return () => window.removeEventListener('hashchange', open);
-  }, [historyReady, pushToast, switchConversationFromList]);
-  const copyPassageLink = useCallback(() => {
-    if (!sourceView) return;
-    const url = passageLinkUrl(
-      {
-        filename: sourceView.filename,
-        ...(sourceView.chunkId ? { chunkId: sourceView.chunkId } : {}),
-        ...(workspace ? { workspace } : {}),
-      },
-      window.location,
-    );
-    void copyText(url).then((ok) =>
-      pushToast(
-        ok
-          ? { tone: 'good', title: 'Link copied', body: 'It opens this passage for anyone with access to this server.' }
-          : { tone: 'warn', title: 'Could not copy the link', body: url },
-      ),
-    );
-  }, [sourceView, workspace, pushToast]);
-  const copyLink = useCallback(
-    (turnId?: string) => {
-      if (!activeConversationId) return;
-      const url = deepLinkUrl({ conversationId: activeConversationId, turnId }, window.location);
-      void copyText(url).then((ok) =>
-        pushToast(
-          ok
-            ? { tone: 'good', title: 'Link copied', body: 'It opens this conversation in this browser.' }
-            : { tone: 'warn', title: 'Could not copy the link', body: url },
-        ),
-      );
-    },
-    [activeConversationId, pushToast],
-  );
+  const { copyPassageLink, copyLink } = useLinks({
+    historyReady,
+    conversations,
+    activeConversationId,
+    workspace,
+    sourceView,
+    setSourceView,
+    setPanelDrawerOpen,
+    chooseWorkspaceRef,
+    switchConversationFromList,
+    pushToast,
+  });
   const usage = usageTotal(turns);
   const usageLabel = usage
     ? `${usage.tokens.toLocaleString()} tokens${usage.costUsd !== undefined ? ` · ${formatCost(usage.costUsd)}` : ''}`
@@ -1003,68 +914,15 @@ function App() {
     // markers dangled), and on plain HTTP too.
     void copyText(withCitationFootnotes(answer.content, answer.sources)).then(done);
   });
-  // The conversation list's order (pinned first, its filters and search applied) while
-  // it is shown: ] and [ walk what the reader sees. Else pinned first, by recent use.
-  const listedOrderRef = useRef<string[] | null>(null);
-  const noteListedOrder = useCallback((ids: string[]) => {
-    listedOrderRef.current = ids;
-  }, []);
-  useEffect(() => {
-    if (rail !== 'chat') listedOrderRef.current = null;
-  }, [rail]);
-  const cycleConversation = useStableHandler((step: 1 | -1) => {
-    const order =
-      listedOrderRef.current ??
-      [
-        ...conversations.filter((conversation) => conversation.pinned),
-        ...conversations.filter((conversation) => !conversation.pinned),
-      ].map((conversation) => conversation.id);
-    if (order.length < 2) return;
-    const index = order.indexOf(activeConversationId ?? '');
-    // Not among those listed (filtered out): the first (or last) one.
-    const nextIndex = index < 0 ? (step === 1 ? 0 : order.length - 1) : (index + step + order.length) % order.length;
-    const next = order[nextIndex];
-    if (next && next !== activeConversationId) switchConversation(next);
-  });
-  // 1-9: that source of the answer that has focus (j/k move it), else of the latest.
-  const openAnswerSource = useStableHandler((number: number) => {
-    const answers = turns.filter((turn) => turn.role === 'assistant' && turn.content);
-    const focusedId = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>(
-      '[role="article"][data-role="assistant"]',
-    )?.dataset.turnId;
-    const answer = answers.find((turn) => turn.id === focusedId) ?? answers[answers.length - 1];
-    const source = answer?.sources.find((candidate) => candidate.source_number === number);
-    if (!source) return;
-    handleOpenSource(
-      source.filename,
-      source.chunk_id,
-      source.spans?.length ? source.spans.map((span) => span.quote) : undefined,
-    );
-  });
-  const moveBetweenAnswers = useStableHandler((step: 1 | -1) => {
-    const answers = [
-      ...document.querySelectorAll<HTMLElement>('[role="article"][data-role="assistant"]'),
-    ];
-    if (answers.length === 0) return;
-    const current = answers.findIndex((answer) => answer.contains(document.activeElement));
-    let target: HTMLElement | undefined;
-    if (current >= 0) {
-      target = answers[current + step];
-    } else {
-      // Nothing focused yet: the first answer in view (j) or the last (k).
-      const inView = answers.filter((answer) => {
-        const box = answer.getBoundingClientRect();
-        return box.bottom > 0 && box.top < window.innerHeight;
-      });
-      const pool = inView.length > 0 ? inView : answers;
-      target = step === 1 ? pool[0] : pool[pool.length - 1];
-    }
-    if (!target) return;
-    target.focus({ preventScroll: true });
-    // The CSS reduced-motion rule doesn't reach a scripted smooth scroll.
-    const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
-    target.scrollIntoView({ block: 'start', behavior: still ? 'auto' : 'smooth' });
-  });
+  const { noteListedOrder, cycleConversation, openAnswerSource, moveBetweenAnswers } =
+    useConversationNavigation({
+      rail,
+      conversations,
+      activeConversationId,
+      switchConversation,
+      turns,
+      handleOpenSource,
+    });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const unsaveAnswer = useCallback(
     (conversationId: string, turnId: string) => setTurnSaved(turnId, false, conversationId),
@@ -1104,23 +962,6 @@ function App() {
     (name: string) => saveScopePreset(name, scope),
     [saveScopePreset, scope],
   );
-  // The "Needs review" panel: this workspace's answers, walked only while it is open
-  // (conversations change on every streamed frame).
-  // Marking an answer reviewed changes a turn, not the conversation summaries: counted
-  // here so the list (and the rail's count) are read again.
-  const [reviewTick, setReviewTick] = useState(0);
-  const markReviewed = useCallback(
-    (conversationId: string, turnId: string, reviewed: boolean) => {
-      setTurnReviewed(conversationId, turnId, reviewed);
-      setReviewTick((tick) => tick + 1);
-    },
-    [setTurnReviewed],
-  );
-  const reviewAnswers = useMemo(
-    () => (rail === 'review' ? answersIn(workspace) : []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [rail, workspace, answersIn, conversations, reviewTick],
-  );
   // The card lists answers from this workspace's conversations only.
   const answersCitingHere = useCallback(
     (filename: string) => answersCiting(filename, workspace),
@@ -1132,19 +973,15 @@ function App() {
       sourceChange(filename, answeredAtMs, documents, corpusChecked && !listingFailed),
     [documents, corpusChecked, listingFailed],
   );
-  // The rail's count of answers still to review: read between answers (walking every
-  // turn on each streamed frame would cost the stream), kept while one streams.
-  const reviewCountRef = useRef(0);
-  const reviewCount = useMemo(() => {
-    if (!pending) {
-      reviewCountRef.current = unreviewedCount(
-        answersIn(workspace).map((item) => item.turn),
-        sourceChangeOf,
-      );
-    }
-    return reviewCountRef.current;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending, workspace, answersIn, conversations, sourceChangeOf, reviewTick]);
+  const { markReviewed, reviewAnswers, reviewCount } = useReviewQueue({
+    rail,
+    workspace,
+    pending,
+    conversations,
+    answersIn,
+    setTurnReviewed,
+    sourceChangeOf,
+  });
   const suggestions = useMemo(() => {
     const newest = [...indexedFilenames]
       .sort((a, b) => (documents[b]?.uploadedAt ?? 0) - (documents[a]?.uploadedAt ?? 0))
@@ -1333,29 +1170,6 @@ function App() {
     else loadTraces();
   });
 
-  const keepQuote = useStableHandler((quote: SelectedQuote) => {
-    setQuotes(
-      saveQuote({
-        id: newId(),
-        ...quote,
-        workspace: getWorkspace() ?? '',
-        savedAt: Date.now(),
-      }),
-    );
-  });
-  const collectPassages = useStableHandler(
-    (passages: Omit<BasketPassage, 'workspace' | 'addedAt'>[]) => {
-      const next = addToBasket(
-        passages.map((passage) => ({
-          ...passage,
-          workspace: getWorkspace() ?? '',
-          addedAt: Date.now(),
-        })),
-      );
-      setBasket(next);
-      pushToast({ tone: 'good', title: `${passages.length === 1 ? 'Passage' : `${passages.length} passages`} in the basket` });
-    },
-  );
   const openCollected = useStableHandler(
     (filename: string, chunkId: string | null, inWorkspace: string) => {
       if (inWorkspace !== (getWorkspace() ?? '')) chooseWorkspaceRef.current(inWorkspace);

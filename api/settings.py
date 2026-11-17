@@ -40,11 +40,17 @@ class AppSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    # Qdrant's REST address (Compose sets http://qdrant:6333).
     qdrant_url: str = "http://localhost:6333"
+    # The default workspace's collection; other workspaces add __ws_<name>.
     qdrant_collection: str = "docrag_documents"
+    # Name of the dense vector on each point (part of the collection schema).
     qdrant_dense_vector_name: str = "dense"
+    # Name of the sparse (BM25) vector on each point (part of the collection schema).
     qdrant_sparse_vector_name: str = "sparse"
+    # Dimensions of DENSE_EMBEDDING_MODEL's vectors (bge-small: 384).
     qdrant_dense_vector_size: PositiveInt = 384
+    # Talk to Qdrant over gRPC instead of REST.
     # gRPC avoids per-call JSON (de)serialization overhead versus Qdrant's REST API —
     # meaningful at query volume, free to enable since the client already exposes both
     # transports over the same connection details.
@@ -58,7 +64,10 @@ class AppSettings(BaseSettings):
     # collection directly, around API_KEY entirely.
     qdrant_api_key: str = ""
 
+    # Local FastEmbed dense model. Changing it is a new vector space: bump
+    # EMBEDDING_MODEL_TAG and re-index (questions are refused until the tag matches).
     dense_embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Local FastEmbed sparse model for the keyword (BM25) leg of hybrid search.
     sparse_embedding_model: str = "Qdrant/BM25"
     # Prepended to the dense query text only (never the corpus side) before embedding.
     # bge-small's model card recommends this instruction for short-query→passage
@@ -73,7 +82,10 @@ class AppSettings(BaseSettings):
     # BM25's stemmer language (Qdrant/BM25 only), e.g. "german", "french", "spanish".
     # Recorded with the collection like the models: a change needs a re-index.
     sparse_language: str = "english"
+    # Local cross-encoder that rescores the fused candidates.
     reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
+    # Stored with the collection; a mismatch with this value refuses questions until
+    # the corpus is re-indexed for the current embedding setup.
     embedding_model_tag: str = "fastembed:BAAI/bge-small-en-v1.5"
 
     # Dense vectors kept as int8 in RAM beside the float32 originals ("scalar"), about a
@@ -82,10 +94,17 @@ class AppSettings(BaseSettings):
     # close. "none" (default): float32 only. Applied to an existing collection in place
     # (no re-embedding); switching back removes it.
     qdrant_quantization: Literal["none", "scalar"] = "none"
+    # With QDRANT_QUANTIZATION=scalar: how many times more candidates are re-scored
+    # against the full vectors.
     qdrant_quantization_oversampling: float = Field(default=2.0, ge=1.0, le=8.0)
+    # Reciprocal Rank Fusion constant for combining the dense and sparse lists (fixed at
+    # 60 by design; never overridden per request).
     rrf_k: PositiveInt = 60
+    # Candidates fetched from the dense (semantic) leg.
     dense_retrieval_limit: PositiveInt = 50
+    # Candidates fetched from the sparse (BM25) leg.
     sparse_retrieval_limit: PositiveInt = 50
+    # Candidates kept after fusion, before reranking.
     fused_top_n: PositiveInt = 50
     # How many of the fused top-N candidates are actually sent through the
     # cross-encoder — the reranker is the single most expensive retrieval-side stage,
@@ -93,6 +112,7 @@ class AppSettings(BaseSettings):
     # fused_top_n (which stays "the fusion spec's own top-N" per CLAUDE.md). Clamped to
     # fused_top_n at the call site — it can never rerank more than fusion produced.
     rerank_candidates: PositiveInt = 50
+    # Passages kept after reranking (before the context cap below).
     rerank_top_k: PositiveInt = 8
     # Caps how many query-document pairs the cross-encoder scores per forward pass, which
     # is what bounds its peak memory: attention cost grows with batch x sequence^2, and at
@@ -126,11 +146,14 @@ class AppSettings(BaseSettings):
     # embedding and query-time rerank from oversubscribing the same cores when they
     # overlap. Leave at 0 unless you run ingest and questions concurrently.
     embedding_threads: int = Field(default=0, ge=0)
+    # ONNX Runtime threads for the reranker's session; see EMBEDDING_THREADS.
     reranker_threads: int = Field(default=0, ge=0)
     # Rerank scores memoized per (query, passage text). Regenerate/Retry re-ask the
     # identical query, so a hit skips the most expensive stage entirely. 0 disables.
     rerank_cache_size: int = Field(default=4096, ge=0)
+    # Most passages put into the answering prompt.
     max_context_chunks: PositiveInt = 6
+    # Lowest rerank score (0 to 1) a passage needs to be used for an answer.
     # Cross-encoder logits are unbounded and model-specific; sigmoid-normalizing to
     # [0, 1] before comparing against this threshold makes it comparable across
     # reranker models. sigmoid(0)=0.5 is the "indifferent" point, but in practice
@@ -159,6 +182,8 @@ class AppSettings(BaseSettings):
     # untouched; the order decides which passages reach the prompt first. 0 = off.
     recency_boost_weight: float = Field(default=0.0, ge=0.0, le=1.0)
 
+    # Which provider writes answers: ollama (local, default), openai, openai_compatible or
+    # anthropic.
     # Checked at startup (case-insensitive): a typo used to boot fine and then fail
     # every question with a 400 that blamed the client.
     llm_provider: Literal["ollama", "openai", "openai_compatible", "anthropic"] = "ollama"
@@ -169,9 +194,14 @@ class AppSettings(BaseSettings):
     allowed_request_providers: (
         list[Literal["ollama", "openai", "openai_compatible", "anthropic"]] | None
     ) = None
+    # Generation model for LLM_PROVIDER=ollama (an Ollama model name).
     llm_model: str = "llama3.1:8b"
+    # Sampling temperature for answers (0 = most deterministic).
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    # Output-token budget of an answer (reasoning models get REASONING_TOKEN_HEADROOM
+    # on top).
     llm_max_tokens: PositiveInt = 512
+    # Longest wait for an LLM reply; local providers add prompt-reading time (below).
     llm_request_timeout_seconds: float = Field(default=60.0, gt=0.0)
     # Local providers (Ollama, OpenAI-compatible) send nothing while they read the
     # prompt, and LiteLLM hands its timeout to httpx as the longest silence allowed
@@ -180,7 +210,9 @@ class AppSettings(BaseSettings):
     # estimated prompt tokens divided by this rate (or by the slower rate this server
     # has been measured at). 0 turns the scaling off; hosted providers never scale.
     llm_prefill_tokens_per_second: float = Field(default=40.0, ge=0.0)
+    # LiteLLM retries of a failed LLM call (0 = none).
     llm_num_retries: int = Field(default=0, ge=0)
+    # Where Ollama listens (Compose's ollama profile: http://ollama:11434).
     ollama_base_url: str = "http://localhost:11434"
     # Ollama unloads a model from memory 5 minutes after its last use by default,
     # forcing a multi-second reload on the next question. Keeping it resident trades
@@ -235,24 +267,31 @@ class AppSettings(BaseSettings):
     # cache off. Invalidated by every ingest, delete and tag change, and expired after
     # the TTL. Questions with conversation history are never cached.
     answer_cache_size: int = Field(default=256, ge=0)
+    # How long a cached answer (and a cached LLM reply) is reused.
     answer_cache_ttl_seconds: float = Field(default=3600.0, gt=0.0)
     # Replies to identical LLM calls (the same messages, model and options) reused for
     # ANSWER_CACHE_TTL_SECONDS, whatever the corpus did meanwhile: retrieval, citations
     # and the trace still run; only the call is saved. 0 = off.
     prompt_cache_size: int = Field(default=256, ge=0, le=100_000)
+    # OpenAI key, for LLM_PROVIDER=openai or a question that picks it. Hosted and
+    # optional: uploads and indexing never call it.
     openai_api_key: str | None = Field(default=None)
     # Any server speaking the OpenAI chat-completions API — vLLM, llama.cpp's server,
     # LM Studio, LocalAI — selected with LLM_PROVIDER=openai_compatible (or per request).
     # Self-hostable like Ollama; the base URL is the one ending in /v1. The key is
     # optional: most local servers accept anything.
     openai_compatible_base_url: str = ""
+    # Model name sent to the OpenAI-compatible server.
     openai_compatible_model: str = ""
+    # Key for the OpenAI-compatible server, if it wants one.
     openai_compatible_api_key: str = ""
+    # Generation model for LLM_PROVIDER=openai.
     openai_model: str = "gpt-4o-mini"
     # Optional Anthropic (Claude) generation, selected with LLM_PROVIDER=anthropic or
     # per question. Like OpenAI it is a hosted add-on: upload, indexing and passage
     # search never call it, and embeddings stay local.
     anthropic_api_key: str | None = Field(default=None)
+    # Generation model for LLM_PROVIDER=anthropic.
     anthropic_model: str = "claude-sonnet-5-5"
     # Reasoning models (gpt-5 family) spend hidden reasoning tokens out of the same
     # max_completion_tokens budget as the visible answer. "low" keeps that spend modest
@@ -265,6 +304,7 @@ class AppSettings(BaseSettings):
     # for non-reasoning models, which keep the plain llm_max_tokens budget.
     reasoning_token_headroom: PositiveInt = 3072
 
+    # Largest single upload (and URL download) accepted.
     max_upload_bytes: PositiveInt = 50 * 1024 * 1024
     # POST /import: the largest backup zip (GET /export) accepted. Each original inside
     # is still held to max_upload_bytes.
@@ -288,12 +328,15 @@ class AppSettings(BaseSettings):
     front_matter_tags: bool = False
     # POST /documents/from-sitemap: the most pages one sitemap or feed adds.
     sitemap_max_pages: PositiveInt = 100
+    # Largest passage, in the dense model's tokens.
     # Real dense-model subword tokens (api/chunking.py counts with the model's own
     # tokenizer). bge-small hard-truncates at 512 tokens; the chunker reserves headroom
     # for the contextual-embedding prefix and never exceeds this budget, so the embedded
     # string fits the model. 448 leaves margin under 512 for special tokens and the
     # prefix. Changing this alters chunk contents — re-upload documents for consistency.
     chunk_size_tokens: PositiveInt = 448
+    # Tokens repeated between consecutive chunks of a section (must be below
+    # CHUNK_SIZE_TOKENS; clamped to half the window).
     chunk_overlap_tokens: int = Field(default=100, ge=0)
     # Markdown heading sections shorter than this are folded into a neighboring
     # section before chunking, so a one-line subsection doesn't become its own
@@ -310,6 +353,7 @@ class AppSettings(BaseSettings):
     # slowest step by far), the rest skipped with a warning. Without them a small file
     # of thousands of blank pages held both ingest workers for hours.
     max_pdf_pages: int = Field(default=2000, ge=1)
+    # Most text-less PDF pages OCR'd per document (see above).
     max_ocr_pages: int = Field(default=100, ge=0)
     # An XLSX workbook with more cells than this (counted across sheets, empty ones
     # included as openpyxl reads them) is refused. Every cell is held as text while the
@@ -349,6 +393,7 @@ class AppSettings(BaseSettings):
     # "re-index all". At most AUTO_REINDEX_BATCH of its jobs run at once, so uploads
     # still get through. Off by default.
     auto_reindex_stale: bool = False
+    # Most of the background re-index's jobs running at once.
     auto_reindex_batch: PositiveInt = 4
     # With JOB_STORE_BACKEND=sqlite: a re-index or URL fetch a restart cut off is started
     # again (once) at startup, as POST /documents/jobs/{id}/retry would.
@@ -357,7 +402,9 @@ class AppSettings(BaseSettings):
     # written to BACKUP_DIR/<workspace>/ every BACKUP_INTERVAL_HOURS, the newest
     # BACKUP_KEEP of each kept. Empty = off.
     backup_dir: str = ""
+    # Hours between scheduled backups of each workspace.
     backup_interval_hours: PositiveFloat = 24
+    # Scheduled backups kept per workspace (newest first).
     backup_keep: PositiveInt = 7
     # Where background imports keep their uploaded zip while they run; with it set, an
     # import a restart cut off runs again at startup. Empty: the system temp directory,
@@ -370,6 +417,7 @@ class AppSettings(BaseSettings):
     notify_events: str = ""
     # "json": {"text": ...} (Slack-compatible); "text": plain text + a Title header (ntfy).
     notify_format: Literal["json", "text"] = "json"
+    # Allow a NOTIFY_URL on a private address (a service on your LAN).
     notify_allow_private: bool = False
     # At most one notification per event in this many seconds (repeats are counted).
     notify_min_interval_seconds: int = Field(default=3600, ge=0)
@@ -392,6 +440,7 @@ class AppSettings(BaseSettings):
     # collection twice a minute for writes a single-process deployment never has.
     document_listing_ttl_seconds: float = Field(default=300.0, gt=0)
 
+    # Where ingest job status is kept: "memory" or "sqlite" (JOB_STORE_PATH).
     # "memory" (default) matches every prior release: jobs are lost on restart, and a
     # client polling a job whose process just restarted gets a 404 even if the ingest
     # actually succeeded in Qdrant. "sqlite" persists job status to job_store_path
@@ -403,6 +452,8 @@ class AppSettings(BaseSettings):
     # startup fails naming the setting otherwise (api/storage.py).
     job_store_path: str = "./data/jobs.db"
 
+    # Keep each uploaded original in this directory (needed for re-index, backups with
+    # originals, versions and rebuilds). Unset = originals are discarded.
     # None (default) matches every prior release: an uploaded document's raw bytes are
     # discarded once ingestion is queued — no "download original", and a future
     # chunking/embedding change needs every document manually re-uploaded. Setting
@@ -413,6 +464,7 @@ class AppSettings(BaseSettings):
     # re-chunk and re-embed a document from its stored original.
     raw_document_dir: str | None = None
 
+    # Capture thumbs up/down on answers (POST /feedback, GET /feedback).
     # False (default): no answer-feedback capture, matching every prior release. When
     # true, POST /feedback (thumbs up/down, from ChatMessage.tsx) is enabled and
     # PublicConfigResponse.feedback_enabled tells the frontend to render the buttons.
@@ -420,6 +472,7 @@ class AppSettings(BaseSettings):
     # dependency), independent of job_store_backend: this feature works regardless of
     # whether the operator has also opted the job store into sqlite persistence.
     feedback_enabled: bool = False
+    # The feedback sqlite file (with FEEDBACK_ENABLED).
     feedback_store_path: str = "./data/feedback.db"
     # With RAW_DOCUMENT_DIR: how many earlier versions of each original a re-upload keeps
     # (GET /documents/{f}/versions, POST .../versions/{v}/restore). 0 = none (default).
@@ -431,11 +484,14 @@ class AppSettings(BaseSettings):
     # (GET /query-log, full key). Off by default: it keeps what users typed. Its own
     # sqlite file; never in a backup. Oldest rows go past QUERY_LOG_MAX_ROWS.
     query_log_enabled: bool = False
+    # The query log's sqlite file (with QUERY_LOG_ENABLED).
     query_log_path: str = "./data/query_log.db"
+    # Oldest query-log rows are dropped past this many.
     query_log_max_rows: PositiveInt = 20_000
     # Keep the audit events (deletes, uploads, re-indexes, restores...) in this sqlite
     # file, newest AUDIT_LOG_MAX_ROWS, for GET /audit: log lines rotate away. "" = off.
     audit_log_path: str = ""
+    # Oldest audit rows are dropped past this many.
     audit_log_max_rows: PositiveInt = 100_000
     # Per-workspace relevance settings (PUT /workspaces/{name}/settings) are kept here
     # (sqlite) to survive a restart; empty keeps them in memory only.
@@ -469,13 +525,16 @@ class AppSettings(BaseSettings):
     # from lower-ranked survivors, so context still gets up to rerank_top_k *distinct*
     # chunks. Pure selection after scoring — rerank scores/order are untouched.
     context_diversity_enabled: bool = True
+    # Word-shingle similarity at which a passage counts as a near-duplicate.
     context_diversity_max_similarity: float = Field(default=0.6, gt=0.0, le=1.0)
 
+    # Extra browser origins allowed to call the API (JSON list).
     # Inert in the primary paths (dev uses the Vite proxy, prod serves the frontend
     # same-origin via StaticFiles) — a fallback for a contributor who points a
     # separately-running frontend directly at this API instead of using the proxy.
     cors_allow_origins: list[str] = Field(default_factory=list)
 
+    # Load the embedding and reranking models at startup instead of on the first request.
     # Off by default: the embedding/reranker models are lazy-loaded on first use, so a
     # cold-start warmup at boot moves that (potentially tens-of-seconds) cost earlier,
     # surfacing a misconfigured MODEL name at startup instead of on a user's first
@@ -494,12 +553,14 @@ class AppSettings(BaseSettings):
     # running instance. trace_max_retained caps memory use for large prompts/candidate
     # lists; oldest traces are pruned first once the cap is exceeded.
     trace_enabled: bool = True
+    # Traces kept in memory (oldest dropped first).
     trace_max_retained: PositiveInt = 100
     # Also keep traces in this sqlite file ("" = memory only): they then survive a
     # restart and outlive the ring, so a cached answer's or a feedback row's trace id
     # still opens. Holds prompts, so passages and what users typed. Oldest rows go past
     # TRACE_STORE_MAX_ROWS. Never part of a backup.
     trace_store_path: str = ""
+    # Oldest archived traces are dropped past this many.
     trace_store_max_rows: PositiveInt = 5000
 
     # Conversation memory: the client sends recent prior turns with each question
@@ -529,7 +590,9 @@ class AppSettings(BaseSettings):
     # hybrid-searched, and the result lists are RRF-fused (same pinned rrf_k) before a
     # single rerank. Adds one LLM round-trip per question, so it stays opt-in.
     query_expansion_enabled: bool = False
+    # Alternative phrasings asked for when QUERY_EXPANSION_ENABLED.
     query_expansion_count: int = Field(default=3, ge=1, le=8)
+    # Output budget of the query-expansion call.
     query_expansion_max_tokens: PositiveInt = 192
 
     # Zero-citation retry (default ON): if a non-insufficient answer comes back with no
@@ -554,21 +617,11 @@ class AppSettings(BaseSettings):
     # FOLLOWUP_COUNT short questions those sources can answer, sent after the answer
     # (a `followups` frame after `done` on the stream; `followups` on /questions).
     followups_enabled: bool = False
+    # Most follow-up questions suggested per answer.
     followup_count: int = Field(default=3, ge=1, le=5)
+    # Output budget of the follow-up call.
     followup_max_tokens: PositiveInt = 128
 
-    # Whole-document summaries and comparisons (POST /questions/summary): the document's
-    # passages are read in order, in parts of at most SUMMARY_BATCH_CHARS characters
-    # (lowered to fit LLM_CONTEXT_WINDOW / OLLAMA_NUM_CTX when known), each part is turned
-    # into cited notes, and the notes are combined into one answer. At most
-    # SUMMARY_MAX_BATCHES parts per request: a longer document is read at evenly spaced
-    # passages, and the answer reports how many it read. Each part is one LLM call, so
-    # this bounds the time a summary takes. SUMMARY_MAX_TOKENS is the final answer's
-    # budget (summaries run longer than answers); notes keep LLM_MAX_TOKENS.
-    # POST /documents/from-url (off by default): the server downloads a document from a
-    # URL and indexes it like an upload (MAX_UPLOAD_BYTES applies). Only public
-    # addresses are fetched unless URL_INGEST_ALLOW_PRIVATE is set — the request comes
-    # from inside the deployment, so a private one could reach Qdrant or cloud metadata.
     # Separate corpora on one server (api/workspaces.py), off by default: each is its own
     # Qdrant collection (QDRANT_COLLECTION__ws_<name>) and originals directory, chosen
     # per request with the X-Workspace header and created with POST /workspaces. Not
@@ -582,16 +635,21 @@ class AppSettings(BaseSettings):
     # names the workspace it indexes into (needs WORKSPACES_ENABLED; created at startup
     # if it doesn't exist yet); empty = the default workspace.
     watch_dir: str = ""
+    # Seconds between scans of the watched folders.
     watch_interval_seconds: float = Field(default=30.0, ge=2.0, le=86_400.0)
+    # Delete the document of a watched file that disappears (only files the watcher
+    # saw in the folder itself).
     watch_delete_missing: bool = False
     # Name a watched file by its path under the folder ("reports/2024/q1.pdf") instead
     # of its base name, so same-named files in different folders are all indexed.
     watch_keep_paths: bool = False
+    # Workspace WATCH_DIR indexes into (needs WORKSPACES_ENABLED); empty = default.
     watch_workspace: str = ""
     # A watched file whose read fails, or whose indexing job fails, is tried again after
     # WATCH_INTERVAL_SECONDS x 2^n (at most WATCH_RETRY_MAX_SECONDS), up to
     # WATCH_MAX_RETRIES times; then it waits until the file changes. 0 = never retried.
     watch_max_retries: int = Field(default=3, ge=0, le=100)
+    # Longest wait between retries of a failing watched file (see above).
     watch_retry_max_seconds: float = Field(default=3600.0, ge=2.0, le=604_800.0)
     # Which files under WATCH_DIR are watched: comma-separated glob patterns. One with
     # no "/" matches a file name ("*.py"), one with a "/" the path under WATCH_DIR
@@ -599,6 +657,7 @@ class AppSettings(BaseSettings):
     # leaves matching files (and directories, by name) out. An excluded file is never
     # deleted by WATCH_DELETE_MISSING. Empty = every supported file.
     watch_include: str = Field(default="", max_length=4000)
+    # Glob patterns of watched files and directories to leave out (see above).
     watch_exclude: str = Field(default="", max_length=4000)
     # More watched folders, each into its own workspace: "path=>workspace;path2=>ws2"
     # (no "=>workspace": the default one). Alongside WATCH_DIR, with the same interval,
@@ -606,21 +665,38 @@ class AppSettings(BaseSettings):
     # startup.
     watch_dirs: str = Field(default="", max_length=8000)
 
+    # POST /documents/from-url (off by default): the server downloads a document from a
+    # URL and indexes it like an upload (MAX_UPLOAD_BYTES applies). Only public
+    # addresses are fetched unless URL_INGEST_ALLOW_PRIVATE is set — the request comes
+    # from inside the deployment, so a private one could reach Qdrant or cloud metadata.
     url_ingest_enabled: bool = False
+    # Allow URL ingest from private addresses (see above).
     url_ingest_allow_private: bool = False
+    # Time allowed for one URL download, start to finish.
     url_ingest_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     # Refresh URL-fetched documents in the background (api/url_refresh.py): each one
     # whose last check is this many minutes old is fetched again conditionally (an
     # unchanged page is a 304, nothing re-indexed), at most URL_REFRESH_BATCH per pass.
     # 0 = off. Needs URL_INGEST_ENABLED.
     url_refresh_interval_minutes: int = Field(default=0, ge=0, le=525_600)
+    # Most refreshed documents queued per pass.
     url_refresh_batch: PositiveInt = 4
     # Where the scheduled refresh keeps when each document was last checked (a sqlite
     # file), so a restart doesn't make every document due at once. Empty = in memory.
     url_refresh_state_path: str = ""
 
+    # Whole-document summaries and comparisons (POST /questions/summary): the document's
+    # passages are read in order, in parts of at most SUMMARY_BATCH_CHARS characters
+    # (lowered to fit LLM_CONTEXT_WINDOW / OLLAMA_NUM_CTX when known), each part is turned
+    # into cited notes, and the notes are combined into one answer. At most
+    # SUMMARY_MAX_BATCHES parts per request: a longer document is read at evenly spaced
+    # passages, and the answer reports how many it read. Each part is one LLM call, so
+    # this bounds the time a summary takes. SUMMARY_MAX_TOKENS is the final answer's
+    # budget (summaries run longer than answers); notes keep LLM_MAX_TOKENS.
     summary_batch_chars: int = Field(default=9000, ge=1000, le=200_000)
+    # Most parts read per summary request (see above).
     summary_max_batches: int = Field(default=8, ge=1, le=64)
+    # Output budget of a summary's final answer (see above).
     summary_max_tokens: PositiveInt = 1024
     # Parts of a long document turned into notes at once, with a hosted provider (OpenAI,
     # Anthropic, an OpenAI-compatible server). Ollama always takes them one at a time:

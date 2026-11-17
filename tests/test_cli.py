@@ -1658,7 +1658,8 @@ def test_ingest_skip_unchanged_asks_before_sending_and_rebuild_reports_nothing_t
 def test_the_hash_cache_rehashes_only_what_changed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from cli import __main__ as docrag_cli
+    # The sync commands (HashCache, _sha256) live in cli.document_commands.
+    from cli import document_commands as docrag_cli
 
     target = tmp_path / "a.txt"
     target.write_text("one")

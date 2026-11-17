@@ -1,7 +1,7 @@
 {
   "name": "docrag-frontend",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "typecheck:tests": "tsc -p tsconfig.test.json --noEmit",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "e2e": "playwright test",
     "e2e:smoke": "playwright test --grep @smoke",
     "e2e:ui": "playwright test --ui"
@@ -29,6 +30,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4",
+    "@vitest/coverage-v8": "3.2.6",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^25",
     "oxlint": "^1.71.0",

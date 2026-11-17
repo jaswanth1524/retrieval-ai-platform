@@ -5,7 +5,6 @@ import type {
   FeedbackRating,
   HistoryMessage,
   LlmProvider,
-  PassageNarrowing,
   QuestionOptions,
   QuestionOverrides,
 } from '../api/types';
@@ -14,9 +13,13 @@ import { newId } from '../utils/id';
 import { useChatPersistence } from './useChatPersistence';
 import { useConversationActions } from './useConversationActions';
 import { answerStreamHandlers, createDeltaBuffer } from './streamHandlers';
-import { mergeRegenerated, withVersionRestored } from '../utils/answerVersions';
-import { MAX_NOTE_CHARS, sanitizeStyle } from './chat/sanitize';
+import { mergeRegenerated } from '../utils/answerVersions';
+import { sanitizeStyle } from './chat/sanitize';
 import type { ImportItem } from './useConversationActions';
+import { turnCounts, useAnswerQueries, type SavedAnswer } from './chat/answers';
+import { useTurnMarks } from './chat/turnMarks';
+// Re-exported for the components and tests that import it from here.
+export type { SavedAnswer } from './chat/answers';
 
 /** How often streamed answer text is applied (see createDeltaBuffer's use below). */
 export const STREAM_FLUSH_MS = 50;
@@ -32,7 +35,6 @@ import {
   deriveTitle,
   loadStorage,
   searchConversations as searchStoredConversations,
-  updateTurn,
   withConversationRestored,
   withoutConversation,
 } from './chatPersistence';
@@ -222,50 +224,6 @@ function makeTurn(role: ChatTurn['role'], content: string, sources: ChatTurn['so
 }
 
 const NO_TURNS: ChatTurn[] = [];
-
-/** A saved answer and where it is (the Saved answers panel). */
-export interface SavedAnswer {
-  conversationId: string;
-  conversationTitle: string;
-  /** The workspace its conversation asked in ("" = the default). */
-  workspace: string;
-  turn: ChatTurn;
-  /** The question it answered (the user turn before it), if there is one. */
-  question: string | null;
-  /** How that question was narrowed, and whether it was a whole-document task (a
-   *  summary's "question" is a label, not something to search for). */
-  narrowing?: PassageNarrowing;
-  task?: boolean;
-}
-
-interface TurnCounts {
-  turnCount: number;
-  savedCount?: number;
-  firstSavedTurnId?: string;
-}
-
-// Per turns array: only the conversation being answered gets a new one per streamed
-// frame, so every other conversation's counts are reused instead of recounted.
-const turnCountsCache = new WeakMap<readonly ChatTurn[], TurnCounts>();
-
-function turnCounts(turns: readonly ChatTurn[]): TurnCounts {
-  const cached = turnCountsCache.get(turns);
-  if (cached) return cached;
-  let turnCount = 0;
-  let savedCount = 0;
-  let firstSavedTurnId: string | undefined;
-  for (const turn of turns) {
-    if (turn.role === 'user') turnCount += 1;
-    if (turn.saved) {
-      savedCount += 1;
-      firstSavedTurnId ??= turn.id;
-    }
-  }
-  const counts: TurnCounts =
-    savedCount > 0 ? { turnCount, savedCount, firstSavedTurnId } : { turnCount };
-  turnCountsCache.set(turns, counts);
-  return counts;
-}
 
 /** Times a question refused with 429 is asked again on its own. */
 export const BUSY_RETRY_ATTEMPTS = 3;
@@ -1081,200 +1039,16 @@ export function useChat(): UseChatResult {
   // These change one conversation's turn (the active one unless named): an edited
   // question's copy shares the earlier turns' ids, so matching the id alone rated,
   // marked or swapped the answer in both conversations.
-  const setSourceIrrelevant = useCallback(
-    (turnId: string, sourceNumber: number, marked: boolean, conversationId?: string) => {
-      setStorage((prev) =>
-        updateTurn(
-          prev,
-          conversationId ?? prev.activeConversationId ?? '',
-          turnId,
-          (turn) => {
-            const others = (turn.irrelevantSources ?? []).filter((n) => n !== sourceNumber);
-            const next = marked ? [...others, sourceNumber] : others;
-            const { irrelevantSources: _previous, ...rest } = turn;
-            return next.length > 0 ? { ...rest, irrelevantSources: next } : rest;
-          },
-          Date.now(),
-        ),
-      );
-    },
-    [],
-  );
+  const {
+    setSourceIrrelevant,
+    setTurnSaved,
+    setTurnNote,
+    setTurnReviewed,
+    restoreAnswerVersion,
+    setTurnFeedback,
+  } = useTurnMarks(setStorage);
 
-  const setTurnSaved = useCallback((turnId: string, saved: boolean, conversationId?: string) => {
-    // One conversation's turn: an edited question's copy shares the earlier turns' ids
-    // (follow-ups, feedback and the in-flight answer key on them), so matching the id
-    // alone saved the answer in both and listed it twice.
-    setStorage((prev) =>
-      updateTurn(
-        prev,
-        conversationId ?? prev.activeConversationId ?? '',
-        turnId,
-        (turn) => {
-          const { saved: _previous, ...rest } = turn;
-          return saved ? { ...rest, saved: true } : rest;
-        },
-        Date.now(),
-      ),
-    );
-  }, []);
-
-  // The reader's note on a saved answer ("" takes it away).
-  const setTurnNote = useCallback((conversationId: string, turnId: string, note: string) => {
-    setStorage((prev) =>
-      updateTurn(
-        prev,
-        conversationId,
-        turnId,
-        (turn) => {
-          const { note: _previous, ...rest } = turn;
-          const text = note.trim().slice(0, MAX_NOTE_CHARS);
-          return text ? { ...rest, note: text } : rest;
-        },
-        Date.now(),
-      ),
-    );
-  }, []);
-
-  // Marked looked at in the Needs review panel (or unmarked).
-  const setTurnReviewed = useCallback(
-    (conversationId: string, turnId: string, reviewed: boolean) => {
-      setStorage((prev) =>
-        updateTurn(
-          prev,
-          conversationId,
-          turnId,
-          (turn) => {
-            const { reviewedAt: _previous, ...rest } = turn;
-            return reviewed ? { ...rest, reviewedAt: Date.now() } : rest;
-          },
-          Date.now(),
-        ),
-      );
-    },
-    [],
-  );
-
-  // An earlier version of an answer made the answer again (the one shown becomes a
-  // version, so nothing is lost).
-  const restoreAnswerVersion = useCallback((turnId: string, index: number) => {
-    setStorage((prev) =>
-      updateTurn(
-        prev,
-        prev.activeConversationId ?? '',
-        turnId,
-        (turn) => withVersionRestored(turn, index),
-        Date.now(),
-      ),
-    );
-  }, []);
-
-  const setTurnFeedback = useCallback(
-    (turnId: string, rating: FeedbackRating | undefined, conversationId?: string) => {
-      // Stored on the turn, so a rating survives a reload or a conversation switch and
-      // the buttons can't send a duplicate row for the same answer.
-      setStorage((prev) =>
-        updateTurn(
-          prev,
-          conversationId ?? prev.activeConversationId ?? '',
-          turnId,
-          (turn) => ({ ...turn, feedback: rating }),
-          Date.now(),
-        ),
-      );
-    },
-    [],
-  );
-
-  const savedAnswersRef = useRef<SavedAnswer[]>([]);
-  const savedAnswers = useMemo(() => {
-    const found: SavedAnswer[] = [];
-    for (const conversation of conversations) {
-      // The cached counts skip every conversation with nothing saved, unwalked.
-      if (!turnCounts(conversation.turns).savedCount) continue;
-      conversation.turns.forEach((turn, index) => {
-        if (!turn.saved) return;
-        const asked = conversation.turns
-          .slice(0, index)
-          .reverse()
-          .find((earlier) => earlier.role === 'user');
-        found.push({
-          conversationId: conversation.id,
-          conversationTitle: conversation.title,
-          workspace: conversation.workspace ?? '',
-          turn,
-          question: asked?.content ?? null,
-          ...(asked?.narrowing ? { narrowing: asked.narrowing } : {}),
-          ...(asked?.task ? { task: true } : {}),
-        });
-      });
-    }
-    found.sort((a, b) => b.turn.timestamp - a.turn.timestamp);
-    const previous = savedAnswersRef.current;
-    // The same list (a streamed frame changed something else): the same array.
-    if (
-      previous.length === found.length &&
-      previous.every(
-        (item, index) =>
-          item.turn === found[index].turn &&
-          item.conversationTitle === found[index].conversationTitle,
-      )
-    ) {
-      return previous;
-    }
-    savedAnswersRef.current = found;
-    return found;
-  }, [conversations]);
-
-  // Every answer of a workspace's conversations, newest first, with its question: what
-  // the "Needs review" panel looks through (read when it is open).
-  const answersIn = useCallback((workspace: string) => {
-    const found: SavedAnswer[] = [];
-    for (const conversation of storageRef.current.conversations) {
-      if ((conversation.workspace ?? '') !== workspace) continue;
-      let question: string | null = null;
-      for (const turn of conversation.turns) {
-        if (turn.role === 'user') question = turn.content;
-        else if (turn.role === 'assistant') {
-          found.push({
-            conversationId: conversation.id,
-            conversationTitle: conversation.title,
-            workspace,
-            turn,
-            question,
-          });
-        }
-      }
-    }
-    return found.sort((a, b) => b.turn.timestamp - a.turn.timestamp);
-  }, []);
-
-  // Read when asked (a card's "Questions that cited this"), not kept up to date: it walks
-  // every turn of every conversation.
-  const answersCiting = useCallback((filename: string, workspace: string) => {
-    const found: SavedAnswer[] = [];
-    for (const conversation of storageRef.current.conversations) {
-      // Another workspace's document of the same name is a different document.
-      if ((conversation.workspace ?? '') !== workspace) continue;
-      conversation.turns.forEach((turn, index) => {
-        if (turn.role !== 'assistant' || !turn.sources.some((source) => source.filename === filename)) {
-          return;
-        }
-        const asked = conversation.turns
-          .slice(0, index)
-          .reverse()
-          .find((earlier) => earlier.role === 'user');
-        found.push({
-          conversationId: conversation.id,
-          conversationTitle: conversation.title,
-          workspace: conversation.workspace ?? '',
-          turn,
-          question: asked?.content ?? null,
-        });
-      });
-    }
-    return found.sort((a, b) => b.turn.timestamp - a.turn.timestamp);
-  }, []);
+  const { savedAnswers, answersIn, answersCiting } = useAnswerQueries(conversations, storageRef);
 
   // Keeps the previous array when nothing the list shows changed: `conversations` is a
   // new array on every streamed frame, and a new summaries array re-rendered the list.

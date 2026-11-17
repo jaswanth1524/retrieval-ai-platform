@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from typing import get_args
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
@@ -292,262 +292,266 @@ def sse_response(
     )
 
 
-def register(app: FastAPI) -> None:
-    """Register the question routes."""
+router = APIRouter()
 
-    @app.post(
-        "/questions", response_model=QuestionResponse, dependencies=[Depends(require_api_key)]
-    )
-    async def answer_question(
-        request: QuestionRequest,
-        http_request: Request,
-        pipeline: RagPipelineDep,
-        slots: QuestionSlotsDep,
-        settings: SettingsDep,
-    ) -> QuestionResponse:
-        check_request_provider(request.llm_provider, settings, request.llm_temperature)
-        check_rerank_top_k(request.rerank_top_k, settings)
-        check_question_text(request.question)
-        release = question_slot(slots)
-        # A client that leaves (a CLI timeout, a closed connection) stops the pipeline
-        # before its next expensive stage, as on the stream: the slot, the local model
-        # and the LLM call were otherwise held to the end for nobody.
-        stop = threading.Event()
-        watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
-        try:
-            grounded = await run_in_threadpool(
-                lambda: pipeline.answer(
-                    request.question,
-                    question_overrides(request),
-                    filenames=request.filenames,
-                    history=history_messages(request.history),
-                    tags=request.tags,
-                    use_cache=request.use_cache,
-                    should_stop=stop.is_set,
-                )
-            )
-        except QuestionAbandoned:
-            questions_total.labels(outcome="error", error_type="abandoned").inc()
-            # Nobody reads it; a status is still needed for the access log.
-            raise HTTPException(status_code=499, detail="The client left.") from None
-        except Exception as exc:
-            questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
-            raise
-        finally:
-            watcher.cancel()
-            release()
-        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-        count_answer(grounded.answer_status, grounded.truncated)
-        if grounded.cached:
-            answer_cache_hits_total.inc()
-        elif grounded.timings is not None:
-            timings = timings_dict(grounded.timings)
-            observe_question_timings(timings, prompt_cached=grounded.prompt_cached)
-            log_question(
-                provider=request.llm_provider,
-                source_count=len(grounded.sources),
-                timings=timings,
-            )
-        return QuestionResponse(
-            answer=grounded.answer,
-            sources=[CitationResponse(**asdict(source)) for source in grounded.sources],
-            timings=timings_response(grounded.timings),
-            trace_id=grounded.trace_id,
-            cached=grounded.cached,
-            answer_status=grounded.answer_status,
-            top_rerank_score=grounded.top_rerank_score,
-            rerank_min_score=float(settings.rerank_min_score),
-            weak_matches=grounded.weak_matches,
-            truncated=grounded.truncated,
-            citation_backfilled=grounded.citation_backfilled,
-            unsupported_claims=grounded.unsupported_claims,
-            unsupported_numbers=grounded.unsupported_numbers,
-            prompt_cached=grounded.prompt_cached,
-            prompt_cut=grounded.prompt_cut,
-            passages_left_out=grounded.passages_left_out,
-            followups=grounded.followups,
-            usage=usage_response(grounded.usage, grounded.cost_usd),
-        )
 
-    @app.post(
-        "/questions/continue",
-        dependencies=[Depends(require_api_key)],
-        responses={
-            404: {"description": "No such trace here, or traces are off."},
-            409: {"description": "That answer wasn't cut off, or its passages changed."},
-        },
-    )
-    def continue_answer_stream(
-        request: ContinueRequest,
-        pipeline: RagPipelineDep,
-        slots: QuestionSlotsDep,
-        settings: SettingsDep,
-        traces: TraceStoreDep,
-    ) -> ClosingStreamingResponse:
-        """The rest of an answer cut off at the token limit, streamed like
-        /questions/stream (sources, deltas, done with the whole answer)."""
-
-        try:
-            plan = pipeline.continuable(request.trace_id, traces.get(request.trace_id), settings)
-        except ContinueRefused as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        lease = StreamLease(question_slot(slots))
-        stop = threading.Event()
-
-        def on_done(event: DoneEvent) -> None:
-            count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
-            questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-
-        def on_error(exc: Exception) -> None:
-            questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
-
-        return sse_response(
-            pipeline.continue_stream(plan, settings, should_stop=stop.is_set),
-            lease,
-            stop,
-            on_done=on_done,
-            on_error=on_error,
-            what="continued answer",
-        )
-
-    @app.post("/questions/stream", dependencies=[Depends(require_api_key)])
-    def answer_question_stream(
-        request: QuestionRequest,
-        pipeline: RagPipelineDep,
-        slots: QuestionSlotsDep,
-        settings: SettingsDep,
-    ) -> ClosingStreamingResponse:
-        check_request_provider(request.llm_provider, settings, request.llm_temperature)
-        check_rerank_top_k(request.rerank_top_k, settings)
-        check_question_text(request.question)
-        # Taken here, before the 200 is committed, so a full server can still say 429.
-        lease = StreamLease(question_slot(slots))
-        stop = threading.Event()
-        overrides = question_overrides(request)
-
-        def on_done(event: DoneEvent) -> None:
-            count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
-            questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-            if event.get("cached"):
-                answer_cache_hits_total.inc()
-                return
-            observe_question_timings(
-                event["timings"], prompt_cached=bool(event.get("prompt_cached"))
-            )
-            log_question(
-                provider=request.llm_provider,
-                source_count=len(event["sources"]),
-                timings=event["timings"],
-            )
-
-        def on_error(exc: Exception) -> None:
-            questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
-
-        return sse_response(
-            pipeline.answer_stream(
+@router.post("/questions", response_model=QuestionResponse, dependencies=[Depends(require_api_key)])
+async def answer_question(
+    request: QuestionRequest,
+    http_request: Request,
+    pipeline: RagPipelineDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+) -> QuestionResponse:
+    check_request_provider(request.llm_provider, settings, request.llm_temperature)
+    check_rerank_top_k(request.rerank_top_k, settings)
+    check_question_text(request.question)
+    release = question_slot(slots)
+    # A client that leaves (a CLI timeout, a closed connection) stops the pipeline
+    # before its next expensive stage, as on the stream: the slot, the local model
+    # and the LLM call were otherwise held to the end for nobody.
+    stop = threading.Event()
+    watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
+    try:
+        grounded = await run_in_threadpool(
+            lambda: pipeline.answer(
                 request.question,
-                overrides,
+                question_overrides(request),
                 filenames=request.filenames,
                 history=history_messages(request.history),
                 tags=request.tags,
                 use_cache=request.use_cache,
                 should_stop=stop.is_set,
-            ),
-            lease,
-            stop,
-            on_done=on_done,
-            on_error=on_error,
-            what="question",
-        )
-
-    # Whole-document tasks: the same admission, provider check, key guard, rate limit
-    # and answer frames as a question, over every passage of the named documents
-    # instead of the retrieved few (api/summarize.py).
-    @app.post(
-        "/questions/summary",
-        response_model=SummaryResponse,
-        dependencies=[Depends(require_api_key)],
-    )
-    async def summarize_documents(
-        request: SummaryRequest,
-        http_request: Request,
-        summarizer: DocumentSummarizerDep,
-        slots: QuestionSlotsDep,
-        settings: SettingsDep,
-    ) -> SummaryResponse:
-        check_request_provider(request.llm_provider, settings, request.llm_temperature)
-        task = summary_request(request)
-        await run_in_threadpool(summarizer.check_documents, task.filenames, task.narrow)
-        release = question_slot(slots, count_metric=False, kind="summary")
-        # As /questions: a client that leaves stops the summary before its next part,
-        # instead of every part running (and both slots held) for nobody.
-        stop = threading.Event()
-        watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
-        try:
-            result = await run_in_threadpool(
-                lambda: summarizer.summarize(
-                    task, use_cache=request.use_cache, should_stop=stop.is_set
-                )
             )
-        except QuestionAbandoned:
-            summaries_total.labels(mode=request.mode, outcome="error").inc()
-            raise HTTPException(status_code=499, detail="The client left.") from None
-        except Exception:
-            summaries_total.labels(mode=request.mode, outcome="error").inc()
-            raise
-        finally:
-            watcher.cancel()
-            release()
-        summaries_total.labels(mode=request.mode, outcome="ok").inc()
-        count_answer(result.grounded.answer_status, result.grounded.truncated)
-        if result.grounded.cached:
+        )
+    except QuestionAbandoned:
+        questions_total.labels(outcome="error", error_type="abandoned").inc()
+        # Nobody reads it; a status is still needed for the access log.
+        raise HTTPException(status_code=499, detail="The client left.") from None
+    except Exception as exc:
+        questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
+        raise
+    finally:
+        watcher.cancel()
+        release()
+    questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+    count_answer(grounded.answer_status, grounded.truncated)
+    if grounded.cached:
+        answer_cache_hits_total.inc()
+    elif grounded.timings is not None:
+        timings = timings_dict(grounded.timings)
+        observe_question_timings(timings, prompt_cached=grounded.prompt_cached)
+        log_question(
+            provider=request.llm_provider,
+            source_count=len(grounded.sources),
+            timings=timings,
+        )
+    return QuestionResponse(
+        answer=grounded.answer,
+        sources=[CitationResponse(**asdict(source)) for source in grounded.sources],
+        timings=timings_response(grounded.timings),
+        trace_id=grounded.trace_id,
+        cached=grounded.cached,
+        answer_status=grounded.answer_status,
+        top_rerank_score=grounded.top_rerank_score,
+        rerank_min_score=float(settings.rerank_min_score),
+        weak_matches=grounded.weak_matches,
+        truncated=grounded.truncated,
+        citation_backfilled=grounded.citation_backfilled,
+        unsupported_claims=grounded.unsupported_claims,
+        unsupported_numbers=grounded.unsupported_numbers,
+        prompt_cached=grounded.prompt_cached,
+        prompt_cut=grounded.prompt_cut,
+        passages_left_out=grounded.passages_left_out,
+        followups=grounded.followups,
+        usage=usage_response(grounded.usage, grounded.cost_usd),
+    )
+
+
+@router.post(
+    "/questions/continue",
+    dependencies=[Depends(require_api_key)],
+    responses={
+        404: {"description": "No such trace here, or traces are off."},
+        409: {"description": "That answer wasn't cut off, or its passages changed."},
+    },
+)
+def continue_answer_stream(
+    request: ContinueRequest,
+    pipeline: RagPipelineDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+    traces: TraceStoreDep,
+) -> ClosingStreamingResponse:
+    """The rest of an answer cut off at the token limit, streamed like
+    /questions/stream (sources, deltas, done with the whole answer)."""
+
+    try:
+        plan = pipeline.continuable(request.trace_id, traces.get(request.trace_id), settings)
+    except ContinueRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    lease = StreamLease(question_slot(slots))
+    stop = threading.Event()
+
+    def on_done(event: DoneEvent) -> None:
+        count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
+        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+
+    def on_error(exc: Exception) -> None:
+        questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
+
+    return sse_response(
+        pipeline.continue_stream(plan, settings, should_stop=stop.is_set),
+        lease,
+        stop,
+        on_done=on_done,
+        on_error=on_error,
+        what="continued answer",
+    )
+
+
+@router.post("/questions/stream", dependencies=[Depends(require_api_key)])
+def answer_question_stream(
+    request: QuestionRequest,
+    pipeline: RagPipelineDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+) -> ClosingStreamingResponse:
+    check_request_provider(request.llm_provider, settings, request.llm_temperature)
+    check_rerank_top_k(request.rerank_top_k, settings)
+    check_question_text(request.question)
+    # Taken here, before the 200 is committed, so a full server can still say 429.
+    lease = StreamLease(question_slot(slots))
+    stop = threading.Event()
+    overrides = question_overrides(request)
+
+    def on_done(event: DoneEvent) -> None:
+        count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
+        questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+        if event.get("cached"):
             answer_cache_hits_total.inc()
-        grounded = result.grounded
-        return SummaryResponse(
-            answer=grounded.answer,
-            sources=[CitationResponse(**asdict(source)) for source in grounded.sources],
-            timings=timings_response(grounded.timings),
-            trace_id=grounded.trace_id,
-            cached=grounded.cached,
-            answer_status=grounded.answer_status,
-            truncated=grounded.truncated,
-            usage=usage_response(grounded.usage, grounded.cost_usd),
-            citation_backfilled=grounded.citation_backfilled,
-            unsupported_claims=grounded.unsupported_claims,
-            unsupported_numbers=grounded.unsupported_numbers,
-            prompt_cached=grounded.prompt_cached,
-            prompt_cut=grounded.prompt_cut,
-            chunks_read=result.chunks_read,
-            chunks_total=result.chunks_total,
-            parts_skipped=result.parts_skipped,
-            notes_truncated=result.notes_truncated,
+            return
+        observe_question_timings(event["timings"], prompt_cached=bool(event.get("prompt_cached")))
+        log_question(
+            provider=request.llm_provider,
+            source_count=len(event["sources"]),
+            timings=event["timings"],
         )
 
-    @app.post("/questions/summary/stream", dependencies=[Depends(require_api_key)])
-    def summarize_documents_stream(
-        request: SummaryRequest,
-        summarizer: DocumentSummarizerDep,
-        slots: QuestionSlotsDep,
-        settings: SettingsDep,
-    ) -> ClosingStreamingResponse:
-        check_request_provider(request.llm_provider, settings, request.llm_temperature)
-        task = summary_request(request)
-        # Before the 200: an unknown or oversized document is a plain 404 / 400.
-        summarizer.check_documents(task.filenames, task.narrow)
-        lease = StreamLease(question_slot(slots, count_metric=False, kind="summary"))
-        stop = threading.Event()
+    def on_error(exc: Exception) -> None:
+        questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
 
-        def on_done(event: DoneEvent) -> None:
-            summaries_total.labels(mode=request.mode, outcome="ok").inc()
-            count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
-            if event.get("cached"):
-                answer_cache_hits_total.inc()
+    return sse_response(
+        pipeline.answer_stream(
+            request.question,
+            overrides,
+            filenames=request.filenames,
+            history=history_messages(request.history),
+            tags=request.tags,
+            use_cache=request.use_cache,
+            should_stop=stop.is_set,
+        ),
+        lease,
+        stop,
+        on_done=on_done,
+        on_error=on_error,
+        what="question",
+    )
 
-        return sse_response(
-            summarizer.summarize_stream(task, use_cache=request.use_cache, should_stop=stop.is_set),
-            lease,
-            stop,
-            on_done=on_done,
-            on_error=lambda exc: summaries_total.labels(mode=request.mode, outcome="error").inc(),
-            what="summary",
+
+# Whole-document tasks: the same admission, provider check, key guard, rate limit
+# and answer frames as a question, over every passage of the named documents
+# instead of the retrieved few (api/summarize.py).
+@router.post(
+    "/questions/summary",
+    response_model=SummaryResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def summarize_documents(
+    request: SummaryRequest,
+    http_request: Request,
+    summarizer: DocumentSummarizerDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+) -> SummaryResponse:
+    check_request_provider(request.llm_provider, settings, request.llm_temperature)
+    task = summary_request(request)
+    await run_in_threadpool(summarizer.check_documents, task.filenames, task.narrow)
+    release = question_slot(slots, count_metric=False, kind="summary")
+    # As /questions: a client that leaves stops the summary before its next part,
+    # instead of every part running (and both slots held) for nobody.
+    stop = threading.Event()
+    watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
+    try:
+        result = await run_in_threadpool(
+            lambda: summarizer.summarize(task, use_cache=request.use_cache, should_stop=stop.is_set)
         )
+    except QuestionAbandoned:
+        summaries_total.labels(mode=request.mode, outcome="error").inc()
+        raise HTTPException(status_code=499, detail="The client left.") from None
+    except Exception:
+        summaries_total.labels(mode=request.mode, outcome="error").inc()
+        raise
+    finally:
+        watcher.cancel()
+        release()
+    summaries_total.labels(mode=request.mode, outcome="ok").inc()
+    count_answer(result.grounded.answer_status, result.grounded.truncated)
+    if result.grounded.cached:
+        answer_cache_hits_total.inc()
+    grounded = result.grounded
+    return SummaryResponse(
+        answer=grounded.answer,
+        sources=[CitationResponse(**asdict(source)) for source in grounded.sources],
+        timings=timings_response(grounded.timings),
+        trace_id=grounded.trace_id,
+        cached=grounded.cached,
+        answer_status=grounded.answer_status,
+        truncated=grounded.truncated,
+        usage=usage_response(grounded.usage, grounded.cost_usd),
+        citation_backfilled=grounded.citation_backfilled,
+        unsupported_claims=grounded.unsupported_claims,
+        unsupported_numbers=grounded.unsupported_numbers,
+        prompt_cached=grounded.prompt_cached,
+        prompt_cut=grounded.prompt_cut,
+        chunks_read=result.chunks_read,
+        chunks_total=result.chunks_total,
+        parts_skipped=result.parts_skipped,
+        notes_truncated=result.notes_truncated,
+    )
+
+
+@router.post("/questions/summary/stream", dependencies=[Depends(require_api_key)])
+def summarize_documents_stream(
+    request: SummaryRequest,
+    summarizer: DocumentSummarizerDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+) -> ClosingStreamingResponse:
+    check_request_provider(request.llm_provider, settings, request.llm_temperature)
+    task = summary_request(request)
+    # Before the 200: an unknown or oversized document is a plain 404 / 400.
+    summarizer.check_documents(task.filenames, task.narrow)
+    lease = StreamLease(question_slot(slots, count_metric=False, kind="summary"))
+    stop = threading.Event()
+
+    def on_done(event: DoneEvent) -> None:
+        summaries_total.labels(mode=request.mode, outcome="ok").inc()
+        count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
+        if event.get("cached"):
+            answer_cache_hits_total.inc()
+
+    return sse_response(
+        summarizer.summarize_stream(task, use_cache=request.use_cache, should_stop=stop.is_set),
+        lease,
+        stop,
+        on_done=on_done,
+        on_error=lambda exc: summaries_total.labels(mode=request.mode, outcome="error").inc(),
+        what="summary",
+    )
+
+
+def register(app: FastAPI) -> None:
+    """Register the question routes."""
+
+    app.include_router(router)

@@ -2,7 +2,7 @@
 # `make check` runs the backend and frontend gates as CI does (coverage floor and
 # dependency audits included); e2e and Docker stay separate.
 
-.PHONY: check backend frontend e2e golden openapi eval-ingest eval-retrieval eval-mixed eval-answer eval-record eval-replay eval-ragas eval-diff eval-report
+.PHONY: check backend frontend e2e golden openapi settings-docs eval-ingest eval-retrieval eval-mixed eval-answer eval-record eval-replay eval-ragas eval-diff eval-report
 
 check: backend frontend
 
@@ -39,7 +39,7 @@ backend:
 		status=$$?; rm -f "$$req"; exit $$status
 
 frontend:
-	cd frontend && npm run test
+	cd frontend && npm run test:coverage
 	cd frontend && npm run typecheck:tests
 	cd frontend && npm run build
 	cd frontend && npm run lint
@@ -49,8 +49,12 @@ e2e:
 	cd frontend && npm run e2e
 
 # Regenerate the pinned snapshots after an intended change, then review the diff.
-golden:
+golden: settings-docs
 	DOCRAG_UPDATE_GOLDEN=1 uv run pytest tests/test_chunking_golden.py tests/test_openapi_snapshot.py
+
+# docs/settings.md, from the comments above each field in api/settings.py.
+settings-docs:
+	uv run python -m api.settings_docs
 
 openapi:
 	DOCRAG_UPDATE_GOLDEN=1 uv run pytest tests/test_openapi_snapshot.py
