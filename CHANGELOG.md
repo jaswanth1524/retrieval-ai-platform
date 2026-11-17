@@ -13,7 +13,7 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 Latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
-(pass 11), then six fixes-and-features passes (passes 12 to 17). **Re-index:
+(pass 11), then seven fixes-and-features passes (passes 12 to 18). **Re-index:
 recommended** — chunker version 9 (see Changed). Every document
 is listed as "older chunking" until it is re-indexed (↻ on its card, or "Re-index all
 stale" with `RAW_DOCUMENT_DIR` set) or uploaded again; until then it keeps working as
@@ -28,6 +28,48 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
 <project>_docrag_data:/to busybox cp -a /from/. /to/`).
 
 ### Changed
+- Pass 18: `docrag sync` tags what it indexes `sync:<folder>-<8 hex of the folder's
+  path>` (two folders with one name no longer share a tag); documents carrying the old
+  `sync:<folder>` tag are taken over on the next sync of that folder. `--delete` removes
+  only documents of this folder whose file is gone from disk — not ones left out by
+  `--include`/`--exclude` or a type no longer accepted — and deletes nothing from an
+  empty or unreadable folder without `--force`. A same-named document from elsewhere is
+  left alone (exit 1) unless `--adopt`; tags set by hand survive a changed file. Symbolic
+  links are skipped unless `--follow-symlinks` (`ingest` too). **Re-index: none.**
+- Pass 18: a parser that fails on a file's content (rather than the server's
+  surroundings) is a permanent document error: the folder watcher and the scheduled
+  re-index wait for the file to change instead of retrying it forever.
+- Pass 18: citation markers past the last source (`[12]` with four sources, `matrix[7]`)
+  stay in the answer text and simply aren't citations (pass 17 removed them, which cut
+  real text).
+- Pass 18: deleting a workspace moves its scheduled backups to `BACKUP_DIR/.deleted/`
+  (kept, never listed or restored into a new workspace of that name).
+- Pass 18: an uploaded backup may hold 200,000 entries (was 10,000); a backup this server
+  wrote has no entry limit. A zip's entry count is read from its end record before it is
+  opened, so a zip of millions of empty entries is refused at once.
+- Pass 18: stored names may carry folders (`reports/2024/q1.pdf`) when a source asks
+  for them; document routes take the name as a path (`/documents/reports/2024/q1.pdf`).
+  Names without folders are unchanged. **Re-index: none.**
+- Pass 18: the details that a rebuild needs (tags, upload time, source, watched folder)
+  are kept beside each original in `RAW_DOCUMENT_DIR/.meta/`; written for existing
+  originals at the next document listing. **Re-index: none.**
+- Pass 18: with `RECENCY_BOOST_WEIGHT` set, a question about an earlier state of things
+  (a year, "previous", "old", "original", "former"…) is answered without the boost: it
+  put the newest document first, the one such a question isn't about. Measured on
+  `eval/corpus_recency` (weight 1.0): the new `recency_history_eval.jsonl` set, file
+  hit@1 0.33 → 1.00; the current-state set keeps its 1.00 (0.50 unboosted). Boosting
+  only questions that say "current" or "latest" was measured too and lost the gain.
+- Pass 18: the retrieval eval reports k = 6 as well (`MAX_CONTEXT_CHUNKS`' default: what
+  the model reads); the handbook, mixed and sample baselines were re-measured — every
+  earlier number identical.
+- Pass 18, measured and left as it is: the passages placed before the question in the
+  answering prompt (a new question over the same passages got its first token in 1.2 s
+  instead of 13.9 s on Ollama, but qwen2.5 then answered one follow-up from an archived
+  policy: chain fact hit 1.0 → 0.889); starting the raw follow-up's search during the
+  rewrite (it already runs beside the rewrite's: ~1 ms to win).
+- Pass 18: `harness from-queries` labels only the documents an answer cited
+  (`filenames_cited` on `GET /query-log`); an answer citing none goes to the review file
+  with its documents as a draft, not as an `expect_no_context` row.
 - Pass 17: `POST /documents/from-url` no longer replaces a document of the same name
   that came from somewhere else (an upload, another URL) when the name comes from the
   URL itself: that is a 409, and `replace: true` (CLI `add-url --replace`) replaces it.
@@ -363,6 +405,82 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   bounds how long another process's writes go unseen.
 
 ### Added
+- Pass 18: "Why this answer?" under each answer in Reader mode: what was searched (a
+  follow-up's rewrite), where, how well the best passage scored against the bar, and
+  which passages it cites — from the answer itself, no request.
+- Pass 18: on touch screens a conversation's and a document card's actions are one "⋯"
+  menu of labelled items (arrow keys, Escape); Read and Ask stay on the card.
+- Pass 18: Settings → Administration restores a stored backup in the background on
+  request (as zip uploads can); the palette's "Restore a backup" follows the corpus
+  panel's "import in the background" choice. Backup checks, file previews and the
+  unanswered re-check can be cancelled.
+- Pass 18: earlier answer versions can be compared word by word while side by side.
+- Pass 18: `docrag_backup_enabled` and the `DocragBackupNeverRecorded` alert (backups on,
+  none on record); after a restart the newest backup on disk counts as the last success.
+- Pass 18: **Rebuild from originals** (`POST /admin/rebuild`, `docrag rebuild`,
+  Settings → Administration): every kept original with no document is indexed again in
+  the background, with its tags, upload time and source — the way back from a lost Qdrant
+  volume. The consistency check and the rebuild read the index as it is, not the cached
+  listing (a lost collection stayed listed for five minutes and the rebuild found nothing).
+- Pass 18: **Move a whole server** (`docrag migrate pack|unpack`, `GET
+  /admin/migrate/export`, `POST /admin/migrate/import`, Administration): one file with
+  every workspace's originals, versions, tags, sources, settings, ratings and a Qdrant
+  snapshot of each index. Unpacked where the embedding setup matches and the workspace is
+  empty, the index comes back as it was — measured: 17 documents in about a second,
+  nothing embedded; otherwise the documents are indexed from their originals.
+  `MAX_MIGRATE_BYTES` (8 GiB).
+- Pass 18: **Failure notifications** (`NOTIFY_URL`, `NOTIFY_EVENTS`, `NOTIFY_FORMAT`
+  json/text for ntfy, `NOTIFY_ALLOW_PRIVATE`, `NOTIFY_MIN_INTERVAL_SECONDS`): a failed
+  backup, a file the watcher gave up on, a scheduled re-index that failed on the file, a
+  URL refresh that keeps failing, a settings warning at startup. `POST
+  /admin/notify-test`, `docrag notify-test`. Never blocks the work it reports.
+- Pass 18: **Resumable background imports** (`IMPORT_SPOOL_DIR`): a zip or backup imported
+  in the background keeps its file there, and an import a restart (or a crash) cut off
+  runs again at startup — measured: a 450-document zip killed at 48 resumed and finished.
+- Pass 18: **Folder paths in names**, opt-in: `WATCH_KEEP_PATHS`, `docrag ingest|sync
+  --keep-paths`, `keep_paths` on a zip upload, `name` on `POST /documents`. A name and a
+  folder of the same name can't both be stored.
+- Pass 18: `MIN_FREE_BYTES` (507 before an upload, import or backup writes to a nearly
+  full disk); `MAX_CHUNKS_PER_DOCUMENT`; `POST /documents/preview` gives
+  `estimated_seconds` (from the embedding speed measured here) and `over_chunk_limit`.
+- Pass 18: the settings check and `/metrics` (`docrag_index_points`,
+  `docrag_index_vector_bytes`) report the index's size; `docrag init` writes a starting
+  `.env` (a generated `API_KEY`, originals kept, durable jobs, backups, audit log); a
+  compose `ollama` profile runs and pulls the model.
+- Pass 18: `GET /documents` takes `limit`/`cursor`/`prefix`/`tag` (one page, with `total`
+  and `next_cursor`); `POST /documents/missing` says which of a client's files (name +
+  SHA-256) aren't indexed with those bytes; `docrag ingest --skip-unchanged`; sync
+  compares sizes first and remembers file hashes.
+- Pass 18: `unsupported_numbers` (answers, traces, `docrag_unsupported_numbers_total`,
+  the UI's note): citing sentences stating a number none of their cited passages
+  contains. Measured on the recorded handbook answers: 0 of 40 correct answers flagged,
+  22 of 23 answers with one number changed caught.
+- Pass 18: `AUTO_CONTINUE_MAX` (0 = off): a streamed answer cut off at the output limit
+  is continued in the same answer. `retrieval_query` on `done`: what a follow-up was
+  searched as (shown under the answer).
+- Pass 18: recorded answer evals in CI (`harness answer --record/--replay`, `make
+  eval-record`/`eval-replay`, `eval/baselines/replies/`): condense, prompt fitting,
+  citations, status and spans run against the real index with every model reply
+  replayed, held to answer baselines. `answer_excludes` (a stale value fails the row),
+  `chain` (multi-turn with the run's own answers) and `task` (summaries) dataset rows;
+  `chain_eval.jsonl`, `summary_eval.jsonl`; `harness calibrate` (the bar that separates
+  answerable questions), `harness models` (a table of runs), `--provider/--model`.
+- Pass 18: formats `.tsv`, `.jsonl`, `.xml` (DTDs refused), `.org`, and `.ini .conf .cfg
+  .log .css .php .cs .kt .swift .lua` as text; `FRONT_MATTER_TAGS`; `POST
+  /documents/archive-from-url` (a zip at a URL, imported in the background; CLI `add-url
+  --archive`).
+- Pass 18: CLI `export --include-versions`, `imports [--cancel]`, `settings get|set`,
+  `cache [--clear]`, `outline`, `continue`; MCP `list_jobs`, `add_note` (with
+  `--allow-writes`), and document text marked as data, not instructions.
+- Pass 18 (UI): **Quotes & passages** (save a selection as a quote with a link back;
+  collect passages from Search, the viewer or an answer's sources and ask about them
+  together; export both); "Ask within these sources"; "Ask again" from Saved answers and
+  Needs review (the old answer kept as a version to compare); notes on saved answers
+  (exported); passage links in Markdown exports; the workspace in the chat header; zip
+  options (keep folder names, import in the background); Administration: rebuild, audit
+  log, notification test, move this server; Share (where the browser has a share sheet);
+  a web app manifest; the viewer reopens a document where you left it; 24 px citation
+  chips on touch screens.
 - Pass 17: **Continue** for an answer cut off at the token limit
   (`POST /questions/continue` with its `trace_id`): the model carries on from where it
   stopped (the partial answer is passed as its own message to continue — asked in words,
@@ -962,6 +1080,40 @@ into the new one first (`docker run --rm -v <project>_docrag_job_store:/from -v
   lays out only the turns near the viewport.
 
 ### Fixed
+- Pass 18 (found testing with gpt-5-mini): a continued answer from a provider that
+  can't be prefilled (OpenAI; `AUTO_CONTINUE_MAX` and Continue) no longer repeats the
+  words, list marker or list item it picked up from ("It also It also states");
+  a cut just after "(" isn't followed by a space. The wrong-number check counts a cited
+  source's file name and section ("the 2019 file [7]" of
+  `travel_policy_2019_archived.md`), reads "forty‑five" with a typographic hyphen,
+  takes "thirty cents" as "€0.30", and ignores a count of the documents themselves
+  ("all three policies"). Live with gpt-5-mini over the handbook: 9 continuations with
+  no repeated words; the compare and brief false positives gone.
+- Pass 18: a sitemap is read as a stream and at most 50,000 entries (the protocol's
+  limit) are taken from one listing: a 50 MB sitemap of short entries peaked near 1 GB
+  (now 9 MB). The folder watcher waits on a nearly full disk (`MIN_FREE_BYTES`) as it
+  does on a full queue, instead of giving up on the file. A prompt is no longer taken for
+  cut when it is padded (a Markdown table of `------` cells read whole on Ollama was
+  flagged): a cut is now judged against the smaller of two estimates — characters, and
+  words and punctuation runs; a real cut (num_ctx 2048) is still flagged. Recent
+  searches are kept per workspace, and a prefetched passage page is never handed to
+  another workspace. Conversations the history cap lets go, and a cleared
+  conversation's turns, go to Recently deleted. Unsaving an answer keeps keyboard focus
+  in the list.
+- Pass 18: a cut-off summary isn't cached; Continue refuses a summary's trace; a
+  summary not streamed stops when its client leaves; Regenerate replaces the reply kept
+  in the prompt cache; search `explain` judges a file by its best passage. An original
+  dated before 1980 no longer breaks every export. Background imports clean up their
+  temporary files and say `failed` when they end on an error; a cancelled restore leaves
+  feedback alone. Captions starting with NOTE or STYLE are kept; RTF emoji are read.
+  `replace` on a URL the remote server names now replaces. Repair refuses to delete the
+  originals of a lost index. The settings check doesn't warn on a stock install and says
+  when Ollama lacks `LLM_MODEL`. Child sitemaps stay on the sitemap's host. Background
+  imports leave a quarter of the indexing queue to uploads. UI: Continue writes into the
+  same answer; "Ask about this" closes the viewer first; a prefill no longer replaces a
+  draft; token totals count replaced answers; Search keys and "Ask about these" after a
+  similar search; Recently deleted confirms before deleting for good; the saved-answer
+  check searches as the answer was asked; light-theme contrast; viewer contents focus.
 - Pass 17: `/questions` (not streamed) stops when its client leaves, before its next
   expensive stage, as the stream does; its rewrite and query-expansion calls wait their
   turn at a local model. Citation markers past the last source are removed. "Insufficient"

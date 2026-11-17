@@ -19,7 +19,7 @@ DocRAG is a self-hostable, open-source document Q&A system. Clone the repository
 - **Command line and MCP**: `docrag` (`uv tool install ./cli`, or `python -m cli` in the repository) ingests folders, asks, searches, summarizes, exports and restores over the REST API; `docrag-mcp` (`./cli[mcp]`, or `python -m cli.mcp_server`) offers search, cited answers, summaries and document reading as tools to MCP clients such as Claude Desktop. See [Command line and MCP](#command-line-and-mcp).
 - **Multilingual documents**: an opt-in profile swaps in a multilingual embedding model and BM25 stemming for the corpus's language; the reranker is multilingual already. See [Multilingual documents](#multilingual-documents).
 - **Search without an answer**: `POST /search` returns the ranked passages for a query — the same hybrid search, RRF and rerank a question uses, with no LLM call — so finding things in your documents works even when the LLM is down. It also narrows by page range (`page_min`, `page_max`; a passage running onto the range counts), section label (`section`), documents or passages left out (`exclude_filenames`, `exclude_chunk_ids`) and upload date (`uploaded_after`, `uploaded_before`), and marks the sentences that match (`spans`). Questions take the same narrowing. `like_chunk_id` finds the passages most like a stored one instead of a query ("similar" in Search and the source viewer, `docrag search --like`). The UI has it as the Search panel in the left rail (and in the ⌘K palette), scoped like a question, with its own filters (pages, section, tag, upload dates, documents left out).
-- **Stricter answers** (per question): `passages_only` answers from the matched passages without their neighbouring text, and `strong_matches_only` says "not found" rather than answer from weak matches — Settings → Answers, or `--passages-only`/`--strong-only` on the CLI. `RECENCY_BOOST_WEIGHT` (off by default) puts passages from newer documents first among those kept, for a corpus where newer versions supersede older ones.
+- **Stricter answers** (per question): `passages_only` answers from the matched passages without their neighbouring text, and `strong_matches_only` says "not found" rather than answer from weak matches — Settings → Answers, or `--passages-only`/`--strong-only` on the CLI. `RECENCY_BOOST_WEIGHT` (off by default) puts passages from newer documents first among those kept, for a corpus where newer versions supersede older ones; a question about the past ("the 2019 policy", "the previous rules") is answered without it.
 - **Saved answers**: ☆ under an answer keeps it; the Saved answers panel lists them across conversations, to reopen or export as Markdown. "Check against the documents" searches each saved question again and flags answers whose cited passages no longer come up.
 - **Answer language**: `ANSWER_LANGUAGE=match` makes answers and summaries use the language of the question (or name one: `German`); follow-up rewriting keeps the question's language, and recognizes Spanish, German, French, Portuguese and Italian follow-ups.
 - **Multi-query expansion** (opt-in): rewrite the query into several phrasings, retrieve each, and RRF-fuse before reranking — off by default (`QUERY_EXPANSION_ENABLED`).
@@ -133,6 +133,12 @@ docker compose up
 ```
 
 Needs Docker Compose v2.24+ (Docker Engine 25+): the file uses an optional `env_file` entry and `start_interval` healthchecks. Once a release is tagged, `DOCRAG_VERSION=<version> DOCRAG_PULL_POLICY=always docker compose up` runs it instead of building (`ghcr.io/jaswanth1524/retrieval-ai-platform:<version>`, linux/amd64 and linux/arm64); until then, `docker compose up --build` builds the image from the checkout.
+
+**A durable setup in one step:** `docrag init` (the CLI, see below) writes a `.env` with
+a generated `API_KEY`, originals kept (`RAW_DOCUMENT_DIR`), the sqlite job store with
+interrupted jobs re-queued, daily backups and the audit log; `docrag init
+--ollama-in-compose` also points the API at Compose's own Ollama, which `docker compose
+--profile ollama up` starts (the `ollama-pull` service fetches `LLM_MODEL` once).
 
 The UI and API are published on `127.0.0.1:8000` only. To open DocRAG from another device, set `API_BIND=0.0.0.0` in `.env`, and set `API_KEY` too: with no key, anyone who can reach the port can upload, delete and download the whole corpus.
 
@@ -443,7 +449,10 @@ the folder read-only and point `WATCH_DIR` at it (see the commented line in
 `WATCH_DIRS="/srv/hr=>hr;/srv/legal=>legal"` (the same folder twice, one inside
 another, or two folders into one workspace stops startup); `GET /watch` lists each under
 `folders`. A folder can have its own patterns after a `|`:
-`/srv/legal=>legal|include=*.pdf,*.docx|exclude=drafts/*`.
+`/srv/legal=>legal|include=*.pdf,*.docx|exclude=drafts/*`. `WATCH_KEEP_PATHS=true`
+names each document by its path under the folder (`reports/2024/q1.pdf`), so same-named
+files in different subfolders are all indexed (`docrag sync --keep-paths` and the zip
+upload's "keep folder names" do the same).
 
 ## Troubleshooting
 
@@ -620,14 +629,16 @@ own baseline: what a parser loses shows up next to the Markdown run, and a run o
 several formats breaks its scores down by format (`by_format`, in `report` and `diff`).
 CI runs it too. A corpus can say when its documents were uploaded with a
 `.uploaded_at.json` (`{"policy.md": "2021-03-01"}`): `eval/corpus_recency` and
-`recency_eval.jsonl` (superseded policy versions) measure `RECENCY_BOOST_WEIGHT`.
+`recency_eval.jsonl` (superseded policy versions) and `recency_history_eval.jsonl`
+(questions about the older versions) measure `RECENCY_BOOST_WEIGHT`.
 
 `harness sweep DATASET --grid rerank_min_score=0.1,0.15,0.2 rerank_fallback_count=0,3` ranks
 each question once and replays passage selection under every combination, printing hit@k
 and the no-context rate per row and the `.env` lines of the best (`--rank-by`). `harness
 generate --corpus DIR --count N` drafts labeled rows (one question per sampled passage,
-asked of the configured LLM) and `harness from-queries` drafts rows from the query log;
-review both before using them. `harness diff` gives a paired bootstrap interval per
+asked of the configured LLM) and `harness from-queries` drafts rows from the query log
+(only documents an answer cited become a label; an answer citing none goes to the review
+file); review both before using them. `harness diff` gives a paired bootstrap interval per
 metric, so a small move can be read as noise. Dataset rows may carry `filenames`/`tags`
 to scope a question, and answer runs report `cited_chunk_precision` and
 `unsupported_claims_mean`. `GET /traces/score-report?labels=feedback` builds the score
@@ -641,6 +652,24 @@ baseline checks) are unit-tested with fakes; the handbook eval runs for real in 
 > queryable and no re-ingest is *required* — but re-uploading documents is recommended
 > so a corpus is chunked consistently. Re-uploading replaces a document's chunks
 > automatically.
+
+### Recorded answer evals (no LLM)
+
+`harness answer --record replies.jsonl` keeps every model reply of a run, keyed by the
+exact messages sent; `--replay replies.jsonl` answers each call from that file instead, so
+everything around the model — the follow-up rewrite, prompt fitting, citation retry and
+backfill, answer status and spans — runs for real with no LLM. CI replays the handbook,
+follow-up, compare and unanswerable sets this way against `eval/baselines/answers_*.json`
+(`--baseline`, `--max-regression`). A call whose passages merely moved (int8 reranker
+scores differ slightly between CPUs) gets the reply recorded for the same question and
+instructions; a changed question, rewrite or prompt is a miss, and that question an
+error row: after an intended change, `make eval-record` (with
+Ollama and qwen2.5, as recorded) records them again and rewrites the baselines; `make
+eval-replay` runs them as CI does. Datasets can also say what an answer must not state
+(`answer_excludes`), chain questions into a conversation (`chain`), or ask for a summary
+(`task`). `harness calibrate DATASET…` reports the rerank bar that best separates
+answerable questions from `expect_no_context` ones; `harness models RUN…` tables several
+answer runs (facts, uncited, seconds, cost) — e.g. one per `--provider/--model`.
 
 ## Behind a reverse proxy
 
@@ -707,6 +736,33 @@ knows lives in two places:
   database, and stored originals (`RAW_DOCUMENT_DIR`). Back it up with the volume, e.g.
   `docker run --rm -v <project>_docrag_data:/data -v "$PWD":/backup busybox tar czf
   /backup/docrag-data.tgz -C /data .`.
+
+**After losing the index** (a wiped `qdrant_storage` volume, a collection deleted by
+hand) with originals kept: Settings → Administration → Rebuild, `docrag rebuild` or `POST
+/admin/rebuild` indexes every stored original again, with its tags, upload time and
+source (kept beside it in `RAW_DOCUMENT_DIR/.meta/`). The consistency check refuses to
+delete "orphaned" originals while most of them have no document — that is a lost index,
+and they are the only copies.
+
+**Moving to another machine:** `docrag migrate pack server.zip` (or Administration →
+Move this server) writes one file with every workspace's originals, history, tags,
+sources, settings and ratings, plus a Qdrant snapshot of each index; `docrag migrate
+unpack server.zip` on the new server puts it back. With the same embedding settings and
+empty workspaces the snapshots are used as they are — nothing is embedded again;
+otherwise documents are indexed from their originals. The upload is spooled to disk
+twice (by the web server, in `TMPDIR`, then into `IMPORT_SPOOL_DIR`): in Compose `/tmp`
+is memory counted against `API_MEM_LIMIT`, so for a large bundle set `TMPDIR` and
+`IMPORT_SPOOL_DIR` to folders under `/app/data`, or raise `API_MEM_LIMIT`.
+
+**Background imports that survive a restart:** with `IMPORT_SPOOL_DIR` set (e.g.
+`./data/imports`), a zip or backup imported in the background keeps its file there, and
+one a restart or crash cut off runs again at the next start. `MIN_FREE_BYTES` refuses
+uploads, imports and backups (507) before they fill the disk.
+
+**Being told when unattended work fails:** `NOTIFY_URL` (a Slack-compatible webhook, or
+an ntfy topic with `NOTIFY_FORMAT=text`) gets a message for a failed backup, a file the
+watcher gave up on, a scheduled re-index that failed, a URL that keeps failing to refresh,
+and a settings warning at startup. `docrag notify-test` sends one now.
 
 **After changing the embedding model** (`DENSE_EMBEDDING_MODEL`/`EMBEDDING_MODEL_TAG`, or the
 sparse model) the existing index no longer matches: questions, search and uploads answer
