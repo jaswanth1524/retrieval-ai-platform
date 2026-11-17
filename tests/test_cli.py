@@ -1561,3 +1561,202 @@ def test_ingest_sends_a_zip_in_the_background_and_waits_until_it_is_queued(
     code, out = run(client, "ingest", str(archive), "--background", "--json")
     report = json.loads(out)
     assert code == 0 and report["queued_in_background"][0]["queued"] == 2
+
+
+def test_sync_delete_only_removes_this_folders_files_that_are_really_gone(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    from cli.__main__ import legacy_sync_tag, sync_tag
+
+    first, second = tmp_path / "a" / "docs", tmp_path / "b" / "docs"
+    for folder, name in ((first, "one.txt"), (second, "two.txt")):
+        folder.mkdir(parents=True)
+        (folder / name).write_text(f"Intro\n{name} text")
+    (first / "keep.md").write_text("# Keep\nkept in the first folder")
+    assert sync_tag(first) != sync_tag(second) and legacy_sync_tag(first) == legacy_sync_tag(second)
+    assert run(client, "sync", str(first))[0] == 0
+    assert run(client, "sync", str(second))[0] == 0
+
+    # Two folders of the same name: one's --delete leaves the other's documents.
+    code, out = run(client, "sync", str(second), "--delete")
+    assert code == 0 and "0 deleted" in out
+    assert sorted(client.documents()["filenames"]) == ["keep.md", "one.txt", "two.txt"]
+
+    # A file left out by a filter is still on disk: it isn't "gone".
+    code, out = run(client, "sync", str(first), "--exclude", "*.md", "--delete")
+    assert "0 deleted" in out and "keep.md" in client.documents()["filenames"]
+
+    # A hand-set tag survives a changed file's re-upload.
+    client.set_tags("one.txt", ["hr", sync_tag(first)])
+    (first / "one.txt").write_text("Intro\none.txt changed")
+    assert run(client, "sync", str(first))[0] == 0
+    assert sorted(client.documents()["tags"]["one.txt"]) == sorted(["hr", sync_tag(first)])
+
+    # An empty folder (an unmounted share) deletes nothing without --force.
+    for path in first.iterdir():
+        path.unlink()
+    code, out = run(client, "sync", str(first), "--delete")
+    assert code == 1 and "nothing deleted" in out
+    assert "one.txt" in client.documents()["filenames"]
+    code, out = run(client, "sync", str(first), "--delete", "--force")
+    assert "2 deleted" in out
+    assert sorted(client.documents()["filenames"]) == ["two.txt"]
+
+
+def test_sync_leaves_a_same_named_document_from_elsewhere_and_skips_symlinks(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    from cli.__main__ import legacy_sync_tag, sync_tag
+
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    (folder / "plan.txt").write_text("Intro\nthe folder's plan")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("Intro\nnot for upload")
+    (folder / "link.txt").symlink_to(secret)
+    elsewhere = tmp_path / "plan.txt"
+    elsewhere.write_text("Intro\nanother plan, uploaded by hand")
+    assert run(client, "ingest", str(elsewhere))[0] == 0
+
+    code, out = run(client, "sync", str(folder))
+    assert code == 1 and "--adopt replaces it" in out
+    assert client.documents()["filenames"] == ["plan.txt"]  # the link wasn't followed
+    assert "by hand" in client.content("plan.txt")["chunks"][0]["text"]
+    code, out = run(client, "sync", str(folder), "--adopt", "--delete")
+    assert code == 0 and "folder's plan" in client.content("plan.txt")["chunks"][0]["text"]
+
+    # A document an older version's sync tagged (the folder's name alone) is taken over.
+    client.set_tags("plan.txt", [legacy_sync_tag(folder)])
+    assert run(client, "sync", str(folder))[0] == 0
+    assert sync_tag(folder) in client.documents()["tags"]["plan.txt"]
+
+
+def test_ingest_skip_unchanged_asks_before_sending_and_rebuild_reports_nothing_to_do(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    (folder / "a.txt").write_text("Intro\nalpha one")
+    (folder / "b.txt").write_text("Intro\nbeta two")
+    code, out = run(client, "ingest", str(folder), "--skip-unchanged")
+    assert code == 0 and "2 indexed, 0 failed, 0 skipped" in out
+    (folder / "b.txt").write_text("Intro\nbeta, now different")
+    code, out = run(client, "ingest", str(folder), "--skip-unchanged")
+    assert code == 0
+    assert "a.txt (unchanged: already indexed with these bytes)" in out
+    assert "b.txt (unchanged" not in out
+
+    assert client.missing([("a.txt", "0" * 64), ("nope.txt", "1" * 64)]) == ["a.txt", "nope.txt"]
+    page = client.documents(limit=1)
+    assert page["filenames"] == ["a.txt"] and page["next_cursor"] == "a.txt" and page["total"] == 2
+
+    code, out = run(client, "rebuild")
+    # Originals aren't kept by this test server: the refusal is the server's message.
+    assert code == 1 and out == ""
+
+
+def test_the_hash_cache_rehashes_only_what_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli import __main__ as docrag_cli
+
+    target = tmp_path / "a.txt"
+    target.write_text("one")
+    calls: list[Path] = []
+    real = docrag_cli._sha256
+
+    def counting(path: Path) -> str:
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(docrag_cli, "_sha256", counting)
+    store = tmp_path / "cache" / "hashes.json"
+    cache = docrag_cli.HashCache(store)
+    first = cache.sha256(target)
+    cache.save()
+    again = docrag_cli.HashCache(store)
+    assert again.sha256(target) == first and len(calls) == 1
+    target.write_text("three")
+    assert again.sha256(target) != first and len(calls) == 2
+    store.write_text("not json")
+    assert docrag_cli.HashCache(store).sha256(target) == again.sha256(target)
+
+
+def test_init_writes_a_private_env_with_a_key_and_the_durable_stores(tmp_path: Path) -> None:
+    import io
+    import stat
+
+    from api.settings import AppSettings
+    from cli.__main__ import main
+
+    target = tmp_path / ".env"
+    out = io.StringIO()
+    assert main(["init", "--output", str(target), "--ollama-in-compose"], out=out) == 0
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    values = dict(
+        line.split("=", 1)
+        for line in target.read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    assert len(values["API_KEY"]) >= 32 and values["OLLAMA_BASE_URL"] == "http://ollama:11434"
+    # Every name it writes is a real setting, and the values load.
+    settings = AppSettings(**{name.lower(): value for name, value in values.items()})
+    assert settings.raw_document_dir and settings.job_store_backend == "sqlite"
+    first = target.read_text()
+    assert main(["init", "--output", str(target)], out=io.StringIO()) == 2
+    assert target.read_text() == first
+    assert main(["init", "--output", str(target), "--force"], out=io.StringIO()) == 0
+    assert target.read_text() != first
+
+
+def test_sync_keep_paths_indexes_same_named_files_in_different_folders(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    folder = tmp_path / "notes"
+    (folder / "2024").mkdir(parents=True)
+    (folder / "2025").mkdir()
+    (folder / "2024" / "readme.txt").write_text("Intro\nthe 2024 notes")
+    (folder / "2025" / "readme.txt").write_text("Intro\nthe 2025 notes")
+
+    code, out = run(client, "sync", str(folder), "--keep-paths")
+    assert code == 0 and "sync: 2 sent, 0 unchanged" in out
+    assert sorted(client.documents()["filenames"]) == ["2024/readme.txt", "2025/readme.txt"]
+    code, out = run(client, "sync", str(folder), "--keep-paths")
+    assert "sync: 0 sent, 2 unchanged" in out
+    (folder / "2025" / "readme.txt").unlink()
+    code, out = run(client, "sync", str(folder), "--keep-paths", "--delete")
+    assert code == 0 and "1 deleted" in out
+    assert client.documents()["filenames"] == ["2024/readme.txt"]
+
+
+def test_imports_settings_cache_outline_export_and_continue_commands(
+    client: DocragClient, tmp_path: Path
+) -> None:
+    import json
+
+    code, out = run(client, "imports")
+    assert code == 0 and "no background imports" in out
+    code, out = run(client, "settings", "set", "rerank_min_score=0.3", "answer_format=null")
+    assert code == 0 and "rerank_min_score = 0.3  (this workspace's)" in out
+    code, out = run(client, "settings", "get", "--json")
+    assert json.loads(out)["settings"]["rerank_min_score"] == 0.3
+    assert run(client, "settings", "set", "nonsense")[0] == 2
+
+    code, out = run(client, "cache")
+    assert code == 0 and ("cached" in out or "off" in out)
+    assert run(client, "cache", "--clear")[0] == 0
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "guide.md").write_text("# Intro\nalpha\n\n# Setup\nbeta gamma")
+    assert run(client, "ingest", str(folder))[0] == 0
+    code, out = run(client, "outline", "guide.md")
+    assert code == 0 and "p.    1  Intro" in out  # short sections are merged
+
+    target = tmp_path / "backup.zip"
+    assert run(client, "export", str(target), "--include-versions")[0] == 0
+    assert target.stat().st_size > 0
+
+    # An unknown trace: the server's 404, as an error exit.
+    code, _ = run(client, "continue", "no-such-trace")
+    assert code != 0

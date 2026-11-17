@@ -42,6 +42,8 @@ JOB_POLL_MAX_FAILURES = 3
 # 50 by default — a finished job is evicted past it, and would read as unknown) and its
 # in-flight cap (an upload past it waits on a 503).
 INGEST_WINDOW = 8
+# Name and hash pairs per POST /documents/missing (the server takes 2000).
+MISSING_BATCH = 1000
 
 
 class Cancelled(Exception):
@@ -328,13 +330,26 @@ class DocragClient:
         result: dict[str, Any] = self._json("GET", "/config")
         return result
 
-    def documents(self) -> dict[str, Any]:
-        result: dict[str, Any] = self._json("GET", "/documents")
+    def documents(self, **params: Any) -> dict[str, Any]:
+        """The listing; ``limit``/``cursor``/``prefix``/``tag`` ask for one page of it."""
+
+        result: dict[str, Any] = self._json("GET", "/documents", params=params or None)
         return result
+
+    def missing(self, documents: list[tuple[str, str]]) -> list[str]:
+        """``POST /documents/missing``: the names (of at most ``MISSING_BATCH`` name and
+        SHA-256 pairs) that aren't indexed with exactly those bytes."""
+
+        result: dict[str, Any] = self._json(
+            "POST",
+            "/documents/missing",
+            json={"documents": [{"name": name, "sha256": digest} for name, digest in documents]},
+        )
+        return list(result.get("missing", []))
 
     def content(self, filename: str, **params: Any) -> dict[str, Any]:
         result: dict[str, Any] = self._json(
-            "GET", f"/documents/{_quote(filename)}/content", params=params
+            "GET", f"/documents/{_quote_name(filename)}/content", params=params
         )
         return result
 
@@ -443,6 +458,17 @@ class DocragClient:
                 body[key] = value
         return self._stream("/questions/summary/stream", body, on_delta, on_stage, should_stop)
 
+    def continue_answer(
+        self,
+        trace_id: str,
+        on_delta: Callable[[str], None] | None = None,
+        on_stage: Callable[[dict[str, Any]], None] | None = None,
+    ) -> StreamResult:
+        """``POST /questions/continue``: the rest of an answer cut off at the output
+        limit; ``done`` carries the whole answer."""
+
+        return self._stream("/questions/continue", {"trace_id": trace_id}, on_delta, on_stage)
+
     def _stream(
         self,
         path: str,
@@ -504,7 +530,12 @@ class DocragClient:
     # -- changes -----------------------------------------------------------------------
 
     def upload(
-        self, path: Path, *, deadline: float | None = None, tags: Sequence[str] = ()
+        self,
+        path: Path,
+        *,
+        deadline: float | None = None,
+        tags: Sequence[str] = (),
+        name: str | None = None,
     ) -> dict[str, Any]:
         """Upload one file (with ``tags``); waits out a full indexing queue (503) or a
         rate limit (429), each with its Retry-After — but not past ``deadline`` (this
@@ -519,7 +550,12 @@ class DocragClient:
                 response = self._http.post(
                     "/documents",
                     files={"file": (path.name, content, "application/octet-stream")},
-                    data={"tags": list(tags)} if tags else None,
+                    data={
+                        **({"tags": list(tags)} if tags else {}),
+                        # A stored name with folders (--keep-paths).
+                        **({"name": name} if name else {}),
+                    }
+                    or None,
                     headers=self._headers,
                 )
             except httpx.HTTPError as exc:
@@ -538,6 +574,20 @@ class DocragClient:
             result: dict[str, Any] = _response_json(response)
             return result
         raise DocragError("The indexing queue stayed full.")  # pragma: no cover
+
+    def upload_text(self, name: str, text: str, *, tags: Sequence[str] = ()) -> dict[str, Any]:
+        """Index ``text`` as a document named ``name`` (a note), as an upload would."""
+
+        response = self._http.post(
+            "/documents",
+            files={"file": (name.rsplit("/", 1)[-1], text.encode("utf-8"), "text/markdown")},
+            data={**({"tags": list(tags)} if tags else {}), "name": name},
+            headers=self._headers,
+        )
+        if response.status_code >= 400:
+            raise DocragError(_detail(response), response.status_code)
+        result: dict[str, Any] = _response_json(response)
+        return result
 
     def add_sitemap(
         self,
@@ -725,6 +775,7 @@ class DocragClient:
         timeout: float | None = None,
         on_finished: Callable[[Path, dict[str, Any]], None] | None = None,
         tags: Sequence[str] = (),
+        names: dict[Path, str] | None = None,
     ) -> dict[Path, dict[str, Any]]:
         """Upload ``paths`` and wait for them, at most ``window`` indexing at once (the
         server indexes those side by side); the next goes up as soon as one finishes.
@@ -750,7 +801,10 @@ class DocragClient:
             while queue and len(indexing) < window and not timed_out:
                 path = queue.pop(0)
                 try:
-                    indexing[self.upload(path, deadline=deadline, tags=tags)["job_id"]] = path
+                    accepted = self.upload(
+                        path, deadline=deadline, tags=tags, name=(names or {}).get(path)
+                    )
+                    indexing[accepted["job_id"]] = path
                 except DocragError as exc:
                     finish(path, {"state": "failed", "error": str(exc)})
             finished = 0
@@ -797,20 +851,20 @@ class DocragClient:
         return status
 
     def delete(self, filename: str) -> None:
-        self._request("DELETE", f"/documents/{_quote(filename)}")
+        self._request("DELETE", f"/documents/{_quote_name(filename)}")
 
     def set_tags(self, filename: str, tags: list[str]) -> list[str]:
         """Replace a document's tags; the tags as stored."""
 
         result: dict[str, Any] = self._json(
-            "PATCH", f"/documents/{_quote(filename)}/tags", json={"tags": tags}
+            "PATCH", f"/documents/{_quote_name(filename)}/tags", json={"tags": tags}
         )
         return list(result.get("tags", []))
 
     def reindex(self, filename: str) -> dict[str, Any]:
         """Re-index one document from its stored original; the accepted job."""
 
-        result: dict[str, Any] = self._json("POST", f"/documents/{_quote(filename)}/reindex")
+        result: dict[str, Any] = self._json("POST", f"/documents/{_quote_name(filename)}/reindex")
         return result
 
     def reindex_stale(self) -> dict[str, Any]:
@@ -822,7 +876,7 @@ class DocragClient:
     def refresh(self, filename: str) -> dict[str, Any]:
         """Fetch a URL-ingested document again: the accepted job, or ``unchanged``."""
 
-        result: dict[str, Any] = self._json("POST", f"/documents/{_quote(filename)}/refresh")
+        result: dict[str, Any] = self._json("POST", f"/documents/{_quote_name(filename)}/refresh")
         return result
 
     def set_refresh_interval(self, filename: str, minutes: int | None) -> dict[str, Any]:
@@ -830,7 +884,7 @@ class DocragClient:
 
         result: dict[str, Any] = self._json(
             "PATCH",
-            f"/documents/{_quote(filename)}/refresh-settings",
+            f"/documents/{_quote_name(filename)}/refresh-settings",
             json={"refresh_minutes": minutes},
         )
         return result
@@ -838,12 +892,12 @@ class DocragClient:
     def versions(self, filename: str) -> list[dict[str, Any]]:
         """Earlier versions of a document's original, newest first."""
 
-        result: dict[str, Any] = self._json("GET", f"/documents/{_quote(filename)}/versions")
+        result: dict[str, Any] = self._json("GET", f"/documents/{_quote_name(filename)}/versions")
         return list(result.get("versions", []))
 
     def restore_version(self, filename: str, version: str) -> dict[str, Any]:
         result: dict[str, Any] = self._json(
-            "POST", f"/documents/{_quote(filename)}/versions/{_quote(version)}/restore"
+            "POST", f"/documents/{_quote_name(filename)}/versions/{_quote(version)}/restore"
         )
         return result
 
@@ -931,14 +985,64 @@ class DocragClient:
     def watch_scan(self) -> None:
         self._request("POST", "/watch/scan")
 
-    def export(self, destination: Path) -> int:
+    def export(self, destination: Path, *, include_versions: bool = False) -> int:
         """Stream ``GET /export`` into ``destination``; returns the bytes written.
 
         The download goes to a temporary file beside ``destination``, which replaces it
         only once the whole zip arrived: a failed or interrupted export never truncates
         an existing backup, and leaves nothing behind."""
 
-        return self.download("/export", destination)
+        path = "/export?include_versions=true" if include_versions else "/export"
+        return self.download(path, destination)
+
+    def background_imports(self) -> list[dict[str, Any]]:
+        """``GET /documents/imports``: this workspace's background imports, newest first."""
+
+        result: dict[str, Any] = self._json("GET", "/documents/imports")
+        return list(result.get("imports", []))
+
+    def cancel_import(self, import_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("DELETE", f"/documents/imports/{_quote(import_id)}")
+        return result
+
+    def workspace_settings(self, name: str) -> dict[str, Any]:
+        """A workspace's own settings ("default" for the default one) and the ones in
+        effect."""
+
+        result: dict[str, Any] = self._json("GET", f"/workspaces/{_quote(name)}/settings")
+        return result
+
+    def set_workspace_settings(self, name: str, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace a workspace's own settings (an unset one is the server's)."""
+
+        result: dict[str, Any] = self._json(
+            "PUT", f"/workspaces/{_quote(name)}/settings", json=dict(values)
+        )
+        return result
+
+    def answer_cache(self) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("GET", "/answer-cache")
+        return result
+
+    def clear_answer_cache(self) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("DELETE", "/answer-cache")
+        return result
+
+    def outline(self, filename: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json("GET", f"/documents/{_quote_name(filename)}/outline")
+        return result
+
+    def add_archive_url(
+        self, url: str, *, tags: Sequence[str] = (), keep_paths: bool = False
+    ) -> dict[str, Any]:
+        """``POST /documents/archive-from-url``: the server fetches a zip and imports its
+        documents in the background (``wait_for_import``)."""
+
+        body: dict[str, Any] = {"url": url, "keep_paths": keep_paths}
+        if tags:
+            body["tags"] = list(tags)
+        result: dict[str, Any] = self._json("POST", "/documents/archive-from-url", json=body)
+        return result
 
     def export_traces(self, destination: Path) -> int:
         """Every kept trace as JSON Lines (``GET /traces/export``, full key)."""
@@ -948,7 +1052,7 @@ class DocragClient:
     def original(self, filename: str, destination: Path) -> int:
         """A document's stored original (RAW_DOCUMENT_DIR) into ``destination``."""
 
-        return self.download(f"/documents/{_quote(filename)}/original", destination)
+        return self.download(f"/documents/{_quote_name(filename)}/original", destination)
 
     def download(self, path: str, destination: Path) -> int:
         """Stream ``GET path`` into ``destination`` through a temporary file beside it
@@ -1064,6 +1168,38 @@ class DocragClient:
         result: dict[str, Any] = self._json("DELETE", f"/backups/{_quote(name)}")
         return result
 
+    def migrate_pack(self, destination: Path) -> int:
+        """``GET /admin/migrate/export`` into ``destination``; the bytes written."""
+
+        return self.download("/admin/migrate/export", destination)
+
+    def migrate_unpack(self, bundle: Path) -> dict[str, Any]:
+        """``POST /admin/migrate/import``: the server unpacks it in the background."""
+
+        try:
+            handle = bundle.open("rb")
+        except OSError as exc:
+            raise DocragError(f"Cannot read {bundle}: {exc.strerror or exc}") from exc
+        with handle:
+            result: dict[str, Any] = self._json(
+                "POST",
+                "/admin/migrate/import",
+                files={"file": (bundle.name, handle, "application/zip")},
+            )
+        return result
+
+    def notify_test(self) -> dict[str, Any]:
+        """``POST /admin/notify-test``: send one notification through NOTIFY_URL now."""
+
+        result: dict[str, Any] = self._json("POST", "/admin/notify-test")
+        return result
+
+    def rebuild(self) -> dict[str, Any]:
+        """``POST /admin/rebuild``: index every stored original that has no document."""
+
+        result: dict[str, Any] = self._json("POST", "/admin/rebuild")
+        return result
+
     def repair(self, **remedies: bool) -> dict[str, Any]:
         """``POST /admin/consistency/repair`` with the remedies asked for."""
 
@@ -1112,6 +1248,13 @@ def _until(lines: Iterator[str], should_stop: Callable[[], bool]) -> Iterator[st
 
 def _quote(segment: str) -> str:
     return quote(segment, safe="")
+
+
+def _quote_name(name: str) -> str:
+    """A document's name in a URL path: each part quoted, the ``/`` between folders
+    kept (a name may carry them: reports/2024/q1.pdf)."""
+
+    return quote(name, safe="/")
 
 
 # What an answer's grounding means, for a person (CLI) or an agent (MCP). The server's

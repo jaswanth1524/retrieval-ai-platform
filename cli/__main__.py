@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 from cli.client import (
     FINISHED_JOB_STATES,
+    MISSING_BATCH,
     REFUSED_STATUSES,
     DocragClient,
     DocragError,
@@ -73,12 +74,16 @@ def ingestible(
     *,
     include: Sequence[str] = (),
     exclude: Sequence[str] = (),
+    follow_symlinks: bool = False,
 ) -> tuple[list[Path], list[Path]]:
     """Files to upload under ``paths`` (directories walked recursively, sorted) and the
     ones skipped for an unsupported type. Dotfiles and dot-directories inside a walked
     directory are ignored; a file named on the command line is always considered.
     ``include`` / ``exclude`` glob patterns choose files (left out silently), and an
-    excluded directory name leaves its whole tree out."""
+    excluded directory name leaves its whole tree out. A symbolic link met while
+    walking is left out unless ``follow_symlinks``: a folder holding
+    ``notes.txt -> ~/.ssh/id_rsa`` would otherwise upload the key (the server's folder
+    watcher refuses them too)."""
 
     found: list[Path] = []
     skipped: list[Path] = []
@@ -88,6 +93,7 @@ def ingestible(
                 p
                 for p in path.rglob("*")
                 if p.is_file()
+                and (follow_symlinks or not p.is_symlink())
                 and not any(part.startswith(".") for part in p.relative_to(path).parts)
                 and not any(
                     _matches("/".join(p.relative_to(path).parts[: depth + 1]), exclude)
@@ -107,6 +113,28 @@ def ingestible(
             else:
                 skipped.append(candidate)
     return found, skipped
+
+
+def document_names(
+    files: Sequence[Path], roots: Sequence[Path], keep_paths: bool
+) -> dict[Path, str]:
+    """The name each file is stored under: its base name, or with ``keep_paths`` its
+    path under the folder named on the command line that holds it (``reports/q1.pdf``;
+    a file named on its own keeps its base name)."""
+
+    names: dict[Path, str] = {}
+    folders = [root for root in roots if root.is_dir()]
+    for path in files:
+        name = path.name
+        if keep_paths:
+            for root in folders:
+                try:
+                    name = path.relative_to(root).as_posix()
+                    break
+                except ValueError:
+                    continue
+        names[path] = name
+    return names
 
 
 def stored_name_key(name: str) -> str:
@@ -153,6 +181,7 @@ STAGE_NAMES = {
     "joining_identical_question": "the same question is being answered; waiting for it",
     "reading": "reading the passages",
     "verifying_citations": "checking citations",
+    "continuing": "continuing the answer",
     "reading_documents": "reading the document",
     "summarizing": "taking notes",
     "combining": "combining notes",
@@ -318,7 +347,11 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     extensions = {ext.lower() for ext in config.get("supported_extensions", [])}
     max_bytes = config.get("max_upload_bytes")
     files, unsupported = ingestible(
-        paths, extensions, include=args.include or (), exclude=args.exclude or ()
+        paths,
+        extensions,
+        include=args.include or (),
+        exclude=args.exclude or (),
+        follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
     )
     # A zip found while walking a directory is sent as an archive too, as one named on
     # the command line is (it used to be skipped as an unsupported type).
@@ -344,6 +377,12 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         skip(path, "unsupported type")
     uploads: list[Path] = []
     first_of: dict[str, Path] = {}
+    given = getattr(args, "names", None)
+    names: dict[Path, str] = (
+        {path: given.get(str(path), path.name) for path in files}
+        if given is not None
+        else document_names(files, paths, bool(getattr(args, "keep_paths", False)))
+    )
     for path in files:
         try:
             size = path.stat().st_size
@@ -354,11 +393,19 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             skip(path, f"too large: {size} bytes, the limit is {max_bytes}")
             continue
         # Same basename from two folders: the second upload would replace the first.
-        first = first_of.setdefault(stored_name_key(path.name), path)
+        first = first_of.setdefault(stored_name_key(names[path]), path)
         if first is not path:
-            skip(path, f"another file is already indexed as {first.name}: {first}")
+            skip(path, f"another file is already indexed as {names[first]}: {first}")
             continue
         uploads.append(path)
+    if getattr(args, "skip_unchanged", False) and uploads:
+        cache = HashCache()
+        unchanged = _unchanged_on_server(client, uploads, cache, names)
+        cache.save()
+        for path in uploads:
+            if path in unchanged:
+                skip(path, "unchanged: already indexed with these bytes")
+        uploads = [path for path in uploads if path not in unchanged]
 
     def finished(path: Path, status: dict[str, Any]) -> None:
         if status.get("state") != "done":
@@ -382,7 +429,11 @@ def cmd_ingest(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
                 print(f"      note: {warning}", file=text)
 
     statuses = client.index_files(
-        uploads, timeout=_wait_limit(args), on_finished=finished, tags=args.tag or ()
+        uploads,
+        timeout=_wait_limit(args),
+        on_finished=finished,
+        tags=args.tag or (),
+        names={path: names[path] for path in uploads if names[path] != path.name},
     )
     for path, status in statuses.items():
         if status.get("state") not in FINISHED_JOB_STATES:
@@ -471,16 +522,31 @@ def _follow_archive_import(
         )
 
 
-# Tags are at most 40 characters: "sync:" and the folder's name, cut to fit.
+# Tags are at most 40 characters: "sync:", the folder's name (cut to fit) and a short
+# digest of its full path.
 _SYNC_TAG_PREFIX = "sync:"
 _MAX_TAG_CHARS = 40
+_SYNC_DIGEST_CHARS = 8
 
 
-def sync_tag(directory: Path) -> str:
-    """The tag ``docrag sync`` marks a folder's documents with (what --delete may remove)."""
+def legacy_sync_tag(directory: Path) -> str:
+    """The tag earlier versions used: the folder's name alone, which two folders of the
+    same name shared (so one's --delete removed the other's documents)."""
 
     name = directory.resolve().name or "root"
     return (_SYNC_TAG_PREFIX + name)[:_MAX_TAG_CHARS]
+
+
+def sync_tag(directory: Path) -> str:
+    """The tag ``docrag sync`` marks a folder's documents with (what --delete may
+    remove): the folder's name and a digest of its resolved path, so ``~/a/docs`` and
+    ``~/b/docs`` each have their own."""
+
+    resolved = directory.resolve()
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:_SYNC_DIGEST_CHARS]
+    room = _MAX_TAG_CHARS - len(_SYNC_TAG_PREFIX) - len(digest) - 1
+    name = (resolved.name or "root").lower()[:room]
+    return f"{_SYNC_TAG_PREFIX}{name}-{digest}"
 
 
 def _sha256(path: Path) -> str:
@@ -491,57 +557,194 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class HashCache:
+    """SHA-256 of local files remembered between runs, by path, size and modification
+    time: a sync of a large folder hashes only what changed since the last one. Kept in
+    the user's cache directory; a file it can't read or write is simply not used."""
+
+    _MAX_ENTRIES = 200_000
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path if path is not None else self._default_path()
+        self._entries: dict[str, list[Any]] = {}
+        self._dirty = False
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self._entries = {k: v for k, v in loaded.items() if isinstance(v, list)}
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _default_path() -> Path:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        return Path(base) / "docrag" / "hashes.json"
+
+    def sha256(self, path: Path) -> str:
+        stat = path.stat()
+        key = str(path.resolve())
+        entry = self._entries.get(key)
+        if entry and entry[:2] == [stat.st_size, stat.st_mtime_ns] and len(entry) == 3:
+            return str(entry[2])
+        digest = _sha256(path)
+        self._entries[key] = [stat.st_size, stat.st_mtime_ns, digest]
+        self._dirty = True
+        return digest
+
+    def save(self) -> None:
+        if not self._dirty:
+            return
+        if len(self._entries) > self._MAX_ENTRIES:
+            self._entries = dict(list(self._entries.items())[-self._MAX_ENTRIES :])
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            partial = self._path.with_suffix(".json.part")
+            partial.write_text(json.dumps(self._entries), encoding="utf-8")
+            os.replace(partial, self._path)
+        except OSError:
+            pass
+
+
+def _unchanged_on_server(
+    client: DocragClient,
+    files: list[Path],
+    cache: HashCache,
+    names: dict[Path, str] | None = None,
+) -> set[Path]:
+    """The files the server already holds under their name with exactly these bytes
+    (``POST /documents/missing``, a batch at a time). A server without that route (or
+    a file that can't be read) leaves everything to be sent."""
+
+    def name_of(path: Path) -> str:
+        return (names or {}).get(path, path.name)
+
+    hashed: list[tuple[Path, str]] = []
+    for path in files:
+        try:
+            hashed.append((path, cache.sha256(path)))
+        except OSError:
+            continue
+    unchanged: set[Path] = set()
+    for start in range(0, len(hashed), MISSING_BATCH):
+        batch = hashed[start : start + MISSING_BATCH]
+        try:
+            missing = set(client.missing([(name_of(path), digest) for path, digest in batch]))
+        except DocragError:
+            return set()
+        unchanged.update(path for path, _ in batch if name_of(path) not in missing)
+    return unchanged
+
+
+def _names_on_disk(directory: Path, keep_paths: bool = False) -> set[str] | None:
+    """The name of every file under ``directory``, whatever its type or the filters say
+    (what --delete must not remove); None when the folder can't be listed."""
+
+    names: set[str] = set()
+    try:
+        for path in directory.rglob("*"):
+            if path.is_file() or path.is_symlink():
+                name = path.relative_to(directory).as_posix() if keep_paths else path.name
+                names.add(stored_name_key(name))
+    except OSError:
+        return None
+    return names
+
+
 def cmd_sync(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     """Make the index match a folder: upload files that are new or changed (by their
     SHA-256 against the server's), and with --delete remove documents this folder's
-    sync put there whose file is gone. Unchanged files aren't sent at all."""
+    sync put there whose file is gone. Unchanged files aren't sent at all.
+
+    --delete only ever removes a document that carries this folder's own tag and whose
+    file is no longer anywhere under the folder: a file left out by --include/--exclude
+    or of a type no longer accepted is still there, and stays indexed. A folder with no
+    files at all (an unmounted share) deletes nothing without --force."""
 
     directory = Path(args.directory)
     if not directory.is_dir():
         print(f"error: not a directory: {directory}", file=sys.stderr)
         return 2
-    tag = sync_tag(directory)
+    tag, legacy = sync_tag(directory), legacy_sync_tag(directory)
     config = client.config()
     extensions = {ext.lower() for ext in config.get("supported_extensions", [])}
     files, _ = ingestible(
-        [directory], extensions, include=args.include or (), exclude=args.exclude or ()
+        [directory],
+        extensions,
+        include=args.include or (),
+        exclude=args.exclude or (),
+        follow_symlinks=args.follow_symlinks,
     )
     listing = client.documents()
     hashes: dict[str, str] = listing.get("content_sha256s") or {}
     indexed = set(listing.get("filenames", []))
+    tags: dict[str, list[str]] = listing.get("tags") or {}
+    code = 0
+    names = document_names(files, [directory], args.keep_paths)
     local: dict[str, Path] = {}
     for path in files:
-        local.setdefault(stored_name_key(path.name), path)
+        first = local.setdefault(stored_name_key(names[path]), path)
+        if first is not path:
+            print(f"skip  {path} (another file is indexed as {names[first]}: {first})", file=out)
     changed: list[Path] = []
+    adopted: list[str] = []
     unchanged = 0
+    sizes: dict[str, int] = listing.get("byte_sizes") or {}
+    cache = HashCache()
     for path in local.values():
         try:
-            same = path.name in indexed and hashes.get(path.name) == _sha256(path)
+            # The size first: a file of another size has changed, without reading it.
+            same = (
+                names[path] in indexed
+                and sizes.get(names[path], path.stat().st_size) == path.stat().st_size
+                and hashes.get(names[path]) == cache.sha256(path)
+            )
         except OSError as exc:
             print(f"skip  {path} (cannot read it: {exc.strerror or exc})", file=out)
             continue
+        held = tags.get(names[path], [])
+        ours = tag in held or legacy in held
+        if legacy in held and tag not in held:
+            adopted.append(names[path])  # an older sync's (the name-only tag): marked ours
         if same:
             unchanged += 1
+        elif names[path] in indexed and not ours and not args.adopt:
+            # Indexed from somewhere else (an upload, a URL, another folder) with other
+            # content: replacing it — and later deleting it — isn't this sync's call.
+            print(
+                f"skip  {path} (a different document named {names[path]} is already "
+                "indexed; --adopt replaces it)",
+                file=out,
+            )
+            code = 1
         else:
             changed.append(path)
-    tags: dict[str, list[str]] = listing.get("tags") or {}
+    cache.save()
+    on_disk = _names_on_disk(directory, args.keep_paths)
     gone = sorted(
         name
         for name, document_tags in tags.items()
-        if tag in document_tags and stored_name_key(name) not in local
+        if tag in document_tags and (on_disk is None or stored_name_key(name) not in on_disk)
     )
+    # Nothing readable under the folder while documents came from it: an unmounted
+    # share or a wrong path looks exactly like "everything was deleted".
+    stand_down = bool(gone) and not on_disk and not args.force
     if args.dry_run:
         for path in changed:
             print(f"send    {path}", file=out)
-        for name in gone if args.delete else []:
+        for name in gone if args.delete and not stand_down else []:
             print(f"delete  {name}", file=out)
         print(
             f"{len(changed)} to send, {unchanged} unchanged"
-            + (f", {len(gone)} to delete" if args.delete else f", {len(gone)} gone (--delete)"),
+            + (
+                f", {len(gone)} to delete"
+                if args.delete and not stand_down
+                else f", {len(gone)} gone (--delete)"
+            ),
             file=out,
         )
-        return 0
-    code = 0
+        if stand_down and args.delete:
+            print(_SYNC_STAND_DOWN.format(directory=directory), file=out)
+        return code
     if changed:
         ingest_args = argparse.Namespace(
             **{
@@ -550,11 +753,34 @@ def cmd_sync(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
                 "tag": [*(args.tag or []), tag],
                 "include": None,
                 "exclude": None,
+                "background": False,
+                "names": {str(path): names[path] for path in changed},
             }
         )
-        code = cmd_ingest(client, ingest_args, out)
+        code = cmd_ingest(client, ingest_args, out) or code
+    # An upload with tags replaces a document's tags: the ones it had (set by hand,
+    # "hr") are put back beside this folder's, and a document taken over from an older
+    # sync is marked as this folder's.
+    wanted = [*(args.tag or []), tag]
+    sent = {names[path] for path in changed}
+    for name in sorted(sent | set(adopted)):
+        before = tags.get(name, [])
+        if name in sent:
+            desired = [*before, *(t for t in wanted if t not in before)]
+            if set(desired) == set(wanted):
+                continue  # it had no other tags to put back
+        else:
+            desired = [*before, tag]
+        try:
+            client.set_tags(name, desired[:20])
+        except DocragError as exc:
+            print(f"fail  tags of {name}: {exc}", file=out)
+            code = 1
     deleted = 0
-    for name in gone if args.delete else []:
+    if args.delete and stand_down:
+        print(_SYNC_STAND_DOWN.format(directory=directory), file=out)
+        code = 1
+    for name in gone if args.delete and not stand_down else []:
         try:
             client.delete(name)
             deleted += 1
@@ -570,6 +796,12 @@ def cmd_sync(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
     return code
 
 
+_SYNC_STAND_DOWN = (
+    "nothing deleted: {directory} has no files at all, which is also what an unmounted "
+    "or mistyped folder looks like (--force deletes anyway)"
+)
+
+
 def _finished_member(
     member: dict[str, Path],
     finished: Callable[[Path, dict[str, Any]], None],
@@ -580,6 +812,15 @@ def _finished_member(
 
 
 def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if args.archive:
+        started = client.add_archive_url(
+            args.source_url, tags=args.tag or (), keep_paths=args.keep_paths
+        )
+        import_id = started.get("import_id")
+        if not import_id:
+            print("error: the server didn't start an import (too old?)", file=sys.stderr)
+            return 1
+        return _follow_import(client, import_id, args, out)
     if args.sitemap:
         added = client.add_sitemap(
             args.source_url,
@@ -954,6 +1195,65 @@ def cmd_audit(client: DocragClient, args: argparse.Namespace, out: TextIO) -> in
         fields = " ".join(f"{name}={value}" for name, value in (entry.get("fields") or {}).items())
         where = f"[{entry.get('workspace')}, {entry.get('key')}]"
         print(f"{when}  {entry.get('event')}  {where}  {fields}", file=out)
+    return 0
+
+
+# What `docrag init` turns on: the durable pieces a fresh install leaves off.
+_INIT_SETTINGS = (
+    ("RAW_DOCUMENT_DIR", "./data/originals", "Keep uploaded files: re-index, backups, rebuild."),
+    ("JOB_STORE_BACKEND", "sqlite", "Indexing jobs survive a restart."),
+    ("JOB_STORE_PATH", "./data/jobs.db", None),
+    ("REQUEUE_INTERRUPTED_JOBS", "true", "A re-index or URL fetch a restart cut off runs again."),
+    ("BACKUP_DIR", "./data/backups", "A backup a day (BACKUP_INTERVAL_HOURS), the last 7 kept."),
+    ("AUDIT_LOG_PATH", "./data/audit.db", "Who changed what (GET /admin/audit, `docrag audit`)."),
+)
+
+
+def init_env(*, ollama_in_compose: bool = False, key: str | None = None) -> str:
+    """The text of a starting ``.env``: a generated API key and the durable stores on."""
+
+    import secrets
+
+    lines = [
+        "# Written by `docrag init`. Every other setting keeps its default (.env.example).",
+        "# Required on every request as X-API-Key (the UI asks for it once).",
+        f"API_KEY={key or secrets.token_urlsafe(32)}",
+    ]
+    for name, value, why in _INIT_SETTINGS:
+        if why:
+            lines.append(f"# {why}")
+        lines.append(f"{name}={value}")
+    if ollama_in_compose:
+        lines.append("# Ollama from compose's own profile: docker compose --profile ollama up")
+        lines.append("OLLAMA_BASE_URL=http://ollama:11434")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_init(args: argparse.Namespace, out: TextIO) -> int:
+    """Write a starting ``.env`` (never over an existing one without ``--force``)."""
+
+    target = Path(args.output)
+    if target.exists() and not args.force:
+        print(f"error: {target} already exists (--force replaces it)", file=sys.stderr)
+        return 2
+    text = init_env(ollama_in_compose=args.ollama_in_compose)
+    try:
+        # Readable by its owner only: it holds the API key.
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(target, 0o600)
+    except OSError as exc:
+        print(f"error: cannot write {target}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    print(f"wrote {target} (API key inside; keep it private)", file=out)
+    print(
+        "next: docker compose"
+        + (" --profile ollama" if args.ollama_in_compose else "")
+        + " up. `docrag doctor` then checks the setup: it notes the backups share a "
+        "disk with the originals (set BACKUP_DIR to another disk to copy them off it)",
+        file=out,
+    )
     return 0
 
 
@@ -1642,7 +1942,7 @@ def cmd_check(client: DocragClient, args: argparse.Namespace, out: TextIO) -> in
 
 
 def cmd_export(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    written = client.export(Path(args.output))
+    written = client.export(Path(args.output), include_versions=args.include_versions)
     if args.json:
         print(json.dumps({"output": args.output, "bytes": written}), file=out)
     else:
@@ -1659,6 +1959,15 @@ def _import_in_background(client: DocragClient, args: argparse.Namespace, out: T
     if not import_id:
         print("error: the server didn't start a background import (too old?)", file=sys.stderr)
         return 1
+    return _follow_import(client, import_id, args, out)
+
+
+def _follow_import(
+    client: DocragClient, import_id: str, args: argparse.Namespace, out: TextIO
+) -> int:
+    """Follow a background import (a backup, a zip, a rebuild) until it has queued
+    everything; exits 1 unless it finished with nothing failed."""
+
     seen = -1
 
     def progress(status: dict[str, Any]) -> None:
@@ -1680,6 +1989,179 @@ def _import_in_background(client: DocragClient, args: argparse.Namespace, out: T
             file=out,
         )
     return 0 if status.get("state") == "done" and not status.get("failed") else 1
+
+
+def cmd_migrate(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """``pack FILE``: the whole server (every workspace's documents, settings and index
+    snapshot) into one file. ``unpack FILE``: put one back and follow it."""
+
+    target = Path(args.file)
+    if args.action == "pack":
+        written = client.migrate_pack(target)
+        if args.json:
+            print(json.dumps({"output": str(target), "bytes": written}), file=out)
+        else:
+            print(f"wrote {written} bytes to {target}", file=out)
+        return 0
+    started = client.migrate_unpack(target)
+    import_id = started.get("import_id")
+    if not import_id:
+        print("error: the server didn't start unpacking (too old?)", file=sys.stderr)
+        return 1
+    if not args.json:
+        print(f"unpacking: {', '.join(started.get('workspaces', [])) or 'no workspaces'}", file=out)
+    # The import belongs to the default workspace, whichever one this command names.
+    client.use_workspace("")
+    return _follow_import(client, import_id, args, out)
+
+
+def cmd_imports(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Background imports (zips, backups, rebuilds, bundles); --cancel stops one."""
+
+    if args.cancel:
+        stopped = client.cancel_import(args.cancel)
+        print(json.dumps(stopped) if args.json else f"stopping {args.cancel}", file=out)
+        return 0
+    imports = client.background_imports()
+    if args.json:
+        print(json.dumps(imports), file=out)
+        return 0
+    for item in imports:
+        print(
+            f"{item.get('id')}  {item.get('kind'):8} {item.get('state'):10} "
+            f"queued {item.get('queued', 0)}, skipped {item.get('skipped', 0)}, "
+            f"failed {item.get('failed', 0)}  {item.get('name')}"
+            + ("  (resumed)" if item.get("resumed") else ""),
+            file=out,
+        )
+    if not imports:
+        print("no background imports", file=out)
+    return 0
+
+
+def _setting_value(raw: str) -> Any:
+    """A NAME=VALUE's value as JSON when it reads as JSON (0.3, 5, null), else text."""
+
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def cmd_settings(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """A workspace's own settings: ``get`` shows them and the ones in effect; ``set
+    NAME=VALUE...`` changes those named (``NAME=null`` gives one back to the server)."""
+
+    name = args.name or client.workspace or "default"
+    if args.action == "set":
+        current = dict(client.workspace_settings(name).get("settings", {}))
+        for pair in args.values:
+            key, sep, raw = pair.partition("=")
+            if not sep or not key:
+                print(f"error: expected NAME=VALUE, got {pair!r}", file=sys.stderr)
+                return 2
+            current[key.strip().lower()] = _setting_value(raw.strip())
+        result = client.set_workspace_settings(name, current)
+    else:
+        result = client.workspace_settings(name)
+    if args.json:
+        print(json.dumps(result), file=out)
+        return 0
+    own = result.get("settings", {})
+    for key, value in sorted(result.get("effective", {}).items()):
+        mark = "" if own.get(key) is None else "  (this workspace's)"
+        print(f"{key} = {json.dumps(value)}{mark}", file=out)
+    return 0
+
+
+def cmd_cache(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """The workspace's cached answers; --clear empties them."""
+
+    if args.clear:
+        removed = client.clear_answer_cache()
+        print(
+            json.dumps(removed) if args.json else f"removed {removed.get('removed', 0)}", file=out
+        )
+        return 0
+    cache = client.answer_cache()
+    if args.json:
+        print(json.dumps(cache), file=out)
+        return 0
+    if not cache.get("enabled"):
+        print("the answer cache is off (ANSWER_CACHE_SIZE=0)", file=out)
+        return 0
+    print(
+        f"{cache.get('total_entries', 0)} of {cache.get('max_entries', 0)} cached "
+        f"(kept {cache.get('ttl_seconds', 0):.0f} s), {cache.get('in_flight', 0)} being answered",
+        file=out,
+    )
+    for entry in cache.get("entries", []):
+        print(f"  {entry.get('age_seconds', 0):6.0f} s  {entry.get('question')}", file=out)
+    return 0
+
+
+def cmd_outline(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    outline = client.outline(args.filename)
+    if args.json:
+        print(json.dumps(outline), file=out)
+        return 0
+    for entry in outline.get("sections", []):
+        print(f"p. {entry.get('page'):>4}  {entry.get('section')}", file=out)
+    if outline.get("truncated"):
+        print("(more sections than the outline lists)", file=out)
+    return 0
+
+
+def cmd_continue(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """The rest of an answer cut off at the output limit (its trace id is in ``ask
+    --json``'s output and in ``docrag traces``); prints the whole answer."""
+
+    streaming = not args.json
+
+    def write(text: str) -> None:
+        out.write(text)
+        out.flush()
+
+    result = client.continue_answer(args.trace_id, on_delta=write if streaming else None)
+    if args.json:
+        print(json.dumps(result.done), file=out)
+        return 0
+    print(file=out)
+    if result.done.get("truncated"):
+        print(
+            f"(still cut off: docrag continue {result.done.get('trace_id')} goes on)",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_notify_test(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Send one notification through the server's NOTIFY_URL; exits 1 when it failed."""
+
+    result = client.notify_test()
+    if args.json:
+        print(json.dumps(result), file=out)
+    elif result.get("sent"):
+        print("sent: check where your notifications arrive", file=out)
+    else:
+        print(f"not sent: {result.get('error') or 'the server gave no reason'}", file=out)
+    return 0 if result.get("sent") else 1
+
+
+def cmd_rebuild(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Index every stored original that has no document (after a lost index)."""
+
+    started = client.rebuild()
+    import_id = started.get("import_id")
+    if not import_id:
+        if args.json:
+            print(json.dumps(started), file=out)
+        else:
+            print("nothing to rebuild: every stored original has its document", file=out)
+        return 0
+    if not args.json:
+        print(f"rebuilding {started.get('originals', 0)} documents from their originals", file=out)
+    return _follow_import(client, import_id, args, out)
 
 
 def cmd_import(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -1764,6 +2246,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     completion = command("completion", "Print a shell completion script.")
     completion.add_argument("shell", choices=("bash", "zsh"))
+    init = command(
+        "init",
+        "Write a starting .env: a generated API key, originals kept, durable jobs, "
+        "backups and the audit log.",
+    )
+    init.add_argument("--output", default=".env", help="Where to write it (default .env).")
+    init.add_argument("--force", action="store_true", help="Replace an existing file.")
+    init.add_argument(
+        "--ollama-in-compose",
+        action="store_true",
+        help="Point the API at compose's own Ollama (docker compose --profile ollama up).",
+    )
     command("status", "Version, provider, document count.")
     command("documents", "List indexed documents.")
 
@@ -1797,6 +2291,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="GLOB",
         help='Leave matching files (or directories, by name) out ("*.py", "node_modules").',
     )
+    ingest.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Send symbolic links found in a folder too (left out by default).",
+    )
+    ingest.add_argument(
+        "--keep-paths",
+        action="store_true",
+        help="Name a file found in a folder by its path under it (reports/q1.pdf).",
+    )
+    ingest.add_argument(
+        "--skip-unchanged",
+        action="store_true",
+        help="Don't send a file the server already holds under that name with the same "
+        "bytes (asked before anything is uploaded).",
+    )
     wait_flag(ingest)
 
     sync = command("sync", "Upload a folder's new and changed files; --delete removes ones gone.")
@@ -1810,6 +2320,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete documents this folder's sync added whose file is gone.",
     )
     sync.add_argument("--dry-run", action="store_true", help="Only say what it would do.")
+    sync.add_argument(
+        "--force",
+        action="store_true",
+        help="With --delete: delete even when the folder has no files at all.",
+    )
+    sync.add_argument(
+        "--adopt",
+        action="store_true",
+        help="Replace a same-named document that came from somewhere else.",
+    )
+    sync.add_argument("--follow-symlinks", action="store_true", help="Send symlinked files too.")
+    sync.add_argument(
+        "--keep-paths",
+        action="store_true",
+        help="Name documents by their path under the folder (reports/q1.pdf), so "
+        "same-named files in different folders are all indexed.",
+    )
     wait_flag(sync)
 
     add_url = command("add-url", "Have the server fetch and index a URL.")
@@ -1841,6 +2368,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_url.add_argument(
         "--any-host", action="store_true", help="--sitemap: pages on other hosts too."
+    )
+    add_url.add_argument(
+        "--archive",
+        action="store_true",
+        help="The URL is a zip of documents: the server imports them in the background.",
+    )
+    add_url.add_argument(
+        "--keep-paths", action="store_true", help="--archive: name documents by their path."
     )
     wait_flag(add_url)
 
@@ -2034,8 +2569,43 @@ def build_parser() -> argparse.ArgumentParser:
         "or version folders, or re-index incomplete documents.",
     )
 
+    migrate = command(
+        "migrate",
+        "Move the whole server: pack every workspace into one file, or unpack one (full key).",
+    )
+    migrate.add_argument("action", choices=("pack", "unpack"))
+    migrate.add_argument("file")
+    wait_flag(migrate)
+    command("notify-test", "Send a test notification through the server's NOTIFY_URL (full key).")
+    rebuild = command(
+        "rebuild",
+        "Index every stored original that has no document: after a lost index (full key).",
+    )
+    wait_flag(rebuild)
+
     export = command("export", "Download a backup zip (full key).")
     export.add_argument("output")
+    export.add_argument(
+        "--include-versions",
+        action="store_true",
+        help="With every document's kept earlier versions (RAW_DOCUMENT_VERSIONS).",
+    )
+    imports = command("imports", "Background imports in this workspace (zips, backups, rebuilds).")
+    imports.add_argument("--cancel", metavar="IMPORT_ID", help="Stop this import.")
+    settings_parser = command(
+        "settings", "A workspace's own settings: get, or set NAME=VALUE (full key to set)."
+    )
+    settings_parser.add_argument("action", choices=("get", "set"))
+    settings_parser.add_argument("values", nargs="*", metavar="NAME=VALUE")
+    settings_parser.add_argument(
+        "--name", help="The workspace (default: --workspace, else the default one)."
+    )
+    cache = command("cache", "This workspace's cached answers (full key).")
+    cache.add_argument("--clear", action="store_true", help="Empty them.")
+    outline = command("outline", "A document's sections and the page each starts on.")
+    outline.add_argument("filename")
+    cont = command("continue", "The rest of an answer cut off at the output limit.")
+    cont.add_argument("trace_id")
     restore = command("import", "Restore a backup zip and wait for it.")
     restore.add_argument("archive")
     restore.add_argument(
@@ -2052,6 +2622,14 @@ COMMANDS = {
     "status": cmd_status,
     "backup": cmd_backup,
     "check": cmd_check,
+    "rebuild": cmd_rebuild,
+    "notify-test": cmd_notify_test,
+    "imports": cmd_imports,
+    "settings": cmd_settings,
+    "cache": cmd_cache,
+    "outline": cmd_outline,
+    "continue": cmd_continue,
+    "migrate": cmd_migrate,
     "doctor": cmd_doctor,
     "sync": cmd_sync,
     "audit": cmd_audit,
@@ -2108,6 +2686,8 @@ def main(
         # Needs no server: the script is made from this parser.
         print(completion_script(build_parser(), args.shell), file=stream)
         return 0
+    if args.command == "init":
+        return cmd_init(args, stream)  # needs no server either
     owned = client is None
     if client is None:
         try:
