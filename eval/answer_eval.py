@@ -404,8 +404,14 @@ def _count(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+# Hyphen, non-breaking hyphen, figure dash: read as "-" (gpt-5-mini writes "forty‑five"
+# with U+2011, which missed "twenty-eight" facts and let excluded values through). En and
+# em dashes stay: between words they are punctuation, not a hyphen.
+_HYPHENS = str.maketrans({"‐": "-", "‑": "-", "‒": "-"})
+
+
 def _normalized(text: str) -> str:
-    return " ".join(text.split()).casefold()
+    return " ".join(text.translate(_HYPHENS).split()).casefold()
 
 
 def partial_path(output: Path) -> Path:

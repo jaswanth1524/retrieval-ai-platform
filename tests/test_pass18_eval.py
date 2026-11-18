@@ -106,6 +106,23 @@ def test_an_excluded_value_fails_the_row_and_numbers_match_whole() -> None:
     assert scored_facts("It is 25 days.", example) == (True, False)
 
 
+@pytest.mark.parametrize("hyphen", ["‐", "‑", "‒"])
+def test_unicode_hyphens_match_a_plain_hyphen_in_facts_and_excludes(hyphen: str) -> None:
+    # gpt-5-mini writes "forty‑five" with a non-breaking hyphen: the excluded stale value
+    # went unnoticed (the row passed) and a stated fact ("twenty-eight") was missed.
+    from eval.answer_eval import scored_facts, states_excluded, states_fact
+
+    assert states_fact(f"Staff get twenty{hyphen}eight days [1].", ["twenty-eight"]) is True
+    assert states_excluded(f"It was forty{hyphen}five euros [1].", ["forty-five euros"]) is True
+    example = _example(
+        "meal?", answer_contains=("sixty euros",), answer_excludes=("forty-five euros",)
+    )
+    answer = f"It is sixty euros [2] (in 2019 it was forty{hyphen}five euros [1])."
+    assert scored_facts(answer, example) == (False, True)
+    # A dash between words is not a hyphen: left as written.
+    assert states_fact("twenty – eight", ["twenty-eight"]) is False
+
+
 class TurnGenerator:
     """Answers each question with its own text, so the chain's history is visible."""
 

@@ -21,6 +21,9 @@ gpt-4o-mini — no change to retrieval or stored data. **Re-index: none.**
 - A cut-off answer continued (Continue, `AUTO_CONTINUE_MAX`) right at a Markdown marker
   is joined without a space there: "**Security Policy:" and "**" became
   "**Security Policy: **", which showed the asterisks as text.
+- The answer eval reads a non-breaking hyphen (U+2010/2011/2012, which gpt-5-mini
+  writes in "forty‑five") as "-" in `answer_contains` and `answer_excludes`: such an
+  answer missed "twenty-eight", and one stating an excluded "forty-five euros" passed.
 
 ### Development
 - Version 0.2.0 closes the development section that followed 0.1.0.
