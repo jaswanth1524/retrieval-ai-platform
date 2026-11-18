@@ -10,12 +10,17 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 ## Unreleased
 
-Pass 19: maintenance only — no change to answers, retrieval or stored data. **Re-index:
-none.**
+Pass 19: maintenance, plus two small fixes found checking it with gpt-5-mini and
+gpt-4o-mini — no change to retrieval or stored data. **Re-index: none.**
 
 ### Changed
 - `GET /health/ready` declares its response (`ReadinessResponse`, 200 and 503) in the
   OpenAPI document; it used to show an empty schema. The response itself is unchanged.
+
+### Fixed
+- A cut-off answer continued (Continue, `AUTO_CONTINUE_MAX`) right at a Markdown marker
+  is joined without a space there: "**Security Policy:" and "**" became
+  "**Security Policy: **", which showed the asterisks as text.
 
 ### Development
 - Version 0.2.0 closes the development section that followed 0.1.0.

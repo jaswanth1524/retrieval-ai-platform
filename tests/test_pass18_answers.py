@@ -378,3 +378,21 @@ def test_a_continuation_that_repeats_the_last_words_is_joined_once() -> None:
     # One repeated short word is left alone: "the" may well begin the next phrase.
     assert joined("the end of the", "the policy says") == "the end of the the policy says"
     assert joined("Leave is ten", "days per year.") == "Leave is ten days per year."
+
+
+def test_a_cut_inside_markdown_emphasis_keeps_the_markers_attached() -> None:
+    # gpt-4o-mini, AUTO_CONTINUE_MAX live: "**Security Policy:" went on "**\n1. …", and
+    # the space put between them ("**Security Policy: **") showed the asterisks as text.
+    from api.pipeline import join_continuation
+
+    assert join_continuation("**Security Policy:", "**\n1. Passwords") == (
+        "**Security Policy:**\n1. Passwords"
+    )
+    assert join_continuation("the *default", "* class") == "the *default* class"
+    assert join_continuation("run `docrag", "`.") == "run `docrag`."
+    # Cut just after an opening marker: the word it opens follows it directly.
+    assert join_continuation("Rules: **", "Booking**") == "Rules: **Booking**"
+    assert join_continuation("1. **", "Per diem**: sixty") == "1. **Per diem**: sixty"
+    # A marker that opens a new bold phrase after a word is still a new word.
+    assert join_continuation("policy says", "**never** reuse") == "policy says **never** reuse"
+    assert join_continuation("economy, but", "business class") == "economy, but business class"

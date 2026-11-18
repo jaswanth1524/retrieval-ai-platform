@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -121,12 +122,21 @@ def _drop_repeated_tail(before: str, after: str) -> str:
     return after
 
 
+# Markdown emphasis or code markers at a cut. One that closes ("**" then a line break,
+# space, punctuation or the end) belongs to the text before it; one that opens (at the
+# start or after a space) belongs to the word after it. A space between either and its
+# text breaks the markup ("**Security Policy: **" shows the asterisks).
+_CLOSING_MARKER_RE = re.compile(r"[*_`]+(?:$|[\s.,;:!?)\]}'\"])")
+_OPENING_MARKER_RE = re.compile(r"(?:^|\s)[*_`]+$")
+
+
 def join_continuation(before: str, after: str, *, prefilled: bool = False) -> str:
     """A cut-off answer and its continuation as one text. Continuing a prefill, the
     model writes its own leading space where a word ends (" can be", or "2]" inside a
     marker): the two are joined as they are. Asked in words, a space goes between them
-    unless either side already has one, the continuation starts with punctuation, or the
-    cut came just after an opening bracket or quote."""
+    unless either side already has one, the continuation starts with punctuation or a
+    closing Markdown marker, or the cut came just after an opening bracket, quote or
+    Markdown marker."""
 
     if not after:
         return before
@@ -135,5 +145,7 @@ def join_continuation(before: str, after: str, *, prefilled: bool = False) -> st
     if before[-1:].isspace() or after[:1].isspace() or after[:1] in ".,;:!?)]}'\"":
         return before + after
     if before[-1:] in "([{\u201c\u2018":  # cut just after an opening bracket or quote
+        return before + after
+    if _CLOSING_MARKER_RE.match(after) or _OPENING_MARKER_RE.search(before):
         return before + after
     return f"{before} {after}"
