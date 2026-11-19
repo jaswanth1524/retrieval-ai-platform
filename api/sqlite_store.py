@@ -1,13 +1,48 @@
-"""Shared connection handling for the small sqlite-backed stores (jobs, feedback, the
-query log, the trace archive)."""
+"""Shared connection handling and column upgrades for the small sqlite-backed stores
+(jobs, feedback, the query log, the trace archive)."""
 
 from __future__ import annotations
 
+import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from threading import Lock
+
+_NOT_NULL_RE = re.compile(r"\bNOT\s+NULL\b", re.I)
+_DEFAULT_RE = re.compile(r"\bDEFAULT\b", re.I)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def add_missing_columns(
+    conn: sqlite3.Connection, table: str, columns: Iterable[tuple[str, str]]
+) -> list[str]:
+    """Add each ``(name, declaration)`` column ``table`` lacks; the names added.
+
+    How every store upgrades a file an older version wrote: it looks at what is there
+    rather than a version number, so a file at any earlier state (or one a newer
+    version already upgraded) opens the same way, and running it twice is harmless.
+    Rows already in the table take the column's default.
+    """
+
+    columns = list(columns)
+    # Names go into the statement itself (sqlite takes no parameters there).
+    for identifier in (table, *(name for name, _ in columns)):
+        if not _IDENTIFIER_RE.fullmatch(identifier):
+            raise ValueError(f"not a table or column name: {identifier!r}")
+    for name, declaration in columns:
+        # sqlite refuses ADD COLUMN ... NOT NULL without a default, but only on a table
+        # that has to be upgraded — caught here, before any file is that old.
+        if _NOT_NULL_RE.search(declaration) and not _DEFAULT_RE.search(declaration):
+            raise ValueError(f"{table}.{name}: an added NOT NULL column needs a DEFAULT")
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    added: list[str] = []
+    for name, declaration in columns:
+        if name not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            added.append(name)
+    return added
 
 
 def enable_wal(path: str) -> None:

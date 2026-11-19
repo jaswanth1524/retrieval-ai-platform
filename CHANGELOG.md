@@ -10,7 +10,53 @@ The version is `version` in `pyproject.toml` (served as the API's OpenAPI versio
 
 ## Unreleased
 
-Latency and features pass, then two improvement passes (fixes, security, accessibility,
+Pass 19: maintenance, plus two small fixes found checking it with gpt-5-mini and
+gpt-4o-mini — no change to retrieval or stored data. **Re-index: none.**
+
+### Changed
+- `GET /health/ready` declares its response (`ReadinessResponse`, 200 and 503) in the
+  OpenAPI document; it used to show an empty schema. The response itself is unchanged.
+
+### Fixed
+- A cut-off answer continued (Continue, `AUTO_CONTINUE_MAX`) right at a Markdown marker
+  is joined without a space there: "**Security Policy:" and "**" became
+  "**Security Policy: **", which showed the asterisks as text.
+- The answer eval reads a non-breaking hyphen (U+2010/2011/2012, which gpt-5-mini
+  writes in "forty‑five") as "-" in `answer_contains` and `answer_excludes`: such an
+  answer missed "twenty-eight", and one stating an excluded "forty-five euros" passed.
+
+### Development
+- Version 0.2.0 closes the development section that followed 0.1.0.
+- `docs/settings.md` lists every setting by topic with its type, default and limits,
+  generated from `api/settings.py` (`make settings-docs`; a test fails when it is out
+  of date, or when a setting has no comment or no section). Comments were added to the
+  settings that had none, and the summary and URL-ingest comments, which had drifted
+  above `WORKSPACES_ENABLED`, are back above their own settings.
+- `RagPipeline` is built in layers, each in its own module (`answer_traces`,
+  `pipeline_core`, `answer_stream`, with shared parts in `answer_run`,
+  `conversation_history`, `answer_events`, `continuation`, `passage_selection` and
+  `run_coordination`); `api/pipeline.py` re-exports every name it used to define. The
+  trace, question and workspace routes are module-level routers like the document routes.
+  The CLI's commands moved to `cli/question_commands.py`, `document_commands.py`,
+  `admin_commands.py` and `common.py` (re-exported by `cli/__main__.py`), and the MCP
+  server registers its read tools in `_add_read_tools`. Every moved function is
+  byte-for-byte the same; the OpenAPI document, the CLI's help pages, its shell
+  completions and the MCP tool list are unchanged.
+- The UI's `App.tsx` and `useChat.ts` hand quotes and the basket, keyboard navigation,
+  the review queue, links, turn marks and the answer lists to their own hooks.
+- The sqlite stores add missing columns through one helper
+  (`sqlite_store.add_missing_columns`), which also refuses a `NOT NULL` column without a
+  default before any old file would need it.
+- `tests/test_frontend_contract.py` also compares field types: a field the server may
+  send as null typed as non-null, a number typed as a string, a request field the server
+  requires left optional, or a nested response type naming the wrong schema.
+- Frontend tests run with coverage floors (`npm run test:coverage`, in CI and `make
+  check`). The pass-numbered end-to-end specs are grouped by feature.
+- `CLAUDE.md` is short again: the pass-by-pass notes moved to `docs/history/PASSES.md`.
+
+## 0.2.0 — 2026-11-17
+
+Everything since 0.1.0: the latency and features pass, then two improvement passes (fixes, security, accessibility,
 features), then a follow-up retrieval and chunking pass (pass 8), then a local-model and
 text-extraction pass (pass 9), then a correctness pass (pass 10), then a features pass
 (pass 11), then seven fixes-and-features passes (passes 12 to 18). **Re-index:

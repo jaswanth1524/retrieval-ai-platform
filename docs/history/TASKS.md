@@ -1,5 +1,8 @@
 # DocRAG Task Plan
 
+> **Status: historical.** The original build plan, kept for reference; every milestone is
+> done. What was built since is in `docs/history/PASSES.md` and `CHANGELOG.md`.
+
 This task plan follows the requested build order and the architecture implied by the specification. Application feature code starts only after owner approval for the relevant milestone.
 
 ## Milestone 1: Planning Artifacts And Spec Review

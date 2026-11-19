@@ -9,7 +9,7 @@ import shutil
 from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from qdrant_client import QdrantClient
 
@@ -189,150 +189,156 @@ def _forget_rows(
     return removed
 
 
+router = APIRouter()
+
+
+@router.get(
+    "/workspaces",
+    response_model=WorkspaceListResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def workspaces(settings: BaseSettingsDep, client: QdrantClientDep) -> WorkspaceListResponse:
+    # Answers when the feature is off too (enabled: false), so a client can ask.
+    if not settings.workspaces_enabled:
+        return WorkspaceListResponse(enabled=False, workspaces=[])
+    return WorkspaceListResponse(
+        enabled=True, workspaces=list_workspaces(client, settings.qdrant_collection)
+    )
+
+
+@router.post(
+    "/workspaces",
+    response_model=WorkspaceResponse,
+    status_code=201,
+    dependencies=[Depends(require_full_key)],
+)
+async def create_workspace(
+    request: WorkspaceCreateRequest,
+    settings: BaseSettingsDep,
+    client: QdrantClientDep,
+    repository: VectorRepositoryDep,
+) -> WorkspaceResponse:
+    _require_enabled(settings)
+    name = _name(request.name, new=True)
+    existing = await run_in_threadpool(list_workspaces, client, settings.qdrant_collection)
+    if name in existing:
+        raise HTTPException(status_code=409, detail=f"Workspace '{name}' already exists.")
+    if len(existing) >= MAX_WORKSPACES:
+        raise HTTPException(
+            status_code=409, detail=f"At most {MAX_WORKSPACES} workspaces can exist."
+        )
+    await run_in_threadpool(
+        functools.partial(
+            repository.ensure_writable, settings_for(settings, name), create_workspace=True
+        )
+    )
+    audit("workspace.create", workspace=name)
+    return WorkspaceResponse(name=name)
+
+
+# A workspace's own relevance settings ("default" for the default workspace): read
+# with any key, changed with the full key. A change empties its cached answers.
+@router.get(
+    "/workspaces/{name}/settings",
+    response_model=WorkspaceSettingsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def workspace_settings(
+    name: str,
+    settings: BaseSettingsDep,
+    client: QdrantClientDep,
+    store: WorkspaceSettingsStoreDep,
+) -> WorkspaceSettingsResponse:
+    return _settings_response(_settings_target(settings, client, name), store)
+
+
+@router.put(
+    "/workspaces/{name}/settings",
+    response_model=WorkspaceSettingsResponse,
+    dependencies=[Depends(require_full_key)],
+)
+def put_workspace_settings(
+    name: str,
+    request: WorkspaceSettingsRequest,
+    settings: BaseSettingsDep,
+    client: QdrantClientDep,
+    store: WorkspaceSettingsStoreDep,
+    cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+) -> WorkspaceSettingsResponse:
+    target = _settings_target(settings, client, name)
+    values = request.model_dump(exclude_none=True)
+    store.put(workspace_of(target), values)
+    # Answers cached under the old settings would be served as if given under these.
+    if cache is not None:
+        cache.drop_collection(target.qdrant_collection)
+    bump_corpus_generation(collection=target.qdrant_collection)
+    audit("workspace.settings", workspace=workspace_of(target), **values)
+    return _settings_response(target, store)
+
+
+@router.delete(
+    "/workspaces/{name}",
+    response_model=WorkspaceResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={409: {"description": "The workspace still holds documents or originals."}},
+)
+def delete_workspace(
+    name: str,
+    http_request: Request,
+    settings: BaseSettingsDep,
+    client: QdrantClientDep,
+    feedback: Annotated[FeedbackStore | None, Depends(get_feedback_store)],
+    query_log: Annotated[QueryLogStore | None, Depends(get_query_log_store)],
+    traces: Annotated[TraceStore, Depends(get_trace_store)],
+    jobs: Annotated[JobStore, Depends(get_ingest_job_store)],
+    workspace_settings: WorkspaceSettingsStoreDep,
+) -> WorkspaceResponse:
+    _require_enabled(settings)
+    name = _name(name)
+    if not workspace_exists(client, settings.qdrant_collection, name):
+        raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
+    # The watched folder's workspace: its watcher would fail every pass once the
+    # collection is gone (it is never recreated implicitly), until a restart.
+    if name in watched_workspaces(settings):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace '{name}' is WATCH_WORKSPACE, where the watched folder "
+            "is indexed; change that setting before deleting it.",
+        )
+    target = settings_for(settings, name)
+    if importing_into(target.qdrant_collection) or imports.importing_into(target.qdrant_collection):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace '{name}' has an import (a sitemap, a zip or a backup) "
+            "still adding documents; try again when it finishes.",
+        )
+    # Not while anything for it is queued or running: a job would recreate the
+    # collection on its first write (the repository recreates a missing one), or
+    # fail, after the workspace was reported deleted. Keys are workspace-qualified
+    # (api/workspaces.document_key), so only this workspace's work counts. The check
+    # also closes the workspace to new work until the delete is done, in one step,
+    # so an upload can't be admitted between the check and the delete.
+    group = name
+    if not ingest_sequencer.close_if_idle(group, lambda key: filename_of(target, key) is not None):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace '{name}' has documents being indexed or deleted; try "
+            "again when they finish.",
+        )
+    try:
+        _delete_if_empty(client, target, name)
+    finally:
+        ingest_sequencer.reopen(group)
+    forget_workspace_metrics(name)
+    backup = getattr(http_request.app.state, "backup", None)
+    if backup is not None:
+        backup.forget_workspace(name)
+    removed = _forget_rows(name, feedback, query_log, traces, jobs, workspace_settings)
+    audit("workspace.delete", workspace=name, **{f"{k}_removed": v for k, v in removed.items()})
+    return WorkspaceResponse(name=name)
+
+
 def register(app: FastAPI) -> None:
     """Register the workspace routes."""
 
-    @app.get(
-        "/workspaces",
-        response_model=WorkspaceListResponse,
-        dependencies=[Depends(require_api_key)],
-    )
-    def workspaces(settings: BaseSettingsDep, client: QdrantClientDep) -> WorkspaceListResponse:
-        # Answers when the feature is off too (enabled: false), so a client can ask.
-        if not settings.workspaces_enabled:
-            return WorkspaceListResponse(enabled=False, workspaces=[])
-        return WorkspaceListResponse(
-            enabled=True, workspaces=list_workspaces(client, settings.qdrant_collection)
-        )
-
-    @app.post(
-        "/workspaces",
-        response_model=WorkspaceResponse,
-        status_code=201,
-        dependencies=[Depends(require_full_key)],
-    )
-    async def create_workspace(
-        request: WorkspaceCreateRequest,
-        settings: BaseSettingsDep,
-        client: QdrantClientDep,
-        repository: VectorRepositoryDep,
-    ) -> WorkspaceResponse:
-        _require_enabled(settings)
-        name = _name(request.name, new=True)
-        existing = await run_in_threadpool(list_workspaces, client, settings.qdrant_collection)
-        if name in existing:
-            raise HTTPException(status_code=409, detail=f"Workspace '{name}' already exists.")
-        if len(existing) >= MAX_WORKSPACES:
-            raise HTTPException(
-                status_code=409, detail=f"At most {MAX_WORKSPACES} workspaces can exist."
-            )
-        await run_in_threadpool(
-            functools.partial(
-                repository.ensure_writable, settings_for(settings, name), create_workspace=True
-            )
-        )
-        audit("workspace.create", workspace=name)
-        return WorkspaceResponse(name=name)
-
-    # A workspace's own relevance settings ("default" for the default workspace): read
-    # with any key, changed with the full key. A change empties its cached answers.
-    @app.get(
-        "/workspaces/{name}/settings",
-        response_model=WorkspaceSettingsResponse,
-        dependencies=[Depends(require_api_key)],
-    )
-    def workspace_settings(
-        name: str,
-        settings: BaseSettingsDep,
-        client: QdrantClientDep,
-        store: WorkspaceSettingsStoreDep,
-    ) -> WorkspaceSettingsResponse:
-        return _settings_response(_settings_target(settings, client, name), store)
-
-    @app.put(
-        "/workspaces/{name}/settings",
-        response_model=WorkspaceSettingsResponse,
-        dependencies=[Depends(require_full_key)],
-    )
-    def put_workspace_settings(
-        name: str,
-        request: WorkspaceSettingsRequest,
-        settings: BaseSettingsDep,
-        client: QdrantClientDep,
-        store: WorkspaceSettingsStoreDep,
-        cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
-    ) -> WorkspaceSettingsResponse:
-        target = _settings_target(settings, client, name)
-        values = request.model_dump(exclude_none=True)
-        store.put(workspace_of(target), values)
-        # Answers cached under the old settings would be served as if given under these.
-        if cache is not None:
-            cache.drop_collection(target.qdrant_collection)
-        bump_corpus_generation(collection=target.qdrant_collection)
-        audit("workspace.settings", workspace=workspace_of(target), **values)
-        return _settings_response(target, store)
-
-    @app.delete(
-        "/workspaces/{name}",
-        response_model=WorkspaceResponse,
-        dependencies=[Depends(require_full_key)],
-        responses={409: {"description": "The workspace still holds documents or originals."}},
-    )
-    def delete_workspace(
-        name: str,
-        http_request: Request,
-        settings: BaseSettingsDep,
-        client: QdrantClientDep,
-        feedback: Annotated[FeedbackStore | None, Depends(get_feedback_store)],
-        query_log: Annotated[QueryLogStore | None, Depends(get_query_log_store)],
-        traces: Annotated[TraceStore, Depends(get_trace_store)],
-        jobs: Annotated[JobStore, Depends(get_ingest_job_store)],
-        workspace_settings: WorkspaceSettingsStoreDep,
-    ) -> WorkspaceResponse:
-        _require_enabled(settings)
-        name = _name(name)
-        if not workspace_exists(client, settings.qdrant_collection, name):
-            raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
-        # The watched folder's workspace: its watcher would fail every pass once the
-        # collection is gone (it is never recreated implicitly), until a restart.
-        if name in watched_workspaces(settings):
-            raise HTTPException(
-                status_code=409,
-                detail=f"Workspace '{name}' is WATCH_WORKSPACE, where the watched folder "
-                "is indexed; change that setting before deleting it.",
-            )
-        target = settings_for(settings, name)
-        if importing_into(target.qdrant_collection) or imports.importing_into(
-            target.qdrant_collection
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=f"Workspace '{name}' has an import (a sitemap, a zip or a backup) "
-                "still adding documents; try again when it finishes.",
-            )
-        # Not while anything for it is queued or running: a job would recreate the
-        # collection on its first write (the repository recreates a missing one), or
-        # fail, after the workspace was reported deleted. Keys are workspace-qualified
-        # (api/workspaces.document_key), so only this workspace's work counts. The check
-        # also closes the workspace to new work until the delete is done, in one step,
-        # so an upload can't be admitted between the check and the delete.
-        group = name
-        if not ingest_sequencer.close_if_idle(
-            group, lambda key: filename_of(target, key) is not None
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=f"Workspace '{name}' has documents being indexed or deleted; try "
-                "again when they finish.",
-            )
-        try:
-            _delete_if_empty(client, target, name)
-        finally:
-            ingest_sequencer.reopen(group)
-        forget_workspace_metrics(name)
-        backup = getattr(http_request.app.state, "backup", None)
-        if backup is not None:
-            backup.forget_workspace(name)
-        removed = _forget_rows(name, feedback, query_log, traces, jobs, workspace_settings)
-        audit("workspace.delete", workspace=name, **{f"{k}_removed": v for k, v in removed.items()})
-        return WorkspaceResponse(name=name)
+    app.include_router(router)

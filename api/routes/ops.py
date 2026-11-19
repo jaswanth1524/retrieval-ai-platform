@@ -124,7 +124,15 @@ def register(app: FastAPI) -> None:
     # The app's settings, never an X-Workspace one, as /config: a probe or a browser
     # holding a since-deleted workspace must not get a 404 (or 400 with workspaces off)
     # from a readiness check, and the index checked is the app's own collection.
-    @app.get("/health/ready")
+    # A JSONResponse (so a degraded server answers 503 with the same body), declared here
+    # so the schema reaches the OpenAPI document and the frontend contract test.
+    @app.get(
+        "/health/ready",
+        responses={
+            200: {"model": ReadinessResponse},
+            503: {"model": ReadinessResponse, "description": "Degraded: the same body."},
+        },
+    )
     def health_ready(
         settings: Annotated[AppSettings, Depends(get_app_settings)],
         check_qdrant: QdrantCheckDep,

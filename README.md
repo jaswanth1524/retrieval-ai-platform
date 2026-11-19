@@ -96,8 +96,8 @@ Measured again for the latency pass, on a different corpus: the 15 handbook docu
 | Build | First token p50 | Answer done p50 | Rerank p50 | UI bytes on a cold load |
 |---|---|---|---|---|
 | 0.1.0 | 7.7s | 12.4s | 3.5s | 326 KB |
-| This release (default) | 8.1s | 13.9s | 2.9s | 87 KB |
-| This release, `CONTEXT_NEIGHBOR_MAX_CHARS=300` | 5.0s | 9.5s | 1.7s | 87 KB |
+| 0.2.0 (default) | 8.1s | 13.9s | 2.9s | 87 KB |
+| 0.2.0, `CONTEXT_NEIGHBOR_MAX_CHARS=300` | 5.0s | 9.5s | 1.7s | 87 KB |
 
 In isolation, scoring the shortest passages first made a 50-candidate rerank about 22% faster (2.5s vs 3.2s median); the rest of the rerank difference between rows is run-to-run noise (the neighbour cap can't affect reranking). The cap's own effect is on prefill, about 4.3s → 3.2s median, with the same answers and citations on all 11 questions — measured only at these 96-token chunks, so it stays off by default. The UI's JavaScript and CSS are served precompressed.
 
@@ -192,6 +192,7 @@ uv run ruff format .           # format (CI checks it)
 uv run mypy api eval cli         # typecheck (strict mode)
 make check                     # the backend and frontend gates CI runs, coverage floor and audits included (not e2e)
 make golden                    # regenerate the chunking and OpenAPI snapshots, then review the diff
+make settings-docs             # regenerate docs/settings.md after changing a setting or its comment
 ```
 
 Frontend (`frontend/`, npm-managed):
@@ -199,6 +200,7 @@ Frontend (`frontend/`, npm-managed):
 ```bash
 npm ci                         # install deps (matches CI)
 npm run test                   # vitest run (all tests)
+npm run test:coverage          # the same with the coverage floors CI enforces
 npm run build                  # tsc -b && vite build -> frontend/dist
 npm run lint                   # oxlint
 npm run typecheck:tests        # type-check the vitest suite (vitest itself doesn't)
@@ -223,6 +225,8 @@ Releases (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` that matches 
 ## Configuration
 
 All runtime configuration lives in `api/settings.py` (`AppSettings`, pydantic-settings) and is read from environment variables — see `.env.example` for the full list with defaults and explanatory comments, including hybrid-retrieval tuning (`RRF_K`, `RERANK_TOP_K`, `RERANK_MIN_SCORE`, ...), chunking (`CHUNK_SIZE_TOKENS`, `CHUNK_OVERLAP_TOKENS`, ...), conversation memory (`CONVERSATION_CONDENSE_ENABLED`, `CONVERSATION_MAX_HISTORY_MESSAGES`), and provider selection (`LLM_PROVIDER`, `OPENAI_API_KEY`, ...).
+
+[`docs/settings.md`](docs/settings.md) lists every setting grouped by topic, with its type, default and limits (generated from `api/settings.py` with `make settings-docs`).
 
 ## API reference
 
@@ -783,7 +787,9 @@ existing collection automatically, with no re-ingest.
 ## Current Files
 
 - `CLAUDE.md`: operating instructions for future agent work on this repo.
+- `docs/history/PASSES.md`: what each review pass built, measured and decided (the detail behind `CLAUDE.md`).
 - `.env.example`: non-secret configuration defaults, documented inline.
+- `docs/settings.md`: every setting by topic, with its type, default and limits (generated from `api/settings.py`).
 - `pyproject.toml`: Python 3.12 dependency and tool configuration.
 - `docker-compose.yml`: Qdrant + API services (the API also serves the built frontend).
 - `Dockerfile`: multi-stage build — Node builds `frontend/`, uv builds the Python venv, and a plain `python:3.12-slim` stage runs the API as a non-root user with a container healthcheck (base images pinned by digest).
@@ -813,7 +819,7 @@ existing collection automatically, with no re-ingest.
 - `api/retrieval.py`, `api/repository.py`: hybrid dense+sparse retrieval, RRF, and the Qdrant repository seam (search, upsert, delete).
 - `api/reranking.py`: cross-encoder reranking for fused retrieval candidates.
 - `api/generation.py`, `api/llm.py`, `api/prompting.py`, `api/citations.py`: grounded answers; the LiteLLM client and provider errors; the prompt, context-window fitting, condensing and query expansion; citation parsing and the citation retry.
-- `api/pipeline.py`: orchestrates retrieve → rerank → generate and parse → chunk → embed → index behind single calls.
+- `api/pipeline.py`: `RagPipeline`, which orchestrates retrieve → rerank → generate behind single calls; its layers are `api/answer_traces.py`, `api/pipeline_core.py` and `api/answer_stream.py` (ingestion is `api/ingest_service.py`).
 - `api/tracing.py`: in-memory per-query debug trace store.
 - `api/jobs.py`: background job tracking for document ingestion — in-memory by default, or sqlite-backed (surviving a restart) when `JOB_STORE_BACKEND=sqlite`.
 - `api/provider_health.py`: reachability probes for Qdrant and Ollama, used by `/health/ready` and `/config`.

@@ -482,6 +482,57 @@
     "title": "BackupRunResponse",
     "type": "object"
    },
+   "BackupStatusResponse": {
+    "description": "The last scheduled backup written or attempted (BACKUP_DIR). /health/ready is\nopen, so with API_KEY set ``workspace`` is \"\" and ``file`` and ``error`` are left\nout (the error is in the server log).",
+    "properties": {
+     "at": {
+      "title": "At",
+      "type": "number"
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "file": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "File"
+     },
+     "ok": {
+      "title": "Ok",
+      "type": "boolean"
+     },
+     "originals_missing": {
+      "default": 0,
+      "title": "Originals Missing",
+      "type": "integer"
+     },
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "at",
+     "workspace",
+     "ok"
+    ],
+    "title": "BackupStatusResponse",
+    "type": "object"
+   },
    "Body_import_backup_import_post": {
     "properties": {
      "background": {
@@ -3016,6 +3067,89 @@
      "sources"
     ],
     "title": "QuestionResponse",
+    "type": "object"
+   },
+   "ReadinessResponse": {
+    "description": "Readiness check response \u2014 unlike /health, this probes real dependencies.",
+    "properties": {
+     "backups_failing": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Backups Failing",
+      "type": "array"
+     },
+     "generation_provider": {
+      "title": "Generation Provider",
+      "type": "boolean"
+     },
+     "index_compatible": {
+      "default": true,
+      "title": "Index Compatible",
+      "type": "boolean"
+     },
+     "index_detail": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Index Detail"
+     },
+     "last_backup": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/BackupStatusResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "llm_provider": {
+      "title": "Llm Provider",
+      "type": "string"
+     },
+     "models": {
+      "additionalProperties": {
+       "enum": [
+        "ok",
+        "failed",
+        "fallback"
+       ],
+       "type": "string"
+      },
+      "title": "Models",
+      "type": "object"
+     },
+     "originals_kept": {
+      "default": false,
+      "title": "Originals Kept",
+      "type": "boolean"
+     },
+     "qdrant": {
+      "title": "Qdrant",
+      "type": "boolean"
+     },
+     "status": {
+      "enum": [
+       "ok",
+       "degraded"
+      ],
+      "title": "Status",
+      "type": "string"
+     }
+    },
+    "required": [
+     "status",
+     "qdrant",
+     "generation_provider",
+     "llm_provider"
+    ],
+    "title": "ReadinessResponse",
     "type": "object"
    },
    "RebuildResponse": {
@@ -9640,10 +9774,22 @@
      "200": {
       "content": {
        "application/json": {
-        "schema": {}
+        "schema": {
+         "$ref": "#/components/schemas/ReadinessResponse"
+        }
        }
       },
       "description": "Successful Response"
+     },
+     "503": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ReadinessResponse"
+        }
+       }
+      },
+      "description": "Degraded: the same body."
      }
     },
     "summary": "Health Ready"

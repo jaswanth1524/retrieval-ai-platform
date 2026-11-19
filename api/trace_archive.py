@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 
-from api.sqlite_store import CappedRowLog
+from api.sqlite_store import CappedRowLog, add_missing_columns
 from api.tracing import (
     QueryTrace,
     TraceSummary,
@@ -77,10 +77,7 @@ class TraceArchive(CappedRowLog):
                 "CREATE INDEX IF NOT EXISTS traces_workspace_created_at "
                 "ON traces (workspace, created_at)"
             )
-            present = {row[1] for row in conn.execute("PRAGMA table_info(traces)")}
-            for name, declaration in _SUMMARY_COLUMNS:
-                if name not in present:
-                    conn.execute(f"ALTER TABLE traces ADD COLUMN {name} {declaration}")
+            add_missing_columns(conn, "traces", _SUMMARY_COLUMNS)
         self._backfill_summaries()
 
     def _backfill_summaries(self) -> None:

@@ -26,7 +26,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, get_args
 
-from api.sqlite_store import enable_wal, sqlite_transaction
+from api.sqlite_store import add_missing_columns, enable_wal, sqlite_transaction
 
 FeedbackRating = Literal["up", "down"]
 # What was rated: an answer to a question, a suggested follow-up question, or a summary
@@ -109,9 +109,7 @@ def _add_kind_column(conn: sqlite3.Connection) -> None:
     """Add ``kind`` to a table from before it was recorded, in place: every rating
     then was of an answer to a question."""
 
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
-    if "kind" not in columns:
-        conn.execute("ALTER TABLE feedback ADD COLUMN kind TEXT NOT NULL DEFAULT 'question'")
+    add_missing_columns(conn, "feedback", [("kind", "TEXT NOT NULL DEFAULT 'question'")])
 
 
 class FeedbackStore:

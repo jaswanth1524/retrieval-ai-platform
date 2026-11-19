@@ -2045,7 +2045,8 @@ def test_a_capped_neighbour_expansion_keeps_adjacent_chunks(
     """The filter drops a chunk next to a kept one because expansion brings its text
     back; capped by CONTEXT_NEIGHBOR_MAX_CHARS, it brings back only a slice of it."""
 
-    import api.pipeline as pipeline_module
+    # Passage selection lives in api.passage_selection (re-exported by api.pipeline).
+    import api.passage_selection as pipeline_module
 
     seen: list[bool] = []
     real = pipeline_module.select_diverse

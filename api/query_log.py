@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from api.sqlite_store import CappedRowLog
+from api.sqlite_store import CappedRowLog, add_missing_columns
 from api.tracing import QueryTrace, TraceSink
 
 _CREATE_TABLE = """
@@ -100,10 +100,7 @@ class QueryLogStore(CappedRowLog):
         super().__init__(path, max_rows)
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE)
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(queries)")}
-            for name, declaration in _ADDED_COLUMNS:
-                if name not in columns:
-                    conn.execute(f"ALTER TABLE queries ADD COLUMN {name} {declaration}")
+            add_missing_columns(conn, "queries", _ADDED_COLUMNS)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS queries_workspace_created_at "
                 "ON queries (workspace, created_at)"
