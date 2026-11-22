@@ -38,6 +38,10 @@ interface DocumentViewerProps {
   /** ``chunkId`` is where the reader left off: opened there, not marked as cited, and
    *  a passage that is gone since just opens the document at the top. */
   resume?: boolean;
+  /** Docked beside the conversation (wide windows): no backdrop, the chat stays usable. */
+  docked?: boolean;
+  /** Dock it beside the conversation, or back over it; absent when there is no room. */
+  onToggleDock?: () => void;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -88,6 +92,8 @@ function DocumentViewer({
   onGoTo,
   onCollect,
   resume = false,
+  docked = false,
+  onToggleDock,
 }: DocumentViewerProps) {
   // The passage whose question box is open, and what is typed in it.
   const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
@@ -202,7 +208,8 @@ function DocumentViewer({
   // open, no Tab trap, no focus restored to the citation that opened it. The hook
   // re-queries focusables on every Tab, which matters here because the chunk list (and
   // its Load-earlier/later buttons) only exists after the fetch resolves.
-  const dialogRef = useDialog(true, onClose);
+  // Docked, it is a side panel, not a dialog: focus is neither trapped in it nor moved.
+  const dialogRef = useDialog(!docked, onClose);
 
   const chunks = loaded?.chunks ?? null;
   const first = ordinalOf(chunks?.[0]);
@@ -428,12 +435,18 @@ function DocumentViewer({
 
   return (
     <div
-      className="document-viewer"
-      role="dialog"
-      aria-modal="true"
+      className={docked ? 'document-viewer document-viewer--docked' : 'document-viewer'}
+      role={docked ? 'complementary' : 'dialog'}
+      aria-modal={docked ? undefined : 'true'}
       aria-label={`Source: ${filename}`}
       ref={dialogRef}
+      data-testid="document-viewer"
       onKeyDown={(event) => {
+        if (docked && event.key === 'Escape') {
+          event.preventDefault();
+          onClose();
+          return;
+        }
         // The browser's own find can't see passages not loaded, and missed the dialog's
         // scroll box: this one searches what is loaded and offers the rest.
         if (event.key.toLowerCase() === 'f' && isShortcutModifier(event.nativeEvent) && mode === 'passages') {
@@ -442,7 +455,9 @@ function DocumentViewer({
         }
       }}
     >
-      <div className="document-viewer__backdrop" data-testid="viewer-backdrop" onClick={onClose} />
+      {!docked && (
+        <div className="document-viewer__backdrop" data-testid="viewer-backdrop" onClick={onClose} />
+      )}
       <div className="document-viewer__panel">
         <div className="document-viewer__header">
           <span className="document-viewer__filename" title={filename}>
@@ -489,6 +504,18 @@ function DocumentViewer({
               data-testid="viewer-copy-link"
             >
               Copy link
+            </button>
+          )}
+          {onToggleDock && (
+            <button
+              type="button"
+              className="document-viewer__original"
+              onClick={onToggleDock}
+              aria-pressed={docked}
+              title={docked ? 'Show the document over the conversation' : 'Keep the document open beside the conversation'}
+              data-testid="viewer-dock"
+            >
+              {docked ? 'Undock' : 'Dock beside'}
             </button>
           )}
           <button

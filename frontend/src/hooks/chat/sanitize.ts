@@ -239,6 +239,7 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
     'incomplete',
     'cached',
     'notFound',
+    'emptyScope',
     'uncited',
     'truncated',
     'promptCut',

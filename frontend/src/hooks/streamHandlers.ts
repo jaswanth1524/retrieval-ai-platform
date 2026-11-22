@@ -9,6 +9,9 @@ type DoneHandler = NonNullable<QuestionStreamHandlers['onDone']>;
  *  streaming message, whose markdown is re-parsed over the whole answer so far — per
  *  token that is quadratic in answer length on a fast provider. The text waiting is
  *  kept in `pending` (a ref: a pagehide snapshot reads it too). */
+/** What the stage reads while the model writes an answer. */
+export const GENERATING_LABEL = 'generating answer…';
+
 export function createDeltaBuffer(
   pending: MutableRefObject<string>,
   apply: (text: string) => void,
@@ -66,7 +69,7 @@ export function answerStreamHandlers(
   buffer: ReturnType<typeof createDeltaBuffer>,
   actions: AnswerStreamActions,
 ): QuestionStreamHandlers {
-  const writing = isTask ? 'writing the summary…' : 'generating answer…';
+  const writing = isTask ? 'writing the summary…' : GENERATING_LABEL;
   let streamedText = false;
   return {
     onStage: (serverStage, progress, reading) => {

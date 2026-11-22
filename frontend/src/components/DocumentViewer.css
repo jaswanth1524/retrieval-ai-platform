@@ -342,3 +342,22 @@
   text-align: left;
   cursor: pointer;
 }
+
+/* Docked beside the conversation on wide windows (App reserves the column): a side
+   panel the full height of the window, the conversation still usable beside it. */
+.document-viewer--docked {
+  inset: 0 0 0 auto;
+  width: var(--w-viewer-dock);
+  z-index: 20;
+  align-items: stretch;
+  justify-content: stretch;
+  border-left: 1px solid var(--rule-hi);
+}
+
+.document-viewer--docked .document-viewer__panel {
+  width: 100%;
+  max-height: none;
+  height: 100%;
+  border-radius: 0;
+  box-shadow: none;
+}

@@ -4,6 +4,7 @@ import { chatStoreAvailable, clearChatStore, readChatStore, saveChatStore } from
 import {
   CHAT_STORAGE_KEY,
   LOCAL_STORAGE_MAX_CONVERSATIONS,
+  capConversations,
   forChatStore,
   isOnlyEmpty,
   mergeConversations,
@@ -23,6 +24,22 @@ export interface StreamingRefs {
   streamingTurnIdRef: MutableRefObject<string | null>;
   streamingConversationIdRef: MutableRefObject<string | null>;
   bufferedDeltaRef: MutableRefObject<string>;
+}
+
+/** What to write to IndexedDB: this tab's history with the conversations another tab
+ *  stored there and this one never loaded (it only hears of localStorage's 20 most
+ *  recent), deletions on either side respected and the history cap applied. */
+export function withStoredConversations(
+  mine: ChatStorageV2,
+  stored: unknown,
+  streamingId: string | null,
+): unknown {
+  const incoming = parseConversations(stored)?.filter((c) => c.turns.length > 0);
+  const deleted = parseDeleted(stored);
+  if (!incoming?.length && !deleted?.length) return forChatStore(mine);
+  const merged = mergeConversations(mine, incoming ?? [], false, deleted, Date.now(), streamingId);
+  if (merged === mine) return forChatStore(mine);
+  return forChatStore({ ...merged, conversations: capConversations(merged.conversations) });
 }
 
 /** Saving and restoring the chat history (``useChat``'s storage): localStorage's
@@ -65,7 +82,11 @@ export function useChatPersistence(
     // Mirrors persistStorage: a lone empty conversation clears the store rather than
     // being saved, so it can't come back next to a new one after a reload.
     void (
-      isOnlyEmpty(pendingStorage) ? clearChatStore() : saveChatStore(forChatStore(pendingStorage))
+      isOnlyEmpty(pendingStorage)
+        ? clearChatStore()
+        : saveChatStore(forChatStore(pendingStorage), (stored) =>
+            withStoredConversations(pendingStorage, stored, streamingConversationIdRef.current),
+          )
     ).then(
       (saved) => {
         if (!mountedRef.current) return;

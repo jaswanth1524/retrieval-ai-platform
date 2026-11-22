@@ -563,11 +563,12 @@ export class MockApi {
       return this.json(route, 200, { filename, versions: this.versions[filename] ?? [] });
     }
 
-    const documentRoute = /^\/documents\/([^/]+)(?:\/(content|outline|reindex|tags|original|refresh-settings))?$/.exec(
+    // A name may have folders ("reports/q1.pdf", sent a segment at a time).
+    const documentRoute = /^\/documents\/(.+?)(?:\/(content|outline|reindex|tags|original|refresh-settings))?$/.exec(
       path,
     );
     if (documentRoute) {
-      const filename = decodeURIComponent(documentRoute[1]);
+      const filename = documentRoute[1].split('/').map(decodeURIComponent).join('/');
       const action = documentRoute[2];
       if (!this.documents.includes(filename)) {
         return this.configured(route, 404, { detail: `No indexed document named '${filename}'.` });

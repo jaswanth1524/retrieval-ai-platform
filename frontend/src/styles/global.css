@@ -28,6 +28,16 @@ body {
   overflow: hidden;
 }
 
+:root {
+  /* The width of a document docked beside the conversation. */
+  --w-viewer-dock: min(560px, 38vw);
+}
+
+/* A document docked beside the conversation takes the right of the window. */
+.app-shell--viewer-docked {
+  padding-right: var(--w-viewer-dock);
+}
+
 /* Shown while files are dragged over the window (useWindowFileDrop). Pointer events
    pass through so the drop lands on whatever is underneath. */
 .app-drop-overlay {

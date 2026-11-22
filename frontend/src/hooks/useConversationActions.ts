@@ -3,6 +3,7 @@ import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { getWorkspace } from '../api/client';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
+import { addToTrash } from '../utils/trash';
 import {
   EMPTY_SCOPE,
   isEmptyScope,
@@ -123,6 +124,8 @@ export function useConversationActions(
         : [];
       const chosen = built.slice(0, room + removable.length);
       if (chosen.length > 0) {
+        // Into Recently deleted, as any delete: restorable for as long as that keeps them.
+        for (const conversation of removable) addToTrash(conversation, now);
         const gone = new Set(removable.map((conversation) => conversation.id));
         setStorage((prev) => ({
           ...prev,

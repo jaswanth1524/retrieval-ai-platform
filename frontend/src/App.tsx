@@ -84,7 +84,8 @@ import {
   DEFAULT_MAX_UPLOAD_BYTES,
   validateUploads,
 } from './utils/uploadValidation';
-import { addToTrash, removeFromTrash } from './utils/trash';
+import { addToTrash, readTrash, removeFromTrash } from './utils/trash';
+import { takeHistoryReminder } from './utils/historyBackup';
 import { otherUsableProviders } from './utils/providers';
 import RecentlyDeleted from './components/RecentlyDeleted';
 import SelectionActions from './components/SelectionActions';
@@ -113,6 +114,9 @@ const CommandPalette = lazy(() => import('./components/CommandPalette'));
 const DocumentViewer = lazy(() => import('./components/DocumentViewer'));
 const Inspector = lazy(() => import('./components/Inspector'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
+
+// The document viewer docked beside the conversation ("true"), kept per browser.
+const VIEWER_DOCK_STORAGE_KEY = 'docrag-viewer-docked';
 
 function App() {
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
@@ -147,6 +151,16 @@ function App() {
   );
   const restoreInputRef = useRef<HTMLInputElement>(null);
   const { tooNarrowForInspector, roomyEnoughForInspector, panelCollapsed } = useResponsiveLayout();
+  // The document viewer docked beside the conversation (wide windows, by choice; kept).
+  const [viewerDockPreferred, setViewerDockPreferred] = useState(
+    () => readStored(VIEWER_DOCK_STORAGE_KEY) === 'true',
+  );
+  const toggleViewerDock = useStableHandler(() => {
+    setViewerDockPreferred((docked) => {
+      writeStored(VIEWER_DOCK_STORAGE_KEY, docked ? null : 'true');
+      return !docked;
+    });
+  });
   // Reopening on a new turn should follow the conversation again rather than resurface
   // whatever trace row was last clicked.
   const { inspectorOpen, showInspector, closeInspector, toggleInspector } = useInspectorVisibility(
@@ -169,11 +183,13 @@ function App() {
   // chunkId null: opened from the corpus panel's Read, at the document's first passage.
   // highlights: the passages a citation rests on, marked in the cited chunk.
   const [sourceView, setSourceView] = useState<SourceView | null>(null);
+  const viewerDocked = sourceView !== null && viewerDockPreferred && roomyEnoughForInspector;
   const corpusBrowseInputRef = useRef<HTMLInputElement>(null);
   const {
     turns,
     pending,
     streamingConversationId,
+    continuingTurnId,
     askedTurns,
     stage,
     stageTiming,
@@ -221,8 +237,15 @@ function App() {
   // look deleted, and lose its draft.
   useEffect(() => {
     if (!historyReady) return;
-    pruneDrafts(new Set(conversations.map((conversation) => conversation.id)));
-  }, [conversations, historyReady]);
+    // Recently deleted ones keep theirs: Undo or Restore brings the conversation back
+    // with what was being typed in it.
+    pruneDrafts(
+      new Set([
+        ...conversations.map((conversation) => conversation.id),
+        ...readTrash().map((entry) => entry.conversation.id),
+      ]),
+    );
+  }, [conversations, historyReady, trashedVersion]);
   // At the cap, starting another conversation drops the least recently used unpinned
   // one. Said once a session, when the history first fills, rather than not at all.
   const capNoticeShownRef = useRef(false);
@@ -695,7 +718,7 @@ function App() {
     apiStatus === 'unauthorized'
       ? 'This server requires an API key — add one in Settings.'
       : connectionLost
-        ? 'Can’t reach the server right now — checking again every few seconds.'
+        ? 'Can’t reach the server right now — checking again every few seconds. A question sent now goes once it is back.'
         : listingFailed
           ? 'Couldn’t load the document list — retrying. You can still ask.'
           : noDocs
@@ -880,6 +903,24 @@ function App() {
     if (!persistPartial) dismissToast('persist-partial');
   }, [persistError, persistPartial, pushToast, dismissToast]);
 
+  // Now and then, a reminder that the history lives only in this browser (after the
+  // full history loaded, once per session at most, and only when there is some to lose).
+  const historyReminderCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!historyReady || historyReminderCheckedRef.current) return;
+    historyReminderCheckedRef.current = true;
+    const count = conversations.filter((conversation) => conversation.turnCount > 0).length;
+    if (!takeHistoryReminder(count)) return;
+    pushToast({
+      id: 'history-backup',
+      tone: 'info',
+      title: 'Your chat history is kept only in this browser',
+      body: 'Clearing site data or switching devices loses it. Export a copy now and then.',
+      action: { label: 'Export all', run: () => exportAllRef.current() },
+    });
+  }, [historyReady, conversations, pushToast]);
+  const exportAllRef = useRef<() => void>(() => undefined);
+
   const {
     exportMarkdown,
     exportHtml,
@@ -898,6 +939,7 @@ function App() {
     noteAuthFailure,
     conversationWorkspace ?? workspace,
   );
+  exportAllRef.current = () => exportAllConversations();
   // The print stylesheet (global.css) leaves only the conversation on the page.
   const printConversation = useStableHandler(() => window.print());
 
@@ -1089,15 +1131,15 @@ function App() {
     let removed = 0;
     if (parsed.kind === 'many') {
       const items = parsed.items;
-      // Asked first: making room removes conversations, which can't be undone.
+      // Asked first: making room removes conversations (to Recently deleted).
       const { valid, room } = importPreview(items);
       const makeRoom =
         valid > room &&
         window.confirm(
           `This file has ${valid} conversations and the history has room for ${room} ` +
             `(it keeps ${MAX_CONVERSATIONS}).\n\nOK: remove up to ${valid - room} of the ` +
-            'least recently used conversations (never pinned ones, nor ones with saved answers) ' +
-            'to import them all.\n' +
+            'least recently used conversations (never pinned ones, nor ones with saved answers; ' +
+            'they go to Recently deleted) to import them all.\n' +
             `Cancel: import only the ${room} that fit.`,
         );
       ({ imported: count, skipped, removed } = importConversations(items, { makeRoom }));
@@ -1227,7 +1269,7 @@ function App() {
   });
 
   return (
-    <div className="app-shell">
+    <div className={viewerDocked ? 'app-shell app-shell--viewer-docked' : 'app-shell'}>
       {/* First stop for Tab: past the rail and the whole context panel to the question. */}
       <a
         className="app-skip-link"
@@ -1526,6 +1568,7 @@ function App() {
               key={`thread-${activeConversationId ?? 'none'}`}
               turns={turns}
               pending={streamingHere}
+              streamingTurnId={streamingHere ? continuingTurnId : null}
               busy={pending}
               stage={streamingHere ? stage : null}
               stageTiming={streamingHere ? stageTiming : null}
@@ -1581,12 +1624,14 @@ function App() {
         {apiStatus !== 'error' && (
           <Composer
             onSubmit={askQuestion}
+            recallQuestion={[...turns].reverse().find((turn) => turn.role === 'user' && !turn.task)?.content}
             // Typing is fine while the app boots; only sending waits for it.
             disabled={apiStatus === 'unauthorized' || noDocs}
-            sendHeld={booting || (pending && !streamingHere)}
-            // Only the startup wait queues a send; waiting for another conversation's
-            // answer to finish doesn't send this one by itself later.
-            sendQueueable={booting && !(pending && !streamingHere)}
+            sendHeld={booting || connectionLost || (pending && !streamingHere)}
+            // The startup wait and a lost connection queue a send (it goes once the
+            // server answers again, rather than failing into an error turn); waiting
+            // for another conversation's answer to finish doesn't send this one later.
+            sendQueueable={(booting || connectionLost) && !(pending && !streamingHere)}
             hint={composerHint ?? (pending && !streamingHere ? streamingElsewhereHint : undefined)}
             pending={streamingHere}
             onCancel={cancel}
@@ -1625,7 +1670,7 @@ function App() {
         }}
       >
         <Suspense fallback={null}>
-          {inspectorOpen && apiStatus !== 'error' && (
+          {inspectorOpen && apiStatus !== 'error' && !viewerDocked && (
             <Inspector
               engineerMode={mode === 'engineer'}
               tab={inspectorTab}
@@ -1709,6 +1754,8 @@ function App() {
                 Boolean(config?.raw_documents_enabled),
                 documents[sourceView.filename],
               )}
+              docked={viewerDocked}
+              onToggleDock={roomyEnoughForInspector ? toggleViewerDock : undefined}
             />
           )}
         </Suspense>

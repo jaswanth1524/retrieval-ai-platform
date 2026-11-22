@@ -14,6 +14,43 @@
   color: var(--warn);
 }
 
+.composer__scope-chips {
+  max-width: var(--content-rail);
+  margin: 0 auto 8px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer__scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  max-width: 220px;
+  padding: 2px 8px;
+  border: 1px solid var(--rule-hi);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.composer__scope-chip:hover,
+.composer__scope-chip:focus-visible {
+  border-color: var(--accent);
+}
+
+.composer__scope-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .composer__box {
   max-width: var(--content-rail);
   margin: 0 auto;

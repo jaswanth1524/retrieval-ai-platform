@@ -12,8 +12,8 @@ import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
 import { useChatPersistence } from './useChatPersistence';
 import { useConversationActions } from './useConversationActions';
-import { answerStreamHandlers, createDeltaBuffer } from './streamHandlers';
-import { mergeRegenerated } from '../utils/answerVersions';
+import { GENERATING_LABEL, answerStreamHandlers, createDeltaBuffer } from './streamHandlers';
+import { ANSWER_RUN_FIELDS, mergeRegenerated } from '../utils/answerVersions';
 import { sanitizeStyle } from './chat/sanitize';
 import type { ImportItem } from './useConversationActions';
 import { turnCounts, useAnswerQueries, type SavedAnswer } from './chat/answers';
@@ -103,6 +103,8 @@ export interface UseChatResult {
   pending: boolean;
   /** The conversation the answer in flight is written to; null when none is. */
   streamingConversationId: string | null;
+  /** The answer a Continue is writing into, while it runs (null otherwise). */
+  continuingTurnId: string | null;
   /** The turns of the conversation asked in last (the active one's before any ask). */
   askedTurns: ChatTurn[];
   // Human-readable label for the stage the in-flight question is on, or null when
@@ -298,7 +300,8 @@ export function answeredTurn(
   grounding: DoneArgs[5],
 ): ChatTurn {
   const status = grounding?.answerStatus;
-  const notFound = status === 'insufficient_context' || status === 'no_context';
+  const emptyScope = status === 'empty_scope';
+  const notFound = status === 'insufficient_context' || status === 'no_context' || emptyScope;
   return {
     ...turn,
     content: answer,
@@ -322,6 +325,7 @@ export function answeredTurn(
     traceId,
     ...(cached ? { cached: true } : {}),
     ...(notFound ? { notFound: true } : {}),
+    ...(emptyScope ? { emptyScope: true } : {}),
     ...(status === 'uncited' ? { uncited: true } : {}),
     ...(grounding?.weakMatches ? { weakMatch: true } : {}),
     ...(grounding?.truncated ? { truncated: true } : {}),
@@ -355,6 +359,18 @@ interface TrailingStream {
 }
 
 
+/** ``turns`` without a stopped Regenerate's own pair: its answer (``answerId``, when it
+ *  was created) and the copy of ``question`` asked last for it. */
+export function withoutRegenerateAttempt(
+  turns: ChatTurn[],
+  answerId: string,
+  question: string,
+): ChatTurn[] {
+  const kept = turns.filter((turn) => turn.id !== answerId);
+  const last = kept[kept.length - 1];
+  return last?.role === 'user' && last.content === question ? kept.slice(0, -1) : kept;
+}
+
 export function useChat(): UseChatResult {
   const [storage, setStorage] = useState<ChatStorageV2>(loadStorage);
   const [pending, setPending] = useState(false);
@@ -363,6 +379,9 @@ export function useChat(): UseChatResult {
   // Which conversation the answer in flight is written to (null when none is), and the
   // one asked in last: other conversations can be opened while an answer streams.
   const [streamingConversationId, setStreamingConversationId] = useState<string | null>(null);
+  // The answer a Continue is writing into (any answer, not only the last); null while
+  // a new answer streams at the end of the thread.
+  const [continuingTurnId, setContinuingTurnId] = useState<string | null>(null);
   const [askedConversationId, setAskedConversationId] = useState<string | null>(null);
 
   const { conversations, activeConversationId } = storage;
@@ -561,7 +580,11 @@ export function useChat(): UseChatResult {
     // The assistant turn is created lazily on the first `sources`/`delta` event so a
     // mid-stream failure before any event arrives renders as a clean error turn.
     const assistantTurnId = continued?.id ?? newId();
-    streamingTurnIdRef.current = assistantTurnId;
+    // A Continue changes nothing on the answer before `done` (below): a reload or a
+    // discarded tab meanwhile finds the answer as it was, not marked stopped with raw
+    // continuation text on it.
+    streamingTurnIdRef.current = continued ? null : assistantTurnId;
+    if (continued) setContinuingTurnId(assistantTurnId);
     const updateAssistantTurn = (update: (turn: ChatTurn) => ChatTurn, touch = true) => {
       updateTurns((prev) => {
         const existing = prev.find((turn) => turn.id === assistantTurnId);
@@ -591,9 +614,16 @@ export function useChat(): UseChatResult {
     // Each flush re-renders the answer, re-parses its last markdown block and lays the
     // thread out; 20 a second still reads as continuous text (a model sends ~30-80
     // tokens a second). The first text is shown at once.
+    // A Continue's text isn't shown as it streams: the server joins it to the answer
+    // (a space or none, a restart dropped) only at `done`, and the raw pieces read
+    // "butbusiness" or repeated the answer until then. The answer stays as it was, with
+    // "continuing the answer…", and `done` brings the whole text.
     const deltas = createDeltaBuffer(
-      bufferedDeltaRef,
-      (text) => updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false),
+      continued ? { current: '' } : bufferedDeltaRef,
+      (text) => {
+        if (continued) return;
+        updateAssistantTurn((turn) => ({ ...turn, content: turn.content + text }), false);
+      },
       (flush) => window.setTimeout(flush, STREAM_FLUSH_MS),
       (id) => window.clearTimeout(id),
       true,
@@ -613,6 +643,7 @@ export function useChat(): UseChatResult {
       streamingTurnIdRef.current = null;
       streamingConversationIdRef.current = null;
       setStreamingConversationId(null);
+      setContinuingTurnId(null);
       if (inflightRef.current === controller) inflightRef.current = null;
       if (conversationId) {
         setStorage((prev) => applyDeleteHeldDuringStream(prev, conversationId, startedAt));
@@ -641,9 +672,16 @@ export function useChat(): UseChatResult {
             filenames,
             history,
             answerStreamHandlers(Boolean(task), deltas, {
-              enterStage,
+              // A Continue reads "continuing the answer…" while the model writes.
+              enterStage: continued
+                ? (label, etaMs) =>
+                    enterStage(label === GENERATING_LABEL ? stageLabel('continuing') : label, etaMs)
+                : enterStage,
               stageLabel,
-              updateAnswer: updateAssistantTurn,
+              // A Continue's sources are the answer's own, and its new trace id is only
+              // stored once written (`done`): set before, the Inspector looked it up
+              // while the server had no such trace yet and said it was gone.
+              updateAnswer: continued ? () => undefined : updateAssistantTurn,
               // Onto this answer by id, and never creating it: by now it may have been
               // cleared or deleted, and other questions may have been asked since.
               setFollowups: (followups) =>
@@ -660,10 +698,23 @@ export function useChat(): UseChatResult {
                   if (!continued) {
                     return answeredTurn(turn, answer, sources, timings, traceId, cached, grounding);
                   }
-                  // The whole answer now: how its first part ended no longer describes
-                  // it, and what the continuation cost is added to what that part did.
-                  const { truncated: _cut, cannotContinue: _gone, continueFailed: _failed, ...whole } = turn;
-                  const done = answeredTurn(whole, answer, sources, timings, traceId, cached, grounding);
+                  // The whole answer now: what described its first part (how it ended,
+                  // its checks and notes, a rating of that text) no longer applies, and
+                  // what the continuation cost is added to what that part did.
+                  const whole: Partial<ChatTurn> = { ...turn };
+                  for (const field of ANSWER_RUN_FIELDS) delete whole[field];
+                  // Finished now, however its first part ended.
+                  delete whole.stopped;
+                  delete whole.incomplete;
+                  const done = answeredTurn(
+                    { ...(whole as ChatTurn), timings: null },
+                    answer,
+                    sources,
+                    timings,
+                    traceId,
+                    cached,
+                    grounding,
+                  );
                   const before = continued.usage;
                   if (!before || !done.usage) return done;
                   const cost =
@@ -724,6 +775,11 @@ export function useChat(): UseChatResult {
               : turn,
           ),
         );
+      } else if (controller.signal.aborted && options?.replacesAnswer) {
+        // A Regenerate stopped: the answer it was to replace stays the answer, and the
+        // second copy of its question (with whatever streamed) goes, rather than ending
+        // the thread with the same question asked twice.
+        updateTurns((prev) => withoutRegenerateAttempt(prev, assistantTurnId, question));
       } else if (controller.signal.aborted) {
         // Drop a content-less assistant turn: cancelling after `sources` but before the
         // first delta would otherwise leave an empty answer bubble behind. A partial one
@@ -732,6 +788,17 @@ export function useChat(): UseChatResult {
           prev
             .filter((turn) => turn.id !== assistantTurnId || turn.content !== '')
             .map((turn) => (turn.id === assistantTurnId ? { ...turn, stopped: true } : turn)),
+        );
+      } else if (options?.replacesAnswer) {
+        // A Regenerate failed: the answer it was to replace stays, with why, instead of
+        // the same question asked twice and an error row whose Retry no longer
+        // replaced anything.
+        const message = apiErrorMessage(err, 'Something went wrong.');
+        const replaced = options.replacesAnswer;
+        updateTurns((prev) =>
+          withoutRegenerateAttempt(prev, assistantTurnId, question).map((turn) =>
+            turn.id === replaced ? { ...turn, regenerateFailed: message } : turn,
+          ),
         );
       } else {
         const message = apiErrorMessage(err, 'Something went wrong.');
@@ -1090,6 +1157,7 @@ export function useChat(): UseChatResult {
     historyReady,
     trashedVersion,
     streamingConversationId,
+    continuingTurnId,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
     conversationWorkspace: activeConversation ? conversationWorkspace(activeConversation) : null,
