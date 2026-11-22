@@ -1138,15 +1138,21 @@ def with_model(settings: AppSettings, provider: str | None, model: str | None) -
 
 
 def _check_answer_baseline(output: Path, baseline_path: Path, tolerance: float) -> int:
-    from eval.replay import answer_regressions
+    from eval.replay import answer_regressions, answer_shape_problems
 
     try:
-        metrics = json.loads(output.read_text(encoding="utf-8"))["metrics"]
-        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))["metrics"]
+        current_run = json.loads(output.read_text(encoding="utf-8"))
+        baseline_run = json.loads(baseline_path.read_text(encoding="utf-8"))
+        metrics = current_run["metrics"]
+        baseline = baseline_run["metrics"]
+        current_print = dict(current_run.get("fingerprint") or {})
+        baseline_print = dict(baseline_run.get("fingerprint") or {})
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"error: could not read the answer baseline: {exc}", file=sys.stderr)
         return 2
-    problems = answer_regressions(metrics, baseline, tolerance)
+    problems = answer_shape_problems(current_print, baseline_print) + answer_regressions(
+        metrics, baseline, tolerance
+    )
     for problem in problems:
         print(f"regression: {problem}", file=sys.stderr)
     return 1 if problems else 0

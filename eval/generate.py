@@ -149,6 +149,29 @@ def rows_from_queries(
     for row in latest.values():
         if row.get("status") == "error":
             continue  # a failure, not a sign the documents lack the answer
+        if row.get("retrieval_query") or row.get("scope"):
+            # A follow-up ("And for contractors?") means what its rewrite says, and a
+            # scoped question was searched in a part of the corpus: neither is a
+            # standalone dataset question as written.
+            review.append(
+                {
+                    "question": row["question"],
+                    "status": row.get("status"),
+                    "top_score": row.get("top_score"),
+                    "draft_relevant_filenames": sorted(
+                        {str(name) for name in row.get("filenames") or []}
+                    ),
+                    **(
+                        {"searched_as": row["retrieval_query"]}
+                        if row.get("retrieval_query")
+                        else {}
+                    ),
+                    **({"scope": row["scope"]} if row.get("scope") else {}),
+                    "note": "a follow-up or scoped question: rewrite it as a standalone "
+                    "question before labelling it",
+                }
+            )
+            continue
         filenames = sorted({str(name) for name in row.get("filenames") or []})
         if row.get("status") == "ok" and filenames and row.get("filenames_cited") is True:
             labelled.append({"question": row["question"], "relevant_filenames": filenames})

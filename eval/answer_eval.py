@@ -288,6 +288,29 @@ def _summary_row(
     )
 
 
+_SOURCE_HEADER = re.compile(r"^\[(\d+)\] filename=[^\n]*\n", re.MULTILINE)
+
+
+def _contexts_from_prompt(messages: Sequence[ChatMessage] | None) -> list[str]:
+    """Each numbered source's text as the answer prompt gave it, in source order; [] when
+    the prompt has no ``Context:`` block to read (an older trace, a summary)."""
+
+    if not messages:
+        return []
+    content = str(messages[-1].get("content", ""))
+    start = content.find("Context:\n")
+    end = content.rfind("\n\nInstructions:\n")
+    if start < 0 or end <= start:
+        return []
+    block = content[start + len("Context:\n") : end]
+    headers = list(_SOURCE_HEADER.finditer(block))
+    texts: list[str] = []
+    for index, header in enumerate(headers):
+        stop = headers[index + 1].start() if index + 1 < len(headers) else len(block)
+        texts.append(block[header.end() : stop].strip())
+    return texts
+
+
 def _prompt_contexts(
     trace: QueryTrace | None,
     repository: Any,
@@ -301,6 +324,11 @@ def _prompt_contexts(
 
     if trace is None:
         return []
+    from_prompt = _contexts_from_prompt(trace.prompt_messages)
+    if from_prompt:
+        # What the model read, neighbour text included (``neighbor_expanded``): the
+        # passage alone under-credited answers that used it.
+        return from_prompt
     # Candidates are listed in fused order; the prompt holds them by rerank score.
     selected = sorted(
         (c for c in trace.candidates if c.selected_for_context),
@@ -535,6 +563,12 @@ def run_answer_eval(
             "llm_max_tokens": int(settings.llm_max_tokens),
             "citation_retry_mode": settings.citation_retry_mode,
             "prompt_token_budget": int(settings.prompt_token_budget),
+            # What the model saw and how it was asked to write: a baseline measured
+            # with other values judges a different run.
+            "max_context_chunks": int(settings.max_context_chunks),
+            "answer_format": settings.answer_format,
+            "answer_language": settings.answer_language,
+            "question_count": len(rows),
         },
         "metrics": {name: round(value, 4) for name, value in metrics.items()},
         "examples": [r.to_dict() for r in rows],
