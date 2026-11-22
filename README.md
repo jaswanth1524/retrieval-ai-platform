@@ -755,8 +755,30 @@ unpack server.zip` on the new server puts it back. With the same embedding setti
 empty workspaces the snapshots are used as they are — nothing is embedded again;
 otherwise documents are indexed from their originals. The upload is spooled to disk
 twice (by the web server, in `TMPDIR`, then into `IMPORT_SPOOL_DIR`): in Compose `/tmp`
-is memory counted against `API_MEM_LIMIT`, so for a large bundle set `TMPDIR` and
-`IMPORT_SPOOL_DIR` to folders under `/app/data`, or raise `API_MEM_LIMIT`.
+is memory counted against `API_MEM_LIMIT` and sized by `API_TMP_SIZE` (2g; an upload
+bigger than the room left is refused with a 507 before it is read), so for a large
+bundle set `TMPDIR` and `IMPORT_SPOOL_DIR` to folders under `/app/data`, or raise
+`API_TMP_SIZE` and `API_MEM_LIMIT` together.
+
+**A lost index:** at startup a workspace whose index holds no document while its
+originals are kept (a wiped Qdrant volume) is logged and reported (`NOTIFY_URL`, event
+`index_lost`); `AUTO_REBUILD_LOST_INDEX=true` also rebuilds it from them. Scheduled
+backups include originals with no indexed document, a backup holding far fewer documents
+than the one before is reported as failed, and the newest backup that held documents is
+never pruned. `BACKUP_COPY_COMMAND` runs on each new backup (its path as the last
+argument) to copy it off the disk.
+
+**Moving a large server:** `docrag migrate pack server.zip --background` has the server
+write the bundle in the background and downloads it when done (for a pack that outlasts
+a proxy's request timeout).
+
+**Checking a text against the documents:** `docrag verify draft.txt` (or `POST
+/questions/verify`, MCP `verify_text`) looks up each sentence with no LLM and says
+which passage supports it, which states other numbers, and which nothing supports.
+
+**Hidden Office content** (hidden XLSX sheets, DOCX hidden text, hidden PPTX slides) is
+left out of the index; `INDEX_HIDDEN_CONTENT=true` keeps it. A document indexed before
+this keeps its hidden text until it is re-indexed (`docrag reindex NAME`).
 
 **Background imports that survive a restart:** with `IMPORT_SPOOL_DIR` set (e.g.
 `./data/imports`), a zip or backup imported in the background keeps its file there, and
