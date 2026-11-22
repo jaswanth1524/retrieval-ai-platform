@@ -5,22 +5,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
-from typing import get_args
+from typing import NamedTuple, get_args
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from api.admission import QuestionSlots, Release, SlotKind
+from api.answer_cache import CachedAnswer
 from api.dependencies import (
     require_api_key,
 )
 from api.document_names import stored_filename
 from api.errors import public_error_message, question_error_type
 from api.generation import GenerationConfigError
-from api.llm import completion_model_and_kwargs
+from api.llm import ServerGenerationConfigError, completion_model_and_kwargs
 from api.metrics import (
     NO_ERROR_TYPE,
     answer_cache_hits_total,
@@ -105,6 +107,80 @@ def question_slot(
     return release
 
 
+def _no_slot() -> None:
+    return None
+
+
+# How long a request finding every slot busy waits for an identical run to show up.
+IDENTICAL_RUN_SETTLE_SECONDS = 1.0
+
+
+class Admission(NamedTuple):
+    """How a question got in: its slot's release (which also releases the followers of
+    a run it claimed), and — when it needn't run the question — the cached answer to
+    replay or the identical run to wait for, or the run it now leads."""
+
+    release: Release
+    cached: CachedAnswer | None = None
+    follow: threading.Event | None = None
+    claimed: threading.Event | None = None
+
+
+Claim = Callable[[], "tuple[threading.Event, bool, Callable[[], None]] | None"]
+
+
+def question_slot_unless_cached(
+    slots: QuestionSlots,
+    cached: Callable[[], CachedAnswer | None],
+    running: Callable[[], threading.Event | None] = lambda: None,
+    claim: Claim = lambda: None,
+) -> Admission:
+    """Admit a question. A stored answer is replayed as found (so it can't expire into
+    a full run), and a question identical to one being answered waits for its answer —
+    neither needs a slot, so a full server doesn't turn them away. Otherwise a slot
+    (or 429), and the run is claimed at once: an identical question sent at the same
+    moment finds it registered and waits instead of taking a slot or a 429. The claim
+    is released with the slot, however the request ends (the pipeline finishes it
+    earlier, once the answer is stored)."""
+
+    release = slots.try_acquire("question")
+    if release is None:
+        hit = cached()
+        if hit is not None:
+            return Admission(_no_slot, cached=hit)
+        # A run claimed a moment ago may still be registering: wait briefly for it.
+        deadline = time.monotonic() + IDENTICAL_RUN_SETTLE_SECONDS
+        while True:
+            event = running()
+            if event is not None:
+                return Admission(_no_slot, follow=event)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        return Admission(question_slot(slots))
+    hit = cached()
+    if hit is not None:
+        release()
+        return Admission(_no_slot, cached=hit)
+    claimed = claim()
+    if claimed is None:
+        return Admission(release)
+    event, leading, finish = claimed
+    if not leading:
+        # Someone is answering it already: wait for that, and free the slot.
+        release()
+        return Admission(_no_slot, follow=event)
+    slot_release = release
+
+    def release_both() -> None:
+        try:
+            finish()
+        finally:
+            slot_release()
+
+    return Admission(release_both, claimed=event)
+
+
 def check_question_text(question: str) -> None:
     """400 for a blank question, before a slot is taken: it used to take one (and,
     with history, a condense call) before the pipeline refused it, and the stream
@@ -171,6 +247,12 @@ def check_request_provider(
             f"got {float(effective_temperature):g}."
         )
     if provider is None:
+        # The server's default: checked here too, so a missing key costs no search and
+        # rerank, and is reported as the server's fault (503), not the request's.
+        try:
+            completion_model_and_kwargs(settings)
+        except GenerationConfigError as exc:
+            raise ServerGenerationConfigError(str(exc)) from exc
         return
     if provider not in allowed_request_providers(settings):
         raise GenerationConfigError(
@@ -306,7 +388,22 @@ async def answer_question(
     check_request_provider(request.llm_provider, settings, request.llm_temperature)
     check_rerank_top_k(request.rerank_top_k, settings)
     check_question_text(request.question)
-    release = question_slot(slots)
+    lookup = (
+        request.question,
+        question_overrides(request),
+        request.filenames,
+        request.tags,
+        history_messages(request.history),
+    )
+    # In the threadpool: on a full server it may wait a moment for an identical run.
+    admitted = await run_in_threadpool(
+        question_slot_unless_cached,
+        slots,
+        lambda: pipeline.cached_answer(*lookup) if request.use_cache else None,
+        lambda: pipeline.identical_run(*lookup) if request.use_cache else None,
+        lambda: pipeline.claim_run(*lookup) if request.use_cache else None,
+    )
+    release, hit = admitted.release, admitted.cached
     # A client that leaves (a CLI timeout, a closed connection) stops the pipeline
     # before its next expensive stage, as on the stream: the slot, the local model
     # and the LLM call were otherwise held to the end for nobody.
@@ -322,6 +419,9 @@ async def answer_question(
                 tags=request.tags,
                 use_cache=request.use_cache,
                 should_stop=stop.is_set,
+                cached=hit,
+                follow=admitted.follow,
+                claimed=admitted.claimed,
             )
         )
     except QuestionAbandoned:
@@ -362,6 +462,7 @@ async def answer_question(
         unsupported_numbers=grounded.unsupported_numbers,
         prompt_cached=grounded.prompt_cached,
         prompt_cut=grounded.prompt_cut,
+        retrieval_query=grounded.retrieval_query,
         passages_left_out=grounded.passages_left_out,
         followups=grounded.followups,
         usage=usage_response(grounded.usage, grounded.cost_usd),
@@ -421,9 +522,23 @@ def answer_question_stream(
     check_rerank_top_k(request.rerank_top_k, settings)
     check_question_text(request.question)
     # Taken here, before the 200 is committed, so a full server can still say 429.
-    lease = StreamLease(question_slot(slots))
-    stop = threading.Event()
     overrides = question_overrides(request)
+    lookup = (
+        request.question,
+        overrides,
+        request.filenames,
+        request.tags,
+        history_messages(request.history),
+    )
+    admitted = question_slot_unless_cached(
+        slots,
+        lambda: pipeline.cached_answer(*lookup) if request.use_cache else None,
+        lambda: pipeline.identical_run(*lookup) if request.use_cache else None,
+        lambda: pipeline.claim_run(*lookup) if request.use_cache else None,
+    )
+    release, hit = admitted.release, admitted.cached
+    lease = StreamLease(release)
+    stop = threading.Event()
 
     def on_done(event: DoneEvent) -> None:
         count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
@@ -450,6 +565,9 @@ def answer_question_stream(
             tags=request.tags,
             use_cache=request.use_cache,
             should_stop=stop.is_set,
+            cached=hit,
+            follow=admitted.follow,
+            claimed=admitted.claimed,
         ),
         lease,
         stop,

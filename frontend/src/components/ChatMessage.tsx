@@ -147,6 +147,8 @@ export interface ChatTurn {
   // The server said the documents don't answer it (answer_status insufficient_context
   // or no_context): still an answer, shown with a "not found" flag.
   notFound?: boolean;
+  /** Not found because its documents or tags match nothing indexed (a typo'd name). */
+  emptyScope?: boolean;
   // The answer cites none of its sources (answer_status uncited): worth checking.
   uncited?: boolean;
   // The provider stopped at the token limit, so the answer ends mid-way.
@@ -157,6 +159,8 @@ export interface ChatTurn {
   cannotContinue?: boolean;
   // Why the last Continue didn't work (this session only); the answer is as it was.
   continueFailed?: string;
+  /** Regenerating this answer failed (why); it stays the answer. Not kept on reload. */
+  regenerateFailed?: string;
   // A whole-document task (summary, comparison) rather than a question: on the user
   // turn that asked it, and on its error turn, so Retry and Regenerate repeat the task.
   task?: DocumentTask;
@@ -316,7 +320,9 @@ interface ChatMessageProps {
  *  above say it in one or two, as a tooltip a touch or keyboard user never sees. */
 function groundingNotes(turn: ChatTurn): string[] {
   const notes: string[] = [];
-  if (turn.notFound) {
+  if (turn.emptyScope) {
+    notes.push('None of the documents or tags this was limited to are indexed here — check the scope.');
+  } else if (turn.notFound) {
     notes.push(
       turn.scoped
         ? 'Nothing in the selected documents answers this.'
@@ -338,6 +344,9 @@ function groundingNotes(turn: ChatTurn): string[] {
     notes.push("This answer can't be continued any more (the server no longer has its prompt). Regenerate asks it again.");
   } else if (turn.continueFailed) {
     notes.push(`Continuing didn't work: ${turn.continueFailed}`);
+  }
+  if (turn.regenerateFailed) {
+    notes.push(`Asking again didn't work: ${turn.regenerateFailed}`);
   }
   if (turn.promptCut) {
     notes.push(
@@ -647,17 +656,16 @@ function ChatMessage({
                   Regenerate
                 </button>
               )}
-              {/* Cut off at the token limit: the rest, from the same prompt (its trace). */}
+              {/* Cut off at the token limit, stopped, or broken off: the rest, from the
+                  same prompt (its trace; a server that can't refuses, and the button goes). */}
               {turn.content &&
-                turn.truncated &&
+                (turn.truncated || turn.stopped || turn.incomplete) &&
                 !turn.cannotContinue &&
                 turn.traceId &&
                 regenerateQuestion &&
                 onContinue &&
                 !regenerateTask &&
-                !streamStage &&
-                !turn.incomplete &&
-                !turn.stopped && (
+                !streamStage && (
                   <button
                     type="button"
                     className="chat-message__regenerate"

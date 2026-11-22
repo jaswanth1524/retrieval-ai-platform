@@ -57,7 +57,12 @@ interface ComposerProps {
   /** Save the current scope under a name. */
   onSaveScopePreset?: (name: string) => void;
   onDeleteScopePreset?: (name: string) => void;
+  /** The conversation's last question: Up in an empty box puts it back, to edit. */
+  recallQuestion?: string;
 }
+
+// Scoped to more documents than this, the button's label says how many (no chips).
+const SCOPE_CHIPS_MAX = 8;
 
 // Typing is saved this long after the last keystroke.
 const DRAFT_SAVE_DELAY_MS = 300;
@@ -97,6 +102,7 @@ function Composer({
   onApplyScopePreset,
   onSaveScopePreset,
   onDeleteScopePreset,
+  recallQuestion,
 }: ComposerProps) {
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
@@ -253,6 +259,23 @@ function Composer({
     if (event.key === 'Enter' && !event.shiftKey && !enterAddsNewline()) {
       event.preventDefault();
       submit();
+      return;
+    }
+    // Up in an empty box: the last question back, to fix a typo or ask it a little
+    // differently (as a shell recalls the last command).
+    if (
+      event.key === 'ArrowUp' &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      value === '' &&
+      recallQuestion
+    ) {
+      event.preventDefault();
+      setValue(recallQuestion);
+      const box = event.currentTarget;
+      window.requestAnimationFrame(() => box.setSelectionRange(box.value.length, box.value.length));
     }
   };
 
@@ -288,6 +311,39 @@ function Composer({
         <p className="composer__hint composer__hint--warn" data-testid="question-length-note" aria-hidden="true">
           Pasted text was cut to {MAX_QUESTION_CHARS.toLocaleString()} characters, the limit for a question.
         </p>
+      )}
+      {(selectedFilenames.length > 0 || selectedTags.length > 0) && selectedFilenames.length <= SCOPE_CHIPS_MAX && (
+        // What the next question is limited to, each one removable here: the button's
+        // one-line label is clipped on a phone, and changing it meant the popover.
+        <ul className="composer__scope-chips" aria-label="Asking within" data-testid="composer-scope-chips">
+          {selectedFilenames.map((name) => (
+            <li key={`f:${name}`}>
+              <button
+                type="button"
+                className="composer__scope-chip"
+                onClick={() => onSelectedFilenamesChange(selectedFilenames.filter((f) => f !== name))}
+                aria-label={`Stop limiting to ${name}`}
+                title={name}
+              >
+                <span className="composer__scope-chip-text">{name.split('/').pop()}</span>
+                <span aria-hidden="true">×</span>
+              </button>
+            </li>
+          ))}
+          {selectedTags.map((tag) => (
+            <li key={`t:${tag}`}>
+              <button
+                type="button"
+                className="composer__scope-chip"
+                onClick={() => onSelectedTagsChange?.(selectedTags.filter((t) => t !== tag))}
+                aria-label={`Stop limiting to the tag ${tag}`}
+              >
+                <span className="composer__scope-chip-text">#{tag}</span>
+                <span aria-hidden="true">×</span>
+              </button>
+            </li>
+          ))}
+        </ul>
       )}
       <div className="composer__box">
         <textarea

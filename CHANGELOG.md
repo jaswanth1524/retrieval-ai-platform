@@ -25,6 +25,115 @@ gpt-4o-mini — no change to retrieval or stored data. **Re-index: none.**
   writes in "forty‑five") as "-" in `answer_contains` and `answer_excludes`: such an
   answer missed "twenty-eight", and one stating an excluded "forty-five euros" passed.
 
+Pass 20: fixes from a whole-codebase review, then features. **Re-index: recommended**
+only for Office files with hidden sheets, hidden text or hidden slides (they are now
+left out; see `INDEX_HIDDEN_CONTENT`); nothing else changes stored data.
+
+### Changed (pass 20)
+- Hidden Office content is no longer indexed: hidden and very hidden XLSX sheets, DOCX
+  text formatted hidden, hidden PPTX slides (as hidden HTML elements already were).
+  `INDEX_HIDDEN_CONTENT=true` keeps it. A document already indexed keeps its hidden text
+  until it is re-indexed (`POST /documents/{name}/reindex`, `docrag reindex NAME`).
+- The compose file sizes the API's `/tmp` (`API_TMP_SIZE`, default 2g). An upload bigger
+  than the room left there is refused with a 507 before it is read; before, one big
+  enough took the container's memory. Raise `API_TMP_SIZE` (and `API_MEM_LIMIT`) to
+  import a bigger backup or migration bundle.
+- Wrong API keys are limited to `FAILED_KEY_ATTEMPTS_PER_MINUTE` (30) per client even
+  with `RATE_LIMIT_PER_MINUTE` off; past it, 429.
+- A server whose default provider can't be used (`LLM_PROVIDER=openai` with no
+  `OPENAI_API_KEY`) answers questions with a 503 at once, before any search; it was a
+  400 after the search and rerank.
+- An uploaded migration bundle (`POST /admin/migrate/import`) and the backups inside it
+  get the upload caps (entries, manifest size); the bundle holds at most 4096 entries.
+- A scheduled backup holding no documents, or under half of a dozen or more, where the
+  one before held them, is reported as failed (once), and pruning always keeps the newest
+  backup that held documents.
+- Continue shows the answer as it was, with "continuing the answer…", until the joined
+  answer arrives: the raw pieces ("butbusiness") no longer flash, on any answer.
+
+### Added (pass 20)
+- `POST /questions/verify`, `docrag verify FILE|-` and the MCP tool `verify_text`: a
+  text checked against the documents sentence by sentence, with no LLM — the passage
+  and words that support each sentence, or that a passage states other numbers, or that
+  none does.
+- `answer_status` `empty_scope`: the question's `filenames` or `tags` match no indexed
+  document (a typo'd name), instead of "the documents don't cover it".
+- `retrieval_query` ("Searched as") on the sync `/questions` response, and in the CLI's
+  and MCP's notes; `retrieval_query` and `scope` on `GET /query-log` rows.
+- Notifications `index_lost`, `import_failed` and `import_finished`. At startup a
+  workspace whose index is empty while its originals are kept is reported, and with
+  `AUTO_REBUILD_LOST_INDEX=true` rebuilt from them.
+- `BACKUP_COPY_COMMAND` (+ `BACKUP_COPY_TIMEOUT_SECONDS`): a command run on each new
+  backup, with its path, to copy it off the disk; a failed copy fails the backup.
+- `folder` on `POST /documents/from-url` and `/documents/from-sitemap`, and
+  `docrag add-url --folder`: documents named `<folder>/<name>`.
+- MCP `list_documents` pages (`limit`, `cursor`, `prefix`, `tag`); `add_note` takes
+  `replace` and no longer replaces an existing document without it.
+- UI: removable scope chips above the question box; Up in an empty box brings the last
+  question back; a question sent while the server is unreachable goes once it is back;
+  conversations removed to make room for an import go to Recently deleted.
+- A backup export includes stored originals that have no indexed document (marked
+  `not_indexed`), so a backup taken after the index was lost still holds them.
+- Continue works on a stopped or broken-off answer too (its trace now keeps the
+  prompt), not only one cut off at the output limit.
+- The "not in the documents" answer is written in `ANSWER_LANGUAGE` when it names one of
+  12 common languages (German, French, Spanish, Italian, Portuguese, Dutch, Polish,
+  Swedish, Japanese, Chinese, Korean, Hindi; by English or native name).
+- `POST /admin/migrate/export` writes the bundle in the background (follow it with
+  `GET /documents/imports/{id}`, download it once from `GET
+  /admin/migrate/export/{id}`); `docrag migrate pack FILE --background`.
+- UI: the source viewer can dock beside the conversation on wide windows ("Dock
+  beside"; kept per browser); a reminder now and then to export the chat history,
+  which lives only in this browser.
+- The settings check notes when the temp directory can't hold the largest import or
+  migration bundle allowed, and warns when its path is too long for the parser's Unix
+  socket (every upload then failed with "AF_UNIX path too long").
+
+### Fixed (pass 20)
+- A background restore could overwrite a document uploaded while it waited for room;
+  a stale re-index could put an original's old text back over a newer upload.
+- The zip entry cap could be bypassed with a zip64 record that zipfile reads.
+- Continue checked numbers and citations without the neighbour text the prompt had
+  (false "unsupported numbers"); a client leaving while a Continue waited for the model
+  was logged as an unexpected error.
+- An answer the cache already held got a 429 when every question slot was busy, and so
+  did a question identical to one being answered: the run is now claimed as its
+  question is admitted, and identical questions sent at the same moment wait for its
+  answer without a slot (one that ends with no answer is a 429).
+- `POST /questions/verify` stops when its client leaves (499), freeing its slot.
+- A migration bundle uploaded without `IMPORT_SPOOL_DIR` is no longer copied a second
+  time into the same temp directory; the backups inside a bundle may hold up to
+  `MAX_MIGRATE_MEMBERS` (1,000,000) entries, not an upload's 200,000.
+- A source header the model echoes inside a sentence ("[ [1] filename=…; page=1 ]") is
+  cut back to its `[1]`: it showed in the answer, and its "page=1" was flagged as an
+  unsupported number.
+- A scheduled backup reads the index as it is (not a cached listing that still showed a
+  wiped collection), and its drop check counts documents with their originals.
+- A re-index admitted before an upload but applied first no longer makes that upload
+  fail as superseded.
+- A failed Regenerate keeps the answer it was to replace, with why, instead of a second
+  copy of the question and an error row.
+- Earlier answers sent as history lost every bracketed number ("the Policy [2024]"),
+  not only their citations.
+- Answer baselines are refused when the run's setup differs (another model, `--limit`,
+  `max_context_chunks`), as retrieval baselines are; the replay gate also holds
+  `unsupported_numbers_mean`, `unsupported_claims_mean`, `truncated_rate`,
+  `prompt_cut_rate` and `cited_chunk_precision`. RAGAS contexts are the passages as
+  the prompt gave them; `harness from-queries` sends follow-ups and scoped questions to
+  review.
+- Consistency repair treats an index with no document as lost, whatever the corpus
+  size; MCP `add_note` retries a full queue and reports an unreachable server.
+- Migrated workspace settings are validated; the migrate export's temporary file is
+  removed even when the download breaks off; one archive download from a URL at a time;
+  temp files left in the originals store's subfolders are swept; `docrag sync` keeps its
+  own tag on a document with many tags.
+- UI: passage links to documents in folders open; Regenerate and Ask again keep a saved
+  answer's note; Ask again from Needs review keeps a summary's task and a question's
+  narrowing; a reload during Continue keeps the answer as it was; restoring an earlier
+  version drops the replaced answer's warnings; two tabs no longer overwrite each
+  other's history in IndexedDB; Undo of a delete brings back the unsent draft; a stopped
+  Regenerate leaves no second copy of its question.
+
 ### Development
 - Version 0.2.0 closes the development section that followed 0.1.0.
 - `docs/settings.md` lists every setting by topic with its type, default and limits,

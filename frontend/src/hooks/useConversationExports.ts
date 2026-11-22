@@ -14,6 +14,7 @@ import { chatToHtml } from '../utils/exportHtml';
 import type { SavedAnswer } from './useChat';
 import { useStableHandler } from './useStableHandler';
 import type { ToastInput } from './useToasts';
+import { noteHistoryExported } from '../utils/historyBackup';
 
 /** The downloads offered from the header and the palette: the open conversation (as
  *  Markdown, HTML or JSON), every conversation, the saved answers, and the traces. */
@@ -98,6 +99,7 @@ export function useConversationExports(
       const stamp = new Date().toISOString().slice(0, 10);
       const name = label ? `docrag-${safeFilename(label)}-${stamp}.json` : `docrag-conversations-${stamp}.json`;
       downloadFile(name, 'application/json', allConversationsJson(label));
+      if (!label) noteHistoryExported();
     },
     [allConversationsJson],
   );

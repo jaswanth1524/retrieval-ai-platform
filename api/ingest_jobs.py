@@ -193,6 +193,11 @@ class IngestRequest:
     # The watched folder that owns the document (a restore carries it; None keeps the
     # stored one, or the ingest service's own when it is the watcher's).
     watched_from: str | None = None
+    # False for a re-index of the stored original: it never counts as the newest
+    # version of the document, so an upload admitted before it but applied after isn't
+    # refused as superseded (the re-index's own precondition refuses it instead, when
+    # the original it read has been replaced meanwhile).
+    ordered: bool = True
 
 
 def run_ingest_job(
@@ -232,7 +237,7 @@ def run_ingest_job(
             ingest_sequencer.check(key, sequence)
 
     def save_original() -> None:
-        if sequence is not None:
+        if sequence is not None and request.ordered:
             ingest_sequencer.mark_applied(key, sequence)
         if raw_store is None:
             return
@@ -385,6 +390,8 @@ class IngestQueue:
                 dedupe=dedupe,
                 kind=kind,
                 watched_from=watched_from,
+                # A re-index puts back what is already stored: never the newest version.
+                ordered=kind != "reindex",
             ),
         )
 

@@ -147,12 +147,16 @@ def restore_backup(
     keep_version: KeepVersion | None = None,
     stored: bool = False,
     stop: Callable[[], bool] | None = None,
+    max_members: int | None = None,
 ) -> ImportOutcome:
     """``stored``: one of BACKUP_DIR's own backups (written by this server), which the
-    upload caps on entries and manifest size don't apply to."""
+    upload caps on entries and manifest size don't apply to. ``max_members``: an
+    upload's entry cap when not MAX_MEMBERS (a migration bundle's backups,
+    MAX_MIGRATE_MEMBERS); the manifest's cap grows with it."""
 
-    if not stored and too_many_entries(upload, MAX_MEMBERS):
-        raise BackupImportError(f"The archive has more than {MAX_MEMBERS} entries.")
+    cap = MAX_MEMBERS if max_members is None else int(max_members)
+    if not stored and too_many_entries(upload, cap):
+        raise BackupImportError(f"The archive has more than {cap} entries.")
     try:
         archive = zipfile.ZipFile(upload)
     except (zipfile.BadZipFile, OSError) as exc:
@@ -160,7 +164,7 @@ def restore_backup(
     with archive:
         infos = archive.infolist()
         members = {info.filename: info for info in infos}
-        manifest = _manifest(archive, members, stored=stored)
+        manifest = _manifest(archive, members, stored=stored, members_cap=cap)
         outcome = ImportOutcome()
         stopped = False
         for document in manifest["documents"]:
@@ -192,15 +196,19 @@ def restore_backup(
 
 
 def _manifest(
-    archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo], *, stored: bool = False
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    *,
+    stored: bool = False,
+    members_cap: int = MAX_MEMBERS,
 ) -> dict[str, Any]:
     info = members.get("manifest.json")
+    # A manifest entry is a few hundred bytes: one listing more documents may be larger.
+    upload_cap = max(_MANIFEST_MAX_BYTES, min(members_cap * 1024, _STORED_MANIFEST_MAX_BYTES))
     if info is None:
         raise BackupImportError("The archive has no manifest.json; is it a DocRAG backup?")
     try:
-        raw = _read_capped(
-            archive, info, _STORED_MANIFEST_MAX_BYTES if stored else _MANIFEST_MAX_BYTES
-        )
+        raw = _read_capped(archive, info, _STORED_MANIFEST_MAX_BYTES if stored else upload_cap)
     except _UnreadableMemberError:
         raise BackupImportError("manifest.json in the archive is damaged or encrypted.") from None
     try:

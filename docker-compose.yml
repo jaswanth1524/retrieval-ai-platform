@@ -69,9 +69,12 @@ services:
     # tmpfs is RAM, counted against mem_limit: a large POST /import upload spools there,
     # so raise API_MEM_LIMIT by the backup's size to restore a big one. (/export streams
     # its zip as it writes it and needs no room here.)
+    # Sized, so an upload bigger than the room is refused with a 507 before it is read
+    # (unsized, one large enough took the container's memory instead): raise
+    # API_TMP_SIZE, and API_MEM_LIMIT with it, to import a bigger backup or bundle.
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:size=${API_TMP_SIZE:-2g}
     cap_drop:
       - ALL
     security_opt:

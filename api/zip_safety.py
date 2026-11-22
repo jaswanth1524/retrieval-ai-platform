@@ -36,16 +36,28 @@ def central_directory(upload: IO[bytes]) -> tuple[int, int] | None:
         if at < 0 or len(tail) - at < 22:
             return None
         entries, directory_bytes = struct.unpack_from("<HL", tail, at + 10)
-        if entries == 0xFFFF or directory_bytes == 0xFFFFFFFF:
-            locator = tail.rfind(_EOCD64_LOCATOR, 0, at)
-            if locator < 0 or len(tail) - locator < 20:
+        # zipfile reads the zip64 record whenever its locator sits right before the end
+        # record, whatever the end record's own fields say: so must this, or a zip
+        # whose end record claims one entry and whose zip64 record claims millions got
+        # past the cap and then built every entry.
+        locator = at - 20
+        has_locator = locator >= 0 and tail.startswith(_EOCD64_LOCATOR, locator)
+        if not has_locator and (entries == 0xFFFF or directory_bytes == 0xFFFFFFFF):
+            found = tail.rfind(_EOCD64_LOCATOR, 0, at)
+            if found < 0 or len(tail) - found < 20:
                 return None
+            locator, has_locator = found, True
+        if has_locator:
             (record_at,) = struct.unpack_from("<Q", tail, locator + 8)
             upload.seek(record_at)
             record = upload.read(56)
             if len(record) < 56 or not record.startswith(_EOCD64):
-                return None
-            entries, directory_bytes = struct.unpack_from("<QQ", record, 32)
+                if entries == 0xFFFF or directory_bytes == 0xFFFFFFFF:
+                    return None
+            else:
+                wide_entries, wide_bytes = struct.unpack_from("<QQ", record, 32)
+                entries = max(entries, wide_entries)
+                directory_bytes = max(directory_bytes, wide_bytes)
         return int(entries), int(directory_bytes)
     except (OSError, struct.error, ValueError):
         return None

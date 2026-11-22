@@ -21,6 +21,7 @@ from api.errors import (
 from api.generation import GenerationConfigError, GenerationError
 from api.ingestion import IngestionError
 from api.jobs import JobNotFoundError
+from api.llm import ServerGenerationConfigError
 from api.qdrant_schema import (
     CollectionSchemaError,
     VectorStoreUnavailableError,
@@ -28,6 +29,7 @@ from api.qdrant_schema import (
 )
 from api.reranking import RerankingError
 from api.retrieval import RetrievalError, RetrievalPayloadError
+from api.run_coordination import NoSlotForRun
 from api.tracing import TraceNotFoundError
 from api.upload import UploadTooLargeError
 
@@ -51,6 +53,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     # grpcio is a hard dependency of qdrant-client and nothing else here speaks gRPC,
     # so this is effectively "any Qdrant gRPC failure" despite the broad type.
     app.add_exception_handler(grpc.RpcError, vector_store_transport_handler)
+    app.add_exception_handler(ServerGenerationConfigError, service_unavailable_handler)
+    app.add_exception_handler(NoSlotForRun, busy_handler)
     app.add_exception_handler(GenerationConfigError, bad_request_handler)
     app.add_exception_handler(GenerationError, bad_gateway_handler)
     app.add_exception_handler(RerankingError, bad_gateway_handler)
@@ -76,6 +80,14 @@ async def bad_gateway_handler(request: Request, exc: Exception) -> JSONResponse:
     """Return a 502 response for provider failures."""
 
     return error_response(502, exc)
+
+
+async def busy_handler(request: Request, exc: Exception) -> JSONResponse:
+    """A 429 for a request let in without a question slot that would have to run."""
+
+    response = error_response(429, exc)
+    response.headers["Retry-After"] = "5"
+    return response
 
 
 async def service_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:

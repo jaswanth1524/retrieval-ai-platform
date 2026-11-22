@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,9 @@ _MODELS_BYTES_FP32 = 3_300 * 1024**2
 _INGEST_EXPANSION = 4
 _LOW_DISK_BYTES = 1024**3
 _LOW_DISK_SHARE = 0.05
+# Longest temp directory path the forkserver's socket (pymp-*/listener-*, ~40 more
+# characters) still fits under the Unix socket path limit with.
+_TEMP_PATH_MAX = 60
 # A document past this many passages ties up an ingest worker for a long time and makes
 # a summary sample it.
 LARGE_DOCUMENT_CHUNKS = 20_000
@@ -104,6 +108,45 @@ def diagnose(
 
     env = os.environ if environ is None else environ
     found: list[Finding] = []
+
+    # Uploads are received into the temp directory before any route runs, and
+    # background imports and migration bundles are copied there again without
+    # IMPORT_SPOOL_DIR: a temp directory smaller than what MAX_IMPORT_BYTES or
+    # MAX_MIGRATE_BYTES lets in (in Docker, a memory-backed /tmp) refuses them (507).
+    temp = tempfile.gettempdir()
+    # Documents are parsed in a forkserver child (PARSE_TIMEOUT_SECONDS), which listens
+    # on a Unix socket under the temp directory: past the socket path limit (104 bytes on
+    # macOS, 108 on Linux) every upload failed with "AF_UNIX path too long" (measured with
+    # a 120-character TMPDIR).
+    if float(settings.parse_timeout_seconds) > 0 and len(temp) > _TEMP_PATH_MAX:
+        found.append(
+            Finding(
+                "warning",
+                "TMPDIR",
+                f"The temp directory's path is {len(temp)} characters ({temp}); document "
+                "parsing opens a Unix socket under it, and paths that long fail "
+                '("AF_UNIX path too long"), so every upload would fail. Point TMPDIR at a '
+                "shorter path (e.g. /tmp).",
+            )
+        )
+    try:
+        temp_free = int(disk_usage(temp).free)
+    except (OSError, AttributeError, TypeError, ValueError):
+        temp_free = None
+    biggest = max(int(settings.max_import_bytes), int(settings.max_migrate_bytes))
+    needed = biggest if settings.import_spool_dir else biggest * 2
+    if temp_free is not None and temp_free < needed:
+        found.append(
+            Finding(
+                "note",
+                "TMPDIR",
+                f"{temp_free // 1024**2} MB are free in {temp}, where uploads are received; "
+                f"an import or migration bundle up to {biggest // 1024**2} MB is allowed"
+                + ("" if settings.import_spool_dir else ", and needs room for two copies")
+                + ". A bigger one is refused (507): point TMPDIR at the data volume, or "
+                "raise API_TMP_SIZE and API_MEM_LIMIT, and set IMPORT_SPOOL_DIR.",
+            )
+        )
 
     if settings.backup_dir and not settings.raw_document_dir:
         found.append(

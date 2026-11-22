@@ -359,6 +359,47 @@ def cmd_summarize(client: DocragClient, args: argparse.Namespace, out: TextIO) -
     return 0
 
 
+VERIFY_MARKS = {
+    "supported": "ok  ",
+    "numbers_differ": "num ",
+    "unsupported": "??  ",
+    "no_claim": "    ",
+}
+
+
+def format_checks(result: dict[str, Any]) -> list[str]:
+    """``/questions/verify``'s answer as lines: each sentence, how it fared, and the
+    passage words that support it."""
+
+    lines: list[str] = []
+    for check in result.get("sentences") or []:
+        status = str(check.get("status"))
+        lines.append(f"{VERIFY_MARKS.get(status, status + ' ')}{check.get('sentence')}")
+        if check.get("filename"):
+            where = f"{check['filename']} p.{check.get('page')}, {check.get('section') or '-'}"
+            lines.append(f'      {where}: "{" ".join(str(check.get("quote") or "").split())}"')
+        if check.get("missing_numbers"):
+            lines.append(f"      not in it: {', '.join(check['missing_numbers'])}")
+    if result.get("more"):
+        lines.append("(only the first sentences were checked; send the rest separately)")
+    return lines
+
+
+def cmd_verify(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Check a text (a file, or - for stdin) against the documents, sentence by
+    sentence: exit 1 when a sentence is unsupported or states other numbers."""
+
+    text = sys.stdin.read() if args.path == "-" else Path(args.path).read_text(encoding="utf-8")
+    result = client.verify(text, args.file, args.tag)
+    if args.json:
+        print(json.dumps(result), file=out)
+    else:
+        for line in format_checks(result):
+            print(line, file=out)
+    bad = {"unsupported", "numbers_differ"}
+    return 1 if any(c.get("status") in bad for c in result.get("sentences") or []) else 0
+
+
 def cmd_search(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     if not (args.query or "").strip() and not args.like:
         print("search needs a query, or --like CHUNK_ID", file=sys.stderr)

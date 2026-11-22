@@ -120,6 +120,7 @@ from cli.question_commands import cmd_chat as cmd_chat
 from cli.question_commands import cmd_continue as cmd_continue
 from cli.question_commands import cmd_search as cmd_search
 from cli.question_commands import cmd_summarize as cmd_summarize
+from cli.question_commands import cmd_verify as cmd_verify
 from cli.question_commands import narrowing_options as narrowing_options
 from cli.question_commands import question_options as question_options
 
@@ -334,6 +335,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_url.add_argument("--name", help="Stored filename (with a supported extension).")
     add_url.add_argument("--tag", action="append", help="Tag it (repeatable).")
     add_url.add_argument(
+        "--folder", help="Keep it (or, with --sitemap, every page) under this folder."
+    )
+    add_url.add_argument(
         "--refresh-minutes",
         type=int,
         metavar="MINUTES",
@@ -403,6 +407,11 @@ def build_parser() -> argparse.ArgumentParser:
     summarize.add_argument("--section", help="One document: only this section (exact label).")
     summarize.add_argument("--provider")
     summarize.add_argument("--quiet", action="store_true")
+
+    verify = command("verify", "Check a text against the documents, sentence by sentence (no LLM).")
+    verify.add_argument("path", help="A text file, or - to read stdin.")
+    verify.add_argument("--file", action="append")
+    verify.add_argument("--tag", action="append")
 
     search = command("search", "Ranked passages, no LLM.")
     search.add_argument("query", nargs="?", default="")
@@ -564,6 +573,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("action", choices=("pack", "unpack"))
     migrate.add_argument("file")
+    migrate.add_argument(
+        "--background",
+        action="store_true",
+        help="pack: have the server write the bundle in the background, then download it "
+        "(for a large server, past a proxy's request timeout).",
+    )
     wait_flag(migrate)
     command("notify-test", "Send a test notification through the server's NOTIFY_URL (full key).")
     rebuild = command(
@@ -629,6 +644,7 @@ COMMANDS = {
     "chat": cmd_chat,
     "summarize": cmd_summarize,
     "search": cmd_search,
+    "verify": cmd_verify,
     "preview": cmd_preview,
     "read": cmd_read,
     "delete": cmd_delete,

@@ -150,9 +150,36 @@ HIGHER_IS_BETTER = (
     "answered_rate",
     "cited_relevant_rate",
     "refused_unanswerable_rate",
+    "cited_chunk_precision",
 )
 # ...lower for these.
-LOWER_IS_BETTER = ("uncited_rate", "error_rate", "excluded_rate")
+LOWER_IS_BETTER = (
+    "uncited_rate",
+    "error_rate",
+    "excluded_rate",
+    "unsupported_numbers_mean",
+    "unsupported_claims_mean",
+    "truncated_rate",
+    "prompt_cut_rate",
+)
+
+# Recorded to explain a drift, never a reason to refuse the comparison (CI is amd64,
+# a laptop arm64; a --server run's address and release).
+_NOTED_ONLY = frozenset({"platform_machine", "server", "server_version"})
+
+
+def answer_shape_problems(current: dict[str, object], baseline: dict[str, object]) -> list[str]:
+    """Reasons an answer baseline can't judge this run: a setting both recorded with
+    different values (another model, ``--limit``, a changed ``max_context_chunks``), as
+    the retrieval baselines' ``baseline_shape_problems``. A key only one side has (a
+    baseline from before it was recorded) is no reason."""
+
+    return [
+        f"{key} differs: {current[key]!r} vs baseline {baseline[key]!r} "
+        "(re-record the baseline if the change is intended)"
+        for key in sorted(set(current) & set(baseline) - _NOTED_ONLY)
+        if current[key] != baseline[key]
+    ]
 
 
 def answer_regressions(

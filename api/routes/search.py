@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import threading
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from api.citations import query_spans
 from api.dependencies import require_api_key
 from api.explain import explain
 from api.parsers.common import clean_text
 from api.pipeline import AnswerOverrides
+from api.reranking import RerankedChunk
 from api.routes.deps import QuestionSlotsDep, RagPipelineDep
-from api.routes.questions import passage_narrowing, question_slot
+from api.routes.questions import (
+    _watch_disconnect,
+    check_question_text,
+    passage_narrowing,
+    question_slot,
+)
 from api.schemas import (
     CitationSpanResponse,
     SearchExplanationResponse,
@@ -20,11 +29,75 @@ from api.schemas import (
     SearchResponse,
     SearchResultResponse,
     SearchTimingsResponse,
+    VerifyRequest,
+    VerifyResponse,
+    VerifySentenceResponse,
 )
+from api.verify import VerifyAbandoned, verify_text
 
 
 def register(app: FastAPI) -> None:
-    """Register the search route."""
+    """Register the search and verify routes."""
+
+    # A text (a draft answer, an email) checked against the documents a sentence at a
+    # time: the passage and words that support each, or that none does. The search a
+    # question uses and the span and number checks its citations get; no LLM call. Read
+    # key allowed, as for /search; one question slot for the whole check.
+    @app.post(
+        "/questions/verify",
+        response_model=VerifyResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    async def verify(
+        request: VerifyRequest,
+        http_request: Request,
+        pipeline: RagPipelineDep,
+        slots: QuestionSlotsDep,
+    ) -> VerifyResponse:
+        check_question_text(request.text)
+        release = question_slot(slots, count_metric=False)
+        # A client that leaves stops the check before the next sentence's search,
+        # freeing its slot (up to 20 searches and reranks otherwise ran for nobody).
+        stop = threading.Event()
+        watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
+
+        def search(sentence: str) -> list[RerankedChunk]:
+            return list(
+                pipeline.retrieve(
+                    sentence,
+                    AnswerOverrides(),
+                    filenames=request.filenames,
+                    tags=request.tags,
+                    for_generation=False,
+                ).context_chunks
+            )
+
+        try:
+            checks, more = await run_in_threadpool(
+                verify_text, clean_text(request.text), search, stop.is_set
+            )
+        except VerifyAbandoned:
+            raise HTTPException(status_code=499, detail="The client left.") from None
+        finally:
+            watcher.cancel()
+            release()
+        return VerifyResponse(
+            sentences=[
+                VerifySentenceResponse(
+                    sentence=check.sentence,
+                    status=check.status,
+                    filename=check.chunk.filename if check.chunk else None,
+                    page=check.chunk.page if check.chunk else None,
+                    section=check.chunk.section if check.chunk else None,
+                    chunk_id=check.chunk.chunk_id if check.chunk else None,
+                    quote=check.quote,
+                    rerank_score=check.chunk.rerank_score if check.chunk else None,
+                    missing_numbers=list(check.missing_numbers),
+                )
+                for check in checks
+            ],
+            more=more,
+        )
 
     # The same hybrid search, RRF (k=60) and cross-encoder rerank a question uses
     # (RagPipeline.retrieve, which the eval harness also scores), so "find in my

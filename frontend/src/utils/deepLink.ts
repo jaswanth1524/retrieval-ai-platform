@@ -42,11 +42,19 @@ export interface PassageLink {
 const FILENAME_MAX = 1024;
 const CHUNK_ID_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/;
 
+/** A document name a link may carry: folders allowed ("reports/q1.pdf", as the server
+ *  names documents kept with their paths), but no backslash, control character, or
+ *  empty, "." or ".." folder. */
+function isDocumentName(name: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\\]/.test(name)) return false;
+  return name.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
 export function parsePassageLink(hash: string): PassageLink | null {
   const params = new URLSearchParams(hash.replace(/^#/, ''));
   const filename = params.get('d');
-  // eslint-disable-next-line no-control-regex
-  if (!filename || filename.length > FILENAME_MAX || /[\x00-\x1f/\\]/.test(filename)) return null;
+  if (!filename || filename.length > FILENAME_MAX || !isDocumentName(filename)) return null;
   const chunkId = params.get('k');
   const workspace = params.get('w');
   return {

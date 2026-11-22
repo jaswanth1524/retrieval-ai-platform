@@ -100,6 +100,10 @@ LOST_INDEX_MIN_ORPHANS = 5
 
 def looks_like_a_lost_index(report: ConsistencyReport, stored: int) -> bool:
     orphans = len(report.originals_without_document)
+    if orphans and report.documents == 0:
+        # Nothing indexed at all while originals are kept: a small corpus's lost index
+        # too (three originals were below the count above, and repair deleted them).
+        return True
     return orphans >= LOST_INDEX_MIN_ORPHANS and orphans * 2 > stored
 
 

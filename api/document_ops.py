@@ -43,18 +43,31 @@ from api.workspaces import document_key, workspace_of
 logger = logging.getLogger(__name__)
 
 
-def original_still_stored(store: RawDocumentStore, filename: str) -> Callable[[], None]:
-    """A re-index precondition: fail if the document was deleted while queued.
+def original_still_stored(
+    store: RawDocumentStore,
+    filename: str,
+    identity: tuple[int, int] | None = None,
+) -> Callable[[], None]:
+    """A re-index precondition: fail if the document was deleted while queued, or —
+    given the ``identity`` of the original that was read — replaced since.
 
     Checked under the filename lock DELETE also takes (and DELETE removes the original
     under it), so "original gone" means the delete landed first — re-indexing anyway
-    would silently bring the deleted document back.
+    would silently bring the deleted document back. An upload saves its original under
+    the same lock once indexed, so a changed identity means a newer version is indexed:
+    the bytes this re-index read would put the old text back over it.
     """
 
     def check() -> None:
-        if store.path(filename) is None:
+        current = store.identity(filename)
+        if current is None:
             raise IngestionError(
                 f"'{filename}' was deleted before its re-index ran; nothing was re-indexed."
+            )
+        if identity is not None and current != identity:
+            raise IngestionError(
+                f"'{filename}' was replaced by a newer upload before its re-index ran; "
+                "the newer version was kept."
             )
 
     return check
@@ -328,6 +341,7 @@ def reindex_stale(
         if limit is not None and len(jobs) >= limit:
             deferred.append(name)
             continue
+        identity = store.identity(name)  # before the read: what the bytes are
         try:
             content = read_within_backlog(
                 queue, store.size(name), functools.partial(store.read, name)
@@ -347,7 +361,7 @@ def reindex_stale(
                     content=content,
                     raw_store=None,
                     uploaded_at=meta.uploaded_at,
-                    precondition=original_still_stored(store, name),
+                    precondition=original_still_stored(store, name, identity),
                     source=source_of(meta),
                     kind="reindex",
                 )
@@ -421,6 +435,7 @@ def reindex_from_original(
     ``POST /documents/{f}/reindex``, its job's Retry, and a restart's re-queue."""
 
     store = require_raw_store(raw_store)
+    identity = store.identity(name)  # before the read: what the bytes are
     content = admit_from_store(
         repository,
         settings,
@@ -438,7 +453,7 @@ def reindex_from_original(
         # re-save it, and a failed save deletes it — losing the only copy.
         raw_store=None,
         uploaded_at=meta.uploaded_at if meta is not None else None,
-        precondition=original_still_stored(store, name),
+        precondition=original_still_stored(store, name, identity),
         # A re-index is the same document: where it came from carries over.
         source=source_of(meta) if meta is not None else None,
         kind="reindex",

@@ -260,6 +260,12 @@ class InflightRuns:
             self._runs[key] = event
             return event, True
 
+    def running(self, key: CacheKey) -> Event | None:
+        """The event of ``key``'s run when one is going, else None."""
+
+        with self._lock:
+            return self._runs.get(key)
+
     def finish(self, key: CacheKey, event: Event) -> None:
         """Release ``key``'s followers (idempotent). Called right after the leader's
         answer is cached, and again from its ``finally`` as a backstop."""

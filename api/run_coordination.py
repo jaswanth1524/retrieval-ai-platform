@@ -27,6 +27,33 @@ class QuestionAbandoned(Exception):
     """The client left mid-question; stop before the next expensive stage."""
 
 
+class NoSlotForRun(Exception):
+    """A request admitted without a question slot, to replay an identical question's
+    answer, found none to replay (that run failed or kept no answer): it may not run
+    the question itself — the server is full (429)."""
+
+
+def follow_only(
+    cache: AnswerCache,
+    key: CacheKey,
+    event: threading.Event,
+    should_stop: Callable[[], bool] | None,
+) -> Generator[StreamEvent, None, CachedAnswer | None]:
+    """Wait for the identical run ``event`` belongs to and return its answer: None when
+    the reader left; ``NoSlotForRun`` when it left none."""
+
+    yield {"type": "stage", "stage": "joining_identical_question"}
+    while not event.wait(_JOIN_POLL_SECONDS):
+        if should_stop is not None and should_stop():
+            return None
+    hit = cache.get(key)
+    if hit is None:
+        answer_inflight_joins_total.labels(outcome="ran").inc()
+        raise NoSlotForRun("The server is answering as many questions as it allows; try again.")
+    answer_inflight_joins_total.labels(outcome="replayed").inc()
+    return hit
+
+
 def wait_for_model(
     settings: AppSettings, should_stop: Callable[[], bool] | None
 ) -> Generator[StreamEvent, None, GenerationSlot]:
@@ -97,6 +124,7 @@ def cached_run(
     run: Callable[[], Generator[StreamEvent]],
     keep: Callable[[DoneEvent], bool] = lambda done: True,
     on_hit: Callable[[CachedAnswer], None] | None = None,
+    claimed: threading.Event | None = None,
 ) -> Iterator[StreamEvent]:
     """A run through the answer cache, for answers and summaries alike: a hit replayed
     (``replay``), or the identical run already going joined (``lead_or_join``), or
@@ -109,10 +137,12 @@ def cached_run(
     they never wait for the follow-ups. ``use_cache=False`` (Regenerate) skips the
     lookup but still stores the result. ``on_hit`` is told of a hit (or a join) before
     it is replayed: it has no trace of its own, so the query log is told here.
+    ``claimed`` (a run the caller already leads) skips the lookup and the join.
     """
 
-    lead: threading.Event | None = None
-    if key is not None and use_cache and cache is not None:
+    # ``claimed``: the request already leads this run (it claimed it as it was admitted).
+    lead: threading.Event | None = claimed
+    if claimed is None and key is not None and use_cache and cache is not None:
         hit = cache.get(key)
         if hit is None:
             joined = yield from lead_or_join(cache, key, should_stop)

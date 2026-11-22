@@ -24,7 +24,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import asdict
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from api.documents import CHUNKER_VERSION, chunking_fingerprint
 from api.feedback import Feedback, FeedbackCursor, FeedbackStore
@@ -152,6 +152,43 @@ def _source_fields(meta: DocumentMetadata) -> dict[str, str | int]:
     return fields
 
 
+def _listed(value: object) -> list[object]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _unindexed_originals(
+    archive: zipfile.ZipFile,
+    raw_store: RawDocumentStore,
+    metadata: dict[str, DocumentMetadata],
+    include_versions: bool,
+) -> list[dict[str, Any]]:
+    """Stored originals with no indexed document (a lost index, a failed re-index), with
+    the details kept beside them: a backup taken after the index was lost still holds
+    every document a rebuild would bring back, instead of nothing. Marked
+    ``not_indexed`` (older restores ignore it and index them like the rest)."""
+
+    entries: list[dict[str, Any]] = []
+    for filename in sorted(raw_store.stored_names() - set(metadata)):
+        handle = raw_store.open(filename)
+        if handle is None:
+            continue
+        with handle:
+            _write_member(archive, f"originals/{filename}", handle)
+        versions = _write_versions(archive, raw_store, filename) if include_versions else []
+        details = raw_store.details(filename)
+        entries.append(
+            {
+                **{key: value for key, value in details.items() if key != "tags"},
+                "filename": filename,
+                "tags": [tag for tag in _listed(details.get("tags")) if isinstance(tag, str)],
+                "original": f"originals/{filename}",
+                "not_indexed": True,
+                **({"versions": versions} if versions else {}),
+            }
+        )
+    return entries
+
+
 def _write_archive(
     archive: zipfile.ZipFile,
     settings: AppSettings,
@@ -162,7 +199,7 @@ def _write_archive(
     *,
     include_versions: bool = False,
 ) -> None:
-    documents = []
+    documents: list[dict[str, Any]] = []
     for filename, meta in sorted(metadata.items()):
         # A document deleted while the export runs simply has no original here,
         # instead of failing the whole export with FileNotFoundError.
@@ -199,6 +236,8 @@ def _write_archive(
                 **({"versions": versions} if versions else {}),
             }
         )
+    if raw_store is not None:
+        documents.extend(_unindexed_originals(archive, raw_store, metadata, include_versions))
     manifest = {
         # Bumped on any change a restore (POST /import) must handle differently.
         "manifest_version": MANIFEST_VERSION,

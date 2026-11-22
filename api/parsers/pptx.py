@@ -25,13 +25,16 @@ PPTX_MAX_EXPANDED_BYTES = ZIP_MAX_EXPANDED_BYTES
 _MAX_GROUP_DEPTH = 16
 
 
-def parse_pptx_document(filename: str, content: bytes) -> list[DocumentSection]:
+def parse_pptx_document(
+    filename: str, content: bytes, *, hidden: bool = False
+) -> list[DocumentSection]:
     """Extract each slide's text: text boxes and placeholders in shape order, tables as
     "header: value; ..." rows, then the speaker notes.
 
     A slide is a page (its number in the deck) and its title is the section label
     ("Slide n" without one), so a citation reads as the slide a presenter would show.
-    Charts, pictures and media are skipped.
+    Charts, pictures and media are skipped, and so are hidden slides unless ``hidden``
+    (INDEX_HIDDEN_CONTENT).
     """
 
     check_zip_expanded_size(filename, content, "PPTX", PPTX_MAX_EXPANDED_BYTES)
@@ -43,6 +46,9 @@ def parse_pptx_document(filename: str, content: bytes) -> list[DocumentSection]:
         presentation = Presentation(BytesIO(content))
         sections: list[DocumentSection] = []
         for number, slide in enumerate(presentation.slides, start=1):
+            # A hidden slide (show="0") isn't presented; numbers stay deck positions.
+            if not hidden and slide._element.get("show") in ("0", "false"):  # noqa: SLF001
+                continue
             title_shape = slide.shapes.title
             title = normalize_text(title_shape.text_frame.text) if title_shape is not None else ""
             # By id: python-pptx hands out a new proxy object per lookup. The title is

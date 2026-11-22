@@ -15,6 +15,8 @@ interface ChatThreadProps {
   turns: ChatTurn[];
   /** An answer is being written into this conversation. */
   pending: boolean;
+  /** The answer a Continue is writing into (any answer); unset: the last one. */
+  streamingTurnId?: string | null;
   /** An answer is being written anywhere (here or in another conversation): retry,
    *  regenerate and edit wait for it. Defaults to `pending`. */
   busy?: boolean;
@@ -124,6 +126,7 @@ function precedingUserTurns(turns: ChatTurn[]): (ChatTurn | undefined)[] {
 function ChatThread({
   turns,
   pending,
+  streamingTurnId = null,
   busy = pending,
   stage,
   stageTiming = null,
@@ -307,6 +310,8 @@ function ChatThread({
   }, [showsRail]);
 
   const lastTurn = turns[turns.length - 1];
+  // The answer being written: the last turn, or the earlier one a Continue writes into.
+  const writingId = streamingTurnId ?? lastTurn?.id;
   // One polite status line for the whole thread, always mounted so the first change is
   // announced too. The answer text itself is not a live region: it changes on every
   // streamed token, and a polite region over it re-reads the whole answer each time.
@@ -384,17 +389,17 @@ function ChatThread({
             engineerMode={engineerMode}
             currentModelLabel={currentModelLabel}
             streamStage={
-              pending && turn.id === lastTurn?.id && turn.role === 'assistant'
+              pending && turn.id === writingId && turn.role === 'assistant'
                 ? (stage ?? 'generating answer…')
                 : undefined
             }
             streamStartedAt={
-              pending && turn.id === lastTurn?.id && turn.role === 'assistant'
+              pending && turn.id === writingId && turn.role === 'assistant'
                 ? stageTiming?.askedAt
                 : undefined
             }
             streamEtaMs={
-              pending && turn.id === lastTurn?.id && turn.role === 'assistant'
+              pending && turn.id === writingId && turn.role === 'assistant'
                 ? stageTiming?.etaMs
                 : undefined
             }

@@ -6,6 +6,6 @@ export const ANSWER_FILTER_STATUSES: Record<AnswerFilter, readonly string[]> = {
   any: [],
   answered: ['answered'],
   uncited: ['uncited'],
-  unanswered: ['insufficient_context', 'no_context'],
+  unanswered: ['insufficient_context', 'no_context', 'empty_scope'],
 };
 

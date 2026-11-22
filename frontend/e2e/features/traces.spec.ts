@@ -13,7 +13,7 @@ test('the trace list asks the server for traces answered one way', async ({ page
   await expect(page.getByTestId('traces-panel-row')).toHaveCount(2);
   await page.getByTestId('traces-answer-filter').selectOption('unanswered');
   await expect(page.getByTestId('traces-panel-row')).toHaveCount(1);
-  expect(api.traceQueries.at(-1)).toEqual(['insufficient_context', 'no_context']);
+  expect(api.traceQueries.at(-1)).toEqual(['insufficient_context', 'no_context', 'empty_scope']);
 });
 
 test('the traces panel shows the score report and compares two traces', async ({ page, api }) => {

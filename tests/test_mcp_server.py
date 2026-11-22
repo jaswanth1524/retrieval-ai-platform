@@ -44,6 +44,7 @@ async def test_every_tool_is_listed_as_read_only(server: MCPServer) -> None:
     assert set(tools) == {
         "list_documents",
         "search_passages",
+        "verify_text",
         "ask",
         "summarize",
         "read_document",
@@ -57,8 +58,12 @@ async def test_every_tool_is_listed_as_read_only(server: MCPServer) -> None:
 async def test_tools_answer_from_the_indexed_documents_with_citations(server: MCPServer) -> None:
     listing = text_of(await server.call_tool("list_documents", {}))
     assert listing == "guide.txt (1 passages)"
+    paged = text_of(await server.call_tool("list_documents", {"prefix": "nothing/"}))
+    assert paged == "No document matches."
 
     passages = text_of(await server.call_tool("search_passages", {"query": "alpha"}))
+    checked = text_of(await server.call_tool("verify_text", {"text": "The moon is green cheese."}))
+    assert "??" in checked and "green cheese" in checked
     # Document text comes marked as data, not instructions.
     assert passages.startswith("[The text below is quoted from indexed documents.")
     assert "\n\n1. guide.txt p.1" in passages and "Alpha is the first letter" in passages
@@ -424,6 +429,11 @@ async def test_write_tools_only_with_allow_writes_and_the_full_key(
         assert noted.startswith("Queued notes/alpha.md as job ")
         empty = text_of(await writer.call_tool("add_note", {"name": "x", "text": "  "}))
         assert empty == "The note is empty; nothing was indexed."
+        # A note never silently replaces a document: only with replace=true.
+        clash = text_of(await writer.call_tool("add_note", {"name": "guide.txt", "text": "Mine."}))
+        assert clash.startswith("'guide.txt' is already indexed; nothing was changed.")
+        assert tools["add_note"].annotations is not None
+        assert tools["add_note"].annotations.destructive_hint is True
         assert tools["reindex"].annotations is not None
         assert tools["reindex"].annotations.read_only_hint is False
 

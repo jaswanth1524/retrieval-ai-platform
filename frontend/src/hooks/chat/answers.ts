@@ -101,16 +101,20 @@ export function useAnswerQueries(
     const found: SavedAnswer[] = [];
     for (const conversation of storageRef.current.conversations) {
       if ((conversation.workspace ?? '') !== workspace) continue;
-      let question: string | null = null;
+      let asked: ChatTurn | null = null;
       for (const turn of conversation.turns) {
-        if (turn.role === 'user') question = turn.content;
+        if (turn.role === 'user') asked = turn;
         else if (turn.role === 'assistant') {
           found.push({
             conversationId: conversation.id,
             conversationTitle: conversation.title,
             workspace,
             turn,
-            question,
+            question: asked?.content ?? null,
+            // As the saved list: "Ask again" re-asks a summary as a summary, and a
+            // narrowed question with its narrowing (both were dropped here).
+            ...(asked?.narrowing ? { narrowing: asked.narrowing } : {}),
+            ...(asked?.task ? { task: true } : {}),
           });
         }
       }

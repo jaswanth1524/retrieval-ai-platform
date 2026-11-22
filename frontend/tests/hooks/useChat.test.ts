@@ -2050,7 +2050,7 @@ it('imports a whole export into the room left, keeping its dates and every exist
   expect(newest?.updatedAt).toBe(old + 5000);
 });
 
-it('makes room for an import only when asked, never removing a pinned or the active chat', () => {
+it('makes room for an import only when asked, never removing a pinned or the active chat', async () => {
   const { result } = renderHook(() => useChat());
   const turn = (id: string, role: string, content: string) => ({
     id,
@@ -2084,4 +2084,7 @@ it('makes room for an import only when asked, never removing a pinned or the act
   expect(outcome).toEqual({ imported: 5, skipped: 0, removed: 4 });
   expect(result.current.conversations.length).toBe(MAX_CONVERSATIONS);
   expect(result.current.conversations.some((c) => c.id === oldest.id)).toBe(true);
+  // The ones that made room are in Recently deleted, to be restored.
+  const { readTrash } = await import('../../src/utils/trash');
+  expect(readTrash().length).toBeGreaterThanOrEqual(4);
 });

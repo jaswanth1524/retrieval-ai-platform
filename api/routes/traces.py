@@ -258,6 +258,8 @@ def list_query_log(
                 kind=row.kind,
                 cached=row.cached,
                 filenames_cited=row.cited,
+                retrieval_query=row.retrieval_query,
+                scope=row.scope,
             )
             for row in rows
         ]

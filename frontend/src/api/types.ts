@@ -476,6 +476,8 @@ export type AnswerStatus =
   | 'insufficient_context'
   | 'no_context'
   | 'uncited'
+  /** The question's documents or tags match no indexed document. */
+  | 'empty_scope'
   | (string & {});
 
 export interface HistoryMessage {

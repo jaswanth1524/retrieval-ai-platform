@@ -802,6 +802,10 @@ class QueryLogEntryResponse(BaseModel):
     # True when ``filenames`` are the documents the answer cited; False when they are
     # the prompt's (an answer citing none), a summary's, or the row predates this.
     filenames_cited: bool = False
+    # What was searched when it differs from ``question``: a follow-up's rewrite.
+    retrieval_query: str | None = None
+    # The documents, tags, dates or passages the question was limited to (None: all).
+    scope: dict[str, Any] | None = None
 
 
 class QueryLogResponse(BaseModel):
@@ -1004,6 +1008,9 @@ class QuestionResponse(BaseModel):
     # The provider read far less of the prompt than was sent: cut to fit its context
     # window, grounding rules first (raise OLLAMA_NUM_CTX).
     prompt_cut: bool = False
+    # What was searched when it differs from the question: a follow-up's rewrite (the
+    # stream's `done` frame carries the same).
+    retrieval_query: str | None = None
     # Suggested next questions (FOLLOWUPS_ENABLED); empty when off or none were found.
     # Picked passages (chunk_ids) the prompt had no room for: past max_context_chunks,
     # past the reranker's candidates, or cut to fit the context window.
@@ -1101,6 +1108,9 @@ class UrlIngestRequest(BaseModel):
     # replaced only with this set (or with `filename` given); otherwise the request is
     # a 409. The same URL always updates its own document.
     replace: bool = False
+    # Kept under this folder ("handbook/2024"): the document is named
+    # "<folder>/<its name>", as folder paths are named elsewhere.
+    folder: RequestFilename | None = None
 
 
 class ArchiveUrlIngestRequest(BaseModel):
@@ -1124,6 +1134,8 @@ class SitemapIngestRequest(BaseModel):
     same_host: bool = True
     tags: list[RequestTag] | None = Field(default=None, max_length=MAX_TAGS_PER_DOCUMENT)
     refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
+    # Every page kept under this folder ("docs-site"): named "<folder>/<page name>".
+    folder: RequestFilename | None = None
 
 
 class SitemapIngestResponse(BaseModel):
@@ -1319,6 +1331,48 @@ class SearchRequest(PassageNarrowing):
         return self
 
 
+# A text sent to POST /questions/verify, at most (a page of an answer or an email).
+VERIFY_MAX_CHARS = 8000
+
+
+class VerifyRequest(BaseModel):
+    """A text to check against the documents, sentence by sentence (no LLM call)."""
+
+    text: str = Field(min_length=1, max_length=VERIFY_MAX_CHARS)
+    filenames: list[RequestFilename] | None = Field(
+        default=None, min_length=1, max_length=REQUEST_FILENAMES_MAX
+    )
+    tags: list[RequestTag] | None = Field(
+        default=None, min_length=1, max_length=MAX_TAGS_PER_DOCUMENT
+    )
+
+
+class VerifySentenceResponse(BaseModel):
+    sentence: str
+    # "supported" (a passage says it: ``quote``), "numbers_differ" (a passage says
+    # it with other numbers: ``missing_numbers`` are the sentence's it lacks),
+    # "unsupported" (no passage found says it), "no_claim" (too short to check).
+    # Extensible.
+    status: str = Field(
+        json_schema_extra={
+            "x-extensible-enum": ["supported", "numbers_differ", "unsupported", "no_claim"]
+        }
+    )
+    filename: str | None = None
+    page: int | None = None
+    section: str | None = None
+    chunk_id: str | None = None
+    quote: str | None = None
+    rerank_score: float | None = None
+    missing_numbers: list[str] = []
+
+
+class VerifyResponse(BaseModel):
+    sentences: list[VerifySentenceResponse]
+    # The text had more sentences than are checked at once (the first ones were).
+    more: bool = False
+
+
 class SearchResultResponse(BaseModel):
     """One passage, best first, with the scores that ranked it."""
 
@@ -1477,6 +1531,14 @@ class ConsistencyRepairResponse(BaseModel):
     # Not touched: indexed again meanwhile, in flight, couldn't be removed, or couldn't
     # be queued for a re-index now (a full queue: try again).
     left: list[str]
+
+
+class MigrateExportStartedResponse(BaseModel):
+    """A migration bundle being written in the background: follow it with GET
+    /documents/imports/{import_id}, then download it from GET
+    /admin/migrate/export/{import_id}."""
+
+    import_id: str
 
 
 class MigrateImportResponse(BaseModel):

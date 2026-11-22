@@ -64,6 +64,8 @@ export function mergeRegenerated(
     versions,
     previousIds,
     ...(oldAnswer.saved ? { saved: true } : {}),
+    // The reader's own note on the answer (Saved) goes with it, as saving does.
+    ...(oldAnswer.note ? { note: oldAnswer.note } : {}),
   };
   return [...turns.slice(0, index - 1), newQuestion, merged, ...turns.slice(index + 1, end - 2)];
 }
@@ -91,6 +93,7 @@ const RUN_FIELDS = [
   'timings',
   'cached',
   'notFound',
+  'emptyScope',
   'uncited',
   'weakMatch',
   'truncated',
@@ -106,7 +109,18 @@ const RUN_FIELDS = [
   'reviewedAt',
   // A rating was of the other answer's text.
   'feedback',
+  // Checks and notes that described the other answer's text or run.
+  'unsupportedClaims',
+  'unsupportedNumbers',
+  'promptCut',
+  'searchedAs',
+  'cannotContinue',
+  'continueFailed',
+  'regenerateFailed',
 ] as const;
+
+/** The run fields, for code that replaces an answer's text with another run's. */
+export const ANSWER_RUN_FIELDS: readonly (keyof ChatTurn)[] = RUN_FIELDS;
 
 /** ``turn`` with its earlier version ``index`` as the answer again; the answer it
  *  had becomes that version (so nothing is lost, and the order of the others stays). */

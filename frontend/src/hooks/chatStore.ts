@@ -109,11 +109,32 @@ function write(apply: (store: IDBObjectStore) => void): Promise<boolean> {
   );
 }
 
-/** Resolves true once the value is durably written, false when it couldn't be. */
-export async function saveChatStore(value: unknown): Promise<boolean> {
+/** Resolves true once the value is durably written, false when it couldn't be.
+ *  With ``merge``, what is stored now is read and merged in the same transaction (no
+ *  other tab can write in between): another tab's conversations this one never loaded
+ *  are kept, not overwritten by this tab's copy. */
+export async function saveChatStore(
+  value: unknown,
+  merge?: (stored: unknown) => unknown,
+): Promise<boolean> {
   if (!chatStoreAvailable()) return false;
   try {
-    return await write((store) => store.put(value, KEY));
+    return await write((store) => {
+      if (!merge) {
+        store.put(value, KEY);
+        return;
+      }
+      const read = store.get(KEY);
+      read.onsuccess = () => {
+        let merged: unknown = value;
+        try {
+          merged = read.result === undefined ? value : merge(read.result);
+        } catch {
+          merged = value;
+        }
+        store.put(merged, KEY);
+      };
+    });
   } catch {
     return false;
   }

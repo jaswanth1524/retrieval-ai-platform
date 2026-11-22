@@ -59,6 +59,7 @@ from api.prompting import (
     format_context_chunk,
     generate_followups,
     generate_query_variants,
+    insufficient_context_answer,
     needs_condense,
     with_answer_language,
 )
@@ -81,6 +82,7 @@ __all__ = [
     "GenerationError",
     "GroundedAnswer",
     "INSUFFICIENT_CONTEXT_ANSWER",
+    "insufficient_context_answer",
     "LiteLLMGenerator",
     "SourceCitation",
     "StageTimings",
@@ -196,6 +198,8 @@ class GroundedAnswer:
     # The provider read far less of the prompt than was sent: cut to fit its context
     # window, grounding rules first (raise OLLAMA_NUM_CTX).
     prompt_cut: bool = False
+    # What was searched when it differs from the question: a follow-up's rewrite.
+    retrieval_query: str | None = None
     # Passages the question picked (chunk_ids) that the prompt had no room for: past
     # max_context_chunks (or the reranker's candidates), or cut to fit the window.
     passages_left_out: int = 0
@@ -284,7 +288,7 @@ def generate_grounded_answer(
 
     selected_chunks = list(context_chunks[: int(settings.max_context_chunks)])
     if not selected_chunks:
-        return GroundedAnswer(answer=INSUFFICIENT_CONTEXT_ANSWER, sources=[])
+        return GroundedAnswer(answer=insufficient_context_answer(settings), sources=[])
 
     messages = answer_messages(
         normalized_query, selected_chunks, history, settings, weak_matches=weak_matches

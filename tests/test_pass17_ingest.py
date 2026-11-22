@@ -377,14 +377,18 @@ def test_a_zip_bigger_than_the_queue_is_imported_whole_in_the_background() -> No
         assert started.status_code == 202
         import_id = started.json()["import_id"]
         assert import_id and started.json()["deferred"] == []
+        # Generous: imports run one at a time on a process-wide thread, and on a loaded
+        # machine (a parallel run) 30 s was once not enough.
         wait_until(
             lambda: client.get(f"/documents/imports/{import_id}").json()["state"] == "done",
-            timeout=30,
+            timeout=90,
         )
         status = client.get(f"/documents/imports/{import_id}").json()
         assert status["queued"] == 6 and status["kind"] == "archive"
-        wait_until(lambda: len(client.get("/documents").json()["filenames"]) == 6, timeout=30)
-        assert [i["id"] for i in client.get("/documents/imports").json()["imports"]] == [import_id]
+        wait_until(lambda: len(client.get("/documents").json()["filenames"]) == 6, timeout=90)
+        # Listed (the registry is process-wide: an earlier test's import may be too).
+        listed = [i["id"] for i in client.get("/documents/imports").json()["imports"]]
+        assert import_id in listed
         assert client.delete(f"/documents/imports/{import_id}").status_code == 409
         assert client.get("/documents/imports/nope").status_code == 404
     clear_dependency_caches()
