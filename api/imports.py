@@ -18,6 +18,7 @@ already there, so running it twice is harmless.
 from __future__ import annotations
 
 import contextvars
+import io
 import json
 import logging
 import os
@@ -32,6 +33,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
+
+from fastapi import UploadFile
+
+from api.notify import notify
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +152,7 @@ def start(
                     cleanup()
             finally:
                 status.finished_at = time.time()
+                _report(status)
 
     # The request's context (its id, the audit actor) goes with the work.
     context = contextvars.copy_context()
@@ -163,6 +169,33 @@ def start(
         status.finished_at = time.time()
         cleanup()
     return status
+
+
+def _report(status: BackgroundImport) -> None:
+    """Tell NOTIFY_URL how a background import ended: ``import_failed`` when it stopped
+    on an error or some documents failed, else ``import_finished`` — they run for
+    minutes to hours, and polling was the only way to find out. A shutdown's stop is
+    not an ending (the import resumes at the next start)."""
+
+    if status.interrupted:
+        return
+    where = f" in workspace '{status.workspace}'" if status.workspace else ""
+    summary = f"{status.queued} queued, {status.skipped} skipped, {status.failed} failed" + (
+        f"; {status.problems[0]}" if status.problems else ""
+    )
+    try:
+        if status.errored or status.failed:
+            notify(
+                "import_failed",
+                f"The {status.kind} import '{status.name}'{where} {status.state}: {summary}",
+            )
+        else:
+            notify(
+                "import_finished",
+                f"The {status.kind} import '{status.name}'{where} {status.state}: {summary}",
+            )
+    except Exception:  # noqa: BLE001 - a notification never fails the import it reports
+        logger.warning("Could not report the end of import %s.", status.id, exc_info=True)
 
 
 def spool_directory(setting: str) -> Path | None:
@@ -245,6 +278,17 @@ def spool_upload(source: IO[bytes], prefix: str, directory: Path | None = None) 
         path.unlink(missing_ok=True)
         raise
     return path
+
+
+def adopt_upload(upload: UploadFile) -> IO[bytes]:
+    """The file an upload was received into, taken over for the import thread (which
+    closes it, and so removes it): the request's own cleanup closes a stand-in. Saves a
+    second copy of a large upload in the same temp directory."""
+
+    held = upload.file
+    upload.file = io.BytesIO()
+    held.seek(0)
+    return held
 
 
 def wait_for_room(

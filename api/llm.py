@@ -40,6 +40,11 @@ class GenerationConfigError(GenerationError):
         super().__init__(message, worth_retrying=False)
 
 
+class ServerGenerationConfigError(GenerationConfigError):
+    """The server's own generation setup is incomplete (LLM_PROVIDER=openai with no
+    OPENAI_API_KEY): a 503 the operator fixes, not a 400 the client caused."""
+
+
 class ChatMessage(TypedDict):
     """LiteLLM-compatible chat message."""
 

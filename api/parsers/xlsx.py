@@ -31,12 +31,14 @@ def parse_xlsx_document(
     page number and by its section label, ``"<sheet> · Rows 4-53"`` — spreadsheet row
     numbers, blank rows included, as with CSV. The first non-blank row of a sheet is its
     header. Cells hold their last computed values (``data_only``); formulas are not
-    evaluated. Charts and images are skipped.
+    evaluated. Charts and images are skipped, and so are hidden sheets unless
+    INDEX_HIDDEN_CONTENT is on.
     """
 
     limits = settings if settings is not None else AppSettings.model_construct()
     rows_per_section = int(limits.csv_rows_per_section)
     max_cells = int(limits.max_spreadsheet_cells)
+    hidden = bool(settings is not None and settings.index_hidden_content)
     check_zip_expanded_size(filename, content, "XLSX", XLSX_MAX_EXPANDED_BYTES)
     refuse_zip_xml_dtd(filename, content, "XLSX")
 
@@ -51,6 +53,10 @@ def parse_xlsx_document(
     cells = 0
     try:
         for page, sheet in enumerate(workbook.worksheets, start=1):
+            # Hidden and very hidden sheets (INDEX_HIDDEN_CONTENT): what the workbook
+            # keeps from its reader. Pages stay the sheets' positions in the workbook.
+            if not hidden and getattr(sheet, "sheet_state", "visible") != "visible":
+                continue
             # The declared dimension is only a hint; trusting it padded every row to
             # its width (a sheet claiming A1:XFD1048576 is 17 billion cells).
             sheet.reset_dimensions()

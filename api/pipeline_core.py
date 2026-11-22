@@ -110,7 +110,13 @@ from api.retrieval import (
     embed_query,
     points_to_chunks,
 )
-from api.run_coordination import QuestionAbandoned, drain, lead_or_join, wait_for_model
+from api.run_coordination import (
+    QuestionAbandoned,
+    drain,
+    follow_only,
+    lead_or_join,
+    wait_for_model,
+)
 from api.settings import AppSettings
 from api.tracing import (
     QueryTrace,
@@ -122,6 +128,10 @@ from api.workspaces import workspace_of
 
 # Logs as api.pipeline, where this code lived, so existing log filters still match.
 logger = logging.getLogger("api.pipeline")
+
+
+# Bracketed numbers up to this are taken for an earlier answer's citations.
+HISTORY_MARKER_MAX = 20
 
 
 class PipelineCore(TraceRecording):
@@ -199,11 +209,19 @@ class PipelineCore(TraceRecording):
         # with its question cut away: the model read an answer to nothing, and
         # Anthropic's API refuses a conversation that doesn't open with the user.
         kept = _from_first_question(kept)
+        # The most sources an earlier answer could cite (generously: a workspace or a
+        # request may have allowed more): "[2024]" past it is the answer's own text.
+        most_sources = max(
+            HISTORY_MARKER_MAX,
+            int(effective_settings.max_context_chunks),
+            int(effective_settings.rerank_top_k),
+        )
         return [
             {
                 "role": "assistant",
                 # A bare "[1]" answer still holds its place, so the turns keep alternating.
-                "content": strip_citation_markers(message["content"]) or "(answer omitted)",
+                "content": strip_citation_markers(message["content"], most_sources)
+                or "(answer omitted)",
             }
             if message["role"] == "assistant"
             else message
@@ -314,6 +332,28 @@ class PipelineCore(TraceRecording):
         truncated = self._truncate_history(history, settings)
         query, _, _, _ = self._condense_query(question.strip(), truncated, settings)
         return query
+
+    def _scoped_status(self, status: str, run: AnswerRun, settings: AppSettings) -> str:
+        """``empty_scope`` for a question with nothing to answer from because its scope
+        (``filenames``, ``tags``) names no indexed document — a typo'd name, a tag no
+        document carries — rather than ``no_context``, which reads as "the documents
+        don't cover it". Else ``status``."""
+
+        if status != "no_context" or not (run.filenames or run.tags):
+            return status
+        try:
+            if run.filenames:
+                indexed = self._repository.filename_metadata(settings)
+                if not any(name in indexed for name in run.filenames):
+                    return "empty_scope"
+            if run.tags:
+                wanted = {" ".join(tag.split()).casefold() for tag in run.tags}
+                stored = {tag.casefold() for tag in self._repository.stored_tags(settings)}
+                if not wanted & stored:
+                    return "empty_scope"
+        except Exception:  # noqa: BLE001 - the plain status is still right
+            return status
+        return status
 
     def _stored_tag_variants(self, tags: Sequence[str], settings: AppSettings) -> list[str]:
         """The stored spellings of ``tags``, matched the way tags are de-duplicated.
@@ -701,6 +741,61 @@ class PipelineCore(TraceRecording):
             # included (a provider without its key failed here, before the trace).
             return None
 
+    def cached_answer(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        history: Sequence[ChatMessage] | None,
+    ) -> CachedAnswer | None:
+        """The answer cache's answer to this question now, if it has one: a full server
+        still replays it (no question slot is needed for that), passed back as
+        ``answer(cached=)`` so it can't expire between the check and the replay."""
+
+        key = self._cache_key(question, overrides, filenames, tags, history)
+        if key is None or self._answer_cache is None:
+            return None
+        return self._answer_cache.get(key)
+
+    def identical_run(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        history: Sequence[ChatMessage] | None,
+    ) -> threading.Event | None:
+        """The event of an identical question being answered right now, if there is
+        one: a full server lets a request wait for its answer without a slot
+        (``answer(follow=)``)."""
+
+        key = self._cache_key(question, overrides, filenames, tags, history)
+        if key is None or self._answer_cache is None:
+            return None
+        return self._answer_cache.inflight.running(key)
+
+    def claim_run(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        history: Sequence[ChatMessage] | None,
+    ) -> tuple[threading.Event, bool, Callable[[], None]] | None:
+        """Claim this question's run as it is admitted: (its event, whether the caller
+        now leads it, a finish that releases its followers — idempotent, so the
+        request's own end can call it however the run went). None when it isn't
+        cached. Claimed at admission, an identical question sent at the same moment
+        finds the run already registered and waits for it, never a 429."""
+
+        key = self._cache_key(question, overrides, filenames, tags, history)
+        cache = self._answer_cache
+        if key is None or cache is None:
+            return None
+        event, leading = cache.inflight.claim(key)
+        return event, leading, (lambda: cache.inflight.finish(key, event))
+
     def answer(
         self,
         question: str,
@@ -711,8 +806,12 @@ class PipelineCore(TraceRecording):
         tags: Sequence[str] | None = None,
         use_cache: bool = True,
         should_stop: Callable[[], bool] | None = None,
+        cached: CachedAnswer | None = None,
+        follow: threading.Event | None = None,
+        claimed: threading.Event | None = None,
     ) -> GroundedAnswer:
-        """``_answer_uncached``, served from the answer cache when it has this question.
+        """``_answer_uncached``, served from the answer cache when it has this question
+        (``cached``: the hit already looked up, replayed as it is).
 
         ``use_cache=False`` (Regenerate) skips the lookup but still stores the new
         answer, so the next plain ask gets the regenerated one. ``should_stop`` (the
@@ -721,9 +820,20 @@ class PipelineCore(TraceRecording):
         """
 
         started = time.monotonic()
+        if cached is not None:
+            self._log_hit(cached, question, "sync", filenames, tags, overrides)
+            return cached.as_grounded(_cached_timings(started))
         key = self._cache_key(question, overrides, filenames, tags, history)
-        lead: threading.Event | None = None
-        if key is not None and use_cache and self._answer_cache is not None:
+        if follow is not None and key is not None and self._answer_cache is not None:
+            # Admitted without a slot to wait for the identical run: its answer or a 429.
+            followed = drain(follow_only(self._answer_cache, key, follow, should_stop))
+            if followed is None:
+                raise QuestionAbandoned
+            self._log_hit(followed, question, "sync", filenames, tags, overrides)
+            return followed.as_grounded(_cached_timings(started))
+        # ``claimed``: this request leads the run already (claimed as it was admitted).
+        lead: threading.Event | None = claimed
+        if claimed is None and key is not None and use_cache and self._answer_cache is not None:
             hit = self._answer_cache.get(key)
             if hit is None:
                 joined = drain(lead_or_join(self._answer_cache, key, should_stop))
@@ -880,7 +990,11 @@ class PipelineCore(TraceRecording):
         usage = usage_totals()
         cost_usd = usage_cost_usd(effective_settings, usage)
         try:
-            status = answer_status(grounded.answer, len(grounded.sources), len(selected))
+            status = self._scoped_status(
+                answer_status(grounded.answer, len(grounded.sources), len(selected)),
+                run,
+                effective_settings,
+            )
             wants_followups = effective_settings.followups_enabled and status == "answered"
             followups = (
                 generate_followups(
@@ -939,6 +1053,7 @@ class PipelineCore(TraceRecording):
             cost_usd=cost_usd,
             prompt_cached=self._prompt_cached(run),
             prompt_cut=was_prompt_cut(),
+            retrieval_query=run.condensed_question or None,
         )
 
     def _log_hit(

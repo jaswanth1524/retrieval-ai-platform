@@ -5,15 +5,17 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Annotated
+from typing import IO, Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import ValidationError
 from qdrant_client import QdrantClient
-from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 
 from api.audit import audit
 from api.chunking import TokenCounter
@@ -26,7 +28,7 @@ from api.dependencies import (
     require_full_key,
 )
 from api.embeddings import LocalEmbeddingProvider
-from api.imports import BackgroundImport, spool_directory, spool_upload
+from api.imports import BackgroundImport, adopt_upload, spool_directory, spool_upload
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
 from api.migrate import (
@@ -51,7 +53,11 @@ from api.routes.deps import (
     TokenCounterDep,
     VectorRepositoryDep,
 )
-from api.schemas import MigrateImportResponse
+from api.schemas import (
+    MigrateExportStartedResponse,
+    MigrateImportResponse,
+    WorkspaceSettingsRequest,
+)
 from api.settings import AppSettings
 from api.storage import require_free_space
 from api.workspace_settings import WORKSPACE_SETTING_FIELDS, WorkspaceSettingsStore
@@ -63,6 +69,7 @@ from api.workspaces import (
     settings_for,
     validate_name,
 )
+from api.zip_safety import too_many_entries
 
 logger = logging.getLogger("api.routes.documents")
 
@@ -190,12 +197,129 @@ def migrate_export(
         snapshots=sum(1 for entry in manifest["workspaces"] if entry["snapshot"]),
     )
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    return FileResponse(
+    return _RemovedAfterSending(
         path,
         media_type="application/zip",
         filename=f"docrag-migrate-{stamp}.zip",
-        background=BackgroundTask(path.unlink, missing_ok=True),
     )
+
+
+class _RemovedAfterSending(FileResponse):
+    """A file sent once, then removed — however the response ends. A background task
+    never ran when the client left mid-download, and the bundle (gigabytes) stayed in
+    the temp directory."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            Path(self.path).unlink(missing_ok=True)
+
+
+# Bundles written in the background (POST /admin/migrate/export), by import id: kept
+# until downloaded once, or for BACKGROUND_EXPORT_KEEP_SECONDS.
+_background_exports: dict[str, tuple[Path, float]] = {}
+_background_lock = threading.Lock()
+BACKGROUND_EXPORT_KEEP_SECONDS = 24 * 3600
+
+
+def _forget_old_exports(now: float) -> None:
+    with _background_lock:
+        old = [
+            key
+            for key, (_, at) in _background_exports.items()
+            if now - at > BACKGROUND_EXPORT_KEEP_SECONDS
+        ]
+        for key in old:
+            path, _ = _background_exports.pop(key)
+            path.unlink(missing_ok=True)
+
+
+# The same bundle as GET /admin/migrate/export, written in the background: for a big
+# server the GET held the request (and its proxy's timeout) for the whole pack. Follow
+# it with GET /documents/imports/{import_id}; once it is done, GET
+# /admin/migrate/export/{import_id} downloads it (once).
+@router.post(
+    "/admin/migrate/export",
+    response_model=MigrateExportStartedResponse,
+    status_code=202,
+    dependencies=[Depends(require_full_key)],
+)
+def migrate_export_in_background(
+    server: ServerDep,
+    feedback_store: FeedbackStoreDep,
+    own_settings: WorkspaceSettingsStoreDep,
+) -> MigrateExportStartedResponse:
+    settings = server.settings
+    directory = _scratch(settings)
+    require_free_space(settings, directory or tempfile.gettempdir())
+    _forget_old_exports(time.time())
+
+    def run(status: BackgroundImport) -> None:
+        if not backup_routes._export_running.acquire(blocking=False):
+            status.errored = True
+            status.note("Another export or backup was being written; start it again.")
+            return
+        handle = tempfile.NamedTemporaryFile(
+            prefix="docrag-migrate-", suffix=".zip", delete=False, dir=directory
+        )
+        handle.close()
+        path = Path(handle.name)
+        try:
+            manifest = pack(
+                settings,
+                server.repository,
+                server.targets(),
+                feedback_store,
+                own_settings.get,
+                server.snapshots(),
+                path,
+            )
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            backup_routes._export_running.release()
+        if status.cancel.is_set():
+            path.unlink(missing_ok=True)
+            return
+        status.queued = len(manifest["workspaces"])
+        status.note(f"ready to download: {path.stat().st_size} bytes")
+        with _background_lock:
+            _background_exports[status.id] = (path, time.time())
+        audit(
+            "admin.migrate_export",
+            workspace="",
+            workspaces=[entry["name"] for entry in manifest["workspaces"]],
+            background=True,
+        )
+
+    started = start_import("migrate-export", "server bundle", "", "", run)
+    return MigrateExportStartedResponse(import_id=started.id)
+
+
+@router.get(
+    "/admin/migrate/export/{import_id}",
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No finished background export with that id."}},
+)
+def migrate_export_download(import_id: str) -> FileResponse:
+    with _background_lock:
+        found = _background_exports.pop(import_id, None)
+    if found is None or not found[0].exists():
+        raise HTTPException(
+            status_code=404,
+            detail="No finished bundle with that id (still being written, already "
+            "downloaded, or older than a day).",
+        )
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(found[1]))
+    return _RemovedAfterSending(
+        found[0], media_type="application/zip", filename=f"docrag-migrate-{stamp}.zip"
+    )
+
+
+# Entries a bundle may hold: its manifest and, per workspace, a backup and a snapshot.
+BUNDLE_MAX_MEMBERS = 4096
 
 
 # A bundle put back, in the background (follow it with GET /documents/imports/{id}, in
@@ -215,17 +339,37 @@ def migrate_import(
     own_settings: WorkspaceSettingsStoreDep,
 ) -> MigrateImportResponse:
     settings = server.settings
+    # Before anything is copied or its directory read into memory: a bundle holds a
+    # manifest and two files per workspace.
+    if too_many_entries(file.file, BUNDLE_MAX_MEMBERS):
+        raise HTTPException(
+            status_code=400, detail=f"The bundle has more than {BUNDLE_MAX_MEMBERS} entries."
+        )
     directory = _scratch(settings)
     require_free_space(settings, directory or tempfile.gettempdir())
-    spool = spool_upload(file.file, "docrag-migrate-", directory)
+    # With IMPORT_SPOOL_DIR, copied onto the data volume (the temp copy goes with the
+    # request). Without it, the file the web server already received is kept as it is:
+    # copying it into the same temp directory needed room for the bundle twice.
+    spool: Path | IO[bytes] = (
+        spool_upload(file.file, "docrag-migrate-", directory)
+        if directory is not None
+        else adopt_upload(file)
+    )
+
+    def discard() -> None:
+        if isinstance(spool, Path):
+            spool.unlink(missing_ok=True)
+        else:
+            spool.close()
+
     try:
         with zipfile.ZipFile(spool) as bundle:
             manifest = read_manifest(bundle)
     except (zipfile.BadZipFile, OSError) as exc:
-        spool.unlink(missing_ok=True)
+        discard()
         raise HTTPException(status_code=400, detail="That file isn't a zip archive.") from exc
     except MigrateError as exc:
-        spool.unlink(missing_ok=True)
+        discard()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     name = file.filename or "bundle.zip"
 
@@ -245,7 +389,7 @@ def migrate_import(
         "",
         str(settings.qdrant_collection),
         run,
-        cleanup=lambda: spool.unlink(missing_ok=True),
+        cleanup=discard,
     )
     audit("admin.migrate_import", workspace="", bundle=name, import_id=started.id)
     return MigrateImportResponse(
@@ -291,7 +435,15 @@ def _unpack_workspace(
         values = entry.get("settings")
         if isinstance(values, dict) and values:
             kept = {k: v for k, v in values.items() if k in WORKSPACE_SETTING_FIELDS}
-            own_settings.put(name, kept)
+            try:
+                # Checked as PUT /workspaces/{name}/settings checks them: a wrong type
+                # stored here broke every question in the workspace.
+                checked = WorkspaceSettingsRequest(**kept).model_dump(exclude_none=True)
+            except ValidationError:
+                checked = {}
+                status.note(f"{label}: its settings were not valid here; left at the defaults")
+            if checked:
+                own_settings.put(name, checked)
         collection = str(target.settings.qdrant_collection)
         points = server.client.count(collection_name=collection, exact=True).count
         backup = backup_of(bundle, entry, _scratch(base))
@@ -309,7 +461,12 @@ def _unpack_workspace(
                 reason = str(exc)
         if reason is None:
             stored = store_originals(
-                backup, target.raw_store, int(base.max_upload_bytes), feedback_store, name
+                backup,
+                target.raw_store,
+                int(base.max_upload_bytes),
+                feedback_store,
+                name,
+                max_members=int(base.max_migrate_members),
             )
             bump_corpus_generation(collection=collection)
             documents = len(server.repository.filename_metadata(target.settings))

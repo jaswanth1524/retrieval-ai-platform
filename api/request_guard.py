@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from collections.abc import Callable
 from typing import Any
 
@@ -25,6 +26,7 @@ from api.dependencies import READ_ONLY_KEY_ERROR, get_app_settings, key_access
 from api.metrics import rate_limited_total
 from api.rate_limit import RateLimiter, retry_after_seconds
 from api.settings import AppSettings
+from api.storage import free_bytes
 
 # Every route under these prefixes (and the exact paths) is key-guarded; see CLAUDE.md.
 # /health, /health/ready, /config and the static frontend stay open. The API docs are
@@ -151,6 +153,7 @@ class RequestGuardMiddleware:
         self.app = app
         # One limiter per configured rate, so a settings override (tests) gets its own.
         self._limiters: dict[int, RateLimiter] = {}
+        self._failed_key_limiters: dict[int, RateLimiter] = {}
 
     def _rate_limited(self, scope: Scope, settings: AppSettings) -> float:
         """Spend one of this client's tokens: 0.0 when allowed, else seconds to wait."""
@@ -159,6 +162,17 @@ class RequestGuardMiddleware:
         if per_minute <= 0:
             return 0.0
         limiter = self._limiters.setdefault(per_minute, RateLimiter(per_minute))
+        client = scope.get("client")
+        return limiter.take(str(client[0]) if client else "unknown")
+
+    def _failed_key(self, scope: Scope, settings: AppSettings) -> float:
+        """Spend one of this client's wrong-key tokens (FAILED_KEY_ATTEMPTS_PER_MINUTE):
+        0.0 when allowed, else seconds to wait."""
+
+        per_minute = int(settings.failed_key_attempts_per_minute)
+        if per_minute <= 0:
+            return 0.0
+        limiter = self._failed_key_limiters.setdefault(per_minute, RateLimiter(per_minute))
         client = scope.get("client")
         return limiter.take(str(client[0]) if client else "unknown")
 
@@ -193,8 +207,10 @@ class RequestGuardMiddleware:
                 return
             access = key_access(settings, headers.get(b"x-api-key"))
             if access == "none":
-                # Counted on every method: guessing the key is the attempt to limit.
-                wait = self._rate_limited(scope, settings)
+                # Counted on every method: guessing the key is the attempt to limit —
+                # by its own limit too, so a server without RATE_LIMIT_PER_MINUTE isn't
+                # open to unlimited guesses.
+                wait = max(self._rate_limited(scope, settings), self._failed_key(scope, settings))
                 if wait > 0:
                     await _reject_rate_limited(send, wait)
                     return
@@ -221,6 +237,10 @@ class RequestGuardMiddleware:
                 return
             if too_large:
                 await _reject(send, 413, _too_large_detail(limit))
+                return
+            room = _spool_room(int(declared))
+            if room is not None:
+                await _reject(send, 507, room)
                 return
 
         received = 0
@@ -253,6 +273,29 @@ class RequestGuardMiddleware:
             pass
         if exceeded and not response_started:
             await _reject(send, 413, _too_large_detail(limit))
+
+
+# A multipart body past this is spooled to the temp directory as it is received.
+_SPOOLED_PAST_BYTES = 1024 * 1024
+
+
+def _spool_room(declared: int) -> str | None:
+    """Why a body of ``declared`` bytes can't be received (507), or None. A multipart
+    upload is written to the temp directory before any route runs; in Docker that is a
+    tmpfs counted against the memory limit, and a backup or migration bundle bigger
+    than its room filled it — or, unsized, took the container's memory with it."""
+
+    if declared <= _SPOOLED_PAST_BYTES:
+        return None
+    directory = tempfile.gettempdir()
+    free = free_bytes(directory)
+    if free is None or declared < free:
+        return None
+    return (
+        f"The upload is {declared // (1024 * 1024)} MB and only {free // (1024 * 1024)} MB "
+        f"are free in {directory}, where uploads are received. Point TMPDIR at a larger "
+        "disk (in Docker: raise API_TMP_SIZE and API_MEM_LIMIT), then try again."
+    )
 
 
 def _too_large_detail(limit: int) -> str:

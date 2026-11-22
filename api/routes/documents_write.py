@@ -3,6 +3,7 @@ delete, tags and refresh settings."""
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import io
 import logging
@@ -48,6 +49,7 @@ from api.documents import (
     DocumentNotFoundError,
     DocumentSource,
     chunk_sections,
+    normalize_document_name,
     normalize_tags,
     validate_document_name,
     validate_upload_filename,
@@ -211,6 +213,30 @@ def _names_and_sources(
     return names, pages
 
 
+def checked_folder(folder: str | None) -> str | None:
+    """A ``folder`` to keep fetched documents under, checked as a document name's
+    folders are (400 otherwise); None for none."""
+
+    if folder is None or not folder.strip("/ "):
+        return None
+    cleaned = folder.strip().strip("/")
+    try:
+        normalize_document_name(f"{cleaned}/x.txt")
+    except DocumentError as exc:
+        raise HTTPException(status_code=400, detail=f"Not a usable folder: {exc}") from exc
+    return cleaned
+
+
+def in_folder(fetched: FetchedDocument, folder: str | None) -> FetchedDocument:
+    """``fetched`` named under ``folder`` (unchanged without one)."""
+
+    if folder is None:
+        return fetched
+    return dataclasses.replace(
+        fetched, filename=normalize_document_name(f"{folder}/{fetched.filename}")
+    )
+
+
 # A site's pages from its sitemap (or sitemap index, RSS or Atom feed): read now, its
 # pages fetched and queued one by one in the background (api/sitemap.py). The full key
 # and URL_INGEST_ENABLED, as /documents/from-url.
@@ -234,6 +260,7 @@ async def add_from_sitemap(
 ) -> SitemapIngestResponse:
     if not settings.url_ingest_enabled:
         raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+    folder = checked_folder(request.folder)
     given_tags = normalize_tags(request.tags) if request.tags else None
     await run_in_threadpool(repository.ensure_writable, settings)
     require_free_space(settings, settings.raw_document_dir)
@@ -263,7 +290,10 @@ async def add_from_sitemap(
     def fetch_page(
         url: str, has_room: Callable[[int], bool], etag: str | None, modified: str | None
     ) -> FetchedDocument:
-        return fetch_document(url, settings, has_room=has_room, etag=etag, last_modified=modified)
+        return in_folder(
+            fetch_document(url, settings, has_room=has_room, etag=etag, last_modified=modified),
+            folder,
+        )
 
     status = start_page_import(
         found.urls,
@@ -563,6 +593,9 @@ def _archive_in_background(
 # A zip of documents at a URL: fetched within the URL-ingest guards (public addresses,
 # MAX_IMPORT_BYTES, the deadline), then imported in the background as an uploaded one
 # sent with background=true is. Follow it with GET /documents/imports/{import_id}.
+_archive_fetches = threading.BoundedSemaphore(1)
+
+
 @router.post(
     "/documents/archive-from-url",
     response_model=ArchiveUploadResponse,
@@ -586,12 +619,24 @@ async def upload_archive_from_url(
     await run_in_threadpool(repository.ensure_writable, settings)
     directory = spool_directory(settings.import_spool_dir)
     require_free_space(settings, directory or tempfile.gettempdir())
-    fetched = await _fetch_for_ingest(
-        queue,
-        functools.partial(
-            fetch_document, request.url, settings, has_room=lambda size: True, archive=True
-        ),
-    )
+    # One archive download at a time: each is held whole in memory (up to
+    # MAX_IMPORT_BYTES, twice while it is copied out), and four at once came near the
+    # container's memory limit.
+    if not _archive_fetches.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail="Another archive is being downloaded; try again when it has finished.",
+            headers={"Retry-After": "30"},
+        )
+    try:
+        fetched = await _fetch_for_ingest(
+            queue,
+            functools.partial(
+                fetch_document, request.url, settings, has_room=lambda size: True, archive=True
+            ),
+        )
+    finally:
+        _archive_fetches.release()
     if too_many_entries(
         io.BytesIO(fetched.content), int(settings.max_archive_members) * _ENTRIES_PER_DOCUMENT
     ):
@@ -812,6 +857,7 @@ async def upload_document_from_url(
 ) -> DocumentJobAcceptedResponse:
     if not settings.url_ingest_enabled:
         raise HTTPException(status_code=404, detail="URL ingest is not enabled.")
+    folder = checked_folder(request.folder)
     given_tags = normalize_tags(request.tags) if request.tags else None
     await run_in_threadpool(repository.ensure_writable, settings)
     require_free_space(settings, settings.raw_document_dir)
@@ -825,6 +871,7 @@ async def upload_document_from_url(
             has_room=queue.backlog.has_room,
         ),
     )
+    fetched = in_folder(fetched, folder)
     url = request.url.strip()
     # Naming the document (`filename`) says which one to replace, as it always has;
     # a name taken from the URL alone doesn't.

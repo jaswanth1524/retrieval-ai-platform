@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 _STALE_TEMP_FILE_SECONDS = 3600.0
 # What tempfile.mkstemp(prefix=".upload-") produces: 8 characters from
 # [a-z0-9_] and no suffix — which no accepted upload name can have.
-_TEMP_FILE_NAME = re.compile(r"\.upload-[a-z0-9_]{8}")
+_TEMP_FILE_NAME = re.compile(r"\.(?:upload|restore)-[a-z0-9_]{8}")
 
 
 # Earlier versions of each original (RAW_DOCUMENT_VERSIONS), in a subdirectory per
@@ -83,7 +83,7 @@ class RawDocumentStore:
         self._sweep_stale_temp_files()
 
     def _sweep_stale_temp_files(self) -> None:
-        """Remove ``.upload-*`` temp files a crash or kill left mid-save.
+        """Remove ``.upload-*`` / ``.restore-*`` temp files a crash or kill left mid-save.
 
         ``save`` removes its temp file on any error it sees, but not when the process
         dies in between; those accumulated forever. An hour old is never a save still
@@ -91,7 +91,11 @@ class RawDocumentStore:
         """
 
         cutoff = time.time() - _STALE_TEMP_FILE_SECONDS
-        for temp in self._directory.glob(".upload-*"):
+        # Anywhere in the store: a version restore writes ``.restore-*`` under
+        # ``.versions/<name>/``, details ``.upload-*`` under ``.meta/``, and folder names
+        # put originals in subdirectories.
+        temps = [*self._directory.rglob(".upload-*"), *self._directory.rglob(".restore-*")]
+        for temp in temps:
             # Only mkstemp's own names: a stored original may be called ".upload-x.txt"
             # (a leading dot is a valid name), and it has a suffix a temp file never has.
             if not _TEMP_FILE_NAME.fullmatch(temp.name):

@@ -134,6 +134,7 @@ class TraceRecording:
         phase: RetrievalPhase | None = None,
         fitted: FittedPrompt | None = None,
         usage: tuple[int, int] | None = None,
+        prompt_messages: list[ChatMessage] | None = None,
     ) -> QueryTrace:
         """The trace of a question that failed (or was abandoned) before finishing:
         with what retrieval found (``phase``, ``fitted``) when it got that far, and the
@@ -166,7 +167,7 @@ class TraceRecording:
             if effective_settings is not None
             else None,
             candidates=candidates,
-            prompt_messages=None,
+            prompt_messages=prompt_messages,
             answer=answer,
             cited_source_numbers=[],
             timings=None,
@@ -279,6 +280,8 @@ class TraceRecording:
                 tags=run.tags,
                 error=error,
                 answer="".join(run.parts).strip() or None,
+                # Only with an answer begun: what a Continue of it is written from.
+                prompt_messages=run.prompt_messages if run.parts else None,
                 condensed_question=run.condensed_question,
                 condense_note=run.condense_note,
                 history_message_count=len(run.history),

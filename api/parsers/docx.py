@@ -28,12 +28,15 @@ def _check_docx_expanded_size(filename: str, content: bytes) -> None:
     check_zip_expanded_size(filename, content, "DOCX", DOCX_MAX_EXPANDED_BYTES)
 
 
-def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
+def parse_docx_document(
+    filename: str, content: bytes, *, hidden: bool = False
+) -> list[DocumentSection]:
     """Extract DOCX text, using heading styles as semantic section boundaries.
 
     DOCX has no fixed pagination, so ``page`` is always 1 and the section label
     carries the location meaning. Tables are rendered in place, a row per line (see
-    ``_table_text``).
+    ``_table_text``). Text formatted hidden (``w:vanish``) is left out unless ``hidden``
+    (INDEX_HIDDEN_CONTENT).
     """
 
     from docx import Document
@@ -64,7 +67,7 @@ def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
 
     for block in _iter_blocks(document.element.body):
         if block.tag == _W_P:
-            text = _paragraph_text(block).strip()
+            text = _paragraph_text(block, hidden).strip()
             if not text:
                 continue
             paragraph = Paragraph(block, document)
@@ -76,7 +79,7 @@ def parse_docx_document(filename: str, content: bytes) -> list[DocumentSection]:
             else:
                 buffer.append(text)
         else:
-            table_text = _table_text(block)
+            table_text = _table_text(block, hidden)
             if table_text:
                 buffer.append(table_text)
 
@@ -106,7 +109,19 @@ def _iter_blocks(element: Any) -> Iterator[Any]:
             yield from _iter_blocks(child)
 
 
-def _paragraph_text(paragraph: Any) -> str:
+def _vanished(run: Any) -> bool:
+    """A run formatted hidden: ``<w:rPr><w:vanish/>`` (not ``w:val="0"``/``false``)."""
+
+    properties = run.find(f"{_W}rPr")
+    if properties is None:
+        return False
+    vanish = properties.find(f"{_W}vanish")
+    if vanish is None:
+        return False
+    return vanish.get(f"{_W}val") not in ("0", "false", "off")
+
+
+def _paragraph_text(paragraph: Any, hidden: bool = False) -> str:
     """A paragraph's text as it reads: runs inside tracked insertions, hyperlinks,
     simple fields and content controls included, tracked deletions left out (python-
     docx's ``Paragraph.text`` reads only direct runs and hyperlinks)."""
@@ -117,6 +132,8 @@ def _paragraph_text(paragraph: Any) -> str:
         for child in element.iterchildren():
             tag = child.tag
             if tag in _W_REMOVED:
+                continue
+            if tag == f"{_W}r" and not hidden and _vanished(child):
                 continue
             if tag == f"{_W}t":
                 parts.append(child.text or "")
@@ -131,19 +148,23 @@ def _paragraph_text(paragraph: Any) -> str:
     return "".join(parts)
 
 
-def _cell_text(cell: Any) -> str:
+def _cell_text(cell: Any, hidden: bool = False) -> str:
     return " ".join(
-        text for text in (" ".join(_paragraph_text(p).split()) for p in cell.iter(_W_P)) if text
+        text
+        for text in (" ".join(_paragraph_text(p, hidden).split()) for p in cell.iter(_W_P))
+        if text
     )
 
 
-def _table_text(table: Any) -> str:
+def _table_text(table: Any, hidden: bool = False) -> str:
     """A table as text, a row per line. Each cell is read once: python-docx repeats a
     merged cell in every column it spans ("Merged | Merged"). A table with a header row
     and at least two rows under it reads like a spreadsheet's ("Days: 20; Grade: B"),
     so a chunk holding part of it still says what each value is."""
 
-    rows = [[_cell_text(cell) for cell in _row_cells(row)] for row in table.iterchildren(_W_TR)]
+    rows = [
+        [_cell_text(cell, hidden) for cell in _row_cells(row)] for row in table.iterchildren(_W_TR)
+    ]
     rows = [row for row in rows if any(row)]
     if len(rows) >= 3 and len(rows[0]) >= 2 and all(rows[0]):
         header = rows[0]

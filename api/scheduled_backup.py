@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -107,6 +109,42 @@ class BackupStatus:
     error: str | None = None
     # Indexed documents the backup holds no original of: a restore can't bring them back.
     originals_missing: int = 0
+
+
+# A backup holding under half the documents of the one before it is reported as failed
+# once the one before held at least this many (fewer: ordinary deletes swing the share).
+DROP_ALARM_MIN_DOCUMENTS = 12
+
+
+def copy_backup(settings: AppSettings, backup: Path) -> str | None:
+    """Run BACKUP_COPY_COMMAND on ``backup`` (its path as the last argument, no shell):
+    why the copy failed, or None (done, or no command set)."""
+
+    command = settings.backup_copy_command.strip()
+    if not command:
+        return None
+    try:
+        argv = [*shlex.split(command), str(backup)]
+    except ValueError as exc:
+        return f"BACKUP_COPY_COMMAND can't be read ({exc})"
+    try:
+        result = subprocess.run(  # noqa: S603 - the operator's own command, no shell
+            argv,
+            capture_output=True,
+            timeout=int(settings.backup_copy_timeout_seconds),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "the copy command ran past BACKUP_COPY_TIMEOUT_SECONDS "
+            f"({settings.backup_copy_timeout_seconds} s)"
+        )
+    except OSError as exc:
+        return f"the copy command could not run ({exc.strerror or exc})"
+    if result.returncode != 0:
+        said = (result.stderr or result.stdout).decode("utf-8", "replace").strip()[-200:]
+        return f"the copy command failed (exit {result.returncode})" + (f": {said}" if said else "")
+    return None
 
 
 # Where a deleted workspace's backups are moved (never a workspace name: those can't
@@ -261,14 +299,33 @@ class ScheduledBackup(BackgroundLoop):
                 self._note(BackupStatus(self._clock(), name, False, error=str(exc)[:200]))
             finally:
                 self._export_lock.release()
+            # Off the export lock: a copy may take minutes (an upload elsewhere), and
+            # /export and the other workspaces' backups would wait on it.
+            if written and written[-1].parent == directory:
+                self._copy(target, name, written[-1])
             self._prune(directory)
         return written
+
+    def _copy(self, target: WorkspaceTarget, name: str, backup: Path) -> None:
+        """BACKUP_COPY_COMMAND on a backup just written that checked out; a failed copy
+        turns this workspace's status into a failure."""
+
+        status = self.by_workspace.get(name)
+        if status is None or not status.ok or status.file != backup.name:
+            return
+        failed = copy_backup(target.settings, backup)
+        if failed is not None:
+            logger.warning("The backup %s: %s", backup, failed)
+            self._note(dataclasses.replace(status, at=self._clock(), ok=False, error=failed))
 
     def _write(self, target: WorkspaceTarget, directory: Path, name: str) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         low = low_on_space(target.settings, directory)
         if low is not None:
             raise OSError(low)
+        # What is indexed now: a listing cached from before a wiped collection showed
+        # its documents still there, and the backup (and its drop check) believed it.
+        self._repository.forget_listing(target.settings)
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(self._clock()))
         final = directory / f"docrag-{stamp}.zip"
         partial = directory / f".docrag-{stamp}.zip.part"
@@ -306,13 +363,16 @@ class ScheduledBackup(BackgroundLoop):
         self.record_check(final, check)
         if not check.ok:
             logger.warning("The backup %s did not check out: %s", final, "; ".join(check.problems))
+        drop = self._document_drop(directory, final, check)
+        if drop is not None:
+            logger.warning("The backup %s: %s", final, drop)
         self._note(
             BackupStatus(
                 self._clock(),
                 name,
-                check.ok,
+                check.ok and drop is None,
                 file=final.name,
-                error=None if check.ok else check.problems[0][:200],
+                error=(check.problems[0][:200] if not check.ok else drop),
                 originals_missing=stream.originals_missing,
             )
         )
@@ -358,6 +418,27 @@ class ScheduledBackup(BackgroundLoop):
                 exc_info=True,
             )
 
+    def _document_drop(self, directory: Path, final: Path, check: BackupCheck) -> str | None:
+        """Why this backup is suspect next to the one before it: it holds no documents
+        where that one held some, or under half of a dozen or more (a lost index, a
+        mass delete) — reported once, as a failed backup, so it is seen before pruning
+        would leave only backups like it."""
+
+        earlier = [b for b in backups_in(directory) if b != final]
+        previous = self.check_for(earlier[-1]) if earlier else None
+        # What a restore could bring back: documents with their original.
+        before = previous.originals if previous is not None else 0
+        now = check.originals
+        if before == 0:
+            return None
+        if now == 0 or (before >= DROP_ALARM_MIN_DOCUMENTS and now * 2 < before):
+            return (
+                f"it holds {now} documents with their originals where the backup before "
+                f"it held {before}: check that the index and originals weren't lost "
+                "(docrag doctor) before older backups are pruned"
+            )
+        return None
+
     def _prune(self, directory: Path) -> None:
         backups = backups_in(directory)
         doomed = backups[: -self._keep]
@@ -366,8 +447,18 @@ class ScheduledBackup(BackgroundLoop):
         good = next(
             (b for b in reversed(backups) if (check := self.check_for(b)) and check.ok), None
         )
+        # So does the newest that held any document: backups taken after the index was
+        # lost hold none, and pruning by count alone would remove the last full one.
+        holding = next(
+            (
+                b
+                for b in reversed(backups)
+                if (check := self.check_for(b)) and check.ok and check.originals > 0
+            ),
+            None,
+        )
         for old in doomed:
-            if old == good:
+            if old in (good, holding):
                 continue
             try:
                 old.unlink()

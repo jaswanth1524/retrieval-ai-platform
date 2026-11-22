@@ -51,14 +51,23 @@ _CITATION_RANGE_SEP = re.compile(r"\s*[-–]\s*")
 _MARKER_WITH_SPACE_RE = re.compile(r"[ \t]*" + _CITATION_RE.pattern)
 
 
-def strip_citation_markers(text: str) -> str:
+def strip_citation_markers(text: str, max_number: int | None = None) -> str:
     """``text`` without its ``[n]`` citation markers (lists, ranges and runs too).
 
     For earlier answers sent back as conversation history: their numbers named the
-    sources of the turn they answered, not this one's.
+    sources of the turn they answered, not this one's. With ``max_number`` (the most
+    sources an answer can have), a bracketed number past it is the answer's own text
+    ("the Policy [2024]") and stays.
     """
 
-    return _MARKER_WITH_SPACE_RE.sub("", text).strip()
+    if max_number is None:
+        return _MARKER_WITH_SPACE_RE.sub("", text).strip()
+
+    def _strip(match: re.Match[str]) -> str:
+        numbers = [int(n) for n in re.findall(r"\d+", match.group(1))]
+        return "" if numbers and max(numbers) <= max_number else match.group(0)
+
+    return _MARKER_WITH_SPACE_RE.sub(_strip, text).strip()
 
 
 CITATION_EXCERPT_MAX_CHARS = 200
@@ -688,7 +697,9 @@ def needs_citation_retry(answer: str, source_count: int) -> bool:
 
 # How well an answer is grounded, sent with every answer. A string, not an enum, so a
 # new value can be added without breaking a client: an unknown one reads as "answered".
-ANSWER_STATUSES = ("answered", "insufficient_context", "no_context", "uncited")
+# ``empty_scope``: the question's documents or tags match no indexed document (set by
+# the pipeline, which knows the scope; ``answer_status`` never returns it).
+ANSWER_STATUSES = ("answered", "insufficient_context", "no_context", "uncited", "empty_scope")
 
 
 def answer_status(answer: str, cited_count: int, source_count: int) -> str:
@@ -1124,10 +1135,18 @@ def _backfill(answer: str, texts: tuple[str, ...]) -> str | None:
 _ECHOED_HEADER_RE = re.compile(r"^[ \t>*-]*(?:\[\d{1,6}\][ \t]*)+filename=[^\n]*(?:\n|$)", re.M)
 
 
-def strip_echoed_source_headers(answer: str) -> str:
-    """``answer`` without lines that repeat a source header; never emptied by it."""
+# A header echoed inside a sentence, bracketed: "... March [ [1] filename=a.md; page=1;
+# section=Leave ]." (qwen2.5, measured). Kept as its marker: its "page=1" read as a
+# figure the passage doesn't state (unsupported_numbers), and the reader saw the header.
+_INLINE_ECHOED_HEADER_RE = re.compile(r"\[[ \t]*((?:\[\d{1,6}\][ \t]*)+)filename=[^\]\n]*\]")
 
-    stripped = _ECHOED_HEADER_RE.sub("", answer).strip()
+
+def strip_echoed_source_headers(answer: str) -> str:
+    """``answer`` without lines that repeat a source header, and with a header echoed
+    inside a sentence cut back to its ``[n]`` marker; never emptied by it."""
+
+    inline = _INLINE_ECHOED_HEADER_RE.sub(lambda m: m.group(1).strip(), answer)
+    stripped = _ECHOED_HEADER_RE.sub("", inline).strip()
     return stripped or answer
 
 

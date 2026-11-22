@@ -36,6 +36,7 @@ from api.feedback import FeedbackStore
 from api.imports import BackgroundImport, remember, spool_directory, spool_upload, wait_for_room
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
+from api.ingestion import IngestionError
 from api.notify import TEST_EVENT, NotifyError, current_notifier
 from api.raw_documents import RawDocumentStore
 from api.rebuild import originals_to_rebuild, rebuild
@@ -295,6 +296,13 @@ def _restore_in_background(
     )
 
 
+def _still_absent(repository: VectorRepository, settings: AppSettings, name: str) -> None:
+    if repository.content_identity(settings, name) is not None:
+        raise IngestionError(
+            f"'{name}' was indexed while the restore ran; the newer document was kept."
+        )
+
+
 def _restore(
     upload: IO[bytes],
     repository: VectorRepository,
@@ -335,6 +343,9 @@ def _restore(
             content=content,
             raw_store=raw_store,
             uploaded_at=uploaded_at,
+            # A restore never overwrites: a document uploaded while it waited for room
+            # (a background restore can wait hours) is newer than the backup's copy.
+            precondition=lambda name=filename: _still_absent(repository, settings, name),  # type: ignore[misc]
             tags=tags,
             source=source,
             watched_from=watched_from,
@@ -365,8 +376,16 @@ def _restore(
             workspace=workspace_of(settings),
             keep_version=raw_store.add_version if raw_store is not None else None,
             # One of BACKUP_DIR's own (``source`` names it): no upload caps.
-            stored=source is not None,
+            # A backup this server wrote (BACKUP_DIR) is trusted past the upload caps; one
+            # inside an uploaded migration bundle is an upload like any other.
+            stored=source is not None and not source.startswith("bundle:"),
             stop=status.cancel.is_set if status is not None else None,
+            # In a migration bundle: a whole server's worth of entries may be in it.
+            max_members=(
+                int(settings.max_migrate_members)
+                if source is not None and source.startswith("bundle:")
+                else None
+            ),
         )
     except BackupImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

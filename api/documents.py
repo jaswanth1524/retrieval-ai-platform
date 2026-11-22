@@ -136,10 +136,16 @@ def _parse_csv(
     return parse_csv_document(filename, decode_text_document(filename, content), settings)
 
 
+def _hidden(settings: AppSettings | None) -> bool:
+    """Whether hidden Office content is indexed (INDEX_HIDDEN_CONTENT; off)."""
+
+    return bool(settings is not None and settings.index_hidden_content)
+
+
 def _parse_docx(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
-    return parse_docx_document(filename, content)
+    return parse_docx_document(filename, content, hidden=_hidden(settings))
 
 
 def _parse_epub(
@@ -157,7 +163,7 @@ def _parse_eml(
 def _parse_pptx(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
-    return parse_pptx_document(filename, content)
+    return parse_pptx_document(filename, content, hidden=_hidden(settings))
 
 
 def _parse_odt(

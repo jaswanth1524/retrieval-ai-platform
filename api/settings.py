@@ -263,6 +263,9 @@ class AppSettings(BaseSettings):
     # wrong API key; past it, 429 + Retry-After (api/rate_limit.py). Reads and job polls
     # are never limited. 0 = off.
     rate_limit_per_minute: int = Field(default=0, ge=0)
+    # Wrong API keys each client may present per minute, whatever RATE_LIMIT_PER_MINUTE
+    # says (off by default, which left key guessing unlimited); past it, 429. 0 = off.
+    failed_key_attempts_per_minute: int = Field(default=30, ge=0)
     # Finished answers kept for repeat questions (api/answer_cache.py); 0 turns the
     # cache off. Invalidated by every ingest, delete and tag change, and expired after
     # the TTL. Questions with conversation history are never cached.
@@ -312,6 +315,10 @@ class AppSettings(BaseSettings):
     # Largest migration bundle POST /admin/migrate/import accepts (every workspace's
     # originals and index snapshot in one file).
     max_migrate_bytes: PositiveInt = 8 * 1024 * 1024 * 1024
+    # Entries each backup inside a migration bundle may hold (one per original and per
+    # kept version): an uploaded backup's cap (200,000) refused a large corpus's bundle.
+    # Reading a zip's directory takes about 500 bytes per entry.
+    max_migrate_members: PositiveInt = 1_000_000
     # POST /documents/archive: a zip of documents, each indexed as its own. At most this
     # many members are looked at; what they expand to in all is held to
     # MAX_IMPORT_BYTES, and each one to MAX_UPLOAD_BYTES. The zip itself may be up to
@@ -326,6 +333,15 @@ class AppSettings(BaseSettings):
     # A Markdown file's front matter ``tags:`` become its document's tags when it is
     # indexed (new or changed) without tags of its own.
     front_matter_tags: bool = False
+    # Index what an Office file hides from its reader: hidden and very hidden XLSX
+    # sheets, DOCX text formatted hidden, hidden PPTX slides. Off: they are left out,
+    # as the HTML parser leaves out hidden elements (a hidden sheet of salaries became
+    # citable text). Applies when a document is next indexed.
+    index_hidden_content: bool = False
+    # At startup, a workspace whose index holds no document while its originals are kept
+    # (a lost Qdrant volume) is reported (NOTIFY_URL, event index_lost); with this on it
+    # is also rebuilt from those originals, as POST /admin/rebuild would.
+    auto_rebuild_lost_index: bool = False
     # POST /documents/from-sitemap: the most pages one sitemap or feed adds.
     sitemap_max_pages: PositiveInt = 100
     # Largest passage, in the dense model's tokens.
@@ -406,6 +422,14 @@ class AppSettings(BaseSettings):
     backup_interval_hours: PositiveFloat = 24
     # Scheduled backups kept per workspace (newest first).
     backup_keep: PositiveInt = 7
+    # Run after each scheduled backup is written and checked, with the backup's path as
+    # its last argument (no shell: e.g. "rclone copy --no-traverse" plus a remote, or
+    # "cp" plus a mounted share's folder) — a copy somewhere other than this disk. Empty =
+    # none. A command that fails or runs past BACKUP_COPY_TIMEOUT_SECONDS fails the
+    # backup (reported like any other failure).
+    backup_copy_command: str = ""
+    # How long BACKUP_COPY_COMMAND may run before the copy (and the backup) fails.
+    backup_copy_timeout_seconds: PositiveInt = 1800
     # Where background imports keep their uploaded zip while they run; with it set, an
     # import a restart cut off runs again at startup. Empty: the system temp directory,
     # and a restart forgets them.

@@ -2085,6 +2085,20 @@
     "title": "LocalDocument",
     "type": "object"
    },
+   "MigrateExportStartedResponse": {
+    "description": "A migration bundle being written in the background: follow it with GET\n/documents/imports/{import_id}, then download it from GET\n/admin/migrate/export/{import_id}.",
+    "properties": {
+     "import_id": {
+      "title": "Import Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "import_id"
+    ],
+    "title": "MigrateExportStartedResponse",
+    "type": "object"
+   },
    "MigrateImportResponse": {
     "description": "POST /admin/migrate/import: the bundle is being unpacked in the background.",
     "properties": {
@@ -2499,6 +2513,29 @@
      "question": {
       "title": "Question",
       "type": "string"
+     },
+     "retrieval_query": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Retrieval Query"
+     },
+     "scope": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Scope"
      },
      "status": {
       "title": "Status",
@@ -2945,7 +2982,8 @@
        "answered",
        "insufficient_context",
        "no_context",
-       "uncited"
+       "uncited",
+       "empty_scope"
       ]
      },
      "cached": {
@@ -2991,6 +3029,17 @@
        }
       ],
       "title": "Rerank Min Score"
+     },
+     "retrieval_query": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Retrieval Query"
      },
      "sources": {
       "items": {
@@ -3849,6 +3898,18 @@
    "SitemapIngestRequest": {
     "description": "Add a site's pages from its sitemap, sitemap index, RSS or Atom feed\n(POST /documents/from-sitemap).",
     "properties": {
+     "folder": {
+      "anyOf": [
+       {
+        "maxLength": 1024,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Folder"
+     },
      "max_pages": {
       "anyOf": [
        {
@@ -4076,7 +4137,8 @@
        "answered",
        "insufficient_context",
        "no_context",
-       "uncited"
+       "uncited",
+       "empty_scope"
       ]
      },
      "cached": {
@@ -4142,6 +4204,17 @@
        }
       ],
       "title": "Rerank Min Score"
+     },
+     "retrieval_query": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Retrieval Query"
      },
      "sources": {
       "items": {
@@ -5479,6 +5552,18 @@
       ],
       "title": "Filename"
      },
+     "folder": {
+      "anyOf": [
+       {
+        "maxLength": 1024,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Folder"
+     },
      "refresh_minutes": {
       "anyOf": [
        {
@@ -5650,6 +5735,175 @@
      "type"
     ],
     "title": "ValidationError",
+    "type": "object"
+   },
+   "VerifyRequest": {
+    "description": "A text to check against the documents, sentence by sentence (no LLM call).",
+    "properties": {
+     "filenames": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        "maxItems": 500,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Filenames"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 128,
+         "type": "string"
+        },
+        "maxItems": 20,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tags"
+     },
+     "text": {
+      "maxLength": 8000,
+      "minLength": 1,
+      "title": "Text",
+      "type": "string"
+     }
+    },
+    "required": [
+     "text"
+    ],
+    "title": "VerifyRequest",
+    "type": "object"
+   },
+   "VerifyResponse": {
+    "properties": {
+     "more": {
+      "default": false,
+      "title": "More",
+      "type": "boolean"
+     },
+     "sentences": {
+      "items": {
+       "$ref": "#/components/schemas/VerifySentenceResponse"
+      },
+      "title": "Sentences",
+      "type": "array"
+     }
+    },
+    "required": [
+     "sentences"
+    ],
+    "title": "VerifyResponse",
+    "type": "object"
+   },
+   "VerifySentenceResponse": {
+    "properties": {
+     "chunk_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chunk Id"
+     },
+     "filename": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Filename"
+     },
+     "missing_numbers": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Missing Numbers",
+      "type": "array"
+     },
+     "page": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page"
+     },
+     "quote": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Quote"
+     },
+     "rerank_score": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Score"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Section"
+     },
+     "sentence": {
+      "title": "Sentence",
+      "type": "string"
+     },
+     "status": {
+      "title": "Status",
+      "type": "string",
+      "x-extensible-enum": [
+       "supported",
+       "numbers_differ",
+       "unsupported",
+       "no_claim"
+      ]
+     }
+    },
+    "required": [
+     "sentence",
+     "status"
+    ],
+    "title": "VerifySentenceResponse",
     "type": "object"
    },
    "WatchFolderStatusResponse": {
@@ -6439,6 +6693,106 @@
      }
     },
     "summary": "Migrate Export"
+   },
+   "post": {
+    "operationId": "migrate_export_in_background_admin_migrate_export_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MigrateExportStartedResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Migrate Export In Background"
+   }
+  },
+  "/admin/migrate/export/{import_id}": {
+   "get": {
+    "operationId": "migrate_export_download_admin_migrate_export__import_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "import_id",
+      "required": true,
+      "schema": {
+       "title": "Import Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No finished background export with that id."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Migrate Export Download"
    }
   },
   "/admin/migrate/import": {
@@ -10457,6 +10811,78 @@
      }
     },
     "summary": "Summarize Documents Stream"
+   }
+  },
+  "/questions/verify": {
+   "post": {
+    "operationId": "verify_questions_verify_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/VerifyRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/VerifyResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Verify"
    }
   },
   "/search": {

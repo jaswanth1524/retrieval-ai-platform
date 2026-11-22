@@ -27,6 +27,59 @@ INSUFFICIENT_CONTEXT_ANSWER = (
     "I do not have enough information in the provided documents to answer that question."
 )
 
+# The canned answer above in the languages ANSWER_LANGUAGE most often names (by its
+# English and its own name): it is written with no LLM call, so a question asked for an
+# answer in German got this one in English. Any other language keeps the English.
+_INSUFFICIENT_CONTEXT_TRANSLATIONS = {
+    "german": "Die bereitgestellten Dokumente enthalten nicht genügend Informationen, "
+    "um diese Frage zu beantworten.",
+    "french": "Les documents fournis ne contiennent pas assez d'informations pour "
+    "répondre à cette question.",
+    "spanish": "Los documentos proporcionados no contienen suficiente información para "
+    "responder a esa pregunta.",
+    "italian": "I documenti forniti non contengono informazioni sufficienti per "
+    "rispondere a questa domanda.",
+    "portuguese": "Os documentos fornecidos não contêm informações suficientes para "
+    "responder a essa pergunta.",
+    "dutch": "De verstrekte documenten bevatten niet genoeg informatie om die vraag te "
+    "beantwoorden.",
+    "polish": "Dostarczone dokumenty nie zawierają wystarczających informacji, aby "
+    "odpowiedzieć na to pytanie.",
+    "swedish": "De tillhandahållna dokumenten innehåller inte tillräckligt med "
+    "information för att besvara den frågan.",
+    "japanese": "提供された文書には、その質問に答えるための十分な情報がありません。",
+    "chinese": "所提供的文档中没有足够的信息来回答这个问题。",
+    "korean": "제공된 문서에는 그 질문에 답할 수 있는 충분한 정보가 없습니다.",
+    "hindi": "दिए गए दस्तावेज़ों में इस प्रश्न का उत्तर देने के लिए पर्याप्त जानकारी नहीं है।",
+}
+_LANGUAGE_NAMES = {
+    "deutsch": "german",
+    "français": "french",
+    "francais": "french",
+    "español": "spanish",
+    "espanol": "spanish",
+    "italiano": "italian",
+    "português": "portuguese",
+    "portugues": "portuguese",
+    "nederlands": "dutch",
+    "polski": "polish",
+    "svenska": "swedish",
+    "日本語": "japanese",
+    "中文": "chinese",
+    "简体中文": "chinese",
+    "한국어": "korean",
+    "हिन्दी": "hindi",
+}
+
+
+def insufficient_context_answer(settings: AppSettings) -> str:
+    """The canned "not in the documents" answer, in ANSWER_LANGUAGE when it names a
+    language this knows (English otherwise, and for "match")."""
+
+    wanted = " ".join(str(settings.answer_language or "").split()).casefold()
+    wanted = _LANGUAGE_NAMES.get(wanted, wanted)
+    return _INSUFFICIENT_CONTEXT_TRANSLATIONS.get(wanted, INSUFFICIENT_CONTEXT_ANSWER)
+
 
 CONDENSE_SYSTEM_PROMPT = (
     "You rewrite a follow-up question into one standalone search query for document "

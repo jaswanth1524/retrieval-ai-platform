@@ -4,11 +4,13 @@ top layer of ``RagPipeline``, over ``api/pipeline_core.py``.
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import replace
 
+from api.answer_cache import CachedAnswer
 from api.answer_events import (
     DoneEvent,
     StageEvent,
@@ -33,6 +35,7 @@ from api.answer_run import (
 from api.citations import (
     answer_status,
 )
+from api.context_expansion import expand_with_neighbors
 from api.continuation import (
     ContinuePlan,
     ContinueRefused,
@@ -43,7 +46,6 @@ from api.continuation import (
 )
 from api.errors import public_error_message
 from api.generation import (
-    INSUFFICIENT_CONTEXT_ANSWER,
     ChatGenerator,
     ChatMessage,
     GenerationError,
@@ -51,6 +53,7 @@ from api.generation import (
     answer_messages,
     finish_answer,
     generate_followups,
+    insufficient_context_answer,
     source_citations,
     will_call_llm_for_citations,
 )
@@ -69,12 +72,12 @@ from api.prompting import (
     FittedPrompt,
     estimate_prompt_tokens,
 )
-from api.repository import PassageFilter
+from api.repository import PassageFilter, VectorRepository
 from api.request_id import current_request_id
 from api.reranking import (
     RerankedChunk,
 )
-from api.run_coordination import QuestionAbandoned, cached_run, wait_for_model
+from api.run_coordination import QuestionAbandoned, cached_run, follow_only, wait_for_model
 from api.settings import AppSettings
 from api.tracing import (
     QueryTrace,
@@ -95,8 +98,12 @@ class StreamingAnswers(PipelineCore):
         tags: Sequence[str] | None = None,
         use_cache: bool = True,
         should_stop: Callable[[], bool] | None = None,
+        cached: CachedAnswer | None = None,
+        follow: threading.Event | None = None,
+        claimed: threading.Event | None = None,
     ) -> Iterator[StreamEvent]:
-        """``_answer_stream_uncached``, replayed from the answer cache on a hit.
+        """``_answer_stream_uncached``, replayed from the answer cache on a hit
+        (``cached``: the hit already looked up, replayed as it is).
 
         ``should_stop`` (the client has gone) is polled between stages, so an
         abandoned question stops before the rerank or the LLM call instead of
@@ -104,19 +111,37 @@ class StreamingAnswers(PipelineCore):
         """
 
         started = time.monotonic()
-        yield from cached_run(
-            self._answer_cache,
-            self._cache_key(question, overrides, filenames, tags, history),
-            use_cache=use_cache,
-            should_stop=should_stop,
-            replay=lambda hit: replay_cached(
+
+        def replay(hit: CachedAnswer) -> Iterator[StreamEvent]:
+            return replay_cached(
                 hit,
                 started,
                 top_rerank_score=hit.top_rerank_score,
                 # In the cache key: the bar it was answered under is today's.
                 rerank_min_score=float(self._settings.rerank_min_score),
                 weak_matches=hit.weak_matches,
-            ),
+            )
+
+        if cached is not None:
+            self._log_hit(cached, question, "stream", filenames, tags, overrides)
+            yield from replay(cached)
+            return
+        key = self._cache_key(question, overrides, filenames, tags, history)
+        if follow is not None and key is not None and self._answer_cache is not None:
+            # Admitted without a slot to wait for the identical run: its answer, or the
+            # error frame of a full server (NoSlotForRun).
+            followed = yield from follow_only(self._answer_cache, key, follow, should_stop)
+            if followed is None:
+                return
+            self._log_hit(followed, question, "stream", filenames, tags, overrides)
+            yield from replay(followed)
+            return
+        yield from cached_run(
+            self._answer_cache,
+            key,
+            use_cache=use_cache,
+            should_stop=should_stop,
+            replay=replay,
             run=lambda: self._answer_stream_uncached(
                 question, overrides, filenames, history, tags, should_stop, use_memo=use_cache
             ),
@@ -124,6 +149,7 @@ class StreamingAnswers(PipelineCore):
             # Nor one whose prompt the provider cut short (its grounding rules gone).
             keep=lambda done: not done.get("truncated") and not done.get("prompt_cut"),
             on_hit=lambda hit: self._log_hit(hit, question, "stream", filenames, tags, overrides),
+            claimed=claimed,
         )
 
     def continuable(
@@ -143,7 +169,10 @@ class StreamingAnswers(PipelineCore):
         if trace.kind != "question":
             # A summary's trace holds no passages to check citations against.
             raise ContinueRefused(409, "Only a question's answer can be continued.")
-        if not trace.truncated or not trace.answer or not trace.prompt_messages:
+        # Cut off at the output limit, or stopped (or broken off) part-way: either way an
+        # answer begun from a prompt the trace kept.
+        cut_short = trace.truncated or trace.status == "error"
+        if not cut_short or not trace.answer or not trace.prompt_messages:
             raise ContinueRefused(409, "That answer wasn't cut off; there is nothing to continue.")
         prompt_sources = sorted(
             (c for c in trace.candidates if c.source_number is not None),
@@ -179,9 +208,10 @@ class StreamingAnswers(PipelineCore):
                     retrieval_score=candidate.retrieval_score,
                     rerank_score=candidate.rerank_score or 0.0,
                     page_end=_int_or_none(found.get("page_end")),
+                    chunk_ordinal=_int_or_none(found.get("chunk_ordinal")),
                 )
             )
-        return ContinuePlan(trace, chunks)
+        return ContinuePlan(trace, _with_neighbour_text(chunks, trace, self._repository, settings))
 
     def continue_stream(
         self,
@@ -215,7 +245,13 @@ class StreamingAnswers(PipelineCore):
             "sources": [_citation_dict(source) for source in all_sources],
             "trace_id": new_trace_id,
         }
-        slot = yield from wait_for_model(settings, should_stop)
+        try:
+            slot = yield from wait_for_model(settings, should_stop)
+        except QuestionAbandoned:
+            return  # the client left while waiting for the model: nothing was generated
+        if should_stop is not None and should_stop():
+            slot.release()
+            return
         try:
             yield {
                 "type": "stage",
@@ -429,6 +465,7 @@ class StreamingAnswers(PipelineCore):
         timings = self._phase_timings(phase, total_start=run.started, condense_ms=condense_ms)
         # The condense and query-expansion calls were still made.
         usage = usage_totals()
+        status = self._scoped_status("no_context", run, settings)
         self._store_finished_trace(
             run,
             settings,
@@ -436,20 +473,20 @@ class StreamingAnswers(PipelineCore):
             status="insufficient_context",
             selected=[],
             prompt_messages=None,
-            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            answer=insufficient_context_answer(settings),
             cited_source_numbers=[],
             timings=timings,
             usage=usage,
-            answer_status="no_context",
+            answer_status=status,
         )
         run.finalized = True
         yield {
             "type": "done",
-            "answer": INSUFFICIENT_CONTEXT_ANSWER,
+            "answer": insufficient_context_answer(settings),
             "sources": [],
             "timings": timings_dict(timings),
             "trace_id": run.trace_id,
-            "answer_status": "no_context",
+            "answer_status": status,
             "top_rerank_score": _top_rerank_score(phase),
             "rerank_min_score": float(settings.rerank_min_score),
             "passages_left_out": _picked_left_out(run.narrow, []),
@@ -482,6 +519,7 @@ class StreamingAnswers(PipelineCore):
             settings,
             weak_matches=phase.below_min_score,
         )
+        run.prompt_messages = list(messages)
         if should_stop is not None and should_stop():
             return None
         generator = self._answer_generator(run, settings)
@@ -672,3 +710,30 @@ class StreamingAnswers(PipelineCore):
             )
             if followups:
                 yield {"type": "followups", "questions": followups}
+
+
+def _with_neighbour_text(
+    chunks: list[RerankedChunk],
+    trace: QueryTrace,
+    repository: VectorRepository,
+    settings: AppSettings,
+) -> list[RerankedChunk]:
+    """The passages with the neighbour text the first answer's prompt gave them: the
+    citation, number and backfill checks over the continued answer read it, so a number
+    the model took from a neighbour isn't flagged as unsupported. Only passages the
+    trace marks ``neighbor_expanded`` get it back."""
+
+    expanded_ids = {c.point_id for c in trace.candidates if c.neighbor_expanded}
+    if not expanded_ids:
+        return chunks
+    try:
+        widened = expand_with_neighbors(chunks, repository, settings)
+    except Exception:  # noqa: BLE001 - the checks then read the passage alone
+        return chunks
+    by_id = {chunk.point_id: chunk for chunk in widened}
+    return [
+        replace(chunk, expanded_text=by_id[chunk.point_id].expanded_text)
+        if chunk.point_id in expanded_ids and chunk.point_id in by_id
+        else chunk
+        for chunk in chunks
+    ]

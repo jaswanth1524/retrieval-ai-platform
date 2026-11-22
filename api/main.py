@@ -52,6 +52,7 @@ from api.embeddings import EmbeddedText
 from api.error_handlers import register_exception_handlers
 from api.imports import leftover, spool_directory
 from api.imports import shutdown as shutdown_background_imports
+from api.imports import start as start_import
 from api.ingest_jobs import (
     JOB_CANCELLED_ERROR,
     IngestQueue,
@@ -606,6 +607,79 @@ def resume_imports(settings: AppSettings) -> list[str]:
     return started
 
 
+def check_for_lost_index(settings: AppSettings) -> list[str]:
+    """``find_lost_indexes``, never raising: it runs on its own thread at startup."""
+
+    try:
+        return find_lost_indexes(settings)
+    except Exception:  # noqa: BLE001 - advice only; readiness reports what is down
+        logger.warning("Could not check the indexes against their originals.", exc_info=True)
+        return []
+
+
+def find_lost_indexes(settings: AppSettings) -> list[str]:
+    """At startup: each workspace whose index holds no document while its originals are
+    kept (a wiped Qdrant volume, a collection rebuilt by hand) is reported
+    (``index_lost``), and with AUTO_REBUILD_LOST_INDEX rebuilt from those originals in
+    the background. The workspaces found. Only the listing and the originals store are
+    read: the embedding model and an indexing queue are built for a rebuild alone."""
+
+    from api.rebuild import originals_to_rebuild, rebuild
+
+    client = get_qdrant_client()
+    repository = VectorRepository(client)
+    candidates = [settings]
+    if settings.workspaces_enabled:
+        candidates += [
+            settings_for(settings, name)
+            for name in list_workspaces(client, settings.qdrant_collection)
+        ]
+    lost: list[str] = []
+    for workspace_settings in candidates:
+        label = workspace_of(workspace_settings) or "default"
+        try:
+            store = raw_store_for(workspace_settings)
+            if store is None or not store.stored_names():
+                continue
+            if repository.filename_metadata(workspace_settings):
+                continue
+            names = originals_to_rebuild(repository, workspace_settings, store)
+        except Exception:  # noqa: BLE001 - one workspace's check; the rest go on
+            logger.warning("Could not check workspace %r for a lost index.", label, exc_info=True)
+            continue
+        if not names:
+            continue
+        lost.append(label)
+        logger.warning(
+            "Workspace %r has %d stored originals and no indexed document: its index looks lost.",
+            label,
+            len(names),
+        )
+        if settings.auto_rebuild_lost_index:
+            target = workspace_target(workspace_settings, repository, get_token_counter())
+            queue = target.queue
+            assert queue is not None
+            repository.ensure_writable(workspace_settings)
+            start_import(
+                "rebuild",
+                f"{len(names)} originals",
+                workspace_of(workspace_settings),
+                str(workspace_settings.qdrant_collection),
+                lambda status, w=workspace_settings, n=names, q=queue, r=store: rebuild(  # type: ignore[misc]
+                    n, repository, w, r, q, status
+                ),
+            )
+            action = "it is being rebuilt from them now (AUTO_REBUILD_LOST_INDEX)"
+        else:
+            action = "rebuild it with `docrag rebuild` or POST /admin/rebuild"
+        notify(
+            "index_lost",
+            f"Workspace '{label}' has {len(names)} stored originals and no indexed "
+            f"document: its index looks lost; {action}.",
+        )
+    return lost
+
+
 def notify_config_warnings(settings: AppSettings) -> None:
     """Tell the operator (NOTIFY_URL) what the settings check warns about at startup."""
 
@@ -677,6 +751,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.notify_url.strip():
             threading.Thread(
                 target=notify_config_warnings, args=(settings,), name="docrag-doctor", daemon=True
+            ).start()
+        if settings.raw_document_dir:
+            threading.Thread(
+                target=check_for_lost_index, args=(settings,), name="docrag-lost", daemon=True
             ).start()
         backup = start_scheduled_backup(settings) if settings.backup_dir else None
         # For GET /health/ready's last_backup.

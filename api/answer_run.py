@@ -199,7 +199,11 @@ def trace_status(status: str) -> TraceStatus:
     """A finished answer's trace status: a model that said the sources don't answer it
     is "insufficient_context" too, not "ok" (the query log counts those as uncovered)."""
 
-    return "insufficient_context" if status in ("no_context", "insufficient_context") else "ok"
+    return (
+        "insufficient_context"
+        if status in ("no_context", "insufficient_context", "empty_scope")
+        else "ok"
+    )
 
 
 def _top_rerank_score(phase: RetrievalPhase) -> float | None:
@@ -389,6 +393,9 @@ class AnswerRun:
     condense_note: str | None = None
     # The answer streamed so far (kept on the trace of a stream that broke off).
     parts: list[str] = field(default_factory=list)
+    # The answer's prompt once generation starts: kept on the trace of a stream that
+    # broke off, so a stopped answer can be continued from where it stopped.
+    prompt_messages: list[ChatMessage] | None = None
     # The stream's model slot, held from generation through follow-ups.
     slot: GenerationSlot | None = None
     # What retrieval found and what of it fit the prompt (kept on an error or

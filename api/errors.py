@@ -16,6 +16,7 @@ from api.generation import GenerationConfigError, GenerationError
 from api.qdrant_schema import CollectionSchemaError, VectorStoreUnavailableError
 from api.reranking import RerankingError
 from api.retrieval import RetrievalConfigError, RetrievalError, RetrievalPayloadError
+from api.run_coordination import NoSlotForRun
 
 # Ordered most-specific-first: several of these are subclasses of one another
 # (RetrievalPayloadError/RetrievalConfigError < RetrievalError,
@@ -30,6 +31,8 @@ QUESTION_ERROR_TYPES: tuple[tuple[type[Exception], str], ...] = (
     (EmbeddingError, "embedding"),
     (VectorStoreUnavailableError, "vector_store_unavailable"),
     (CollectionSchemaError, "collection_schema"),
+    # Its message is authored ("try again"), so safe to send as is.
+    (NoSlotForRun, "busy"),
 )
 
 # Derived from QUESTION_ERROR_TYPES above, which has two jobs: it orders the metric

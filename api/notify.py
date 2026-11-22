@@ -36,6 +36,12 @@ EVENTS = (
     "reindex_failed",
     "url_refresh_failed",
     "config_warning",
+    # A background import (zip, restore, rebuild, migrate) that ended: failed, or done
+    # with documents it couldn't queue.
+    "import_failed",
+    "import_finished",
+    # The index is empty while originals are kept (a wiped Qdrant volume).
+    "index_lost",
 )
 TEST_EVENT = "test"
 _TIMEOUT_SECONDS = 10.0

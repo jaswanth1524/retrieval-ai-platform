@@ -70,10 +70,10 @@ from api.pipeline import (
 )
 from api.prompting import (
     CHARS_PER_TOKEN_ESTIMATE,
-    INSUFFICIENT_CONTEXT_ANSWER,
     clip_to_weight,
     context_window_tokens,
     format_context_chunk,
+    insufficient_context_answer,
     one_line,
     weighted_length,
     with_answer_language,
@@ -1068,14 +1068,14 @@ class DocumentSummarizer:
         self._store_trace(
             run,
             "insufficient_context",
-            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            answer=insufficient_context_answer(run.settings),
             timings=timings,
             status_of_answer="no_context",
         )
         yield {"type": "sources", "sources": [], "trace_id": run.trace_id}
         yield {
             "type": "done",
-            "answer": INSUFFICIENT_CONTEXT_ANSWER,
+            "answer": insufficient_context_answer(run.settings),
             "sources": [],
             "timings": timings_dict(timings),
             "trace_id": run.trace_id,

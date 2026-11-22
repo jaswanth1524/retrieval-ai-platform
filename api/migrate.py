@@ -224,6 +224,7 @@ def store_originals(
     max_bytes: int,
     feedback_store: FeedbackStore | None,
     workspace: str,
+    max_members: int | None = None,
 ) -> int:
     """Put a backup's originals and versions straight into ``raw_store`` (when
     originals are kept here) and its ratings into ``feedback_store``, indexing nothing:
@@ -255,7 +256,9 @@ def store_originals(
             feedback_store=feedback_store,
             workspace=workspace,
             keep_version=raw_store.add_version if raw_store is not None else None,
-            stored=True,
+            # Inside an uploaded bundle: the upload caps apply (MAX_MIGRATE_MEMBERS).
+            stored=False,
+            max_members=max_members,
         )
     if raw_store is not None:
         # Their details (tags, sources) are in the recovered index: written beside the
