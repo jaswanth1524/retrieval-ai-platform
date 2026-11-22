@@ -563,8 +563,11 @@ def cmd_sync(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int
                 continue  # it had no other tags to put back
         else:
             desired = [*before, tag]
+        # At most 20 tags: the sync tag is kept first, or a document with many tags
+        # lost it and stopped being this folder's (never deleted, changes skipped).
+        desired = [tag, *(t for t in desired if t != tag)][:20]
         try:
-            client.set_tags(name, desired[:20])
+            client.set_tags(name, desired)
         except DocragError as exc:
             print(f"fail  tags of {name}: {exc}", file=out)
             code = 1
@@ -620,6 +623,7 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
             refresh_minutes=args.refresh_minutes,
             max_pages=args.max_pages,
             same_host=not args.any_host,
+            folder=args.folder,
         )
         import_id = added.get("import_id")
         if args.wait and import_id:
@@ -654,6 +658,7 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
         tags=args.tag or (),
         refresh_minutes=args.refresh_minutes,
         replace=args.replace,
+        folder=args.folder,
     )
     status = client.wait_for_jobs([job["job_id"]], timeout=_wait_limit(args))[job["job_id"]]
     succeeded = status.get("state") == "done"

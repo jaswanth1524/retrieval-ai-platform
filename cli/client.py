@@ -365,6 +365,19 @@ class DocragClient:
         ]
         return results
 
+    def verify(
+        self, text: str, filenames: list[str] | None = None, tags: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Each sentence of ``text`` checked against the documents (no LLM)."""
+
+        body: dict[str, Any] = {"text": text}
+        if filenames:
+            body["filenames"] = filenames
+        if tags:
+            body["tags"] = tags
+        result: dict[str, Any] = self._json("POST", "/questions/verify", json=body)
+        return result
+
     def search_response(
         self,
         query: str,
@@ -578,16 +591,27 @@ class DocragClient:
     def upload_text(self, name: str, text: str, *, tags: Sequence[str] = ()) -> dict[str, Any]:
         """Index ``text`` as a document named ``name`` (a note), as an upload would."""
 
-        response = self._http.post(
-            "/documents",
-            files={"file": (name.rsplit("/", 1)[-1], text.encode("utf-8"), "text/markdown")},
-            data={**({"tags": list(tags)} if tags else {}), "name": name},
-            headers=self._headers,
-        )
-        if response.status_code >= 400:
-            raise DocragError(_detail(response), response.status_code)
-        result: dict[str, Any] = _response_json(response)
-        return result
+        for attempt in range(UPLOAD_MAX_ATTEMPTS):
+            try:
+                response = self._http.post(
+                    "/documents",
+                    files={
+                        "file": (name.rsplit("/", 1)[-1], text.encode("utf-8"), "text/markdown")
+                    },
+                    data={**({"tags": list(tags)} if tags else {}), "name": name},
+                    headers=self._headers,
+                )
+            except httpx.HTTPError as exc:
+                raise self._unreachable(exc) from exc
+            # A full indexing queue (503) or a rate limit (429): waited out, as upload().
+            if response.status_code in (429, 503) and attempt + 1 < UPLOAD_MAX_ATTEMPTS:
+                self._sleep(_retry_after(response))
+                continue
+            if response.status_code >= 400:
+                raise DocragError(_detail(response), response.status_code)
+            result: dict[str, Any] = _response_json(response)
+            return result
+        raise DocragError("The indexing queue stayed full.")  # pragma: no cover
 
     def add_sitemap(
         self,
@@ -597,6 +621,7 @@ class DocragClient:
         refresh_minutes: int | None = None,
         max_pages: int | None = None,
         same_host: bool = True,
+        folder: str | None = None,
     ) -> dict[str, Any]:
         """Have the server add the pages a sitemap or feed lists (fetched and queued in
         the background; the pages it is adding are returned)."""
@@ -608,6 +633,8 @@ class DocragClient:
             body["refresh_minutes"] = refresh_minutes
         if max_pages is not None:
             body["max_pages"] = max_pages
+        if folder:
+            body["folder"] = folder
         result: dict[str, Any] = self._json(
             "POST", "/documents/from-sitemap", json=body, attempts=BUSY_MAX_ATTEMPTS
         )
@@ -685,6 +712,7 @@ class DocragClient:
         tags: Sequence[str] = (),
         refresh_minutes: int | None = None,
         replace: bool = False,
+        folder: str | None = None,
     ) -> dict[str, Any]:
         """Have the server fetch and index ``url`` (URL_INGEST_ENABLED), with ``tags``,
         and checked again every ``refresh_minutes`` (0 = never; None = the server's).
@@ -700,6 +728,8 @@ class DocragClient:
             body["tags"] = list(tags)
         if refresh_minutes is not None:
             body["refresh_minutes"] = refresh_minutes
+        if folder:
+            body["folder"] = folder
         result: dict[str, Any] = self._json(
             "POST", "/documents/from-url", json=body, attempts=BUSY_MAX_ATTEMPTS
         )
@@ -1173,6 +1203,19 @@ class DocragClient:
 
         return self.download("/admin/migrate/export", destination)
 
+    def migrate_pack_in_background(self, destination: Path, timeout: float | None = None) -> int:
+        """``POST /admin/migrate/export``, followed until the bundle is written, then
+        downloaded into ``destination``; the bytes written. For a server whose pack
+        outlasts a proxy's request timeout."""
+
+        started: dict[str, Any] = self._json("POST", "/admin/migrate/export")
+        import_id = str(started["import_id"])
+        status = self.wait_for_import(import_id, timeout=timeout)
+        if status.get("state") != "done":
+            problems = "; ".join(status.get("problems") or []) or str(status.get("state"))
+            raise DocragError(f"The server didn't finish the bundle: {problems}")
+        return self.download(f"/admin/migrate/export/{_quote(import_id)}", destination)
+
     def migrate_unpack(self, bundle: Path) -> dict[str, Any]:
         """``POST /admin/migrate/import``: the server unpacks it in the background."""
 
@@ -1266,8 +1309,12 @@ STATUS_MESSAGES = {
     ),
     "no_context": "nothing in the searched documents matched this question",
     "uncited": "answered without citing its sources — check it against the documents",
+    "empty_scope": (
+        "none of the documents or tags it was limited to are indexed — check the "
+        "--file/--tag names (`docrag list`)"
+    ),
 }
-REFUSED_STATUSES = frozenset({"insufficient_context", "no_context"})
+REFUSED_STATUSES = frozenset({"insufficient_context", "no_context", "empty_scope"})
 
 
 def grounding_notes(done: dict[str, Any]) -> list[str]:
@@ -1286,4 +1333,8 @@ def grounding_notes(done: dict[str, Any]) -> list[str]:
         )
     if done.get("truncated"):
         notes.append("the answer was cut off at the model's output limit")
+    searched = done.get("retrieval_query")
+    if isinstance(searched, str) and searched.strip():
+        # A follow-up is searched as its rewrite: what was looked for, to check.
+        notes.append(f"searched as: {' '.join(searched.split())[:300]}")
     return notes

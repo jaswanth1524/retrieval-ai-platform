@@ -548,7 +548,11 @@ def cmd_migrate(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
 
     target = Path(args.file)
     if args.action == "pack":
-        written = client.migrate_pack(target)
+        written = (
+            client.migrate_pack_in_background(target, timeout=_wait_limit(args))
+            if args.background
+            else client.migrate_pack(target)
+        )
         if args.json:
             print(json.dumps({"output": str(target), "bytes": written}), file=out)
         else:

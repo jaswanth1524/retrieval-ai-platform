@@ -41,6 +41,8 @@ from cli.client import (
     upload_bound,
 )
 
+# Documents list_documents shows per call (a large corpus overflowed an agent's context).
+LIST_PAGE = 100
 # A passage shown to the model is cut here: a search returns up to a dozen of them.
 _PASSAGE_CHARS = 1200
 # read_document returns whole passages up to this much text in all (a page of 100 long
@@ -54,6 +56,8 @@ _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 # The --allow-writes tools: they add to the corpus and never delete a document, but a
 # re-index rewrites one's passages, and add_url can replace one (only with replace=true).
 _WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+# add_note: writes only, but with replace=true it replaces a document of that name.
+_REPLACES = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
 _FETCHES = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
 INSTRUCTIONS = (
@@ -268,23 +272,67 @@ def _add_read_tools(server: MCPServer, call: ToolCall) -> None:
     """The tools that only read: registered on every server, before any write tool."""
 
     @server.tool(annotations=_READ_ONLY)
-    async def list_documents(workspace: str | None = None) -> str:
-        """List the indexed documents with their passage counts and tags. workspace
-        picks another collection (list_workspaces names them)."""
+    async def list_documents(
+        workspace: str | None = None,
+        prefix: str | None = None,
+        tag: str | None = None,
+        limit: int = LIST_PAGE,
+        cursor: str | None = None,
+    ) -> str:
+        """List the indexed documents with their passage counts and tags, a page at a
+        time (limit, at most 500). prefix keeps names starting with it (a folder:
+        "reports/"); tag keeps documents with that tag. When there are more, the last
+        line gives the cursor for the next page. workspace picks another collection
+        (list_workspaces names them)."""
 
         def work(client: DocragClient, should_stop: Callable[[], bool]) -> str:
-            listing = client.documents()
+            params: dict[str, Any] = {"limit": max(1, min(int(limit), 500))}
+            if prefix:
+                params["prefix"] = prefix
+            if tag:
+                params["tag"] = tag
+            if cursor:
+                params["cursor"] = cursor
+            listing = client.documents(**params)
             names = listing.get("filenames", [])
             if not names:
-                return "No documents are indexed."
+                return "No document matches." if prefix or tag else "No documents are indexed."
             counts, tags = listing.get("chunk_counts", {}), listing.get("tags", {})
-            return "\n".join(
+            lines = [
                 f"{name} ({counts.get(name, '?')} passages)"
                 + (f" tags: {', '.join(tags[name])}" if tags.get(name) else "")
                 for name in names
-            )
+            ]
+            total, following = listing.get("total"), listing.get("next_cursor")
+            if following:
+                lines.append(
+                    f"(showing {len(names)} of {total if total is not None else 'more'}; "
+                    f'pass cursor="{following}" for the next page)'
+                )
+            return "\n".join(lines)
 
         return await call(work, workspace)
+
+    @server.tool(annotations=_READ_ONLY)
+    async def verify_text(
+        text: str,
+        filenames: list[str] | None = None,
+        tags: list[str] | None = None,
+        workspace: str | None = None,
+    ) -> str:
+        """Check a text (a draft, an answer from elsewhere) against the indexed
+        documents, sentence by sentence, with no LLM: for each, the passage words that
+        support it, "num" when a passage says it with other numbers, "??" when none
+        does. filenames/tags limit where to look."""
+
+        from cli.question_commands import format_checks
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            lines = format_checks(client.verify(text, filenames, tags))
+            return UNTRUSTED_NOTE + "\n" + "\n".join(lines) if lines else "Nothing to check."
+
+        result: str = await call(work, workspace)
+        return result
 
     @server.tool(annotations=_READ_ONLY)
     async def search_passages(
@@ -556,13 +604,18 @@ def _add_write_tools(server: MCPServer, call: Call) -> None:
         result: str = await call(work, workspace)
         return result
 
-    @server.tool(annotations=_WRITES)
+    @server.tool(annotations=_REPLACES)
     async def add_note(
-        name: str, text: str, tags: list[str] | None = None, workspace: str | None = None
+        name: str,
+        text: str,
+        tags: list[str] | None = None,
+        workspace: str | None = None,
+        replace: bool = False,
     ) -> str:
         """Index a note you write (Markdown) as a document, e.g. a summary worth finding
         again. name is its document name ("notes/meeting-2024-05.md"; .md is added when
-        it has no extension); an existing document of that name is replaced."""
+        it has no extension). A document already indexed under that name is kept unless
+        replace is true (then the note replaces it)."""
 
         def work(client: DocragClient, _: Callable[[], bool]) -> str:
             stored = name.strip()
@@ -570,6 +623,11 @@ def _add_write_tools(server: MCPServer, call: Call) -> None:
                 stored += ".md"
             if not text.strip():
                 return "The note is empty; nothing was indexed."
+            if not replace and stored in client.documents(prefix=stored).get("filenames", []):
+                return (
+                    f"'{stored}' is already indexed; nothing was changed. Pass replace=true "
+                    "to replace it with this note, or choose another name."
+                )
             return accepted(client.upload_text(stored, text, tags=tags or ()))
 
         result: str = await call(work, workspace)
