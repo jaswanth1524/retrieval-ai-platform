@@ -37,7 +37,12 @@ def test_a_zip64_locator_pointing_at_junk_does_not_hide_the_record_zipfile_reads
     # The locator's offset points at the first local header, not at the record.
     locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
     crafted = plain[:at] + record + locator + plain[at:]
-    zipfile.ZipFile(io.BytesIO(crafted))  # zipfile accepts it (and believes the record)
+    # Python 3.12 up to its later patch releases accepts it and believes the record
+    # (3.12.5 does); newer ones refuse it as corrupt. The guard must catch it either way.
+    try:
+        zipfile.ZipFile(io.BytesIO(crafted))
+    except zipfile.BadZipFile:
+        pass
     entries, _ = central_directory(io.BytesIO(crafted)) or (0, 0)
     assert entries == claimed
     assert too_many_entries(io.BytesIO(crafted), 1000)
