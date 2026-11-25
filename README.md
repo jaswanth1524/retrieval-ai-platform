@@ -760,25 +760,51 @@ bigger than the room left is refused with a 507 before it is read), so for a lar
 bundle set `TMPDIR` and `IMPORT_SPOOL_DIR` to folders under `/app/data`, or raise
 `API_TMP_SIZE` and `API_MEM_LIMIT` together.
 
-**A lost index:** at startup a workspace whose index holds no document while its
-originals are kept (a wiped Qdrant volume) is logged and reported (`NOTIFY_URL`, event
-`index_lost`); `AUTO_REBUILD_LOST_INDEX=true` also rebuilds it from them. Scheduled
-backups include originals with no indexed document, a backup holding far fewer documents
-than the one before is reported as failed, and the newest backup that held documents is
-never pruned. `BACKUP_COPY_COMMAND` runs on each new backup (its path as the last
-argument) to copy it off the disk.
+**A lost index:** at startup, and every 15 minutes after, a workspace whose index holds
+no document while its originals are kept (a wiped Qdrant volume) is logged and reported
+once (`NOTIFY_URL`, event `index_lost`); `AUTO_REBUILD_LOST_INDEX=true` also rebuilds it
+from them. Scheduled backups include originals with no indexed document, a backup
+holding far fewer documents than the one before is reported as failed, and the newest
+backup that held documents is never pruned. `BACKUP_COPY_COMMAND` runs on each new
+backup (its path as the last argument) to copy it off the disk, and a failed copy is
+tried again on later passes. The Docker image has no `curl` or `rclone`: mount a script
+(or use `cp` to a mounted folder) for the copy.
+
+**Rehearsing a restore:** `docrag backup drill NAME` reads, parses and chunks a sample of
+a stored backup's originals (`--sample 0`: all) without indexing anything — proof the
+backup still makes documents with this server. `docrag backup restore NAME --only
+FILE` restores just the documents named.
 
 **Moving a large server:** `docrag migrate pack server.zip --background` has the server
 write the bundle in the background and downloads it when done (for a pack that outlasts
-a proxy's request timeout).
+a proxy's request timeout), resuming a cut download and checking it against the
+server's SHA-256.
 
 **Checking a text against the documents:** `docrag verify draft.txt` (or `POST
 /questions/verify`, MCP `verify_text`) looks up each sentence with no LLM and says
 which passage supports it, which states other numbers, and which nothing supports.
+Every answer gets the same check against the passages it cites (`ANSWER_SELF_CHECK`):
+the UI lists the sentences they don't back. A saved answer can be checked again later
+(**Recheck** in Saved answers, `POST /questions/recheck`): which of its passages changed
+or went, and whether each sentence still holds.
 
-**Hidden Office content** (hidden XLSX sheets, DOCX hidden text, hidden PPTX slides) is
-left out of the index; `INDEX_HIDDEN_CONTENT=true` keeps it. A document indexed before
-this keeps its hidden text until it is re-indexed (`docrag reindex NAME`).
+**Questions about several things at once** ("summarize the leave, expense and IT
+policies"): with `QUERY_DECOMPOSITION_ENABLED=true` one LLM call splits such a question
+into parts, each searched on its own, so no topic is left out because the others
+outscored it. It costs one more model call (about 5 s on a local model) for questions
+that look compound; others are untouched.
+
+**A checklist of questions:** `docrag ask --questions checklist.txt --file contract.pdf`
+answers each line in turn (`POST /questions/batch`).
+
+**Calibrating the relevance bar per workspace:** `docrag traces report` suggests a
+`RERANK_MIN_SCORE` from the workspace's own traced questions; `--apply` makes it that
+workspace's setting (`POST /admin/calibrate`).
+
+**Hidden Office content** (hidden XLSX sheets, rows and columns, DOCX hidden text, hidden
+PPTX slides, and their OpenDocument counterparts) is left out of the index, and the parse
+says how much; `INDEX_HIDDEN_CONTENT=true` keeps it. A document indexed before this keeps
+its hidden text until it is re-indexed (`docrag reindex NAME`).
 
 **Background imports that survive a restart:** with `IMPORT_SPOOL_DIR` set (e.g.
 `./data/imports`), a zip or backup imported in the background keeps its file there, and
