@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
@@ -593,6 +593,8 @@ def resume_imports(settings: AppSettings) -> list[str]:
                         source=str(stored) if stored else None,
                         resumable=True,
                         resumed=True,
+                        # A restore of chosen documents resumes as one.
+                        only=_only(record.get("only")),
                     ).import_id
                     or ""
                 )
@@ -607,23 +609,49 @@ def resume_imports(settings: AppSettings) -> list[str]:
     return started
 
 
-def check_for_lost_index(settings: AppSettings) -> list[str]:
-    """``find_lost_indexes``, never raising: it runs on its own thread at startup."""
+def _only(value: object) -> frozenset[str] | None:
+    """A resumed restore's chosen documents (its record's ``only``), if any."""
+
+    return frozenset(str(n) for n in value) if isinstance(value, list) and value else None
+
+
+def check_for_lost_index(settings: AppSettings, reported: set[str] | None = None) -> list[str]:
+    """``find_lost_indexes``, never raising: it runs on its own thread."""
 
     try:
-        return find_lost_indexes(settings)
+        return find_lost_indexes(settings, reported)
     except Exception:  # noqa: BLE001 - advice only; readiness reports what is down
         logger.warning("Could not check the indexes against their originals.", exc_info=True)
         return []
 
 
-def find_lost_indexes(settings: AppSettings) -> list[str]:
-    """At startup: each workspace whose index holds no document while its originals are
-    kept (a wiped Qdrant volume, a collection rebuilt by hand) is reported
-    (``index_lost``), and with AUTO_REBUILD_LOST_INDEX rebuilt from those originals in
-    the background. The workspaces found. Only the listing and the originals store are
-    read: the embedding model and an indexing queue are built for a rebuild alone."""
+# How often the lost-index check runs again after startup: an index wiped while the
+# server runs (or a Qdrant not up yet at boot) used to go unnoticed until a restart.
+LOST_INDEX_CHECK_SECONDS = 15 * 60
 
+
+def watch_for_lost_index(settings: AppSettings, stop: threading.Event) -> None:
+    """``check_for_lost_index`` at startup, then every LOST_INDEX_CHECK_SECONDS until
+    ``stop``; each loss is reported (and rebuilt) once, until the index is back."""
+
+    reported: set[str] = set()
+    check_for_lost_index(settings, reported)
+    while not stop.wait(LOST_INDEX_CHECK_SECONDS):
+        check_for_lost_index(settings, reported)
+
+
+def find_lost_indexes(settings: AppSettings, reported: set[str] | None = None) -> list[str]:
+    """Each workspace whose index holds no document while its originals are kept (a
+    wiped Qdrant volume, a collection rebuilt by hand) is reported (``index_lost``),
+    and with AUTO_REBUILD_LOST_INDEX rebuilt from those originals in the background.
+    The workspaces found. Only the listing and the originals store are read: the
+    embedding model and an indexing queue are built for a rebuild alone.
+
+    ``reported`` (the periodic check's memory): a workspace already reported isn't
+    reported or rebuilt again until its index is seen holding documents; one with an
+    import (a rebuild, a restore) still running is left to it."""
+
+    from api.imports import importing_into
     from api.rebuild import originals_to_rebuild, rebuild
 
     client = get_qdrant_client()
@@ -637,47 +665,83 @@ def find_lost_indexes(settings: AppSettings) -> list[str]:
     lost: list[str] = []
     for workspace_settings in candidates:
         label = workspace_of(workspace_settings) or "default"
+        # The whole check and any rebuild per workspace: one's error (a store that
+        # can't be read, a collection that can't be written) leaves the rest checked.
         try:
-            store = raw_store_for(workspace_settings)
-            if store is None or not store.stored_names():
-                continue
-            if repository.filename_metadata(workspace_settings):
-                continue
-            names = originals_to_rebuild(repository, workspace_settings, store)
+            found = _lost_index(
+                workspace_settings,
+                repository,
+                label,
+                reported,
+                importing_into,
+                originals_to_rebuild,
+                rebuild,
+            )
         except Exception:  # noqa: BLE001 - one workspace's check; the rest go on
             logger.warning("Could not check workspace %r for a lost index.", label, exc_info=True)
             continue
-        if not names:
-            continue
-        lost.append(label)
-        logger.warning(
-            "Workspace %r has %d stored originals and no indexed document: its index looks lost.",
-            label,
-            len(names),
-        )
-        if settings.auto_rebuild_lost_index:
-            target = workspace_target(workspace_settings, repository, get_token_counter())
-            queue = target.queue
-            assert queue is not None
-            repository.ensure_writable(workspace_settings)
-            start_import(
-                "rebuild",
-                f"{len(names)} originals",
-                workspace_of(workspace_settings),
-                str(workspace_settings.qdrant_collection),
-                lambda status, w=workspace_settings, n=names, q=queue, r=store: rebuild(  # type: ignore[misc]
-                    n, repository, w, r, q, status
-                ),
-            )
-            action = "it is being rebuilt from them now (AUTO_REBUILD_LOST_INDEX)"
-        else:
-            action = "rebuild it with `docrag rebuild` or POST /admin/rebuild"
-        notify(
-            "index_lost",
-            f"Workspace '{label}' has {len(names)} stored originals and no indexed "
-            f"document: its index looks lost; {action}.",
-        )
+        if found:
+            lost.append(label)
     return lost
+
+
+def _lost_index(
+    workspace_settings: AppSettings,
+    repository: VectorRepository,
+    label: str,
+    reported: set[str] | None,
+    importing_into: Any,
+    originals_to_rebuild: Any,
+    rebuild: Any,
+) -> bool:
+    store = raw_store_for(workspace_settings)
+    if store is None or not store.stored_names():
+        return False
+    if repository.filename_metadata(workspace_settings):
+        if reported is not None:
+            reported.discard(label)
+        return False
+    if importing_into(str(workspace_settings.qdrant_collection)):
+        return False  # a rebuild or restore is filling it
+    names = originals_to_rebuild(repository, workspace_settings, store)
+    if not names:
+        return False
+    if reported is not None:
+        if label in reported:
+            return True
+        reported.add(label)
+    logger.warning(
+        "Workspace %r has %d stored originals and no indexed document: its index looks lost.",
+        label,
+        len(names),
+    )
+    rebuilding = bool(workspace_settings.auto_rebuild_lost_index)
+    action = (
+        "it is being rebuilt from them now (AUTO_REBUILD_LOST_INDEX)"
+        if rebuilding
+        else "rebuild it with `docrag rebuild` or POST /admin/rebuild"
+    )
+    # Told first: a rebuild that fails to start must not keep the loss quiet.
+    notify(
+        "index_lost",
+        f"Workspace '{label}' has {len(names)} stored originals and no indexed "
+        f"document: its index looks lost; {action}.",
+    )
+    if rebuilding:
+        target = workspace_target(workspace_settings, repository, get_token_counter())
+        queue = target.queue
+        assert queue is not None
+        repository.ensure_writable(workspace_settings)
+        start_import(
+            "rebuild",
+            f"{len(names)} originals",
+            workspace_of(workspace_settings),
+            str(workspace_settings.qdrant_collection),
+            lambda status, w=workspace_settings, n=names, q=queue, r=store: rebuild(  # type: ignore[misc]
+                n, repository, w, r, q, status
+            ),
+        )
+    return True
 
 
 def notify_config_warnings(settings: AppSettings) -> None:
@@ -720,6 +784,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # For /health/ready: a model that never loaded makes the app "degraded".
         app.state.model_health = health
     watchers: list[FolderWatcher] = []
+    lost_index_stop = threading.Event()
     reindexer = None
     refresher = None
     backup = None
@@ -754,13 +819,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ).start()
         if settings.raw_document_dir:
             threading.Thread(
-                target=check_for_lost_index, args=(settings,), name="docrag-lost", daemon=True
+                target=watch_for_lost_index,
+                args=(settings, lost_index_stop),
+                name="docrag-lost",
+                daemon=True,
             ).start()
         backup = start_scheduled_backup(settings) if settings.backup_dir else None
         # For GET /health/ready's last_backup.
         app.state.backup = backup
         yield
     finally:
+        lost_index_stop.set()
         if backup is not None:
             backup.stop()
             backup_enabled.set(0)

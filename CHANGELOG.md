@@ -134,6 +134,128 @@ left out; see `INDEX_HIDDEN_CONTENT`); nothing else changes stored data.
   other's history in IndexedDB; Undo of a delete brings back the unsent draft; a stopped
   Regenerate leaves no second copy of its question.
 
+Pass 21: fixes from another whole-codebase review, then features. **Re-index:
+recommended** only for ODT/ODS/ODP files with hidden text, sheets or slides and XLSX
+files with hidden rows or columns (now left out, as pass 20 did for the other Office
+hidden content); run `docrag reindex NAME` (or re-index all) to drop it from documents
+already indexed. Nothing else changes stored data.
+
+### Added (pass 21)
+- **Answer self-check** (`ANSWER_SELF_CHECK`, on): each answer's sentences checked
+  against the passages they cite — no LLM call, no search — as `verification` on
+  `/questions` and the stream's `done`. The UI lists the sentences no cited passage
+  backs, or that state numbers the passages don't.
+- `POST /questions/recheck`: a saved answer and the passages it cited against the
+  documents now — each passage unchanged, changed or deleted, and each sentence still
+  backed (a changed document is searched for it). A **Recheck** button in Saved answers.
+- `POST /admin/calibrate`: the workspace's suggested `RERANK_MIN_SCORE` from its own
+  traces (the score report's), written into its settings with `apply`;
+  `docrag traces report --apply [--labels feedback]`.
+- `POST /questions/batch` (up to 20 questions, one scope, one question slot; a failing
+  one doesn't stop the rest) and `docrag ask --questions FILE`.
+- `POST /backups/{name}/drill`: a restore rehearsed — a sample of a stored backup's
+  originals (or all) read, parsed and chunked with this server's parsers, nothing
+  indexed; `docrag backup drill NAME [--sample N]`.
+- `POST /backups/{name}/restore?only=NAME` (repeatable) restores just those documents;
+  `docrag backup restore NAME --only NAME`.
+- `docrag dedupe [--delete]`: the documents holding identical bytes, and deleting the
+  copies (the listing's `duplicate_groups`).
+- A background migration bundle (`GET /admin/migrate/export/{id}`) can be resumed with a
+  `Range` request and carries `X-Content-SHA256`; `docrag migrate pack --background`
+  resumes a cut download and checks it.
+- `POST /documents/from-sitemap` takes `dry_run`: the pages, each new, to check or
+  unchanged, with nothing fetched; `docrag add-url --sitemap --dry-run`.
+- MCP: `index_status` (readiness, documents, last backup, failing jobs, imports);
+  with `--allow-writes`, `tag_document` and `delete_document` (the name repeated in
+  `confirm_filename`).
+- UI: other tabs pick up a conversation saved here at once (`BroadcastChannel`), even an
+  older one only IndexedDB holds; leaving or reloading while an answer is written (or a
+  question waits to be sent) asks first; **Select** in the conversation list deletes
+  (one Undo), pins or labels several at once; **Templates** in the composer keep
+  questions to start from, the first `{blank}` selected when one is put back; the
+  document viewer goes **back and forward** through the passages opened.
+- `/questions/verify` says `empty_scope` when the files or tags asked for match no
+  document, instead of marking every sentence unsupported.
+- `QUERY_DECOMPOSITION_ENABLED` (off): a question asking about several things ("the
+  leave, expense and IT policies") is split into standalone parts by one LLM call, each
+  part searched and reranked on its own, their passages taken in turn so the prompt
+  covers every part. Scored against the whole question, the cross-encoder ranked one
+  topic's passages under the bar ("not covered"). Only questions that look compound
+  (and, a comma, versus, compare, both, between) make the call. Measured on a new set
+  of 12 compound questions (`eval/datasets/compound_eval.jsonl`): every fact answered
+  8/12 → 11/12 with gpt-5-mini, 9/12 → 10/12 with qwen2.5 (answered 10/12 → 12/12);
+  the handbook, compare, follow-up and unanswerable sets unchanged; about 5 s more per
+  compound question on qwen2.5. Off until it is turned on.
+- `GET /documents/duplicates`: the groups of documents holding identical bytes, each with
+  its size, and how many copies deleting them would remove (`docrag dedupe` reads it).
+- The sentences the self-check flags are also marked where they stand in the answer
+  (a wavy underline), not only listed under it.
+- The score report's "Use it for this workspace" goes through `POST /admin/calibrate`:
+  the bar applied is the server's suggestion from the same labels.
+
+### Fixed (pass 21)
+- Questions waiting for an identical one being answered got a 429 when that one failed
+  or wasn't kept, though slots were free: they now take a slot and answer it (one of
+  them; the others follow it). Requests waiting that way are capped (4 per question
+  slot): a burst of one question behind a slow local model held every request thread.
+- A full server answered 429 a second late to questions that couldn't wait for an
+  identical run (Regenerate, follow-ups); an answer stored just before admission was run
+  again; a lookup that raised after the slot was taken kept it.
+- Continue checks the answer's provider (allowed, configured) before the stream starts:
+  400 or 503, not an error frame after the sources.
+- The stream's "nothing found" `done` carries `weak_matches` and `retrieval_query`, as
+  the sync answer does. The sync route continues a cut-off answer as the stream does
+  (`AUTO_CONTINUE_MAX`).
+- Declines written in Dutch, Polish, Swedish, Japanese, Chinese, Korean or Hindi are
+  recognised (no citation retry for them); English is unchanged.
+- The eval counts `empty_scope` as a refusal, records `conversation_max_history_messages`
+  and `auto_continue_max` in the answer fingerprint, and warns about a baseline with none.
+- The zip guard read the zip64 record only where its locator pointed; Python 3.12's
+  `zipfile` reads the one right before the locator — a crafted zip claiming millions of
+  entries got past the cap. Both are read now.
+- `docrag migrate pack --background` failed with a 404 under a workspace. A background
+  bundle is kept until it is downloaded whole (a cut download used to delete it), only
+  the newest is kept, and it is removed after a day even on an idle server.
+- An import waiting behind another reads `waiting` (it said `running`), and can be
+  cancelled there; a migration export no longer reports a workspace count as queued.
+- A failed `BACKUP_COPY_COMMAND` is tried again on later passes; one past its timeout is
+  stopped with every process it started.
+- The lost-index check runs every 15 minutes, not only at startup; the notification goes
+  out before an automatic rebuild starts; one workspace's error no longer skips the rest.
+- A background `/import` no longer copies the upload a second time (it needed room for
+  two), nor leaves its copy behind on an error. A zip from a URL is accepted while the
+  indexing queue is full (it waits for room as it goes).
+- Hidden content in ODT, ODS and ODP files, and hidden XLSX rows and columns, is left out
+  like the rest (`INDEX_HIDDEN_CONTENT`), and the parse warns how much was.
+- UI: keyboard shortcuts work with the viewer docked; the snapshot saved during a stream
+  merges with other tabs' history (it overwrote it), and a save whose merge fails writes
+  nothing; a stopped or failed Continue keeps a rating, save or note made meanwhile, and
+  the first part's usage when the rest reports none; the background notice says stopped
+  or failed after a Continue or Regenerate; an import's "make room" never pushes earlier
+  deletes out of Recently deleted and says how many removals are recoverable; focus stays
+  on Dock/Undock and moves to the next scope chip; many tags show as a count; a send
+  queued offline is dropped when the workspace changes; a document's source address is a
+  link only when it is http(s).
+- An answer the model had finished, followed by a failure in a later step (the citation
+  retry, storing the trace, the client leaving), was offered to Continue as if cut off,
+  and Continue appended to a whole answer. Its error trace no longer keeps the prompt.
+- A passage link (`#d=…`) opened before the server answered (a key still to enter, the
+  app starting) waits for it instead of opening a viewer whose fetch failed.
+- Found testing with OpenAI: a continued answer cut just after a word with a comma
+  ("… Furthermore,") read "Furthermore, Furthermore," — a repeated word ending in a
+  comma, colon or semicolon is joined once now; and the self-check flagged a sentence
+  saying the documents don't cover part of the question ("… no information on the
+  expense policy") as unsupported — such a sentence is `no_claim`.
+- With the self-check on, an answer could read "2 cited sentences match nothing in the
+  passages it cites" while the self-check backed every sentence (the older count reads
+  the cited passage alone; the self-check reads it with the neighbouring text the model
+  was shown). The self-check's list now stands in for those counts.
+- On a phone, an answer's source rows pushed "↻ without" past the edge once a section
+  name wrapped: the buttons drop below the source instead.
+- On a phone (390 px) with workspaces on, the conversation header ran 45 px past the
+  edge and cut off the Reader/Engineer switch: its labels are short there ("Read",
+  "Eng"; full names kept for assistive technology) and its controls tighter.
+
 ### Development
 - Version 0.2.0 closes the development section that followed 0.1.0.
 - `docs/settings.md` lists every setting by topic with its type, default and limits,

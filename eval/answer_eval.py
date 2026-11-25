@@ -346,6 +346,11 @@ def _prompt_contexts(
     return [by_id[c.chunk_id] for c in selected if c.chunk_id in by_id]
 
 
+# Answers that say the documents don't cover the question: a scope naming no document
+# (``empty_scope``) refuses as plainly as one whose documents lack it.
+REFUSED_STATUSES = ("no_context", "insufficient_context", "empty_scope")
+
+
 def answer_metrics(
     examples: Sequence[RetrievalExample],
     rows: Sequence[AnswerRow],
@@ -391,7 +396,7 @@ def answer_metrics(
         )
     if unanswerable:
         metrics["refused_unanswerable_rate"] = sum(
-            r.answer_status in ("no_context", "insufficient_context") for _, r in unanswerable
+            r.answer_status in REFUSED_STATUSES for _, r in unanswerable
         ) / len(unanswerable)
     facts = [r for e, r in zip(examples, rows, strict=True) if e.fact_groups]
     if facts:
@@ -568,6 +573,10 @@ def run_answer_eval(
             "max_context_chunks": int(settings.max_context_chunks),
             "answer_format": settings.answer_format,
             "answer_language": settings.answer_language,
+            # How much of a conversation a follow-up sees, and whether a cut-off
+            # answer is continued: both change the answers measured.
+            "conversation_max_history_messages": int(settings.conversation_max_history_messages),
+            "auto_continue_max": int(settings.auto_continue_max),
             "question_count": len(rows),
         },
         "metrics": {name: round(value, 4) for name, value in metrics.items()},

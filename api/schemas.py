@@ -326,6 +326,21 @@ class DocumentListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class DuplicateGroupResponse(BaseModel):
+    # Names in order; the first is the one `docrag dedupe --delete` keeps.
+    filenames: list[str]
+    byte_size: int | None = None
+    chunk_count: int = 0
+
+
+class DuplicateReportResponse(BaseModel):
+    """GET /documents/duplicates: documents holding identical bytes under other names."""
+
+    groups: list[DuplicateGroupResponse]
+    # Documents beyond the first of each group: what deleting the copies removes.
+    copies: int
+
+
 class LocalDocument(BaseModel):
     name: RequestFilename
     sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -636,6 +651,16 @@ class TraceListResponse(BaseModel):
     traces: list[TraceSummaryResponse]
 
 
+class CalibrateRequest(BaseModel):
+    """POST /admin/calibrate: the request's workspace's relevance bar, from its traces."""
+
+    # What decides each side, as GET /traces/score-report's ``labels``.
+    labels: Literal["model", "feedback"] = "model"
+    # Write the suggested bar into the workspace's settings (WORKSPACE_SETTINGS_PATH);
+    # without it, only the report.
+    apply: bool = False
+
+
 class ScoreReportResponse(BaseModel):
     """GET /traces/score-report: the best rerank score of each traced question, for
     questions answered against questions not answered, and a suggested
@@ -652,6 +677,8 @@ class ScoreReportResponse(BaseModel):
     note: str
     # Traced questions whose best score lies between the current and the suggested bar.
     would_change: int = 0
+    # POST /admin/calibrate with apply: the suggested bar is now the workspace's.
+    applied: bool = False
     # Traced questions left out: scored by another reranker, about picked passages, or
     # summaries (left_out); outside the asked-for since/bar (filtered_out).
     left_out: int = 0
@@ -943,6 +970,22 @@ class QuestionRequest(PassageNarrowing):
         return self
 
 
+# Questions one POST /questions/batch answers (each its own retrieval and LLM call).
+BATCH_MAX_QUESTIONS = 20
+
+BatchQuestion = Annotated[str, StringConstraints(min_length=1, max_length=MAX_QUESTION_CHARS)]
+
+
+class BatchQuestionRequest(QuestionRequest):
+    """Several questions answered one after another, with the same scope and options
+    (POST /questions/batch): a checklist of questions over a set of documents. No
+    conversation history: each question stands alone."""
+
+    question: str = Field(default="", max_length=0)
+    questions: list[BatchQuestion] = Field(min_length=1, max_length=BATCH_MAX_QUESTIONS)
+    history: list[HistoryMessageRequest] | None = Field(default=None, max_length=0)
+
+
 class CitationSpanResponse(BaseModel):
     """The passage of a cited chunk an answer's claim rests on (see api/citations.py)."""
 
@@ -970,6 +1013,33 @@ class CitationResponse(BaseModel):
     # The cross-encoder's score for this passage, in [0, 1] (absent on answers cached
     # before it was recorded).
     rerank_score: float | None = None
+
+
+class BatchAnswerResponse(BaseModel):
+    question: str
+    # The answer, or why this question failed (the others still ran).
+    answer: QuestionResponse | None = None
+    error: str | None = None
+
+
+class BatchQuestionResponse(BaseModel):
+    answers: list[BatchAnswerResponse]
+
+
+class AnswerCheckResponse(BaseModel):
+    """One sentence of an answer against the passages it cites (ANSWER_SELF_CHECK)."""
+
+    sentence: str
+    # "supported" / "numbers_differ" / "unsupported" / "no_claim", as /questions/verify.
+    status: str = Field(
+        json_schema_extra={
+            "x-extensible-enum": ["supported", "numbers_differ", "unsupported", "no_claim"]
+        }
+    )
+    # The source (its [n]) whose words support it, when one does.
+    source_number: int | None = None
+    quote: str | None = None
+    missing_numbers: list[str] = []
 
 
 class QuestionResponse(BaseModel):
@@ -1018,6 +1088,9 @@ class QuestionResponse(BaseModel):
     followups: list[str] = []
     # None when the provider reported no usage, and on a cache hit.
     usage: UsageResponse | None = None
+    # Each sentence against the passages it cites (ANSWER_SELF_CHECK); None when off or
+    # the answer cites nothing.
+    verification: list[AnswerCheckResponse] | None = None
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -1136,6 +1209,17 @@ class SitemapIngestRequest(BaseModel):
     refresh_minutes: int | None = Field(default=None, ge=0, le=MAX_REFRESH_MINUTES)
     # Every page kept under this folder ("docs-site"): named "<folder>/<page name>".
     folder: RequestFilename | None = None
+    # Only read the sitemap and say what each page would be (``pages``): nothing is
+    # fetched or indexed, and no import starts.
+    dry_run: bool = False
+
+
+class SitemapPageResponse(BaseModel):
+    url: str
+    # "new" (no document from it yet), "unchanged" (indexed, and the sitemap dates it no
+    # later than that: skipped), "check" (indexed: fetched again only if it changed).
+    # Extensible.
+    state: str = Field(json_schema_extra={"x-extensible-enum": ["new", "unchanged", "check"]})
 
 
 class SitemapIngestResponse(BaseModel):
@@ -1149,6 +1233,8 @@ class SitemapIngestResponse(BaseModel):
     child_sitemaps: int
     # Follow it at GET /documents/sitemap-imports/{import_id}; cancel with DELETE.
     import_id: str | None = None
+    # dry_run: what each page would be (no import_id then).
+    pages: list[SitemapPageResponse] | None = None
 
 
 class BackgroundImportResponse(BaseModel):
@@ -1158,8 +1244,8 @@ class BackgroundImportResponse(BaseModel):
     # "archive" (a zip of documents) or "restore" (a backup); extensible.
     kind: str
     name: str
-    # running / cancelling / done / cancelled / failed (it ended on an error: see
-    # problems); extensible.
+    # waiting (behind another import: one runs at a time) / running / cancelling /
+    # done / cancelled / failed (it ended on an error: see problems); extensible.
     state: str
     started_at: float
     finished_at: float | None = None
@@ -1371,6 +1457,45 @@ class VerifyResponse(BaseModel):
     sentences: list[VerifySentenceResponse]
     # The text had more sentences than are checked at once (the first ones were).
     more: bool = False
+    # The scope (filenames, tags) names no indexed document: nothing was searched, and
+    # ``sentences`` is empty — a typo'd name, not text the documents don't support.
+    empty_scope: bool = False
+
+
+# Sources a recheck looks at (an answer cites at most max_context_chunks of them).
+RECHECK_MAX_SOURCES = 50
+
+
+class RecheckSource(BaseModel):
+    source_number: int = Field(ge=1)
+    filename: RequestFilename
+    chunk_id: str = Field(min_length=1, max_length=128)
+
+
+class RecheckRequest(BaseModel):
+    """A saved answer and the passages it cited, checked against the documents now."""
+
+    answer: str = Field(min_length=1, max_length=VERIFY_MAX_CHARS)
+    sources: list[RecheckSource] = Field(min_length=1, max_length=RECHECK_MAX_SOURCES)
+
+
+class RecheckSourceResponse(BaseModel):
+    source_number: int
+    filename: str
+    chunk_id: str
+    # "unchanged" (the passage is still indexed as it was), "changed" (its document
+    # was re-indexed or uploaded again: the passage reads differently now), "deleted"
+    # (the document is gone). Extensible.
+    state: str = Field(json_schema_extra={"x-extensible-enum": ["unchanged", "changed", "deleted"]})
+
+
+class RecheckResponse(BaseModel):
+    sources: list[RecheckSourceResponse]
+    # Each sentence against the cited passages as they are now (a changed document's
+    # closest passages, searched within it).
+    sentences: list[VerifySentenceResponse]
+    # No cited document is gone and no sentence is unsupported or states other numbers.
+    still_holds: bool
 
 
 class SearchResultResponse(BaseModel):
@@ -1493,6 +1618,29 @@ class BackupDeleteResponse(BaseModel):
     """DELETE /backups/{name}: the stored backup that was deleted."""
 
     name: str
+
+
+class DrillDocumentResponse(BaseModel):
+    filename: str
+    ok: bool
+    # Passages its original makes now; as many as the backup says it had (null if not).
+    chunks: int = 0
+    chunks_then: int | None = None
+    error: str | None = None
+
+
+class BackupDrillResponse(BaseModel):
+    """POST /backups/{name}/drill: a restore rehearsed — originals read, parsed and
+    chunked, nothing indexed."""
+
+    name: str
+    # Documents the backup lists, and those the drill read (a sample, or all).
+    listed: int
+    checked: int
+    failed: int
+    documents: list[DrillDocumentResponse]
+    problems: list[str] = []
+    ok: bool
 
 
 class BackupCheckResponse(BaseModel):

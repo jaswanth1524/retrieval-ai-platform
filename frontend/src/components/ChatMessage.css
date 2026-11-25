@@ -598,3 +598,11 @@
   padding-left: 18px;
   overflow-wrap: anywhere;
 }
+
+/* A sentence the self-check found no cited passage backs (listed under the answer). */
+.chat-message__unbacked {
+  background: none;
+  color: inherit;
+  text-decoration: underline wavy var(--warn);
+  text-underline-offset: 3px;
+}

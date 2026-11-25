@@ -6,6 +6,7 @@ out of ``api/pipeline.py``, which re-exports these names.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator, Sequence
 from typing import cast
 
@@ -38,20 +39,46 @@ def follow_only(
     key: CacheKey,
     event: threading.Event,
     should_stop: Callable[[], bool] | None,
-) -> Generator[StreamEvent, None, CachedAnswer | None]:
+    take_slot: Callable[[], bool] | None = None,
+) -> Generator[StreamEvent, None, CachedAnswer | bool | None]:
     """Wait for the identical run ``event`` belongs to and return its answer: None when
-    the reader left; ``NoSlotForRun`` when it left none."""
+    the reader left. When that run left none (it failed, was abandoned, or its answer
+    isn't kept), True if ``take_slot`` got this request a question slot of its own —
+    the caller then runs the question itself — else ``NoSlotForRun``: before pass 21
+    every follower of a failed leader got a 429 though slots were free."""
 
     yield {"type": "stage", "stage": "joining_identical_question"}
-    while not event.wait(_JOIN_POLL_SECONDS):
-        if should_stop is not None and should_stop():
-            return None
-    hit = cache.get(key)
-    if hit is None:
-        answer_inflight_joins_total.labels(outcome="ran").inc()
-        raise NoSlotForRun("The server is answering as many questions as it allows; try again.")
-    answer_inflight_joins_total.labels(outcome="replayed").inc()
-    return hit
+    while True:
+        while not event.wait(_JOIN_POLL_SECONDS):
+            if should_stop is not None and should_stop():
+                return None
+        hit = cache.get(key)
+        if hit is not None:
+            answer_inflight_joins_total.labels(outcome="replayed").inc()
+            return hit
+        # The leader's slot is freed just after it releases its followers, and one of
+        # them may lead the question again: for a moment, take a slot or follow that.
+        deadline = time.monotonic() + _RELEAD_SETTLE_SECONDS
+        while True:
+            if take_slot is not None and take_slot():
+                answer_inflight_joins_total.labels(outcome="ran").inc()
+                return True
+            again = cache.inflight.running(key)
+            if again is not None and again is not event:
+                event = again
+                break
+            if time.monotonic() >= deadline:
+                answer_inflight_joins_total.labels(outcome="ran").inc()
+                raise NoSlotForRun(
+                    "The server is answering as many questions as it allows; try again."
+                )
+            if should_stop is not None and should_stop():
+                return None
+            time.sleep(_JOIN_POLL_SECONDS / 10)
+
+
+# How long a follower whose leader left no answer looks for a slot or a new leader.
+_RELEAD_SETTLE_SECONDS = 1.0
 
 
 def wait_for_model(

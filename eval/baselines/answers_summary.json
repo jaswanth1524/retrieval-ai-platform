@@ -42,6 +42,8 @@
     "max_context_chunks": 6,
     "answer_format": "default",
     "answer_language": "",
+    "conversation_max_history_messages": 12,
+    "auto_continue_max": 0,
     "question_count": 3
   },
   "metrics": {

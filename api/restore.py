@@ -16,6 +16,7 @@ import json
 import logging
 import lzma
 import math
+import random
 import re
 import zipfile
 import zlib
@@ -148,11 +149,13 @@ def restore_backup(
     stored: bool = False,
     stop: Callable[[], bool] | None = None,
     max_members: int | None = None,
+    only: frozenset[str] | None = None,
 ) -> ImportOutcome:
     """``stored``: one of BACKUP_DIR's own backups (written by this server), which the
     upload caps on entries and manifest size don't apply to. ``max_members``: an
     upload's entry cap when not MAX_MEMBERS (a migration bundle's backups,
-    MAX_MIGRATE_MEMBERS); the manifest's cap grows with it."""
+    MAX_MIGRATE_MEMBERS); the manifest's cap grows with it. ``only``: just these
+    documents (no feedback); a name the backup lacks is listed under ``rejected``."""
 
     cap = MAX_MEMBERS if max_members is None else int(max_members)
     if not stored and too_many_entries(upload, cap):
@@ -167,11 +170,24 @@ def restore_backup(
         manifest = _manifest(archive, members, stored=stored, members_cap=cap)
         outcome = ImportOutcome()
         stopped = False
+        if only is not None:
+            listed = {
+                document.get("filename")
+                for document in manifest["documents"]
+                if isinstance(document, dict)
+            }
+            outcome.rejected.extend(
+                f"{name} (not in this backup)" for name in sorted(only - listed)
+            )
         for document in manifest["documents"]:
             # A cancelled background import: what is queued stays, nothing more is.
             if stop is not None and stop():
                 stopped = True
                 break
+            if only is not None and (
+                not isinstance(document, dict) or document.get("filename") not in only
+            ):
+                continue
             _restore_document(
                 archive,
                 members,
@@ -183,7 +199,12 @@ def restore_backup(
                 enqueue=enqueue,
                 keep_version=keep_version,
             )
-        if not stopped and feedback_store is not None and "feedback.jsonl" in members:
+        if (
+            not stopped
+            and only is None
+            and feedback_store is not None
+            and "feedback.jsonl" in members
+        ):
             try:
                 _restore_feedback(
                     archive, members["feedback.jsonl"], feedback_store, outcome, workspace
@@ -678,3 +699,92 @@ def _refused_by_restore(
     if max_original_bytes is not None and sizes.get(document["original"], 0) > max_original_bytes:
         return "larger than MAX_UPLOAD_BYTES"
     return None
+
+
+@dataclass
+class DrillDocument:
+    filename: str
+    ok: bool
+    # Passages its original makes now, and as many as the backup says it had.
+    chunks: int = 0
+    chunks_then: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class DrillReport:
+    documents: list[DrillDocument] = field(default_factory=list)
+    # Documents the backup lists, and how many of them the drill read.
+    listed: int = 0
+    problems: list[str] = field(default_factory=list)
+
+
+def drill_backup(
+    upload: IO[bytes],
+    parse: Callable[[str, bytes], int],
+    *,
+    sample: int | None,
+    max_original_bytes: int,
+    stored: bool = True,
+    rng: random.Random | None = None,
+) -> DrillReport:
+    """A restore rehearsed without restoring: ``sample`` of the backup's documents (all
+    with None, at random otherwise) have their originals read and parsed and chunked as
+    an upload would be (``parse``: name and bytes to the passages they make) — nothing
+    is indexed or stored. Proves what verify can't: the originals still make documents
+    with this server's parsers and settings."""
+
+    report = DrillReport()
+    try:
+        archive = zipfile.ZipFile(upload)
+    except (zipfile.BadZipFile, OSError):
+        report.problems.append("It isn't a zip archive.")
+        return report
+    with archive:
+        members = {info.filename: info for info in archive.infolist()}
+        try:
+            manifest = _manifest(archive, members, stored=stored)
+        except BackupImportError as exc:
+            report.problems.append(str(exc))
+            return report
+        documents = [
+            d
+            for d in manifest["documents"]
+            if isinstance(d, dict) and isinstance(d.get("filename"), str)
+        ]
+        report.listed = len(documents)
+        if sample is not None and sample < len(documents):
+            documents = (rng or random.Random()).sample(documents, sample)
+        for document in documents:
+            name = str(document["filename"])
+            then = document.get("chunk_count")
+            info = members.get(f"originals/{name}")
+            if info is None:
+                report.documents.append(
+                    DrillDocument(name, False, error="no original in the backup")
+                )
+                continue
+            try:
+                content = _read_capped(archive, info, max_original_bytes)
+            except _UNREADABLE_MEMBER:
+                content = None
+            if content is None:
+                report.documents.append(
+                    DrillDocument(name, False, error="its original is damaged or too large")
+                )
+                continue
+            try:
+                chunks = parse(name, content)
+            except Exception as exc:  # noqa: BLE001 - one document's failure is reported
+                report.documents.append(DrillDocument(name, False, error=str(exc)[:300]))
+                continue
+            report.documents.append(
+                DrillDocument(
+                    name,
+                    chunks > 0,
+                    chunks=chunks,
+                    chunks_then=then if isinstance(then, int) else None,
+                    error=None if chunks > 0 else "it makes no passages",
+                )
+            )
+    return report

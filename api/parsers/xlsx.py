@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import datetime
 from io import BytesIO
+from xml.etree import ElementTree
+from zipfile import BadZipFile, ZipFile
 
 from api.parsers.common import (
     ZIP_MAX_EXPANDED_BYTES,
@@ -15,6 +17,7 @@ from api.parsers.common import (
     refuse_zip_xml_dtd,
     row_groups,
 )
+from api.parsers.odt import warn_hidden
 from api.settings import AppSettings
 
 # openpyxl reads sheet XML as it goes, but shared strings are held in memory; see
@@ -51,15 +54,24 @@ def parse_xlsx_document(
 
     sections: list[DocumentSection] = []
     cells = 0
+    skipped_sheets = skipped_rows = 0
     try:
         for page, sheet in enumerate(workbook.worksheets, start=1):
             # Hidden and very hidden sheets (INDEX_HIDDEN_CONTENT): what the workbook
             # keeps from its reader. Pages stay the sheets' positions in the workbook.
             if not hidden and getattr(sheet, "sheet_state", "visible") != "visible":
+                skipped_sheets += 1
                 continue
             # The declared dimension is only a hint; trusting it padded every row to
             # its width (a sheet claiming A1:XFD1048576 is 17 billion cells).
             sheet.reset_dimensions()
+            # Hidden rows and columns (INDEX_HIDDEN_CONTENT), read from the sheet's XML:
+            # the read-only reader doesn't report them. Row numbers stay the sheet's.
+            hidden_rows, hidden_columns = (
+                (frozenset(), frozenset())
+                if hidden
+                else _hidden_rows_and_columns(content, getattr(sheet, "_worksheet_path", ""))
+            )
             records: list[tuple[int, list[str]]] = []
             for number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
                 cells += len(row) + 1
@@ -68,9 +80,17 @@ def parse_xlsx_document(
                         f"XLSX '{filename}' has more than {max_cells} cells "
                         "(MAX_SPREADSHEET_CELLS). Split it into smaller files."
                     )
-                values = [_cell_text(value) for value in row]
-                if any(value.strip() for value in values):
-                    records.append((number, values))
+                values = [
+                    _cell_text(value)
+                    for column, value in enumerate(row, start=1)
+                    if column not in hidden_columns
+                ]
+                if not any(value.strip() for value in values):
+                    continue
+                if number in hidden_rows:
+                    skipped_rows += 1
+                    continue
+                records.append((number, values))
             sections.extend(_sheet_sections(filename, page, sheet.title, records, rows_per_section))
     except DocumentParseError:
         raise
@@ -78,9 +98,42 @@ def parse_xlsx_document(
         raise DocumentParseError(f"Could not parse XLSX '{filename}'.") from exc
     finally:
         workbook.close()
+    warn_hidden(filename, skipped_sheets, "sheet(s)")
+    warn_hidden(filename, skipped_rows, "row(s)")
     if not sections:
         raise EmptyDocumentError(f"XLSX '{filename}' has no cell values.")
     return sections
+
+
+# Columns a hidden <col> range may name (XFD, the last column Excel has).
+_MAX_COLUMN = 16384
+
+
+def _hidden_rows_and_columns(
+    content: bytes, sheet_path: str
+) -> tuple[frozenset[int], frozenset[int]]:
+    """The row numbers and column numbers (1-based) a sheet hides, streamed from its
+    XML; none when it can't be read (the sheet is then read whole, as before)."""
+
+    if not sheet_path:
+        return frozenset(), frozenset()
+    rows: set[int] = set()
+    columns: set[int] = set()
+    try:
+        with ZipFile(BytesIO(content)) as archive, archive.open(sheet_path.lstrip("/")) as xml:
+            for _, element in ElementTree.iterparse(xml):
+                tag = element.tag.rsplit("}", 1)[-1]
+                if tag == "row":
+                    if element.get("hidden") in ("1", "true") and element.get("r"):
+                        rows.add(int(element.get("r") or 0))
+                    element.clear()
+                elif tag == "col" and element.get("hidden") in ("1", "true"):
+                    low = int(element.get("min") or 0)
+                    high = min(int(element.get("max") or low), _MAX_COLUMN)
+                    columns.update(range(max(low, 1), high + 1))
+    except (KeyError, OSError, ValueError, ElementTree.ParseError, BadZipFile):
+        return frozenset(), frozenset()
+    return frozenset(rows), frozenset(columns)
 
 
 def _sheet_sections(

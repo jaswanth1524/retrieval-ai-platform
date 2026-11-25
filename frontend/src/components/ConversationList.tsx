@@ -33,6 +33,8 @@ interface ConversationListProps {
   streamingId?: string | null;
   /** Told the ids in the order shown, whenever it changes (for ] and [). */
   onVisibleOrder?: (ids: string[]) => void;
+  /** Delete several at once (Select): one Undo for them all. */
+  onDeleteMany?: (ids: string[]) => void;
 }
 
 function ConversationList({
@@ -49,6 +51,7 @@ function ConversationList({
   disabled,
   streamingId = null,
   onVisibleOrder,
+  onDeleteMany,
 }: ConversationListProps) {
   const compactActions = useCompactActions();
   const [filter, setFilter] = useState<ListFilter>('all');
@@ -58,6 +61,24 @@ function ConversationList({
     [conversations],
   );
   const anySaved = conversations.some((conversation) => (conversation.savedCount ?? 0) > 0);
+  // Select: several conversations picked to delete, pin or label together.
+  const [selecting, setSelecting] = useState(false);
+  const [picked, setPicked] = useState<ReadonlySet<string>>(() => new Set());
+  const [bulkConfirm, setBulkConfirm] = useState(false);
+  const [bulkLabel, setBulkLabel] = useState<string | null>(null);
+  const endSelecting = () => {
+    setSelecting(false);
+    setPicked(new Set());
+    setBulkConfirm(false);
+    setBulkLabel(null);
+  };
+  const togglePicked = (id: string) =>
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
@@ -121,6 +142,14 @@ function ConversationList({
       setWorkspaceFilter(ALL_WORKSPACES);
     }
   }, [workspaceFilter, workspaces]);
+  // Picked ones deleted meanwhile (another tab, an import) drop out of the selection.
+  useEffect(() => {
+    setPicked((prev) => {
+      const live = new Set(conversations.map((conversation) => conversation.id));
+      const kept = [...prev].filter((id) => live.has(id));
+      return kept.length === prev.size ? prev : new Set(kept);
+    });
+  }, [conversations]);
   // Date headings only for the plain list: a search or filter is its own grouping.
   const grouped = !needle && filter === 'all';
   const pinLimitReached =
@@ -331,6 +360,119 @@ function ConversationList({
           )}
         </div>
       )}
+      {(onDeleteMany || onPin || onSetLabels) && conversations.length > 1 && (
+        <div className="conversation-list__bulk" role="group" aria-label="Select conversations" data-testid="conversation-bulk">
+          {!selecting ? (
+            <button
+              type="button"
+              className="conversation-list__label"
+              onClick={() => setSelecting(true)}
+              disabled={disabled}
+              data-testid="conversation-select-mode"
+            >
+              Select
+            </button>
+          ) : bulkConfirm ? (
+            <ConfirmInline
+              className="conversation-list__confirm"
+              prompt={`Delete ${picked.size} conversation${picked.size === 1 ? '' : 's'}?`}
+              confirmLabel="Delete"
+              onCancel={() => setBulkConfirm(false)}
+              onConfirm={() => {
+                onDeleteMany?.([...picked].filter((id) => id !== streamingId));
+                endSelecting();
+              }}
+              confirmTestId="conversation-bulk-delete-confirm"
+            />
+          ) : bulkLabel !== null ? (
+            <input
+              className="conversation-list__edit"
+              value={bulkLabel}
+              autoFocus
+              placeholder="label to add"
+              list="conversation-label-names"
+              onChange={(event) => setBulkLabel(event.target.value)}
+              onKeyDown={(event) => {
+                if (isImeComposing(event)) return;
+                if (event.key === 'Enter' && bulkLabel.trim()) {
+                  for (const id of picked) {
+                    const current = conversations.find((c) => c.id === id)?.labels ?? [];
+                    onSetLabels?.(id, [...current, bulkLabel.trim()]);
+                  }
+                  endSelecting();
+                }
+                if (event.key === 'Escape') {
+                  event.stopPropagation();
+                  setBulkLabel(null);
+                }
+              }}
+              aria-label="Label to add to the selected conversations"
+              data-testid="conversation-bulk-label-input"
+            />
+          ) : (
+            <>
+              <span className="conversation-list__bulk-count" aria-live="polite">
+                {picked.size} selected
+              </span>
+              <button
+                type="button"
+                className="conversation-list__label"
+                onClick={() => setPicked(new Set(visible.map((c) => c.id)))}
+                data-testid="conversation-select-all"
+              >
+                All
+              </button>
+              {onDeleteMany && (
+                <button
+                  type="button"
+                  className="conversation-list__label"
+                  disabled={picked.size === 0}
+                  onClick={() => setBulkConfirm(true)}
+                  data-testid="conversation-bulk-delete"
+                >
+                  Delete
+                </button>
+              )}
+              {onPin && (
+                <button
+                  type="button"
+                  className="conversation-list__label"
+                  disabled={picked.size === 0}
+                  onClick={() => {
+                    const pin = [...picked].some(
+                      (id) => !conversations.find((c) => c.id === id)?.pinned,
+                    );
+                    for (const id of picked) onPin(id, pin);
+                    endSelecting();
+                  }}
+                  data-testid="conversation-bulk-pin"
+                >
+                  Pin / unpin
+                </button>
+              )}
+              {onSetLabels && (
+                <button
+                  type="button"
+                  className="conversation-list__label"
+                  disabled={picked.size === 0}
+                  onClick={() => setBulkLabel('')}
+                  data-testid="conversation-bulk-label"
+                >
+                  Label
+                </button>
+              )}
+              <button
+                type="button"
+                className="conversation-list__label"
+                onClick={endSelecting}
+                data-testid="conversation-select-done"
+              >
+                Done
+              </button>
+            </>
+          )}
+        </div>
+      )}
       <ul ref={listRef} className="conversation-list" aria-label="Conversations">
         {visible.map((conversation, index) => {
           const group = conversation.pinned ? 'Pinned' : dateGroup(conversation.updatedAt);
@@ -357,6 +499,16 @@ function ConversationList({
               <span className="conversation-list__group" data-testid="conversation-group">
                 {heading}
               </span>
+            )}
+            {selecting && (
+              <input
+                type="checkbox"
+                className="conversation-list__pick"
+                checked={picked.has(conversation.id)}
+                onChange={() => togglePicked(conversation.id)}
+                aria-label={`Select ${conversation.title}`}
+                data-testid="conversation-pick"
+              />
             )}
             {confirmingDeleteId === conversation.id ? (
               <ConfirmInline

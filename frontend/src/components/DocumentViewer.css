@@ -361,3 +361,9 @@
   border-radius: 0;
   box-shadow: none;
 }
+
+/* Back and forward through the passages opened. */
+.document-viewer__trail {
+  display: inline-flex;
+  gap: 2px;
+}

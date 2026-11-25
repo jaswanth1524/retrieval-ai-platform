@@ -16,17 +16,20 @@ from api.parsers.common import (
     normalize_text,
     refuse_zip_xml_dtd,
 )
-from api.parsers.odt import _TABLE, _TEXT, _inline_text, _table_rows
+from api.parsers.odt import _TABLE, _TEXT, HiddenStyles, _inline_text, _table_rows, warn_hidden
 
 _OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 _DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
 _PRESENTATION = "{urn:oasis:names:tc:opendocument:xmlns:presentation:1.0}"
 
 
-def parse_odp_document(filename: str, content: bytes) -> list[DocumentSection]:
+def parse_odp_document(
+    filename: str, content: bytes, *, hidden: bool = False
+) -> list[DocumentSection]:
     """Each slide's text — frames in document order, tables as "header: value; ..."
     rows, then the speaker notes — as PPTX is: a slide is a page, its title the section
-    label ("Slide n" without one). Images and media are skipped."""
+    label ("Slide n" without one). Images and media are skipped, and so are hidden
+    slides unless ``hidden`` (INDEX_HIDDEN_CONTENT)."""
 
     check_zip_expanded_size(filename, content, "ODP", ZIP_MAX_EXPANDED_BYTES)
     refuse_zip_xml_dtd(filename, content, "ODP")
@@ -39,8 +42,17 @@ def parse_odp_document(filename: str, content: bytes) -> list[DocumentSection]:
     body = root.find(f"{_OFFICE}body/{_OFFICE}presentation")
     if body is None:
         raise EmptyDocumentError(f"ODP '{filename}' has no slides.")
+    styles = None if hidden else HiddenStyles(root)
+    skipped = 0
     sections: list[DocumentSection] = []
     for number, slide in enumerate(body.iter(f"{_DRAW}page"), start=1):
+        # A hidden slide isn't presented; numbers stay deck positions.
+        if styles is not None and (
+            slide.get(f"{_DRAW}style-name") in styles.page
+            or slide.get(f"{_PRESENTATION}visibility") == "hidden"
+        ):
+            skipped += 1
+            continue
         title = ""
         lines: list[str] = []
         for frame in _shapes(slide):
@@ -71,6 +83,7 @@ def parse_odp_document(filename: str, content: bytes) -> list[DocumentSection]:
                     boundary="isolated",
                 )
             )
+    warn_hidden(filename, skipped, "slide(s)")
     if not sections:
         raise EmptyDocumentError(f"ODP '{filename}' has no extractable text.")
     return sections

@@ -85,6 +85,7 @@ from cli.document_commands import _names_on_disk as _names_on_disk
 from cli.document_commands import _sha256 as _sha256
 from cli.document_commands import _unchanged_on_server as _unchanged_on_server
 from cli.document_commands import cmd_add_url as cmd_add_url
+from cli.document_commands import cmd_dedupe as cmd_dedupe
 from cli.document_commands import cmd_delete as cmd_delete
 from cli.document_commands import cmd_documents as cmd_documents
 from cli.document_commands import cmd_ingest as cmd_ingest
@@ -355,6 +356,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_url.add_argument("--max-pages", type=int, help="--sitemap: at most this many pages.")
     add_url.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="--sitemap: list the pages and whether each is new or already indexed; "
+        "nothing is fetched or added.",
+    )
+    add_url.add_argument(
         "--wait",
         action="store_true",
         help="--sitemap: wait until every page has been fetched, and report how it went.",
@@ -372,8 +379,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wait_flag(add_url)
 
-    ask = command("ask", "Ask a question (streamed).")
-    ask.add_argument("question")
+    ask = command("ask", "Ask a question (streamed), or a file of them (--questions).")
+    ask.add_argument("question", nargs="?")
+    ask.add_argument(
+        "--questions",
+        metavar="PATH",
+        help="A file of questions, one per line (# starts a comment; - reads stdin), "
+        "answered one after another with the same scope.",
+    )
     ask.add_argument("--file", action="append", help="Limit to this document (repeatable).")
     ask.add_argument("--tag", action="append", help="Limit to documents with this tag.")
     ask.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
@@ -512,6 +525,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("answered", "uncited", "insufficient_context", "no_context"),
         help="Only traces answered this way (repeatable).",
     )
+    traces.add_argument(
+        "--apply",
+        action="store_true",
+        help="report: make the suggested RERANK_MIN_SCORE this workspace's own (full key).",
+    )
+    traces.add_argument(
+        "--labels",
+        choices=("model", "feedback"),
+        default="model",
+        help="report --apply: what decides each side (the answers, or people's ratings).",
+    )
     traces.add_argument("--min-score", type=float, help="rerun: RERANK_MIN_SCORE to try.")
     traces.add_argument("--top-k", type=int, help="rerun: RERANK_TOP_K to try.")
     traces.add_argument("--relative-floor", type=float, help="rerun: RERANK_RELATIVE_FLOOR to try.")
@@ -542,13 +566,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     backup = command("backup", "Scheduled backups in BACKUP_DIR (full key).")
     backup.add_argument(
-        "action", choices=["list", "run", "verify", "restore", "download", "delete"]
+        "action", choices=["list", "run", "verify", "drill", "restore", "download", "delete"]
     )
     backup.add_argument(
         "target", nargs="?", help="A backup's name (from list), or a local zip to verify."
     )
     backup.add_argument(
         "-o", "--output", help="download: where to write it (default: its name, here)."
+    )
+    backup.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME",
+        help="restore: just this document (repeatable).",
+    )
+    backup.add_argument(
+        "--sample",
+        type=int,
+        default=20,
+        help="drill: how many of its documents to read and parse (0 = all; default 20).",
+    )
+    dedupe = command("dedupe", "Documents holding exactly the same bytes under different names.")
+    dedupe.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete every copy but the first name of each group (full key).",
     )
     command("doctor", "Risky server settings: backups, disk, memory, keys (full key).")
 
@@ -655,6 +697,7 @@ COMMANDS = {
     "queries": cmd_queries,
     "jobs": cmd_jobs,
     "traces": cmd_traces,
+    "dedupe": cmd_dedupe,
     "feedback": cmd_feedback,
     "original": cmd_original,
     "workspaces": cmd_workspaces,

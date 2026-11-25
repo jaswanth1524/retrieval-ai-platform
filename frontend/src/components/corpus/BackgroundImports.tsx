@@ -79,10 +79,12 @@ export default function BackgroundImports({
             ? ' (cancelled)'
             : item.state === 'cancelling'
               ? ' (stopping…)'
-              : item.state === 'running'
-                ? ' so far'
-                : ' — done'}
-          {item.state === 'running' && canCancel && (
+              : item.state === 'waiting'
+                ? ' (waiting for another import to finish)'
+                : item.state === 'running'
+                  ? ' so far'
+                  : ' — done'}
+          {(item.state === 'running' || item.state === 'waiting') && canCancel && (
             <>
               {' '}
               <button

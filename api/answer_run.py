@@ -396,6 +396,9 @@ class AnswerRun:
     # The answer's prompt once generation starts: kept on the trace of a stream that
     # broke off, so a stopped answer can be continued from where it stopped.
     prompt_messages: list[ChatMessage] | None = None
+    # The model finished the answer (not cut off at the output limit): an error after
+    # that (the citation retry, the trace) leaves nothing to continue.
+    answer_complete: bool = False
     # The stream's model slot, held from generation through follow-ups.
     slot: GenerationSlot | None = None
     # What retrieval found and what of it fit the prompt (kept on an error or

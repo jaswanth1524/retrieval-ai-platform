@@ -179,8 +179,34 @@
   }
 
   .chat-header__mode-btn {
-    padding: 5px 7px;
+    padding: 5px 5px;
+    letter-spacing: 0;
   }
+
+  /* With a workspace chooser beside Export and Clear, the mode switch ran 45 px past a
+     phone's edge (390 px): every control gives up a little room. */
+  .chat-header__action {
+    padding: 3px 5px;
+    letter-spacing: 0;
+  }
+
+  .chat-header__workspace select {
+    max-width: 9ch;
+  }
+
+  /* "Reader | Engineer" took 133 px of a phone's 338: short labels here (each button
+     keeps its full name for assistive technology). */
+  .chat-header__mode-long {
+    display: none;
+  }
+
+  .chat-header__mode-short {
+    display: inline;
+  }
+}
+
+.chat-header__mode-short {
+  display: none;
 }
 
 .chat-header__kbd {

@@ -43,6 +43,8 @@ from api.schemas import (
     DocumentOutlineResponse,
     DocumentVersionResponse,
     DocumentVersionsResponse,
+    DuplicateGroupResponse,
+    DuplicateReportResponse,
     MissingDocumentsRequest,
     MissingDocumentsResponse,
     OutlineEntryResponse,
@@ -74,6 +76,32 @@ CONTENT_UNPAGED_MAX_CHUNKS = 2000
 
 
 _ORIGINAL_CHUNK_BYTES = 64 * 1024
+
+
+# The documents holding exactly the same bytes under different names (the listing's
+# duplicate_groups on their own, with each group's size), for a cleanup pass that
+# needn't read the whole listing. Registered before /documents/{filename}.
+@router.get(
+    "/documents/duplicates",
+    response_model=DuplicateReportResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def list_duplicates(
+    repository: VectorRepositoryDep, settings: SettingsDep
+) -> DuplicateReportResponse:
+    metadata = repository.filename_metadata(settings)
+    groups = duplicate_groups(metadata)
+    return DuplicateReportResponse(
+        groups=[
+            DuplicateGroupResponse(
+                filenames=group,
+                byte_size=metadata[group[0]].byte_size,
+                chunk_count=metadata[group[0]].chunk_count,
+            )
+            for group in groups
+        ],
+        copies=sum(len(group) - 1 for group in groups),
+    )
 
 
 @router.get(

@@ -50,6 +50,7 @@ async def test_every_tool_is_listed_as_read_only(server: MCPServer) -> None:
         "read_document",
         "list_workspaces",
         "list_jobs",
+        "index_status",
     }
     assert all(tool.annotations and tool.annotations.read_only_hint for tool in tools.values())
 

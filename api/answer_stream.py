@@ -71,6 +71,7 @@ from api.pipeline_core import PipelineCore
 from api.prompting import (
     FittedPrompt,
     estimate_prompt_tokens,
+    might_be_compound,
 )
 from api.repository import PassageFilter, VectorRepository
 from api.request_id import current_request_id
@@ -101,6 +102,7 @@ class StreamingAnswers(PipelineCore):
         cached: CachedAnswer | None = None,
         follow: threading.Event | None = None,
         claimed: threading.Event | None = None,
+        take_slot: Callable[[], bool] | None = None,
     ) -> Iterator[StreamEvent]:
         """``_answer_stream_uncached``, replayed from the answer cache on a hit
         (``cached``: the hit already looked up, replayed as it is).
@@ -128,14 +130,18 @@ class StreamingAnswers(PipelineCore):
             return
         key = self._cache_key(question, overrides, filenames, tags, history)
         if follow is not None and key is not None and self._answer_cache is not None:
-            # Admitted without a slot to wait for the identical run: its answer, or the
-            # error frame of a full server (NoSlotForRun).
-            followed = yield from follow_only(self._answer_cache, key, follow, should_stop)
+            # Admitted without a slot to wait for the identical run: its answer; when it
+            # left none, a slot of this request's own to run it, or the error frame of a
+            # full server (NoSlotForRun: the 200 is already sent).
+            followed = yield from follow_only(
+                self._answer_cache, key, follow, should_stop, take_slot
+            )
             if followed is None:
                 return
-            self._log_hit(followed, question, "stream", filenames, tags, overrides)
-            yield from replay(followed)
-            return
+            if isinstance(followed, CachedAnswer):
+                self._log_hit(followed, question, "stream", filenames, tags, overrides)
+                yield from replay(followed)
+                return
         yield from cached_run(
             self._answer_cache,
             key,
@@ -382,6 +388,7 @@ class StreamingAnswers(PipelineCore):
             )
             if generated is None:
                 return  # the finally below records the trace as closed early
+            run.answer_complete = not stopped_at_token_limit()
             yield from self._stream_finish(
                 run, settings, phase, fitted, condense_ms, generated, should_stop
             )
@@ -443,6 +450,19 @@ class StreamingAnswers(PipelineCore):
                 expansion_slot.release()
         else:
             yield {"type": "stage", "stage": "searching"}
+        # A compound question's parts (QUERY_DECOMPOSITION_ENABLED): an LLM call that
+        # waits its turn at a local model, as the expansion does.
+        decomposition: tuple[list[str], float] | None = None
+        if (
+            effective_settings.query_decomposition_enabled
+            and might_be_compound(retrieval_query)
+            and not (run.narrow is not None and run.narrow.chunk_ids)
+        ):
+            decompose_slot = yield from wait_for_model(effective_settings, should_stop)
+            try:
+                decomposition = self._decomposition(retrieval_query, effective_settings)
+            finally:
+                decompose_slot.release()
         phase = self._retrieve_and_rerank(
             retrieval_query,
             effective_settings,
@@ -452,6 +472,7 @@ class StreamingAnswers(PipelineCore):
             narrow=run.narrow,
             also_search=run.question if run.condensed_question else None,
             expansion=expansion,
+            parts=decomposition,
         )
         prompt_question, fitted = self._fit_prompt(run, effective_settings, phase)
         return effective_settings, phase, condense_ms, prompt_question, fitted
@@ -480,7 +501,7 @@ class StreamingAnswers(PipelineCore):
             answer_status=status,
         )
         run.finalized = True
-        yield {
+        done: DoneEvent = {
             "type": "done",
             "answer": insufficient_context_answer(settings),
             "sources": [],
@@ -489,9 +510,15 @@ class StreamingAnswers(PipelineCore):
             "answer_status": status,
             "top_rerank_score": _top_rerank_score(phase),
             "rerank_min_score": float(settings.rerank_min_score),
+            "weak_matches": phase.below_min_score,
             "passages_left_out": _picked_left_out(run.narrow, []),
             "usage": usage_dict(usage, usage_cost_usd(settings, usage)),
         }
+        # As on an answered question (and the sync route): what the follow-up was
+        # searched as, so "nothing found" can be checked against the rewrite.
+        if run.condensed_question:
+            done["retrieval_query"] = run.condensed_question
+        yield done
 
     def _stream_generate(
         self,

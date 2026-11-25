@@ -85,7 +85,7 @@ CITATION_RETRY_REMINDER = (
 # no-citation answer that must not trigger a citation retry. Matched against
 # _normalize_negation'd text, so only spelled-out forms need to be listed here;
 # contractions ("don't", "can't") are expanded to match before comparison.
-_INSUFFICIENCY_HINTS = (
+_INSUFFICIENCY_HINTS: tuple[str, ...] = (
     "enough information",
     "insufficient",
     "do not contain",
@@ -127,6 +127,36 @@ def _fold(text: str) -> str:
 
     decomposed = unicodedata.normalize("NFKD", text.lower())
     return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+# The same for the canned answer's other languages (nl, pl, sv, ja, zh, ko, hi):
+# phrases that say the information isn't there, not a bare "does not contain".
+# Written as a model writes them and folded like the answer (NFKD drops Hindi vowel
+# signs and Japanese voicing marks on both sides alike).
+_OTHER_LANGUAGE_HINTS = (
+    "niet genoeg informatie",
+    "onvoldoende informatie",
+    "kan deze vraag niet beantwoorden",
+    "wystarczających informacji",
+    "wystarczająco informacji",
+    "nie mogę odpowiedzieć",
+    "tillräckligt med information",
+    "inte tillräcklig information",
+    "kan inte besvara",
+    "十分な情報がありません",
+    "情報が不足",
+    "お答えできません",
+    "没有足够的信息",
+    "信息不足",
+    "无法回答",
+    "沒有足夠的資訊",
+    "충분한 정보가 없",
+    "정보가 부족",
+    "답할 수 없",
+    "पर्याप्त जानकारी नहीं",
+    "उत्तर नहीं दे सकता",
+)
+_INSUFFICIENCY_HINTS = _INSUFFICIENCY_HINTS + tuple(_fold(h) for h in _OTHER_LANGUAGE_HINTS)
 
 
 def _normalize_negation(text: str) -> str:

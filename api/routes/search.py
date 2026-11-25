@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import threading
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
@@ -24,6 +25,9 @@ from api.routes.questions import (
 )
 from api.schemas import (
     CitationSpanResponse,
+    RecheckRequest,
+    RecheckResponse,
+    RecheckSourceResponse,
     SearchExplanationResponse,
     SearchRequest,
     SearchResponse,
@@ -33,7 +37,35 @@ from api.schemas import (
     VerifyResponse,
     VerifySentenceResponse,
 )
-from api.verify import VerifyAbandoned, verify_text
+from api.verify import SentenceCheck, VerifyAbandoned, recheck, verify_text
+
+
+def _search_within(pipeline: Any, filename: str) -> Any:
+    """The passages of ``filename`` closest to a sentence (its cited one changed)."""
+
+    def search(sentence: str) -> list[RerankedChunk]:
+        return list(
+            pipeline.retrieve(
+                sentence, AnswerOverrides(), filenames=[filename], for_generation=False
+            ).context_chunks
+        )[:3]
+
+    return search
+
+
+def _sentence_response(check: SentenceCheck) -> VerifySentenceResponse:
+    chunk = check.chunk
+    return VerifySentenceResponse(
+        sentence=check.sentence,
+        status=check.status,
+        filename=chunk.filename if chunk else None,
+        page=chunk.page if chunk else None,
+        section=chunk.section if chunk else None,
+        chunk_id=chunk.chunk_id if chunk else None,
+        quote=check.quote,
+        rerank_score=chunk.rerank_score if chunk else None,
+        missing_numbers=list(check.missing_numbers),
+    )
 
 
 def register(app: FastAPI) -> None:
@@ -55,6 +87,13 @@ def register(app: FastAPI) -> None:
         slots: QuestionSlotsDep,
     ) -> VerifyResponse:
         check_question_text(request.text)
+        if request.filenames or request.tags:
+
+            def scope_empty() -> bool:
+                return pipeline.scope_matches_nothing(request.filenames, request.tags)
+
+            if await run_in_threadpool(scope_empty):
+                return VerifyResponse(sentences=[], empty_scope=True)
         release = question_slot(slots, count_metric=False)
         # A client that leaves stops the check before the next sentence's search,
         # freeing its slot (up to 20 searches and reranks otherwise ran for nobody).
@@ -74,7 +113,11 @@ def register(app: FastAPI) -> None:
 
         try:
             checks, more = await run_in_threadpool(
-                verify_text, clean_text(request.text), search, stop.is_set
+                verify_text,
+                clean_text(request.text),
+                search,
+                stop.is_set,
+                pipeline.neighbour_text,
             )
         except VerifyAbandoned:
             raise HTTPException(status_code=499, detail="The client left.") from None
@@ -97,6 +140,54 @@ def register(app: FastAPI) -> None:
                 for check in checks
             ],
             more=more,
+        )
+
+    # A saved answer against the documents now: is each passage it cited still there as
+    # it was, and does each sentence still hold (a changed document is searched for the
+    # sentence instead)? No LLM. Read key allowed; one question slot.
+    @app.post(
+        "/questions/recheck",
+        response_model=RecheckResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    def recheck_answer(
+        request: RecheckRequest, pipeline: RagPipelineDep, slots: QuestionSlotsDep
+    ) -> RecheckResponse:
+        release = question_slot(slots, count_metric=False)
+        try:
+            states: list[RecheckSourceResponse] = []
+            cited: dict[int, Any] = {}
+            by_file: dict[str, list[str]] = {}
+            for source in request.sources:
+                by_file.setdefault(source.filename, []).append(source.chunk_id)
+            now = {name: pipeline.passages_now(name, ids) for name, ids in by_file.items()}
+            for source in request.sources:
+                indexed, found = now[source.filename]
+                passage = found.get(source.chunk_id)
+                state = "unchanged" if passage else "changed" if indexed else "deleted"
+                states.append(
+                    RecheckSourceResponse(
+                        source_number=source.source_number,
+                        filename=source.filename,
+                        chunk_id=source.chunk_id,
+                        state=state,
+                    )
+                )
+                if passage is not None:
+                    cited[source.source_number] = [passage]
+                elif indexed:
+                    cited[source.source_number] = _search_within(pipeline, source.filename)
+                else:
+                    cited[source.source_number] = []
+            checks = recheck(clean_text(request.answer), cited, pipeline.neighbour_text)
+        finally:
+            release()
+        sentences = [_sentence_response(check) for check in checks]
+        return RecheckResponse(
+            sources=states,
+            sentences=sentences,
+            still_holds=all(s.state != "deleted" for s in states)
+            and all(s.status not in ("unsupported", "numbers_differ") for s in sentences),
         )
 
     # The same hybrid search, RRF (k=60) and cross-encoder rerank a question uses

@@ -16,11 +16,14 @@ from pydantic import StringConstraints
 
 from api.answer_cache import AnswerCache
 from api.audit import audit
+from api.corpus import bump_corpus_generation
 from api.dependencies import (
     get_answer_cache,
+    get_workspace_settings_store,
     require_api_key,
     require_full_key,
 )
+from api.feedback import FeedbackStore
 from api.pipeline import RagPipeline, RetrievalPhase, filter_from_record
 from api.query_log import LoggedQuery
 from api.relevance import UNANSWERED_STATUSES, TraceDiff, score_report, trace_diff
@@ -40,6 +43,7 @@ from api.schemas import (
     AnswerCacheClearResponse,
     AnswerCacheResponse,
     CachedQuestionResponse,
+    CalibrateRequest,
     QueryLogEntryResponse,
     QueryLogResponse,
     QueryRecheckItemResponse,
@@ -60,6 +64,7 @@ from api.schemas import (
 from api.settings import AppSettings
 from api.streaming import ClosingStreamingResponse
 from api.tracing import QueryTrace, TraceNotFoundError, TraceStore, TraceSummary
+from api.workspace_settings import WorkspaceSettingsStore
 from api.workspaces import workspace_of
 
 logger = logging.getLogger(__name__)
@@ -336,6 +341,18 @@ def trace_score_report(
         ),
     ] = "model",
 ) -> ScoreReportResponse:
+    return _score_report(trace_store, settings, feedback, labels, since=since, bar=bar)
+
+
+def _score_report(
+    trace_store: TraceStore,
+    settings: AppSettings,
+    feedback: FeedbackStore | None,
+    labels: str,
+    *,
+    since: float | None = None,
+    bar: float | None = None,
+) -> ScoreReportResponse:
     # Every archived trace, not the list's newest hundred: 20 a side is the floor
     # for a suggestion, and a thin sample makes a noisy one.
     ratings: dict[str, str] | None = None
@@ -592,3 +609,45 @@ def register(app: FastAPI) -> None:
     """Register the trace routes."""
 
     app.include_router(router)
+
+
+# The request's workspace's RERANK_MIN_SCORE worked out from its own traces (the
+# score report's suggestion) and, with ``apply``, written into its settings: each
+# corpus gets the bar its questions call for, where calibrating meant reading the
+# report and setting it by hand. Full key (an /admin/ route).
+@router.post(
+    "/admin/calibrate",
+    response_model=ScoreReportResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={
+        404: {"description": "Feedback labels asked for with feedback off."},
+        409: {"description": "No suggestion to apply (too few traces)."},
+    },
+)
+def calibrate(
+    request: CalibrateRequest,
+    trace_store: TraceStoreDep,
+    settings: SettingsDep,
+    feedback: FeedbackStoreDep,
+    store: Annotated[WorkspaceSettingsStore, Depends(get_workspace_settings_store)],
+    cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+) -> ScoreReportResponse:
+    report = _score_report(trace_store, settings, feedback, request.labels)
+    if not request.apply:
+        return report
+    if report.suggested_min_score is None:
+        raise HTTPException(status_code=409, detail=f"Nothing to apply: {report.note}")
+    workspace = workspace_of(settings)
+    values = {**store.get(workspace), "rerank_min_score": report.suggested_min_score}
+    store.put(workspace, values)
+    # Answers cached under the old bar would be served as if given under this one.
+    if cache is not None:
+        cache.drop_collection(settings.qdrant_collection)
+    bump_corpus_generation(collection=settings.qdrant_collection)
+    audit(
+        "workspace.calibrate",
+        workspace=workspace,
+        rerank_min_score=report.suggested_min_score,
+        labels=request.labels,
+    )
+    return report.model_copy(update={"applied": True})

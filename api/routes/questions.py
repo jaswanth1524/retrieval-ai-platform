@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict
-from typing import NamedTuple, get_args
+from typing import Any, NamedTuple, get_args
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
@@ -16,12 +17,13 @@ from starlette.concurrency import run_in_threadpool
 
 from api.admission import QuestionSlots, Release, SlotKind
 from api.answer_cache import CachedAnswer
+from api.citations import SourceCitation, citation_from_dict
 from api.dependencies import (
     require_api_key,
 )
 from api.document_names import stored_filename
 from api.errors import public_error_message, question_error_type
-from api.generation import GenerationConfigError
+from api.generation import GenerationConfigError, GroundedAnswer
 from api.llm import ServerGenerationConfigError, completion_model_and_kwargs
 from api.metrics import (
     NO_ERROR_TYPE,
@@ -37,11 +39,13 @@ from api.pipeline import (
     ContinueRefused,
     DoneEvent,
     QuestionAbandoned,
+    RagPipeline,
     StreamEvent,
     check_rerank_top_k,
     timings_dict,
 )
 from api.repository import PassageFilter
+from api.reranking import RerankedChunk
 from api.routes.deps import (
     DocumentSummarizerDep,
     QuestionSlotsDep,
@@ -56,6 +60,10 @@ from api.routes.responses import (
     usage_response,
 )
 from api.schemas import (
+    AnswerCheckResponse,
+    BatchAnswerResponse,
+    BatchQuestionRequest,
+    BatchQuestionResponse,
     CitationResponse,
     ContinueRequest,
     PassageNarrowing,
@@ -76,6 +84,7 @@ from api.sse import (
 )
 from api.streaming import ClosingStreamingResponse
 from api.summarize import SummaryRequest as PipelineSummaryRequest
+from api.verify import self_check
 
 logger = logging.getLogger(__name__)
 
@@ -116,23 +125,64 @@ IDENTICAL_RUN_SETTLE_SECONDS = 1.0
 
 
 class Admission(NamedTuple):
-    """How a question got in: its slot's release (which also releases the followers of
-    a run it claimed), and — when it needn't run the question — the cached answer to
-    replay or the identical run to wait for, or the run it now leads."""
+    """How a question got in: its release (its slot, any slot taken later, the
+    followers of a run it claimed), and — when it needn't run the question — the cached
+    answer to replay or the identical run to wait for, or the run it now leads.
+    ``take_slot`` gets a follower a slot of its own when the run it waited for left no
+    answer; the release frees that one too."""
 
     release: Release
     cached: CachedAnswer | None = None
     follow: threading.Event | None = None
     claimed: threading.Event | None = None
+    take_slot: Callable[[], bool] | None = None
 
 
 Claim = Callable[[], "tuple[threading.Event, bool, Callable[[], None]] | None"]
 
 
+class _Held:
+    """The releases a request holds — its slot or follower place, and a slot taken
+    late (a follower whose leader left no answer) — freed together, once."""
+
+    def __init__(self, slots: QuestionSlots, *releases: Release) -> None:
+        self._slots = slots
+        self._releases = list(releases)
+        self._lock = threading.Lock()
+
+    def take_slot(self) -> bool:
+        release = self._slots.try_acquire("question")
+        if release is None:
+            return False
+        with self._lock:
+            self._releases.append(release)
+        return True
+
+    def release(self) -> None:
+        with self._lock:
+            releases, self._releases = self._releases, []
+        for release in reversed(releases):
+            release()
+
+
+def _following(slots: QuestionSlots, event: threading.Event) -> Admission:
+    """Admitted to wait for the identical run ``event`` — within the cap on waiting
+    requests (each holds a request thread), else 429."""
+
+    place = slots.try_follow()
+    if place is None:
+        questions_total.labels(outcome="error", error_type="busy").inc()
+        raise HTTPException(
+            status_code=429, detail=QUESTIONS_BUSY_ERROR, headers={"Retry-After": "5"}
+        )
+    held = _Held(slots, place)
+    return Admission(held.release, follow=event, take_slot=held.take_slot)
+
+
 def question_slot_unless_cached(
     slots: QuestionSlots,
     cached: Callable[[], CachedAnswer | None],
-    running: Callable[[], threading.Event | None] = lambda: None,
+    running: Callable[[], threading.Event | None] | None = None,
     claim: Claim = lambda: None,
 ) -> Admission:
     """Admit a question. A stored answer is replayed as found (so it can't expire into
@@ -141,35 +191,53 @@ def question_slot_unless_cached(
     (or 429), and the run is claimed at once: an identical question sent at the same
     moment finds it registered and waits instead of taking a slot or a 429. The claim
     is released with the slot, however the request ends (the pipeline finishes it
-    earlier, once the answer is stored)."""
+    earlier, once the answer is stored). ``running`` is None when the question can't
+    join a run (no cache key: history, Regenerate): a full server then answers 429 at
+    once instead of waiting for a run that can't appear."""
 
     release = slots.try_acquire("question")
     if release is None:
         hit = cached()
         if hit is not None:
             return Admission(_no_slot, cached=hit)
-        # A run claimed a moment ago may still be registering: wait briefly for it.
-        deadline = time.monotonic() + IDENTICAL_RUN_SETTLE_SECONDS
-        while True:
-            event = running()
-            if event is not None:
-                return Admission(_no_slot, follow=event)
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.05)
+        if running is not None:
+            # A run claimed a moment ago may still be registering: wait briefly for it.
+            deadline = time.monotonic() + IDENTICAL_RUN_SETTLE_SECONDS
+            while True:
+                event = running()
+                if event is not None:
+                    return _following(slots, event)
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
         return Admission(question_slot(slots))
-    hit = cached()
-    if hit is not None:
+    try:
+        claimed = claim()
+        if claimed is None:
+            hit = cached()
+            if hit is not None:
+                release()
+                return Admission(_no_slot, cached=hit)
+            return Admission(release)
+        event, leading, finish = claimed
+        if not leading:
+            # Someone is answering it already: wait for that, and free the slot.
+            release()
+            return _following(slots, event)
+        # Claimed first, then looked up: a leader that stored its answer and finished
+        # between a lookup and the claim would otherwise have been run again.
+        try:
+            hit = cached()
+        except BaseException:
+            finish()
+            raise
+        if hit is not None:
+            finish()
+            release()
+            return Admission(_no_slot, cached=hit)
+    except BaseException:
         release()
-        return Admission(_no_slot, cached=hit)
-    claimed = claim()
-    if claimed is None:
-        return Admission(release)
-    event, leading, finish = claimed
-    if not leading:
-        # Someone is answering it already: wait for that, and free the slot.
-        release()
-        return Admission(_no_slot, follow=event)
+        raise
     slot_release = release
 
     def release_both() -> None:
@@ -179,6 +247,82 @@ def question_slot_unless_cached(
             slot_release()
 
     return Admission(release_both, claimed=event)
+
+
+def joinable_run(
+    pipeline: RagPipeline, lookup: tuple[Any, ...], use_cache: bool
+) -> Callable[[], threading.Event | None] | None:
+    """How admission finds an identical run of this question — None when it can't have
+    one (Regenerate, or no cache key: history, the cache off)."""
+
+    if not use_cache or not pipeline.joinable(*lookup):
+        return None
+    return lambda: pipeline.identical_run(*lookup)
+
+
+def answer_checks(
+    settings: AppSettings,
+    status: str,
+    answer: str,
+    sources: Sequence[SourceCitation],
+    widen: Callable[[RerankedChunk], str] | None = None,
+) -> list[dict[str, Any]] | None:
+    """ANSWER_SELF_CHECK: the answer's sentences against the passages it cites (no LLM,
+    no search) — on cache hits and continued answers too, worked out from the answer and
+    its sources alone. None when it is off or there is nothing to check."""
+
+    if not settings.answer_self_check or status != "answered" or not sources:
+        return None
+    try:
+        checks = self_check(answer, sources, _remembered(widen) if widen else None)
+    except Exception:  # noqa: BLE001 - advice only; the answer stands without it
+        logger.warning("The answer's self-check failed.", exc_info=True)
+        return None
+    return [
+        {
+            "sentence": check.sentence,
+            "status": check.status,
+            "source_number": _source_number(check.chunk, sources),
+            "quote": check.quote,
+            "missing_numbers": list(check.missing_numbers),
+        }
+        for check in checks
+    ]
+
+
+def _remembered(widen: Callable[[RerankedChunk], str]) -> Callable[[RerankedChunk], str]:
+    """``widen`` read once per passage (each is a Qdrant read)."""
+
+    seen: dict[str, str] = {}
+
+    def once(chunk: RerankedChunk) -> str:
+        if chunk.chunk_id not in seen:
+            seen[chunk.chunk_id] = widen(chunk)
+        return seen[chunk.chunk_id]
+
+    return once
+
+
+def _source_number(chunk: RerankedChunk | None, sources: Sequence[SourceCitation]) -> int | None:
+    if chunk is None:
+        return None
+    return next((s.source_number for s in sources if s.chunk_id == chunk.chunk_id), None)
+
+
+def with_answer_checks(
+    settings: AppSettings, event: DoneEvent, pipeline: RagPipeline | None = None
+) -> None:
+    """``answer_checks`` onto a stream's ``done`` frame (it goes out right after)."""
+
+    checks = answer_checks(
+        settings,
+        str(event.get("answer_status", "answered")),
+        event["answer"],
+        [citation_from_dict(dict(source)) for source in event["sources"]],
+        pipeline.neighbour_text if pipeline is not None else None,
+    )
+    if checks is not None:
+        event["verification"] = checks
 
 
 def check_question_text(question: str) -> None:
@@ -400,7 +544,7 @@ async def answer_question(
         question_slot_unless_cached,
         slots,
         lambda: pipeline.cached_answer(*lookup) if request.use_cache else None,
-        lambda: pipeline.identical_run(*lookup) if request.use_cache else None,
+        joinable_run(pipeline, lookup, request.use_cache),
         lambda: pipeline.claim_run(*lookup) if request.use_cache else None,
     )
     release, hit = admitted.release, admitted.cached
@@ -422,6 +566,7 @@ async def answer_question(
                 cached=hit,
                 follow=admitted.follow,
                 claimed=admitted.claimed,
+                take_slot=admitted.take_slot,
             )
         )
     except QuestionAbandoned:
@@ -434,6 +579,18 @@ async def answer_question(
     finally:
         watcher.cancel()
         release()
+    return answered_response(grounded, request, settings, pipeline)
+
+
+def answered_response(
+    grounded: GroundedAnswer,
+    request: QuestionRequest,
+    settings: AppSettings,
+    pipeline: RagPipeline,
+) -> QuestionResponse:
+    """A sync answer's metrics, log line and response body (one question of a batch
+    too)."""
+
     questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
     count_answer(grounded.answer_status, grounded.truncated)
     if grounded.cached:
@@ -466,7 +623,80 @@ async def answer_question(
         passages_left_out=grounded.passages_left_out,
         followups=grounded.followups,
         usage=usage_response(grounded.usage, grounded.cost_usd),
+        verification=[
+            AnswerCheckResponse(**check)
+            for check in answer_checks(
+                settings,
+                grounded.answer_status,
+                grounded.answer,
+                grounded.sources,
+                pipeline.neighbour_text,
+            )
+            or []
+        ]
+        or None,
     )
+
+
+# Several questions over the same scope, answered one after another under one question
+# slot (a checklist over a contract, a set of audit questions): each is answered as
+# /questions answers it, and one that fails doesn't stop the rest.
+@router.post(
+    "/questions/batch",
+    response_model=BatchQuestionResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def answer_questions(
+    request: BatchQuestionRequest,
+    http_request: Request,
+    pipeline: RagPipelineDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+) -> BatchQuestionResponse:
+    check_request_provider(request.llm_provider, settings, request.llm_temperature)
+    check_rerank_top_k(request.rerank_top_k, settings)
+    for question in request.questions:
+        check_question_text(question)
+    overrides = question_overrides(request)
+    release = question_slot(slots)
+    stop = threading.Event()
+    watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
+    answers: list[BatchAnswerResponse] = []
+    try:
+        for question in request.questions:
+            if stop.is_set():
+                raise HTTPException(status_code=499, detail="The client left.")
+            one = request.model_copy(update={"question": question, "questions": [question]})
+            try:
+                grounded = await run_in_threadpool(
+                    functools.partial(
+                        pipeline.answer,
+                        question,
+                        overrides,
+                        filenames=request.filenames,
+                        tags=request.tags,
+                        use_cache=request.use_cache,
+                        should_stop=stop.is_set,
+                    )
+                )
+            except QuestionAbandoned:
+                raise HTTPException(status_code=499, detail="The client left.") from None
+            except Exception as exc:  # noqa: BLE001 - reported on this question; the rest go on
+                questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
+                answers.append(
+                    BatchAnswerResponse(question=question, error=public_error_message(exc))
+                )
+                continue
+            answers.append(
+                BatchAnswerResponse(
+                    question=question,
+                    answer=answered_response(grounded, one, settings, pipeline),
+                )
+            )
+    finally:
+        watcher.cancel()
+        release()
+    return BatchQuestionResponse(answers=answers)
 
 
 @router.post(
@@ -491,12 +721,26 @@ def continue_answer_stream(
         plan = pipeline.continuable(request.trace_id, traces.get(request.trace_id), settings)
     except ContinueRefused as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    # The answer is continued with the provider it was written with: checked now, as a
+    # question's is, so a provider since refused or left without its key is a 400/503
+    # before the 200 — not an error frame after the sources.
+    config = plan.trace.config
+    if config is None:
+        check_request_provider(None, settings)
+    else:
+        provider = config.llm_provider
+        check_request_provider(
+            None if provider == settings.llm_provider else provider,
+            settings,
+            config.llm_temperature,
+        )
     lease = StreamLease(question_slot(slots))
     stop = threading.Event()
 
     def on_done(event: DoneEvent) -> None:
         count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+        with_answer_checks(settings, event, pipeline)
 
     def on_error(exc: Exception) -> None:
         questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
@@ -533,7 +777,7 @@ def answer_question_stream(
     admitted = question_slot_unless_cached(
         slots,
         lambda: pipeline.cached_answer(*lookup) if request.use_cache else None,
-        lambda: pipeline.identical_run(*lookup) if request.use_cache else None,
+        joinable_run(pipeline, lookup, request.use_cache),
         lambda: pipeline.claim_run(*lookup) if request.use_cache else None,
     )
     release, hit = admitted.release, admitted.cached
@@ -543,6 +787,7 @@ def answer_question_stream(
     def on_done(event: DoneEvent) -> None:
         count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
+        with_answer_checks(settings, event, pipeline)
         if event.get("cached"):
             answer_cache_hits_total.inc()
             return
@@ -568,6 +813,7 @@ def answer_question_stream(
             cached=hit,
             follow=admitted.follow,
             claimed=admitted.claimed,
+            take_slot=admitted.take_slot,
         ),
         lease,
         stop,

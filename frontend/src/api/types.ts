@@ -1044,3 +1044,47 @@ export interface QueryRecheckResponse {
   covered_now: number;
   items: QueryRecheckItemResponse[];
 }
+
+/** One sentence of an answer against the passages it cites (ANSWER_SELF_CHECK). */
+export interface AnswerCheckResponse {
+  sentence: string;
+  /** supported / numbers_differ / unsupported / no_claim (extensible). */
+  status: string;
+  source_number?: number | null;
+  quote?: string | null;
+  missing_numbers?: string[];
+}
+
+/** One sentence checked against the documents (/questions/verify, /questions/recheck). */
+export interface VerifySentenceResponse {
+  sentence: string;
+  /** supported / numbers_differ / unsupported / no_claim (extensible). */
+  status: string;
+  filename?: string | null;
+  page?: number | null;
+  section?: string | null;
+  chunk_id?: string | null;
+  quote?: string | null;
+  rerank_score?: number | null;
+  missing_numbers?: string[];
+}
+
+/** POST /questions/recheck: a saved answer against the documents as they are now. */
+export interface RecheckRequest {
+  answer: string;
+  sources: { source_number: number; filename: string; chunk_id: string }[];
+}
+
+export interface RecheckSourceResponse {
+  source_number: number;
+  filename: string;
+  chunk_id: string;
+  /** unchanged / changed / deleted (extensible). */
+  state: string;
+}
+
+export interface RecheckResponse {
+  sources: RecheckSourceResponse[];
+  sentences: VerifySentenceResponse[];
+  still_holds: boolean;
+}

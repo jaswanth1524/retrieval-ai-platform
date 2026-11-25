@@ -1009,3 +1009,79 @@ def generate_followups(
         if line.endswith("?") and len(line) <= FOLLOWUP_MAX_CHARS
     ]
     return questions[:count]
+
+
+DECOMPOSITION_SYSTEM_PROMPT = (
+    "You prepare questions for a document search. A question is COMPOUND when it asks "
+    "about several separate things: several documents, policies, topics, versions, "
+    "years or groups, or two questions joined with 'and'. For a compound question, "
+    "write each part as a standalone question, one per line, and nothing else. For any "
+    "other question write exactly: SINGLE"
+)
+
+# One split and one SINGLE example: without them qwen2.5 answered SINGLE to every
+# comparison (pass 12). As turns of their own: written into the question's message,
+# gpt-5-mini copied the example's parts into its answer (pass 21).
+_DECOMPOSITION_EXAMPLES: tuple[tuple[str, str], ...] = (
+    (
+        "What do the travel policy and the security policy say about laptops?",
+        "What does the travel policy say about laptops?\n"
+        "What does the security policy say about laptops?",
+    ),
+    ("How many vacation days do new staff get?", "SINGLE"),
+)
+_EXAMPLE_LINES = frozenset(
+    line.strip().casefold() for _, reply in _DECOMPOSITION_EXAMPLES for line in reply.splitlines()
+)
+
+
+_COMPOUND_HINT_RE = re.compile(
+    r"\b(?:and|vs\.?|versus|compare[ds]?|comparing|both|between|differ(?:s|ence)?)\b|,",
+    re.IGNORECASE,
+)
+
+
+def might_be_compound(question: str) -> bool:
+    """Whether ``question`` could ask about several things — worth the LLM call."""
+
+    return bool(_COMPOUND_HINT_RE.search(question))
+
+
+def decompose_question(
+    question: str,
+    max_parts: int,
+    generator: ChatGenerator,
+    settings: AppSettings,
+) -> list[str]:
+    """QUERY_DECOMPOSITION_ENABLED: ``question``'s standalone parts (two to
+    ``max_parts``), or ``[]`` when it is one question, doesn't look compound, or the
+    call fails (retrieval then runs on the whole question, as without it)."""
+
+    if not might_be_compound(question):
+        return []
+    decompose_settings = settings.model_copy(
+        update={
+            "llm_temperature": 0.0,
+            "llm_max_tokens": int(settings.query_decomposition_max_tokens),
+        }
+    )
+    messages: list[ChatMessage] = [{"role": "system", "content": DECOMPOSITION_SYSTEM_PROMPT}]
+    for example, reply in _DECOMPOSITION_EXAMPLES:
+        messages.append({"role": "user", "content": f"Question: {example}"})
+        messages.append({"role": "assistant", "content": reply})
+    messages.append({"role": "user", "content": f"Question: {question.strip()}"})
+    try:
+        raw = generator.complete(messages, decompose_settings)
+    except GenerationError:
+        note_degraded()
+        return []
+    if raw.strip().upper().startswith("SINGLE"):
+        return []
+    parts = [
+        line
+        for line in _distinct_lines(raw, question, max_parts + len(_EXAMPLE_LINES))
+        if not line.lower().startswith("question:")
+        and line.upper() != "SINGLE"
+        and line.casefold() not in _EXAMPLE_LINES
+    ][:max_parts]
+    return parts if len(parts) >= 2 else []

@@ -89,6 +89,8 @@ class DoneEvent(TypedDict):
     unsupported_numbers: NotRequired[int]
     # A follow-up rewritten into a standalone question: what was searched for.
     retrieval_query: NotRequired[str]
+    # ANSWER_SELF_CHECK: each sentence against the passages it cites.
+    verification: NotRequired[list[dict[str, Any]]]
     prompt_cached: NotRequired[bool]
     prompt_cut: NotRequired[bool]
     # Picked passages (chunk_ids) the prompt had no room for (GroundedAnswer).

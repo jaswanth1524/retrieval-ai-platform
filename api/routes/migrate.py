@@ -3,6 +3,7 @@ whatever ``X-Workspace`` says."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from qdrant_client import QdrantClient
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 from api.audit import audit
 from api.chunking import TokenCounter
@@ -216,23 +217,97 @@ class _RemovedAfterSending(FileResponse):
             Path(self.path).unlink(missing_ok=True)
 
 
+class _KeptUntilSent(FileResponse):
+    """A background export's bundle, forgotten and removed only once a download got
+    all of it: a connection cut part-way (a multi-gigabyte pack) leaves it to fetch
+    again — or to resume, with a Range request, where it stopped. ``X-Content-SHA256``
+    lets the client check what it put together."""
+
+    def __init__(self, import_id: str, path: Path, filename: str, sha256: str | None) -> None:
+        super().__init__(
+            path,
+            media_type="application/zip",
+            filename=filename,
+            headers={"X-Content-SHA256": sha256} if sha256 else None,
+        )
+        self._import_id = import_id
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        complete = False
+        to_the_end = True
+
+        async def watching(message: Message) -> None:
+            nonlocal complete, to_the_end
+            if message["type"] == "http.response.start" and message.get("status") == 206:
+                # A range: done with the bundle only if it ran to its last byte.
+                headers = {k.lower(): v for k, v in message.get("headers", [])}
+                to_the_end = _reaches_end(headers.get(b"content-range", b"").decode("latin-1"))
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                complete = to_the_end
+
+        await super().__call__(scope, receive, watching)
+        if complete:
+            _forget_export(self._import_id)
+
+
+def _reaches_end(content_range: str) -> bool:
+    """Whether ``bytes a-b/total`` ends at the file's last byte."""
+
+    try:
+        span, total = content_range.removeprefix("bytes ").split("/")
+        return int(span.split("-")[1]) == int(total) - 1
+    except (ValueError, IndexError):
+        return False
+
+
 # Bundles written in the background (POST /admin/migrate/export), by import id: kept
-# until downloaded once, or for BACKGROUND_EXPORT_KEEP_SECONDS.
-_background_exports: dict[str, tuple[Path, float]] = {}
+# until downloaded whole, or for BACKGROUND_EXPORT_KEEP_SECONDS. Only the newest is
+# kept: each is the whole server, so an older one is never the one wanted, and in the
+# stock compose file they sit in a RAM-backed /tmp.
+_background_exports: dict[str, tuple[Path, float, str | None]] = {}
 _background_lock = threading.Lock()
 BACKGROUND_EXPORT_KEEP_SECONDS = 24 * 3600
+
+
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _forget_export(import_id: str) -> None:
+    with _background_lock:
+        found = _background_exports.pop(import_id, None)
+    if found is not None:
+        found[0].unlink(missing_ok=True)
 
 
 def _forget_old_exports(now: float) -> None:
     with _background_lock:
         old = [
             key
-            for key, (_, at) in _background_exports.items()
+            for key, (_, at, _sha) in _background_exports.items()
             if now - at > BACKGROUND_EXPORT_KEEP_SECONDS
         ]
-        for key in old:
-            path, _ = _background_exports.pop(key)
-            path.unlink(missing_ok=True)
+    for key in old:
+        _forget_export(key)
+
+
+def _keep_export(import_id: str, path: Path, sha256: str | None = None) -> None:
+    """``path`` as the one bundle kept, removed after BACKGROUND_EXPORT_KEEP_SECONDS
+    even when no request comes to notice (a timer, not the next export)."""
+
+    with _background_lock:
+        older = list(_background_exports)
+        _background_exports[import_id] = (path, time.time(), sha256)
+    for key in older:
+        _forget_export(key)
+    timer = threading.Timer(BACKGROUND_EXPORT_KEEP_SECONDS, _forget_export, args=(import_id,))
+    timer.daemon = True
+    timer.start()
 
 
 # The same bundle as GET /admin/migrate/export, written in the background: for a big
@@ -283,10 +358,11 @@ def migrate_export_in_background(
         if status.cancel.is_set():
             path.unlink(missing_ok=True)
             return
-        status.queued = len(manifest["workspaces"])
-        status.note(f"ready to download: {path.stat().st_size} bytes")
-        with _background_lock:
-            _background_exports[status.id] = (path, time.time())
+        status.note(
+            f"ready to download: {path.stat().st_size} bytes, "
+            f"{len(manifest['workspaces'])} workspace(s)"
+        )
+        _keep_export(status.id, path, _sha256_of(path))
         audit(
             "admin.migrate_export",
             workspace="",
@@ -304,18 +380,17 @@ def migrate_export_in_background(
     responses={404: {"description": "No finished background export with that id."}},
 )
 def migrate_export_download(import_id: str) -> FileResponse:
+    _forget_old_exports(time.time())
     with _background_lock:
-        found = _background_exports.pop(import_id, None)
+        found = _background_exports.get(import_id)
     if found is None or not found[0].exists():
         raise HTTPException(
             status_code=404,
             detail="No finished bundle with that id (still being written, already "
-            "downloaded, or older than a day).",
+            "downloaded, replaced by a newer one, or older than a day).",
         )
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(found[1]))
-    return _RemovedAfterSending(
-        found[0], media_type="application/zip", filename=f"docrag-migrate-{stamp}.zip"
-    )
+    return _KeptUntilSent(import_id, found[0], f"docrag-migrate-{stamp}.zip", found[2])
 
 
 # Entries a bundle may hold: its manifest and, per workspace, a backup and a snapshot.

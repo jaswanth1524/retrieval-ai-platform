@@ -58,6 +58,27 @@ export function addToTrash(conversation: Conversation, now = Date.now()): void {
   writeTrash([{ conversation: compact, deletedAt: now }, ...others].slice(0, TRASH_MAX_CONVERSATIONS));
 }
 
+/** Room left in the trash before older entries would be pushed out. */
+export function trashRoom(now = Date.now()): number {
+  return Math.max(TRASH_MAX_CONVERSATIONS - readTrash(now).length, 0);
+}
+
+/** Several conversations (removed together: an import's "make room") into the trash, in
+ *  one write, never pushing out what is already there — an import of 100 used to evict
+ *  every earlier delete. As many as the trash has room for go in, the first ones first;
+ *  how many did. */
+export function addManyToTrash(conversations: readonly Conversation[], now = Date.now()): number {
+  const ids = new Set(conversations.map((conversation) => conversation.id));
+  const others = readTrash(now).filter((entry) => !ids.has(entry.conversation.id));
+  const room = Math.max(TRASH_MAX_CONVERSATIONS - others.length, 0);
+  const added = conversations.slice(0, room).map((conversation) => ({
+    conversation: compactForStorage(conversation, CHAT_STORAGE_MAX_TURNS, 0),
+    deletedAt: now,
+  }));
+  if (added.length > 0) writeTrash([...added, ...others]);
+  return added.length;
+}
+
 /** Out of the trash: restored, or deleted for good. */
 export function removeFromTrash(id: string): void {
   writeTrash(readTrash().filter((entry) => entry.conversation.id !== id));

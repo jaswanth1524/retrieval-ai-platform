@@ -367,3 +367,65 @@
   font: inherit;
   font-size: 0.85rem;
 }
+
+/* Templates: saved questions to start from. */
+.composer__templates {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.composer__template {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer__template-delete {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.composer__template-save {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px 2px;
+  border-top: 1px solid var(--rule);
+  margin-top: 4px;
+}
+
+.composer__template-save input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+/* On a phone the Templates chip is its icon alone: with its word, it and the model
+   chip were both cut to a letter or two. */
+@media (max-width: 480px) {
+  .composer__chip-label {
+    display: none;
+  }
+}
+
+.composer__popover-anchor:has(> .composer__chip--templates) {
+  flex: none;
+}
+
+.composer__chip--templates {
+  flex: none;
+  max-width: none;
+}
