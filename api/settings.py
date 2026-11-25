@@ -619,6 +619,18 @@ class AppSettings(BaseSettings):
     # Output budget of the query-expansion call.
     query_expansion_max_tokens: PositiveInt = 192
 
+    # Compound-question decomposition (default OFF): a question that asks about several
+    # things ("the leave, expense and IT policies") is split by one LLM call into
+    # standalone parts, each searched and reranked on its own, their passages taken in
+    # turn — scored against the whole question, the cross-encoder ranked each part's
+    # passages under the bar. Only questions that look compound (and, a comma,
+    # versus, compare, both, between) make the call.
+    query_decomposition_enabled: bool = False
+    # Most parts a question is split into.
+    query_decomposition_max_parts: int = Field(default=3, ge=2, le=5)
+    # Output budget of the decomposition call.
+    query_decomposition_max_tokens: PositiveInt = 160
+
     # Zero-citation retry (default ON): if a non-insufficient answer comes back with no
     # [n] citation markers though sources were available, retry once with a stricter
     # reminder to cite. Never loops; falls back to the original answer if the retry
@@ -635,6 +647,11 @@ class AppSettings(BaseSettings):
     # A streamed answer cut off at the output limit is continued in the same stream,
     # up to this many times (0 = off: the reader presses Continue).
     auto_continue_max: int = Field(default=0, ge=0, le=5)
+
+    # Each answer's sentences checked against the passages it cites (no LLM, no search):
+    # `verification` on /questions and the stream's `done` lists what a passage
+    # supports, what none does, and what states other numbers, for the UI to mark.
+    answer_self_check: bool = True
 
     # Suggested follow-up questions (default OFF: one more LLM call per answer, which on
     # a local model is seconds). When on, an answer that cited its sources gets up to

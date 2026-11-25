@@ -15,6 +15,7 @@ from api.parsers.common import (
     check_zip_expanded_size,
     infer_section,
     normalize_text,
+    note_parse_warning,
     refuse_zip_xml_dtd,
     render_row,
 )
@@ -24,6 +25,50 @@ ODT_MAX_EXPANDED_BYTES = ZIP_MAX_EXPANDED_BYTES
 _OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 _TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
 _TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
+_PRESENTATION = "{urn:oasis:names:tc:opendocument:xmlns:presentation:1.0}"
+
+
+class HiddenStyles:
+    """The automatic styles of an OpenDocument that hide what uses them: text shown
+    nowhere (``text:display="none"``), sheets (``table:display="false"``) and slides
+    (``presentation:visibility="hidden"``) — INDEX_HIDDEN_CONTENT leaves them out, as
+    it does Office's hidden text, sheets and slides."""
+
+    def __init__(self, root: ElementTree.Element) -> None:
+        self.text: set[str] = set()
+        self.table: set[str] = set()
+        self.page: set[str] = set()
+        styles = root.find(f"{_OFFICE}automatic-styles")
+        for style in styles if styles is not None else ():
+            name = style.get(f"{_STYLE}name")
+            if not name:
+                continue
+            for properties in style:
+                if properties.get(f"{_TEXT}display") == "none":
+                    self.text.add(name)
+                if properties.get(f"{_TABLE}display") == "false":
+                    self.table.add(name)
+                if properties.get(f"{_PRESENTATION}visibility") == "hidden":
+                    self.page.add(name)
+
+    def hides_text(self, element: ElementTree.Element) -> bool:
+        if element.tag in (f"{_TEXT}hidden-text", f"{_TEXT}hidden-paragraph"):
+            return True
+        if element.get(f"{_TEXT}display") == "none":  # a hidden section
+            return True
+        return element.get(f"{_TEXT}style-name") in self.text
+
+
+def warn_hidden(filename: str, count: int, what: str) -> None:
+    """Tell the parse's reader (preview, the job) that hidden content was left out."""
+
+    if count:
+        note_parse_warning(
+            f"{count} hidden {what} in '{filename}' left out (INDEX_HIDDEN_CONTENT=true "
+            "indexes them)."
+        )
+
 
 # Containers whose children are read in order as blocks of their own.
 _BLOCK_CONTAINERS = frozenset(
@@ -66,12 +111,15 @@ def _count(element: ElementTree.Element, attribute: str, cap: int) -> int:
         return 1
 
 
-def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
+def parse_odt_document(
+    filename: str, content: bytes, *, hidden: bool = False
+) -> list[DocumentSection]:
     """Extract an ODT's paragraphs, lists and tables in reading order, one section per
     heading (text before the first heading is labelled from its own first line).
 
     ODT has no fixed pages, so every section is page 1, as for DOCX. A table becomes
-    one "header: value; ..." line per row.
+    one "header: value; ..." line per row. Hidden text (a hidden section, paragraph or
+    span) is left out unless ``hidden`` (INDEX_HIDDEN_CONTENT).
     """
 
     check_zip_expanded_size(filename, content, "ODT", ODT_MAX_EXPANDED_BYTES)
@@ -87,6 +135,8 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
     if body is None:
         raise EmptyDocumentError(f"ODT '{filename}' has no text body.")
 
+    styles = None if hidden else HiddenStyles(root)
+    skipped = 0
     sections: list[DocumentSection] = []
     label: str | None = None
     buffer: list[str] = []
@@ -105,7 +155,7 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
             )
 
     def visit(element: ElementTree.Element, depth: int = 0) -> None:
-        nonlocal label, buffer
+        nonlocal label, buffer, skipped
         if depth > _MAX_DEPTH:
             text = normalize_text(" ".join(element.itertext()))
             if text:
@@ -114,14 +164,17 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
         for child in element:
             if child.tag in _SKIPPED:
                 continue
+            if styles is not None and styles.hides_text(child):
+                skipped += 1
+                continue
             if child.tag == f"{_TEXT}h":
-                heading = normalize_text(_inline_text(child))
+                heading = normalize_text(_inline_text(child, styles=styles))
                 if heading:
                     flush()
                     label = cap_section(heading)
                     buffer = [heading]
             elif child.tag == f"{_TEXT}p":
-                paragraph = normalize_text(_inline_text(child))
+                paragraph = normalize_text(_inline_text(child, styles=styles))
                 if paragraph:
                     buffer.append(paragraph)
             elif child.tag == f"{_TABLE}table":
@@ -131,19 +184,25 @@ def parse_odt_document(filename: str, content: bytes) -> list[DocumentSection]:
 
     visit(body)
     flush()
+    warn_hidden(filename, skipped, "passage(s)")
     if not sections:
         raise EmptyDocumentError(f"ODT '{filename}' has no extractable text.")
     return sections
 
 
-def _inline_text(element: ElementTree.Element, depth: int = 0) -> str:
-    """A paragraph's text with ODF's whitespace elements written out."""
+def _inline_text(
+    element: ElementTree.Element, depth: int = 0, *, styles: HiddenStyles | None = None
+) -> str:
+    """A paragraph's text with ODF's whitespace elements written out; with ``styles``,
+    without its hidden spans."""
 
     if depth > _MAX_DEPTH:
         return " ".join(element.itertext())
     parts: list[str] = [element.text or ""]
     for child in element:
-        if child.tag == f"{_TEXT}s":
+        if styles is not None and styles.hides_text(child):
+            pass
+        elif child.tag == f"{_TEXT}s":
             parts.append(" " * _count(child, f"{_TEXT}c", _MAX_SPACE_RUN))
         elif child.tag == f"{_TEXT}tab":
             parts.append("\t")
@@ -152,7 +211,7 @@ def _inline_text(element: ElementTree.Element, depth: int = 0) -> str:
         elif child.tag in (f"{_TEXT}tracked-changes", f"{_OFFICE}annotation"):
             pass
         else:
-            parts.append(_inline_text(child, depth + 1))
+            parts.append(_inline_text(child, depth + 1, styles=styles))
         parts.append(child.tail or "")
     return "".join(parts)
 

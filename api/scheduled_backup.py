@@ -19,7 +19,9 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -127,24 +129,40 @@ def copy_backup(settings: AppSettings, backup: Path) -> str | None:
         argv = [*shlex.split(command), str(backup)]
     except ValueError as exc:
         return f"BACKUP_COPY_COMMAND can't be read ({exc})"
-    try:
-        result = subprocess.run(  # noqa: S603 - the operator's own command, no shell
-            argv,
-            capture_output=True,
-            timeout=int(settings.backup_copy_timeout_seconds),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            "the copy command ran past BACKUP_COPY_TIMEOUT_SECONDS "
-            f"({settings.backup_copy_timeout_seconds} s)"
-        )
-    except OSError as exc:
-        return f"the copy command could not run ({exc.strerror or exc})"
-    if result.returncode != 0:
-        said = (result.stderr or result.stdout).decode("utf-8", "replace").strip()[-200:]
-        return f"the copy command failed (exit {result.returncode})" + (f": {said}" if said else "")
+    # Its own process group, killed whole on a timeout: a wrapper script's children
+    # (an rclone under `sh -c`) were left running. Only stderr's tail is read back.
+    with tempfile.TemporaryFile() as said_file:
+        try:
+            process = subprocess.Popen(  # noqa: S603 - the operator's own command, no shell
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=said_file,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return f"the copy command could not run ({exc.strerror or exc})"
+        try:
+            returncode = process.wait(timeout=int(settings.backup_copy_timeout_seconds))
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            return (
+                "the copy command ran past BACKUP_COPY_TIMEOUT_SECONDS "
+                f"({settings.backup_copy_timeout_seconds} s)"
+            )
+        if returncode != 0:
+            said_file.seek(max(0, said_file.seek(0, os.SEEK_END) - 400))
+            said = said_file.read().decode("utf-8", "replace").strip()[-200:]
+            return f"the copy command failed (exit {returncode})" + (f": {said}" if said else "")
     return None
+
+
+def _kill_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, AttributeError):  # gone already, or no process groups here
+        process.kill()
+    process.wait()
 
 
 # Where a deleted workspace's backups are moved (never a workspace name: those can't
@@ -208,6 +226,9 @@ class ScheduledBackup(BackgroundLoop):
         # Workspaces asked to be backed up on the next pass, whatever their newest.
         self._forced: set[str] = set()
         self._forced_lock = threading.Lock()
+        # Per workspace, the newest backup whose BACKUP_COPY_COMMAND failed: tried
+        # again each pass until it copies (the next backup is a day away).
+        self._uncopied: dict[str, Path] = {}
 
     def directory_of(self, settings: AppSettings) -> Path:
         """Where ``settings``' workspace's backups are written."""
@@ -286,6 +307,7 @@ class ScheduledBackup(BackgroundLoop):
                 # the staleness alert had no series to judge).
                 if name not in self.by_workspace:
                     backup_last_success_timestamp.labels(workspace=name).set(newest)
+                self._retry_copy(target, name)
                 continue
             if not self._export_lock.acquire(blocking=False):
                 logger.info("A /export is running; backing up %r next pass.", name)
@@ -316,7 +338,34 @@ class ScheduledBackup(BackgroundLoop):
         failed = copy_backup(target.settings, backup)
         if failed is not None:
             logger.warning("The backup %s: %s", backup, failed)
+            self._uncopied[name] = backup
             self._note(dataclasses.replace(status, at=self._clock(), ok=False, error=failed))
+        else:
+            self._uncopied.pop(name, None)
+
+    def _retry_copy(self, target: WorkspaceTarget, name: str) -> None:
+        """The copy of this workspace's newest backup again, when it failed: a passing
+        network blip left the backup uncopied (and readiness failed) until the next
+        backup, BACKUP_INTERVAL_HOURS later."""
+
+        backup = self._uncopied.get(name)
+        if backup is None:
+            return
+        newest = backups_in(backup.parent)
+        if not backup.exists() or not newest or newest[-1] != backup:
+            self._uncopied.pop(name, None)  # pruned, or a newer one replaced it
+            return
+        failed = copy_backup(target.settings, backup)
+        status = self.by_workspace.get(name)
+        if failed is not None:
+            # Logged only: the failure was reported (and notified) when it first
+            # happened, and the status still says it.
+            logger.warning("The backup %s (copy retried): %s", backup, failed)
+            return
+        self._uncopied.pop(name, None)
+        logger.info("The backup %s was copied on a retry.", backup)
+        if status is not None and status.file == backup.name:
+            self._note(dataclasses.replace(status, at=self._clock(), ok=True, error=None))
 
     def _write(self, target: WorkspaceTarget, directory: Path, name: str) -> Path:
         directory.mkdir(parents=True, exist_ok=True)

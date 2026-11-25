@@ -280,8 +280,12 @@ class TraceRecording:
                 tags=run.tags,
                 error=error,
                 answer="".join(run.parts).strip() or None,
-                # Only with an answer begun: what a Continue of it is written from.
-                prompt_messages=run.prompt_messages if run.parts else None,
+                # Only with an answer begun and not finished: what a Continue of it is
+                # written from. One the model finished, then a later step failed (the
+                # citation retry, the client leaving), has nothing to continue.
+                prompt_messages=(
+                    run.prompt_messages if run.parts and not run.answer_complete else None
+                ),
                 condensed_question=run.condensed_question,
                 condense_note=run.condense_note,
                 history_message_count=len(run.history),

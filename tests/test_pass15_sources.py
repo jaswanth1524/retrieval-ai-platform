@@ -154,7 +154,7 @@ def test_a_sitemaps_pages_are_fetched_and_queued_in_the_background(
     )
 
     assert response.status_code == 202, response.text
-    assert {k: v for k, v in response.json().items() if k != "import_id"} == {
+    assert {k: v for k, v in response.json().items() if k not in ("import_id", "pages")} == {
         "urls": ["https://example.com/a.txt", "https://example.com/b.txt"],
         "left_out": 2,
         "child_sitemaps": 0,

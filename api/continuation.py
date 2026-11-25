@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from api.generation import (
     ChatMessage,
 )
+from api.llm import ChatGenerator, reset_finish_reason, stopped_at_token_limit
 from api.reranking import (
     RerankedChunk,
 )
@@ -102,8 +103,8 @@ def _drop_repeated_tail(before: str, after: str) -> str:
     also states …", "… expense policies (" on "policies (no …", a cut list item was
     written again from its "- ", a lone "- " was followed by "- Review …", and "…
     within" by "within two days". The repeat must start where a word starts and be two
-    words or more, a whole line, or one word of four letters or more — so "… of the"
-    followed by "the policy" keeps its "the"."""
+    words or more, a whole line, or one word of four letters or more (its comma, colon
+    or semicolon included) — so "… of the" followed by "the policy" keeps its "the"."""
 
     head = after.lstrip()
     end = before.rstrip()
@@ -113,7 +114,10 @@ def _drop_repeated_tail(before: str, after: str) -> str:
             continue  # not where a word starts
         whole_line = size == len(end) or end[-size - 1] == "\n"
         words = tail.split()
-        if not (len(words) >= 2 or whole_line or (len(tail) >= 4 and tail.isalpha())):
+        # One word may end in its punctuation: gpt-4o-mini cut at "… Furthermore,"
+        # went on "Furthermore, software …" (pass 21).
+        word = tail.rstrip(",;:")
+        if not (len(words) >= 2 or whole_line or (len(word) >= 4 and word.isalpha())):
             continue
         if head.startswith(tail):
             rest = head[len(tail) :]
@@ -149,3 +153,33 @@ def join_continuation(before: str, after: str, *, prefilled: bool = False) -> st
     if _CLOSING_MARKER_RE.match(after) or _OPENING_MARKER_RE.search(before):
         return before + after
     return f"{before} {after}"
+
+
+class AutoContinuing:
+    """A generator whose answers cut off at the output limit are continued, as
+    AUTO_CONTINUE_MAX does on the stream, up to that many times — for the sync route,
+    which used to return (and the eval to measure) the cut-off answer the stream
+    would have finished. ``stream`` is passed through unchanged."""
+
+    def __init__(self, inner: ChatGenerator, limit: int) -> None:
+        self._inner = inner
+        self._limit = limit
+
+    def complete(self, messages: Sequence[ChatMessage], settings: AppSettings) -> str:
+        text = self._inner.complete(messages, settings)
+        for _ in range(self._limit):
+            if not text or not stopped_at_token_limit():
+                break
+            follow = continuation_messages(messages, text, settings)
+            prefilled = follow[-1]["role"] == "assistant"
+            reset_finish_reason()
+            more = self._inner.complete(follow, settings)
+            if not prefilled:
+                more = drop_restart(text, more)
+            if not more.strip():
+                break
+            text = join_continuation(text, more, prefilled=prefilled)
+        return text
+
+    def stream(self, messages: Sequence[ChatMessage], settings: AppSettings) -> Iterable[str]:
+        return self._inner.stream(messages, settings)

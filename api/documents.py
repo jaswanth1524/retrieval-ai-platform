@@ -169,7 +169,7 @@ def _parse_pptx(
 def _parse_odt(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
-    return parse_odt_document(filename, content)
+    return parse_odt_document(filename, content, hidden=_hidden(settings))
 
 
 def _parse_mbox(
@@ -181,7 +181,7 @@ def _parse_mbox(
 def _parse_odp(
     filename: str, content: bytes, settings: AppSettings | None
 ) -> list[DocumentSection]:
-    return parse_odp_document(filename, content)
+    return parse_odp_document(filename, content, hidden=_hidden(settings))
 
 
 def _parse_ipynb(

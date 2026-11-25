@@ -75,6 +75,61 @@
     "title": "AnswerCacheResponse",
     "type": "object"
    },
+   "AnswerCheckResponse": {
+    "description": "One sentence of an answer against the passages it cites (ANSWER_SELF_CHECK).",
+    "properties": {
+     "missing_numbers": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Missing Numbers",
+      "type": "array"
+     },
+     "quote": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Quote"
+     },
+     "sentence": {
+      "title": "Sentence",
+      "type": "string"
+     },
+     "source_number": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Source Number"
+     },
+     "status": {
+      "title": "Status",
+      "type": "string",
+      "x-extensible-enum": [
+       "supported",
+       "numbers_differ",
+       "unsupported",
+       "no_claim"
+      ]
+     }
+    },
+    "required": [
+     "sentence",
+     "status"
+    ],
+    "title": "AnswerCheckResponse",
+    "type": "object"
+   },
    "ArchiveSkipResponse": {
     "properties": {
      "name": {
@@ -399,6 +454,56 @@
     "title": "BackupDeleteResponse",
     "type": "object"
    },
+   "BackupDrillResponse": {
+    "description": "POST /backups/{name}/drill: a restore rehearsed \u2014 originals read, parsed and\nchunked, nothing indexed.",
+    "properties": {
+     "checked": {
+      "title": "Checked",
+      "type": "integer"
+     },
+     "documents": {
+      "items": {
+       "$ref": "#/components/schemas/DrillDocumentResponse"
+      },
+      "title": "Documents",
+      "type": "array"
+     },
+     "failed": {
+      "title": "Failed",
+      "type": "integer"
+     },
+     "listed": {
+      "title": "Listed",
+      "type": "integer"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "ok": {
+      "title": "Ok",
+      "type": "boolean"
+     },
+     "problems": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Problems",
+      "type": "array"
+     }
+    },
+    "required": [
+     "name",
+     "listed",
+     "checked",
+     "failed",
+     "documents",
+     "ok"
+    ],
+    "title": "BackupDrillResponse",
+    "type": "object"
+   },
    "BackupFileResponse": {
     "description": "One backup in BACKUP_DIR (GET /backups).",
     "properties": {
@@ -531,6 +636,346 @@
      "ok"
     ],
     "title": "BackupStatusResponse",
+    "type": "object"
+   },
+   "BatchAnswerResponse": {
+    "properties": {
+     "answer": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/QuestionResponse"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "question": {
+      "title": "Question",
+      "type": "string"
+     }
+    },
+    "required": [
+     "question"
+    ],
+    "title": "BatchAnswerResponse",
+    "type": "object"
+   },
+   "BatchQuestionRequest": {
+    "description": "Several questions answered one after another, with the same scope and options\n(POST /questions/batch): a checklist of questions over a set of documents. No\nconversation history: each question stands alone.",
+    "properties": {
+     "answer_format": {
+      "anyOf": [
+       {
+        "enum": [
+         "default",
+         "bullets",
+         "table",
+         "brief"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Format"
+     },
+     "answer_language": {
+      "anyOf": [
+       {
+        "maxLength": 40,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Language"
+     },
+     "chunk_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "maxItems": 100,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chunk Ids"
+     },
+     "exclude_chunk_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "maxItems": 100,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Exclude Chunk Ids"
+     },
+     "exclude_filenames": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        "maxItems": 500,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Exclude Filenames"
+     },
+     "filenames": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 1024,
+         "type": "string"
+        },
+        "maxItems": 500,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Filenames"
+     },
+     "history": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/components/schemas/HistoryMessageRequest"
+        },
+        "maxItems": 0,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "History"
+     },
+     "llm_provider": {
+      "anyOf": [
+       {
+        "enum": [
+         "ollama",
+         "openai",
+         "openai_compatible",
+         "anthropic"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Llm Provider"
+     },
+     "llm_temperature": {
+      "anyOf": [
+       {
+        "maximum": 2.0,
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Llm Temperature"
+     },
+     "max_context_chunks": {
+      "anyOf": [
+       {
+        "maximum": 20.0,
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Max Context Chunks"
+     },
+     "page_max": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Max"
+     },
+     "page_min": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Page Min"
+     },
+     "passages_only": {
+      "default": false,
+      "title": "Passages Only",
+      "type": "boolean"
+     },
+     "question": {
+      "default": "",
+      "maxLength": 0,
+      "title": "Question",
+      "type": "string"
+     },
+     "questions": {
+      "items": {
+       "maxLength": 4000,
+       "minLength": 1,
+       "type": "string"
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Questions",
+      "type": "array"
+     },
+     "rerank_top_k": {
+      "anyOf": [
+       {
+        "maximum": 50.0,
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Rerank Top K"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Section"
+     },
+     "strong_matches_only": {
+      "default": false,
+      "title": "Strong Matches Only",
+      "type": "boolean"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "maxLength": 128,
+         "type": "string"
+        },
+        "maxItems": 20,
+        "minItems": 1,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tags"
+     },
+     "uploaded_after": {
+      "anyOf": [
+       {
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Uploaded After"
+     },
+     "uploaded_before": {
+      "anyOf": [
+       {
+        "minimum": 0.0,
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Uploaded Before"
+     },
+     "use_cache": {
+      "default": true,
+      "title": "Use Cache",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "questions"
+    ],
+    "title": "BatchQuestionRequest",
+    "type": "object"
+   },
+   "BatchQuestionResponse": {
+    "properties": {
+     "answers": {
+      "items": {
+       "$ref": "#/components/schemas/BatchAnswerResponse"
+      },
+      "title": "Answers",
+      "type": "array"
+     }
+    },
+    "required": [
+     "answers"
+    ],
+    "title": "BatchQuestionResponse",
     "type": "object"
    },
    "Body_import_backup_import_post": {
@@ -694,6 +1139,27 @@
      "age_seconds"
     ],
     "title": "CachedQuestionResponse",
+    "type": "object"
+   },
+   "CalibrateRequest": {
+    "description": "POST /admin/calibrate: the request's workspace's relevance bar, from its traces.",
+    "properties": {
+     "apply": {
+      "default": false,
+      "title": "Apply",
+      "type": "boolean"
+     },
+     "labels": {
+      "default": "model",
+      "enum": [
+       "model",
+       "feedback"
+      ],
+      "title": "Labels",
+      "type": "string"
+     }
+    },
+    "title": "CalibrateRequest",
     "type": "object"
    },
    "CitationResponse": {
@@ -1744,6 +2210,105 @@
      "versions"
     ],
     "title": "DocumentVersionsResponse",
+    "type": "object"
+   },
+   "DrillDocumentResponse": {
+    "properties": {
+     "chunks": {
+      "default": 0,
+      "title": "Chunks",
+      "type": "integer"
+     },
+     "chunks_then": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chunks Then"
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "ok": {
+      "title": "Ok",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "filename",
+     "ok"
+    ],
+    "title": "DrillDocumentResponse",
+    "type": "object"
+   },
+   "DuplicateGroupResponse": {
+    "properties": {
+     "byte_size": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Byte Size"
+     },
+     "chunk_count": {
+      "default": 0,
+      "title": "Chunk Count",
+      "type": "integer"
+     },
+     "filenames": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Filenames",
+      "type": "array"
+     }
+    },
+    "required": [
+     "filenames"
+    ],
+    "title": "DuplicateGroupResponse",
+    "type": "object"
+   },
+   "DuplicateReportResponse": {
+    "description": "GET /documents/duplicates: documents holding identical bytes under other names.",
+    "properties": {
+     "copies": {
+      "title": "Copies",
+      "type": "integer"
+     },
+     "groups": {
+      "items": {
+       "$ref": "#/components/schemas/DuplicateGroupResponse"
+      },
+      "title": "Groups",
+      "type": "array"
+     }
+    },
+    "required": [
+     "groups",
+     "copies"
+    ],
+    "title": "DuplicateReportResponse",
     "type": "object"
    },
    "FeedbackItemResponse": {
@@ -3105,6 +3670,20 @@
        }
       ]
      },
+     "verification": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/components/schemas/AnswerCheckResponse"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Verification"
+     },
      "weak_matches": {
       "default": false,
       "title": "Weak Matches",
@@ -3226,6 +3805,121 @@
     "title": "RebuildResponse",
     "type": "object"
    },
+   "RecheckRequest": {
+    "description": "A saved answer and the passages it cited, checked against the documents now.",
+    "properties": {
+     "answer": {
+      "maxLength": 8000,
+      "minLength": 1,
+      "title": "Answer",
+      "type": "string"
+     },
+     "sources": {
+      "items": {
+       "$ref": "#/components/schemas/RecheckSource"
+      },
+      "maxItems": 50,
+      "minItems": 1,
+      "title": "Sources",
+      "type": "array"
+     }
+    },
+    "required": [
+     "answer",
+     "sources"
+    ],
+    "title": "RecheckRequest",
+    "type": "object"
+   },
+   "RecheckResponse": {
+    "properties": {
+     "sentences": {
+      "items": {
+       "$ref": "#/components/schemas/VerifySentenceResponse"
+      },
+      "title": "Sentences",
+      "type": "array"
+     },
+     "sources": {
+      "items": {
+       "$ref": "#/components/schemas/RecheckSourceResponse"
+      },
+      "title": "Sources",
+      "type": "array"
+     },
+     "still_holds": {
+      "title": "Still Holds",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "sources",
+     "sentences",
+     "still_holds"
+    ],
+    "title": "RecheckResponse",
+    "type": "object"
+   },
+   "RecheckSource": {
+    "properties": {
+     "chunk_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Chunk Id",
+      "type": "string"
+     },
+     "filename": {
+      "maxLength": 1024,
+      "title": "Filename",
+      "type": "string"
+     },
+     "source_number": {
+      "minimum": 1.0,
+      "title": "Source Number",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "source_number",
+     "filename",
+     "chunk_id"
+    ],
+    "title": "RecheckSource",
+    "type": "object"
+   },
+   "RecheckSourceResponse": {
+    "properties": {
+     "chunk_id": {
+      "title": "Chunk Id",
+      "type": "string"
+     },
+     "filename": {
+      "title": "Filename",
+      "type": "string"
+     },
+     "source_number": {
+      "title": "Source Number",
+      "type": "integer"
+     },
+     "state": {
+      "title": "State",
+      "type": "string",
+      "x-extensible-enum": [
+       "unchanged",
+       "changed",
+       "deleted"
+      ]
+     }
+    },
+    "required": [
+     "source_number",
+     "filename",
+     "chunk_id",
+     "state"
+    ],
+    "title": "RecheckSourceResponse",
+    "type": "object"
+   },
    "ScoreReportResponse": {
     "description": "GET /traces/score-report: the best rerank score of each traced question, for\nquestions answered against questions not answered, and a suggested\nRERANK_MIN_SCORE when there are enough of both.",
     "properties": {
@@ -3239,6 +3933,11 @@
      "answered_count": {
       "title": "Answered Count",
       "type": "integer"
+     },
+     "applied": {
+      "default": false,
+      "title": "Applied",
+      "type": "boolean"
      },
      "bin_edges": {
       "items": {
@@ -3898,6 +4597,11 @@
    "SitemapIngestRequest": {
     "description": "Add a site's pages from its sitemap, sitemap index, RSS or Atom feed\n(POST /documents/from-sitemap).",
     "properties": {
+     "dry_run": {
+      "default": false,
+      "title": "Dry Run",
+      "type": "boolean"
+     },
      "folder": {
       "anyOf": [
        {
@@ -3992,6 +4696,20 @@
       "title": "Left Out",
       "type": "integer"
      },
+     "pages": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/components/schemas/SitemapPageResponse"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Pages"
+     },
      "urls": {
       "items": {
        "type": "string"
@@ -4006,6 +4724,29 @@
      "child_sitemaps"
     ],
     "title": "SitemapIngestResponse",
+    "type": "object"
+   },
+   "SitemapPageResponse": {
+    "properties": {
+     "state": {
+      "title": "State",
+      "type": "string",
+      "x-extensible-enum": [
+       "new",
+       "unchanged",
+       "check"
+      ]
+     },
+     "url": {
+      "title": "Url",
+      "type": "string"
+     }
+    },
+    "required": [
+     "url",
+     "state"
+    ],
+    "title": "SitemapPageResponse",
     "type": "object"
    },
    "SummaryRequest": {
@@ -4279,6 +5020,20 @@
         "type": "null"
        }
       ]
+     },
+     "verification": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/components/schemas/AnswerCheckResponse"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Verification"
      },
      "weak_matches": {
       "default": false,
@@ -5789,6 +6544,11 @@
    },
    "VerifyResponse": {
     "properties": {
+     "empty_scope": {
+      "default": false,
+      "title": "Empty Scope",
+      "type": "boolean"
+     },
      "more": {
       "default": false,
       "title": "More",
@@ -6450,6 +7210,84 @@
      }
     },
     "summary": "List Audit"
+   }
+  },
+  "/admin/calibrate": {
+   "post": {
+    "operationId": "calibrate_admin_calibrate_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CalibrateRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ScoreReportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "Feedback labels asked for with feedback off."
+     },
+     "409": {
+      "description": "No suggestion to apply (too few traces)."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Calibrate"
    }
   },
   "/admin/consistency": {
@@ -7434,6 +8272,94 @@
     "summary": "Download Stored Backup"
    }
   },
+  "/backups/{name}/drill": {
+   "post": {
+    "operationId": "drill_stored_backup_backups__name__drill_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "name",
+      "required": true,
+      "schema": {
+       "title": "Name",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Documents to read; 0 = all.",
+      "in": "query",
+      "name": "sample",
+      "required": false,
+      "schema": {
+       "default": 20,
+       "description": "Documents to read; 0 = all.",
+       "maximum": 10000,
+       "minimum": 0,
+       "title": "Sample",
+       "type": "integer"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BackupDrillResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such backup, or BACKUP_DIR is unset."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Drill Stored Backup"
+   }
+  },
   "/backups/{name}/restore": {
    "post": {
     "operationId": "restore_stored_backup_backups__name__restore_post",
@@ -7455,6 +8381,28 @@
        "default": false,
        "title": "Background",
        "type": "boolean"
+      }
+     },
+     {
+      "description": "Restore just these documents (repeatable); feedback isn't restored then.",
+      "in": "query",
+      "name": "only",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "items": {
+          "type": "string"
+         },
+         "maxItems": 500,
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Restore just these documents (repeatable); feedback isn't restored then.",
+       "title": "Only"
       }
      },
      {
@@ -7965,6 +8913,68 @@
      }
     },
     "summary": "Upload Archive From Url"
+   }
+  },
+  "/documents/duplicates": {
+   "get": {
+    "operationId": "list_duplicates_documents_duplicates_get",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DuplicateReportResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Duplicates"
    }
   },
   "/documents/from-sitemap": {
@@ -10524,6 +11534,78 @@
     "summary": "Answer Question"
    }
   },
+  "/questions/batch": {
+   "post": {
+    "operationId": "answer_questions_questions_batch_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/BatchQuestionRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BatchQuestionResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Answer Questions"
+   }
+  },
   "/questions/continue": {
    "post": {
     "description": "The rest of an answer cut off at the token limit, streamed like\n/questions/stream (sources, deltas, done with the whole answer).",
@@ -10599,6 +11681,78 @@
      }
     },
     "summary": "Continue Answer Stream"
+   }
+  },
+  "/questions/recheck": {
+   "post": {
+    "operationId": "recheck_answer_questions_recheck_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RecheckRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RecheckResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Recheck Answer"
    }
   },
   "/questions/stream": {

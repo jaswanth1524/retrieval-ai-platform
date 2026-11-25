@@ -96,6 +96,7 @@ from api.schemas import (
     PreviewChunkResponse,
     SitemapIngestRequest,
     SitemapIngestResponse,
+    SitemapPageResponse,
     UrlIngestRequest,
 )
 from api.settings import AppSettings
@@ -213,6 +214,17 @@ def _names_and_sources(
     return names, pages
 
 
+def page_state(before: KnownPage | None, listed: float | None) -> str:
+    """What a sitemap import would do with a page (its dry run): ``new``, ``unchanged``
+    (skipped, as ``run_page_import`` skips it) or ``check`` (fetched conditionally)."""
+
+    if before is None:
+        return "new"
+    if before.uploaded_at is not None and listed is not None and listed <= before.uploaded_at:
+        return "unchanged"
+    return "check"
+
+
 def checked_folder(folder: str | None) -> str | None:
     """A ``folder`` to keep fetched documents under, checked as a document name's
     folders are (400 otherwise); None for none."""
@@ -286,6 +298,18 @@ async def add_from_sitemap(
     finally:
         _url_fetch_slots.release()
     known, indexed = await run_in_threadpool(_names_and_sources, repository, settings)
+    if request.dry_run:
+        return SitemapIngestResponse(
+            urls=found.urls,
+            left_out=found.left_out,
+            child_sitemaps=len(found.child_sitemaps),
+            pages=[
+                SitemapPageResponse(
+                    url=url, state=page_state(indexed.get(url), found.lastmods.get(url))
+                )
+                for url in found.urls
+            ],
+        )
 
     def fetch_page(
         url: str, has_room: Callable[[int], bool], etag: str | None, modified: str | None
@@ -634,6 +658,9 @@ async def upload_archive_from_url(
             functools.partial(
                 fetch_document, request.url, settings, has_room=lambda size: True, archive=True
             ),
+            # Spooled and imported in the background, waiting for room as it goes: a
+            # full indexing queue is no reason to refuse the download.
+            needs_room=False,
         )
     finally:
         _archive_fetches.release()

@@ -70,11 +70,16 @@ class BackgroundImport:
     resumed: bool = False
     # Stopped by the server shutting down, not by anyone asking.
     interrupted: bool = False
+    # Its turn on the import thread has come (one runs at a time).
+    began: bool = False
 
     @property
     def state(self) -> str:
         if self.finished_at is None:
-            return "cancelling" if self.cancel.is_set() else "running"
+            if self.cancel.is_set():
+                return "cancelling"
+            # Behind another import on the one import thread: not running yet.
+            return "running" if self.began else "waiting"
         if self.errored:
             return "failed"
         return "cancelled" if self.cancel.is_set() else "done"
@@ -137,8 +142,11 @@ def start(
                 _waiting.remove(entry)
             else:
                 return  # shut down before its turn (its cleanup ran there)
+        status.began = True
         try:
-            run(status)
+            # Cancelled while it waited its turn: nothing to run.
+            if not status.cancel.is_set():
+                run(status)
         except Exception as exc:  # noqa: BLE001 - reported on the import, not raised
             logger.exception("Background %s import %s failed.", kind, name)
             # An HTTPException carries the message a request would have answered with.

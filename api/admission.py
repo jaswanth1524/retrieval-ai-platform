@@ -19,6 +19,27 @@ Release = Callable[[], None]
 
 SlotKind = Literal["question", "summary"]
 
+# Requests that may wait, slot-less, for an identical question being answered: this
+# many per question slot. Each waits on a request thread (the shared threadpool, or an
+# SSE thread), so without a cap a burst of one question behind a slow local model took
+# every thread the other routes need.
+FOLLOWERS_PER_SLOT = 4
+
+
+def _idempotent(release: Callable[[], None]) -> Release:
+    released = False
+    guard = Lock()
+
+    def once() -> None:
+        nonlocal released
+        with guard:
+            if released:
+                return
+            released = True
+        release()
+
+    return once
+
 
 class QuestionSlots:
     """A non-blocking counting semaphore handing out idempotent release callbacks.
@@ -31,6 +52,18 @@ class QuestionSlots:
         # 0 (MAX_CONCURRENT_QUESTIONS=0 / MAX_CONCURRENT_SUMMARIES=0) means no cap.
         self._semaphore = BoundedSemaphore(limit) if limit > 0 else None
         self._summaries = BoundedSemaphore(summary_limit) if summary_limit > 0 else None
+        self._followers = BoundedSemaphore(limit * FOLLOWERS_PER_SLOT) if limit > 0 else None
+
+    def try_follow(self) -> Release | None:
+        """A release callback for one request waiting on an identical run (no question
+        slot), when the cap on those leaves room, else None. Never blocks."""
+
+        followers = self._followers
+        if followers is None:
+            return _idempotent(lambda: None)
+        if not followers.acquire(blocking=False):
+            return None
+        return _idempotent(followers.release)
 
     def try_acquire(self, kind: SlotKind = "question") -> Release | None:
         """A release callback when a slot was free, else None. Never blocks."""

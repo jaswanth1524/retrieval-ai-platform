@@ -18,9 +18,11 @@ from fastapi.responses import FileResponse
 
 from api.audit import audit
 from api.audit_log import AuditLog
+from api.chunking import TokenCounter
 from api.consistency import LostIndexError, consistency_report, repair
 from api.dependencies import (
     get_audit_log,
+    get_token_counter,
     require_full_key,
 )
 from api.doctor import diagnose
@@ -30,14 +32,23 @@ from api.document_names import (
 )
 from api.documents import (
     DocumentSource,
+    chunk_sections,
 )
 from api.export import build_export
 from api.feedback import FeedbackStore
-from api.imports import BackgroundImport, remember, spool_directory, spool_upload, wait_for_room
+from api.imports import (
+    BackgroundImport,
+    adopt_upload,
+    remember,
+    spool_directory,
+    spool_upload,
+    wait_for_room,
+)
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
 from api.ingestion import IngestionError
 from api.notify import TEST_EVENT, NotifyError, current_notifier
+from api.parse_isolation import parse_with_limit
 from api.raw_documents import RawDocumentStore
 from api.rebuild import originals_to_rebuild, rebuild
 from api.repository import VectorRepository
@@ -45,6 +56,7 @@ from api.restore import (
     MAX_MEMBERS,
     BackupCheck,
     BackupImportError,
+    drill_backup,
     restore_backup,
     verify_backup,
 )
@@ -69,6 +81,7 @@ from api.schemas import (
     AuditResponse,
     BackupCheckResponse,
     BackupDeleteResponse,
+    BackupDrillResponse,
     BackupFileResponse,
     BackupListResponse,
     BackupRunResponse,
@@ -78,6 +91,7 @@ from api.schemas import (
     DoctorFindingResponse,
     DoctorResponse,
     DocumentJobAcceptedResponse,
+    DrillDocumentResponse,
     ImportResponse,
     NotifyTestResponse,
     RebuildResponse,
@@ -191,18 +205,31 @@ def import_backup(
     if background:
         directory = spool_directory(settings.import_spool_dir)
         require_free_space(settings, directory or tempfile.gettempdir())
-        spool = spool_upload(file.file, "docrag-restore-", directory)
         name = file.filename or "backup.zip"
         record = None
+        # With IMPORT_SPOOL_DIR, copied onto the data volume (and remembered, to resume
+        # after a restart). Without it, the file the web server already received is
+        # kept as it is: copying it into the same temp directory needed room twice.
+        spool: Path | IO[bytes]
         if directory is not None:
-            record = remember(
-                directory,
-                {"kind": "restore", "name": name, "workspace": workspace_of(settings)},
-                spool,
-            )
+            spool = spool_upload(file.file, "docrag-restore-", directory)
+            try:
+                record = remember(
+                    directory,
+                    {"kind": "restore", "name": name, "workspace": workspace_of(settings)},
+                    spool,
+                )
+            except BaseException:
+                spool.unlink(missing_ok=True)
+                raise
+        else:
+            spool = adopt_upload(file)
 
         def cleanup() -> None:
-            spool.unlink(missing_ok=True)
+            if isinstance(spool, Path):
+                spool.unlink(missing_ok=True)
+            else:
+                spool.close()
             if record is not None:
                 record.unlink(missing_ok=True)
 
@@ -220,8 +247,21 @@ def import_backup(
     return _restore(file.file, repository, settings, queue, raw_store, feedback_store)
 
 
+@contextlib.contextmanager
+def _opened(source: Path | IO[bytes]) -> Iterator[IO[bytes]]:
+    """A spooled file opened, or an upload taken over read from its start (left open:
+    the import's cleanup closes it, and so removes it)."""
+
+    if isinstance(source, Path):
+        with source.open("rb") as handle:
+            yield handle
+        return
+    source.seek(0)
+    yield source
+
+
 def _restore_in_background(
-    path: Path,
+    path: Path | IO[bytes],
     name: str,
     repository: VectorRepository,
     settings: AppSettings,
@@ -233,6 +273,7 @@ def _restore_in_background(
     source: str | None = None,
     resumable: bool = False,
     resumed: bool = False,
+    only: frozenset[str] | None = None,
 ) -> ImportResponse:
     """Check the backup's manifest now (a bad one is a 400 here, not a failed import),
     then restore it on the import thread, waiting for room instead of deferring."""
@@ -254,7 +295,7 @@ def _restore_in_background(
         raise
 
     def run(status: BackgroundImport) -> None:
-        with path.open("rb") as handle:
+        with _opened(path) as handle:
             outcome = _restore(
                 handle,
                 repository,
@@ -264,6 +305,7 @@ def _restore_in_background(
                 feedback_store,
                 source=source,
                 status=status,
+                only=only,
             )
         status.skipped += len(outcome.skipped) + len(outcome.missing_originals)
         # Cancelled: a document it was waiting to queue was left out, not refused.
@@ -313,6 +355,7 @@ def _restore(
     *,
     source: str | None = None,
     status: BackgroundImport | None = None,
+    only: frozenset[str] | None = None,
 ) -> ImportResponse:
     """Restore one backup into ``settings``' workspace: an upload (``/import``) or one
     of BACKUP_DIR's (``source`` names it, for the audit). With ``status`` (a background
@@ -380,6 +423,7 @@ def _restore(
             # inside an uploaded migration bundle is an upload like any other.
             stored=source is not None and not source.startswith("bundle:"),
             stop=status.cancel.is_set if status is not None else None,
+            only=only,
             # In a migration bundle: a whole server's worth of entries may be in it.
             max_members=(
                 int(settings.max_migrate_members)
@@ -578,6 +622,48 @@ def verify_stored_backup(name: str, request: Request, settings: SettingsDep) -> 
     return _check_response(check)
 
 
+# A restore rehearsed on one of this workspace's backups: a sample of its originals
+# (``sample``; 0 = all) read, parsed and chunked with this server's parsers and
+# settings — nothing indexed or stored. Verify proves the zip is whole; this proves its
+# originals still make documents. One at a time (it shares verify's guard).
+@router.post(
+    "/backups/{name}/drill",
+    response_model=BackupDrillResponse,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No such backup, or BACKUP_DIR is unset."}},
+)
+def drill_stored_backup(
+    name: str,
+    settings: SettingsDep,
+    counter: Annotated[TokenCounter, Depends(get_token_counter)],
+    sample: Annotated[int, Query(ge=0, le=10_000, description="Documents to read; 0 = all.")] = 20,
+) -> BackupDrillResponse:
+    path = _stored_backup(settings, name)
+
+    def parse(filename: str, content: bytes) -> int:
+        sections = parse_with_limit(filename, content, settings)
+        return len(chunk_sections(sections, settings, counter))
+
+    with _one_verify(), path.open("rb") as handle:
+        report = drill_backup(
+            handle,
+            parse,
+            sample=sample or None,
+            max_original_bytes=int(settings.max_upload_bytes),
+        )
+    failed = sum(not d.ok for d in report.documents)
+    audit("backup.drill", workspace=workspace_of(settings), name=name, failed=failed)
+    return BackupDrillResponse(
+        name=name,
+        listed=report.listed,
+        checked=len(report.documents),
+        failed=failed,
+        documents=[DrillDocumentResponse(**dataclasses.asdict(d)) for d in report.documents],
+        problems=report.problems,
+        ok=not failed and not report.problems,
+    )
+
+
 # Restore one of this workspace's backups from BACKUP_DIR, as /import would the same
 # file uploaded — without sending it over the network first.
 @router.post(
@@ -595,8 +681,16 @@ def restore_stored_backup(
     raw_store: RawDocumentStoreDep,
     feedback_store: FeedbackStoreDep,
     background: bool = False,
+    only: Annotated[
+        list[str] | None,
+        Query(
+            max_length=500,
+            description="Restore just these documents (repeatable); feedback isn't restored then.",
+        ),
+    ] = None,
 ) -> ImportResponse:
     path = _stored_backup(settings, name)
+    chosen = frozenset(only) if only else None
     require_free_space(settings, settings.raw_document_dir)
     if background:
         directory = spool_directory(settings.import_spool_dir)
@@ -610,6 +704,7 @@ def restore_stored_backup(
                     "name": name,
                     "workspace": workspace_of(settings),
                     "stored": name,
+                    **({"only": sorted(chosen)} if chosen else {}),
                 },
             )
         kept = record
@@ -624,9 +719,12 @@ def restore_stored_backup(
             source=name,
             cleanup=(lambda: kept.unlink(missing_ok=True)) if kept is not None else lambda: None,
             resumable=record is not None,
+            only=chosen,
         )
     with path.open("rb") as handle:
-        return _restore(handle, repository, settings, queue, raw_store, feedback_store, source=name)
+        return _restore(
+            handle, repository, settings, queue, raw_store, feedback_store, source=name, only=chosen
+        )
 
 
 # The audit events kept in AUDIT_LOG_PATH (api/audit_log.py): this workspace's, or every

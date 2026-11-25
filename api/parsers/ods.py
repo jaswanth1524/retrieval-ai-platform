@@ -14,7 +14,7 @@ from api.parsers.common import (
     check_zip_expanded_size,
     refuse_zip_xml_dtd,
 )
-from api.parsers.odt import _TABLE, _count, row_cells
+from api.parsers.odt import _TABLE, HiddenStyles, _count, row_cells, warn_hidden
 from api.parsers.xlsx import _sheet_sections
 from api.settings import AppSettings
 
@@ -45,13 +45,27 @@ def parse_ods_document(
     body = root.find(f"{_OFFICE}body/{_OFFICE}spreadsheet")
     if body is None:
         raise EmptyDocumentError(f"ODS '{filename}' has no sheets.")
+    # Hidden sheets and rows (INDEX_HIDDEN_CONTENT), as in XLSX. Pages and row numbers
+    # stay the sheets' and rows' own.
+    hidden = bool(settings is not None and settings.index_hidden_content)
+    styles = None if hidden else HiddenStyles(root)
+    hidden_sheets = hidden_rows = 0
     sections: list[DocumentSection] = []
     cells = 0
     for page, table in enumerate(body.iter(f"{_TABLE}table"), start=1):
+        if styles is not None and table.get(f"{_TABLE}style-name") in styles.table:
+            hidden_sheets += 1
+            continue
         title = table.get(f"{_TABLE}name") or f"Sheet {page}"
         records: list[tuple[int, list[str]]] = []
         number = 0
         for row in table.iter(f"{_TABLE}table-row"):
+            if styles is not None and row.get(f"{_TABLE}visibility") == "collapse":
+                repeat = _count(row, f"{_TABLE}number-rows-repeated", 1 << 30)
+                if any(value.strip() for value in row_cells(row)):
+                    hidden_rows += min(repeat, _MAX_REPEATED_ROWS)
+                number += repeat
+                continue
             values = row_cells(row)
             filled = any(value.strip() for value in values)
             repeat = _count(row, f"{_TABLE}number-rows-repeated", 1 << 30)
@@ -69,6 +83,8 @@ def parse_ods_document(
                 records.append((number, list(values)))
             number += max(repeat - _MAX_REPEATED_ROWS, 0)
         sections.extend(_sheet_sections(filename, page, title, records, rows_per_section))
+    warn_hidden(filename, hidden_sheets, "sheet(s)")
+    warn_hidden(filename, hidden_rows, "row(s)")
     if not sections:
         raise EmptyDocumentError(f"ODS '{filename}' has no cell values.")
     return sections

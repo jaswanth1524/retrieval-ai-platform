@@ -61,7 +61,7 @@ def _job_response(job: IngestJob) -> DocumentJobStatusResponse:
 
 
 async def _fetch_for_ingest(
-    queue: IngestQueue, fetch: Callable[[], FetchedDocument]
+    queue: IngestQueue, fetch: Callable[[], FetchedDocument], *, needs_room: bool = True
 ) -> FetchedDocument:
     """Run a URL fetch for indexing (add from URL, refresh), admitted like an upload.
 
@@ -70,9 +70,11 @@ async def _fetch_for_ingest(
     before reading the body, and ``enqueue`` makes the real reservation. Each fetch
     holds a request thread for up to URL_INGEST_TIMEOUT_SECONDS and up to
     MAX_UPLOAD_BYTES of memory: a few at a time, the rest told to retry.
+    ``needs_room=False`` (a zip imported in the background, which waits for room as
+    it goes): a full backlog doesn't refuse it.
     """
 
-    if not queue.backlog.has_room(1):
+    if needs_room and not queue.backlog.has_room(1):
         raise backlog_full_error()
     if not _url_fetch_slots.acquire(blocking=False):
         raise HTTPException(

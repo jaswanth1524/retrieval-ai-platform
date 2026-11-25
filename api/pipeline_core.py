@@ -50,6 +50,7 @@ from api.context_expansion import (
     _map_concurrently,
     expand_with_neighbors,
 )
+from api.continuation import AutoContinuing
 from api.conversation_history import (
     CondenseMemo,
     _clip_earlier_answers,
@@ -92,6 +93,8 @@ from api.prompt_cache import CachingGenerator, shared_prompt_cache
 from api.prompting import (
     FittedPrompt,
     condense_question_detailed,
+    decompose_question,
+    might_be_compound,
 )
 from api.qdrant_schema import check_dense_dimension
 from api.query_log import log_served
@@ -341,19 +344,80 @@ class PipelineCore(TraceRecording):
 
         if status != "no_context" or not (run.filenames or run.tags):
             return status
+        if self.scope_matches_nothing(run.filenames, run.tags, settings):
+            return "empty_scope"
+        return status
+
+    def scope_matches_nothing(
+        self,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        settings: AppSettings | None = None,
+    ) -> bool:
+        """Whether a scope (``filenames``, ``tags``) names no indexed document — a
+        typo'd name, a tag no document carries. False when there is no scope, or when
+        the index can't be read (the plain outcome is still right then)."""
+
+        settings = settings or self._settings
         try:
-            if run.filenames:
+            if filenames:
                 indexed = self._repository.filename_metadata(settings)
-                if not any(name in indexed for name in run.filenames):
-                    return "empty_scope"
-            if run.tags:
-                wanted = {" ".join(tag.split()).casefold() for tag in run.tags}
+                if not any(name in indexed for name in filenames):
+                    return True
+            if tags:
+                wanted = {" ".join(tag.split()).casefold() for tag in tags}
                 stored = {tag.casefold() for tag in self._repository.stored_tags(settings)}
                 if not wanted & stored:
-                    return "empty_scope"
+                    return True
         except Exception:  # noqa: BLE001 - the plain status is still right
-            return status
-        return status
+            return False
+        return False
+
+    def passages_now(
+        self, filename: str, chunk_ids: Sequence[str]
+    ) -> tuple[bool, dict[str, RerankedChunk]]:
+        """Whether ``filename`` is indexed now, and which of ``chunk_ids`` it still holds
+        (a chunk id is its text's hash: one present reads as it did)."""
+
+        if filename not in self._repository.filename_metadata(self._settings):
+            return False, {}
+        found: dict[str, RerankedChunk] = {}
+        for payload in self._repository.chunks_for_filename(
+            self._settings, filename, PassageFilter(chunk_ids=tuple(chunk_ids))
+        ):
+            chunk_id = str(payload.get("chunk_id"))
+            ordinal = payload.get("chunk_ordinal")
+            found[chunk_id] = RerankedChunk(
+                point_id=chunk_id,
+                filename=filename,
+                page=int(payload.get("page") or 1),  # type: ignore[call-overload]
+                section=str(payload.get("section") or ""),
+                chunk_id=chunk_id,
+                text=str(payload.get("text") or ""),
+                retrieval_score=0.0,
+                rerank_score=0.0,
+                chunk_ordinal=ordinal if isinstance(ordinal, int) else None,
+            )
+        return True, found
+
+    def neighbour_text(self, chunk: RerankedChunk) -> str:
+        """``chunk``'s text with its neighbours (as a question's prompt would have it),
+        or its own text when they can't be read."""
+
+        try:
+            if chunk.chunk_ordinal is None:
+                # From an answer's sources (no position): read it off the passage.
+                found = self._repository.chunks_for_filename(
+                    self._settings, chunk.filename, PassageFilter(chunk_ids=(chunk.chunk_id,))
+                )
+                ordinal = found[0].get("chunk_ordinal") if found else None
+                if not isinstance(ordinal, int):
+                    return chunk.text
+                chunk = replace(chunk, chunk_ordinal=ordinal)
+            widened = expand_with_neighbors([chunk], self._repository, self._settings)
+        except Exception:  # noqa: BLE001 - the passage alone is still a fair reading
+            return chunk.text
+        return (widened[0].expanded_text if widened else None) or chunk.text
 
     def _stored_tag_variants(self, tags: Sequence[str], settings: AppSettings) -> list[str]:
         """The stored spellings of ``tags``, matched the way tags are de-duplicated.
@@ -403,6 +467,24 @@ class PipelineCore(TraceRecording):
             query.strip(), int(settings.query_expansion_count), self._generator, settings
         )
         return variants, (time.monotonic() - start) * 1000
+
+    def _decompose(self, query: str, settings: AppSettings) -> tuple[list[str], float]:
+        """QUERY_DECOMPOSITION_ENABLED's standalone parts of ``query`` (none when it is
+        one question) and the time taken."""
+
+        start = time.monotonic()
+        parts = decompose_question(
+            query.strip(), int(settings.query_decomposition_max_parts), self._generator, settings
+        )
+        return parts, (time.monotonic() - start) * 1000
+
+    def _decomposition(self, query: str, settings: AppSettings) -> tuple[list[str], float] | None:
+        """Whether this question gets decomposed at all (an LLM call it must wait for at a
+        local model): only with the setting on and a question that looks compound."""
+
+        if not settings.query_decomposition_enabled or not might_be_compound(query):
+            return None
+        return self._decompose(query, settings)
 
     def _search(
         self,
@@ -472,8 +554,13 @@ class PipelineCore(TraceRecording):
         seed: EmbeddedText | None = None,
         traced: bool | None = None,
         collect_leg_ranks: bool = False,
+        parts: tuple[list[str], float] | None = None,
+        expand_neighbours: bool = True,
     ) -> RetrievalPhase:
         """Run retrieve -> rerank -> neighbor-expand.
+
+        ``parts`` (QUERY_DECOMPOSITION_ENABLED): a compound question's standalone parts,
+        each retrieved and reranked on its own (``_retrieve_parts``).
 
         ``traced`` says whether a trace will show this retrieval (default: when it
         feeds an answer): only then are each candidate's leg ranks collected, which
@@ -498,6 +585,24 @@ class PipelineCore(TraceRecording):
         normalized_query = question.strip()
         if not normalized_query:
             raise RetrievalError("Query text is required.")
+        picked = narrow is not None and bool(narrow.chunk_ids)
+        if (
+            parts is not None
+            and len(parts[0]) >= 2
+            and for_generation
+            and not picked
+            and seed is None
+        ):
+            return self._retrieve_parts(
+                parts,
+                effective_settings,
+                filenames,
+                tags,
+                should_stop,
+                narrow=narrow,
+                traced=traced,
+                collect_leg_ranks=collect_leg_ranks,
+            )
         self._repository.ensure_ready(effective_settings)
         # Looked up alongside embedding (and, for a sync answer, query expansion), which
         # don't depend on it; only the search below needs the stored spellings.
@@ -560,7 +665,7 @@ class PipelineCore(TraceRecording):
         expanded, context_expansion_ms = self._expand_context(
             diverse_outcome.kept,
             effective_settings,
-            for_generation and not picked_only,
+            for_generation and not picked_only and expand_neighbours,
             narrow=narrow,
         )
 
@@ -579,6 +684,100 @@ class PipelineCore(TraceRecording):
             query_variants=queries[1:],
             below_min_score=selection.below_min_score,
             leg_ranks=leg_ranks or {},
+        )
+
+    def _retrieve_parts(
+        self,
+        parts: tuple[list[str], float],
+        effective_settings: AppSettings,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        should_stop: Callable[[], bool] | None,
+        *,
+        narrow: PassageFilter | None,
+        traced: bool | None,
+        collect_leg_ranks: bool,
+    ) -> RetrievalPhase:
+        """A compound question's parts each retrieved and reranked on its own (scored
+        against the whole question, a part's passages fell under the bar: the cross-
+        encoder spreads one passage's relevance over every topic asked), then their kept
+        passages taken in turn — each part's best first — so the prompt's first
+        ``max_context_chunks`` cover every part. Neighbour expansion runs once, over the
+        merged list."""
+
+        questions, decompose_ms = parts
+        phases = [
+            self._retrieve_and_rerank(
+                part,
+                effective_settings,
+                filenames,
+                tags,
+                should_stop,
+                narrow=narrow,
+                # Selected as for an answer (fallback, relative cut); no expansion call
+                # per part, and neighbours added once, over the merged list.
+                expansion=([], 0.0),
+                traced=traced,
+                collect_leg_ranks=collect_leg_ranks,
+                expand_neighbours=False,
+            )
+            for part in questions
+        ]
+        merged: list[RerankedChunk] = []
+        seen: set[str] = set()
+        for rank in range(max((len(phase.context_chunks) for phase in phases), default=0)):
+            for phase in phases:
+                if rank < len(phase.context_chunks):
+                    chunk = phase.context_chunks[rank]
+                    if chunk.point_id not in seen:
+                        seen.add(chunk.point_id)
+                        merged.append(chunk)
+        merged = merged[: int(effective_settings.rerank_top_k)]
+        expanded, context_expansion_ms = self._expand_context(
+            merged, effective_settings, True, narrow=narrow
+        )
+
+        def unique[T](items: Sequence[T], key: Callable[[T], str]) -> list[T]:
+            out: list[T] = []
+            keys: set[str] = set()
+            for item in items:
+                if key(item) not in keys:
+                    keys.add(key(item))
+                    out.append(item)
+            return out
+
+        leg_ranks: dict[str, list[int | None]] = {}
+        for phase in phases:
+            for point, ranks in phase.leg_ranks.items():
+                leg_ranks.setdefault(point, ranks)
+        return RetrievalPhase(
+            context_chunks=expanded,
+            fused_candidates=unique(
+                [c for phase in phases for c in phase.fused_candidates], lambda c: c.point_id
+            ),
+            scored_chunks=sorted(
+                unique(
+                    sorted(
+                        (c for phase in phases for c in phase.scored_chunks),
+                        key=lambda c: -c.rerank_score,
+                    ),
+                    lambda c: c.point_id,
+                ),
+                key=lambda c: -c.rerank_score,
+            ),
+            embed_ms=sum(phase.embed_ms for phase in phases),
+            search_ms=sum(phase.search_ms for phase in phases),
+            rerank_ms=sum(phase.rerank_ms for phase in phases),
+            rerank_wait_ms=sum(phase.rerank_wait_ms for phase in phases),
+            # The decomposition is a query rewrite, as the expansion is.
+            query_expansion_ms=decompose_ms,
+            context_expansion_ms=context_expansion_ms,
+            diversity_dropped_ids=frozenset().union(*(p.diversity_dropped_ids for p in phases)),
+            relative_cut_ids=frozenset().union(*(p.relative_cut_ids for p in phases)),
+            query_variants=list(questions),
+            # Weak only when no part found a passage clearing the bar.
+            below_min_score=all(phase.below_min_score for phase in phases),
+            leg_ranks=leg_ranks,
         )
 
     def retrieve(
@@ -758,6 +957,21 @@ class PipelineCore(TraceRecording):
             return None
         return self._answer_cache.get(key)
 
+    def joinable(
+        self,
+        question: str,
+        overrides: AnswerOverrides | None,
+        filenames: Sequence[str] | None,
+        tags: Sequence[str] | None,
+        history: Sequence[ChatMessage] | None,
+    ) -> bool:
+        """Whether this question could join (or lead) an identical run: it has a cache
+        key and there is a cache. Admission skips waiting for a run otherwise."""
+
+        if self._answer_cache is None:
+            return False
+        return self._cache_key(question, overrides, filenames, tags, history) is not None
+
     def identical_run(
         self,
         question: str,
@@ -809,6 +1023,7 @@ class PipelineCore(TraceRecording):
         cached: CachedAnswer | None = None,
         follow: threading.Event | None = None,
         claimed: threading.Event | None = None,
+        take_slot: Callable[[], bool] | None = None,
     ) -> GroundedAnswer:
         """``_answer_uncached``, served from the answer cache when it has this question
         (``cached``: the hit already looked up, replayed as it is).
@@ -825,12 +1040,14 @@ class PipelineCore(TraceRecording):
             return cached.as_grounded(_cached_timings(started))
         key = self._cache_key(question, overrides, filenames, tags, history)
         if follow is not None and key is not None and self._answer_cache is not None:
-            # Admitted without a slot to wait for the identical run: its answer or a 429.
-            followed = drain(follow_only(self._answer_cache, key, follow, should_stop))
+            # Admitted without a slot to wait for the identical run: its answer, or — when
+            # it left none — a slot of this request's own to run it (else a 429).
+            followed = drain(follow_only(self._answer_cache, key, follow, should_stop, take_slot))
             if followed is None:
                 raise QuestionAbandoned
-            self._log_hit(followed, question, "sync", filenames, tags, overrides)
-            return followed.as_grounded(_cached_timings(started))
+            if isinstance(followed, CachedAnswer):
+                self._log_hit(followed, question, "sync", filenames, tags, overrides)
+                return followed.as_grounded(_cached_timings(started))
         # ``claimed``: this request leads the run already (claimed as it was admitted).
         lead: threading.Event | None = claimed
         if claimed is None and key is not None and use_cache and self._answer_cache is not None:
@@ -922,6 +1139,18 @@ class PipelineCore(TraceRecording):
                     expansion = self._expand_query(retrieval_query, effective_settings)
                 finally:
                     expansion_slot.release()
+            # A compound question's parts (QUERY_DECOMPOSITION_ENABLED): an LLM call too.
+            decomposition: tuple[list[str], float] | None = None
+            if (
+                effective_settings.query_decomposition_enabled
+                and might_be_compound(retrieval_query)
+                and not (run.narrow is not None and run.narrow.chunk_ids)
+            ):
+                decompose_slot = drain(wait_for_model(effective_settings, should_stop))
+                try:
+                    decomposition = self._decomposition(retrieval_query, effective_settings)
+                finally:
+                    decompose_slot.release()
             phase = self._retrieve_and_rerank(
                 retrieval_query,
                 effective_settings,
@@ -931,6 +1160,7 @@ class PipelineCore(TraceRecording):
                 narrow=run.narrow,
                 also_search=question if run.condensed_question else None,
                 expansion=expansion,
+                parts=decomposition,
             )
             prompt_question, fitted = self._fit_prompt(run, effective_settings, phase)
             selected = fitted.context_chunks
@@ -958,7 +1188,12 @@ class PipelineCore(TraceRecording):
             grounded = generate_grounded_answer(
                 query=prompt_question,
                 context_chunks=selected,
-                generator=generator,
+                # AUTO_CONTINUE_MAX, as on the stream: a cut-off answer is continued.
+                generator=(
+                    AutoContinuing(generator, int(effective_settings.auto_continue_max))
+                    if effective_settings.auto_continue_max
+                    else generator
+                ),
                 settings=effective_settings,
                 history=fitted.history or None,
                 weak_matches=phase.below_min_score,

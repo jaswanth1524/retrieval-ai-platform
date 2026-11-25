@@ -49,15 +49,25 @@ def central_directory(upload: IO[bytes]) -> tuple[int, int] | None:
             locator, has_locator = found, True
         if has_locator:
             (record_at,) = struct.unpack_from("<Q", tail, locator + 8)
-            upload.seek(record_at)
-            record = upload.read(56)
-            if len(record) < 56 or not record.startswith(_EOCD64):
-                if entries == 0xFFFF or directory_bytes == 0xFFFFFFFF:
-                    return None
-            else:
+            # Python 3.12's zipfile reads the record right before the locator and never
+            # looks at the offset the locator gives; newer ones read at that offset and
+            # fall back to the record before the locator. Either may be the one believed,
+            # so both are read and the larger claim counts: reading only the offset let a
+            # locator pointing at junk keep the end record's small count.
+            found = False
+            for position in {start + locator - 56, record_at}:
+                if position < 0:
+                    continue
+                upload.seek(position)
+                record = upload.read(56)
+                if len(record) < 56 or not record.startswith(_EOCD64):
+                    continue
+                found = True
                 wide_entries, wide_bytes = struct.unpack_from("<QQ", record, 32)
                 entries = max(entries, wide_entries)
                 directory_bytes = max(directory_bytes, wide_bytes)
+            if not found and (entries == 0xFFFF or directory_bytes == 0xFFFFFFFF):
+                return None
         return int(entries), int(directory_bytes)
     except (OSError, struct.error, ValueError):
         return None
