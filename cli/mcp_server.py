@@ -12,10 +12,11 @@ default one; ``list_workspaces`` shows which exist.
 Every tool goes through the REST API (``cli.client``), so the server's key, read-only
 key, rate limit and question slots apply; the read-only key is enough, since no tool
 changes the corpus — unless the server is started with ``--allow-writes`` (or
-``DOCRAG_MCP_ALLOW_WRITES=1``), which adds ``add_url``, ``add_note``, ``reindex``,
-``retry_job`` and ``job_status``: those need the full key, and let an agent add to the
-corpus (add_url replaces a document from another source only when asked to, with
-``replace``).
+``DOCRAG_MCP_ALLOW_WRITES=1``), which adds ``add_url``, ``add_note``,
+``tag_document``, ``delete_document``, ``reindex``, ``retry_job`` and ``job_status``:
+those need the full key, and let an agent change the corpus (add_url replaces a
+document from another source only when asked to, with ``replace``; delete_document
+only with the name repeated in ``confirm_filename``).
 """
 
 from __future__ import annotations
@@ -59,6 +60,13 @@ _WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_wor
 # add_note: writes only, but with replace=true it replaces a document of that name.
 _REPLACES = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
 _FETCHES = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
+# tag_document replaces a document's tags; delete_document removes it.
+_TAGS = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+)
+_DELETES = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False
+)
 
 INSTRUCTIONS = (
     "DocRAG answers questions from the user's own indexed documents, with citations. "
@@ -551,6 +559,18 @@ def _add_read_tools(server: MCPServer, call: ToolCall) -> None:
         return await call(work)
 
     @server.tool(annotations=_READ_ONLY)
+    async def index_status(workspace: str | None = None) -> str:
+        """How DocRAG is doing: whether it is ready (Qdrant, the model, the index), how
+        many documents are indexed and how many need re-indexing, the last backup,
+        failing and running indexing jobs, and background imports."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            return index_status_text(client)
+
+        result: str = await call(work, workspace)
+        return result
+
+    @server.tool(annotations=_READ_ONLY)
     async def list_jobs(failed_only: bool = False, workspace: str | None = None) -> str:
         """Indexing jobs: those queued or running now, then the latest finished ones
         (only the failed ones with failed_only), with why a failed one failed."""
@@ -570,8 +590,54 @@ def _add_read_tools(server: MCPServer, call: ToolCall) -> None:
         return result
 
 
+def index_status_text(client: DocragClient) -> str:
+    """``index_status``'s report: readiness, the listing's counts, jobs and imports."""
+
+    ready = client.readiness()
+    lines = [
+        f"Status: {ready.get('status')} (Qdrant {'up' if ready.get('qdrant') else 'DOWN'}, "
+        f"model {ready.get('llm_provider')} "
+        f"{'reachable' if ready.get('generation_provider') else 'NOT reachable'})"
+    ]
+    if not ready.get("index_compatible", True):
+        lines.append(f"Index: incompatible — {ready.get('index_detail') or 're-ingest needed'}")
+    failed_models = [
+        name for name, state in (ready.get("models") or {}).items() if state == "failed"
+    ]
+    if failed_models:
+        lines.append("Models not loaded: " + ", ".join(failed_models))
+    listing = client.documents(limit=1)
+    total = listing.get("total", len(listing.get("filenames", [])))
+    stale = len(listing.get("stale_filenames", []))
+    lines.append(f"Documents: {total}" + (f" ({stale} need re-indexing)" if stale else ""))
+    if total == 0 and ready.get("originals_kept"):
+        lines.append(
+            "No document is indexed though originals are kept: if the index was lost, "
+            "`docrag rebuild` brings it back."
+        )
+    backup = ready.get("last_backup")
+    if backup:
+        state = "ok" if backup.get("ok") else f"FAILED — {backup.get('error')}"
+        lines.append(f"Last backup: {state}")
+    if ready.get("backups_failing"):
+        lines.append("Backups failing: " + ", ".join(ready["backups_failing"]))
+    running = client.active_jobs()
+    failed = client.finished_jobs(failed_only=True, limit=5)
+    lines.append(f"Indexing jobs: {len(running)} queued or running, {len(failed)} failed recently")
+    for job in failed:
+        lines.append(f"  failed: {job.get('filename')} — {job.get('error')}")
+    imports = [i for i in client.background_imports() if i.get("finished_at") is None]
+    for item in imports:
+        lines.append(
+            f"Import {item.get('kind')} '{item.get('name')}': {item.get('state')}, "
+            f"{item.get('queued', 0)} queued so far"
+        )
+    return "\n".join(lines)
+
+
 def _add_write_tools(server: MCPServer, call: Call) -> None:
-    """``add_url``, ``reindex``, ``retry_job``, ``job_status`` (--allow-writes)."""
+    """``add_url``, ``add_note``, ``tag_document``, ``delete_document``, ``reindex``,
+    ``retry_job``, ``job_status`` (--allow-writes)."""
 
     def accepted(job: dict[str, Any]) -> str:
         return (
@@ -629,6 +695,33 @@ def _add_write_tools(server: MCPServer, call: Call) -> None:
                     "to replace it with this note, or choose another name."
                 )
             return accepted(client.upload_text(stored, text, tags=tags or ()))
+
+        result: str = await call(work, workspace)
+        return result
+
+    @server.tool(annotations=_TAGS)
+    async def tag_document(filename: str, tags: list[str], workspace: str | None = None) -> str:
+        """Set a document's tags (replacing the ones it has; [] removes them all)."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            stored = client.set_tags(filename, tags)
+            return f"{filename}: " + (", ".join(stored) if stored else "no tags now")
+
+        result: str = await call(work, workspace)
+        return result
+
+    @server.tool(annotations=_DELETES)
+    async def delete_document(
+        filename: str, confirm_filename: str, workspace: str | None = None
+    ) -> str:
+        """Delete a document from the index (and its stored original). Irreversible
+        unless a backup holds it: confirm_filename must repeat the filename exactly."""
+
+        def work(client: DocragClient, _: Callable[[], bool]) -> str:
+            if confirm_filename != filename:
+                return "Nothing was deleted: confirm_filename must repeat the filename exactly."
+            client.delete(filename)
+            return f"Deleted {filename}."
 
         result: str = await call(work, workspace)
         return result

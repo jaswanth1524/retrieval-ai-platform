@@ -233,7 +233,73 @@ def _ask_once(
     return result
 
 
+# Questions one batch request carries (the server's BATCH_MAX_QUESTIONS).
+BATCH_SIZE = 20
+
+
+def read_questions(path: str) -> list[str]:
+    """A questions file's questions: one per line, blank lines and # comments left out."""
+
+    text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def cmd_ask_many(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """``ask --questions FILE``: each question answered in turn (POST /questions/batch,
+    BATCH_SIZE at a time), with its sources. Exit 1 when one failed; with --strict,
+    EXIT_NOT_ANSWERED when one wasn't answered."""
+
+    questions = read_questions(args.questions)
+    if not questions:
+        print("error: no questions in that file", file=sys.stderr)
+        return 2
+    answers: list[dict[str, Any]] = []
+    for start in range(0, len(questions), BATCH_SIZE):
+        answers.extend(
+            client.ask_batch(
+                questions[start : start + BATCH_SIZE],
+                filenames=args.file or None,
+                tags=args.tag or None,
+                provider=args.provider,
+                options=question_options(args),
+            )
+        )
+    if args.json or getattr(args, "format", None) == "json":
+        print(json.dumps(answers), file=out)
+    else:
+        for index, item in enumerate(answers, start=1):
+            print(f"{index}. {item.get('question')}", file=out)
+            answer = item.get("answer")
+            if answer is None:
+                print(f"   error: {item.get('error')}", file=out)
+            else:
+                print(f"   {str(answer.get('answer', '')).strip()}", file=out)
+                for source in answer.get("sources", []):
+                    print(
+                        f"   [{source.get('source_number')}] {source.get('filename')} "
+                        f"p.{source.get('page')}, {source.get('section') or '-'}",
+                        file=out,
+                    )
+            print(file=out)
+    if any(item.get("answer") is None for item in answers):
+        return 1
+    if args.strict and any(
+        (item.get("answer") or {}).get("answer_status") in REFUSED_STATUSES for item in answers
+    ):
+        return EXIT_NOT_ANSWERED
+    return 0
+
+
 def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    if getattr(args, "questions", None):
+        return cmd_ask_many(client, args, out)
+    if not args.question:
+        print("ask needs a question, or --questions FILE", file=sys.stderr)
+        return 2
     result = _ask_once(client, args, args.question, out)
     if args.strict and result.done.get("answer_status") in REFUSED_STATUSES:
         return EXIT_NOT_ANSWERED
@@ -372,6 +438,11 @@ def format_checks(result: dict[str, Any]) -> list[str]:
     passage words that support it."""
 
     lines: list[str] = []
+    if result.get("empty_scope"):
+        lines.append(
+            "Nothing was checked: no indexed document matches those files or tags "
+            "(check the names with `docrag list`)."
+        )
     for check in result.get("sentences") or []:
         status = str(check.get("status"))
         lines.append(f"{VERIFY_MARKS.get(status, status + ' ')}{check.get('sentence')}")
@@ -396,6 +467,8 @@ def cmd_verify(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
     else:
         for line in format_checks(result):
             print(line, file=out)
+    if result.get("empty_scope"):
+        return 2
     bad = {"unsupported", "numbers_differ"}
     return 1 if any(c.get("status") in bad for c in result.get("sentences") or []) else 0
 

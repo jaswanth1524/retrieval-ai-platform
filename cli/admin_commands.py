@@ -211,7 +211,12 @@ def cmd_queries(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
 
 def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     if args.action == "report":
-        report = client.score_report()
+        apply = bool(getattr(args, "apply", False))
+        report = (
+            client.calibrate(apply=True, labels=getattr(args, "labels", "model"))
+            if apply
+            else client.score_report()
+        )
         if args.json:
             print(json.dumps(report), file=out)
             return 0
@@ -235,6 +240,8 @@ def cmd_traces(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
                 f"({report['would_change']} traced question(s) decided differently)",
                 file=out,
             )
+            if report.get("applied"):
+                print(f"applied: this workspace now uses RERANK_MIN_SCORE={suggested:g}", file=out)
         print(report["note"], file=out)
         return 0
     if args.action == "diff":
@@ -463,7 +470,24 @@ def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         else:
             print(f"deleted {deleted.get('name')}", file=out)
         return 0
-    report = client.restore_stored_backup(args.target)
+    if args.action == "drill":
+        drill = client.drill_stored_backup(args.target, sample=args.sample)
+        if args.json:
+            print(json.dumps(drill), file=out)
+            return 0 if drill.get("ok") else 1
+        for problem in drill.get("problems", []):
+            print(f"problem: {problem}", file=out)
+        for document in drill.get("documents", []):
+            if not document.get("ok"):
+                print(f"FAILED  {document.get('filename')}: {document.get('error')}", file=out)
+        print(
+            f"{drill.get('checked', 0)} of {drill.get('listed', 0)} document(s) read and "
+            f"parsed, {drill.get('failed', 0)} failed"
+            + (" — the backup restores" if drill.get("ok") else ""),
+            file=out,
+        )
+        return 0 if drill.get("ok") else 1
+    report = client.restore_stored_backup(args.target, only=getattr(args, "only", None))
     if args.json:
         print(json.dumps(report), file=out)
     else:
@@ -548,6 +572,9 @@ def cmd_migrate(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
 
     target = Path(args.file)
     if args.action == "pack":
+        # The bundle (and its background export) belongs to the default workspace,
+        # whichever one this command names: polled under another, it read as unknown.
+        client.use_workspace("")
         written = (
             client.migrate_pack_in_background(target, timeout=_wait_limit(args))
             if args.background

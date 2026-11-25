@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import tempfile
@@ -299,6 +300,41 @@ class DocragClient:
         result: dict[str, Any] = self._json("GET", "/traces/score-report")
         return result
 
+    def ask_batch(
+        self,
+        questions: list[str],
+        *,
+        filenames: list[str] | None = None,
+        tags: list[str] | None = None,
+        provider: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``POST /questions/batch``: each question's answer (or error), in order."""
+
+        body: dict[str, Any] = {"questions": questions}
+        if filenames:
+            body["filenames"] = filenames
+        if tags:
+            body["tags"] = tags
+        if provider:
+            body["llm_provider"] = provider
+        body.update({k: v for k, v in (options or {}).items() if v is not None})
+        # No read limit: the server answers nothing until every question is done
+        # (minutes each on a local model).
+        result: dict[str, Any] = self._json(
+            "POST", "/questions/batch", json=body, timeout=httpx.Timeout(30.0, read=None)
+        )
+        return list(result.get("answers", []))
+
+    def calibrate(self, *, apply: bool = False, labels: str = "model") -> dict[str, Any]:
+        """``POST /admin/calibrate``: this workspace's suggested RERANK_MIN_SCORE, made its
+        own with ``apply``."""
+
+        result: dict[str, Any] = self._json(
+            "POST", "/admin/calibrate", json={"apply": apply, "labels": labels}
+        )
+        return result
+
     def trace_diff(self, trace_id: str, other_id: str) -> dict[str, Any]:
         result: dict[str, Any] = self._json(
             "GET", f"/traces/{_quote(trace_id)}/diff/{_quote(other_id)}"
@@ -334,6 +370,12 @@ class DocragClient:
         """The listing; ``limit``/``cursor``/``prefix``/``tag`` ask for one page of it."""
 
         result: dict[str, Any] = self._json("GET", "/documents", params=params or None)
+        return result
+
+    def duplicates(self) -> dict[str, Any]:
+        """``GET /documents/duplicates``: groups of documents holding identical bytes."""
+
+        result: dict[str, Any] = self._json("GET", "/documents/duplicates")
         return result
 
     def missing(self, documents: list[tuple[str, str]]) -> list[str]:
@@ -622,11 +664,15 @@ class DocragClient:
         max_pages: int | None = None,
         same_host: bool = True,
         folder: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Have the server add the pages a sitemap or feed lists (fetched and queued in
-        the background; the pages it is adding are returned)."""
+        the background; the pages it is adding are returned). ``dry_run``: only what
+        each page would be (``pages``)."""
 
         body: dict[str, Any] = {"url": url, "same_host": same_host}
+        if dry_run:
+            body["dry_run"] = True
         if tags:
             body["tags"] = list(tags)
         if refresh_minutes is not None:
@@ -1119,6 +1165,55 @@ class DocragClient:
             raise DocragError(f"Cannot write {destination}: {exc.strerror or exc}") from exc
         return written
 
+    def download_resumable(self, path: str, destination: Path, attempts: int = 5) -> int:
+        """``GET path`` into ``destination``, resumed where a cut connection left it
+        (a Range request) up to ``attempts`` times, then checked against the server's
+        ``X-Content-SHA256`` when it sends one; returns the bytes written."""
+
+        partial = destination.with_name(f".{destination.name}.part")
+        written = 0
+        expected: str | None = None
+        try:
+            for attempt in range(attempts):
+                headers = dict(self._headers)
+                if written:
+                    headers["Range"] = f"bytes={written}-"
+                try:
+                    with self._http.stream("GET", path, headers=headers) as response:
+                        if response.status_code >= 400:
+                            response.read()
+                            raise DocragError(_detail(response), response.status_code)
+                        expected = response.headers.get("X-Content-SHA256") or expected
+                        if written and response.status_code != 206:
+                            written = 0  # the server sent it whole again
+                        with partial.open("ab" if written else "wb") as out:
+                            for block in response.iter_bytes():
+                                out.write(block)
+                                written += len(block)
+                    break
+                except httpx.HTTPError as exc:
+                    if attempt + 1 >= attempts:
+                        raise DocragError(f"The download was interrupted: {exc}") from exc
+                    self._sleep(min(2.0**attempt, 30.0))
+            if expected is not None:
+                digest = hashlib.sha256()
+                with partial.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1 << 20), b""):
+                        digest.update(block)
+                if digest.hexdigest() != expected:
+                    raise DocragError(
+                        "The downloaded bundle doesn't match the server's checksum; download "
+                        "it again."
+                    )
+            os.replace(partial, destination)
+        except OSError as exc:
+            partial.unlink(missing_ok=True)
+            raise DocragError(f"Cannot write {destination}: {exc.strerror or exc}") from exc
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        return written
+
     def restore(self, archive: Path, *, background: bool = False) -> dict[str, Any]:
         """``POST /import``; with ``background`` the server queues every document as
         room frees and returns an ``import_id`` (``wait_for_import``)."""
@@ -1190,8 +1285,24 @@ class DocragClient:
         result: dict[str, Any] = self._json("POST", f"/backups/{_quote(name)}/verify")
         return result
 
-    def restore_stored_backup(self, name: str) -> dict[str, Any]:
-        result: dict[str, Any] = self._json("POST", f"/backups/{_quote(name)}/restore")
+    def restore_stored_backup(self, name: str, only: list[str] | None = None) -> dict[str, Any]:
+        """Restore a stored backup; ``only`` these documents when given."""
+
+        params = {"only": only} if only else None
+        result: dict[str, Any] = self._json(
+            "POST", f"/backups/{_quote(name)}/restore", params=params
+        )
+        return result
+
+    def drill_stored_backup(self, name: str, sample: int = 20) -> dict[str, Any]:
+        """``POST /backups/{name}/drill``: originals parsed and chunked, nothing indexed."""
+
+        result: dict[str, Any] = self._json(
+            "POST",
+            f"/backups/{_quote(name)}/drill",
+            params={"sample": sample},
+            timeout=httpx.Timeout(30.0, read=None),
+        )
         return result
 
     def delete_stored_backup(self, name: str) -> dict[str, Any]:
@@ -1214,7 +1325,7 @@ class DocragClient:
         if status.get("state") != "done":
             problems = "; ".join(status.get("problems") or []) or str(status.get("state"))
             raise DocragError(f"The server didn't finish the bundle: {problems}")
-        return self.download(f"/admin/migrate/export/{_quote(import_id)}", destination)
+        return self.download_resumable(f"/admin/migrate/export/{_quote(import_id)}", destination)
 
     def migrate_unpack(self, bundle: Path) -> dict[str, Any]:
         """``POST /admin/migrate/import``: the server unpacks it in the background."""

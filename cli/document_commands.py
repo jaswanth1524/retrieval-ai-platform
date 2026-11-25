@@ -624,7 +624,26 @@ def cmd_add_url(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
             max_pages=args.max_pages,
             same_host=not args.any_host,
             folder=args.folder,
+            dry_run=getattr(args, "dry_run", False),
         )
+        if getattr(args, "dry_run", False):
+            if args.json:
+                print(json.dumps(added), file=out)
+                return 0
+            pages = added.get("pages") or []
+            for page in pages:
+                print(f"{page.get('state'):9} {page.get('url')}", file=out)
+            counts = {
+                state: sum(p.get("state") == state for p in pages)
+                for state in ("new", "check", "unchanged")
+            }
+            print(
+                f"{len(pages)} page(s): {counts['new']} new, {counts['check']} to check for "
+                f"changes, {counts['unchanged']} unchanged; {added.get('left_out', 0)} left out "
+                "(dry run: nothing was fetched)",
+                file=out,
+            )
+            return 0
         import_id = added.get("import_id")
         if args.wait and import_id:
             status = client.wait_for_sitemap_import(import_id, timeout=_wait_limit(args))
@@ -947,3 +966,29 @@ def cmd_outline(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
     if outline.get("truncated"):
         print("(more sections than the outline lists)", file=out)
     return 0
+
+
+def cmd_dedupe(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
+    """The listing's same-bytes groups; ``--delete`` keeps each group's first name (in
+    name order) and deletes the other copies. Exit 1 when copies remain."""
+
+    groups = [list(group["filenames"]) for group in client.duplicates().get("groups", [])]
+    deleted: list[str] = []
+    if args.delete:
+        for group in groups:
+            for name in group[1:]:
+                client.delete(name)
+                deleted.append(name)
+    if args.json:
+        print(json.dumps({"duplicate_groups": groups, "deleted": deleted}), file=out)
+    else:
+        for group in groups:
+            kept, *copies = group
+            verb = "deleted" if args.delete else "copies"
+            print(f"keep {kept}; {verb}: {', '.join(copies)}", file=out)
+        print(
+            f"{len(groups)} group(s) of identical documents"
+            + (f"; {len(deleted)} copies deleted" if args.delete else ""),
+            file=out,
+        )
+    return 0 if args.delete or not groups else 1
