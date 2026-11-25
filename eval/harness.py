@@ -1150,6 +1150,14 @@ def _check_answer_baseline(output: Path, baseline_path: Path, tolerance: float) 
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"error: could not read the answer baseline: {exc}", file=sys.stderr)
         return 2
+    if not baseline_print:
+        # Nothing to compare the run's setup with: a model or setting change can't be
+        # told from a regression.
+        print(
+            f"warning: {baseline_path} records no fingerprint; the run's setup is not "
+            "checked against it (re-record the baseline to add one)",
+            file=sys.stderr,
+        )
     problems = answer_shape_problems(current_print, baseline_print) + answer_regressions(
         metrics, baseline, tolerance
     )
