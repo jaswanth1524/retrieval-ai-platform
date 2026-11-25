@@ -3,7 +3,7 @@ import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { getWorkspace } from '../api/client';
 import type { ChatTurn } from '../components/ChatMessage';
 import { newId } from '../utils/id';
-import { addToTrash } from '../utils/trash';
+import { addManyToTrash, trashRoom } from '../utils/trash';
 import {
   EMPTY_SCOPE,
   isEmptyScope,
@@ -92,7 +92,8 @@ export function useConversationActions(
       (item) => importedConversation(item.raw, item.title, now, true) !== null,
     ).length;
     const room = Math.max(MAX_CONVERSATIONS - storageRef.current.conversations.length, 0);
-    return { valid, room };
+    // How many conversations making room could put in Recently deleted.
+    return { valid, room, recoverable: trashRoom(now) };
   }, [storageRef]);
 
   const importConversations = useCallback(
@@ -124,8 +125,9 @@ export function useConversationActions(
         : [];
       const chosen = built.slice(0, room + removable.length);
       if (chosen.length > 0) {
-        // Into Recently deleted, as any delete: restorable for as long as that keeps them.
-        for (const conversation of removable) addToTrash(conversation, now);
+        // Into Recently deleted, as far as it has room (the most recently used first):
+        // what is already there is never pushed out. The confirm said how many.
+        addManyToTrash([...removable].reverse(), now);
         const gone = new Set(removable.map((conversation) => conversation.id));
         setStorage((prev) => ({
           ...prev,

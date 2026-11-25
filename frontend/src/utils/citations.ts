@@ -72,3 +72,22 @@ export function citationNumberFromHref(href: string | undefined): number | null 
   const n = Number(href.slice(CITATION_HREF_PREFIX.length));
   return Number.isInteger(n) && n > 0 ? n : null;
 }
+
+/** The href ``markUnbacked`` gives a sentence the self-check flagged. */
+export const UNBACKED_HREF = '#docrag-unbacked';
+
+/** Each flagged sentence's words (up to its first citation marker) made a link to
+ *  ``UNBACKED_HREF``, for the renderer to show marked. Only text that is plain (no
+ *  brackets, emphasis or code characters) and found once is marked: a wrapper must
+ *  never change how the rest of the answer renders. */
+export function markUnbacked(markdown: string, sentences: readonly string[]): string {
+  let marked = markdown;
+  for (const sentence of sentences) {
+    const words = sentence.split('[')[0].trim();
+    if (words.length < 12 || /[[\]()*_`<>#\n]/.test(words)) continue;
+    const at = marked.indexOf(words);
+    if (at < 0 || marked.indexOf(words, at + 1) >= 0) continue;
+    marked = `${marked.slice(0, at)}[${words}](${UNBACKED_HREF})${marked.slice(at + words.length)}`;
+  }
+  return marked;
+}

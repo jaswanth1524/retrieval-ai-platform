@@ -112,7 +112,8 @@ function write(apply: (store: IDBObjectStore) => void): Promise<boolean> {
 /** Resolves true once the value is durably written, false when it couldn't be.
  *  With ``merge``, what is stored now is read and merged in the same transaction (no
  *  other tab can write in between): another tab's conversations this one never loaded
- *  are kept, not overwritten by this tab's copy. */
+ *  are kept, not overwritten by this tab's copy. A merge that returns ``undefined``
+ *  removes the stored history; one that throws writes nothing. */
 export async function saveChatStore(
   value: unknown,
   merge?: (stored: unknown) => unknown,
@@ -126,13 +127,18 @@ export async function saveChatStore(
       }
       const read = store.get(KEY);
       read.onsuccess = () => {
-        let merged: unknown = value;
+        let merged: unknown;
         try {
           merged = read.result === undefined ? value : merge(read.result);
         } catch {
-          merged = value;
+          // Never this tab's copy over what is stored: that is the cross-tab loss the
+          // merge exists to prevent. Nothing is written (false); the next save merges.
+          store.transaction.abort();
+          return;
         }
-        store.put(merged, KEY);
+        // ``undefined``: nothing worth keeping (see clearChatStore).
+        if (merged === undefined) store.delete(KEY);
+        else store.put(merged, KEY);
       };
     });
   } catch {

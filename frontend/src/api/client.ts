@@ -1,4 +1,7 @@
 import type {
+  AnswerCheckResponse,
+  RecheckRequest,
+  RecheckResponse,
   AccessResponse,
   AuditResponse,
   MigrateImportResponse,
@@ -455,12 +458,36 @@ export interface QuestionStreamHandlers {
       unsupportedNumbers?: number;
       /** A follow-up's rewrite: what was searched for. */
       searchedAs?: string;
+      /** Sentences its cited passages don't back (ANSWER_SELF_CHECK). */
+      flaggedSentences?: FlaggedSentence[];
+      /** The server's self-check ran (``verification`` was sent), flagged or not. */
+      selfChecked?: boolean;
       /** Summaries only: passages read, of the passages the documents hold. */
       coverage?: SummaryCoverage;
       /** Tokens the provider reported for this answer; absent when it reported none. */
       usage?: UsageResponse | null;
     },
   ) => void;
+}
+
+/** A sentence of an answer that its cited passages don't back. */
+export interface FlaggedSentence {
+  sentence: string;
+  /** unsupported, or numbers_differ (with the numbers the passages lack). */
+  status: string;
+  missingNumbers?: string[];
+}
+
+/** The sentences a self-check flagged (``verification``), in answer order. */
+export function flaggedFrom(checks: AnswerCheckResponse[] | undefined): FlaggedSentence[] {
+  if (!Array.isArray(checks)) return [];
+  return checks
+    .filter((check) => check.status === 'unsupported' || check.status === 'numbers_differ')
+    .map((check) => ({
+      sentence: check.sentence,
+      status: check.status,
+      ...(check.missing_numbers?.length ? { missingNumbers: check.missing_numbers } : {}),
+    }));
 }
 
 export const api = {
@@ -743,6 +770,18 @@ export const api = {
       ...(workspace !== undefined ? { workspace } : {}),
     }),
 
+  // A saved answer against the documents now: its cited passages still there, each
+  // sentence still backed (no LLM; one question slot).
+  recheckAnswer: (body: RecheckRequest, signal?: AbortSignal, workspace?: string) =>
+    request<RecheckResponse>('/questions/recheck', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+      signal,
+      ...(workspace !== undefined ? { workspace } : {}),
+    }),
+
   submitFeedback: (body: FeedbackRequest, signal?: AbortSignal) =>
     request<FeedbackResponse>('/feedback', {
       method: 'POST',
@@ -795,6 +834,16 @@ export const api = {
     }),
 
   // Best rerank scores of answered against unanswered traced questions.
+  // POST /admin/calibrate: the suggested bar worked out again on the server (same
+  // labels) and, with apply, made this workspace's own (full key).
+  calibrate: (body: { apply: boolean; labels: 'model' | 'feedback' }, signal?: AbortSignal) =>
+    request<ScoreReportResponse>('/admin/calibrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    }),
+
   scoreReport: (signal?: AbortSignal, labels: 'model' | 'feedback' = 'model') =>
     request<ScoreReportResponse>(
       labels === 'feedback' ? '/traces/score-report?labels=feedback' : '/traces/score-report',
@@ -1168,6 +1217,10 @@ export const api = {
                   ...(typeof event.retrieval_query === 'string' && event.retrieval_query
                     ? { searchedAs: event.retrieval_query }
                     : {}),
+                  ...(flaggedFrom(event.verification).length > 0
+                    ? { flaggedSentences: flaggedFrom(event.verification) }
+                    : {}),
+                  ...(Array.isArray(event.verification) ? { selfChecked: true } : {}),
                   truncated: event.truncated,
                   ...(event.prompt_cut === true ? { promptCut: true } : {}),
                   ...(event.usage ? { usage: event.usage } : {}),

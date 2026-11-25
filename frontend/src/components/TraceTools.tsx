@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, apiErrorMessage, getWorkspace } from '../api/client';
+import { api, apiErrorMessage } from '../api/client';
 import type { ScoreReportResponse, TraceDiffResponse, TraceWhatIfResponse } from '../api/types';
 
 /** One request's state: loading, the answer, or the reason it failed. */
@@ -35,13 +35,15 @@ export function ScoreReportView({
   ratingsAvailable?: boolean;
 }) {
   const [applied, setApplied] = useState<string | null>(null);
-  const apply = async (bar: number) => {
-    const workspace = getWorkspace() || 'default';
+  // Worked out again on the server from the same traces and labels (POST
+  // /admin/calibrate), which keeps the workspace's other settings: what is applied is
+  // the server's suggestion now, not the number this page was shown.
+  const apply = async () => {
     try {
-      // PUT replaces every setting: the workspace's others are kept as they are.
-      const current = await api.workspaceSettings(workspace);
-      await api.putWorkspaceSettings(workspace, { ...current.settings, rerank_min_score: bar });
-      setApplied(`This workspace now uses ${bar}; its cached answers were cleared.`);
+      const done = await api.calibrate({ apply: true, labels: byRatings ? 'feedback' : 'model' });
+      setApplied(
+        `This workspace now uses ${done.suggested_min_score}; its cached answers were cleared.`,
+      );
     } catch (err) {
       setApplied(apiErrorMessage(err, 'Could not set it.'));
     }
@@ -107,7 +109,7 @@ export function ScoreReportView({
                   {' '}
                   <button
                     type="button"
-                    onClick={() => void apply(report.suggested_min_score as number)}
+                    onClick={() => void apply()}
                     data-testid="score-report-apply"
                   >
                     Use it for this workspace

@@ -6,6 +6,7 @@ import type {
   SummaryCoverage,
 } from '../../api/types';
 import type { AnswerStyle, ChatTurn } from '../../components/ChatMessage';
+import type { FlaggedSentence } from '../../api/client';
 import { isAnswerFormat, isAnswerLanguage } from '../../utils/overrides';
 import { MAX_QUESTION_CHARS, MAX_SCOPE_FILENAMES, WORKSPACE_NAME_PATTERN } from '../../utils/limits';
 import {
@@ -314,6 +315,28 @@ export function sanitizeTurn(value: unknown): ChatTurn | null {
   }
   if (turn.role === 'assistant' && typeof turn.note === 'string' && turn.note.trim()) {
     sanitized.note = turn.note.slice(0, MAX_NOTE_CHARS);
+  }
+  if (turn.selfChecked === true) sanitized.selfChecked = true;
+  if (Array.isArray(turn.flaggedSentences)) {
+    const flagged = turn.flaggedSentences
+      .filter(
+        (item): item is FlaggedSentence =>
+          !!item && typeof item.sentence === 'string' && typeof item.status === 'string',
+      )
+      .slice(0, 20)
+      .map((item) => ({
+        sentence: item.sentence.slice(0, 1000),
+        status: item.status.slice(0, 40),
+        ...(Array.isArray(item.missingNumbers)
+          ? {
+              missingNumbers: item.missingNumbers
+                .filter((n): n is string => typeof n === 'string')
+                .slice(0, 20)
+                .map((n) => n.slice(0, 40)),
+            }
+          : {}),
+      }));
+    if (flagged.length > 0) sanitized.flaggedSentences = flagged;
   }
   if (typeof turn.searchedAs === 'string' && turn.searchedAs.trim()) {
     sanitized.searchedAs = turn.searchedAs.slice(0, 2000);

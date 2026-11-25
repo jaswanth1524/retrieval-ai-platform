@@ -16,6 +16,10 @@ export interface SourceView {
 
 interface LinksOptions {
   historyReady: boolean;
+  /** The server answers with this browser's key: a passage link waits for it (opened
+   *  before, its document's fetch failed with a 401, or from a workspace not yet
+   *  listed). Absent: ready. */
+  serverReady?: boolean;
   conversations: ConversationSummary[];
   activeConversationId: string | null;
   workspace: string;
@@ -33,6 +37,7 @@ interface LinksOptions {
  */
 export function useLinks({
   historyReady,
+  serverReady = true,
   conversations,
   activeConversationId,
   workspace,
@@ -53,6 +58,8 @@ export function useLinks({
     const open = () => {
       // A document or passage on this server (#d=…&k=…): opened in the viewer.
       const passage = parsePassageLink(window.location.hash);
+      // Left on the address until the server answers: opened then (this runs again).
+      if (passage && !serverReady) return;
       if (passage) {
         window.history.replaceState(null, '', window.location.pathname + window.location.search);
         if ((passage.workspace ?? '') !== (getWorkspace() ?? '')) {
@@ -80,7 +87,7 @@ export function useLinks({
     window.addEventListener('hashchange', open);
     return () => window.removeEventListener('hashchange', open);
     // The setters and the ref never change identity: listed only to satisfy the rule.
-  }, [historyReady, pushToast, switchConversationFromList, setSourceView, setPanelDrawerOpen, chooseWorkspaceRef]);
+  }, [historyReady, serverReady, pushToast, switchConversationFromList, setSourceView, setPanelDrawerOpen, chooseWorkspaceRef]);
   const copyPassageLink = useCallback(() => {
     if (!sourceView) return;
     const url = passageLinkUrl(

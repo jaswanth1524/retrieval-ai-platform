@@ -42,6 +42,9 @@ interface DocumentViewerProps {
   docked?: boolean;
   /** Dock it beside the conversation, or back over it; absent when there is no room. */
   onToggleDock?: () => void;
+  /** The passage opened before this one, and the one gone back from (absent: none). */
+  onBack?: () => void;
+  onForward?: () => void;
 }
 
 type ViewerMode = 'passages' | 'original';
@@ -94,6 +97,8 @@ function DocumentViewer({
   resume = false,
   docked = false,
   onToggleDock,
+  onBack,
+  onForward,
 }: DocumentViewerProps) {
   // The passage whose question box is open, and what is typed in it.
   const [asking, setAsking] = useState<{ chunkId: string; question: string } | null>(null);
@@ -210,6 +215,15 @@ function DocumentViewer({
   // its Load-earlier/later buttons) only exists after the fetch resolves.
   // Docked, it is a side panel, not a dialog: focus is neither trapped in it nor moved.
   const dialogRef = useDialog(!docked, onClose);
+  // Docking or undocking ends or starts the dialog, whose focus handling sent focus to
+  // the citation that opened it (or the first control): the toggle keeps it instead.
+  const dockToggleRef = useRef<HTMLButtonElement>(null);
+  const toggledDockRef = useRef(false);
+  useEffect(() => {
+    if (!toggledDockRef.current) return;
+    toggledDockRef.current = false;
+    dockToggleRef.current?.focus();
+  }, [docked]);
 
   const chunks = loaded?.chunks ?? null;
   const first = ordinalOf(chunks?.[0]);
@@ -506,11 +520,39 @@ function DocumentViewer({
               Copy link
             </button>
           )}
+          {(onBack || onForward) && (
+            <span className="document-viewer__trail" role="group" aria-label="Passages opened">
+              <button
+                type="button"
+                className="document-viewer__original"
+                onClick={onBack}
+                disabled={!onBack}
+                aria-label="Back to the passage opened before"
+                data-testid="viewer-back"
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                className="document-viewer__original"
+                onClick={onForward}
+                disabled={!onForward}
+                aria-label="Forward to the passage gone back from"
+                data-testid="viewer-forward"
+              >
+                ›
+              </button>
+            </span>
+          )}
           {onToggleDock && (
             <button
               type="button"
               className="document-viewer__original"
-              onClick={onToggleDock}
+              ref={dockToggleRef}
+              onClick={() => {
+                toggledDockRef.current = true;
+                onToggleDock();
+              }}
               aria-pressed={docked}
               title={docked ? 'Show the document over the conversation' : 'Keep the document open beside the conversation'}
               data-testid="viewer-dock"

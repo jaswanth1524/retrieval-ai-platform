@@ -42,6 +42,13 @@
   align-items: stretch;
   gap: 2px;
   max-width: 100%;
+  /* On a phone the card's location wrapped onto three lines and pushed "↻ without" and
+     the not-relevant mark past the edge: they drop below it instead. */
+  flex-wrap: wrap;
+}
+
+.citation-card-wrap > .citation-card {
+  min-width: 0;
 }
 
 .citation-card__irrelevant {

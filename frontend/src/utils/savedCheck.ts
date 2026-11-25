@@ -1,4 +1,4 @@
-import type { SearchRequest, SearchResponse } from '../api/types';
+import type { RecheckRequest, RecheckResponse, SearchRequest, SearchResponse } from '../api/types';
 import type { SavedAnswer } from '../hooks/useChat';
 
 /** What searching a saved answer's question again found (no LLM: POST /search):
@@ -47,4 +47,31 @@ export function judgeSaved(item: SavedAnswer, response: SearchResponse): SavedCh
   if (response.weak_matches || response.results.length === 0) return 'weak';
   const cited = new Set(item.turn.sources.map((source) => source.chunk_id));
   return response.results.some((result) => cited.has(result.chunk_id)) ? 'found' : 'moved';
+}
+
+/** POST /questions/recheck's body for a saved answer: its text and cited passages. */
+export function recheckRequest(item: SavedAnswer): RecheckRequest {
+  return {
+    answer: item.turn.content.slice(0, 8000),
+    sources: item.turn.sources.slice(0, 50).map(({ source_number, filename, chunk_id }) => ({
+      source_number,
+      filename,
+      chunk_id,
+    })),
+  };
+}
+
+/** A recheck in one line: holds, or what changed and what no longer is backed. */
+export function recheckSummary(response: RecheckResponse): string {
+  if (response.still_holds) return 'Still holds: its passages back every sentence.';
+  const count = (state: string) => response.sources.filter((s) => s.state === state).length;
+  const unbacked = response.sentences.filter(
+    (s) => s.status === 'unsupported' || s.status === 'numbers_differ',
+  ).length;
+  const parts = [
+    unbacked ? `${unbacked} sentence${unbacked === 1 ? '' : 's'} no longer backed` : '',
+    count('changed') ? `${count('changed')} cited passage${count('changed') === 1 ? '' : 's'} changed` : '',
+    count('deleted') ? `${count('deleted')} cited document${count('deleted') === 1 ? '' : 's'} deleted` : '',
+  ].filter(Boolean);
+  return `Check it: ${parts.join(', ')}.`;
 }

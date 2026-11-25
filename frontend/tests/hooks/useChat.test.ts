@@ -2074,7 +2074,7 @@ it('makes room for an import only when asked, never removing a pinned or the act
   const items = [1, 2, 3, 4, 5].map((n) => ({
     raw: { turns: pair(500 + n), createdAt: now - n, updatedAt: now - n },
   }));
-  expect(result.current.importPreview(items)).toEqual({ valid: 5, room: 1 });
+  expect(result.current.importPreview(items)).toEqual({ valid: 5, room: 1, recoverable: 20 });
 
   let outcome!: { imported: number; skipped: number; removed: number };
   act(() => {

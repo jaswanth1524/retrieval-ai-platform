@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import { chatStoreAvailable, clearChatStore, readChatStore, saveChatStore } from './chatStore';
+import { chatStoreAvailable, readChatStore, saveChatStore } from './chatStore';
+import { announceHistorySaved, onHistorySaved } from '../utils/chatChannel';
 import {
   CHAT_STORAGE_KEY,
   LOCAL_STORAGE_MAX_CONVERSATIONS,
@@ -29,6 +30,11 @@ export interface StreamingRefs {
 /** What to write to IndexedDB: this tab's history with the conversations another tab
  *  stored there and this one never loaded (it only hears of localStorage's 20 most
  *  recent), deletions on either side respected and the history cap applied. */
+/** Whether a stored history holds any conversation with turns. */
+function holdsConversations(stored: unknown): boolean {
+  return (parseConversations(stored) ?? []).some((c) => c.turns.length > 0);
+}
+
 export function withStoredConversations(
   mine: ChatStorageV2,
   stored: unknown,
@@ -80,18 +86,20 @@ export function useChatPersistence(
     pendingChatStoreRef.current = null;
     if (pendingStorage === null) return;
     // Mirrors persistStorage: a lone empty conversation clears the store rather than
-    // being saved, so it can't come back next to a new one after a reload.
-    void (
-      isOnlyEmpty(pendingStorage)
-        ? clearChatStore()
-        : saveChatStore(forChatStore(pendingStorage), (stored) =>
-            withStoredConversations(pendingStorage, stored, streamingConversationIdRef.current),
-          )
+    // being saved — unless another tab's conversations are stored there: those are
+    // merged in and kept (clearing deleted them, and their tombstones with them).
+    void saveChatStore(forChatStore(pendingStorage), (stored) =>
+      isOnlyEmpty(pendingStorage) && !holdsConversations(stored)
+        ? undefined
+        : withStoredConversations(pendingStorage, stored, streamingConversationIdRef.current),
     ).then(
       (saved) => {
         if (!mountedRef.current) return;
         // The full history is safe in IndexedDB: a localStorage quota miss loses nothing.
         if (saved) {
+          // Other tabs read it and merge: an older conversation changed here reaches
+          // them now, not at their next reload.
+          announceHistorySaved();
           setPersistError(false);
           setPersistPartial(false);
         } else {
@@ -176,7 +184,10 @@ export function useChatPersistence(
     pendingChatStoreRef.current = null;
     // Not before the stored history was read: this would replace it with this copy.
     if (chatStoreAvailable() && chatStoreWritableRef.current) {
-      void saveChatStore(forChatStore(snapshot));
+      // Merged like any other save: a plain put overwrote what other tabs had stored.
+      void saveChatStore(forChatStore(snapshot), (stored) =>
+        withStoredConversations(snapshot, stored, streamingConversationIdRef.current),
+      );
     }
   };
 
@@ -260,6 +271,35 @@ export function useChatPersistence(
     // persistStreamSnapshot only reads refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Another tab saved the full history: read it and merge what this tab lacks (the
+  // conversations localStorage's storage event doesn't carry). Only once this tab's
+  // own read is done, and never one it couldn't read.
+  useEffect(() => {
+    if (!chatStoreReady || chatStoreUnreadable) return;
+    let reading = false;
+    return onHistorySaved(() => {
+      if (reading) return;
+      reading = true;
+      void readChatStore().then((read) => {
+        reading = false;
+        if (read.status !== 'data') return;
+        const incoming = parseConversations(read.value)?.filter((c) => c.turns.length > 0);
+        const deleted = parseDeleted(read.value);
+        if (!incoming?.length && !deleted?.length) return;
+        setStorage((prev) =>
+          mergeConversations(
+            prev,
+            incoming ?? [],
+            false,
+            deleted,
+            Date.now(),
+            streamingConversationIdRef.current,
+          ),
+        );
+      });
+    });
+  }, [chatStoreReady, chatStoreUnreadable, setStorage, streamingConversationIdRef]);
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {

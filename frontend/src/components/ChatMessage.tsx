@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import type { FlaggedSentence } from '../api/client';
 import type { Components } from 'react-markdown';
 import type {
   LlmProvider,
@@ -15,7 +16,7 @@ import type {
 import type { SourceChange } from '../utils/citationFreshness';
 import { copyText } from '../utils/clipboard';
 import { formatTurnTime, withCitationFootnotes } from '../utils/exportChat';
-import { citationNumberFromHref, linkCitations } from '../utils/citations';
+import { UNBACKED_HREF, citationNumberFromHref, linkCitations, markUnbacked } from '../utils/citations';
 import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
 import { pageLabel } from '../utils/pages';
 import { useMarkdownRenderer } from './markdownLoader';
@@ -209,6 +210,11 @@ export interface ChatTurn {
   unsupportedNumbers?: number;
   /** A follow-up's rewrite into a standalone question: what was searched for. */
   searchedAs?: string;
+  /** Sentences the passages it cites don't back (the server's self-check). */
+  flaggedSentences?: FlaggedSentence[];
+  /** The self-check ran: its list (with neighbour text, as the prompt had it) stands in
+   *  for the older per-passage counts, which read only the cited passage itself. */
+  selfChecked?: boolean;
   /** The reader's own note on a saved answer (Saved answers panel). */
   note?: string;
   // Asked within some documents or tags, not the whole corpus.
@@ -353,7 +359,12 @@ function groundingNotes(turn: ChatTurn): string[] {
       "The model read only part of what it was sent (its context window is too small), so it may have missed its sources or its instructions — check this answer.",
     );
   }
-  if (turn.unsupportedNumbers) {
+  // The self-check's list says it sentence by sentence, reading what the model was
+  // shown; the counts below, from the cited passage alone, contradicted it ("2 cited
+  // sentences match nothing" over an answer whose every sentence it backed).
+  if (turn.selfChecked) {
+    // The list under the answer says it.
+  } else if (turn.unsupportedNumbers) {
     const count = turn.unsupportedNumbers;
     notes.push(
       `${count === 1 ? 'One sentence states a number' : `${count} sentences state numbers`} ` +
@@ -491,6 +502,13 @@ function ChatMessage({
     return {
       ...MARKDOWN_COMPONENTS,
       a: ({ href, children }) => {
+        if (href === UNBACKED_HREF) {
+          return (
+            <mark className="chat-message__unbacked" title="No passage it cites backs this" data-testid="answer-unbacked">
+              {children}
+            </mark>
+          );
+        }
         const number = citationNumberFromHref(href);
         if (number === null) return <ExternalLink href={href}>{children}</ExternalLink>;
         const source = byNumber.get(number);
@@ -509,8 +527,10 @@ function ChatMessage({
   }, [turn.sources, onOpenSource, onCitationHover, onCitationLeave]);
   const linkedContent = useMemo(() => {
     const highest = turn.sources.reduce((max, source) => Math.max(max, source.source_number), 0);
-    return linkCitations(turn.content, highest);
-  }, [turn.content, turn.sources]);
+    // The self-check's flagged sentences marked where they stand (and listed below).
+    const flagged = (turn.flaggedSentences ?? []).map((item) => item.sentence);
+    return linkCitations(flagged.length ? markUnbacked(turn.content, flagged) : turn.content, highest);
+  }, [turn.content, turn.sources, turn.flaggedSentences]);
   const timings = turn.timings;
   const showMeta = engineerMode && turn.role === 'assistant' && !showSkeleton && timings !== null;
 
@@ -735,6 +755,25 @@ function ChatMessage({
               <p className="chat-message__searched-as mono" data-testid="chat-message-searched-as">
                 Searched as: <span dir="auto">{turn.searchedAs}</span>
               </p>
+            )}
+            {!streamStage && turn.flaggedSentences && turn.flaggedSentences.length > 0 && (
+              <details className="chat-message__notes" data-testid="answer-self-check">
+                <summary>
+                  {turn.flaggedSentences.length === 1
+                    ? 'One sentence isn’t backed by the passages it cites'
+                    : `${turn.flaggedSentences.length} sentences aren’t backed by the passages they cite`}
+                </summary>
+                <ul>
+                  {turn.flaggedSentences.map((flagged, index) => (
+                    <li key={index} dir="auto">
+                      “{flagged.sentence}”
+                      {flagged.status === 'numbers_differ'
+                        ? ` — the passages don’t state ${flagged.missingNumbers?.join(', ') || 'its numbers'}`
+                        : ' — no passage says this'}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
             {!streamStage && groundingNotes(turn).length > 0 && (
               <div className="chat-message__notes" data-testid="chat-message-notes">

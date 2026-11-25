@@ -1,4 +1,6 @@
 import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLeaveGuard } from './hooks/useLeaveGuard';
+import { useViewerTrail } from './hooks/useViewerTrail';
 import { api, apiErrorMessage, getWorkspace } from './api/client';
 import type {
   CitationResponse,
@@ -190,6 +192,7 @@ function App() {
     pending,
     streamingConversationId,
     continuingTurnId,
+    lastOutcome: lastRunOutcome,
     askedTurns,
     stage,
     stageTiming,
@@ -509,6 +512,38 @@ function App() {
     },
     [removeConversation, restoreConversation, pushToast, setPinnedTraceId, setHoveredCitation],
   );
+  // Several deleted at once (the list's Select): into Recently deleted, as any delete,
+  // with one Undo for them all instead of a toast each.
+  const deleteConversations = useCallback(
+    (ids: string[]) => {
+      setPinnedTraceId(null);
+      setHoveredCitation(null);
+      const removed = ids
+        .map((id) => removeConversation(id))
+        .filter((conversation): conversation is Conversation => !!conversation && conversation.turns.length > 0);
+      if (removed.length === 0) return;
+      for (const conversation of removed) addToTrash(conversation);
+      setTrashVersion((version) => version + 1);
+      pushToast({
+        id: `deleted-many-${removed[0].id}`,
+        tone: 'info',
+        title: `Deleted ${removed.length} conversation${removed.length === 1 ? '' : 's'}`,
+        action: {
+          label: 'Undo',
+          run: () => {
+            setPinnedTraceId(null);
+            setHoveredCitation(null);
+            for (const conversation of removed) {
+              removeFromTrash(conversation.id);
+              restoreConversation(conversation);
+            }
+            setTrashVersion((version) => version + 1);
+          },
+        },
+      });
+    },
+    [removeConversation, restoreConversation, pushToast, setPinnedTraceId, setHoveredCitation],
+  );
   // A conversation search hit names the turn it matched: the thread scrolls to it.
   const [focusTurn, setFocusTurn] = useState<{ turnId: string } | null>(null);
   // "Ask again" from Saved answers or Needs review: the conversation is opened, then
@@ -525,6 +560,7 @@ function App() {
   );
   const { copyPassageLink, copyLink } = useLinks({
     historyReady,
+    serverReady: apiStatus === 'ok',
     conversations,
     activeConversationId,
     workspace,
@@ -734,13 +770,18 @@ function App() {
   const lastTurn = askedTurns[askedTurns.length - 1];
   // A question stopped before the server sent anything leaves no answer turn at all: the
   // question itself is the last turn, and it read as "Answer ready".
+  // The run's own word first: a stopped or failed Continue or Regenerate leaves the
+  // earlier answer as the last turn, which read as "answered".
   const lastOutcome =
-    lastTurn?.role === 'error'
+    lastRunOutcome ??
+    (lastTurn?.role === 'error'
       ? 'failed'
       : lastTurn?.stopped || lastTurn?.role === 'user'
         ? 'stopped'
-        : 'answered';
+        : 'answered');
   useBackgroundNotice(pending, notifyOnAnswer, lastQuestion, lastOutcome);
+  // An answer being written goes with the page: leaving or reloading asks first.
+  useLeaveGuard(pending);
   // The selected provider's model. Each answer records the one it was asked of
   // (ChatTurn.model); this labels answers saved before that, and the composer.
   // What an answer can be asked again of (Reformat → "Ask …"): one array per change of
@@ -1108,8 +1149,13 @@ function App() {
       },
     },
     {
+      // A docked viewer is no dialog: it sits beside the thread, and the keys go on
+      // working (they all stopped while a document was docked).
       otherDialogOpen:
-        settingsOpen || sourceView !== null || shortcutsOpen || summaryFilenames !== null,
+        settingsOpen ||
+        (sourceView !== null && !viewerDocked) ||
+        shortcutsOpen ||
+        summaryFilenames !== null,
       togglePalette: () => setPaletteOpen((prev) => !prev),
       closePalette: () => setPaletteOpen(false),
     },
@@ -1132,14 +1178,21 @@ function App() {
     if (parsed.kind === 'many') {
       const items = parsed.items;
       // Asked first: making room removes conversations (to Recently deleted).
-      const { valid, room } = importPreview(items);
+      const { valid, room, recoverable } = importPreview(items);
+      const toRemove = valid - room;
+      const kept =
+        recoverable >= toRemove
+          ? 'they go to Recently deleted'
+          : recoverable > 0
+            ? `${recoverable} of them go to Recently deleted, the rest are deleted for good`
+            : 'Recently deleted is full: they are deleted for good';
       const makeRoom =
         valid > room &&
         window.confirm(
           `This file has ${valid} conversations and the history has room for ${room} ` +
-            `(it keeps ${MAX_CONVERSATIONS}).\n\nOK: remove up to ${valid - room} of the ` +
+            `(it keeps ${MAX_CONVERSATIONS}).\n\nOK: remove up to ${toRemove} of the ` +
             'least recently used conversations (never pinned ones, nor ones with saved answers; ' +
-            'they go to Recently deleted) to import them all.\n' +
+            `${kept}) to import them all.\n` +
             `Cancel: import only the ${room} that fit.`,
         );
       ({ imported: count, skipped, removed } = importConversations(items, { makeRoom }));
@@ -1184,6 +1237,8 @@ function App() {
   // Stable, so the memoized viewer isn't re-rendered (every passage of a long document)
   // on each frame of an answer streaming meanwhile.
   const closeSourceView = useStableHandler(() => setSourceView(null));
+  // Back and forward through the passages opened in the viewer.
+  const viewerTrail = useViewerTrail(sourceView, setSourceView);
   const downloadViewedOriginal = useStableHandler(() => {
     if (sourceView) downloadOriginal(sourceView.filename);
   });
@@ -1337,6 +1392,7 @@ function App() {
             onSwitch={switchConversationFromList}
             onRename={renameConversation}
             onDelete={deleteConversation}
+            onDeleteMany={deleteConversations}
             onPin={pinConversation}
             onSetLabels={setLabels}
             onRenameLabel={renameLabel}
@@ -1658,6 +1714,7 @@ function App() {
             providerLabel={currentModelLabel ?? selectedProvider}
             draftKey={activeConversationId ?? NEW_CONVERSATION_DRAFT}
             prefill={prefill}
+            workspace={workspace}
           />
         )}
       </main>
@@ -1756,6 +1813,8 @@ function App() {
               )}
               docked={viewerDocked}
               onToggleDock={roomyEnoughForInspector ? toggleViewerDock : undefined}
+              onBack={viewerTrail.back}
+              onForward={viewerTrail.forward}
             />
           )}
         </Suspense>

@@ -112,6 +112,8 @@ const RUN_FIELDS = [
   // Checks and notes that described the other answer's text or run.
   'unsupportedClaims',
   'unsupportedNumbers',
+  'flaggedSentences',
+  'selfChecked',
   'promptCut',
   'searchedAs',
   'cannotContinue',

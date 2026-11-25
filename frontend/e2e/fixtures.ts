@@ -84,6 +84,7 @@ const CONFIG = {
   query_log_enabled: false,
   document_versions_enabled: false,
   watch_enabled: false,
+  workspaces_enabled: false,
 };
 
 type JobStep = { status: number; body?: object };
@@ -192,6 +193,9 @@ export class MockApi {
   /** POST /query-log/recheck's answer; how many times it was asked. */
   recheck: object = { checked: 0, covered_now: 0, items: [] };
   rechecks = 0;
+  /** POST /questions/recheck's answer (a saved answer against the documents now). */
+  answerRecheck: object = { sources: [], sentences: [], still_holds: true };
+  readonly answerRecheckBodies: Record<string, unknown>[] = [];
   /** GET /backups (null answers 404: BACKUP_DIR unset); POST /backups/run count. */
   backups: object | null = null;
   backupRuns = 0;
@@ -215,6 +219,8 @@ export class MockApi {
   readonly reruns: object[] = [];
   /** GET/PUT /workspaces/{name}/settings: the stored settings, and every PUT body. */
   workspaceSettings: Record<string, unknown> = {};
+  /** GET /workspaces: the named workspaces (with config.workspaces_enabled). */
+  workspaceNames: string[] = [];
   readonly settingsPuts: object[] = [];
   /** In-flight ingest jobs by id: the file each one indexes, how often it was polled and
    *  whether it was cancelled. Every job walks `jobSteps` on its own, so a bulk re-index
@@ -341,6 +347,12 @@ export class MockApi {
       }
       return this.json(route, 200, this.answerCache);
     }
+    if (path === '/workspaces' && method === 'GET') {
+      return this.json(route, 200, {
+        enabled: Boolean(this.config.workspaces_enabled),
+        workspaces: this.workspaceNames,
+      });
+    }
     if (/^\/workspaces\/[^/]+\/settings$/.test(path)) {
       const empty = { rerank_min_score: null, recency_boost_weight: null, answer_language: null, answer_format: null };
       if (method === 'PUT') {
@@ -365,6 +377,14 @@ export class MockApi {
         diff: { question_a: 'q', question_b: 'q', same_answer: false, settings: [], candidates: [] },
         candidates: [],
       });
+    }
+    if (path === '/admin/calibrate' && method === 'POST') {
+      const body = JSON.parse(request.postData() ?? '{}') as { apply?: boolean };
+      const report = this.scoreReport as { suggested_min_score?: number | null } | null;
+      if (body.apply && report?.suggested_min_score == null) {
+        return this.json(route, 409, { detail: 'Nothing to apply: too few traces.' });
+      }
+      return this.json(route, 200, { ...(this.scoreReport ?? {}), applied: Boolean(body.apply) });
     }
     if (path === '/traces/score-report') {
       return this.json(route, 200, this.scoreReport ?? {
@@ -643,6 +663,10 @@ export class MockApi {
       }
     }
 
+    if (path === '/questions/recheck' && method === 'POST') {
+      this.answerRecheckBodies.push(JSON.parse(request.postData() ?? '{}'));
+      return this.json(route, 200, this.answerRecheck);
+    }
     if (path === '/search' && method === 'POST') {
       this.searches.push(JSON.parse(request.postData() ?? '{}'));
       if (this.searchResults === null) {

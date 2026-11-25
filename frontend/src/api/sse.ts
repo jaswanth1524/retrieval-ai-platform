@@ -1,4 +1,4 @@
-import type { AnswerStatus, CitationResponse, TimingsResponse, UsageResponse } from './types';
+import type { AnswerCheckResponse, AnswerStatus, CitationResponse, TimingsResponse, UsageResponse } from './types';
 import { ApiClientError } from './errors';
 
 /** One frame of a streamed answer or summary (``/questions/stream``,
@@ -38,6 +38,8 @@ export type QuestionStreamEvent =
       /** Picked passages the prompt had no room for (absent from older servers). */
       passages_left_out?: number;
       retrieval_query?: string;
+      /** Each sentence against the passages it cites (absent when off). */
+      verification?: AnswerCheckResponse[];
       chunks_read?: number;
       chunks_total?: number;
       /** Summaries: parts left out after failing twice, and notes cut off at the limit. */

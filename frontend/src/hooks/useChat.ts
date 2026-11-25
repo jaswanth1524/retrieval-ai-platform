@@ -17,6 +17,7 @@ import { ANSWER_RUN_FIELDS, mergeRegenerated } from '../utils/answerVersions';
 import { sanitizeStyle } from './chat/sanitize';
 import type { ImportItem } from './useConversationActions';
 import { turnCounts, useAnswerQueries, type SavedAnswer } from './chat/answers';
+import type { AnswerOutcome } from './useBackgroundNotice';
 import { useTurnMarks } from './chat/turnMarks';
 // Re-exported for the components and tests that import it from here.
 export type { SavedAnswer } from './chat/answers';
@@ -105,6 +106,8 @@ export interface UseChatResult {
   streamingConversationId: string | null;
   /** The answer a Continue is writing into, while it runs (null otherwise). */
   continuingTurnId: string | null;
+  /** How the last run ended (answered, stopped, failed); null before any. */
+  lastOutcome: AnswerOutcome | null;
   /** The turns of the conversation asked in last (the active one's before any ask). */
   askedTurns: ChatTurn[];
   // Human-readable label for the stage the in-flight question is on, or null when
@@ -168,7 +171,7 @@ export interface UseChatResult {
   ) => { imported: number; skipped: number; removed: number };
   /** How many of ``items`` are valid conversations, and how many fit without removing
    *  any (asked before importing, to offer making room). */
-  importPreview: (items: readonly ImportItem[]) => { valid: number; room: number };
+  importPreview: (items: readonly ImportItem[]) => { valid: number; room: number; recoverable: number };
   cancel: () => void;
   clear: () => void;
   newConversation: () => void;
@@ -321,6 +324,8 @@ export function answeredTurn(
     ...(grounding?.unsupportedClaims ? { unsupportedClaims: grounding.unsupportedClaims } : {}),
     ...(grounding?.unsupportedNumbers ? { unsupportedNumbers: grounding.unsupportedNumbers } : {}),
     ...(grounding?.searchedAs ? { searchedAs: grounding.searchedAs } : {}),
+    ...(grounding?.flaggedSentences?.length ? { flaggedSentences: grounding.flaggedSentences } : {}),
+    ...(grounding?.selfChecked ? { selfChecked: true } : {}),
     timings,
     traceId,
     ...(cached ? { cached: true } : {}),
@@ -382,6 +387,10 @@ export function useChat(): UseChatResult {
   // The answer a Continue is writing into (any answer, not only the last); null while
   // a new answer streams at the end of the thread.
   const [continuingTurnId, setContinuingTurnId] = useState<string | null>(null);
+  // How the last question (or Continue, or Regenerate) ended, told by the run itself:
+  // read off the thread, a failed Continue or a stopped Regenerate (which put the old
+  // answer back) looked answered.
+  const [lastOutcome, setLastOutcome] = useState<AnswerOutcome | null>(null);
   const [askedConversationId, setAskedConversationId] = useState<string | null>(null);
 
   const { conversations, activeConversationId } = storage;
@@ -636,9 +645,11 @@ export function useChat(): UseChatResult {
     // question waited for suggestions nobody had asked for yet. Run once — at `done`, or
     // when the stream ends without one — so a question asked in between keeps its state.
     let finished = false;
+    let outcome: AnswerOutcome = 'answered';
     const finish = () => {
       if (finished) return;
       finished = true;
+      setLastOutcome(outcome);
       flushDelta();
       streamingTurnIdRef.current = null;
       streamingConversationIdRef.current = null;
@@ -716,7 +727,9 @@ export function useChat(): UseChatResult {
                     grounding,
                   );
                   const before = continued.usage;
-                  if (!before || !done.usage) return done;
+                  if (!before) return done;
+                  // The continuation reported no usage: the first part's still counts.
+                  if (!done.usage) return { ...done, usage: before };
                   const cost =
                     before.costUsd === undefined && done.usage.costUsd === undefined
                       ? {}
@@ -753,6 +766,7 @@ export function useChat(): UseChatResult {
       );
     } catch (err) {
       flushDelta();
+      if (!finished) outcome = controller.signal.aborted ? 'stopped' : 'failed';
       // A user-initiated Stop aborts `controller`; a timeout aborts askQuestionStream's
       // own private controller instead, leaving this one untouched. So the flag is true
       // only for a deliberate cancel — where whatever streamed so far should simply
@@ -764,11 +778,13 @@ export function useChat(): UseChatResult {
         const status = err instanceof ApiClientError ? err.statusCode : undefined;
         const gone = !controller.signal.aborted && (status === 404 || status === 409);
         const failed = controller.signal.aborted ? undefined : apiErrorMessage(err, 'Something went wrong.');
+        // Onto the answer as it is now, not the copy taken when Continue was pressed: a
+        // rating, a save, a note or a source marked irrelevant meanwhile stay.
         updateTurns((prev) =>
           prev.map((turn) =>
             turn.id === assistantTurnId
               ? {
-                  ...continued,
+                  ...turn,
                   ...(gone ? { cannotContinue: true } : {}),
                   ...(failed && !gone ? { continueFailed: failed } : {}),
                 }
@@ -1158,6 +1174,7 @@ export function useChat(): UseChatResult {
     trashedVersion,
     streamingConversationId,
     continuingTurnId,
+    lastOutcome,
     askedTurns,
     scope: activeConversation?.scope ?? EMPTY_SCOPE,
     conversationWorkspace: activeConversation ? conversationWorkspace(activeConversation) : null,

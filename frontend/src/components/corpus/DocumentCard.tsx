@@ -390,7 +390,9 @@ const DocumentCard = memo(function DocumentCard({
           <span className="corpus-panel__source">
             {'from '}
             <a
-              href={card.sourceUrl}
+              // Only a web address is a link: a restored backup's or import's metadata
+              // could carry any scheme (javascript: ran on a click).
+              href={/^https?:\/\//i.test(card.sourceUrl) ? card.sourceUrl : undefined}
               target="_blank"
               rel="noopener noreferrer"
               title={card.sourceUrl}

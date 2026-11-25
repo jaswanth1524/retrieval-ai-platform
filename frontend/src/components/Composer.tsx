@@ -1,5 +1,14 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
+import { useLeaveGuard } from '../hooks/useLeaveGuard';
+import {
+  MAX_TEMPLATE_NAME_CHARS,
+  type QuestionTemplate,
+  deleteTemplate,
+  firstPlaceholder,
+  readTemplates,
+  saveTemplate,
+} from '../utils/questionTemplates';
 import type { LlmProvider, PublicConfigResponse } from '../api/types';
 import type { ScopePreset } from '../utils/scopePresets';
 import ScopePopover from './ScopePopover';
@@ -59,6 +68,9 @@ interface ComposerProps {
   onDeleteScopePreset?: (name: string) => void;
   /** The conversation's last question: Up in an empty box puts it back, to edit. */
   recallQuestion?: string;
+  /** The workspace asked in: a send queued while offline is dropped when it changes
+   *  (it went out to the next workspace, against its documents). */
+  workspace?: string;
 }
 
 // Scoped to more documents than this, the button's label says how many (no chips).
@@ -103,6 +115,7 @@ function Composer({
   onSaveScopePreset,
   onDeleteScopePreset,
   recallQuestion,
+  workspace,
 }: ComposerProps) {
   const [value, setValue] = useState(() => (draftKey ? readDraft(draftKey) : ''));
   // A paste the length limit cut short: maxLength drops the excess silently, and a
@@ -127,6 +140,11 @@ function Composer({
       save();
     };
   }, [draftKey]);
+  // A send queued for one workspace never goes out in another: the question stays in
+  // the box, to send again where it belongs.
+  useEffect(() => {
+    setSendQueued(false);
+  }, [workspace]);
   useEffect(() => {
     if (!draftKey) return;
     const timer = setTimeout(() => writeDraft(draftKey, value), DRAFT_SAVE_DELAY_MS);
@@ -142,9 +160,22 @@ function Composer({
     );
     textareaRef.current?.focus();
   }, [prefill]);
-  const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | null>(null);
+  const [openPopover, setOpenPopover] = useState<'scope' | 'provider' | 'templates' | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // A removed chip took the focus with it (to <body>): the chip now in its place, or
+  // the one before, or the question box, gets it instead.
+  const chipsRef = useRef<HTMLUListElement>(null);
+  const focusChipRef = useRef<number | null>(null);
+  useEffect(() => {
+    const index = focusChipRef.current;
+    if (index === null) return;
+    focusChipRef.current = null;
+    const chips = chipsRef.current?.querySelectorAll<HTMLButtonElement>('button') ?? [];
+    const next = chips[Math.min(index, chips.length - 1)];
+    if (next) next.focus();
+    else textareaRef.current?.focus();
+  }, [selectedFilenames, selectedTags]);
   // Grows with what is typed (up to a share of the window, then scrolls): two fixed
   // rows hid all but the end of a long, multi-line question.
   useLayoutEffect(() => {
@@ -185,6 +216,27 @@ function Composer({
   }, []);
   const scopeButtonRef = useRef<HTMLButtonElement>(null);
   const providerButtonRef = useRef<HTMLButtonElement>(null);
+  const templatesButtonRef = useRef<HTMLButtonElement>(null);
+  const openerOf = (which: 'scope' | 'provider' | 'templates') =>
+    which === 'scope' ? scopeButtonRef : which === 'provider' ? providerButtonRef : templatesButtonRef;
+  // Saved questions (this browser's), and the one being saved: its name so far.
+  const [templates, setTemplates] = useState<QuestionTemplate[]>(() => readTemplates());
+  const [templateName, setTemplateName] = useState('');
+  // A template just put in the box: its first {placeholder} is selected once rendered.
+  const selectAfterInsertRef = useRef<[number, number] | null>(null);
+  useLayoutEffect(() => {
+    const range = selectAfterInsertRef.current;
+    if (!range) return;
+    selectAfterInsertRef.current = null;
+    textareaRef.current?.focus();
+    textareaRef.current?.setSelectionRange(range[0], range[1]);
+  });
+  const insertTemplate = (template: QuestionTemplate) => {
+    setValue(template.text);
+    const placeholder = firstPlaceholder(template.text);
+    selectAfterInsertRef.current = placeholder ?? [template.text.length, template.text.length];
+    setOpenPopover(null);
+  };
 
   useEffect(() => {
     if (!openPopover) return;
@@ -197,7 +249,7 @@ function Composer({
       if (event.key !== 'Escape') return;
       // Return focus to the control that opened it. Escaping a popover otherwise drops
       // focus to the document body, stranding a keyboard user at the top of the page.
-      const opener = openPopover === 'scope' ? scopeButtonRef : providerButtonRef;
+      const opener = openerOf(openPopover);
       setOpenPopover(null);
       opener.current?.focus();
     };
@@ -205,7 +257,7 @@ function Composer({
     // thread while focus went on elsewhere. Focus moving, not blur: a click on a
     // checkbox in Safari focuses nothing, and must not close the list.
     const handleFocus = (event: FocusEvent) => {
-      const opener = (openPopover === 'scope' ? scopeButtonRef : providerButtonRef).current;
+      const opener = openerOf(openPopover).current;
       const anchor = opener?.closest('.composer__popover-anchor');
       if (anchor && event.target instanceof Node && !anchor.contains(event.target)) {
         setOpenPopover(null);
@@ -224,6 +276,8 @@ function Composer({
   // The textarea stays editable while an answer streams (it can take a minute or two);
   // only sending is held until it finishes.
   const [sendQueued, setSendQueued] = useState(false);
+  // A question waiting to be sent goes with the page: leaving asks first.
+  useLeaveGuard(sendQueued);
   const submit = () => {
     const trimmed = value.trim();
     if (!trimmed || disabled || pending) return;
@@ -312,37 +366,57 @@ function Composer({
           Pasted text was cut to {MAX_QUESTION_CHARS.toLocaleString()} characters, the limit for a question.
         </p>
       )}
-      {(selectedFilenames.length > 0 || selectedTags.length > 0) && selectedFilenames.length <= SCOPE_CHIPS_MAX && (
-        // What the next question is limited to, each one removable here: the button's
-        // one-line label is clipped on a phone, and changing it meant the popover.
-        <ul className="composer__scope-chips" aria-label="Asking within" data-testid="composer-scope-chips">
-          {selectedFilenames.map((name) => (
-            <li key={`f:${name}`}>
-              <button
-                type="button"
-                className="composer__scope-chip"
-                onClick={() => onSelectedFilenamesChange(selectedFilenames.filter((f) => f !== name))}
-                aria-label={`Stop limiting to ${name}`}
-                title={name}
-              >
-                <span className="composer__scope-chip-text">{name.split('/').pop()}</span>
-                <span aria-hidden="true">×</span>
-              </button>
-            </li>
-          ))}
-          {selectedTags.map((tag) => (
-            <li key={`t:${tag}`}>
-              <button
-                type="button"
-                className="composer__scope-chip"
-                onClick={() => onSelectedTagsChange?.(selectedTags.filter((t) => t !== tag))}
-                aria-label={`Stop limiting to the tag ${tag}`}
-              >
-                <span className="composer__scope-chip-text">#{tag}</span>
-                <span aria-hidden="true">×</span>
-              </button>
-            </li>
-          ))}
+      {(selectedFilenames.length > 0 || selectedTags.length > 0) && (
+        <ul
+          ref={chipsRef}
+          className="composer__scope-chips"
+          aria-label="Asking within"
+          data-testid="composer-scope-chips"
+        >
+          {/* Past SCOPE_CHIPS_MAX, a group is one count, not a row of chips each (many
+              tags stacked rows above the composer on a phone). */}
+          {selectedFilenames.length > SCOPE_CHIPS_MAX ? (
+            <li className="composer__scope-chip-text">{selectedFilenames.length} documents</li>
+          ) : (
+            selectedFilenames.map((name, index) => (
+              <li key={`f:${name}`}>
+                <button
+                  type="button"
+                  className="composer__scope-chip"
+                  onClick={() => {
+                    focusChipRef.current = index;
+                    onSelectedFilenamesChange(selectedFilenames.filter((f) => f !== name));
+                  }}
+                  aria-label={`Stop limiting to ${name}`}
+                  title={name}
+                >
+                  <span className="composer__scope-chip-text">{name.split('/').pop()}</span>
+                  <span aria-hidden="true">×</span>
+                </button>
+              </li>
+            ))
+          )}
+          {selectedTags.length > SCOPE_CHIPS_MAX ? (
+            <li className="composer__scope-chip-text">{selectedTags.length} tags</li>
+          ) : (
+            selectedTags.map((tag, index) => (
+              <li key={`t:${tag}`}>
+                <button
+                  type="button"
+                  className="composer__scope-chip"
+                  onClick={() => {
+                    focusChipRef.current =
+                      (selectedFilenames.length > SCOPE_CHIPS_MAX ? 0 : selectedFilenames.length) + index;
+                    onSelectedTagsChange?.(selectedTags.filter((t) => t !== tag));
+                  }}
+                  aria-label={`Stop limiting to the tag ${tag}`}
+                >
+                  <span className="composer__scope-chip-text">#{tag}</span>
+                  <span aria-hidden="true">×</span>
+                </button>
+              </li>
+            ))
+          )}
         </ul>
       )}
       <div className="composer__box">
@@ -404,6 +478,90 @@ function Composer({
                 onSaveScopePreset={onSaveScopePreset}
                 onDeleteScopePreset={onDeleteScopePreset}
               />
+            )}
+          </div>
+          <div className="composer__popover-anchor">
+            <button
+              type="button"
+              className="composer__chip composer__chip--templates"
+              onClick={() => {
+                setTemplates(readTemplates());
+                setOpenPopover((prev) => (prev === 'templates' ? null : 'templates'));
+              }}
+              aria-expanded={openPopover === 'templates'}
+              aria-controls="composer-templates-popover"
+              ref={templatesButtonRef}
+              title="Saved questions to start from"
+              aria-label="Templates"
+              data-testid="composer-templates-button"
+            >
+              <span aria-hidden="true">☰</span>
+              <span className="composer__chip-label"> Templates</span>
+            </button>
+            {openPopover === 'templates' && (
+              <div
+                className="composer__popover"
+                id="composer-templates-popover"
+                role="group"
+                aria-label="Question templates"
+                data-testid="composer-templates-popover"
+              >
+                {templates.length === 0 ? (
+                  <p className="composer__popover-note">
+                    No templates yet. Write a question (with {'{placeholders}'} to fill in) and
+                    save it here.
+                  </p>
+                ) : (
+                  <ul className="composer__templates">
+                    {templates.map((template) => (
+                      <li key={template.name} className="composer__popover-item">
+                        <button
+                          type="button"
+                          className="composer__template"
+                          onClick={() => insertTemplate(template)}
+                          title={template.text}
+                          data-testid="template-insert"
+                        >
+                          {template.name}
+                        </button>
+                        <button
+                          type="button"
+                          className="composer__template-delete"
+                          onClick={() => setTemplates(deleteTemplate(template.name))}
+                          aria-label={`Delete the template ${template.name}`}
+                          data-testid="template-delete"
+                        >
+                          ×
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <form
+                  className="composer__template-save"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    setTemplates(saveTemplate(templateName, value));
+                    setTemplateName('');
+                  }}
+                >
+                  <input
+                    value={templateName}
+                    onChange={(event) => setTemplateName(event.target.value)}
+                    placeholder="Name"
+                    maxLength={MAX_TEMPLATE_NAME_CHARS}
+                    aria-label="Name for the question in the box"
+                    data-testid="template-name"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!templateName.trim() || !value.trim()}
+                    data-testid="template-save"
+                  >
+                    Save question
+                  </button>
+                </form>
+              </div>
             )}
           </div>
           <div className="composer__popover-anchor">

@@ -4,6 +4,8 @@ import {
   checkable,
   judgeSaved,
   SAVED_CHECK_LABELS,
+  recheckRequest,
+  recheckSummary,
   savedCheckRequest,
   type SavedCheck,
 } from '../utils/savedCheck';
@@ -88,6 +90,25 @@ function SavedPanel({
       keptChecks = { workspace, checks: next };
       return next;
     });
+  // "Recheck" on one answer: its passages and sentences against the documents now.
+  const [rechecks, setRechecks] = useState<Record<string, string>>({});
+  const recheckRef = useRef<AbortController | null>(null);
+  useEffect(() => () => recheckRef.current?.abort(), []);
+  const recheckOne = async (item: SavedAnswer) => {
+    const key = `${item.conversationId}:${item.turn.id}`;
+    recheckRef.current?.abort();
+    const controller = new AbortController();
+    recheckRef.current = controller;
+    setRechecks((prev) => ({ ...prev, [key]: 'Rechecking…' }));
+    try {
+      const response = await api.recheckAnswer(recheckRequest(item), controller.signal, workspace);
+      if (!controller.signal.aborted) setRechecks((prev) => ({ ...prev, [key]: recheckSummary(response) }));
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        setRechecks((prev) => ({ ...prev, [key]: apiErrorMessage(err, 'The recheck failed.') }));
+      }
+    }
+  };
   const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
   const checkRef = useRef<AbortController | null>(null);
@@ -236,6 +257,11 @@ function SavedPanel({
                   {SAVED_CHECK_LABELS[checks[`${item.conversationId}:${item.turn.id}`]]}
                 </span>
               )}
+              {rechecks[`${item.conversationId}:${item.turn.id}`] && (
+                <span className="unanswered-panel__meta" role="status" data-testid="saved-recheck-result">
+                  {rechecks[`${item.conversationId}:${item.turn.id}`]}
+                </span>
+              )}
               {editing?.key === `${item.conversationId}:${item.turn.id}` ? (
                 <form
                   className="saved-panel__note-form"
@@ -287,6 +313,16 @@ function SavedPanel({
                 >
                   Open
                 </button>
+                {item.turn.sources.length > 0 && item.workspace === workspace && (
+                  <button
+                    type="button"
+                    onClick={() => void recheckOne(item)}
+                    title="Check its cited passages and each sentence against the documents as they are now (no model)"
+                    data-testid="saved-recheck"
+                  >
+                    Recheck
+                  </button>
+                )}
                 {/* In the workspace in use only: it is asked against these documents. */}
                 {onAskAgain && item.question && !item.task && item.workspace === workspace && (
                   <button

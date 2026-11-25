@@ -159,8 +159,10 @@ function ChatHeader({
           className={`chat-header__mode-btn${mode === 'reader' ? ' chat-header__mode-btn--active' : ''}`}
           onClick={() => onSetMode('reader')}
           data-testid="mode-reader"
+          aria-label="Reader"
         >
-          Reader
+          <span className="chat-header__mode-long">Reader</span>
+          <span className="chat-header__mode-short" aria-hidden="true">Read</span>
         </button>
         <button
           type="button"
@@ -171,8 +173,10 @@ function ChatHeader({
           className={`chat-header__mode-btn${mode === 'engineer' ? ' chat-header__mode-btn--active' : ''}`}
           onClick={() => onSetMode('engineer')}
           data-testid="mode-engineer"
+          aria-label="Engineer"
         >
-          Engineer
+          <span className="chat-header__mode-long">Engineer</span>
+          <span className="chat-header__mode-short" aria-hidden="true">Eng</span>
         </button>
       </div>
       <button type="button" className="chat-header__palette" onClick={onOpenPalette} data-testid="open-palette">
