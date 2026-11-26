@@ -56,6 +56,7 @@ from api.restore import (
     MAX_MEMBERS,
     BackupCheck,
     BackupImportError,
+    DrillReport,
     drill_backup,
     restore_backup,
     verify_backup,
@@ -312,7 +313,12 @@ def _restore_in_background(
         left_out = [] if status.cancel.is_set() else outcome.deferred
         status.failed += len(outcome.rejected) + len(left_out)
         for filename in outcome.rejected:
-            status.note(f"{filename}: refused by restore's rules (or damaged)")
+            # "b.txt (not in this backup)" says why already.
+            status.note(
+                filename
+                if filename.endswith(")")
+                else f"{filename}: refused by restore's rules (or damaged)"
+            )
         for filename in outcome.missing_originals:
             status.note(f"{filename}: the backup holds no original of it")
 
@@ -356,10 +362,13 @@ def _restore(
     source: str | None = None,
     status: BackgroundImport | None = None,
     only: frozenset[str] | None = None,
+    dry_run: bool = False,
 ) -> ImportResponse:
     """Restore one backup into ``settings``' workspace: an upload (``/import``) or one
     of BACKUP_DIR's (``source`` names it, for the audit). With ``status`` (a background
-    import) a full queue is waited out instead of deferring, and its count follows."""
+    import) a full queue is waited out instead of deferring, and its count follows.
+    ``dry_run``: what it would restore, skip and reject, with nothing queued, stored or
+    changed (feedback included)."""
 
     # Read once for the whole backup, then kept up to date with what it queues:
     # read per document, each job finishing mid-import moved the corpus generation
@@ -375,6 +384,8 @@ def _restore(
         watched_from: str | None,
     ) -> DocumentJobAcceptedResponse:
         nonlocal known
+        if dry_run:
+            return DocumentJobAcceptedResponse(job_id="", filename=filename, state="queued")
         if raw_store is not None:
             if known is None:
                 known = set(known_filenames(repository, settings))
@@ -399,13 +410,16 @@ def _restore(
         return accepted
 
     def has_room(size: int) -> bool:
+        if dry_run:
+            return True
         if status is None:
             return queue.backlog.has_room(size)
         return wait_for_room(queue.backlog.has_spare_room, size, status)
 
     # The last step of recovering from an embedding change (export, delete all,
     # import): an emptied collection is rebuilt here; a non-empty one is a 409.
-    repository.ensure_writable(settings)
+    if not dry_run:
+        repository.ensure_writable(settings)
     try:
         outcome = restore_backup(
             upload,
@@ -415,9 +429,9 @@ def _restore(
             max_original_bytes=int(settings.max_upload_bytes),
             has_room=has_room,
             enqueue=enqueue,
-            feedback_store=feedback_store,
+            feedback_store=None if dry_run else feedback_store,
             workspace=workspace_of(settings),
-            keep_version=raw_store.add_version if raw_store is not None else None,
+            keep_version=raw_store.add_version if raw_store is not None and not dry_run else None,
             # One of BACKUP_DIR's own (``source`` names it): no upload caps.
             # A backup this server wrote (BACKUP_DIR) is trusted past the upload caps; one
             # inside an uploaded migration bundle is an upload like any other.
@@ -433,6 +447,18 @@ def _restore(
         )
     except BackupImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if dry_run:
+        return ImportResponse(
+            jobs=[],
+            deferred=outcome.deferred,
+            skipped=outcome.skipped,
+            missing_originals=outcome.missing_originals,
+            rejected=outcome.rejected,
+            feedback_imported=0,
+            feedback_skipped=0,
+            would_restore=[job.filename for job in outcome.jobs],
+            dry_run=True,
+        )
     audit(
         "backup.import",
         workspace=workspace_of(settings),
@@ -622,6 +648,37 @@ def verify_stored_backup(name: str, request: Request, settings: SettingsDep) -> 
     return _check_response(check)
 
 
+# How long one drill request reads and parses originals before it stops and reports.
+DRILL_BUDGET_SECONDS = 600.0
+
+
+def drill_file(
+    path: Path,
+    settings: AppSettings,
+    counter: TokenCounter,
+    sample: int | None,
+    *,
+    originals_only: bool = False,
+) -> DrillReport:
+    """``path``'s originals (``sample`` of them; None = all) parsed and chunked with
+    this server's parsers and settings, nothing indexed (POST /backups/{name}/drill,
+    and BACKUP_DRILL_SAMPLE after each scheduled backup)."""
+
+    def parse(filename: str, content: bytes) -> int:
+        sections = parse_with_limit(filename, content, settings)
+        return len(chunk_sections(sections, settings, counter))
+
+    with path.open("rb") as handle:
+        return drill_backup(
+            handle,
+            parse,
+            sample=sample,
+            max_original_bytes=int(settings.max_upload_bytes),
+            budget_seconds=DRILL_BUDGET_SECONDS,
+            originals_only=originals_only,
+        )
+
+
 # A restore rehearsed on one of this workspace's backups: a sample of its originals
 # (``sample``; 0 = all) read, parsed and chunked with this server's parsers and
 # settings — nothing indexed or stored. Verify proves the zip is whole; this proves its
@@ -639,18 +696,8 @@ def drill_stored_backup(
     sample: Annotated[int, Query(ge=0, le=10_000, description="Documents to read; 0 = all.")] = 20,
 ) -> BackupDrillResponse:
     path = _stored_backup(settings, name)
-
-    def parse(filename: str, content: bytes) -> int:
-        sections = parse_with_limit(filename, content, settings)
-        return len(chunk_sections(sections, settings, counter))
-
-    with _one_verify(), path.open("rb") as handle:
-        report = drill_backup(
-            handle,
-            parse,
-            sample=sample or None,
-            max_original_bytes=int(settings.max_upload_bytes),
-        )
+    with _one_verify():
+        report = drill_file(path, settings, counter, sample or None)
     failed = sum(not d.ok for d in report.documents)
     audit("backup.drill", workspace=workspace_of(settings), name=name, failed=failed)
     return BackupDrillResponse(
@@ -688,9 +735,26 @@ def restore_stored_backup(
             description="Restore just these documents (repeatable); feedback isn't restored then.",
         ),
     ] = None,
+    dry_run: Annotated[
+        bool,
+        Query(description="List what it would restore, skip and reject; change nothing."),
+    ] = False,
 ) -> ImportResponse:
     path = _stored_backup(settings, name)
     chosen = frozenset(only) if only else None
+    if dry_run:
+        with path.open("rb") as handle:
+            return _restore(
+                handle,
+                repository,
+                settings,
+                queue,
+                raw_store,
+                feedback_store,
+                source=name,
+                only=chosen,
+                dry_run=True,
+            )
     require_free_space(settings, settings.raw_document_dir)
     if background:
         directory = spool_directory(settings.import_spool_dir)

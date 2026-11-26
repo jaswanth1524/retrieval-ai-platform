@@ -35,7 +35,7 @@ from api.feedback import FeedbackStore
 from api.metrics import backup_last_ok, backup_last_success_timestamp
 from api.notify import notify
 from api.repository import VectorRepository
-from api.restore import BackupCheck, verify_backup
+from api.restore import BackupCheck, DrillReport, verify_backup
 from api.settings import AppSettings
 from api.storage import low_on_space
 from api.workspace_target import WorkspaceTarget
@@ -162,7 +162,15 @@ def _kill_group(process: subprocess.Popen[bytes]) -> None:
         os.killpg(process.pid, signal.SIGKILL)
     except (OSError, AttributeError):  # gone already, or no process groups here
         process.kill()
-    process.wait()
+    try:
+        # Bounded: a process stuck in uninterruptible I/O (a hung network mount)
+        # ignores SIGKILL until the I/O returns, and held the backup thread with it.
+        process.wait(timeout=_KILL_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.warning("The backup copy (pid %d) didn't exit after SIGKILL.", process.pid)
+
+
+_KILL_WAIT_SECONDS = 30.0
 
 
 # Where a deleted workspace's backups are moved (never a workspace name: those can't
@@ -206,6 +214,7 @@ class ScheduledBackup(BackgroundLoop):
         *,
         clock: Callable[[], float] = time.time,
         interval: float = BACKUP_CHECK_SECONDS,
+        drill: Callable[[Path, AppSettings], DrillReport] | None = None,
     ) -> None:
         super().__init__("docrag-backup", interval, "Scheduled backup pass failed.", logger)
         self._root = Path(settings.backup_dir)
@@ -229,6 +238,8 @@ class ScheduledBackup(BackgroundLoop):
         # Per workspace, the newest backup whose BACKUP_COPY_COMMAND failed: tried
         # again each pass until it copies (the next backup is a day away).
         self._uncopied: dict[str, Path] = {}
+        # BACKUP_DRILL_SAMPLE's drill of a backup just written (main.py supplies it).
+        self._drill = drill
 
     def directory_of(self, settings: AppSettings) -> Path:
         """Where ``settings``' workspace's backups are written."""
@@ -415,6 +426,10 @@ class ScheduledBackup(BackgroundLoop):
         drop = self._document_drop(directory, final, check)
         if drop is not None:
             logger.warning("The backup %s: %s", final, drop)
+        if check.ok and drop is None:
+            drop = self._drill_problem(final, target.settings)
+            if drop is not None:
+                logger.warning("The backup %s: %s", final, drop)
         self._note(
             BackupStatus(
                 self._clock(),
@@ -426,6 +441,29 @@ class ScheduledBackup(BackgroundLoop):
             )
         )
         return final
+
+    def _drill_problem(self, backup: Path, settings: AppSettings) -> str | None:
+        """BACKUP_DRILL_SAMPLE originals of ``backup`` parsed as a restore would: why
+        they don't make documents, or None."""
+
+        sample = int(settings.backup_drill_sample)
+        if self._drill is None or sample <= 0:
+            return None
+        try:
+            report = self._drill(backup, settings)
+        except Exception as exc:  # noqa: BLE001 - reported as the backup's failure
+            logger.warning("The restore drill of %s failed.", backup, exc_info=True)
+            return f"restore drill failed: {str(exc)[:160]}"
+        if report.problems:
+            return f"restore drill: {report.problems[0][:160]}"
+        failures = [document for document in report.documents if not document.ok]
+        if not failures:
+            return None
+        first = failures[0]
+        return (
+            f"restore drill: {len(failures)} of {len(report.documents)} sampled originals "
+            f"don't make documents ({first.filename}: {(first.error or '')[:120]})"
+        )
 
     def _remove_abandoned_parts(self, directory: Path) -> None:
         """Remove partial backups a killed process left (its ``except`` never ran):

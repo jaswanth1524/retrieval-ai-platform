@@ -253,21 +253,44 @@ def cmd_ask_many(client: DocragClient, args: argparse.Namespace, out: TextIO) ->
     BATCH_SIZE at a time), with its sources. Exit 1 when one failed; with --strict,
     EXIT_NOT_ANSWERED when one wasn't answered."""
 
-    questions = read_questions(args.questions)
-    if not questions:
-        print("error: no questions in that file", file=sys.stderr)
-        return 2
     answers: list[dict[str, Any]] = []
-    for start in range(0, len(questions), BATCH_SIZE):
+    if getattr(args, "batch", None):
+        answers = follow_batch(client, args.batch, quiet=args.quiet)
+        job = client.batch_job(args.batch)
         answers.extend(
-            client.ask_batch(
-                questions[start : start + BATCH_SIZE],
-                filenames=args.file or None,
-                tags=args.tag or None,
-                provider=args.provider,
-                options=question_options(args),
-            )
+            {"question": f"question {n}", "error": "not answered (the batch ended early)"}
+            for n in range(len(answers) + 1, int(job.get("total", 0)) + 1)
         )
+    else:
+        questions = read_questions(args.questions)
+        if not questions:
+            print("error: no questions in that file", file=sys.stderr)
+            return 2
+        for start in range(0, len(questions), BATCH_SIZE):
+            part = questions[start : start + BATCH_SIZE]
+            scope = {
+                "filenames": args.file or None,
+                "tags": args.tag or None,
+                "provider": args.provider,
+                "options": question_options(args),
+            }
+            if getattr(args, "background", False):
+                started = client.start_batch_job(part, **scope)
+                if not args.quiet:
+                    print(f"batch {started['batch_id']} started", file=sys.stderr)
+                got = follow_batch(client, started["batch_id"], quiet=args.quiet)
+                answers.extend(got)
+                if len(got) < len(part):
+                    # Cancelled or failed part way: the rest isn't asked, and the
+                    # questions it never answered make this a failure.
+                    unanswered = part[len(got) :] + questions[start + BATCH_SIZE :]
+                    answers.extend(
+                        {"question": q, "error": "not answered (the batch ended early)"}
+                        for q in unanswered
+                    )
+                    break
+            else:
+                answers.extend(client.ask_batch(part, **scope))
     if args.json or getattr(args, "format", None) == "json":
         print(json.dumps(answers), file=out)
     else:
@@ -294,8 +317,37 @@ def cmd_ask_many(client: DocragClient, args: argparse.Namespace, out: TextIO) ->
     return 0
 
 
+# How often a followed background batch is read.
+BATCH_POLL_SECONDS = 2.0
+
+
+def follow_batch(
+    client: DocragClient, batch_id: str, *, quiet: bool = False, sleep: Any = time.sleep
+) -> list[dict[str, Any]]:
+    """A background batch read until it ends (a progress line per answer on stderr);
+    its answers. Ctrl-C cancels it (the question being answered still finishes)."""
+
+    shown = 0
+    try:
+        while True:
+            job = client.batch_job(batch_id)
+            done = int(job.get("done", 0))
+            if not quiet and done != shown:
+                print(f"[{done}/{job.get('total')}] answered", file=sys.stderr)
+                shown = done
+            if job.get("state") in ("done", "cancelled", "failed"):
+                if job.get("state") != "done" and not quiet:
+                    reason = job.get("error") or job.get("state")
+                    print(f"batch {batch_id} ended: {reason}", file=sys.stderr)
+                return list(job.get("answers", []))
+            sleep(BATCH_POLL_SECONDS)
+    except KeyboardInterrupt:
+        client.cancel_batch_job(batch_id)
+        raise
+
+
 def cmd_ask(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    if getattr(args, "questions", None):
+    if getattr(args, "questions", None) or getattr(args, "batch", None):
         return cmd_ask_many(client, args, out)
     if not args.question:
         print("ask needs a question, or --questions FILE", file=sys.stderr)

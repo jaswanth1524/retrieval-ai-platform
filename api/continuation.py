@@ -177,6 +177,9 @@ class AutoContinuing:
             if not prefilled:
                 more = drop_restart(text, more)
             if not more.strip():
+                # Still cut off where it was: the empty reply's "stop" would have
+                # marked it whole (and kept it in the answer cache).
+                reset_finish_reason("length")
                 break
             text = join_continuation(text, more, prefilled=prefilled)
         return text

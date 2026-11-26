@@ -79,6 +79,8 @@ def is_rate_limited(method: str, path: str) -> bool:
         method == "GET"
         and (
             path in ("/export", "/traces/export", "/admin/migrate/export")
+            # A background export's bundle, the whole server in one download.
+            or path.startswith("/admin/migrate/export/")
             # A stored backup's download reads a whole archive, like /export.
             or (path.startswith("/backups/") and path.count("/") == 2)
         )

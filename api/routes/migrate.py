@@ -66,6 +66,7 @@ from api.workspace_target import WorkspaceTarget
 from api.workspaces import (
     MAX_WORKSPACES,
     WorkspaceError,
+    document_key,
     list_workspaces,
     settings_for,
     validate_name,
@@ -168,11 +169,13 @@ def migrate_export(
         raise HTTPException(
             status_code=409, detail="Another export or backup is being written; try again."
         )
-    handle = tempfile.NamedTemporaryFile(
-        prefix="docrag-migrate-", suffix=".zip", delete=False, dir=directory
-    )
-    handle.close()
-    path = Path(handle.name)
+    try:
+        # Inside the try: a scratch folder that can't be written (or a full disk) left
+        # the lock held, and every export and backup after it refused until a restart.
+        path = _scratch_file(directory)
+    except BaseException:
+        backup_routes._export_running.release()
+        raise
     try:
         manifest = pack(
             settings,
@@ -234,14 +237,20 @@ class _KeptUntilSent(FileResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         complete = False
-        to_the_end = True
+        # Only a whole file (200) or a range running to its last byte (206) finishes the
+        # bundle: a bad Range gets Starlette's own 416/400, whose short body ended
+        # "complete" too and deleted a bundle nobody had downloaded.
+        to_the_end = False
 
         async def watching(message: Message) -> None:
             nonlocal complete, to_the_end
-            if message["type"] == "http.response.start" and message.get("status") == 206:
-                # A range: done with the bundle only if it ran to its last byte.
+            if message["type"] == "http.response.start":
+                status = message.get("status")
                 headers = {k.lower(): v for k, v in message.get("headers", [])}
-                to_the_end = _reaches_end(headers.get(b"content-range", b"").decode("latin-1"))
+                to_the_end = status == 200 or (
+                    status == 206
+                    and _reaches_end(headers.get(b"content-range", b"").decode("latin-1"))
+                )
             await send(message)
             if message["type"] == "http.response.body" and not message.get("more_body", False):
                 complete = to_the_end
@@ -268,6 +277,16 @@ def _reaches_end(content_range: str) -> bool:
 _background_exports: dict[str, tuple[Path, float, str | None]] = {}
 _background_lock = threading.Lock()
 BACKGROUND_EXPORT_KEEP_SECONDS = 24 * 3600
+
+
+def _scratch_file(directory: Path | None) -> Path:
+    """A new, empty file for a bundle being written."""
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix="docrag-migrate-", suffix=".zip", delete=False, dir=directory
+    )
+    handle.close()
+    return Path(handle.name)
 
 
 def _sha256_of(path: Path) -> str:
@@ -335,11 +354,11 @@ def migrate_export_in_background(
             status.errored = True
             status.note("Another export or backup was being written; start it again.")
             return
-        handle = tempfile.NamedTemporaryFile(
-            prefix="docrag-migrate-", suffix=".zip", delete=False, dir=directory
-        )
-        handle.close()
-        path = Path(handle.name)
+        try:
+            path = _scratch_file(directory)
+        except BaseException:
+            backup_routes._export_running.release()
+            raise
         try:
             manifest = pack(
                 settings,
@@ -362,7 +381,12 @@ def migrate_export_in_background(
             f"ready to download: {path.stat().st_size} bytes, "
             f"{len(manifest['workspaces'])} workspace(s)"
         )
-        _keep_export(status.id, path, _sha256_of(path))
+        try:
+            sha256 = _sha256_of(path)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        _keep_export(status.id, path, sha256)
         audit(
             "admin.migrate_export",
             workspace="",
@@ -528,6 +552,13 @@ def _unpack_workspace(
             else "the bundle holds no snapshot of it"
         )
         if reason is None:
+            # Checked again just before the snapshot replaces the collection: writing
+            # the backup out of the bundle takes a while, and an upload landing in it
+            # was wiped with the old collection.
+            now = server.client.count(collection_name=collection, exact=True).count
+            if now != points:
+                reason = f"{now - points} passage(s) were indexed here meanwhile"
+        if reason is None:
             try:
                 recover_workspace(
                     bundle, entry, target, server.client, server.snapshots(), _scratch(base)
@@ -542,6 +573,7 @@ def _unpack_workspace(
                 feedback_store,
                 name,
                 max_members=int(base.max_migrate_members),
+                lock_key=lambda filename: document_key(target.settings, filename),
             )
             bump_corpus_generation(collection=collection)
             documents = len(server.repository.filename_metadata(target.settings))

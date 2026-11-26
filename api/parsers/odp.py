@@ -16,7 +16,16 @@ from api.parsers.common import (
     normalize_text,
     refuse_zip_xml_dtd,
 )
-from api.parsers.odt import _TABLE, _TEXT, HiddenStyles, _inline_text, _table_rows, warn_hidden
+from api.parsers.odt import (
+    _TABLE,
+    _TEXT,
+    HiddenStyles,
+    _inline_text,
+    _table_rows,
+    _visible_paragraphs,
+    read_odf,
+    warn_hidden,
+)
 
 _OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 _DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
@@ -35,14 +44,14 @@ def parse_odp_document(
     refuse_zip_xml_dtd(filename, content, "ODP")
     try:
         with ZipFile(BytesIO(content)) as archive:
-            root = ElementTree.fromstring(archive.read("content.xml"))
+            root, styles_root = read_odf(archive)
     except (BadZipFile, KeyError, ElementTree.ParseError, OSError) as exc:
         raise DocumentParseError(f"Could not parse ODP '{filename}'.") from exc
 
     body = root.find(f"{_OFFICE}body/{_OFFICE}presentation")
     if body is None:
         raise EmptyDocumentError(f"ODP '{filename}' has no slides.")
-    styles = None if hidden else HiddenStyles(root)
+    styles = None if hidden else HiddenStyles(root, styles_root)
     skipped = 0
     sections: list[DocumentSection] = []
     for number, slide in enumerate(body.iter(f"{_DRAW}page"), start=1):
@@ -56,7 +65,7 @@ def parse_odp_document(
         title = ""
         lines: list[str] = []
         for frame in _shapes(slide):
-            text = _frame_text(frame)
+            text = _frame_text(frame, styles)
             if not text:
                 continue
             if not title and frame.get(f"{_PRESENTATION}class") == "title":
@@ -66,7 +75,7 @@ def parse_odp_document(
         if notes is not None:
             spoken = "\n".join(
                 text
-                for text in (_frame_text(frame) for frame in notes.iter(f"{_DRAW}frame"))
+                for text in (_frame_text(frame, styles) for frame in notes.iter(f"{_DRAW}frame"))
                 if text
             )
             if spoken:
@@ -106,22 +115,23 @@ def _shapes(container: ElementTree.Element, depth: int = 0) -> list[ElementTree.
     return found
 
 
-def _frame_text(frame: ElementTree.Element) -> str:
+def _frame_text(frame: ElementTree.Element, styles: HiddenStyles | None = None) -> str:
+    """A shape's paragraphs and tables, without hidden text when ``styles`` is given."""
+
     parts: list[str] = []
     for element in frame:
-        if element.tag in (f"{_TEXT}p", f"{_TEXT}h", f"{_TEXT}list"):
+        if styles is not None and styles.hides_text(element):
+            continue
+        if element.tag in (f"{_TEXT}p", f"{_TEXT}h"):
             # A custom shape holds its paragraphs directly.
-            for paragraph in element.iter():
-                if paragraph.tag in (f"{_TEXT}p", f"{_TEXT}h"):
-                    text = normalize_text(_inline_text(paragraph))
-                    if text:
-                        parts.append(text)
-        elif element.tag == f"{_DRAW}text-box":
-            for paragraph in element.iter():
-                if paragraph.tag in (f"{_TEXT}p", f"{_TEXT}h"):
-                    text = normalize_text(_inline_text(paragraph))
-                    if text:
-                        parts.append(text)
+            text = normalize_text(_inline_text(element, styles=styles))
+            if text:
+                parts.append(text)
+        elif element.tag in (f"{_TEXT}list", f"{_DRAW}text-box"):
+            for paragraph in _visible_paragraphs(element, styles):
+                text = normalize_text(_inline_text(paragraph, styles=styles))
+                if text:
+                    parts.append(text)
         elif element.tag == f"{_TABLE}table":
-            parts.extend(_table_rows(element))
+            parts.extend(_table_rows(element, styles))
     return "\n".join(parts)

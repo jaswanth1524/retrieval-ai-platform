@@ -121,19 +121,32 @@ def _hidden_rows_and_columns(
     columns: set[int] = set()
     try:
         with ZipFile(BytesIO(content)) as archive, archive.open(sheet_path.lstrip("/")) as xml:
+            # A row may leave out its number ("r"): it is then the one after the last.
+            # Such rows, and one unreadable attribute, used to make the whole sheet
+            # read as hiding nothing.
+            last_row = 0
             for _, element in ElementTree.iterparse(xml):
                 tag = element.tag.rsplit("}", 1)[-1]
                 if tag == "row":
-                    if element.get("hidden") in ("1", "true") and element.get("r"):
-                        rows.add(int(element.get("r") or 0))
+                    number = _int_attribute(element, "r") or last_row + 1
+                    last_row = number
+                    if element.get("hidden") in ("1", "true"):
+                        rows.add(number)
                     element.clear()
                 elif tag == "col" and element.get("hidden") in ("1", "true"):
-                    low = int(element.get("min") or 0)
-                    high = min(int(element.get("max") or low), _MAX_COLUMN)
+                    low = _int_attribute(element, "min") or 0
+                    high = min(_int_attribute(element, "max") or low, _MAX_COLUMN)
                     columns.update(range(max(low, 1), high + 1))
-    except (KeyError, OSError, ValueError, ElementTree.ParseError, BadZipFile):
+    except (KeyError, OSError, ElementTree.ParseError, BadZipFile):
         return frozenset(), frozenset()
     return frozenset(rows), frozenset(columns)
+
+
+def _int_attribute(element: ElementTree.Element, name: str) -> int | None:
+    try:
+        return int(element.get(name) or "")
+    except ValueError:
+        return None
 
 
 def _sheet_sections(

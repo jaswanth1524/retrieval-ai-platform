@@ -127,10 +127,15 @@ def list_documents(
         record_missing_details(metadata, raw_store)
     total: int | None = None
     next_cursor: str | None = None
+    stale_total: int | None = None
     if limit is not None or cursor is not None or prefix is not None or tag is not None:
+        # Over every document, not this page: a client asking for one page (a status
+        # line) read len(stale_filenames) and never saw more than the page held.
+        stale_total = sum(1 for meta in metadata.values() if is_stale(meta))
         metadata, total, next_cursor = _page(metadata, limit, cursor, prefix, tag)
     return DocumentListResponse(
         total=total,
+        stale_total=stale_total,
         next_cursor=next_cursor,
         url_refresh=_url_refresh_statuses(metadata, settings),
         filenames=sorted(metadata),
@@ -210,14 +215,21 @@ def missing_documents(
 
 def duplicate_groups(metadata: dict[str, DocumentMetadata]) -> list[list[str]]:
     """Names sharing one content hash, two or more to a group, groups in order of their
-    first name. A document with mixed or no hashes (incomplete, or indexed before
-    hashes were stored) is in none."""
+    first name. A document with mixed or no hashes (indexed before hashes were stored),
+    or whose points are incomplete (a write cut off part way still has one hash), is in
+    none. Within a group the copy to keep comes first: the one with the most tags, then
+    one with a source URL (it can be refreshed), then by name."""
 
     by_hash: dict[str, list[str]] = {}
     for name, meta in sorted(metadata.items()):
-        if meta.content_sha256:
+        if meta.content_sha256 and not meta.incomplete:
             by_hash.setdefault(meta.content_sha256, []).append(name)
-    return sorted(names for names in by_hash.values() if len(names) > 1)
+
+    def keep_first(name: str) -> tuple[int, int, str]:
+        meta = metadata[name]
+        return (-len(meta.tags), 0 if meta.source_url else 1, name)
+
+    return sorted(sorted(names, key=keep_first) for names in by_hash.values() if len(names) > 1)
 
 
 def _url_refresh_statuses(

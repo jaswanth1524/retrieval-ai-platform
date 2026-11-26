@@ -56,6 +56,8 @@
     "qdrant_quantization": "none",
     "query_expansion_count": 3,
     "query_expansion_enabled": false,
+    "query_decomposition_enabled": false,
+    "query_decomposition_max_parts": 3,
     "recency_boost_weight": 0.0,
     "rerank_candidates": 50,
     "rerank_fallback_count": 3,

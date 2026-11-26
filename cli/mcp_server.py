@@ -608,7 +608,10 @@ def index_status_text(client: DocragClient) -> str:
         lines.append("Models not loaded: " + ", ".join(failed_models))
     listing = client.documents(limit=1)
     total = listing.get("total", len(listing.get("filenames", [])))
-    stale = len(listing.get("stale_filenames", []))
+    # The whole listing's count (a server before pass 22 gives only this page's).
+    stale = listing.get("stale_total")
+    if stale is None:
+        stale = len(listing.get("stale_filenames", []))
     lines.append(f"Documents: {total}" + (f" ({stale} need re-indexing)" if stale else ""))
     if total == 0 and ready.get("originals_kept"):
         lines.append(

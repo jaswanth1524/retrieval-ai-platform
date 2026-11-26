@@ -7,7 +7,7 @@ import functools
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, NamedTuple, get_args
 
@@ -17,6 +17,7 @@ from starlette.concurrency import run_in_threadpool
 
 from api.admission import QuestionSlots, Release, SlotKind
 from api.answer_cache import CachedAnswer
+from api.batch_jobs import BatchJob, batch_job_store, run_batch_job
 from api.citations import SourceCitation, citation_from_dict
 from api.dependencies import (
     require_api_key,
@@ -62,6 +63,8 @@ from api.routes.responses import (
 from api.schemas import (
     AnswerCheckResponse,
     BatchAnswerResponse,
+    BatchJobResponse,
+    BatchJobStartedResponse,
     BatchQuestionRequest,
     BatchQuestionResponse,
     CitationResponse,
@@ -149,17 +152,24 @@ class _Held:
         self._slots = slots
         self._releases = list(releases)
         self._lock = threading.Lock()
+        self._closed = False
 
     def take_slot(self) -> bool:
         release = self._slots.try_acquire("question")
         if release is None:
             return False
         with self._lock:
-            self._releases.append(release)
-        return True
+            if not self._closed:
+                self._releases.append(release)
+                return True
+        # Released already (the request ended while its run went on): nothing would
+        # ever free this one.
+        release()
+        return False
 
     def release(self) -> None:
         with self._lock:
+            self._closed = True
             releases, self._releases = self._releases, []
         for release in reversed(releases):
             release()
@@ -266,6 +276,7 @@ def answer_checks(
     answer: str,
     sources: Sequence[SourceCitation],
     widen: Callable[[RerankedChunk], str] | None = None,
+    read: Callable[[Sequence[SourceCitation]], Mapping[str, RerankedChunk]] | None = None,
 ) -> list[dict[str, Any]] | None:
     """ANSWER_SELF_CHECK: the answer's sentences against the passages it cites (no LLM,
     no search) — on cache hits and continued answers too, worked out from the answer and
@@ -274,7 +285,8 @@ def answer_checks(
     if not settings.answer_self_check or status != "answered" or not sources:
         return None
     try:
-        checks = self_check(answer, sources, _remembered(widen) if widen else None)
+        whole = read(sources) if read is not None else None
+        checks = self_check(answer, sources, _remembered(widen) if widen else None, whole)
     except Exception:  # noqa: BLE001 - advice only; the answer stands without it
         logger.warning("The answer's self-check failed.", exc_info=True)
         return None
@@ -320,6 +332,7 @@ def with_answer_checks(
         event["answer"],
         [citation_from_dict(dict(source)) for source in event["sources"]],
         pipeline.neighbour_text if pipeline is not None else None,
+        pipeline.cited_passages if pipeline is not None else None,
     )
     if checks is not None:
         event["verification"] = checks
@@ -579,7 +592,8 @@ async def answer_question(
     finally:
         watcher.cancel()
         release()
-    return answered_response(grounded, request, settings, pipeline)
+    # Off the event loop: the self-check reads the cited passages from Qdrant.
+    return await run_in_threadpool(answered_response, grounded, request, settings, pipeline)
 
 
 def answered_response(
@@ -631,6 +645,7 @@ def answered_response(
                 grounded.answer,
                 grounded.sources,
                 pipeline.neighbour_text,
+                pipeline.cited_passages,
             )
             or []
         ]
@@ -690,13 +705,121 @@ async def answer_questions(
             answers.append(
                 BatchAnswerResponse(
                     question=question,
-                    answer=answered_response(grounded, one, settings, pipeline),
+                    answer=await run_in_threadpool(
+                        answered_response, grounded, one, settings, pipeline
+                    ),
                 )
             )
     finally:
         watcher.cancel()
         release()
     return BatchQuestionResponse(answers=answers)
+
+
+# The same batch on a thread of its own: answers kept as they come, read with GET
+# (again after a dropped connection), each question waiting for a slot rather than
+# failing with a 429. Read key allowed, like asking.
+@router.post(
+    "/questions/batch/jobs",
+    status_code=202,
+    response_model=BatchJobStartedResponse,
+    dependencies=[Depends(require_api_key)],
+    responses={409: {"description": "As many batches as allowed are running already."}},
+)
+def start_batch_job(
+    request: BatchQuestionRequest,
+    pipeline: RagPipelineDep,
+    slots: QuestionSlotsDep,
+    settings: SettingsDep,
+) -> BatchJobStartedResponse:
+    check_request_provider(request.llm_provider, settings, request.llm_temperature)
+    check_rerank_top_k(request.rerank_top_k, settings)
+    for question in request.questions:
+        check_question_text(question)
+    overrides = question_overrides(request)
+    job = batch_job_store().add(str(settings.qdrant_collection), list(request.questions))
+    if job is None:
+        raise HTTPException(
+            status_code=409,
+            detail="As many batches as allowed are running; wait for one to finish.",
+        )
+
+    def answer(question: str, should_stop: Callable[[], bool]) -> BatchAnswerResponse:
+        grounded = pipeline.answer(
+            question,
+            overrides,
+            filenames=request.filenames,
+            tags=request.tags,
+            use_cache=request.use_cache,
+            should_stop=should_stop,
+        )
+        one = request.model_copy(update={"question": question, "questions": [question]})
+        return BatchAnswerResponse(
+            question=question, answer=answered_response(grounded, one, settings, pipeline)
+        )
+
+    def failed(question: str, exc: Exception) -> BatchAnswerResponse:
+        questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
+        return BatchAnswerResponse(question=question, error=public_error_message(exc))
+
+    try:
+        _start_batch_thread(job, lambda: slots.try_acquire("question"), answer, failed)
+    except BaseException:
+        # Never started: ended, so it doesn't hold one of the running places for good.
+        job.state, job.error, job.finished_at = "failed", "it couldn't be started", time.time()
+        raise
+    return BatchJobStartedResponse(batch_id=job.id, total=len(job.questions))
+
+
+def _start_batch_thread(job: BatchJob, *args: Any) -> None:
+    threading.Thread(
+        target=run_batch_job, args=(job, *args), name=f"docrag-batch-{job.id[:8]}", daemon=True
+    ).start()
+
+
+def _batch_job(batch_id: str, settings: AppSettings) -> BatchJob:
+    job = batch_job_store().get(batch_id, str(settings.qdrant_collection))
+    if job is None:
+        raise HTTPException(status_code=404, detail="No such batch here (or it was forgotten).")
+    return job
+
+
+def _batch_job_response(job: BatchJob) -> BatchJobResponse:
+    answers = list(job.answers)
+    return BatchJobResponse(
+        batch_id=job.id,
+        state=job.state,
+        total=len(job.questions),
+        done=len(answers),
+        answers=answers,
+        created_at=job.created_at,
+        finished_at=job.finished_at,
+        error=job.error,
+    )
+
+
+@router.get(
+    "/questions/batch/jobs/{batch_id}",
+    response_model=BatchJobResponse,
+    dependencies=[Depends(require_api_key)],
+    responses={404: {"description": "No such batch in this workspace."}},
+)
+def batch_job_status(batch_id: str, settings: SettingsDep) -> BatchJobResponse:
+    return _batch_job_response(_batch_job(batch_id, settings))
+
+
+@router.post(
+    "/questions/batch/jobs/{batch_id}/cancel",
+    response_model=BatchJobResponse,
+    dependencies=[Depends(require_api_key)],
+    responses={404: {"description": "No such batch in this workspace."}},
+)
+def cancel_batch_job(batch_id: str, settings: SettingsDep) -> BatchJobResponse:
+    """Stop before the next question (the one being answered finishes)."""
+
+    job = _batch_job(batch_id, settings)
+    job.cancel.set()
+    return _batch_job_response(job)
 
 
 @router.post(

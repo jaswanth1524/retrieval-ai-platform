@@ -11,6 +11,8 @@
     "chunker_version": 9,
     "rerank_top_k": 8,
     "query_expansion_enabled": false,
+    "query_decomposition_enabled": false,
+    "query_decomposition_max_parts": 3,
     "chunk_size_tokens": 48,
     "chunk_overlap_tokens": 8,
     "min_section_words": 0,
