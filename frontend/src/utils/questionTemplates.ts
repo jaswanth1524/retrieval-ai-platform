@@ -66,3 +66,15 @@ export function firstPlaceholder(text: string): [number, number] | null {
   const match = /\{[^{}\n]{1,60}\}/.exec(text);
   return match ? [match.index, match.index + match[0].length] : null;
 }
+
+/** The next ``{placeholder}`` starting at or after ``from``, braces included; null when
+ *  there is none further on. Tab in the question box moves to it, so a template with
+ *  several is filled in without the mouse — and past the last one, Tab leaves the box
+ *  as usual (it used to go round to the first). */
+export function nextPlaceholder(text: string, from: number): [number, number] | null {
+  const pattern = /\{[^{}\n]{1,60}\}/g;
+  for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+    if (match.index >= from) return [match.index, match.index + match[0].length];
+  }
+  return null;
+}

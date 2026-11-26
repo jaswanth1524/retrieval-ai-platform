@@ -197,14 +197,21 @@ export function useConversationActions(
     const target = current.find((conversation) => conversation.id === id);
     if (!target || Boolean(target.pinned) === pinned) return Boolean(target);
     if (pinned && current.filter((c) => c.pinned).length >= MAX_PINNED_CONVERSATIONS) return false;
-    setStorage((prev) => ({
-      ...prev,
-      conversations: prev.conversations.map((conversation) =>
-        conversation.id === id
-          ? { ...conversation, pinned: pinned || undefined, editedAt: Date.now() }
-          : conversation,
-      ),
-    }));
+    setStorage((prev) => {
+      // Counted again on the state it applies to: several pins in one go all read the
+      // same (not yet re-rendered) ref above.
+      if (pinned && prev.conversations.filter((c) => c.pinned).length >= MAX_PINNED_CONVERSATIONS) {
+        return prev;
+      }
+      return {
+        ...prev,
+        conversations: prev.conversations.map((conversation) =>
+          conversation.id === id
+            ? { ...conversation, pinned: pinned || undefined, editedAt: Date.now() }
+            : conversation,
+        ),
+      };
+    });
     return true;
   }, [setStorage, storageRef]);
 

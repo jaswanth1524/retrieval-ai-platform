@@ -72,6 +72,8 @@ export function useChatPersistence(
   const [persistPartial, setPersistPartial] = useState(false);
   // The next IndexedDB write, held back by CHAT_STORE_SAVE_DELAY_MS (see the save effect).
   const pendingChatStoreRef = useRef<ChatStorageV2 | null>(null);
+  // The state a merge of another tab's save produced (not written back; see the save).
+  const mergedFromOtherTabRef = useRef<ChatStorageV2 | null>(null);
   const chatStoreTimerRef = useRef<number | undefined>(undefined);
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -237,6 +239,10 @@ export function useChatPersistence(
           storage.conversations.length > LOCAL_STORAGE_MAX_CONVERSATIONS),
     );
     if (!chatStoreReady || !chatStoreAvailable() || !chatStoreWritableRef.current) return;
+    // Merged in from what another tab just saved: that tab wrote the full history
+    // already. Writing it back (and announcing it) made every tab rewrite the whole
+    // history after each edit anywhere.
+    if (storage === mergedFromOtherTabRef.current) return;
     // Coalesced: every scope click, rename or rating used to rewrite the whole history
     // in IndexedDB at once; a burst of changes now costs one write. The timer is not
     // cancelled on unmount (the write must still land), and a hidden tab or pagehide
@@ -278,27 +284,49 @@ export function useChatPersistence(
   useEffect(() => {
     if (!chatStoreReady || chatStoreUnreadable) return;
     let reading = false;
-    return onHistorySaved(() => {
-      if (reading) return;
+    // Told again while a read was going: that read may have run before the second
+    // save committed, so one more follows it (the second change used to wait for the
+    // next save or a reload).
+    let again = false;
+    let closed = false;
+    const read = () => {
       reading = true;
-      void readChatStore().then((read) => {
+      again = false;
+      void readChatStore().then((result) => {
         reading = false;
-        if (read.status !== 'data') return;
-        const incoming = parseConversations(read.value)?.filter((c) => c.turns.length > 0);
-        const deleted = parseDeleted(read.value);
-        if (!incoming?.length && !deleted?.length) return;
-        setStorage((prev) =>
-          mergeConversations(
-            prev,
-            incoming ?? [],
-            false,
-            deleted,
-            Date.now(),
-            streamingConversationIdRef.current,
-          ),
-        );
+        if (closed) return;
+        if (result.status === 'data') {
+          const incoming = parseConversations(result.value)?.filter((c) => c.turns.length > 0);
+          const deleted = parseDeleted(result.value);
+          if (incoming?.length || deleted?.length) {
+            setStorage((prev) => {
+              const next = mergeConversations(
+                prev,
+                incoming ?? [],
+                false,
+                deleted,
+                Date.now(),
+                streamingConversationIdRef.current,
+              );
+              if (next !== prev) mergedFromOtherTabRef.current = next;
+              return next;
+            });
+          }
+        }
+        if (again) read();
       });
+    };
+    const unsubscribe = onHistorySaved(() => {
+      if (reading) {
+        again = true;
+        return;
+      }
+      read();
     });
+    return () => {
+      closed = true;
+      unsubscribe();
+    };
   }, [chatStoreReady, chatStoreUnreadable, setStorage, streamingConversationIdRef]);
 
   useEffect(() => {

@@ -218,6 +218,30 @@ function DocumentViewer({
   // Docking or undocking ends or starts the dialog, whose focus handling sent focus to
   // the citation that opened it (or the first control): the toggle keeps it instead.
   const dockToggleRef = useRef<HTMLButtonElement>(null);
+  // Back and Forward: the one pressed is disabled once there is nowhere further to go,
+  // and focus fell out of the viewer with it — Alt+→ (handled here) then did nothing.
+  // It moves to the other one instead.
+  const backRef = useRef<HTMLButtonElement | null>(null);
+  const forwardRef = useRef<HTMLButtonElement | null>(null);
+  const steppedWithRef = useRef<'back' | 'forward' | null>(null);
+  useEffect(() => {
+    const used = steppedWithRef.current;
+    steppedWithRef.current = null;
+    const active = document.activeElement;
+    // A disabled button may keep or drop focus depending on the browser: either way.
+    const lost = (button: HTMLButtonElement | null) =>
+      active === button || active === document.body || active === null;
+    if (used === 'back' && !onBack && lost(backRef.current)) forwardRef.current?.focus();
+    else if (used === 'forward' && !onForward && lost(forwardRef.current)) backRef.current?.focus();
+  }, [onBack, onForward]);
+  const stepBack = () => {
+    steppedWithRef.current = 'back';
+    onBack?.();
+  };
+  const stepForward = () => {
+    steppedWithRef.current = 'forward';
+    onForward?.();
+  };
   const toggledDockRef = useRef(false);
   useEffect(() => {
     if (!toggledDockRef.current) return;
@@ -461,6 +485,22 @@ function DocumentViewer({
           onClose();
           return;
         }
+        // Alt+← / Alt+→: back and forward through the passages opened, as a browser's
+        // history (not in a text field, where Alt+arrows move by word on macOS).
+        if (
+          event.altKey &&
+          !event.ctrlKey &&
+          !event.metaKey &&
+          (event.key === 'ArrowLeft' || event.key === 'ArrowRight') &&
+          !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)
+        ) {
+          const step = event.key === 'ArrowLeft' ? (onBack && stepBack) : (onForward && stepForward);
+          if (step) {
+            event.preventDefault();
+            step();
+          }
+          return;
+        }
         // The browser's own find can't see passages not loaded, and missed the dialog's
         // scroll box: this one searches what is loaded and offers the rest.
         if (event.key.toLowerCase() === 'f' && isShortcutModifier(event.nativeEvent) && mode === 'passages') {
@@ -525,9 +565,11 @@ function DocumentViewer({
               <button
                 type="button"
                 className="document-viewer__original"
-                onClick={onBack}
+                ref={backRef}
+                onClick={stepBack}
                 disabled={!onBack}
                 aria-label="Back to the passage opened before"
+                title="Back (Alt+←)"
                 data-testid="viewer-back"
               >
                 ‹
@@ -535,9 +577,11 @@ function DocumentViewer({
               <button
                 type="button"
                 className="document-viewer__original"
-                onClick={onForward}
+                ref={forwardRef}
+                onClick={stepForward}
                 disabled={!onForward}
                 aria-label="Forward to the passage gone back from"
+                title="Forward (Alt+→)"
                 data-testid="viewer-forward"
               >
                 ›
@@ -552,6 +596,11 @@ function DocumentViewer({
               onClick={() => {
                 toggledDockRef.current = true;
                 onToggleDock();
+                // A toggle the parent didn't apply leaves no flag to pull focus here at
+                // some later, unrelated change of dock (a narrow window undocking).
+                window.setTimeout(() => {
+                  toggledDockRef.current = false;
+                }, 0);
               }}
               aria-pressed={docked}
               title={docked ? 'Show the document over the conversation' : 'Keep the document open beside the conversation'}

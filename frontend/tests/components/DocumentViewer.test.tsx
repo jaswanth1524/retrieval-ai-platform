@@ -585,3 +585,22 @@ describe('DocumentViewer find', () => {
     expect(screen.getByTestId('viewer-find-count')).toHaveTextContent('2 of 3');
   });
 });
+
+describe('pass 22: stepping through the passages opened', () => {
+  it('keeps focus in the viewer when the button pressed has nowhere further to go', async () => {
+    getContentMock.mockResolvedValue(CONTENT);
+    const onBack = vi.fn();
+    const onForward = vi.fn();
+    const { rerender } = render(
+      <DocumentViewer filename="guide.md" chunkId="c2" onClose={vi.fn()} docked onBack={onBack} />,
+    );
+    const back = screen.getByTestId('viewer-back');
+    await userEvent.click(back);
+    expect(onBack).toHaveBeenCalledTimes(1);
+    // Back is spent now (the parent says so): focus goes to Forward, not the page.
+    rerender(<DocumentViewer filename="guide.md" chunkId="c1" onClose={vi.fn()} docked onForward={onForward} />);
+    await waitFor(() => expect(screen.getByTestId('viewer-forward')).toHaveFocus());
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    expect(onForward).toHaveBeenCalledTimes(1);
+  });
+});

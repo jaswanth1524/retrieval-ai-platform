@@ -6,6 +6,7 @@ import {
   type QuestionTemplate,
   deleteTemplate,
   firstPlaceholder,
+  nextPlaceholder,
   readTemplates,
   saveTemplate,
 } from '../utils/questionTemplates';
@@ -167,6 +168,12 @@ function Composer({
   // the one before, or the question box, gets it instead.
   const chipsRef = useRef<HTMLUListElement>(null);
   const focusChipRef = useRef<number | null>(null);
+  // Past the render the removal causes: a removal the parent refused left the index set,
+  // and a later, unrelated render pulled focus to a chip.
+  const forgetChipFocusSoon = () =>
+    window.setTimeout(() => {
+      focusChipRef.current = null;
+    }, 0);
   useEffect(() => {
     const index = focusChipRef.current;
     if (index === null) return;
@@ -232,11 +239,19 @@ function Composer({
     textareaRef.current?.setSelectionRange(range[0], range[1]);
   });
   const insertTemplate = (template: QuestionTemplate) => {
-    setValue(template.text);
+    // After what is typed, not over it: picking a template replaced the draft unasked.
+    const draft = value.trimEnd();
+    const prefix = draft && draft !== template.text ? `${draft}\n\n` : '';
+    const text = prefix + template.text;
+    setValue(text);
     const placeholder = firstPlaceholder(template.text);
-    selectAfterInsertRef.current = placeholder ?? [template.text.length, template.text.length];
+    selectAfterInsertRef.current = placeholder
+      ? [placeholder[0] + prefix.length, placeholder[1] + prefix.length]
+      : [text.length, text.length];
     setOpenPopover(null);
   };
+  // A save that didn't stick (browser storage full or off) says so.
+  const [templateNote, setTemplateNote] = useState<string | null>(null);
 
   useEffect(() => {
     if (!openPopover) return;
@@ -309,6 +324,18 @@ function Composer({
       event.preventDefault();
       onCancel();
       return;
+    }
+    // Tab with a {placeholder} still in the question: to the next one (Tab otherwise
+    // leaves the box as usual). The selection end is where the search starts, so a
+    // placeholder just selected is stepped past.
+    if (event.key === 'Tab' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      const box = event.currentTarget;
+      const range = nextPlaceholder(box.value, box.selectionEnd);
+      if (range && !(range[0] === box.selectionStart && range[1] === box.selectionEnd)) {
+        event.preventDefault();
+        box.setSelectionRange(range[0], range[1]);
+        return;
+      }
     }
     if (event.key === 'Enter' && !event.shiftKey && !enterAddsNewline()) {
       event.preventDefault();
@@ -386,6 +413,7 @@ function Composer({
                   onClick={() => {
                     focusChipRef.current = index;
                     onSelectedFilenamesChange(selectedFilenames.filter((f) => f !== name));
+                    forgetChipFocusSoon();
                   }}
                   aria-label={`Stop limiting to ${name}`}
                   title={name}
@@ -408,6 +436,7 @@ function Composer({
                     focusChipRef.current =
                       (selectedFilenames.length > SCOPE_CHIPS_MAX ? 0 : selectedFilenames.length) + index;
                     onSelectedTagsChange?.(selectedTags.filter((t) => t !== tag));
+                    forgetChipFocusSoon();
                   }}
                   aria-label={`Stop limiting to the tag ${tag}`}
                 >
@@ -537,12 +566,23 @@ function Composer({
                     ))}
                   </ul>
                 )}
+                {templateNote && (
+                  <p className="composer__popover-note" role="alert" data-testid="template-note">
+                    {templateNote}
+                  </p>
+                )}
                 <form
                   className="composer__template-save"
                   onSubmit={(event) => {
                     event.preventDefault();
-                    setTemplates(saveTemplate(templateName, value));
-                    setTemplateName('');
+                    const name = templateName.trim();
+                    const saved = saveTemplate(templateName, value);
+                    setTemplates(saved);
+                    const kept = saved.some(
+                      (t) => t.name.toLocaleLowerCase() === name.toLocaleLowerCase(),
+                    );
+                    setTemplateNote(kept ? null : 'Not saved: this browser’s storage is full or off.');
+                    if (kept) setTemplateName('');
                   }}
                 >
                   <input

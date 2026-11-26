@@ -494,6 +494,17 @@ function ChatMessage({
     void copyText(withCitationFootnotes(turn.content, turn.sources)).then(settle);
   };
 
+  const selfCheckRef = useRef<HTMLDetailsElement | null>(null);
+  const showFlagged = (text: string) => {
+    const details = selfCheckRef.current;
+    if (!details) return;
+    details.open = true;
+    const words = text.trim();
+    const items = [...details.querySelectorAll<HTMLLIElement>('li[data-flagged]')];
+    const item = items.find((li) => words && (li.textContent ?? '').includes(words)) ?? items[0];
+    item?.scrollIntoView?.({ block: 'nearest' });
+    item?.focus();
+  };
   const showSkeleton = streamStage !== undefined && turn.content === '';
   const Markdown = useMarkdownRenderer();
   // [n] markers become buttons that open (and on hover preview) the source they cite.
@@ -505,7 +516,16 @@ function ChatMessage({
         if (href === UNBACKED_HREF) {
           return (
             <mark className="chat-message__unbacked" title="No passage it cites backs this" data-testid="answer-unbacked">
-              {children}
+              {/* Clicked: the self-check's own line for it, opened and in view. */}
+              <button
+                type="button"
+                className="chat-message__unbacked-link"
+                onClick={(event) => showFlagged(event.currentTarget.textContent ?? '')}
+              >
+                {children}
+              </button>
+              {/* The highlight and its title reach neither a screen reader nor a touch. */}
+              <span className="visually-hidden"> (not backed by its cited passages)</span>
             </mark>
           );
         }
@@ -757,7 +777,7 @@ function ChatMessage({
               </p>
             )}
             {!streamStage && turn.flaggedSentences && turn.flaggedSentences.length > 0 && (
-              <details className="chat-message__notes" data-testid="answer-self-check">
+              <details className="chat-message__notes" data-testid="answer-self-check" ref={selfCheckRef}>
                 <summary>
                   {turn.flaggedSentences.length === 1
                     ? 'One sentence isn’t backed by the passages it cites'
@@ -765,7 +785,7 @@ function ChatMessage({
                 </summary>
                 <ul>
                   {turn.flaggedSentences.map((flagged, index) => (
-                    <li key={index} dir="auto">
+                    <li key={index} dir="auto" data-flagged={index} tabIndex={-1}>
                       “{flagged.sentence}”
                       {flagged.status === 'numbers_differ'
                         ? ` — the passages don’t state ${flagged.missingNumbers?.join(', ') || 'its numbers'}`

@@ -122,6 +122,10 @@ function ConversationList({
       )
     : ordered;
   const visibleKey = visible.map((conversation) => conversation.id).join(',');
+  // What a bulk action acts on: the picked rows still listed. A search or filter typed
+  // after picking used to leave hidden rows picked, and Delete removed them unseen.
+  const chosen = visible.filter((conversation) => picked.has(conversation.id)).map((c) => c.id);
+  const deletable = chosen.filter((id) => id !== streamingId);
   useEffect(() => {
     onVisibleOrder?.(visibleKey ? visibleKey.split(',') : []);
   }, [visibleKey, onVisibleOrder]);
@@ -375,11 +379,13 @@ function ConversationList({
           ) : bulkConfirm ? (
             <ConfirmInline
               className="conversation-list__confirm"
-              prompt={`Delete ${picked.size} conversation${picked.size === 1 ? '' : 's'}?`}
+              prompt={`Delete ${deletable.length} conversation${deletable.length === 1 ? '' : 's'}?${
+                deletable.length < chosen.length ? ' (the one being answered stays)' : ''
+              }`}
               confirmLabel="Delete"
               onCancel={() => setBulkConfirm(false)}
               onConfirm={() => {
-                onDeleteMany?.([...picked].filter((id) => id !== streamingId));
+                onDeleteMany?.(deletable);
                 endSelecting();
               }}
               confirmTestId="conversation-bulk-delete-confirm"
@@ -395,7 +401,7 @@ function ConversationList({
               onKeyDown={(event) => {
                 if (isImeComposing(event)) return;
                 if (event.key === 'Enter' && bulkLabel.trim()) {
-                  for (const id of picked) {
+                  for (const id of chosen) {
                     const current = conversations.find((c) => c.id === id)?.labels ?? [];
                     onSetLabels?.(id, [...current, bulkLabel.trim()]);
                   }
@@ -412,7 +418,7 @@ function ConversationList({
           ) : (
             <>
               <span className="conversation-list__bulk-count" aria-live="polite">
-                {picked.size} selected
+                {chosen.length} selected
               </span>
               <button
                 type="button"
@@ -426,7 +432,7 @@ function ConversationList({
                 <button
                   type="button"
                   className="conversation-list__label"
-                  disabled={picked.size === 0}
+                  disabled={deletable.length === 0}
                   onClick={() => setBulkConfirm(true)}
                   data-testid="conversation-bulk-delete"
                 >
@@ -437,12 +443,22 @@ function ConversationList({
                 <button
                   type="button"
                   className="conversation-list__label"
-                  disabled={picked.size === 0}
+                  disabled={chosen.length === 0}
                   onClick={() => {
-                    const pin = [...picked].some(
+                    const unpinned = chosen.filter(
                       (id) => !conversations.find((c) => c.id === id)?.pinned,
                     );
-                    for (const id of picked) onPin(id, pin);
+                    if (unpinned.length === 0) {
+                      for (const id of chosen) onPin(id, false);
+                    } else {
+                      // As many as there is room for: each pin used to check the same
+                      // stale count, and 15 picked went past the cap of 10.
+                      const room = Math.max(
+                        MAX_PINNED_CONVERSATIONS - conversations.filter((c) => c.pinned).length,
+                        0,
+                      );
+                      for (const id of unpinned.slice(0, Math.max(room, 1))) onPin(id, true);
+                    }
                     endSelecting();
                   }}
                   data-testid="conversation-bulk-pin"
@@ -454,7 +470,7 @@ function ConversationList({
                 <button
                   type="button"
                   className="conversation-list__label"
-                  disabled={picked.size === 0}
+                  disabled={chosen.length === 0}
                   onClick={() => setBulkLabel('')}
                   data-testid="conversation-bulk-label"
                 >

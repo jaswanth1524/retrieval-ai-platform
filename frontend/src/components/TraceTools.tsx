@@ -38,14 +38,22 @@ export function ScoreReportView({
   // Worked out again on the server from the same traces and labels (POST
   // /admin/calibrate), which keeps the workspace's other settings: what is applied is
   // the server's suggestion now, not the number this page was shown.
+  // One at a time: a second click sent a second apply (and a second cache clear).
+  const [applying, setApplying] = useState(false);
   const apply = async () => {
+    if (applying) return;
+    setApplying(true);
     try {
       const done = await api.calibrate({ apply: true, labels: byRatings ? 'feedback' : 'model' });
       setApplied(
-        `This workspace now uses ${done.suggested_min_score}; its cached answers were cleared.`,
+        done.suggested_min_score === null || done.suggested_min_score === undefined
+          ? 'Nothing was changed.'
+          : `This workspace now uses ${done.suggested_min_score}; its cached answers were cleared.`,
       );
     } catch (err) {
       setApplied(apiErrorMessage(err, 'Could not set it.'));
+    } finally {
+      setApplying(false);
     }
   };
   // People's ratings instead of the model's verdicts, when feedback is on: the model's
@@ -110,6 +118,7 @@ export function ScoreReportView({
                   <button
                     type="button"
                     onClick={() => void apply()}
+                    disabled={applying}
                     data-testid="score-report-apply"
                   >
                     Use it for this workspace

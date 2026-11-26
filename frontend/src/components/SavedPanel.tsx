@@ -90,24 +90,39 @@ function SavedPanel({
       keptChecks = { workspace, checks: next };
       return next;
     });
-  // "Recheck" on one answer: its passages and sentences against the documents now.
-  const [rechecks, setRechecks] = useState<Record<string, string>>({});
-  const recheckRef = useRef<AbortController | null>(null);
-  useEffect(() => () => recheckRef.current?.abort(), []);
+  // "Recheck" on one answer: its passages and sentences against the documents now. Each
+  // answer's recheck is its own request: one shared controller let a second Recheck
+  // abort the first, whose row then said "Rechecking…" for good. A result is kept with
+  // the answer it judged, and not shown once that answer reads differently.
+  const [rechecks, setRechecks] = useState<Record<string, { answer: string; text: string }>>({});
+  const recheckRefs = useRef(new Map<string, AbortController>());
+  useEffect(() => {
+    const controllers = recheckRefs.current;
+    return () => {
+      for (const controller of controllers.values()) controller.abort();
+      controllers.clear();
+    };
+  }, []);
   const recheckOne = async (item: SavedAnswer) => {
     const key = `${item.conversationId}:${item.turn.id}`;
-    recheckRef.current?.abort();
+    const answer = item.turn.content;
+    recheckRefs.current.get(key)?.abort();
     const controller = new AbortController();
-    recheckRef.current = controller;
-    setRechecks((prev) => ({ ...prev, [key]: 'Rechecking…' }));
+    recheckRefs.current.set(key, controller);
+    const show = (text: string) => setRechecks((prev) => ({ ...prev, [key]: { answer, text } }));
+    show('Rechecking…');
     try {
       const response = await api.recheckAnswer(recheckRequest(item), controller.signal, workspace);
-      if (!controller.signal.aborted) setRechecks((prev) => ({ ...prev, [key]: recheckSummary(response) }));
+      if (!controller.signal.aborted) show(recheckSummary(response));
     } catch (err) {
-      if (!controller.signal.aborted) {
-        setRechecks((prev) => ({ ...prev, [key]: apiErrorMessage(err, 'The recheck failed.') }));
-      }
+      if (!controller.signal.aborted) show(apiErrorMessage(err, 'The recheck failed.'));
+    } finally {
+      if (recheckRefs.current.get(key) === controller) recheckRefs.current.delete(key);
     }
+  };
+  const recheckOf = (item: SavedAnswer): string | null => {
+    const found = rechecks[`${item.conversationId}:${item.turn.id}`];
+    return found && found.answer === item.turn.content ? found.text : null;
   };
   const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
@@ -257,9 +272,9 @@ function SavedPanel({
                   {SAVED_CHECK_LABELS[checks[`${item.conversationId}:${item.turn.id}`]]}
                 </span>
               )}
-              {rechecks[`${item.conversationId}:${item.turn.id}`] && (
+              {recheckOf(item) && (
                 <span className="unanswered-panel__meta" role="status" data-testid="saved-recheck-result">
-                  {rechecks[`${item.conversationId}:${item.turn.id}`]}
+                  {recheckOf(item)}
                 </span>
               )}
               {editing?.key === `${item.conversationId}:${item.turn.id}` ? (
