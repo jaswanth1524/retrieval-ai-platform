@@ -18,6 +18,7 @@ import lzma
 import math
 import random
 import re
+import time
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -727,6 +728,9 @@ def drill_backup(
     max_original_bytes: int,
     stored: bool = True,
     rng: random.Random | None = None,
+    budget_seconds: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    originals_only: bool = False,
 ) -> DrillReport:
     """A restore rehearsed without restoring: ``sample`` of the backup's documents (all
     with None, at random otherwise) have their originals read and parsed and chunked as
@@ -753,9 +757,23 @@ def drill_backup(
             if isinstance(d, dict) and isinstance(d.get("filename"), str)
         ]
         report.listed = len(documents)
+        if originals_only:
+            # Documents the backup holds no original of (indexed before RAW_DOCUMENT_DIR
+            # was set, or deleted while it was written) are its ``originals_missing``,
+            # reported apart: the scheduled drill failed every backup over them.
+            documents = [d for d in documents if f"originals/{d['filename']}" in members]
         if sample is not None and sample < len(documents):
             documents = (rng or random.Random()).sample(documents, sample)
-        for document in documents:
+        # A drill of every original (sample 0, up to 10,000) holds a request thread: past
+        # its budget it stops and says how far it got, rather than running for hours.
+        deadline = clock() + budget_seconds if budget_seconds else None
+        for read, document in enumerate(documents):
+            if deadline is not None and clock() >= deadline:
+                report.problems.append(
+                    f"Stopped after {budget_seconds:.0f} s with {read} of {len(documents)} "
+                    "documents read: drill a smaller sample."
+                )
+                break
             name = str(document["filename"])
             then = document.get("chunk_count")
             info = members.get(f"originals/{name}")

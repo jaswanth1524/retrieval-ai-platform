@@ -256,6 +256,99 @@ already indexed. Nothing else changes stored data.
   edge and cut off the Reader/Engineer switch: its labels are short there ("Read",
   "Eng"; full names kept for assistive technology) and its controls tighter.
 
+Pass 22: fixes from a third whole-codebase review, then features. **Re-index:
+recommended** only for ODT/ODP files with hidden text in tables, slide frames or
+named styles, ODS files with filtered rows, and XLSX files whose rows carry no number
+(that hidden content is now left out, as pass 21 meant); run `docrag reindex NAME` (or
+re-index all). Nothing else changes stored data.
+
+### Added (pass 22)
+- **Background batches**: `POST /questions/batch/jobs` answers a batch on the server's
+  own thread, each question waiting for a slot instead of failing with a 429; `GET
+  /questions/batch/jobs/{id}` reads the answers so far (again after a dropped
+  connection), `POST …/cancel` stops before the next question. `docrag ask --questions
+  FILE --background` follows one (Ctrl-C cancels it); `docrag ask --batch ID` reads one
+  already started.
+- **Saved answers watched**: when a document a saved answer cites is uploaded again or
+  deleted, those answers (up to 10) are rechecked and a notice says how many no longer
+  hold, with a link to Saved answers.
+- A sentence the self-check flags is a button: it opens the self-check at its own line.
+- `BACKUP_DRILL_SAMPLE` (3): each scheduled backup has a few of its originals parsed and
+  chunked right after it is written; a backup whose originals don't make documents fails
+  (and notifies) the day it is written. 0 turns it off.
+- `POST /backups/{name}/restore?dry_run=true` and `docrag backup restore NAME --dry-run`:
+  what a restore would bring back, skip and reject, with nothing changed. `docrag backup
+  restore NAME --background` restores on the import thread and follows it.
+- `docrag dedupe --delete --merge` gives the copy kept every tag its copies had first.
+- `docrag migrate verify FILE` reads a migration bundle through (each workspace's backup,
+  its checksums, its snapshot) before it is carried anywhere; no server needed.
+- Eval: a `decomposed` retrieval arm (reranked with query decomposition on), answer
+  metrics per kind of question (`metrics_by_category`: single, scoped, compound,
+  follow-up, unanswerable), and a paired bootstrap interval next to the baseline gate's
+  verdict ("within noise" / "beyond noise"; the gate itself is unchanged).
+- Another tab answering in the conversation shown says so above the question box.
+- Tab moves between a template's `{blanks}`; Alt+← / Alt+→ step back and forward through
+  the passages opened in the document viewer (focus moves to the other button when the
+  one pressed has nowhere further to go, so the next shortcut still reaches the viewer).
+- `GET /documents` paged: `stale_total` counts stale documents over the whole listing.
+- `RecheckResponse.more`: the answer had more sentences than one recheck looks at.
+
+### Fixed (pass 22)
+- The answer self-check held each answer against its sources' 200-character excerpts,
+  not the passages: a sentence backed past a passage's first lines was flagged as
+  unbacked. It now reads the cited passages whole.
+- `/questions/recheck` searched a changed document once per source per sentence (up to
+  a thousand searches under one slot), ran on after the client left, and called an
+  answer of more than 20 sentences "still holds" from its first 20.
+- Followers of a failed identical question each took a question slot and then waited on
+  the one that led it, holding theirs; a follower's late slot could also outlive its
+  request. Only the new leader takes a slot now.
+- The self-check's Qdrant reads ran on the event loop of `/questions` and the batch.
+- An answer cut off at the token limit whose continuation came back empty was called
+  whole, and kept in the answer cache.
+- A `Range` header Starlette refuses (416/400) deleted a background migrate bundle
+  nobody had downloaded; an export whose scratch file couldn't be created held the
+  export lock (every later export and backup refused) until a restart.
+- Hidden ODT text in tables and named or inherited styles, hidden ODP text in slide
+  frames, ODS rows hidden by a filter, and XLSX rows without a number were indexed.
+- MCP `index_status` reported at most one stale document; `docrag dedupe --delete` could
+  keep a partial copy and stopped at the first copy it couldn't delete; migrate's
+  originals were written without their write lock, and an upload landing while a bundle
+  unpacked was wiped by the snapshot; a rebuild of a lost index that failed to start was
+  never tried again; a background archive's spool file leaked when its record couldn't
+  be written; `docrag backup restore --only typo.pdf` said "0 queued" and exited 0.
+- A restore drill of every original stops at 10 minutes and says how far it got; the
+  backup copy's kill waits at most 30 s; the background bundle download counts against
+  `RATE_LIMIT_PER_MINUTE`.
+- Chinese and Japanese answers are split into sentences and matched by character pairs
+  for verify and the self-check (they were one unmatched "sentence"); a sentence citing
+  a source the answer doesn't have is flagged.
+- Identical questions waiting on one that failed in a way asking again repeats (the
+  provider rejecting its key, an unknown model, a model timing out on the prompt) now
+  fail with that error at once; each used to ask again in turn, so with a provider that
+  took its timeout to fail, the last of N waited N timeouts. A failure worth retrying
+  (a rate limit) is still asked again.
+- Found reviewing pass 22's own code: the scheduled backup drill failed every backup
+  holding a document it has no original of (it samples only documents with one now);
+  the saved-answer watch reported every saved answer longer than 20 sentences, dropped
+  an earlier change when a second came during its rechecks, and could recheck a document
+  still being indexed; a Chinese sentence's `[1]` after 。 became a "sentence" of its
+  own; `docrag ask --background` exited 0 when the batch ended before answering all of
+  them; a batch whose thread failed to start held one of the two running places until a
+  restart; Tab past a template's last blank went back to the first instead of leaving
+  the box.
+- Eval: `retrieve()` ignored `QUERY_DECOMPOSITION_ENABLED` and fingerprints didn't record
+  it; errored rows counted as clean answers in the unsupported-claims and truncated
+  means; a chain's errored turn went into the next turn's history as an empty reply.
+- UI: a second Recheck left the first stuck on "Rechecking…"; deleting many
+  conversations pushed earlier deletes out of Recently deleted; bulk Pin passed the cap
+  of 10; bulk actions acted on picked rows a search had hidden; a tab re-read its own
+  saves, every tab rewrote the whole history after an edit in any, and a second save
+  announced during a read was missed; two quick Backs in the viewer lost a place; a
+  self-check mark could land in code, a table row or a link, and screen readers didn't
+  hear it; picking a template replaced the question typed; Calibrate could be applied
+  twice; focus could jump to a chip or the dock toggle long after a refused change.
+
 ### Development
 - Version 0.2.0 closes the development section that followed 0.1.0.
 - `docs/settings.md` lists every setting by topic with its type, default and limits,

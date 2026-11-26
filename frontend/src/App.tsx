@@ -44,6 +44,8 @@ import { useCollected } from './hooks/useCollected';
 import { useLinks, type SourceView } from './hooks/useLinks';
 import { useConversationNavigation } from './hooks/useConversationNavigation';
 import { useReviewQueue } from './hooks/useReviewQueue';
+import { useSavedAnswerWatch } from './hooks/useSavedAnswerWatch';
+import { useOtherTabAnswering } from './hooks/useOtherTabAnswering';
 import { useStableHandler } from './hooks/useStableHandler';
 import { useCommands } from './hooks/useCommands';
 import { useServerHealth } from './hooks/useServerHealth';
@@ -86,7 +88,7 @@ import {
   DEFAULT_MAX_UPLOAD_BYTES,
   validateUploads,
 } from './utils/uploadValidation';
-import { addToTrash, readTrash, removeFromTrash } from './utils/trash';
+import { addManyToTrash, addToTrash, readTrash, removeFromTrash } from './utils/trash';
 import { takeHistoryReminder } from './utils/historyBackup';
 import { otherUsableProviders } from './utils/providers';
 import RecentlyDeleted from './components/RecentlyDeleted';
@@ -265,6 +267,12 @@ function App() {
   // An answer can stream into one conversation while another is open. The open one shows
   // its progress (and offers Stop) only when it is the one being answered.
   const streamingHere = pending && streamingConversationId === activeConversationId;
+  // Another tab of this browser answering in the conversation shown here (its answer
+  // lands here when that tab saves it): asking now as well wrote two answers onto it.
+  const otherTabAnswering = useOtherTabAnswering(
+    activeConversationId,
+    pending ? (streamingConversationId ?? null) : null,
+  );
   // Which turn the inspector is describing (see useInspectorTarget).
   const { setPinnedTraceId, inspectedTurn, inspectedTraceId, inspectedTraceReady } =
     useInspectorTarget(turns, streamingHere);
@@ -522,12 +530,22 @@ function App() {
         .map((id) => removeConversation(id))
         .filter((conversation): conversation is Conversation => !!conversation && conversation.turns.length > 0);
       if (removed.length === 0) return;
-      for (const conversation of removed) addToTrash(conversation);
+      // One write, as far as Recently deleted has room: one write per conversation
+      // pushed out the oldest entries (earlier deletes too) past its 20.
+      const kept = addManyToTrash(removed);
       setTrashVersion((version) => version + 1);
       pushToast({
         id: `deleted-many-${removed[0].id}`,
         tone: 'info',
         title: `Deleted ${removed.length} conversation${removed.length === 1 ? '' : 's'}`,
+        ...(kept < removed.length
+          ? {
+              body:
+                kept === 0
+                  ? 'Recently deleted is full: Undo now is the only way back.'
+                  : `${kept} can be restored from Recently deleted; Undo now brings back all ${removed.length}.`,
+            }
+          : {}),
         action: {
           label: 'Undo',
           run: () => {
@@ -1056,6 +1074,22 @@ function App() {
       sourceChange(filename, answeredAtMs, documents, corpusChecked && !listingFailed),
     [documents, corpusChecked, listingFailed],
   );
+  // A document a saved answer cites uploaded again or deleted: those answers rechecked,
+  // and the reader told when some no longer hold.
+  useSavedAnswerWatch({
+    answers: savedAnswers,
+    documents,
+    ready: corpusChecked && !listingFailed,
+    workspace,
+    onNoLongerHold: (count, filenames) =>
+      pushToast({
+        id: `saved-watch-${filenames.join(',')}`,
+        tone: 'warn',
+        title: `${count} saved answer${count === 1 ? '' : 's'} may no longer hold`,
+        body: `Rechecked after ${filenames.slice(0, 3).join(', ')}${filenames.length > 3 ? '…' : ''} changed.`,
+        action: { label: 'Open Saved', run: () => setRail('saved') },
+      }),
+  });
   const { markReviewed, reviewAnswers, reviewCount } = useReviewQueue({
     rail,
     workspace,
@@ -1688,7 +1722,14 @@ function App() {
             // server answers again, rather than failing into an error turn); waiting
             // for another conversation's answer to finish doesn't send this one later.
             sendQueueable={(booting || connectionLost) && !(pending && !streamingHere)}
-            hint={composerHint ?? (pending && !streamingHere ? streamingElsewhereHint : undefined)}
+            hint={
+              composerHint ??
+              (pending && !streamingHere
+                ? streamingElsewhereHint
+                : otherTabAnswering && !pending
+                  ? 'Another tab is answering in this conversation; its answer shows here when it ends.'
+                  : undefined)
+            }
             pending={streamingHere}
             onCancel={cancel}
             scopeLabel={currentScopeLabel}

@@ -38,7 +38,8 @@ answer_cache_hits_total = Counter(
 answer_inflight_joins_total = Counter(
     "docrag_answer_inflight_joins_total",
     "Questions and summaries that waited for an identical one already running: "
-    "outcome=replayed (its answer was reused) or ran (it left none; asked again).",
+    "outcome=replayed (its answer was reused), ran (it left none; asked again) or failed "
+    "(it failed in a way asking again would repeat: the same error).",
     ["outcome"],
 )
 

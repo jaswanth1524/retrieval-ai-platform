@@ -772,13 +772,17 @@ tried again on later passes. The Docker image has no `curl` or `rclone`: mount a
 
 **Rehearsing a restore:** `docrag backup drill NAME` reads, parses and chunks a sample of
 a stored backup's originals (`--sample 0`: all) without indexing anything — proof the
-backup still makes documents with this server. `docrag backup restore NAME --only
-FILE` restores just the documents named.
+backup still makes documents with this server. Each scheduled backup gets a small drill
+of its own right after it is written (`BACKUP_DRILL_SAMPLE`, 3 originals; a failure fails
+the backup and notifies). `docrag backup restore NAME --only FILE` restores just the
+documents named; `--dry-run` lists what a restore would bring back and changes nothing,
+and `--background` restores on the server's import thread and follows it.
 
 **Moving a large server:** `docrag migrate pack server.zip --background` has the server
 write the bundle in the background and downloads it when done (for a pack that outlasts
 a proxy's request timeout), resuming a cut download and checking it against the
-server's SHA-256.
+server's SHA-256. `docrag migrate verify server.zip` reads a bundle through
+(every backup's checksums, each snapshot) before you carry it anywhere.
 
 **Checking a text against the documents:** `docrag verify draft.txt` (or `POST
 /questions/verify`, MCP `verify_text`) looks up each sentence with no LLM and says
@@ -786,7 +790,8 @@ which passage supports it, which states other numbers, and which nothing support
 Every answer gets the same check against the passages it cites (`ANSWER_SELF_CHECK`):
 the UI lists the sentences they don't back. A saved answer can be checked again later
 (**Recheck** in Saved answers, `POST /questions/recheck`): which of its passages changed
-or went, and whether each sentence still holds.
+or went, and whether each sentence still holds. When a document a saved answer cites is uploaded
+again or deleted, the UI rechecks those answers itself and says how many no longer hold.
 
 **Questions about several things at once** ("summarize the leave, expense and IT
 policies"): with `QUERY_DECOMPOSITION_ENABLED=true` one LLM call splits such a question
@@ -795,7 +800,14 @@ outscored it. It costs one more model call (about 5 s on a local model) for ques
 that look compound; others are untouched.
 
 **A checklist of questions:** `docrag ask --questions checklist.txt --file contract.pdf`
-answers each line in turn (`POST /questions/batch`).
+answers each line in turn (`POST /questions/batch`). With `--background` the server
+answers them on its own thread (`POST /questions/batch/jobs`), each question waiting for
+a free slot; a dropped connection loses nothing — `docrag ask --batch ID` reads the
+answers again.
+
+**Duplicates:** `docrag dedupe` lists documents holding the same bytes under different
+names; `--delete` keeps one of each (the one with the most tags, or a source URL), and
+`--merge` gives it every copy's tags first.
 
 **Calibrating the relevance bar per workspace:** `docrag traces report` suggests a
 `RERANK_MIN_SCORE` from the workspace's own traced questions; `--apply` makes it that

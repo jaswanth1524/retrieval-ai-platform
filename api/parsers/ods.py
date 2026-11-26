@@ -14,7 +14,7 @@ from api.parsers.common import (
     check_zip_expanded_size,
     refuse_zip_xml_dtd,
 )
-from api.parsers.odt import _TABLE, HiddenStyles, _count, row_cells, warn_hidden
+from api.parsers.odt import _TABLE, HiddenStyles, _count, read_odf, row_cells, warn_hidden
 from api.parsers.xlsx import _sheet_sections
 from api.settings import AppSettings
 
@@ -38,7 +38,7 @@ def parse_ods_document(
     refuse_zip_xml_dtd(filename, content, "ODS")
     try:
         with ZipFile(BytesIO(content)) as archive:
-            root = ElementTree.fromstring(archive.read("content.xml"))
+            root, styles_root = read_odf(archive)
     except (BadZipFile, KeyError, ElementTree.ParseError, OSError) as exc:
         raise DocumentParseError(f"Could not parse ODS '{filename}'.") from exc
 
@@ -48,7 +48,7 @@ def parse_ods_document(
     # Hidden sheets and rows (INDEX_HIDDEN_CONTENT), as in XLSX. Pages and row numbers
     # stay the sheets' and rows' own.
     hidden = bool(settings is not None and settings.index_hidden_content)
-    styles = None if hidden else HiddenStyles(root)
+    styles = None if hidden else HiddenStyles(root, styles_root)
     hidden_sheets = hidden_rows = 0
     sections: list[DocumentSection] = []
     cells = 0
@@ -60,13 +60,13 @@ def parse_ods_document(
         records: list[tuple[int, list[str]]] = []
         number = 0
         for row in table.iter(f"{_TABLE}table-row"):
-            if styles is not None and row.get(f"{_TABLE}visibility") == "collapse":
+            if styles is not None and row.get(f"{_TABLE}visibility") in ("collapse", "filter"):
                 repeat = _count(row, f"{_TABLE}number-rows-repeated", 1 << 30)
                 if any(value.strip() for value in row_cells(row)):
                     hidden_rows += min(repeat, _MAX_REPEATED_ROWS)
                 number += repeat
                 continue
-            values = row_cells(row)
+            values = row_cells(row, styles)
             filled = any(value.strip() for value in values)
             repeat = _count(row, f"{_TABLE}number-rows-repeated", 1 << 30)
             if not filled:

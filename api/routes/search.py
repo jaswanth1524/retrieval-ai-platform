@@ -39,18 +39,41 @@ from api.schemas import (
 )
 from api.verify import SentenceCheck, VerifyAbandoned, recheck, verify_text
 
+# Changed documents a recheck searches one by one; past this many, one search over all
+# of them per sentence (each search is an embed, a hybrid search and a rerank).
+RECHECK_SEARCHED_ONE_BY_ONE = 4
 
-def _search_within(pipeline: Any, filename: str) -> Any:
-    """The passages of ``filename`` closest to a sentence (its cited one changed)."""
 
-    def search(sentence: str) -> list[RerankedChunk]:
-        return list(
-            pipeline.retrieve(
-                sentence, AnswerOverrides(), filenames=[filename], for_generation=False
-            ).context_chunks
-        )[:3]
+def _search_within(pipeline: Any, filenames: list[str]) -> Any:
+    """For each changed document, its passages closest to a sentence (the passage an
+    answer cited reads differently now). Each search is kept for the sentence: every
+    source in a changed document used to search again, up to RECHECK_MAX_SOURCES
+    searches and reranks for every sentence under one slot."""
 
-    return search
+    found: dict[tuple[str | None, str], list[RerankedChunk]] = {}
+    together = len(filenames) > RECHECK_SEARCHED_ONE_BY_ONE
+
+    def closest(scope: str | None, sentence: str) -> list[RerankedChunk]:
+        key = (scope, sentence)
+        if key not in found:
+            found[key] = list(
+                pipeline.retrieve(
+                    sentence,
+                    AnswerOverrides(),
+                    filenames=filenames if scope is None else [scope],
+                    for_generation=False,
+                ).context_chunks
+            )
+        return found[key]
+
+    def within(filename: str) -> Any:
+        def search(sentence: str) -> list[RerankedChunk]:
+            hits = closest(None if together else filename, sentence)
+            return [chunk for chunk in hits if chunk.filename == filename][:3]
+
+        return search
+
+    return within
 
 
 def _sentence_response(check: SentenceCheck) -> VerifySentenceResponse:
@@ -150,17 +173,25 @@ def register(app: FastAPI) -> None:
         response_model=RecheckResponse,
         dependencies=[Depends(require_api_key)],
     )
-    def recheck_answer(
-        request: RecheckRequest, pipeline: RagPipelineDep, slots: QuestionSlotsDep
+    async def recheck_answer(
+        request: RecheckRequest,
+        http_request: Request,
+        pipeline: RagPipelineDep,
+        slots: QuestionSlotsDep,
     ) -> RecheckResponse:
         release = question_slot(slots, count_metric=False)
-        try:
+        stop = threading.Event()
+        watcher = asyncio.create_task(_watch_disconnect(http_request, stop))
+
+        def check() -> tuple[list[RecheckSourceResponse], list[SentenceCheck], bool]:
             states: list[RecheckSourceResponse] = []
             cited: dict[int, Any] = {}
             by_file: dict[str, list[str]] = {}
             for source in request.sources:
                 by_file.setdefault(source.filename, []).append(source.chunk_id)
             now = {name: pipeline.passages_now(name, ids) for name, ids in by_file.items()}
+            changed = sorted(name for name, (indexed, _) in now.items() if indexed)
+            within = _search_within(pipeline, changed)
             for source in request.sources:
                 indexed, found = now[source.filename]
                 passage = found.get(source.chunk_id)
@@ -173,21 +204,36 @@ def register(app: FastAPI) -> None:
                         state=state,
                     )
                 )
+                # A number given twice keeps its first passage (it names one source).
+                if source.source_number in cited:
+                    continue
                 if passage is not None:
                     cited[source.source_number] = [passage]
                 elif indexed:
-                    cited[source.source_number] = _search_within(pipeline, source.filename)
+                    cited[source.source_number] = within(source.filename)
                 else:
                     cited[source.source_number] = []
-            checks = recheck(clean_text(request.answer), cited, pipeline.neighbour_text)
+            checks, more = recheck(
+                clean_text(request.answer), cited, pipeline.neighbour_text, stop.is_set
+            )
+            return states, checks, more
+
+        try:
+            states, checks, more = await run_in_threadpool(check)
+        except VerifyAbandoned:
+            raise HTTPException(status_code=499, detail="The client left.") from None
         finally:
+            watcher.cancel()
             release()
         sentences = [_sentence_response(check) for check in checks]
         return RecheckResponse(
             sources=states,
             sentences=sentences,
-            still_holds=all(s.state != "deleted" for s in states)
+            # Sentences past the checked ones are unknown: the answer isn't said to hold.
+            still_holds=not more
+            and all(s.state != "deleted" for s in states)
             and all(s.status not in ("unsupported", "numbers_differ") for s in sentences),
+            more=more,
         )
 
     # The same hybrid search, RRF (k=60) and cross-encoder rerank a question uses

@@ -47,10 +47,8 @@ describe('pass 21: selecting several conversations', () => {
     const props = setup();
     await pick('Beta', 'Gamma');
     await userEvent.click(screen.getByTestId('conversation-bulk-pin'));
-    expect(props.onPin.mock.calls).toEqual([
-      ['b', true],
-      ['c', true],
-    ]);
+    // Gamma is pinned already: only Beta needs it (pass 22: within the cap).
+    expect(props.onPin.mock.calls).toEqual([['b', true]]);
   });
 
   it('adds a label to each, keeping their own', async () => {

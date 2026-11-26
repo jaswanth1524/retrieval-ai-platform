@@ -422,6 +422,11 @@ class AppSettings(BaseSettings):
     backup_interval_hours: PositiveFloat = 24
     # Scheduled backups kept per workspace (newest first).
     backup_keep: PositiveInt = 7
+    # Originals of each scheduled backup parsed and chunked right after it is written (a
+    # restore drill, POST /backups/{name}/drill's, nothing indexed): a backup whose
+    # originals no longer make documents with this server's parsers fails, and is
+    # reported, the day it is written. A few at random each time; 0 = no drill.
+    backup_drill_sample: int = Field(default=3, ge=0, le=100)
     # Run after each scheduled backup is written and checked, with the backup's path as
     # its last argument (no shell: e.g. "rclone copy --no-traverse" plus a remote, or
     # "cp" plus a mounted share's folder) — a copy somewhere other than this disk. Empty =

@@ -31,6 +31,7 @@ from qdrant_client import QdrantClient
 
 from api.export import build_export
 from api.feedback import FeedbackStore
+from api.ingestion import filename_write_lock
 from api.qdrant_schema import collection_metadata, forget_collection
 from api.raw_documents import RawDocumentStore
 from api.repository import VectorRepository, forget_metadata
@@ -225,10 +226,15 @@ def store_originals(
     feedback_store: FeedbackStore | None,
     workspace: str,
     max_members: int | None = None,
+    lock_key: Callable[[str], str] | None = None,
 ) -> int:
     """Put a backup's originals and versions straight into ``raw_store`` (when
     originals are kept here) and its ratings into ``feedback_store``, indexing nothing:
-    the documents are already in the recovered index. How many originals."""
+    the documents are already in the recovered index. How many originals.
+
+    ``lock_key`` names a document's write lock (``document_key``): each original is
+    stored under it, as an upload stores one, so one arriving meanwhile isn't
+    overwritten half way by the bundle's."""
 
     stored = 0
 
@@ -242,7 +248,11 @@ def store_originals(
     ) -> DocumentJobAcceptedResponse:
         nonlocal stored
         if raw_store is not None:
-            raw_store.save(filename, content)
+            if lock_key is None:
+                raw_store.save(filename, content)
+            else:
+                with filename_write_lock(lock_key(filename)):
+                    raw_store.save(filename, content)
             stored += 1
         return DocumentJobAcceptedResponse(job_id="", filename=filename, state="queued")
 

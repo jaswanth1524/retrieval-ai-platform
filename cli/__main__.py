@@ -387,6 +387,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="A file of questions, one per line (# starts a comment; - reads stdin), "
         "answered one after another with the same scope.",
     )
+    ask.add_argument(
+        "--background",
+        action="store_true",
+        help="With --questions: answered on the server's own thread (POST "
+        "/questions/batch/jobs), followed here; a dropped connection loses nothing "
+        "(read it again with --batch ID).",
+    )
+    ask.add_argument(
+        "--batch",
+        metavar="ID",
+        help="Read (and follow) a background batch already started.",
+    )
     ask.add_argument("--file", action="append", help="Limit to this document (repeatable).")
     ask.add_argument("--tag", action="append", help="Limit to documents with this tag.")
     ask.add_argument("--provider", help="ollama, openai, openai_compatible or anthropic.")
@@ -581,6 +593,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="restore: just this document (repeatable).",
     )
     backup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="restore: list what it would restore, skip and reject; change nothing.",
+    )
+    backup.add_argument(
+        "--background",
+        action="store_true",
+        help="restore: on the server's import thread (a full indexing queue is waited "
+        "out, not deferred), followed here until everything is queued.",
+    )
+    backup.add_argument(
         "--sample",
         type=int,
         default=20,
@@ -591,6 +614,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--delete",
         action="store_true",
         help="Delete every copy but the first name of each group (full key).",
+    )
+    dedupe.add_argument(
+        "--merge",
+        action="store_true",
+        help="With --delete: first give the copy kept every tag its copies had.",
     )
     command("doctor", "Risky server settings: backups, disk, memory, keys (full key).")
 
@@ -613,7 +641,11 @@ def build_parser() -> argparse.ArgumentParser:
         "migrate",
         "Move the whole server: pack every workspace into one file, or unpack one (full key).",
     )
-    migrate.add_argument("action", choices=("pack", "unpack"))
+    migrate.add_argument(
+        "action",
+        choices=("pack", "unpack", "verify"),
+        help="verify: read a bundle here (every member, checksums included), no server.",
+    )
     migrate.add_argument("file")
     migrate.add_argument(
         "--background",

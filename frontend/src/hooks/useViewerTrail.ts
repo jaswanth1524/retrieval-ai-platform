@@ -24,20 +24,21 @@ export function useViewerTrail(
     setTrail(next);
   };
   const shownRef = useRef<SourceView | null>(view);
-  // A move made here (back, forward): not a new place to remember.
-  const steppingRef = useRef(false);
+  // A move made here (back, forward): the place it went to, not a new one to remember.
+  // The place itself, not a flag: a move the parent didn't make (it kept the view) left
+  // the flag set, and the next real navigation wasn't remembered.
+  const steppingRef = useRef<SourceView | null>(null);
 
   useEffect(() => {
     const before = shownRef.current;
     shownRef.current = view;
+    const stepped = steppingRef.current;
+    steppingRef.current = null;
     if (view === null) {
       keep({ back: [], forward: [] });
       return;
     }
-    if (steppingRef.current) {
-      steppingRef.current = false;
-      return;
-    }
+    if (stepped !== null && samePlace(stepped, view)) return;
     if (before !== null && !samePlace(before, view)) {
       keep({ back: [...trailRef.current.back, before].slice(-TRAIL_MAX), forward: [] });
     }
@@ -49,7 +50,10 @@ export function useViewerTrail(
     const target = behind[behind.length - 1];
     if (!target || !current) return;
     keep({ back: behind.slice(0, -1), forward: [current, ...ahead] });
-    steppingRef.current = true;
+    // Now, not after the render: a second Back pressed before it pushed the place
+    // already left onto the forward stack again, and lost the one between.
+    shownRef.current = target;
+    steppingRef.current = target;
     setView(target);
   }, [setView]);
 
@@ -59,7 +63,8 @@ export function useViewerTrail(
     const [target, ...rest] = ahead;
     if (!target || !current) return;
     keep({ back: [...behind, current], forward: rest });
-    steppingRef.current = true;
+    shownRef.current = target;
+    steppingRef.current = target;
     setView(target);
   }, [setView]);
 

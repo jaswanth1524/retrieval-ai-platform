@@ -351,6 +351,36 @@ def _prompt_contexts(
 REFUSED_STATUSES = ("no_context", "insufficient_context", "empty_scope")
 
 
+def question_category(example: RetrievalExample) -> str:
+    """The kind of question an example is, for the per-category metrics."""
+
+    if example.expect_no_context:
+        return "unanswerable"
+    if example.history or example.chain:
+        return "follow-up"
+    if example.answer_contains_all:
+        return "compound"
+    if example.filenames or example.tags:
+        return "scoped"
+    return "single"
+
+
+def metrics_by_category(
+    examples: Sequence[RetrievalExample], rows: Sequence[AnswerRow]
+) -> dict[str, dict[str, float]]:
+    """``answer_metrics`` per ``question_category`` (only when there are two or more)."""
+
+    groups: dict[str, list[int]] = {}
+    for index, example in enumerate(examples):
+        groups.setdefault(question_category(example), []).append(index)
+    if len(groups) < 2:
+        return {}
+    return {
+        category: answer_metrics([examples[i] for i in indexes], [rows[i] for i in indexes])
+        for category, indexes in sorted(groups.items())
+    }
+
+
 def answer_metrics(
     examples: Sequence[RetrievalExample],
     rows: Sequence[AnswerRow],
@@ -407,10 +437,14 @@ def answer_metrics(
     if rows:
         metrics["uncited_rate"] = sum(r.answer_status == "uncited" for r in rows) / len(rows)
         metrics["error_rate"] = sum(r.error is not None for r in rows) / len(rows)
-        metrics["unsupported_claims_mean"] = sum(r.unsupported_claims for r in rows) / len(rows)
-        metrics["unsupported_numbers_mean"] = sum(r.unsupported_numbers for r in rows) / len(rows)
-        metrics["truncated_rate"] = sum(r.truncated for r in rows) / len(rows)
-        metrics["prompt_cut_rate"] = sum(r.prompt_cut for r in rows) / len(rows)
+    # Of the answers given: a question that errored has no answer to measure, and
+    # counted as a clean 0 it made a provider outage look like fewer unsupported claims.
+    given = [r for r in rows if r.error is None]
+    if given:
+        metrics["unsupported_claims_mean"] = sum(r.unsupported_claims for r in given) / len(given)
+        metrics["unsupported_numbers_mean"] = sum(r.unsupported_numbers for r in given) / len(given)
+        metrics["truncated_rate"] = sum(r.truncated for r in given) / len(given)
+        metrics["prompt_cut_rate"] = sum(r.prompt_cut for r in given) / len(given)
     precisions = []
     for index, (example, row) in enumerate(zip(examples, rows, strict=True)):
         relevant = example.relevant_chunk_ids | (passage_ids or {}).get(index, frozenset())
@@ -499,7 +533,9 @@ def run_answer_eval(
     chains: dict[str, list[dict[str, str]]] = {}
 
     def remember_turn(example: RetrievalExample, row: AnswerRow) -> None:
-        if example.chain:
+        # A turn that errored got no answer: the next one in its chain is asked as if it
+        # hadn't happened, not after an empty reply.
+        if example.chain and row.error is None:
             chains.setdefault(example.chain, []).extend(
                 [
                     {"role": "user", "content": example.question},
@@ -580,6 +616,12 @@ def run_answer_eval(
             "question_count": len(rows),
         },
         "metrics": {name: round(value, 4) for name, value in metrics.items()},
+        # The same metrics per kind of question (follow-ups, compound, unanswerable…):
+        # a set whose overall rate held can hide one kind getting worse. Not gated.
+        "metrics_by_category": {
+            category: {name: round(value, 4) for name, value in scores.items()}
+            for category, scores in metrics_by_category(examples, rows).items()
+        },
         "examples": [r.to_dict() for r in rows],
     }
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

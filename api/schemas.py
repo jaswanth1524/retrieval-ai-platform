@@ -301,6 +301,8 @@ class DocumentListResponse(BaseModel):
     # Indexed by an older chunker (or before the version was recorded) — re-indexing
     # them applies the current chunking.
     stale_filenames: list[str] = []
+    # With a page asked for: how many documents of the whole listing are stale.
+    stale_total: int | None = None
     # Points left from more than one ingest, or fewer than the ingest meant to write (a
     # write cut off part way): re-indexing from the original repairs them.
     incomplete_filenames: list[str] = []
@@ -1026,6 +1028,31 @@ class BatchQuestionResponse(BaseModel):
     answers: list[BatchAnswerResponse]
 
 
+class BatchJobStartedResponse(BaseModel):
+    """POST /questions/batch/jobs: the job to follow (GET /questions/batch/jobs/{id})."""
+
+    batch_id: str
+    total: int
+
+
+class BatchJobResponse(BaseModel):
+    """A background batch: its answers so far, in question order."""
+
+    batch_id: str
+    # "queued", "running", "done", "cancelled" or "failed". Extensible.
+    state: str = Field(
+        json_schema_extra={
+            "x-extensible-enum": ["queued", "running", "done", "cancelled", "failed"]
+        }
+    )
+    total: int
+    done: int
+    answers: list[BatchAnswerResponse]
+    created_at: float
+    finished_at: float | None = None
+    error: str | None = None
+
+
 class AnswerCheckResponse(BaseModel):
     """One sentence of an answer against the passages it cites (ANSWER_SELF_CHECK)."""
 
@@ -1494,8 +1521,11 @@ class RecheckResponse(BaseModel):
     # Each sentence against the cited passages as they are now (a changed document's
     # closest passages, searched within it).
     sentences: list[VerifySentenceResponse]
-    # No cited document is gone and no sentence is unsupported or states other numbers.
+    # No cited document is gone and no sentence is unsupported or states other numbers
+    # (false when the answer had more sentences than were checked).
     still_holds: bool
+    # The answer had more sentences than one recheck looks at (MAX_VERIFY_SENTENCES).
+    more: bool = False
 
 
 class SearchResultResponse(BaseModel):
@@ -1783,6 +1813,9 @@ class ImportResponse(BaseModel):
     # background=true: the restore's id (GET /documents/imports/{id}); the lists above
     # are empty, and the documents are queued as room frees.
     import_id: str | None = None
+    # dry_run=true: the documents it would restore (nothing was queued or changed).
+    would_restore: list[str] = []
+    dry_run: bool = False
 
 
 class WatchRetry(BaseModel):

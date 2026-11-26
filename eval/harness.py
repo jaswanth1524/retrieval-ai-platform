@@ -68,7 +68,9 @@ from eval.metrics import aggregate, baseline_shape_problems, compare_to_baseline
 # 6 is MAX_CONTEXT_CHUNKS's default: hit@6 is what the model was given to read.
 DEFAULT_KS: tuple[int, ...] = (1, 3, 5, 6, 8)
 # reranked is what the API serves; the others score one earlier stage on its own.
-ARMS: tuple[str, ...] = ("reranked", "fused", "dense", "sparse")
+# decomposed is reranked with QUERY_DECOMPOSITION_ENABLED on (a compound question
+# searched as its parts: an LLM call per compound question), to measure it against.
+ARMS: tuple[str, ...] = ("reranked", "fused", "dense", "sparse", "decomposed")
 
 
 class _NoGenerator:
@@ -230,8 +232,12 @@ def rank_for_question(
             chunk_ids=[chunk.chunk_id for chunk in chunks],
             total_ms=(time.monotonic() - started) * 1000,
         )
-    if arm not in ("reranked", "fused"):
+    if arm not in ("reranked", "fused", "decomposed"):
         raise ValueError(f"Unknown arm '{arm}'; expected one of {', '.join(ARMS)}.")
+    if arm == "decomposed":
+        if generator is None:
+            raise RuntimeError("The decomposed arm needs an LLM; pass a generator.")
+        settings = settings.model_copy(update={"query_decomposition_enabled": True})
     phase = _pipeline(repository, embedding_provider, reranker, settings, generator).retrieve(
         question,
         filenames=filenames,
@@ -242,7 +248,7 @@ def rank_for_question(
     return RankedResult(
         filenames=[chunk.filename for chunk in ranked],
         chunk_ids=[chunk.chunk_id for chunk in ranked],
-        below_min_score=arm == "reranked" and phase.below_min_score,
+        below_min_score=arm in ("reranked", "decomposed") and phase.below_min_score,
         total_ms=(time.monotonic() - started) * 1000,
         stages_ms={
             "embed_ms": phase.embed_ms,
@@ -521,6 +527,10 @@ def settings_fingerprint(
         "chunker_version": CHUNKER_VERSION,
         "rerank_top_k": int(settings.rerank_top_k),
         "query_expansion_enabled": bool(settings.query_expansion_enabled),
+        # A compound question searched as its parts (an LLM call) finds other passages.
+        "query_decomposition_enabled": arm == "decomposed"
+        or bool(settings.query_decomposition_enabled),
+        "query_decomposition_max_parts": int(settings.query_decomposition_max_parts),
         # Chunk ids (and so chunk-level scores) depend on these.
         "chunk_size_tokens": int(settings.chunk_size_tokens),
         "chunk_overlap_tokens": int(settings.chunk_overlap_tokens),
@@ -1163,6 +1173,21 @@ def _check_answer_baseline(output: Path, baseline_path: Path, tolerance: float) 
     )
     for problem in problems:
         print(f"regression: {problem}", file=sys.stderr)
+    # How much of each change is one or two questions going the other way.
+    from eval.stats import answer_noise
+
+    noise = answer_noise(
+        list(current_run.get("examples") or []), list(baseline_run.get("examples") or [])
+    )
+    for name, (change, low, high) in sorted(noise.items()):
+        if change == 0 and low == high == 0:
+            continue
+        verdict = "within noise" if low <= 0 <= high else "beyond noise"
+        print(
+            f"note: {name} {change:+.3f} (95% CI {low:+.3f}..{high:+.3f}, paired over the "
+            f"same questions): {verdict}",
+            file=sys.stderr,
+        )
     return 1 if problems else 0
 
 

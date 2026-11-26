@@ -487,17 +487,44 @@ def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             file=out,
         )
         return 0 if drill.get("ok") else 1
-    report = client.restore_stored_backup(args.target, only=getattr(args, "only", None))
+    only = getattr(args, "only", None)
+    if getattr(args, "background", False) and not getattr(args, "dry_run", False):
+        started = client.restore_stored_backup(args.target, only=only, background=True)
+        return _follow_import(client, str(started["import_id"]), args, out)
+    dry_run = bool(getattr(args, "dry_run", False))
+    report = client.restore_stored_backup(args.target, only=only, dry_run=dry_run)
+    rejected = list(report.get("rejected", []))
+    if dry_run and not args.json:
+        for name in report.get("would_restore", []):
+            print(f"would restore: {name}", file=out)
+        for name in report.get("skipped", []):
+            print(f"already indexed: {name}", file=out)
+        for name in report.get("missing_originals", []):
+            print(f"no original kept: {name}", file=out)
+        for name in rejected:
+            print(f"not restored: {name}", file=out)
+        print(
+            f"{len(report.get('would_restore', []))} would be restored, "
+            f"{len(report.get('skipped', []))} already indexed, {len(rejected)} not restored "
+            "(nothing was changed)",
+            file=out,
+        )
+        return 1 if rejected else 0
     if args.json:
         print(json.dumps(report), file=out)
     else:
+        for name in rejected:
+            print(f"not restored: {name}", file=out)
         print(
             f"{len(report.get('jobs', []))} documents queued, "
             f"{len(report.get('skipped', []))} already indexed, "
-            f"{len(report.get('deferred', []))} deferred",
+            f"{len(report.get('deferred', []))} deferred"
+            + (f", {len(rejected)} not restored" if rejected else ""),
             file=out,
         )
-    return 0
+    # A name given to --only that the backup doesn't hold (a typo) is a failure: it
+    # used to print "0 documents queued" and exit 0.
+    return 1 if rejected else 0
 
 
 def cmd_check(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
@@ -566,11 +593,91 @@ def _import_in_background(client: DocragClient, args: argparse.Namespace, out: T
     return _follow_import(client, import_id, args, out)
 
 
+# The bundle format this CLI reads (api/migrate.py's MIGRATE_VERSION).
+MIGRATE_VERSION = 1
+_READ_BLOCK = 1 << 20
+
+
+def _read_through(handle: Any) -> None:
+    """Every byte of a zip member read: its CRC is checked as the end is reached."""
+
+    while handle.read(_READ_BLOCK):
+        pass
+
+
+def verify_bundle(path: Path, args: argparse.Namespace, out: TextIO) -> int:
+    """``migrate verify FILE``: a bundle read through before it is carried anywhere —
+    its manifest, each workspace's backup (its own manifest and every member's
+    checksum) and snapshot. Nothing is sent. Exit 1 when something is wrong."""
+
+    import zipfile
+
+    problems: list[str] = []
+    workspaces: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(path) as bundle:
+            try:
+                manifest = json.loads(bundle.read("manifest.json"))
+            except KeyError:
+                raise ValueError("it has no manifest.json; is it a migration bundle?") from None
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("workspaces"), list):
+                raise ValueError("its manifest.json is not a migration manifest")
+            if manifest.get("migrate_version") != MIGRATE_VERSION:
+                problems.append(
+                    f"bundle version {manifest.get('migrate_version')!r}; this CLI knows "
+                    f"version {MIGRATE_VERSION}"
+                )
+            for entry in manifest["workspaces"]:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "?")
+                found: dict[str, Any] = {"name": name, "documents": entry.get("documents")}
+                member = entry.get("backup")
+                try:
+                    with bundle.open(str(member)) as raw, zipfile.ZipFile(raw) as backup:
+                        listed = json.loads(backup.read("manifest.json")).get("documents", [])
+                        found["originals"] = len(listed)
+                        damaged = backup.testzip()
+                        if damaged is not None:
+                            problems.append(f"{name}: {damaged} in its backup is damaged")
+                except (KeyError, zipfile.BadZipFile, ValueError, OSError) as exc:
+                    problems.append(f"{name}: its backup can't be read ({exc})")
+                snapshot = entry.get("snapshot")
+                found["snapshot"] = bool(snapshot)
+                if snapshot:
+                    try:
+                        with bundle.open(str(snapshot)) as handle:
+                            _read_through(handle)
+                    except (KeyError, zipfile.BadZipFile, OSError) as exc:
+                        problems.append(f"{name}: its index snapshot can't be read ({exc})")
+                workspaces.append(found)
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        problems.append(f"{path}: {exc}")
+    if args.json:
+        print(
+            json.dumps({"ok": not problems, "problems": problems, "workspaces": workspaces}),
+            file=out,
+        )
+    else:
+        for found in workspaces:
+            print(
+                f"{found['name']}: {found.get('originals', '?')} originals"
+                + (", index snapshot" if found.get("snapshot") else ", no snapshot (re-indexed)"),
+                file=out,
+            )
+        for problem in problems:
+            print(f"problem: {problem}", file=out)
+        print("the bundle reads through" if not problems else "the bundle has problems", file=out)
+    return 0 if not problems else 1
+
+
 def cmd_migrate(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
     """``pack FILE``: the whole server (every workspace's documents, settings and index
     snapshot) into one file. ``unpack FILE``: put one back and follow it."""
 
     target = Path(args.file)
+    if args.action == "verify":
+        return verify_bundle(target, args, out)
     if args.action == "pack":
         # The bundle (and its background export) belongs to the default workspace,
         # whichever one this command names: polled under another, it read as unknown.

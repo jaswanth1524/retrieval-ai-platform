@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadChatStore, resetChatStoreConnection, saveChatStore } from '../../src/hooks/chatStore';
 import { withStoredConversations } from '../../src/hooks/useChatPersistence';
 
@@ -58,27 +58,35 @@ describe('pass 21: chat store saves', () => {
   });
 });
 
+// What another tab's announcement looks like (pass 22: a tab skips its own).
+function otherTabSaved(): void {
+  const channel = new BroadcastChannel('docrag-chat');
+  channel.postMessage({ type: 'saved', from: 'another-tab' });
+  channel.close();
+}
+
 describe('pass 21: another tab’s save', () => {
-  it('is announced and heard', async () => {
+  it('is announced and heard, but not by the tab that saved', async () => {
     const { announceHistorySaved, onHistorySaved } = await import('../../src/utils/chatChannel');
-    const heard = new Promise<void>((resolve) => {
-      const stop = onHistorySaved(() => {
-        stop();
-        resolve();
-      });
+    let heard = 0;
+    const stop = onHistorySaved(() => {
+      heard += 1;
     });
     announceHistorySaved();
-    await heard;
+    otherTabSaved();
+    await vi.waitFor(() => expect(heard).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(heard).toBe(1);
+    stop();
   });
 
   it('brings a conversation only IndexedDB holds into this tab', async () => {
     const { renderHook, waitFor } = await import('@testing-library/react');
     const { useChat } = await import('../../src/hooks/useChat');
-    const { announceHistorySaved } = await import('../../src/utils/chatChannel');
     const { result } = renderHook(() => useChat());
     await waitFor(() => expect(result.current.historyReady).toBe(true));
     await saveChatStore(stored('other-tab', 'asked elsewhere'));
-    announceHistorySaved();
+    otherTabSaved();
     await waitFor(() =>
       expect(result.current.conversations.map((c) => c.id)).toContain('other-tab'),
     );

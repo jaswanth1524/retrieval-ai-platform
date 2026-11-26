@@ -35,22 +35,53 @@ class HiddenStyles:
     (``presentation:visibility="hidden"``) — INDEX_HIDDEN_CONTENT leaves them out, as
     it does Office's hidden text, sheets and slides."""
 
-    def __init__(self, root: ElementTree.Element) -> None:
+    def __init__(
+        self, root: ElementTree.Element, styles_root: ElementTree.Element | None = None
+    ) -> None:
         self.text: set[str] = set()
         self.table: set[str] = set()
         self.page: set[str] = set()
-        styles = root.find(f"{_OFFICE}automatic-styles")
-        for style in styles if styles is not None else ():
-            name = style.get(f"{_STYLE}name")
-            if not name:
-                continue
-            for properties in style:
-                if properties.get(f"{_TEXT}display") == "none":
-                    self.text.add(name)
-                if properties.get(f"{_TABLE}display") == "false":
-                    self.table.add(name)
-                if properties.get(f"{_PRESENTATION}visibility") == "hidden":
-                    self.page.add(name)
+        # Named styles live in styles.xml, and a style hides what its parent
+        # (``style:parent-style-name``) hides: only content.xml's own automatic styles
+        # were read, so a paragraph styled "Hidden note" was indexed.
+        flags: dict[str, set[str]] = {}
+        parents: dict[str, str] = {}
+        containers = [root.find(f"{_OFFICE}automatic-styles")]
+        if styles_root is not None:
+            containers += [
+                styles_root.find(f"{_OFFICE}styles"),
+                styles_root.find(f"{_OFFICE}automatic-styles"),
+            ]
+        for styles in containers:
+            for style in styles if styles is not None else ():
+                name = style.get(f"{_STYLE}name")
+                if not name:
+                    continue
+                parent = style.get(f"{_STYLE}parent-style-name")
+                if parent:
+                    parents.setdefault(name, parent)
+                found = flags.setdefault(name, set())
+                for properties in style:
+                    if properties.get(f"{_TEXT}display") == "none":
+                        found.add("text")
+                    if properties.get(f"{_TABLE}display") == "false":
+                        found.add("table")
+                    if properties.get(f"{_PRESENTATION}visibility") == "hidden":
+                        found.add("page")
+        for name in flags:
+            inherited: set[str] = set()
+            current: str | None = name
+            seen: set[str] = set()
+            while current is not None and current not in seen and len(seen) < 64:
+                seen.add(current)
+                inherited |= flags.get(current, set())
+                current = parents.get(current)
+            if "text" in inherited:
+                self.text.add(name)
+            if "table" in inherited:
+                self.table.add(name)
+            if "page" in inherited:
+                self.page.add(name)
 
     def hides_text(self, element: ElementTree.Element) -> bool:
         if element.tag in (f"{_TEXT}hidden-text", f"{_TEXT}hidden-paragraph"):
@@ -58,6 +89,18 @@ class HiddenStyles:
         if element.get(f"{_TEXT}display") == "none":  # a hidden section
             return True
         return element.get(f"{_TEXT}style-name") in self.text
+
+
+def read_odf(archive: ZipFile) -> tuple[ElementTree.Element, ElementTree.Element | None]:
+    """An OpenDocument's content.xml, and its styles.xml when it has one (where the
+    named styles a hidden paragraph can use are)."""
+
+    root = ElementTree.fromstring(archive.read("content.xml"))
+    try:
+        styles = ElementTree.fromstring(archive.read("styles.xml"))
+    except KeyError:
+        styles = None
+    return root, styles
 
 
 def warn_hidden(filename: str, count: int, what: str) -> None:
@@ -126,8 +169,7 @@ def parse_odt_document(
     refuse_zip_xml_dtd(filename, content, "ODT")
     try:
         with ZipFile(BytesIO(content)) as archive:
-            xml = archive.read("content.xml")
-        root = ElementTree.fromstring(xml)
+            root, styles_root = read_odf(archive)
     except (BadZipFile, KeyError, ElementTree.ParseError, OSError) as exc:
         raise DocumentParseError(f"Could not parse ODT '{filename}'.") from exc
 
@@ -135,7 +177,7 @@ def parse_odt_document(
     if body is None:
         raise EmptyDocumentError(f"ODT '{filename}' has no text body.")
 
-    styles = None if hidden else HiddenStyles(root)
+    styles = None if hidden else HiddenStyles(root, styles_root)
     skipped = 0
     sections: list[DocumentSection] = []
     label: str | None = None
@@ -178,7 +220,7 @@ def parse_odt_document(
                 if paragraph:
                     buffer.append(paragraph)
             elif child.tag == f"{_TABLE}table":
-                buffer.extend(_table_rows(child))
+                buffer.extend(_table_rows(child, styles))
             elif child.tag in _BLOCK_CONTAINERS:
                 visit(child, depth + 1)
 
@@ -216,17 +258,35 @@ def _inline_text(
     return "".join(parts)
 
 
-def _cell_text(cell: ElementTree.Element) -> str:
+def _cell_text(cell: ElementTree.Element, styles: HiddenStyles | None = None) -> str:
     return " ".join(
         text
         for text in (
-            normalize_text(_inline_text(paragraph)) for paragraph in cell.iter(f"{_TEXT}p")
+            normalize_text(_inline_text(paragraph, styles=styles))
+            for paragraph in _visible_paragraphs(cell, styles)
         )
         if text
     )
 
 
-def row_cells(row: ElementTree.Element) -> list[str]:
+def _visible_paragraphs(
+    element: ElementTree.Element, styles: HiddenStyles | None, depth: int = 0
+) -> list[ElementTree.Element]:
+    """The paragraphs and headings under ``element``, in order, without those hidden
+    themselves or inside a hidden section (a table cell's, a slide frame's)."""
+
+    found: list[ElementTree.Element] = []
+    for child in element:
+        if styles is not None and styles.hides_text(child):
+            continue
+        if child.tag in (f"{_TEXT}p", f"{_TEXT}h"):
+            found.append(child)
+        elif depth < _MAX_DEPTH:
+            found.extend(_visible_paragraphs(child, styles, depth + 1))
+    return found
+
+
+def row_cells(row: ElementTree.Element, styles: HiddenStyles | None = None) -> list[str]:
     """A table row's cells in their columns: a run of repeated cells (blank ones
     included, and cells covered by a merge) takes as many columns as it says, up to
     ``_MAX_REPEATED_CELLS``, so a value after a blank run stays under its own header.
@@ -236,7 +296,7 @@ def row_cells(row: ElementTree.Element) -> list[str]:
     for cell in row:
         if cell.tag not in (f"{_TABLE}table-cell", f"{_TABLE}covered-table-cell"):
             continue
-        text = _cell_text(cell) if cell.tag == f"{_TABLE}table-cell" else ""
+        text = _cell_text(cell, styles) if cell.tag == f"{_TABLE}table-cell" else ""
         repeat = _count(cell, f"{_TABLE}number-columns-repeated", _MAX_REPEATED_CELLS)
         cells.extend([text] * repeat)
     while cells and not cells[-1].strip():
@@ -244,10 +304,10 @@ def row_cells(row: ElementTree.Element) -> list[str]:
     return cells
 
 
-def _table_rows(table: ElementTree.Element) -> list[str]:
+def _table_rows(table: ElementTree.Element, styles: HiddenStyles | None = None) -> list[str]:
     rows: list[list[str]] = []
     for row in table.iter(f"{_TABLE}table-row"):
-        cells = row_cells(row)
+        cells = row_cells(row, styles)
         if any(cells):
             rows.append(cells)
     if len(rows) < 2:

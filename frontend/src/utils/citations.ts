@@ -80,13 +80,29 @@ export const UNBACKED_HREF = '#docrag-unbacked';
  *  ``UNBACKED_HREF``, for the renderer to show marked. Only text that is plain (no
  *  brackets, emphasis or code characters) and found once is marked: a wrapper must
  *  never change how the rest of the answer renders. */
+/** Whether ``at`` in ``markdown`` sits where a link can't go: in a fenced or inline
+ *  code span (it showed as literal ``[..](#…)``), a table row (the label split the
+ *  cell) or an existing link's label (links nested). */
+function insideMarkup(markdown: string, at: number): boolean {
+  const before = markdown.slice(0, at);
+  if ((before.match(/^\s*(```|~~~)/gm) ?? []).length % 2 === 1) return true;
+  const lineStart = before.lastIndexOf('\n') + 1;
+  const lineEnd = markdown.indexOf('\n', at);
+  const line = markdown.slice(lineStart, lineEnd < 0 ? undefined : lineEnd);
+  if (/^\s*\|/.test(line)) return true;
+  const lead = markdown.slice(lineStart, at);
+  if ((lead.match(/`/g) ?? []).length % 2 === 1) return true;
+  return lead.lastIndexOf('[') > lead.lastIndexOf(']');
+}
+
 export function markUnbacked(markdown: string, sentences: readonly string[]): string {
   let marked = markdown;
   for (const sentence of sentences) {
     const words = sentence.split('[')[0].trim();
-    if (words.length < 12 || /[[\]()*_`<>#\n]/.test(words)) continue;
+    if (words.length < 12 || /[[\]()*_`<>#|\n]/.test(words)) continue;
     const at = marked.indexOf(words);
     if (at < 0 || marked.indexOf(words, at + 1) >= 0) continue;
+    if (insideMarkup(marked, at)) continue;
     marked = `${marked.slice(0, at)}[${words}](${UNBACKED_HREF})${marked.slice(at + words.length)}`;
   }
   return marked;

@@ -72,6 +72,7 @@ export function recheckSummary(response: RecheckResponse): string {
     unbacked ? `${unbacked} sentence${unbacked === 1 ? '' : 's'} no longer backed` : '',
     count('changed') ? `${count('changed')} cited passage${count('changed') === 1 ? '' : 's'} changed` : '',
     count('deleted') ? `${count('deleted')} cited document${count('deleted') === 1 ? '' : 's'} deleted` : '',
+    response.more ? `only its first ${response.sentences.length} sentences were checked` : '',
   ].filter(Boolean);
   return `Check it: ${parts.join(', ')}.`;
 }

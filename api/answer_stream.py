@@ -142,6 +142,8 @@ class StreamingAnswers(PipelineCore):
                 self._log_hit(followed, question, "stream", filenames, tags, overrides)
                 yield from replay(followed)
                 return
+            # This request leads the run now (it claimed it and took a slot).
+            claimed = followed
         yield from cached_run(
             self._answer_cache,
             key,
@@ -606,6 +608,7 @@ class StreamingAnswers(PipelineCore):
             reset_finish_reason()
             if prefilled:
                 first = True
+                added = False
                 for delta in generator.stream(follow, settings):
                     if first and so_far[-1:].isspace():
                         # The prefill was sent without its trailing space; the model
@@ -613,11 +616,18 @@ class StreamingAnswers(PipelineCore):
                         delta = delta.lstrip()
                     first = False
                     if delta:
+                        added = True
                         run.parts.append(delta)
                         yield {"type": "delta", "text": delta}
+                if not added:
+                    # Nothing came: the answer is still cut off where it was (the
+                    # empty reply's own "stop" said it was whole, and it was cached).
+                    reset_finish_reason("length")
+                    return
                 continue
             more = drop_restart(so_far, "".join(generator.stream(follow, settings)))
             if not more.strip():
+                reset_finish_reason("length")
                 return
             addition = join_continuation(so_far, more)[len(so_far) :]
             run.parts.append(addition)

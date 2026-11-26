@@ -589,17 +589,23 @@ def _archive_in_background(
     name = file.filename or "archive.zip"
     record = None
     if directory is not None:
-        record = remember(
-            directory,
-            {
-                "kind": "archive",
-                "name": name,
-                "workspace": workspace_of(settings),
-                "tags": list(given_tags) if given_tags is not None else None,
-                "keep_paths": keep_paths,
-            },
-            spool,
-        )
+        try:
+            record = remember(
+                directory,
+                {
+                    "kind": "archive",
+                    "name": name,
+                    "workspace": workspace_of(settings),
+                    "tags": list(given_tags) if given_tags is not None else None,
+                    "keep_paths": keep_paths,
+                },
+                spool,
+            )
+        except BaseException:
+            # A record that can't be written (a full disk) left the spooled zip behind,
+            # with nothing to resume or remove it, as /import already handled.
+            spool.unlink(missing_ok=True)
+            raise
     started = start_archive_import(
         spool,
         name,

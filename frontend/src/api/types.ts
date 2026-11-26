@@ -1087,4 +1087,7 @@ export interface RecheckResponse {
   sources: RecheckSourceResponse[];
   sentences: VerifySentenceResponse[];
   still_holds: boolean;
+  // The answer had more sentences than one recheck looks at (a server before pass 22
+  // leaves it out).
+  more?: boolean;
 }

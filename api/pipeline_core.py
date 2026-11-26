@@ -41,6 +41,7 @@ from api.answer_run import (
 )
 from api.answer_traces import TraceRecording
 from api.citations import (
+    SourceCitation,
     answer_status,
     opens_with_a_refusal,
     strip_citation_markers,
@@ -399,6 +400,32 @@ class PipelineCore(TraceRecording):
                 chunk_ordinal=ordinal if isinstance(ordinal, int) else None,
             )
         return True, found
+
+    def cited_passages(self, sources: Sequence[SourceCitation]) -> dict[str, RerankedChunk]:
+        """The whole passages ``sources`` cite, by chunk id, as indexed now (one read per
+        document). A source's ``text`` is only a 200-character excerpt: the self-check
+        held answers against that, so a claim backed past its first lines read as
+        unsupported. A passage that can't be read is left out (its excerpt stands in)."""
+
+        wanted: dict[str, list[str]] = {}
+        for source in sources:
+            wanted.setdefault(source.filename, []).append(source.chunk_id)
+        found: dict[str, RerankedChunk] = {}
+        for filename, chunk_ids in wanted.items():
+            try:
+                payloads = self._repository.chunks_for_filename(
+                    self._settings,
+                    filename,
+                    PassageFilter(chunk_ids=tuple(dict.fromkeys(chunk_ids))),
+                )
+            except Exception:  # noqa: BLE001 - the excerpt is still a fair reading
+                logger.warning("Couldn't read the cited passages of %r.", filename, exc_info=True)
+                continue
+            for payload in payloads:
+                chunk = _stored_chunk(payload, filename)
+                if chunk is not None:
+                    found[chunk.chunk_id] = chunk
+        return found
 
     def neighbour_text(self, chunk: RerankedChunk) -> str:
         """``chunk``'s text with its neighbours (as a question's prompt would have it),
@@ -804,6 +831,21 @@ class PipelineCore(TraceRecording):
         if explain:
             # With Qdrant's own fusion the leg ranks cost one more query; asked for here.
             effective_settings = effective_settings.model_copy(update={"trace_leg_ranks": True})
+        # QUERY_DECOMPOSITION_ENABLED, as ``answer`` does it (an LLM call): the eval
+        # measured retrieval without it, so turning it on moved nothing it scored.
+        # ``POST /search`` (``for_generation=False``) makes no LLM call.
+        decomposition: tuple[list[str], float] | None = None
+        if (
+            for_generation
+            and effective_settings.query_decomposition_enabled
+            and might_be_compound(question)
+            and not (narrow is not None and narrow.chunk_ids)
+        ):
+            slot = drain(wait_for_model(effective_settings, None))
+            try:
+                decomposition = self._decomposition(question, effective_settings)
+            finally:
+                slot.release()
         return self._retrieve_and_rerank(
             question,
             effective_settings,
@@ -815,6 +857,7 @@ class PipelineCore(TraceRecording):
             # Search, re-check and the eval harness keep no trace of it.
             traced=False,
             collect_leg_ranks=explain,
+            parts=decomposition,
         )
 
     def rerun_retrieval(
@@ -1048,6 +1091,8 @@ class PipelineCore(TraceRecording):
             if isinstance(followed, CachedAnswer):
                 self._log_hit(followed, question, "sync", filenames, tags, overrides)
                 return followed.as_grounded(_cached_timings(started))
+            # This request leads the run now (it claimed it and took a slot).
+            claimed = followed
         # ``claimed``: this request leads the run already (claimed as it was admitted).
         lead: threading.Event | None = claimed
         if claimed is None and key is not None and use_cache and self._answer_cache is not None:
@@ -1063,6 +1108,7 @@ class PipelineCore(TraceRecording):
             if hit is not None:
                 self._log_hit(hit, question, "sync", filenames, tags, overrides)
                 return hit.as_grounded(_cached_timings(started))
+        failure: BaseException | None = None
         try:
             grounded = self._answer_uncached(
                 question, overrides, filenames, history, tags, should_stop, use_memo=use_cache
@@ -1076,11 +1122,14 @@ class PipelineCore(TraceRecording):
                 and not grounded.prompt_cut
             ):
                 self._answer_cache.put(key, CachedAnswer.from_grounded(grounded))
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             # After the store, so followers find the answer; on a failure they find
-            # none and each asks itself.
+            # none and ask themselves — unless asking again would fail the same way.
             if lead is not None and key is not None and self._answer_cache is not None:
-                self._answer_cache.inflight.finish(key, lead)
+                self._answer_cache.inflight.finish(key, lead, failure)
         return grounded
 
     def _answer_uncached(
@@ -1364,3 +1413,29 @@ class PipelineCore(TraceRecording):
         )
         run.phase, run.fitted = phase, fitted
         return prompt_question, fitted
+
+
+def _stored_chunk(payload: Mapping[str, object], filename: str) -> RerankedChunk | None:
+    """A stored point's payload as a passage to check an answer against."""
+
+    text, chunk_id = payload.get("text"), payload.get("chunk_id")
+    if not isinstance(text, str) or not isinstance(chunk_id, str):
+        return None
+
+    def number(key: str) -> int | None:
+        value = payload.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    section = payload.get("section")
+    return RerankedChunk(
+        point_id=chunk_id,
+        filename=filename,
+        page=number("page") or 0,
+        section=section if isinstance(section, str) else "",
+        chunk_id=chunk_id,
+        text=text,
+        retrieval_score=0.0,
+        rerank_score=0.0,
+        chunk_ordinal=number("chunk_ordinal"),
+        page_end=number("page_end"),
+    )

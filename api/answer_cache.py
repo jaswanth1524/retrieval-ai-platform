@@ -266,10 +266,13 @@ class InflightRuns:
         with self._lock:
             return self._runs.get(key)
 
-    def finish(self, key: CacheKey, event: Event) -> None:
+    def finish(self, key: CacheKey, event: Event, failure: BaseException | None = None) -> None:
         """Release ``key``'s followers (idempotent). Called right after the leader's
-        answer is cached, and again from its ``finally`` as a backstop."""
+        answer is cached, and again from its ``finally`` as a backstop. ``failure``: why
+        the run left no answer, for its followers to judge (``run_coordination``)."""
 
+        if failure is not None and not event.is_set():
+            event.failure = failure  # type: ignore[attr-defined]
         event.set()
         with self._lock:
             if self._runs.get(key) is event:

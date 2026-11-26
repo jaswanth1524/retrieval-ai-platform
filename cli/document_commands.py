@@ -969,18 +969,45 @@ def cmd_outline(client: DocragClient, args: argparse.Namespace, out: TextIO) -> 
 
 
 def cmd_dedupe(client: DocragClient, args: argparse.Namespace, out: TextIO) -> int:
-    """The listing's same-bytes groups; ``--delete`` keeps each group's first name (in
-    name order) and deletes the other copies. Exit 1 when copies remain."""
+    """The listing's same-bytes groups; ``--delete`` keeps each group's first name (the
+    server puts the copy with the most tags, or a source URL, first) and deletes the
+    other copies. One that can't be deleted (gone already, or busy) is reported and the
+    rest go on. Exit 1 when copies remain."""
 
     groups = [list(group["filenames"]) for group in client.duplicates().get("groups", [])]
     deleted: list[str] = []
+    failed: dict[str, str] = {}
+    merged: dict[str, list[str]] = {}
+    if args.delete and getattr(args, "merge", False):
+        tags = client.documents().get("tags", {})
+        for group in groups:
+            kept, *copies = group
+            union = list(dict.fromkeys(t for name in group for t in tags.get(name, [])))
+            if union != list(tags.get(kept, [])):
+                try:
+                    merged[kept] = client.set_tags(kept, union)
+                except DocragError as exc:
+                    # Its copies keep the tags, then: none is deleted.
+                    for name in copies:
+                        failed[name] = f"not deleted: its tags couldn't be merged ({exc})"
     if args.delete:
         for group in groups:
             for name in group[1:]:
-                client.delete(name)
+                if name in failed:
+                    continue
+                try:
+                    client.delete(name)
+                except DocragError as exc:
+                    failed[name] = str(exc)
+                    continue
                 deleted.append(name)
     if args.json:
-        print(json.dumps({"duplicate_groups": groups, "deleted": deleted}), file=out)
+        print(
+            json.dumps(
+                {"duplicate_groups": groups, "deleted": deleted, "failed": failed, "merged": merged}
+            ),
+            file=out,
+        )
     else:
         for group in groups:
             kept, *copies = group
@@ -991,4 +1018,8 @@ def cmd_dedupe(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
             + (f"; {len(deleted)} copies deleted" if args.delete else ""),
             file=out,
         )
-    return 0 if args.delete or not groups else 1
+        for name, tags_now in merged.items():
+            print(f"tags of {name}: {', '.join(tags_now)}", file=out)
+        for name, reason in failed.items():
+            print(f"could not delete {name}: {reason}", file=out)
+    return 0 if (args.delete and not failed) or not groups else 1

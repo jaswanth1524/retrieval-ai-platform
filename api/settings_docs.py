@@ -202,6 +202,7 @@ SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "backup_dir",
             "backup_interval_hours",
             "backup_keep",
+            "backup_drill_sample",
             "backup_copy_command",
             "backup_copy_timeout_seconds",
             "workspaces_enabled",

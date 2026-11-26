@@ -326,6 +326,41 @@ class DocragClient:
         )
         return list(result.get("answers", []))
 
+    def start_batch_job(
+        self,
+        questions: list[str],
+        *,
+        filenames: list[str] | None = None,
+        tags: list[str] | None = None,
+        provider: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /questions/batch/jobs``: the same batch answered in the background;
+        its ``batch_id`` to follow with ``batch_job``."""
+
+        body: dict[str, Any] = {"questions": questions}
+        if filenames:
+            body["filenames"] = filenames
+        if tags:
+            body["tags"] = tags
+        if provider:
+            body["llm_provider"] = provider
+        body.update({k: v for k, v in (options or {}).items() if v is not None})
+        result: dict[str, Any] = self._json("POST", "/questions/batch/jobs", json=body)
+        return result
+
+    def batch_job(self, batch_id: str) -> dict[str, Any]:
+        """``GET /questions/batch/jobs/{id}``: its state and the answers so far."""
+
+        result: dict[str, Any] = self._json("GET", f"/questions/batch/jobs/{_quote(batch_id)}")
+        return result
+
+    def cancel_batch_job(self, batch_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._json(
+            "POST", f"/questions/batch/jobs/{_quote(batch_id)}/cancel"
+        )
+        return result
+
     def calibrate(self, *, apply: bool = False, labels: str = "model") -> dict[str, Any]:
         """``POST /admin/calibrate``: this workspace's suggested RERANK_MIN_SCORE, made its
         own with ``apply``."""
@@ -1285,12 +1320,27 @@ class DocragClient:
         result: dict[str, Any] = self._json("POST", f"/backups/{_quote(name)}/verify")
         return result
 
-    def restore_stored_backup(self, name: str, only: list[str] | None = None) -> dict[str, Any]:
-        """Restore a stored backup; ``only`` these documents when given."""
+    def restore_stored_backup(
+        self,
+        name: str,
+        only: list[str] | None = None,
+        *,
+        background: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Restore a stored backup; ``only`` these documents when given. ``background``:
+        on the server's import thread (the reply has its ``import_id``), so a large
+        restore isn't deferred by a full indexing queue."""
 
-        params = {"only": only} if only else None
+        params: dict[str, Any] = {}
+        if only:
+            params["only"] = only
+        if background:
+            params["background"] = "true"
+        if dry_run:
+            params["dry_run"] = "true"
         result: dict[str, Any] = self._json(
-            "POST", f"/backups/{_quote(name)}/restore", params=params
+            "POST", f"/backups/{_quote(name)}/restore", params=params or None
         )
         return result
 

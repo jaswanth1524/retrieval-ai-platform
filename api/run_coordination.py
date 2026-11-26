@@ -5,6 +5,7 @@ out of ``api/pipeline.py``, which re-exports these names.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -17,6 +18,7 @@ from api.answer_cache import (
 )
 from api.answer_events import DoneEvent, StreamEvent
 from api.llm import (
+    GenerationError,
     GenerationSlot,
     was_degraded,
 )
@@ -40,12 +42,17 @@ def follow_only(
     event: threading.Event,
     should_stop: Callable[[], bool] | None,
     take_slot: Callable[[], bool] | None = None,
-) -> Generator[StreamEvent, None, CachedAnswer | bool | None]:
+) -> Generator[StreamEvent, None, CachedAnswer | threading.Event | None]:
     """Wait for the identical run ``event`` belongs to and return its answer: None when
     the reader left. When that run left none (it failed, was abandoned, or its answer
-    isn't kept), True if ``take_slot`` got this request a question slot of its own —
-    the caller then runs the question itself — else ``NoSlotForRun``: before pass 21
-    every follower of a failed leader got a 429 though slots were free."""
+    isn't kept), the run claimed by this request (the event the caller leads and must
+    ``finish``) if ``take_slot`` got it a question slot of its own — the caller then
+    runs the question itself — else ``NoSlotForRun``: before pass 21 every follower of
+    a failed leader got a 429 though slots were free.
+
+    The run is claimed before the slot is taken, so of the followers of a failed
+    leader one leads and the rest follow it without a slot: each used to take a slot
+    of its own first and then wait on the new leader holding it."""
 
     yield {"type": "stage", "stage": "joining_identical_question"}
     while True:
@@ -56,16 +63,29 @@ def follow_only(
         if hit is not None:
             answer_inflight_joins_total.labels(outcome="replayed").inc()
             return hit
-        # The leader's slot is freed just after it releases its followers, and one of
-        # them may lead the question again: for a moment, take a slot or follow that.
+        _raise_shared_failure(event)
+        # The leader's slot is freed just after it releases its followers: for a moment,
+        # lead the question (a claim and a slot) or follow whoever does.
         deadline = time.monotonic() + _RELEAD_SETTLE_SECONDS
         while True:
-            if take_slot is not None and take_slot():
-                answer_inflight_joins_total.labels(outcome="ran").inc()
-                return True
-            again = cache.inflight.running(key)
-            if again is not None and again is not event:
-                event = again
+            if take_slot is None:
+                claim, leading = cache.inflight.running(key), False
+            else:
+                claim, leading = cache.inflight.claim(key)
+            if leading:
+                assert claim is not None and take_slot is not None
+                hit = cache.get(key)
+                if hit is not None:
+                    cache.inflight.finish(key, claim)
+                    answer_inflight_joins_total.labels(outcome="replayed").inc()
+                    return hit
+                if take_slot():
+                    answer_inflight_joins_total.labels(outcome="ran").inc()
+                    return claim
+                # No slot free yet: let another follower (or a new request) lead.
+                cache.inflight.finish(key, claim)
+            elif claim is not None and claim is not event:
+                event = claim
                 break
             if time.monotonic() >= deadline:
                 answer_inflight_joins_total.labels(outcome="ran").inc()
@@ -75,6 +95,20 @@ def follow_only(
             if should_stop is not None and should_stop():
                 return None
             time.sleep(_JOIN_POLL_SECONDS / 10)
+
+
+def _raise_shared_failure(event: threading.Event) -> None:
+    """The run ``event`` belongs to failed in a way the same question would fail again
+    (bad credentials, an unknown model, a model that timed out on this prompt): its
+    followers fail with it. Each used to run the question again in turn, so with a
+    provider that took its timeout to fail, the last of N identical questions waited N
+    timeouts for the same error."""
+
+    failure = getattr(event, "failure", None)
+    if isinstance(failure, GenerationError) and not failure.worth_retrying:
+        answer_inflight_joins_total.labels(outcome="failed").inc()
+        # A copy: the leader's own exception may still be on its way up another thread.
+        raise copy.copy(failure)
 
 
 # How long a follower whose leader left no answer looks for a slot or a new leader.
@@ -138,6 +172,7 @@ def lead_or_join(
         if hit is not None:
             answer_inflight_joins_total.labels(outcome="replayed").inc()
             return hit
+        _raise_shared_failure(event)
         answer_inflight_joins_total.labels(outcome="ran").inc()
 
 
@@ -187,9 +222,11 @@ def cached_run(
     done: DoneEvent | None = None
     events = run()
 
+    failure: BaseException | None = None
+
     def finish_lead() -> None:
         if lead is not None and key is not None and cache is not None:
-            cache.inflight.finish(key, lead)
+            cache.inflight.finish(key, lead, failure)
 
     stored: CachedAnswer | None = None
 
@@ -213,6 +250,9 @@ def cached_run(
         # then), the answer is degraded after all and isn't kept, as on the sync path.
         if stored is not None and key is not None and cache is not None and was_degraded():
             cache.discard(key, stored)
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
         # Closing this generator (the client left) must close the inner one now: its
         # `finally` records the "closed early" trace. Left to garbage collection, it ran

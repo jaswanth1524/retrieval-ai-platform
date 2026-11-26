@@ -672,6 +672,96 @@
     "title": "BatchAnswerResponse",
     "type": "object"
    },
+   "BatchJobResponse": {
+    "description": "A background batch: its answers so far, in question order.",
+    "properties": {
+     "answers": {
+      "items": {
+       "$ref": "#/components/schemas/BatchAnswerResponse"
+      },
+      "title": "Answers",
+      "type": "array"
+     },
+     "batch_id": {
+      "title": "Batch Id",
+      "type": "string"
+     },
+     "created_at": {
+      "title": "Created At",
+      "type": "number"
+     },
+     "done": {
+      "title": "Done",
+      "type": "integer"
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "finished_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Finished At"
+     },
+     "state": {
+      "title": "State",
+      "type": "string",
+      "x-extensible-enum": [
+       "queued",
+       "running",
+       "done",
+       "cancelled",
+       "failed"
+      ]
+     },
+     "total": {
+      "title": "Total",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "batch_id",
+     "state",
+     "total",
+     "done",
+     "answers",
+     "created_at"
+    ],
+    "title": "BatchJobResponse",
+    "type": "object"
+   },
+   "BatchJobStartedResponse": {
+    "description": "POST /questions/batch/jobs: the job to follow (GET /questions/batch/jobs/{id}).",
+    "properties": {
+     "batch_id": {
+      "title": "Batch Id",
+      "type": "string"
+     },
+     "total": {
+      "title": "Total",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "batch_id",
+     "total"
+    ],
+    "title": "BatchJobStartedResponse",
+    "type": "object"
+   },
    "BatchQuestionRequest": {
     "description": "Several questions answered one after another, with the same scope and options\n(POST /questions/batch): a checklist of questions over a set of documents. No\nconversation history: each question stands alone.",
     "properties": {
@@ -1869,6 +1959,17 @@
       "title": "Stale Filenames",
       "type": "array"
      },
+     "stale_total": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Stale Total"
+     },
      "tags": {
       "additionalProperties": {
        "items": {
@@ -2565,6 +2666,11 @@
       "title": "Deferred",
       "type": "array"
      },
+     "dry_run": {
+      "default": false,
+      "title": "Dry Run",
+      "type": "boolean"
+     },
      "feedback_imported": {
       "title": "Feedback Imported",
       "type": "integer"
@@ -2616,6 +2722,14 @@
       "default": 0,
       "title": "Versions Restored",
       "type": "integer"
+     },
+     "would_restore": {
+      "default": [],
+      "items": {
+       "type": "string"
+      },
+      "title": "Would Restore",
+      "type": "array"
      }
     },
     "required": [
@@ -3833,6 +3947,11 @@
    },
    "RecheckResponse": {
     "properties": {
+     "more": {
+      "default": false,
+      "title": "More",
+      "type": "boolean"
+     },
      "sentences": {
       "items": {
        "$ref": "#/components/schemas/VerifySentenceResponse"
@@ -8406,6 +8525,18 @@
       }
      },
      {
+      "description": "List what it would restore, skip and reject; change nothing.",
+      "in": "query",
+      "name": "dry_run",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "List what it would restore, skip and reject; change nothing.",
+       "title": "Dry Run",
+       "type": "boolean"
+      }
+     },
+     {
       "in": "header",
       "name": "X-API-Key",
       "required": false,
@@ -11604,6 +11735,230 @@
      }
     },
     "summary": "Answer Questions"
+   }
+  },
+  "/questions/batch/jobs": {
+   "post": {
+    "operationId": "start_batch_job_questions_batch_jobs_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/BatchQuestionRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BatchJobStartedResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "409": {
+      "description": "As many batches as allowed are running already."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Start Batch Job"
+   }
+  },
+  "/questions/batch/jobs/{batch_id}": {
+   "get": {
+    "operationId": "batch_job_status_questions_batch_jobs__batch_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "batch_id",
+      "required": true,
+      "schema": {
+       "title": "Batch Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BatchJobResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such batch in this workspace."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Batch Job Status"
+   }
+  },
+  "/questions/batch/jobs/{batch_id}/cancel": {
+   "post": {
+    "description": "Stop before the next question (the one being answered finishes).",
+    "operationId": "cancel_batch_job_questions_batch_jobs__batch_id__cancel_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "batch_id",
+      "required": true,
+      "schema": {
+       "title": "Batch Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BatchJobResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such batch in this workspace."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Cancel Batch Job"
    }
   },
   "/questions/continue": {

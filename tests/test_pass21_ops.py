@@ -102,7 +102,10 @@ def test_a_lost_index_is_reported_once_and_before_a_rebuild_that_fails_to_start(
     sent: list[str] = []
     monkeypatch.setattr(main, "notify", lambda event, text: sent.append(event))
 
+    attempts: list[str] = []
+
     def refuses(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(args[0])
         raise RuntimeError("the import thread is gone")
 
     monkeypatch.setattr(main, "start_import", refuses)
@@ -114,9 +117,11 @@ def test_a_lost_index_is_reported_once_and_before_a_rebuild_that_fails_to_start(
     # The rebuild couldn't start, but the loss was told first.
     main.check_for_lost_index(settings, reported)
     assert sent == ["index_lost"]
-    # The periodic check doesn't tell it again while it lasts.
+    # The periodic check doesn't tell it again while it lasts, but (pass 22) it does
+    # try the rebuild again: it never started.
     assert main.check_for_lost_index(settings, reported) == ["default"]
     assert sent == ["index_lost"]
+    assert attempts == ["rebuild", "rebuild"]
     monkeypatch.undo()
     clear_dependency_caches()
 
