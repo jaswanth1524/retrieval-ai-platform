@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -266,6 +267,16 @@ class DocragClient:
     def health(self) -> dict[str, Any]:
         result: dict[str, Any] = self._json("GET", "/health")
         return result
+
+    def require_feature(self, feature: str, what: str) -> None:
+        """Refuse ``what`` against a server whose /health doesn't list ``feature``. An
+        older one ignores a parameter it doesn't know: a "dry run" restored for real."""
+
+        if feature not in (self.health().get("features") or []):
+            raise DocragError(
+                f"This server doesn't support {what}; upgrade it (its /health lists no "
+                f"'{feature}' feature). Nothing was sent."
+            )
 
     def readiness(self) -> dict[str, Any]:
         """``GET /health/ready``: Qdrant, the generation provider, each model and the
@@ -1244,6 +1255,14 @@ class DocragClient:
         except OSError as exc:
             partial.unlink(missing_ok=True)
             raise DocragError(f"Cannot write {destination}: {exc.strerror or exc}") from exc
+        except DocragError as exc:
+            # What arrived is kept: it may be all there is, if the server's copy went.
+            if not written:
+                partial.unlink(missing_ok=True)
+                raise
+            raise DocragError(
+                f"{exc} What was downloaded is kept in {partial}.", exc.status_code
+            ) from exc
         except BaseException:
             partial.unlink(missing_ok=True)
             raise
@@ -1375,7 +1394,13 @@ class DocragClient:
         if status.get("state") != "done":
             problems = "; ".join(status.get("problems") or []) or str(status.get("state"))
             raise DocragError(f"The server didn't finish the bundle: {problems}")
-        return self.download_resumable(f"/admin/migrate/export/{_quote(import_id)}", destination)
+        path = f"/admin/migrate/export/{_quote(import_id)}"
+        written = self.download_resumable(path, destination)
+        # It arrived whole (checked against its checksum): the server's copy can go.
+        # A server that can't be told keeps it until a newer one or for a day.
+        with contextlib.suppress(DocragError):
+            self._request("DELETE", path)
+        return written
 
     def migrate_unpack(self, bundle: Path) -> dict[str, Any]:
         """``POST /admin/migrate/import``: the server unpacks it in the background."""

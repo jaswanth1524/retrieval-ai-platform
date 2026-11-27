@@ -225,10 +225,11 @@ def _ask_once(
         print(json.dumps({**result.done, "followups": result.followups}), file=out)
         return result
     print(file=out)
-    # A citation retry replaces the streamed text with the answer that cites its sources.
+    # The answer kept can differ from what was streamed: a citation retry, citation
+    # markers normalized, a cut-off part rejoined. The kept one is shown again.
     final = str(result.done.get("answer", ""))
     if final.strip() != "".join(streamed).strip():
-        print(f"\n[revised after the citation check]\n{final}", file=out)
+        print(f"\n[the answer as saved]\n{final}", file=out)
     _print_sources(result, out)
     return result
 
@@ -254,6 +255,8 @@ def cmd_ask_many(client: DocragClient, args: argparse.Namespace, out: TextIO) ->
     EXIT_NOT_ANSWERED when one wasn't answered."""
 
     answers: list[dict[str, Any]] = []
+    if getattr(args, "batch", None) or getattr(args, "background", False):
+        client.require_feature("batch_jobs", "background batches")
     if getattr(args, "batch", None):
         answers = follow_batch(client, args.batch, quiet=args.quiet)
         job = client.batch_job(args.batch)
@@ -578,8 +581,10 @@ def cmd_continue(client: DocragClient, args: argparse.Namespace, out: TextIO) ->
     --json``'s output and in ``docrag traces``); prints the whole answer."""
 
     streaming = not args.json
+    streamed: list[str] = []
 
     def write(text: str) -> None:
+        streamed.append(text)
         out.write(text)
         out.flush()
 
@@ -588,6 +593,11 @@ def cmd_continue(client: DocragClient, args: argparse.Namespace, out: TextIO) ->
         print(json.dumps(result.done), file=out)
         return 0
     print(file=out)
+    # Only the new part streams; the whole answer as joined (a half-written citation
+    # dropped, markers normalized) is shown when the new part doesn't simply end it.
+    final = str(result.done.get("answer", ""))
+    if not final.rstrip().endswith("".join(streamed).strip()):
+        print(f"\n[the whole answer as saved]\n{final}", file=out)
     if result.done.get("truncated"):
         print(
             f"(still cut off: docrag continue {result.done.get('trace_id')} goes on)",

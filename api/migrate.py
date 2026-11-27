@@ -15,6 +15,7 @@ Layout: ``manifest.json``, then per workspace ``workspaces/<name>/backup.zip`` a
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -227,6 +228,7 @@ def store_originals(
     workspace: str,
     max_members: int | None = None,
     lock_key: Callable[[str], str] | None = None,
+    indexed_sha256: Callable[[str], str | None] | None = None,
 ) -> int:
     """Put a backup's originals and versions straight into ``raw_store`` (when
     originals are kept here) and its ratings into ``feedback_store``, indexing nothing:
@@ -234,7 +236,9 @@ def store_originals(
 
     ``lock_key`` names a document's write lock (``document_key``): each original is
     stored under it, as an upload stores one, so one arriving meanwhile isn't
-    overwritten half way by the bundle's."""
+    overwritten half way by the bundle's. ``indexed_sha256`` (a document's indexed
+    content hash) keeps one that arrived *before* the bundle's turn: when the stored
+    original is what is indexed and the bundle's is not, the stored one is newer."""
 
     stored = 0
 
@@ -250,10 +254,12 @@ def store_originals(
         if raw_store is not None:
             if lock_key is None:
                 raw_store.save(filename, content)
+                stored += 1
             else:
                 with filename_write_lock(lock_key(filename)):
-                    raw_store.save(filename, content)
-            stored += 1
+                    if not _newer_here(raw_store, filename, content, indexed_sha256):
+                        raw_store.save(filename, content)
+                        stored += 1
         return DocumentJobAcceptedResponse(job_id="", filename=filename, state="queued")
 
     with backup.open("rb") as handle:
@@ -275,6 +281,21 @@ def store_originals(
         # originals at the next listing.
         raw_store.details_backfilled = False
     return stored
+
+
+def _newer_here(
+    raw_store: RawDocumentStore,
+    filename: str,
+    content: bytes,
+    indexed_sha256: Callable[[str], str | None] | None,
+) -> bool:
+    if indexed_sha256 is None:
+        return False
+    indexed = indexed_sha256(filename)
+    if indexed is None or indexed == hashlib.sha256(content).hexdigest():
+        return False
+    held = raw_store.read(filename)
+    return held is not None and hashlib.sha256(held).hexdigest() == indexed
 
 
 def can_use_snapshot(

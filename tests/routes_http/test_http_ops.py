@@ -36,9 +36,14 @@ def test_health_endpoint(api_context: ApiTestContext) -> None:
     response = api_context.client.get("/health")
 
     assert response.status_code == 200
+    from api.routes.ops import SERVER_FEATURES
     from api.version import app_version
 
-    assert response.json() == {"status": "ok", "version": app_version()}
+    assert response.json() == {
+        "status": "ok",
+        "version": app_version(),
+        "features": list(SERVER_FEATURES),
+    }
 
 
 def test_health_ready_returns_ok_when_qdrant_and_provider_are_reachable(

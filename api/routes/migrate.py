@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from qdrant_client import QdrantClient
-from starlette.types import Message, Receive, Scope, Send
+from starlette.types import Receive, Scope, Send
 
 from api.audit import audit
 from api.chunking import TokenCounter
@@ -32,6 +32,7 @@ from api.embeddings import LocalEmbeddingProvider
 from api.imports import BackgroundImport, adopt_upload, spool_directory, spool_upload
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
+from api.ingestion import ingest_sequencer
 from api.migrate import (
     MigrateError,
     QdrantSnapshots,
@@ -67,6 +68,7 @@ from api.workspaces import (
     MAX_WORKSPACES,
     WorkspaceError,
     document_key,
+    filename_of,
     list_workspaces,
     settings_for,
     validate_name,
@@ -220,58 +222,11 @@ class _RemovedAfterSending(FileResponse):
             Path(self.path).unlink(missing_ok=True)
 
 
-class _KeptUntilSent(FileResponse):
-    """A background export's bundle, forgotten and removed only once a download got
-    all of it: a connection cut part-way (a multi-gigabyte pack) leaves it to fetch
-    again — or to resume, with a Range request, where it stopped. ``X-Content-SHA256``
-    lets the client check what it put together."""
-
-    def __init__(self, import_id: str, path: Path, filename: str, sha256: str | None) -> None:
-        super().__init__(
-            path,
-            media_type="application/zip",
-            filename=filename,
-            headers={"X-Content-SHA256": sha256} if sha256 else None,
-        )
-        self._import_id = import_id
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        complete = False
-        # Only a whole file (200) or a range running to its last byte (206) finishes the
-        # bundle: a bad Range gets Starlette's own 416/400, whose short body ended
-        # "complete" too and deleted a bundle nobody had downloaded.
-        to_the_end = False
-
-        async def watching(message: Message) -> None:
-            nonlocal complete, to_the_end
-            if message["type"] == "http.response.start":
-                status = message.get("status")
-                headers = {k.lower(): v for k, v in message.get("headers", [])}
-                to_the_end = status == 200 or (
-                    status == 206
-                    and _reaches_end(headers.get(b"content-range", b"").decode("latin-1"))
-                )
-            await send(message)
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                complete = to_the_end
-
-        await super().__call__(scope, receive, watching)
-        if complete:
-            _forget_export(self._import_id)
-
-
-def _reaches_end(content_range: str) -> bool:
-    """Whether ``bytes a-b/total`` ends at the file's last byte."""
-
-    try:
-        span, total = content_range.removeprefix("bytes ").split("/")
-        return int(span.split("-")[1]) == int(total) - 1
-    except (ValueError, IndexError):
-        return False
-
-
 # Bundles written in the background (POST /admin/migrate/export), by import id: kept
-# until downloaded whole, or for BACKGROUND_EXPORT_KEEP_SECONDS. Only the newest is
+# until the client confirms it has it (DELETE /admin/migrate/export/{id}), or for
+# BACKGROUND_EXPORT_KEEP_SECONDS. A download alone removes nothing: the server can't
+# know one arrived (a cut connection still "sends" to the end, a buffering proxy reads
+# the whole file before its client has any of it). Only the newest is
 # kept: each is the whole server, so an older one is never the one wanted, and in the
 # stock compose file they sit in a RAM-backed /tmp.
 _background_exports: dict[str, tuple[Path, float, str | None]] = {}
@@ -297,11 +252,19 @@ def _sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _forget_export(import_id: str) -> None:
+_NO_BUNDLE = (
+    "No finished bundle with that id (still being written, already removed, "
+    "replaced by a newer one, or older than a day)."
+)
+
+
+def _forget_export(import_id: str) -> bool:
     with _background_lock:
         found = _background_exports.pop(import_id, None)
-    if found is not None:
-        found[0].unlink(missing_ok=True)
+    if found is None:
+        return False
+    found[0].unlink(missing_ok=True)
+    return True
 
 
 def _forget_old_exports(now: float) -> None:
@@ -332,7 +295,8 @@ def _keep_export(import_id: str, path: Path, sha256: str | None = None) -> None:
 # The same bundle as GET /admin/migrate/export, written in the background: for a big
 # server the GET held the request (and its proxy's timeout) for the whole pack. Follow
 # it with GET /documents/imports/{import_id}; once it is done, GET
-# /admin/migrate/export/{import_id} downloads it (once).
+# /admin/migrate/export/{import_id} downloads it, as often as it takes, and DELETE
+# there removes it once it arrived whole.
 @router.post(
     "/admin/migrate/export",
     response_model=MigrateExportStartedResponse,
@@ -410,11 +374,30 @@ def migrate_export_download(import_id: str) -> FileResponse:
     if found is None or not found[0].exists():
         raise HTTPException(
             status_code=404,
-            detail="No finished bundle with that id (still being written, already "
-            "downloaded, replaced by a newer one, or older than a day).",
+            detail=_NO_BUNDLE,
         )
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(found[1]))
-    return _KeptUntilSent(import_id, found[0], f"docrag-migrate-{stamp}.zip", found[2])
+    # X-Content-SHA256 lets the client check what it put together from Range requests.
+    return FileResponse(
+        found[0],
+        media_type="application/zip",
+        filename=f"docrag-migrate-{stamp}.zip",
+        headers={"X-Content-SHA256": found[2]} if found[2] else None,
+    )
+
+
+@router.delete(
+    "/admin/migrate/export/{import_id}",
+    status_code=204,
+    dependencies=[Depends(require_full_key)],
+    responses={404: {"description": "No finished background export with that id."}},
+)
+def migrate_export_delete(import_id: str) -> None:
+    """Remove a background export's bundle, once it was downloaded whole."""
+
+    if not _forget_export(import_id):
+        raise HTTPException(status_code=404, detail=_NO_BUNDLE)
+    audit("admin.migrate_export_delete", workspace="", import_id=import_id)
 
 
 # Entries a bundle may hold: its manifest and, per workspace, a backup and a snapshot.
@@ -497,6 +480,43 @@ def migrate_import(
     )
 
 
+def _recover_closed(
+    bundle: zipfile.ZipFile,
+    entry: dict[str, object],
+    server: _Server,
+    target: WorkspaceTarget,
+    name: str,
+    points: int,
+) -> str | None:
+    """The workspace's snapshot put back with the workspace closed to uploads and
+    deletes, or why it wasn't. Recovering replaces the collection: an upload indexed
+    (or still queued) while the snapshot was being written out of the bundle was wiped,
+    its job still saying done."""
+
+    settings = target.settings
+    if not ingest_sequencer.close_if_idle(name, lambda key: filename_of(settings, key) is not None):
+        return "documents were being indexed or deleted here"
+    try:
+        collection = str(settings.qdrant_collection)
+        now = server.client.count(collection_name=collection, exact=True).count
+        if now != points:
+            return f"{now - points} passage(s) were indexed here meanwhile"
+        try:
+            recover_workspace(
+                bundle,
+                entry,
+                target,
+                server.client,
+                server.snapshots(),
+                _scratch(server.settings),
+            )
+        except MigrateError as exc:
+            return str(exc)
+        return None
+    finally:
+        ingest_sequencer.reopen(name)
+
+
 def _unpack_workspace(
     bundle: zipfile.ZipFile,
     manifest: dict[str, object],
@@ -552,19 +572,7 @@ def _unpack_workspace(
             else "the bundle holds no snapshot of it"
         )
         if reason is None:
-            # Checked again just before the snapshot replaces the collection: writing
-            # the backup out of the bundle takes a while, and an upload landing in it
-            # was wiped with the old collection.
-            now = server.client.count(collection_name=collection, exact=True).count
-            if now != points:
-                reason = f"{now - points} passage(s) were indexed here meanwhile"
-        if reason is None:
-            try:
-                recover_workspace(
-                    bundle, entry, target, server.client, server.snapshots(), _scratch(base)
-                )
-            except MigrateError as exc:
-                reason = str(exc)
+            reason = _recover_closed(bundle, entry, server, target, name, points)
         if reason is None:
             stored = store_originals(
                 backup,
@@ -574,6 +582,9 @@ def _unpack_workspace(
                 name,
                 max_members=int(base.max_migrate_members),
                 lock_key=lambda filename: document_key(target.settings, filename),
+                indexed_sha256=lambda filename: server.repository.content_sha256_of(
+                    target.settings, filename
+                ),
             )
             bump_corpus_generation(collection=collection)
             documents = len(server.repository.filename_metadata(target.settings))

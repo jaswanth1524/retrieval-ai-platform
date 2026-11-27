@@ -11,31 +11,6 @@ from fastapi.testclient import TestClient
 from tests.test_pass15_admin import admin  # noqa: F401 - the fixture
 
 
-def test_a_bad_range_leaves_the_bundle_to_download(tmp_path: Path) -> None:
-    from fastapi import FastAPI
-
-    import api.routes.migrate as migrate_routes
-
-    body = bytes(range(256)) * 40
-    bundle = tmp_path / "bundle.zip"
-    bundle.write_bytes(body)
-    migrate_routes._keep_export("r22", bundle, None)
-    app = FastAPI()
-
-    @app.get("/b")
-    def get_bundle() -> object:
-        return migrate_routes._KeptUntilSent("r22", bundle, "b.zip", None)
-
-    with TestClient(app) as client:
-        for bad in ("bytes=abc", f"bytes={len(body) + 10}-", "bytes=5-2"):
-            response = client.get("/b", headers={"Range": bad})
-            assert response.status_code in (400, 416), bad
-            assert bundle.exists(), bad
-        whole = client.get("/b")
-        assert whole.status_code == 200 and whole.content == body
-        assert not bundle.exists()
-
-
 def test_an_export_that_cant_open_its_scratch_file_lets_go_of_the_lock(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

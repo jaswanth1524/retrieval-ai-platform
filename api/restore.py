@@ -570,10 +570,18 @@ class BackupCheck:
     # an intact backup isn't "damaged" for that).
     would_restore: int = 0
     rejected: list[str] = field(default_factory=list)
+    # How a scheduled backup's restore drill went; None when it had none.
+    drill_ok: bool | None = None
 
     @property
     def ok(self) -> bool:
         return not self.problems
+
+    @property
+    def restorable(self) -> bool:
+        """Intact, and not one whose originals failed to make documents."""
+
+        return self.ok and self.drill_ok is not False
 
 
 # What a verify decompresses, at most: per member, and for the whole archive.

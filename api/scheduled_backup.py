@@ -95,6 +95,8 @@ def load_check(backup: Path) -> BackupCheck | None:
             problems=[str(problem) for problem in fields["problems"]],
             would_restore=int(fields.get("would_restore", 0)),
             rejected=[str(item) for item in fields.get("rejected", [])],
+            # Missing in a record from before drills were kept: not drilled.
+            drill_ok=fields.get("drill_ok"),
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -238,6 +240,8 @@ class ScheduledBackup(BackgroundLoop):
         # Per workspace, the newest backup whose BACKUP_COPY_COMMAND failed: tried
         # again each pass until it copies (the next backup is a day away).
         self._uncopied: dict[str, Path] = {}
+        # Written backups whose attempt isn't noted yet (the drill comes first).
+        self._unfinished: dict[Path, tuple[BackupStatus, BackupCheck]] = {}
         # BACKUP_DRILL_SAMPLE's drill of a backup just written (main.py supplies it).
         self._drill = drill
 
@@ -332,9 +336,10 @@ class ScheduledBackup(BackgroundLoop):
                 self._note(BackupStatus(self._clock(), name, False, error=str(exc)[:200]))
             finally:
                 self._export_lock.release()
-            # Off the export lock: a copy may take minutes (an upload elsewhere), and
-            # /export and the other workspaces' backups would wait on it.
+            # Off the export lock: a drill or a copy may take minutes, and /export
+            # and the other workspaces' backups would wait on it.
             if written and written[-1].parent == directory:
+                self._finish(target, name, written[-1])
                 self._copy(target, name, written[-1])
             self._prune(directory)
         return written
@@ -426,11 +431,7 @@ class ScheduledBackup(BackgroundLoop):
         drop = self._document_drop(directory, final, check)
         if drop is not None:
             logger.warning("The backup %s: %s", final, drop)
-        if check.ok and drop is None:
-            drop = self._drill_problem(final, target.settings)
-            if drop is not None:
-                logger.warning("The backup %s: %s", final, drop)
-        self._note(
+        self._unfinished[final] = (
             BackupStatus(
                 self._clock(),
                 name,
@@ -438,29 +439,48 @@ class ScheduledBackup(BackgroundLoop):
                 file=final.name,
                 error=(check.problems[0][:200] if not check.ok else drop),
                 originals_missing=stream.originals_missing,
-            )
+            ),
+            check,
         )
         return final
 
-    def _drill_problem(self, backup: Path, settings: AppSettings) -> str | None:
-        """BACKUP_DRILL_SAMPLE originals of ``backup`` parsed as a restore would: why
-        they don't make documents, or None."""
+    def _finish(self, target: WorkspaceTarget, name: str, backup: Path) -> None:
+        """Drill a backup that otherwise checked out, then note how this attempt went.
+        What the drill found is kept with the backup's check: pruning keeps the newest
+        backup that passed, and one that failed its drill is not that."""
+
+        pending = self._unfinished.pop(backup, None)
+        if pending is None:
+            return
+        status, check = pending
+        if status.ok:
+            drilled, problem = self._drill_problem(backup, target.settings)
+            if drilled:
+                self.record_check(backup, dataclasses.replace(check, drill_ok=problem is None))
+            if problem is not None:
+                logger.warning("The backup %s: %s", backup, problem)
+                status = dataclasses.replace(status, ok=False, error=problem)
+        self._note(dataclasses.replace(status, at=self._clock()))
+
+    def _drill_problem(self, backup: Path, settings: AppSettings) -> tuple[bool, str | None]:
+        """BACKUP_DRILL_SAMPLE originals of ``backup`` parsed as a restore would:
+        whether one was run, and why they don't make documents (or None)."""
 
         sample = int(settings.backup_drill_sample)
         if self._drill is None or sample <= 0:
-            return None
+            return False, None
         try:
             report = self._drill(backup, settings)
         except Exception as exc:  # noqa: BLE001 - reported as the backup's failure
             logger.warning("The restore drill of %s failed.", backup, exc_info=True)
-            return f"restore drill failed: {str(exc)[:160]}"
+            return True, f"restore drill failed: {str(exc)[:160]}"
         if report.problems:
-            return f"restore drill: {report.problems[0][:160]}"
+            return True, f"restore drill: {report.problems[0][:160]}"
         failures = [document for document in report.documents if not document.ok]
         if not failures:
-            return None
+            return True, None
         first = failures[0]
-        return (
+        return True, (
             f"restore drill: {len(failures)} of {len(report.documents)} sampled originals "
             f"don't make documents ({first.filename}: {(first.error or '')[:120]})"
         )
@@ -532,7 +552,8 @@ class ScheduledBackup(BackgroundLoop):
         # The newest backup that passed its check stays, even past BACKUP_KEEP: with a
         # small keep, failed ones would otherwise push out the last one worth restoring.
         good = next(
-            (b for b in reversed(backups) if (check := self.check_for(b)) and check.ok), None
+            (b for b in reversed(backups) if (check := self.check_for(b)) and check.restorable),
+            None,
         )
         # So does the newest that held any document: backups taken after the index was
         # lost hold none, and pruning by count alone would remove the last full one.
@@ -540,7 +561,7 @@ class ScheduledBackup(BackgroundLoop):
             (
                 b
                 for b in reversed(backups)
-                if (check := self.check_for(b)) and check.ok and check.originals > 0
+                if (check := self.check_for(b)) and check.restorable and check.originals > 0
             ),
             None,
         )

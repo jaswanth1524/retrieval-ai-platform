@@ -22,6 +22,23 @@ _OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 # Repeated rows with values are written out at most this many times; repeated empty
 # rows only move the row numbers on (a sheet's padding is often a million of them).
 _MAX_REPEATED_ROWS = 64
+# Columns looked at for being hidden (a spreadsheet's own most).
+_MAX_COLUMNS = 16_384
+
+
+def _hidden_columns(table: ElementTree.Element) -> set[int]:
+    """The positions of a sheet's hidden columns, among those a row's cells can fill."""
+
+    hidden: set[int] = set()
+    position = 0
+    for column in table.iter(f"{_TABLE}table-column"):
+        repeat = _count(column, f"{_TABLE}number-columns-repeated", 1 << 30)
+        if column.get(f"{_TABLE}visibility") in ("collapse", "filter"):
+            hidden.update(range(position, min(position + repeat, _MAX_COLUMNS)))
+        position += repeat
+        if position >= _MAX_COLUMNS:
+            break
+    return hidden
 
 
 def parse_ods_document(
@@ -49,7 +66,7 @@ def parse_ods_document(
     # stay the sheets' and rows' own.
     hidden = bool(settings is not None and settings.index_hidden_content)
     styles = None if hidden else HiddenStyles(root, styles_root)
-    hidden_sheets = hidden_rows = 0
+    hidden_sheets = hidden_rows = hidden_cells = 0
     sections: list[DocumentSection] = []
     cells = 0
     for page, table in enumerate(body.iter(f"{_TABLE}table"), start=1):
@@ -57,6 +74,8 @@ def parse_ods_document(
             hidden_sheets += 1
             continue
         title = table.get(f"{_TABLE}name") or f"Sheet {page}"
+        unseen = _hidden_columns(table) if styles is not None else set()
+        left_out: set[int] = set()
         records: list[tuple[int, list[str]]] = []
         number = 0
         for row in table.iter(f"{_TABLE}table-row"):
@@ -67,6 +86,9 @@ def parse_ods_document(
                 number += repeat
                 continue
             values = row_cells(row, styles)
+            if unseen:
+                left_out.update(i for i in unseen if i < len(values) and values[i].strip())
+                values = [value for i, value in enumerate(values) if i not in unseen]
             filled = any(value.strip() for value in values)
             repeat = _count(row, f"{_TABLE}number-rows-repeated", 1 << 30)
             if not filled:
@@ -82,9 +104,11 @@ def parse_ods_document(
                     )
                 records.append((number, list(values)))
             number += max(repeat - _MAX_REPEATED_ROWS, 0)
+        hidden_cells += len(left_out)
         sections.extend(_sheet_sections(filename, page, title, records, rows_per_section))
     warn_hidden(filename, hidden_sheets, "sheet(s)")
     warn_hidden(filename, hidden_rows, "row(s)")
+    warn_hidden(filename, hidden_cells, "column(s)")
     if not sections:
         raise EmptyDocumentError(f"ODS '{filename}' has no cell values.")
     return sections

@@ -34,6 +34,14 @@ from api.schemas import (
 from api.settings import AppSettings
 from api.version import app_version
 
+# What /health lists for clients to check before relying on it (HealthResponse.features).
+SERVER_FEATURES = (
+    "batch_jobs",
+    "migrate_export_delete",
+    "restore_background",
+    "restore_dry_run",
+)
+
 
 def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicConfigResponse:
     """Build a non-secret config response."""
@@ -119,7 +127,7 @@ def register(app: FastAPI) -> None:
     # token — so a burst of slow questions holding every token failed the healthcheck.
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
-        return HealthResponse(status="ok", version=app_version())
+        return HealthResponse(status="ok", version=app_version(), features=list(SERVER_FEATURES))
 
     # The app's settings, never an X-Workspace one, as /config: a probe or a browser
     # holding a since-deleted workspace must not get a 404 (or 400 with workspaces off)
