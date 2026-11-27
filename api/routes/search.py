@@ -190,7 +190,14 @@ def register(app: FastAPI) -> None:
             for source in request.sources:
                 by_file.setdefault(source.filename, []).append(source.chunk_id)
             now = {name: pipeline.passages_now(name, ids) for name, ids in by_file.items()}
-            changed = sorted(name for name, (indexed, _) in now.items() if indexed)
+            # Only documents a cited passage went from: every indexed one counted made
+            # an answer citing five documents search them all together once one changed,
+            # and the others crowded out its passages.
+            changed = sorted(
+                name
+                for name, (indexed, found) in now.items()
+                if indexed and any(chunk_id not in found for chunk_id in by_file[name])
+            )
             within = _search_within(pipeline, changed)
             for source in request.sources:
                 indexed, found = now[source.filename]

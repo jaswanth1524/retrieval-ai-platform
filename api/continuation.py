@@ -8,6 +8,7 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+from api.citations import normalize_citation_markers
 from api.generation import (
     ChatMessage,
 )
@@ -93,6 +94,9 @@ def drop_restart(before: str, after: str) -> str:
     return head[shared:]
 
 
+# Punctuation a Chinese or Japanese clause starts after.
+_CLAUSE_ENDS = "。，、；：！？（「『“"
+
 # How far back a continuation is looked at for words it repeats: a whole list item.
 _REPEAT_MAX_CHARS = 400
 
@@ -110,7 +114,18 @@ def _drop_repeated_tail(before: str, after: str) -> str:
     end = before.rstrip()
     for size in range(min(len(end), _REPEAT_MAX_CHARS), 0, -1):
         tail = end[-size:]
-        if tail[:1].isspace() or (size < len(end) and not end[-size - 1].isspace()):
+        if tail[:1].isspace():
+            continue
+        if size < len(end) and not end[-size - 1].isspace():
+            # Chinese and Japanese: a clause repeated from its punctuation on. Four
+            # characters or more, as a shorter run is often doubled on purpose.
+            if (
+                end[-size - 1] in _CLAUSE_ENDS
+                and size >= 4
+                and _UNSPACED_RE.search(tail)
+                and head.startswith(tail)
+            ):
+                return head[size:]
             continue  # not where a word starts
         whole_line = size == len(end) or end[-size - 1] == "\n"
         words = tail.split()
@@ -134,18 +149,55 @@ _CLOSING_MARKER_RE = re.compile(r"[*_`]+(?:$|[\s.,;:!?)\]}'\"])")
 _OPENING_MARKER_RE = re.compile(r"(?:^|\s)[*_`]+$")
 
 
+# A list item's start: "3. ", "3)", "3、" or "- " (not the figure "3.5").
+_LIST_ITEM_RE = re.compile(r"[ \t]*(?:(?P<number>\d{1,3})[.)、](?!\d)|(?P<bullet>[-*•])(?=\s))")
+# A citation marker the output limit cut part way: "[", "[1", "[1, " or "【1".
+_HALF_MARKER_RE = re.compile(r"[ \t]*(?:\[(?:\d[\d\s,，、\-–]*)?|【\d*)\s*$")
+# Chinese and Japanese characters, their punctuation and full-width forms: written with
+# no space between them, or against a number ("出差结束后30天"). Not Hangul.
+_UNSPACED_RE = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
+
+
+def _next_item(before: str, after: str) -> str | None:
+    """``before`` and ``after`` on lines of their own when ``after`` starts the list
+    item that follows the one ``before`` was cut in, else None. A marker cut part way
+    is dropped from ``before``: asked in words, gpt-4o-mini cut after "[" went on
+    "3. …", and the two read "[3. …"."""
+
+    kept = _HALF_MARKER_RE.sub("", before).rstrip()
+    if not kept:
+        return None
+    cut_in = _LIST_ITEM_RE.match(kept.rsplit("\n", 1)[-1])
+    rest = after.lstrip()
+    follows = _LIST_ITEM_RE.match(rest)
+    if cut_in is None or follows is None:
+        return None
+    if cut_in["number"] is not None:
+        if follows["number"] is None or int(follows["number"]) != int(cut_in["number"]) + 1:
+            return None
+    elif follows["bullet"] != cut_in["bullet"]:
+        return None
+    return f"{kept}\n{rest}"
+
+
 def join_continuation(before: str, after: str, *, prefilled: bool = False) -> str:
     """A cut-off answer and its continuation as one text. Continuing a prefill, the
     model writes its own leading space where a word ends (" can be", or "2]" inside a
     marker): the two are joined as they are. Asked in words, a space goes between them
     unless either side already has one, the continuation starts with punctuation or a
     closing Markdown marker, or the cut came just after an opening bracket, quote or
-    Markdown marker."""
+    Markdown marker, or between Chinese or Japanese text. The next item of a list gets
+    its own line (``_next_item``, which may shorten ``before``)."""
 
     if not after:
         return before
     if prefilled:
         return before.rstrip() + after
+    listed = _next_item(before, after)
+    if listed is not None:
+        return listed
+    if _UNSPACED_RE.match(before[-1:]) or _UNSPACED_RE.match(after[:1]):
+        return before + after
     if before[-1:].isspace() or after[:1].isspace() or after[:1] in ".,;:!?)]}'\"":
         return before + after
     if before[-1:] in "([{\u201c\u2018":  # cut just after an opening bracket or quote
@@ -175,7 +227,9 @@ class AutoContinuing:
             reset_finish_reason()
             more = self._inner.complete(follow, settings)
             if not prefilled:
-                more = drop_restart(text, more)
+                # Marker for marker: a restart writing "【1】" for "[1]" is a restart.
+                text = normalize_citation_markers(text)
+                more = drop_restart(text, normalize_citation_markers(more))
             if not more.strip():
                 # Still cut off where it was: the empty reply's "stop" would have
                 # marked it whole (and kept it in the answer cache).

@@ -427,7 +427,15 @@ class PipelineCore(TraceRecording):
                     found[chunk.chunk_id] = chunk
         return found
 
-    def neighbour_text(self, chunk: RerankedChunk) -> str:
+    def widener(self, overrides: AnswerOverrides) -> Callable[[RerankedChunk], str] | None:
+        """``neighbour_text`` as a question with ``overrides`` had its prompt: none with
+        no neighbouring text (``passages_only``), none from outside its narrowing."""
+
+        if overrides.passages_only or int(self._settings.context_neighbor_radius) <= 0:
+            return None
+        return lambda chunk: self.neighbour_text(chunk, overrides.narrow)
+
+    def neighbour_text(self, chunk: RerankedChunk, narrow: PassageFilter | None = None) -> str:
         """``chunk``'s text with its neighbours (as a question's prompt would have it),
         or its own text when they can't be read."""
 
@@ -441,7 +449,9 @@ class PipelineCore(TraceRecording):
                 if not isinstance(ordinal, int):
                     return chunk.text
                 chunk = replace(chunk, chunk_ordinal=ordinal)
-            widened = expand_with_neighbors([chunk], self._repository, self._settings)
+            widened = expand_with_neighbors(
+                [chunk], self._repository, self._settings, narrow=narrow
+            )
         except Exception:  # noqa: BLE001 - the passage alone is still a fair reading
             return chunk.text
         return (widened[0].expanded_text if widened else None) or chunk.text
