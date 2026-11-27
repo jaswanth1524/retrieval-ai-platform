@@ -7,9 +7,11 @@ import {
   recheckRequest,
   recheckSummary,
   savedCheckRequest,
+  savedKey,
   type SavedCheck,
 } from '../utils/savedCheck';
 import type { SavedAnswer } from '../hooks/useChat';
+import type { SavedVerdict } from '../hooks/useSavedVerdicts';
 import { SOURCE_CHANGE_HINTS, type SourceChange } from '../utils/citationFreshness';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { normalized } from '../utils/questions';
@@ -30,6 +32,8 @@ interface SavedPanelProps {
   /** The workspace whose documents ``sourceChangeOf`` knows: another's answers are
    *  never checked against them (each of their sources would read "deleted"). */
   workspace?: string;
+  /** What the saved-answer watch found no longer holding (``useSavedVerdicts``). */
+  verdicts?: Record<string, SavedVerdict>;
 }
 
 /** The answer's sources that changed since it was saved, said in one line. */
@@ -74,6 +78,7 @@ function SavedPanel({
   onAskAgain,
   sourceChangeOf,
   workspace = '',
+  verdicts,
 }: SavedPanelProps) {
   const [filter, setFilter] = useState('');
   // The note being written: which answer, and its text so far.
@@ -123,6 +128,11 @@ function SavedPanel({
   const recheckOf = (item: SavedAnswer): string | null => {
     const found = rechecks[`${item.conversationId}:${item.turn.id}`];
     return found && found.answer === item.turn.content ? found.text : null;
+  };
+  // The watch's verdict, until a Recheck here says something newer.
+  const watchedOf = (item: SavedAnswer): string | null => {
+    const found = verdicts?.[savedKey(item)];
+    return found && found.answer === item.turn.content && !recheckOf(item) ? found.text : null;
   };
   const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
@@ -270,6 +280,11 @@ function SavedPanel({
                   data-testid="saved-check-result"
                 >
                   {SAVED_CHECK_LABELS[checks[`${item.conversationId}:${item.turn.id}`]]}
+                </span>
+              )}
+              {watchedOf(item) && (
+                <span className="unanswered-panel__meta saved-panel__changed" data-testid="saved-watch-result">
+                  {watchedOf(item)}
                 </span>
               )}
               {recheckOf(item) && (

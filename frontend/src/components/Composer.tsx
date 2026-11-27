@@ -238,16 +238,24 @@ function Composer({
     textareaRef.current?.focus();
     textareaRef.current?.setSelectionRange(range[0], range[1]);
   });
+  // A template's placeholders are being filled in: only then does Tab jump between
+  // braces (in a question about "\frac{a}{b}" it selected them, to be typed over).
+  const fillingTemplateRef = useRef(false);
+  if (!value) fillingTemplateRef.current = false;
   const insertTemplate = (template: QuestionTemplate) => {
     // After what is typed, not over it: picking a template replaced the draft unasked.
     const draft = value.trimEnd();
     const prefix = draft && draft !== template.text ? `${draft}\n\n` : '';
-    const text = prefix + template.text;
+    // Cut to the question's limit, which the box enforces on typing only: past it the
+    // server refused the question.
+    const text = (prefix + template.text).slice(0, MAX_QUESTION_CHARS);
     setValue(text);
     const placeholder = firstPlaceholder(template.text);
-    selectAfterInsertRef.current = placeholder
-      ? [placeholder[0] + prefix.length, placeholder[1] + prefix.length]
-      : [text.length, text.length];
+    fillingTemplateRef.current = placeholder !== null;
+    selectAfterInsertRef.current =
+      placeholder && placeholder[1] + prefix.length <= text.length
+        ? [placeholder[0] + prefix.length, placeholder[1] + prefix.length]
+        : [text.length, text.length];
     setOpenPopover(null);
   };
   // A save that didn't stick (browser storage full or off) says so.
@@ -301,6 +309,7 @@ function Composer({
       return;
     }
     setSendQueued(false);
+    fillingTemplateRef.current = false;
     onSubmit(trimmed);
     setValue('');
     if (draftKey) writeDraft(draftKey, '');
@@ -328,7 +337,14 @@ function Composer({
     // Tab with a {placeholder} still in the question: to the next one (Tab otherwise
     // leaves the box as usual). The selection end is where the search starts, so a
     // placeholder just selected is stepped past.
-    if (event.key === 'Tab' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+    if (
+      fillingTemplateRef.current &&
+      event.key === 'Tab' &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey
+    ) {
       const box = event.currentTarget;
       const range = nextPlaceholder(box.value, box.selectionEnd);
       if (range && !(range[0] === box.selectionStart && range[1] === box.selectionEnd)) {
@@ -578,8 +594,13 @@ function Composer({
                     const name = templateName.trim();
                     const saved = saveTemplate(templateName, value);
                     setTemplates(saved);
+                    // Its text too: saving over a name already there, a full storage
+                    // kept the old one, which read as saved.
                     const kept = saved.some(
-                      (t) => t.name.toLocaleLowerCase() === name.toLocaleLowerCase(),
+                      (t) =>
+                        t.name.toLocaleLowerCase() ===
+                          name.slice(0, MAX_TEMPLATE_NAME_CHARS).toLocaleLowerCase() &&
+                        t.text === value.trim().slice(0, MAX_QUESTION_CHARS),
                     );
                     setTemplateNote(kept ? null : 'Not saved: this browser’s storage is full or off.');
                     if (kept) setTemplateName('');

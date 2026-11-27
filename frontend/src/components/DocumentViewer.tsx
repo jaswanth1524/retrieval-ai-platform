@@ -495,10 +495,10 @@ function DocumentViewer({
           !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)
         ) {
           const step = event.key === 'ArrowLeft' ? (onBack && stepBack) : (onForward && stepForward);
-          if (step) {
-            event.preventDefault();
-            step();
-          }
+          // Kept from the browser even with no step to take: one press past the first
+          // passage left the app (Alt+← is its Back on Windows and Linux).
+          event.preventDefault();
+          if (step) step();
           return;
         }
         // The browser's own find can't see passages not loaded, and missed the dialog's
