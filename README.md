@@ -781,7 +781,8 @@ and `--background` restores on the server's import thread and follows it.
 **Moving a large server:** `docrag migrate pack server.zip --background` has the server
 write the bundle in the background and downloads it when done (for a pack that outlasts
 a proxy's request timeout), resuming a cut download and checking it against the
-server's SHA-256. `docrag migrate verify server.zip` reads a bundle through
+server's SHA-256, then removing the server's copy (`DELETE /admin/migrate/export/{id}`;
+until then it stays, for a day at most). `docrag migrate verify server.zip` reads a bundle through
 (every backup's checksums, each snapshot) before you carry it anywhere.
 
 **Checking a text against the documents:** `docrag verify draft.txt` (or `POST
@@ -803,7 +804,11 @@ that look compound; others are untouched.
 answers each line in turn (`POST /questions/batch`). With `--background` the server
 answers them on its own thread (`POST /questions/batch/jobs`), each question waiting for
 a free slot; a dropped connection loses nothing — `docrag ask --batch ID` reads the
-answers again.
+answers again. With two or more question slots, batches never take the last one; with
+`MAX_CONCURRENT_QUESTIONS=1` a batch uses it, so asking meanwhile gets a "busy" reply;
+the batch then holds back for a few seconds after its current question, so the retry
+the reply asks for gets in. Two batches may run per workspace, and a cancelled one
+finishes the question it is on.
 
 **Duplicates:** `docrag dedupe` lists documents holding the same bytes under different
 names; `--delete` keeps one of each (the one with the most tags, or a source URL), and

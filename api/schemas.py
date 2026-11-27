@@ -115,6 +115,9 @@ class HealthResponse(BaseModel):
     # The running version (pyproject.toml), open like the rest of /health so an operator
     # can tell what is deployed without a key.
     version: str = ""
+    # What this server can do that an older one can't, for clients to check first: an
+    # older server ignores an unknown parameter instead of refusing it. Open-ended.
+    features: list[str] = Field(default_factory=list)
 
 
 class BackupStatusResponse(BaseModel):

@@ -16,6 +16,7 @@ from qdrant_client import QdrantClient
 from api import imports
 from api.answer_cache import AnswerCache
 from api.audit import audit
+from api.batch_jobs import batch_job_store
 from api.corpus import bump_corpus_generation
 from api.dependencies import (
     clear_workspace_raw_stores,
@@ -329,6 +330,8 @@ def delete_workspace(
         _delete_if_empty(client, target, name)
     finally:
         ingest_sequencer.reopen(group)
+    # A batch still asking in it would fail question by question.
+    batch_job_store().abort(str(target.qdrant_collection))
     forget_workspace_metrics(name)
     backup = getattr(http_request.app.state, "backup", None)
     if backup is not None:

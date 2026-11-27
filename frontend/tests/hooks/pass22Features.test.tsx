@@ -45,7 +45,7 @@ describe('pass 22: saved answers watched', () => {
     );
     expect(recheck).not.toHaveBeenCalled(); // the first listing is no change
     rerender({ documents: { 'leave.txt': meta(2), 'other.txt': meta(1) } });
-    await waitFor(() => expect(told).toHaveBeenCalledWith(1, ['leave.txt']));
+    await waitFor(() => expect(told).toHaveBeenCalledWith(1, ['leave.txt'], 0));
     expect(recheck).toHaveBeenCalledTimes(1);
   });
 
@@ -101,7 +101,7 @@ describe('pass 22: saved answers watched, after the review', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(recheck).not.toHaveBeenCalled();
     rerender({ documents: { 'leave.txt': meta(2) } });
-    await waitFor(() => expect(told).toHaveBeenCalledWith(1, ['leave.txt']));
+    await waitFor(() => expect(told).toHaveBeenCalledWith(1, ['leave.txt'], 0));
   });
 });
 

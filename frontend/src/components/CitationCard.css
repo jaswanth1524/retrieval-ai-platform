@@ -1,7 +1,11 @@
 .citation-card {
   display: flex;
+  /* Short of room, the location and "changed since" go onto lines of their own:
+     the file name was squeezed to its first letter on a phone. */
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 8px;
+  gap: 2px 8px;
+  text-align: left;
   border: none;
   background: transparent;
   color: var(--muted);
@@ -25,7 +29,9 @@
 }
 
 .citation-card__file {
-  max-width: 200px;
+  flex-shrink: 0;
+  /* Beside the number; shortened only past this. */
+  max-width: min(200px, calc(100% - 28px));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

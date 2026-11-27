@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 import threading
@@ -17,7 +18,7 @@ from starlette.concurrency import run_in_threadpool
 
 from api.admission import QuestionSlots, Release, SlotKind
 from api.answer_cache import CachedAnswer
-from api.batch_jobs import BatchJob, batch_job_store, run_batch_job
+from api.batch_jobs import BATCH_YIELD_SECONDS, BatchJob, batch_job_store, run_batch_job
 from api.citations import SourceCitation, citation_from_dict
 from api.dependencies import (
     require_api_key,
@@ -322,7 +323,10 @@ def _source_number(chunk: RerankedChunk | None, sources: Sequence[SourceCitation
 
 
 def with_answer_checks(
-    settings: AppSettings, event: DoneEvent, pipeline: RagPipeline | None = None
+    settings: AppSettings,
+    event: DoneEvent,
+    pipeline: RagPipeline | None = None,
+    overrides: AnswerOverrides | None = None,
 ) -> None:
     """``answer_checks`` onto a stream's ``done`` frame (it goes out right after)."""
 
@@ -331,7 +335,7 @@ def with_answer_checks(
         str(event.get("answer_status", "answered")),
         event["answer"],
         [citation_from_dict(dict(source)) for source in event["sources"]],
-        pipeline.neighbour_text if pipeline is not None else None,
+        pipeline.widener(overrides or AnswerOverrides()) if pipeline is not None else None,
         pipeline.cited_passages if pipeline is not None else None,
     )
     if checks is not None:
@@ -644,7 +648,7 @@ def answered_response(
                 grounded.answer_status,
                 grounded.answer,
                 grounded.sources,
-                pipeline.neighbour_text,
+                pipeline.widener(question_overrides(request)),
                 pipeline.cited_passages,
             )
             or []
@@ -763,7 +767,13 @@ def start_batch_job(
         return BatchAnswerResponse(question=question, error=public_error_message(exc))
 
     try:
-        _start_batch_thread(job, lambda: slots.try_acquire("question"), answer, failed)
+        _start_batch_thread(
+            job,
+            lambda: slots.try_acquire("batch"),
+            answer,
+            failed,
+            BATCH_YIELD_SECONDS,
+        )
     except BaseException:
         # Never started: ended, so it doesn't hold one of the running places for good.
         job.state, job.error, job.finished_at = "failed", "it couldn't be started", time.time()
@@ -772,8 +782,12 @@ def start_batch_job(
 
 
 def _start_batch_thread(job: BatchJob, *args: Any) -> None:
+    # In the request's context, so its traces and log lines carry its request id.
     threading.Thread(
-        target=run_batch_job, args=(job, *args), name=f"docrag-batch-{job.id[:8]}", daemon=True
+        target=contextvars.copy_context().run,
+        args=(run_batch_job, job, *args),
+        name=f"docrag-batch-{job.id[:8]}",
+        daemon=True,
     ).start()
 
 
@@ -785,16 +799,19 @@ def _batch_job(batch_id: str, settings: AppSettings) -> BatchJob:
 
 
 def _batch_job_response(job: BatchJob) -> BatchJobResponse:
+    # The state before the answers: read after them, a job could finish in between and
+    # read as "done" with its last answer missing.
+    state, finished_at, error = job.state, job.finished_at, job.error
     answers = list(job.answers)
     return BatchJobResponse(
         batch_id=job.id,
-        state=job.state,
+        state=state,
         total=len(job.questions),
         done=len(answers),
         answers=answers,
         created_at=job.created_at,
-        finished_at=job.finished_at,
-        error=job.error,
+        finished_at=finished_at,
+        error=error,
     )
 
 
@@ -863,7 +880,9 @@ def continue_answer_stream(
     def on_done(event: DoneEvent) -> None:
         count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-        with_answer_checks(settings, event, pipeline)
+        # As the answer being continued had its prompt.
+        alone = config is not None and config.context_neighbor_radius == 0
+        with_answer_checks(settings, event, pipeline, AnswerOverrides(passages_only=alone))
 
     def on_error(exc: Exception) -> None:
         questions_total.labels(outcome="error", error_type=question_error_type(exc)).inc()
@@ -910,7 +929,7 @@ def answer_question_stream(
     def on_done(event: DoneEvent) -> None:
         count_answer(event.get("answer_status", "answered"), event.get("truncated", False))
         questions_total.labels(outcome="ok", error_type=NO_ERROR_TYPE).inc()
-        with_answer_checks(settings, event, pipeline)
+        with_answer_checks(settings, event, pipeline, overrides)
         if event.get("cached"):
             answer_cache_hits_total.inc()
             return

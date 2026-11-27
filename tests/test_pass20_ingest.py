@@ -374,7 +374,7 @@ def test_the_settings_check_says_when_the_temp_directory_is_too_small_for_an_imp
     assert not [f for f in roomy if f.subject == "TMPDIR"]
 
 
-def test_a_migration_bundle_can_be_written_in_the_background_and_downloaded_once(
+def test_a_migration_bundle_can_be_written_in_the_background_and_downloaded(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import json
@@ -397,7 +397,12 @@ def test_a_migration_bundle_can_be_written_in_the_background_and_downloaded_once
         with zipfile.ZipFile(io.BytesIO(bundle.content)) as archive:
             names = [w["name"] for w in json.loads(archive.read("manifest.json"))["workspaces"]]
         assert names == ["default"]
-        assert client.get(f"/admin/migrate/export/{import_id}").status_code == 404
+        # A download removes nothing (the server can't know one arrived); DELETE does.
+        path = f"/admin/migrate/export/{import_id}"
+        assert client.get(path).status_code == 200
+        assert client.delete(path).status_code == 204
+        assert client.get(path).status_code == 404
+        assert client.delete(path).status_code == 404
 
 
 def test_docrag_migrate_pack_background_downloads_the_finished_bundle(

@@ -41,22 +41,42 @@ def paired_bootstrap(
 # Per-question outcomes the answer rates are means of.
 _ANSWER_OUTCOMES: dict[str, Callable[[Mapping[str, Any]], float | None]] = {
     "fact_hit_rate": lambda row: None if row.get("fact_hit") is None else float(row["fact_hit"]),
-    "answered_rate": lambda row: float(row.get("answer_status") == "answered"),
+    # Over the questions the gate counts it over: answering an unanswerable one moved
+    # the note's number and not the gate's. A run recorded before ``labelled`` has all.
+    "answered_rate": lambda row: (
+        None if row.get("labelled") is False else float(row.get("answer_status") == "answered")
+    ),
     "error_rate": lambda row: float(row.get("error") is not None),
 }
+
+
+def _keyed(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[tuple[tuple[str, int], Mapping[str, Any]]]:
+    """Each row under its question and how many rows before it asked the same."""
+
+    seen: dict[str, int] = {}
+    keyed = []
+    for row in rows:
+        question = str(row.get("question"))
+        keyed.append(((question, seen.get(question, 0)), row))
+        seen[question] = seen.get(question, 0) + 1
+    return keyed
 
 
 def answer_noise(
     current_rows: Sequence[Mapping[str, Any]], baseline_rows: Sequence[Mapping[str, Any]]
 ) -> dict[str, tuple[float, float, float]]:
     """For each answer rate both runs measured, the change and its 95% interval, over the
-    questions both asked (matched by question text). Empty when they share none."""
+    questions both asked (matched by question text; a text asked twice, as two
+    conversations' "And for contractors?", by its turn among them). Empty when they
+    share none."""
 
-    baseline_by_question = {str(row.get("question")): row for row in baseline_rows}
+    baseline_by_question = dict(_keyed(baseline_rows))
     pairs = [
-        (row, baseline_by_question[str(row.get("question"))])
-        for row in current_rows
-        if str(row.get("question")) in baseline_by_question
+        (row, baseline_by_question[key])
+        for key, row in _keyed(current_rows)
+        if key in baseline_by_question
     ]
     found: dict[str, tuple[float, float, float]] = {}
     for name, outcome in _ANSWER_OUTCOMES.items():

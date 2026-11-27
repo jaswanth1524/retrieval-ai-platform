@@ -384,14 +384,15 @@ def _restore(
         watched_from: str | None,
     ) -> DocumentJobAcceptedResponse:
         nonlocal known
-        if dry_run:
-            return DocumentJobAcceptedResponse(job_id="", filename=filename, state="queued")
         if raw_store is not None:
             if known is None:
                 known = set(known_filenames(repository, settings))
             # A DocumentError: listed under `rejected`, the rest still restored.
             refuse_near_duplicate_name(filename, known)
             known.add(filename)
+        # After the name checks: a dry run rejects what the restore would.
+        if dry_run:
+            return DocumentJobAcceptedResponse(job_id="", filename=filename, state="queued")
         accepted = queue.enqueue(
             filename=filename,
             content=content,
@@ -421,30 +422,34 @@ def _restore(
     if not dry_run:
         repository.ensure_writable(settings)
     try:
-        outcome = restore_backup(
-            upload,
-            # Indexed, or being indexed: importing the same backup again while the
-            # first import's jobs run must not queue each document a second time.
-            existing_filenames=set(known_filenames(repository, settings)),
-            max_original_bytes=int(settings.max_upload_bytes),
-            has_room=has_room,
-            enqueue=enqueue,
-            feedback_store=None if dry_run else feedback_store,
-            workspace=workspace_of(settings),
-            keep_version=raw_store.add_version if raw_store is not None and not dry_run else None,
-            # One of BACKUP_DIR's own (``source`` names it): no upload caps.
-            # A backup this server wrote (BACKUP_DIR) is trusted past the upload caps; one
-            # inside an uploaded migration bundle is an upload like any other.
-            stored=source is not None and not source.startswith("bundle:"),
-            stop=status.cancel.is_set if status is not None else None,
-            only=only,
-            # In a migration bundle: a whole server's worth of entries may be in it.
-            max_members=(
-                int(settings.max_migrate_members)
-                if source is not None and source.startswith("bundle:")
-                else None
-            ),
-        )
+        # A dry run reads every original through, as a verify does: one at a time.
+        with _one_verify() if dry_run else contextlib.nullcontext():
+            outcome = restore_backup(
+                upload,
+                # Indexed, or being indexed: importing the same backup again while the
+                # first import's jobs run must not queue each document a second time.
+                existing_filenames=set(known_filenames(repository, settings)),
+                max_original_bytes=int(settings.max_upload_bytes),
+                has_room=has_room,
+                enqueue=enqueue,
+                feedback_store=None if dry_run else feedback_store,
+                workspace=workspace_of(settings),
+                keep_version=raw_store.add_version
+                if raw_store is not None and not dry_run
+                else None,
+                # One of BACKUP_DIR's own (``source`` names it): no upload caps.
+                # A backup this server wrote (BACKUP_DIR) is trusted past the upload caps; one
+                # inside an uploaded migration bundle is an upload like any other.
+                stored=source is not None and not source.startswith("bundle:"),
+                stop=status.cancel.is_set if status is not None else None,
+                only=only,
+                # In a migration bundle: a whole server's worth of entries may be in it.
+                max_members=(
+                    int(settings.max_migrate_members)
+                    if source is not None and source.startswith("bundle:")
+                    else None
+                ),
+            )
     except BackupImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if dry_run:
@@ -499,7 +504,9 @@ def _stored_backup(settings: AppSettings, name: str) -> Path:
 
 
 def _check_response(check: BackupCheck) -> BackupCheckResponse:
-    return BackupCheckResponse(ok=check.ok, **dataclasses.asdict(check))
+    fields = dataclasses.asdict(check)
+    del fields["drill_ok"]
+    return BackupCheckResponse(ok=check.ok, **fields)
 
 
 # One stored backup, downloaded (to keep it somewhere else) or deleted. Operator data:

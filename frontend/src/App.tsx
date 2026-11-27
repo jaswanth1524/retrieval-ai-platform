@@ -45,6 +45,7 @@ import { useLinks, type SourceView } from './hooks/useLinks';
 import { useConversationNavigation } from './hooks/useConversationNavigation';
 import { useReviewQueue } from './hooks/useReviewQueue';
 import { useSavedAnswerWatch } from './hooks/useSavedAnswerWatch';
+import { useSavedVerdicts } from './hooks/useSavedVerdicts';
 import { useOtherTabAnswering } from './hooks/useOtherTabAnswering';
 import { useStableHandler } from './hooks/useStableHandler';
 import { useCommands } from './hooks/useCommands';
@@ -1074,6 +1075,7 @@ function App() {
       sourceChange(filename, answeredAtMs, documents, corpusChecked && !listingFailed),
     [documents, corpusChecked, listingFailed],
   );
+  const [savedVerdicts, noteVerdict] = useSavedVerdicts();
   // A document a saved answer cites uploaded again or deleted: those answers rechecked,
   // and the reader told when some no longer hold.
   useSavedAnswerWatch({
@@ -1081,12 +1083,15 @@ function App() {
     documents,
     ready: corpusChecked && !listingFailed,
     workspace,
-    onNoLongerHold: (count, filenames) =>
+    onChecked: noteVerdict,
+    onNoLongerHold: (count, filenames, unchecked) =>
       pushToast({
         id: `saved-watch-${filenames.join(',')}`,
         tone: 'warn',
         title: `${count} saved answer${count === 1 ? '' : 's'} may no longer hold`,
-        body: `Rechecked after ${filenames.slice(0, 3).join(', ')}${filenames.length > 3 ? '…' : ''} changed.`,
+        body: `Rechecked after ${filenames.slice(0, 3).join(', ')}${filenames.length > 3 ? '…' : ''} changed.${
+          unchecked ? ` ${unchecked} more citing ${filenames.length === 1 ? 'it' : 'them'} weren’t checked.` : ''
+        }`,
         action: { label: 'Open Saved', run: () => setRail('saved') },
       }),
   });
@@ -1583,6 +1588,7 @@ function App() {
             onAskAgain={summarizeDisabled ? undefined : askSavedAgain}
             sourceChangeOf={sourceChangeOf}
             workspace={workspace}
+            verdicts={savedVerdicts}
           />
         )}
         {rail === 'collected' && (

@@ -61,9 +61,29 @@ export function recheckRequest(item: SavedAnswer): RecheckRequest {
   };
 }
 
+/** One saved answer among them all. */
+export function savedKey(item: SavedAnswer): string {
+  return `${item.conversationId}:${item.turn.id}`;
+}
+
+/** What a recheck found wrong: a cited document gone, or a sentence it read that is
+ *  no longer backed. Not ``still_holds``: that is false for any answer longer than one
+ *  recheck reads (``more``). */
+export function noLongerHolds(response: RecheckResponse): boolean {
+  return (
+    response.sources.some((source) => source.state === 'deleted') ||
+    response.sentences.some(
+      (sentence) => sentence.status === 'unsupported' || sentence.status === 'numbers_differ',
+    )
+  );
+}
+
 /** A recheck in one line: holds, or what changed and what no longer is backed. */
 export function recheckSummary(response: RecheckResponse): string {
   if (response.still_holds) return 'Still holds: its passages back every sentence.';
+  if (response.more && !noLongerHolds(response)) {
+    return `Holds so far: its first ${response.sentences.length} sentences are backed (the rest weren’t checked).`;
+  }
   const count = (state: string) => response.sources.filter((s) => s.state === state).length;
   const unbacked = response.sentences.filter(
     (s) => s.status === 'unsupported' || s.status === 'numbers_differ',

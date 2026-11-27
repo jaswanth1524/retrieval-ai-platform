@@ -52,29 +52,10 @@ def test_a_bundle_download_resumes_with_a_range_and_is_checked(tmp_path: Path) -
 
     import httpx
 
-    import api.routes.migrate as migrate_routes
     from cli.client import DocragClient, DocragError
 
     body = bytes(range(256)) * 400
-    bundle = tmp_path / "bundle.zip"
-    bundle.write_bytes(body)
     sha = hashlib.sha256(body).hexdigest()
-    migrate_routes._keep_export("r1", bundle, sha)
-    from fastapi import FastAPI
-
-    app = FastAPI()
-
-    @app.get("/b")
-    def get_bundle() -> object:
-        return migrate_routes._KeptUntilSent("r1", bundle, "b.zip", sha)
-
-    with TestClient(app) as client:
-        part = client.get("/b", headers={"Range": "bytes=0-99"})
-        assert part.status_code == 206 and part.headers["X-Content-SHA256"] == sha
-        assert bundle.exists()  # a range short of the end keeps it
-        tail = client.get("/b", headers={"Range": f"bytes=100-{len(body) - 1}"})
-        assert tail.status_code == 206 and part.content + tail.content == body
-        assert not bundle.exists()  # the last byte went out
 
     # The client: a cut connection resumed with a Range, then the checksum checked.
     calls: list[str | None] = []

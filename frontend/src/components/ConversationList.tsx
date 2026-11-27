@@ -66,6 +66,18 @@ function ConversationList({
   const [picked, setPicked] = useState<ReadonlySet<string>>(() => new Set());
   const [bulkConfirm, setBulkConfirm] = useState(false);
   const [bulkLabel, setBulkLabel] = useState<string | null>(null);
+  // A bulk pin that pinned only some, said.
+  const [pinNote, setPinNote] = useState<string | null>(null);
+  // Down to one conversation the bar (and its Done) goes: the checkboxes stayed, with
+  // nothing to turn them off.
+  useEffect(() => {
+    if (selecting && conversations.length <= 1) {
+      setSelecting(false);
+      setPicked(new Set());
+      setBulkConfirm(false);
+      setBulkLabel(null);
+    }
+  }, [selecting, conversations.length]);
   const endSelecting = () => {
     setSelecting(false);
     setPicked(new Set());
@@ -370,7 +382,10 @@ function ConversationList({
             <button
               type="button"
               className="conversation-list__label"
-              onClick={() => setSelecting(true)}
+              onClick={() => {
+                setPinNote(null);
+                setSelecting(true);
+              }}
               disabled={disabled}
               data-testid="conversation-select-mode"
             >
@@ -458,6 +473,11 @@ function ConversationList({
                         0,
                       );
                       for (const id of unpinned.slice(0, Math.max(room, 1))) onPin(id, true);
+                      if (room > 0 && unpinned.length > room) {
+                        setPinNote(
+                          `Pinned ${room} of ${unpinned.length}: at most ${MAX_PINNED_CONVERSATIONS} can be pinned.`,
+                        );
+                      }
                     }
                     endSelecting();
                   }}
@@ -488,6 +508,11 @@ function ConversationList({
             </>
           )}
         </div>
+      )}
+      {pinNote && (
+        <p className="conversation-list__bulk-count" role="status" data-testid="conversation-pin-note">
+          {pinNote}
+        </p>
       )}
       <ul ref={listRef} className="conversation-list" aria-label="Conversations">
         {visible.map((conversation, index) => {

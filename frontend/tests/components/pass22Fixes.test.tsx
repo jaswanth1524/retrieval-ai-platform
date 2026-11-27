@@ -58,7 +58,7 @@ describe('pass 22: rechecks of two saved answers', () => {
     );
   });
 
-  it('says when only the first sentences were checked', () => {
+  it('says what held when only the first sentences were checked', () => {
     expect(
       recheckSummary({
         sources: [],
@@ -66,7 +66,7 @@ describe('pass 22: rechecks of two saved answers', () => {
         still_holds: false,
         more: true,
       }),
-    ).toBe('Check it: only its first 20 sentences were checked.');
+    ).toMatch(/^Holds so far: its first 20 sentences/);
   });
 });
 

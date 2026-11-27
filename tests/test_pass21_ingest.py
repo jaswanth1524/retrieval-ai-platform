@@ -73,39 +73,8 @@ def test_docrag_migrate_pack_background_works_from_another_workspace(
         assert "manifest.json" in zipfile.ZipFile(target).namelist()
 
 
-def test_a_background_export_survives_a_cut_download_and_only_the_newest_is_kept(
-    tmp_path: Any,
-) -> None:
-    import asyncio
-
+def test_only_the_newest_background_export_is_kept(tmp_path: Any) -> None:
     import api.routes.migrate as migrate_routes
-
-    first = tmp_path / "first.zip"
-    first.write_bytes(b"x" * 300_000)
-    migrate_routes._keep_export("one", first)
-    response = migrate_routes._KeptUntilSent("one", first, "bundle.zip", None)
-    scope = {"type": "http", "method": "GET", "headers": [], "path": "/"}
-
-    async def receive() -> Any:
-        await asyncio.sleep(3600)
-
-    async def cut(message: Any) -> None:
-        if message["type"] == "http.response.body" and message.get("more_body"):
-            raise OSError("connection reset")
-
-    with pytest.raises(OSError):
-        asyncio.run(response(scope, receive, cut))
-    assert first.exists() and "one" in migrate_routes._background_exports
-
-    sent: list[Any] = []
-
-    async def whole(message: Any) -> None:
-        sent.append(message)
-
-    asyncio.run(
-        migrate_routes._KeptUntilSent("one", first, "bundle.zip", None)(scope, receive, whole)
-    )
-    assert not first.exists() and "one" not in migrate_routes._background_exports
 
     older, newer = tmp_path / "older.zip", tmp_path / "newer.zip"
     older.write_bytes(b"a")

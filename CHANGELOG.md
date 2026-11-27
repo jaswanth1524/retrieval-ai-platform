@@ -378,6 +378,92 @@ re-index all). Nothing else changes stored data.
   check`). The pass-numbered end-to-end specs are grouped by feature.
 - `CLAUDE.md` is short again: the pass-by-pass notes moved to `docs/history/PASSES.md`.
 
+Pass 23: fixes from a fourth whole-codebase review, then four additions.
+**Re-index: recommended** only for ODS files with hidden columns (now left out, as in
+XLSX): `docrag reindex NAME`. Nothing else changes stored data. **Upgrade the server
+before the CLI**: the CLI now refuses `ask --background`, `ask --batch` and `backup
+restore --dry-run` / `--background` against a server that doesn't list them.
+
+### Added
+- `GET /health` lists `features`, for a client to check before relying on one.
+- `DELETE /admin/migrate/export/{id}` removes a background export's bundle.
+- With two or more question slots, batch jobs leave one free for someone asking. With
+  one slot a batch uses it: a question asked meanwhile is told the server is busy, and
+  the batch then leaves the slot free long enough for the retry. Two batches may run
+  per workspace and six in all; deleting a
+  workspace or stopping the server stops its jobs.
+- Saved answers show, each on its own row, what the saved-answer watch found no longer
+  holding.
+
+### Changed
+- **A background export's bundle is no longer removed by downloading it.** It stays until
+  `DELETE`d (`docrag migrate pack --background` does so once the checksum matches), a
+  newer export replaces it, or a day passes. With another client, delete it yourself:
+  in the stock compose file it sits in a RAM-backed `/tmp`.
+
+### Fixed
+- The answer self-check flagged correct sentences gpt-5-mini wrote: a year named in a
+  cited document's file name or section ("the archived 2019 policy" of
+  travel_policy_2019_archived.md), a sentence citing two passages whose numbers come
+  from both, and a line introducing a list ("There are two values:"). The first two
+  now count as the existing unsupported-numbers check counts them; the last claims
+  nothing. A sentence ending inside a bracket or quote ("(… [2].) You can …") is now
+  checked on its own, and a number written with a typographic hyphen ("forty‑five")
+  is matched as one number.
+- `docrag ask` said "revised after the citation check" for any answer that changed
+  after streaming; it now says "the answer as saved". `docrag continue` shows the whole
+  answer when the saved one differs from the streamed part.
+- Continuing a cut-off answer on hosted OpenAI (asked in words, with no prefill): cut part
+  way through a citation marker, the next list item could be glued to the "["
+  ("…。[3. …"); that half marker is now dropped and the item starts its own line (the
+  cut sentence stays without its citation). Chinese and Japanese text is joined without
+  a space, and a clause the model repeats there is written once.
+- On a phone a source card could show only the first letter of its file name; saved
+  answers' last button was cut off at the panel's edge.
+- qwen2.5 sometimes puts part of the source line in a citation ("[1, section=Vacation]"):
+  it showed as written, cited nothing, and its "1" was flagged as a number the passage
+  doesn't state. It is now read as "[1]".
+- A model answering in Chinese or Japanese may cite as `【1】` or `［１］` (gpt-4o-mini
+  did in 5 of 10 tries): the answer came back uncited, with no sources and no
+  self-check. Such markers are now read, and written, as `[1]`. Answers saved before
+  the upgrade keep their old markers; ask again to fix them.
+- A migration bundle was deleted when its download was cut part-way, or after reading
+  only its last bytes. A failed `docrag` download now keeps what arrived.
+- `docrag migrate unpack`: an upload arriving while a snapshot was being recovered could
+  be wiped (the workspace now refuses uploads for that moment), and the bundle's copy of
+  an original could replace a newer upload's.
+- A scheduled backup that failed its restore drill still counted as the last good one,
+  so pruning could remove every backup that did restore. The drill no longer holds up
+  `/export`.
+- `docrag backup restore --dry-run` against an older server restored for real.
+- A restore dry run now rejects the names a restore would.
+- Recheck of an answer citing five or more documents could call it no longer holding
+  when one of them changed.
+- A Continue that brought nothing marked the cut-off answer complete.
+- Chinese and Japanese self-check: numbers with several separators, or decimals spaced
+  differently from the document, were misread; Latin words written against characters
+  were ignored; some sentences weren't split, or lost their citation to the next one.
+- Recheck now calls a sentence citing a nonexistent source unbacked, as the self-check
+  does. The self-check no longer credits neighbouring text a `passages_only` or narrowed
+  question never had.
+- Batches: a finished job could be read with its last answer missing; cancelling threw
+  away the question being answered; traces lost their request id.
+- Saved-answer watch: one half-written document stopped it for all; a failed run could
+  report twice; answers past the first ten were dropped without a word; any listing
+  update restarted it; switching workspace didn't stop it.
+- UI: Alt+← at the first passage left the app; select mode could get stuck with one
+  conversation; a bulk pin over the limit pinned some without saying; a template could
+  push a question past the length limit; Tab jumped between any braces in a question;
+  unbacked marks did nothing during Continue; a long answer that held read as a failed
+  Recheck; the score report didn't update after applying a bar; saving a template into
+  full storage looked successful; a local edit could go unsaved when another tab's
+  change arrived with it.
+- ODS hidden columns are no longer indexed.
+- `docrag migrate verify` counts the originals a bundle holds, reports listed ones that
+  are missing, and no longer crashes on an odd manifest.
+- Eval: the noise note measures the same questions as the gate, per-category metrics use
+  passage labels, and a decomposition baseline records the model.
+
 ## 0.2.0 — 2026-11-17
 
 Everything since 0.1.0: the latency and features pass, then two improvement passes (fixes, security, accessibility,

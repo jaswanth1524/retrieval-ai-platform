@@ -19,6 +19,7 @@ from api.citations import (
     _best_span,
     _claim_numbers,
     _content_words,
+    _header_numbers,
     _source_numbers,
     _span_index,
     _SpanIndex,
@@ -49,14 +50,25 @@ class SentenceCheck:
 # between words: an answer in them was one "sentence" of one "word" (no_claim).
 # The end mark, then the citation markers and closing quotes that belong to the sentence
 # ("…28天假期。[1]」"): the split goes after them, or "[1]" was a sentence of its own.
-_CJK_SENTENCE_END_RE = re.compile(r"[。！？]+(?:\s*\[\d+(?:\s*,\s*\d+)*\])*[」』）)”’]*")
+_CJK_SENTENCE_END_RE = re.compile(r"[。！？]+(?:[」』）)”’]|\s*" + _CITATION_RE.pattern + r")*")
 _CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+
+
+# A sentence ended inside a bracket or quote: "(… [2].) You can ask …" was one
+# sentence, checked against both sources and flagged. Only for checking: the citation
+# code's own splitter (_ANSWER_SENTENCE_RE) is left as it is.
+_CLOSED_SENTENCE_RE = re.compile(r"(?<=[.!?][)\]\"'\u201d\u2019])\s+")
 
 
 def sentences_of(text: str) -> list[str]:
     """``text``'s sentences (lines and sentence ends), citation markers kept."""
 
-    pieces = (part for piece in _ANSWER_SENTENCE_RE.split(text) for part in _cjk_split(piece))
+    pieces = (
+        part
+        for piece in _ANSWER_SENTENCE_RE.split(text)
+        for closed in _CLOSED_SENTENCE_RE.split(piece)
+        for part in _cjk_split(closed)
+    )
     return [piece.strip() for piece in pieces if piece.strip()]
 
 
@@ -64,7 +76,8 @@ def _cjk_split(text: str) -> list[str]:
     parts: list[str] = []
     start = 0
     for end in _CJK_SENTENCE_END_RE.finditer(text):
-        if end.end() < len(text) and not text[end.end()].isspace():
+        # Before a space too: "。[1] …" has none the other splitter splits at.
+        if end.end() < len(text):
             parts.append(text[start : end.end()])
             start = end.end()
     parts.append(text[start:])
@@ -78,33 +91,27 @@ def _cjk_bigrams(text: str) -> set[str]:
     return {run[i : i + 2] for run in _CJK_RUN_RE.findall(text) for i in range(len(run) - 1)}
 
 
-# A number written against characters ("28天"): ``\w+`` read it as part of the run.
-_CJK_NUMBER_RE = re.compile(r"(?<![\d.,])\d+(?:[.,]\d+)?(?![\d.,]*\d)")
+def _apart(text: str) -> str:
+    """``text`` with its runs of characters blanked, leaving what is written between
+    them as words of its own: ``\w+`` reads "使用Kubernetes部署" and "28天" as one."""
 
-
-def _cjk_numbers(text: str) -> set[str]:
-    return {
-        match.group().replace(",", "")
-        for run in re.finditer(r"[^\s]+", text)
-        if _CJK_RUN_RE.search(run.group())
-        for match in _CJK_NUMBER_RE.finditer(run.group())
-    }
+    return _CJK_RUN_RE.sub(" ", text)
 
 
 class _CjkSpanIndex(_SpanIndex):
-    """A passage's sentences with their character pairs as words too."""
+    """A passage's sentences with their character pairs as words, and the Latin words
+    and numbers written against them."""
 
     def words(self, start: int, end: int) -> set[str]:
-        return super().words(start, end) | _cjk_bigrams(self.text[start:end])
+        segment = self.text[start:end]
+        return _content_words(_apart(segment)) | _cjk_bigrams(segment)
 
 
 def _claim_words(plain: str) -> tuple[set[str], Callable[[str], _SpanIndex]]:
     bigrams = _cjk_bigrams(plain)
     if not bigrams:
         return _content_words(plain), _span_index
-    # The run of characters itself is one long "word" no passage shares.
-    words = {w for w in _content_words(plain) if not _CJK_RUN_RE.search(w)} | bigrams
-    return words, _CjkSpanIndex
+    return _content_words(_apart(plain)) | bigrams, _CjkSpanIndex
 
 
 def check_sentence(
@@ -112,21 +119,32 @@ def check_sentence(
     search: Callable[[str], Sequence[RerankedChunk]],
     widen: Callable[[RerankedChunk], str] | None = None,
     passages: int = VERIFY_PASSAGES,
+    together: bool = False,
 ) -> SentenceCheck:
-    """One sentence against the passages ``search`` finds for it. ``widen`` gives a
+    """One sentence against the passages ``search`` finds for it. ``together``: the
+    passages are the ones the sentence cites, and its numbers may come from any of them
+    (as ``unsupported_numbers`` counts them): "the current policy says fourteen days
+    [1]; the archived 2019 one … [2]". ``widen`` gives a
     passage's text with its neighbours: a number missing from the passage alone is
     looked for there before the sentence is called ``numbers_differ`` (a question's
     prompt has that text, so its answers state such numbers)."""
 
     plain = " ".join(_CITATION_RE.sub(" ", sentence).split())
     words, index_of = _claim_words(plain)
-    if len(words) < SPAN_MIN_SHARED_WORDS:
+    # "There are two values in the provided documents:" introduces what follows (a
+    # list on the next lines, checked line by line); it states nothing itself.
+    if len(words) < SPAN_MIN_SHARED_WORDS or plain.endswith((":", "：")):
         return SentenceCheck(sentence, "no_claim")
     cjk = index_of is _CjkSpanIndex
-    numbers = _claim_numbers(plain) | (_cjk_numbers(plain) if cjk else set())
+    # One reading of numbers for the sentence and the passage alike ("3.5" spaced and
+    # unspaced read differently with two).
+    numbers = _claim_numbers(_apart(plain) if cjk else plain)
 
-    def stated(text: str) -> set[str]:
-        return _source_numbers(text) | (_cjk_numbers(text) if cjk else set())
+    def stated(text: str, chunk: RerankedChunk) -> set[str]:
+        # With what the prompt's source line showed (its file name and section): "the
+        # archived 2019 policy" of travel_policy_2019_archived.md, as unsupported_numbers
+        # already allows. gpt-5-mini names documents that way.
+        return _source_numbers(_apart(text) if cjk else text) | _header_numbers(chunk)
 
     differing: list[SentenceCheck] = []
     chunks = list(search(plain))[:passages]
@@ -136,16 +154,20 @@ def check_sentence(
             continue
         _, start, end = found
         quote = chunk.text[start:end].strip()
-        missing = tuple(sorted(numbers - stated(chunk.text)))
+        missing = tuple(sorted(numbers - stated(chunk.text, chunk)))
         if not missing:
             return SentenceCheck(sentence, "supported", chunk, quote)
         differing.append(SentenceCheck(sentence, "numbers_differ", chunk, quote, missing))
+    if together and differing:
+        everywhere = set().union(*(stated(chunk.text, chunk) for chunk in chunks))
+        if numbers <= everywhere:
+            return replace(differing[0], status="supported", missing_numbers=())
     # No passage states the numbers itself: one whose neighbours do still supports it
     # (looked at only now, so a passage holding the numbers is the one quoted).
     if widen is not None:
         for check in differing:
             assert check.chunk is not None
-            if not set(check.missing_numbers) - stated(widen(check.chunk)):
+            if not set(check.missing_numbers) - stated(widen(check.chunk), check.chunk):
                 return replace(check, status="supported", missing_numbers=())
         if not differing:
             # No passage has the words: the text around one may (a question's prompt
@@ -157,7 +179,7 @@ def check_sentence(
                     continue
                 _, start, end = found
                 quote = wide[start:end].strip()
-                missing = tuple(sorted(numbers - stated(wide)))
+                missing = tuple(sorted(numbers - stated(wide, chunk)))
                 if not missing:
                     return SentenceCheck(sentence, "supported", chunk, quote)
                 differing.append(SentenceCheck(sentence, "numbers_differ", chunk, quote, missing))
@@ -228,7 +250,13 @@ def self_check(
             continue
         chosen = [passages[number] for number in cited] or list(passages.values())
         checks.append(
-            check_sentence(sentence, lambda _, c=chosen: c, widen, passages=len(chosen))  # type: ignore[misc]
+            check_sentence(
+                sentence,
+                lambda _, c=chosen: c,  # type: ignore[misc]
+                widen,
+                passages=len(chosen),
+                together=len(cited) > 1,
+            )
         )
     return checks
 
@@ -254,6 +282,10 @@ def recheck(
         if should_stop is not None and should_stop():
             raise VerifyAbandoned
         wanted = sorted(cited_numbers(sentence, max(numbers, default=0)) & set(numbers))
+        if not wanted and _CITATION_RE.search(sentence) and not only_declines(sentence):
+            # It cites only sources there are none of: as self_check says, unbacked.
+            checks.append(SentenceCheck(sentence, "unsupported"))
+            continue
 
         def search(plain: str, wanted: list[int] = wanted or numbers) -> list[RerankedChunk]:
             found: list[RerankedChunk] = []

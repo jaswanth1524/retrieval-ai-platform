@@ -99,6 +99,9 @@ def test_a_batch_that_ends_early_fails_the_cli(tmp_path: Any, monkeypatch: Any) 
     import cli.question_commands as question_commands
 
     class _Client:
+        def require_feature(self, *_: str) -> None:
+            pass
+
         def start_batch_job(self, questions: list[str], **_: Any) -> dict[str, Any]:
             return {"batch_id": "b1", "total": len(questions)}
 

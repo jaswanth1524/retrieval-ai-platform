@@ -488,12 +488,23 @@ def cmd_backup(client: DocragClient, args: argparse.Namespace, out: TextIO) -> i
         )
         return 0 if drill.get("ok") else 1
     only = getattr(args, "only", None)
+    if getattr(args, "dry_run", False):
+        client.require_feature("restore_dry_run", "a restore dry run")
+    elif getattr(args, "background", False):
+        client.require_feature("restore_background", "a background restore")
     if getattr(args, "background", False) and not getattr(args, "dry_run", False):
         started = client.restore_stored_backup(args.target, only=only, background=True)
         return _follow_import(client, str(started["import_id"]), args, out)
     dry_run = bool(getattr(args, "dry_run", False))
     report = client.restore_stored_backup(args.target, only=only, dry_run=dry_run)
     rejected = list(report.get("rejected", []))
+    if dry_run and report.get("dry_run") is not True:
+        print(
+            f"error: the server ignored --dry-run and restored for real: "
+            f"{len(report.get('jobs', []))} documents queued",
+            file=sys.stderr,
+        )
+        return 1
     if dry_run and not args.json:
         for name in report.get("would_restore", []):
             print(f"would restore: {name}", file=out)
@@ -636,11 +647,32 @@ def verify_bundle(path: Path, args: argparse.Namespace, out: TextIO) -> int:
                 try:
                     with bundle.open(str(member)) as raw, zipfile.ZipFile(raw) as backup:
                         listed = json.loads(backup.read("manifest.json")).get("documents", [])
-                        found["originals"] = len(listed)
+                        # Those it holds, not those it lists: and each it says it
+                        # holds must be there.
+                        held = set(backup.namelist())
+                        named = [
+                            str(document["original"])
+                            for document in listed
+                            if isinstance(document, dict) and document.get("original")
+                        ]
+                        found["originals"] = sum(member in held for member in named)
+                        absent = [member for member in named if member not in held]
+                        if absent:
+                            problems.append(
+                                f"{name}: its backup lacks {len(absent)} original(s) it "
+                                f"lists, {absent[0]} first"
+                            )
                         damaged = backup.testzip()
                         if damaged is not None:
                             problems.append(f"{name}: {damaged} in its backup is damaged")
-                except (KeyError, zipfile.BadZipFile, ValueError, OSError) as exc:
+                except (
+                    KeyError,
+                    zipfile.BadZipFile,
+                    ValueError,
+                    OSError,
+                    AttributeError,  # a manifest that isn't an object
+                    TypeError,
+                ) as exc:
                     problems.append(f"{name}: its backup can't be read ({exc})")
                 snapshot = entry.get("snapshot")
                 found["snapshot"] = bool(snapshot)

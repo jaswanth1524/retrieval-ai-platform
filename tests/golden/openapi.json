@@ -2615,6 +2615,13 @@
    "HealthResponse": {
     "description": "Health check response.",
     "properties": {
+     "features": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Features",
+      "type": "array"
+     },
      "status": {
       "title": "Status",
       "type": "string"
@@ -7697,6 +7704,56 @@
    }
   },
   "/admin/migrate/export/{import_id}": {
+   "delete": {
+    "description": "Remove a background export's bundle, once it was downloaded whole.",
+    "operationId": "migrate_export_delete_admin_migrate_export__import_id__delete",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "import_id",
+      "required": true,
+      "schema": {
+       "title": "Import Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No finished background export with that id."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Migrate Export Delete"
+   },
    "get": {
     "operationId": "migrate_export_download_admin_migrate_export__import_id__get",
     "parameters": [

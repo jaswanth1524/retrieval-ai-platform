@@ -49,7 +49,13 @@
 
 .unanswered-panel__actions {
   display: flex;
+  /* Five buttons don't fit the panel: the last was cut off at its edge. */
+  flex-wrap: wrap;
   gap: 6px;
+}
+
+.unanswered-panel__actions button {
+  white-space: nowrap;
 }
 
 /* :where() keeps the controls' rule from outranking a button's own class

@@ -40,11 +40,13 @@ export function ScoreReportView({
   // the server's suggestion now, not the number this page was shown.
   // One at a time: a second click sent a second apply (and a second cache clear).
   const [applying, setApplying] = useState(false);
+  const [appliedCount, setAppliedCount] = useState(0);
   const apply = async () => {
     if (applying) return;
     setApplying(true);
     try {
       const done = await api.calibrate({ apply: true, labels: byRatings ? 'feedback' : 'model' });
+      setAppliedCount((count) => count + 1);
       setApplied(
         done.suggested_min_score === null || done.suggested_min_score === undefined
           ? 'Nothing was changed.'
@@ -61,7 +63,8 @@ export function ScoreReportView({
   const [byRatings, setByRatings] = useState(false);
   const fetched = useFetched<ScoreReportResponse>(
     (signal) => api.scoreReport(signal, byRatings ? 'feedback' : 'model'),
-    byRatings ? 'report-ratings' : 'report',
+    // Asked again after an apply: it still showed the bar as it was before.
+    `${byRatings ? 'report-ratings' : 'report'}:${appliedCount}`,
   );
   const report = fetched?.value;
   const tallest = report ? Math.max(1, ...report.answered, ...report.unanswered) : 1;

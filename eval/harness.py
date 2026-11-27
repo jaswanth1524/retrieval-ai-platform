@@ -515,7 +515,8 @@ def settings_fingerprint(
             "conversation_condense_enabled": bool(settings.conversation_condense_enabled),
             "condense_max_tokens": int(settings.condense_max_tokens),
         }
-        if follow_ups
+        # The decomposed arm splits each question with the model too.
+        if follow_ups or arm == "decomposed"
         else {}
     )
     return {

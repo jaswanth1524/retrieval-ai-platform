@@ -8,6 +8,7 @@ with Retry-After immediately — a clear "busy, try again" instead of a minute o
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from threading import BoundedSemaphore, Lock
 from typing import Literal
@@ -17,13 +18,18 @@ from api.metrics import question_slots_in_use
 Release = Callable[[], None]
 
 
-SlotKind = Literal["question", "summary"]
+SlotKind = Literal["question", "summary", "batch"]
 
 # Requests that may wait, slot-less, for an identical question being answered: this
 # many per question slot. Each waits on a request thread (the shared threadpool, or an
 # SSE thread), so without a cap a burst of one question behind a slow local model took
 # every thread the other routes need.
 FOLLOWERS_PER_SLOT = 4
+
+# With a single slot, how long after refusing someone batches leave it free: past the
+# Retry-After (5 s) the refusal sent. Taking it back between questions left a gap of a
+# second, which a client retrying when told to rarely hit.
+BATCH_STAND_ASIDE_SECONDS = 7.0
 
 
 def _idempotent(release: Callable[[], None]) -> Release:
@@ -48,11 +54,25 @@ class QuestionSlots:
     never hold every slot: questions keep the rest.
     """
 
-    def __init__(self, limit: int, summary_limit: int = 0) -> None:
+    def __init__(
+        self, limit: int, summary_limit: int = 0, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         # 0 (MAX_CONCURRENT_QUESTIONS=0 / MAX_CONCURRENT_SUMMARIES=0) means no cap.
         self._semaphore = BoundedSemaphore(limit) if limit > 0 else None
         self._summaries = BoundedSemaphore(summary_limit) if summary_limit > 0 else None
         self._followers = BoundedSemaphore(limit * FOLLOWERS_PER_SLOT) if limit > 0 else None
+        # Background batches together hold at most all slots but one, so someone asking
+        # is never refused for as long as a batch runs.
+        self._batches = BoundedSemaphore(limit - 1) if limit > 1 else None
+        # With one slot there is none to spare: a batch stands aside for whoever was
+        # just refused it.
+        self._single = limit == 1
+        self._clock = clock
+        self._refused_at: float | None = None
+
+    def _someone_waiting(self) -> bool:
+        refused = self._refused_at
+        return refused is not None and self._clock() - refused < BATCH_STAND_ASIDE_SECONDS
 
     def try_follow(self) -> Release | None:
         """A release callback for one request waiting on an identical run (no question
@@ -68,14 +88,21 @@ class QuestionSlots:
     def try_acquire(self, kind: SlotKind = "question") -> Release | None:
         """A release callback when a slot was free, else None. Never blocks."""
 
-        summaries = self._summaries if kind == "summary" else None
-        if summaries is not None and not summaries.acquire(blocking=False):
+        if kind == "batch" and self._someone_waiting():
+            return None
+        # The kind's own cap, taken first.
+        own = self._summaries if kind == "summary" else self._batches if kind == "batch" else None
+        if own is not None and not own.acquire(blocking=False):
             return None
         semaphore = self._semaphore
         if semaphore is not None and not semaphore.acquire(blocking=False):
-            if summaries is not None:
-                summaries.release()
+            if own is not None:
+                own.release()
+            if self._single and kind != "batch":
+                self._refused_at = self._clock()
             return None
+        if kind != "batch":
+            self._refused_at = None  # whoever was waiting is in
         question_slots_in_use.inc()
         released = False
         guard = Lock()
@@ -92,7 +119,7 @@ class QuestionSlots:
             question_slots_in_use.dec()
             if semaphore is not None:
                 semaphore.release()
-            if summaries is not None:
-                summaries.release()
+            if own is not None:
+                own.release()
 
         return release

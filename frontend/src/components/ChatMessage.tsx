@@ -548,9 +548,11 @@ function ChatMessage({
   const linkedContent = useMemo(() => {
     const highest = turn.sources.reduce((max, source) => Math.max(max, source.source_number), 0);
     // The self-check's flagged sentences marked where they stand (and listed below).
-    const flagged = (turn.flaggedSentences ?? []).map((item) => item.sentence);
+    // Not while it is being continued: the list the marks lead to isn't shown then.
+    const flagged =
+      streamStage === undefined ? (turn.flaggedSentences ?? []).map((item) => item.sentence) : [];
     return linkCitations(flagged.length ? markUnbacked(turn.content, flagged) : turn.content, highest);
-  }, [turn.content, turn.sources, turn.flaggedSentences]);
+  }, [turn.content, turn.sources, turn.flaggedSentences, streamStage]);
   const timings = turn.timings;
   const showMeta = engineerMode && turn.role === 'assistant' && !showSkeleton && timings !== null;
 

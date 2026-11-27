@@ -44,6 +44,30 @@ _CITATION_RE = re.compile(
 )
 
 
+# Markers as models writing Chinese or Japanese put them: full-width brackets, digits or
+# separators ("【1】", "［１，２］"; gpt-4o-mini asked in Chinese). Read as plain text they
+# left the answer uncited, with no sources. At most three digits: "【2024】" is a heading.
+_WIDE_NUMBER = r"[0-9０-９]{1,3}(?![0-9０-９])"
+_WIDE_LIST = rf"\s*{_WIDE_NUMBER}(?:\s*[-–－～,，、]\s*{_WIDE_NUMBER})*\s*"
+_WIDE_MARKER_RE = re.compile(rf"【({_WIDE_LIST})】|［({_WIDE_LIST})］|\[({_WIDE_LIST})\]")
+_WIDE_CHARS = str.maketrans("０１２３４５６７８９，、－～", "0123456789,,--")
+
+
+def normalize_citation_markers(text: str) -> str:
+    """``text`` with each full-width citation marker written as ``[n]``, so everything
+    that reads citations (here and in the UI, whose digits are ASCII only) reads it. A
+    plain ``[n]`` is left exactly as written."""
+
+    def plain(match: re.Match[str]) -> str:
+        inner = next(group for group in match.groups() if group is not None)
+        converted = inner.translate(_WIDE_CHARS)
+        if match.group(3) is not None and converted == inner:
+            return match.group(0)
+        return f"[{converted.strip()}]"
+
+    return _WIDE_MARKER_RE.sub(plain, text)
+
+
 _CITATION_RANGE_SEP = re.compile(r"\s*[-–]\s*")
 
 
@@ -378,7 +402,8 @@ def _words(text: str) -> list[str]:
     for match in _WORD_RE.finditer(text):
         word = match.group(0).lower()
         # A number runs across spaces and hyphens only: "five, six" is two numbers.
-        if in_number and text[previous_end : match.start()].strip(" -"):
+        # Typographic hyphens too: gpt-5-mini wrote "forty\u2011five".
+        if in_number and text[previous_end : match.start()].strip(" -\u2010\u2011\u2012"):
             flush()
         previous_end = match.end()
         if word in _NUMBER_UNITS and last_unit:
@@ -989,7 +1014,7 @@ def retry_uncited_answer(
         return None
     citation_retries_total.inc()
     try:
-        retried = generator.complete(messages, settings).strip()
+        retried = normalize_citation_markers(generator.complete(messages, settings).strip())
     except GenerationError:
         note_degraded()
         return None
@@ -1171,11 +1196,20 @@ _ECHOED_HEADER_RE = re.compile(r"^[ \t>*-]*(?:\[\d{1,6}\][ \t]*)+filename=[^\n]*
 _INLINE_ECHOED_HEADER_RE = re.compile(r"\[[ \t]*((?:\[\d{1,6}\][ \t]*)+)filename=[^\]\n]*\]")
 
 
+# Part of a source line put inside the marker: "[1, section=Vacation]", "[2; page=1;
+# section=…]" (qwen2.5, live). Read as text, its "1" was a figure the passage doesn't
+# state, the sentence went uncited, and the reader saw the header.
+_FIELDS_IN_MARKER_RE = re.compile(
+    r"\[(\d{1,6}(?:\s*,\s*\d{1,6})*)\s*[,;]\s*(?:filename|page|section)=[^\]\n]*\]"
+)
+
+
 def strip_echoed_source_headers(answer: str) -> str:
     """``answer`` without lines that repeat a source header, and with a header echoed
     inside a sentence cut back to its ``[n]`` marker; never emptied by it."""
 
     inline = _INLINE_ECHOED_HEADER_RE.sub(lambda m: m.group(1).strip(), answer)
+    inline = _FIELDS_IN_MARKER_RE.sub(r"[\1]", inline)
     stripped = _ECHOED_HEADER_RE.sub("", inline).strip()
     return stripped or answer
 
@@ -1210,7 +1244,7 @@ def finalize_citations(
     citations to a refusal the weak-match prompt asked to be uncited.
     """
 
-    answer = strip_echoed_source_headers(answer)
+    answer = normalize_citation_markers(strip_echoed_source_headers(answer))
     cited = cited_sources(answer, all_sources)
     final_messages = list(prompt_messages)
     retry_used = False

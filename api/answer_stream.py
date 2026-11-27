@@ -4,6 +4,7 @@ top layer of ``RagPipeline``, over ``api/pipeline_core.py``.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -34,6 +35,7 @@ from api.answer_run import (
 )
 from api.citations import (
     answer_status,
+    normalize_citation_markers,
 )
 from api.context_expansion import expand_with_neighbors
 from api.continuation import (
@@ -273,10 +275,13 @@ class StreamingAnswers(PipelineCore):
                 parts.append(delta)
                 yield {"type": "delta", "text": delta}
             generate_ms = (time.monotonic() - generate_start) * 1000
-            truncated = stopped_at_token_limit()
+            # Nothing came: the answer is still cut off where it was, whatever the
+            # empty reply's own finish reason says.
+            truncated = stopped_at_token_limit() or not "".join(parts).strip()
+            before = normalize_citation_markers(trace.answer)
             answer = join_continuation(
-                trace.answer,
-                drop_restart(trace.answer, "".join(parts)),
+                before,
+                drop_restart(before, normalize_citation_markers("".join(parts))),
                 prefilled=messages[-1]["role"] == "assistant",
             )
             outcome, cited = finish_answer(
@@ -625,12 +630,22 @@ class StreamingAnswers(PipelineCore):
                     reset_finish_reason("length")
                     return
                 continue
-            more = drop_restart(so_far, "".join(generator.stream(follow, settings)))
+            so_far = normalize_citation_markers(so_far)
+            more = drop_restart(
+                so_far, normalize_citation_markers("".join(generator.stream(follow, settings)))
+            )
             if not more.strip():
                 reset_finish_reason("length")
                 return
-            addition = join_continuation(so_far, more)[len(so_far) :]
-            run.parts.append(addition)
+            joined = join_continuation(so_far, more)
+            if joined.startswith(so_far):
+                addition = joined[len(so_far) :]
+                run.parts.append(addition)
+            else:
+                # A marker cut part way was dropped: the answer is what was joined. Only
+                # the new text is streamed; ``done`` replaces what the reader was shown.
+                addition = joined[len(os.path.commonprefix([so_far, joined])) :]
+                run.parts[:] = [joined]
             yield {"type": "delta", "text": addition}
 
     def _stream_finish(

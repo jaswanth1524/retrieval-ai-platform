@@ -74,6 +74,8 @@ export function useChatPersistence(
   const pendingChatStoreRef = useRef<ChatStorageV2 | null>(null);
   // The state a merge of another tab's save produced (not written back; see the save).
   const mergedFromOtherTabRef = useRef<ChatStorageV2 | null>(null);
+  // The state the save last dealt with (queued, or skipped as another tab's own).
+  const lastWrittenRef = useRef<ChatStorageV2 | null>(null);
   const chatStoreTimerRef = useRef<number | undefined>(undefined);
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -242,7 +244,13 @@ export function useChatPersistence(
     // Merged in from what another tab just saved: that tab wrote the full history
     // already. Writing it back (and announcing it) made every tab rewrite the whole
     // history after each edit anywhere.
-    if (storage === mergedFromOtherTabRef.current) return;
+    // Not with a write still waiting: it holds this tab's history from before the
+    // merge, and would put it back over the other tab's.
+    if (storage === mergedFromOtherTabRef.current && pendingChatStoreRef.current === null) {
+      lastWrittenRef.current = storage;
+      return;
+    }
+    lastWrittenRef.current = storage;
     // Coalesced: every scope click, rename or rating used to rewrite the whole history
     // in IndexedDB at once; a burst of changes now costs one write. The timer is not
     // cancelled on unmount (the write must still land), and a hidden tab or pagehide
@@ -308,7 +316,11 @@ export function useChatPersistence(
                 Date.now(),
                 streamingConversationIdRef.current,
               );
-              if (next !== prev) mergedFromOtherTabRef.current = next;
+              // Only the other tab's changes: an edit made here in the same moment
+              // (in ``prev``, not yet saved) must still be written.
+              if (next !== prev) {
+                mergedFromOtherTabRef.current = prev === lastWrittenRef.current ? next : null;
+              }
               return next;
             });
           }

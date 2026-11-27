@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.audit import audit, set_audit_store
 from api.auto_reindex import StaleReindexer
+from api.batch_jobs import batch_job_store
 from api.chunking import TokenCounter
 from api.dependencies import (
     get_app_settings,
@@ -881,6 +882,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         lost_index_stop.set()
+        # Their threads would go on calling the model while the executors shut down.
+        batch_job_store().abort()
         if backup is not None:
             backup.stop()
             backup_enabled.set(0)
