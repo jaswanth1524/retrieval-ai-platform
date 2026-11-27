@@ -366,7 +366,9 @@ def question_category(example: RetrievalExample) -> str:
 
 
 def metrics_by_category(
-    examples: Sequence[RetrievalExample], rows: Sequence[AnswerRow]
+    examples: Sequence[RetrievalExample],
+    rows: Sequence[AnswerRow],
+    passage_ids: Mapping[int, frozenset[str]] | None = None,
 ) -> dict[str, dict[str, float]]:
     """``answer_metrics`` per ``question_category`` (only when there are two or more)."""
 
@@ -376,7 +378,14 @@ def metrics_by_category(
     if len(groups) < 2:
         return {}
     return {
-        category: answer_metrics([examples[i] for i in indexes], [rows[i] for i in indexes])
+        category: answer_metrics(
+            [examples[i] for i in indexes],
+            [rows[i] for i in indexes],
+            # Keyed by position, so by the position within the category.
+            {n: passage_ids[i] for n, i in enumerate(indexes) if i in (passage_ids or {})}
+            if passage_ids
+            else None,
+        )
         for category, indexes in sorted(groups.items())
     }
 
@@ -620,9 +629,14 @@ def run_answer_eval(
         # a set whose overall rate held can hide one kind getting worse. Not gated.
         "metrics_by_category": {
             category: {name: round(value, 4) for name, value in scores.items()}
-            for category, scores in metrics_by_category(examples, rows).items()
+            for category, scores in metrics_by_category(examples, rows, passage_ids).items()
         },
-        "examples": [r.to_dict() for r in rows],
+        # ``labelled``: whether the question names relevant files, which answered_rate
+        # is measured over (eval/stats.py reads it for the same questions).
+        "examples": [
+            {**row.to_dict(), "labelled": bool(example.relevant_filenames)}
+            for example, row in zip(examples, rows, strict=True)
+        ],
     }
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     partial.unlink(missing_ok=True)
