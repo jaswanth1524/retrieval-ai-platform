@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator
 from io import BytesIO
 from typing import Any
@@ -25,6 +26,9 @@ PPTX_MAX_EXPANDED_BYTES = ZIP_MAX_EXPANDED_BYTES
 _MAX_GROUP_DEPTH = 16
 
 
+logger = logging.getLogger(__name__)
+
+
 def parse_pptx_document(
     filename: str, content: bytes, *, hidden: bool = False
 ) -> list[DocumentSection]:
@@ -33,7 +37,8 @@ def parse_pptx_document(
 
     A slide is a page (its number in the deck) and its title is the section label
     ("Slide n" without one), so a citation reads as the slide a presenter would show.
-    Charts, pictures and media are skipped, and so are hidden slides unless ``hidden``
+    A chart is read as its title and a line per category with each series' value.
+    Pictures and media are skipped, and so are hidden slides unless ``hidden``
     (INDEX_HIDDEN_CONTENT).
     """
 
@@ -99,9 +104,73 @@ def _shapes(shapes: Iterable[Any], depth: int) -> Iterator[Any]:
         yield shape
 
 
+# Categories a chart is read for: a chart of every day of a year says what it
+# shows without 365 lines.
+_MAX_CHART_POINTS = 200
+
+
+def _chart_text(chart: Any) -> str:
+    """ "Chart: Meal allowance by city" then "Paris: 2025 60; 2026 65" per category."""
+
+    lines: list[str] = []
+    if chart.has_title and chart.chart_title.has_text_frame:
+        title = normalize_text(chart.chart_title.text_frame.text)
+        if title:
+            lines.append(f"Chart: {title}")
+    for plot in chart.plots:
+        categories = [str(c) for c in plot.categories][:_MAX_CHART_POINTS]
+        series = [(normalize_text(item.name or ""), list(item.values)) for item in plot.series]
+        if not categories:
+            for name, _ in series:
+                if name:
+                    lines.append(name)
+            continue
+        for index, category in enumerate(categories):
+            values = []
+            for name, points in series:
+                if index < len(points) and points[index] is not None:
+                    value = points[index]
+                    shown = int(value) if isinstance(value, float) and value.is_integer() else value
+                    values.append(f"{name} {shown}".strip())
+            if values:
+                lines.append(f"{category}: " + "; ".join(values))
+    if not lines:
+        return ""
+    if not lines[0].startswith("Chart:"):
+        lines.insert(0, "Chart:")
+    return "\n".join(lines)
+
+
+def _table_rows(table: Any) -> list[list[str]]:
+    """Each row's cells' text, a cell under a vertical merge given the text of the
+    merged cell above (python-pptx reads it as empty), so each row says its region."""
+
+    rows: list[list[str]] = []
+    for row in table.rows:
+        texts = []
+        for column, cell in enumerate(row.cells):
+            text = cell.text
+            if not text.strip() and cell.is_spanned and rows:
+                above = rows[-1][column] if column < len(rows[-1]) else ""
+                # Only a merge down: a merge across already has its text once.
+                if above and cell._tc.get("vMerge") in ("1", "true"):  # noqa: SLF001
+                    text = above
+            texts.append(text)
+        rows.append(texts)
+    return rows
+
+
 def _shape_text(shape: Any) -> str:
+    if getattr(shape, "has_chart", False) and shape.has_chart:
+        try:
+            return _chart_text(shape.chart)
+        except Exception:  # noqa: BLE001 - enrichment, never a parse gate
+            # A chart it can't read is skipped, as every chart used to be; the deck's
+            # text still indexes.
+            logger.info("PPTX chart skipped: it could not be read.", exc_info=True)
+            return ""
     if getattr(shape, "has_table", False) and shape.has_table:
-        rows = [[cell.text for cell in row.cells] for row in shape.table.rows]
+        rows = _table_rows(shape.table)
         if not rows:
             return ""
         header = [cell.strip() for cell in rows[0]]
