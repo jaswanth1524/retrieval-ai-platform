@@ -518,6 +518,18 @@ class AppSettings(BaseSettings):
     raw_document_versions: int = Field(default=0, ge=0, le=50)
     # Oldest ratings are dropped past this many rows (~6 KB each at most).
     feedback_max_rows: PositiveInt = 50_000
+    # Shared answers (api/shares.py; off by default): "Share" on an answer or a
+    # conversation stores a frozen copy, opened by link by anyone whose key may use
+    # that workspace (POST/GET /shares). Stored in SHARE_STORE_PATH, not in backups.
+    shares_enabled: bool = False
+    # The shares sqlite file (with SHARES_ENABLED).
+    share_store_path: str = "./data/shares.db"
+    # Shares a workspace may hold at once; past it, a new one is refused (409).
+    share_max_per_workspace: int = Field(default=200, ge=1, le=10_000)
+    # Days a share stays readable (0 = until deleted).
+    share_ttl_days: int = Field(default=30, ge=0, le=3650)
+    # Largest share accepted (the passages' text included), in bytes.
+    share_max_bytes: int = Field(default=2 * 1024 * 1024, ge=64 * 1024, le=32 * 1024 * 1024)
     # A persistent log of every question and summary asked (text, workspace, how it went,
     # best passage score), for "what do people ask that the documents don't cover?"
     # (GET /query-log, full key). Off by default: it keeps what users typed. Its own
@@ -770,14 +782,19 @@ class AppSettings(BaseSettings):
     # preserving the zero-config self-host story. When set, every route except
     # /health, /health/ready and /config — reads included — requires a matching
     # X-API-Key header (api/dependencies.py's require_api_key, and
-    # api/request_guard.py, which checks it before a request body is read). Not multi-user auth —
-    # one key for the whole API.
+    # api/request_guard.py, which checks it before a request body is read). One key for
+    # the whole API; API_KEYS_FILE adds named keys limited to some workspaces.
     api_key: str = ""
     # Optional second, read-only key (needs API_KEY set too): it can ask questions and
     # read documents, traces and jobs, but not upload, delete, re-index, tag, export,
     # or read feedback/metrics — those need API_KEY (403 for the read key). For sharing
     # the UI with people who should use the corpus but not change it.
     api_read_key: str = ""
+    # Named keys (api/keys.py): a TOML file of [[key]] tables, each a name, the key's
+    # SHA-256, a level ("full" or "read") and the workspaces it may use (["*"]: all).
+    # Read again when it changes. Set alone or with API_KEY: either turns the key check
+    # on. Audit lines then say which key acted. `docrag new-key` writes an entry.
+    api_keys_file: str = ""
 
     # Verbosity of the application's own loggers (the "api" and "eval" namespaces).
     # api/logging_config.py consumes this via dictConfig at app construction; without
@@ -871,6 +888,12 @@ class AppSettings(BaseSettings):
         if self.url_refresh_interval_minutes and not self.url_ingest_enabled:
             log.warning("URL_REFRESH_INTERVAL_MINUTES has no effect without URL_INGEST_ENABLED.")
         return self
+
+    @property
+    def auth_required(self) -> bool:
+        """Whether requests need a key: API_KEY or API_KEYS_FILE is set."""
+
+        return bool(self.api_key or self.api_keys_file)
 
     @model_validator(mode="after")
     def _read_key_needs_a_full_key(self) -> "AppSettings":

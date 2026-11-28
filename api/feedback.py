@@ -54,6 +54,9 @@ class Feedback:
     # it is restored into.
     workspace: str = ""
     kind: FeedbackKind = "question"
+    # The name of the key that gave it (API_KEYS_FILE; "full"/"read" for the shared
+    # keys, "open" with none); "" on a rating recorded before names were.
+    key_name: str = ""
 
 
 # Where a page of rows_oldest_first ended: (created_at, rowid) of its last row.
@@ -132,6 +135,7 @@ class FeedbackStore:
             conn.execute(_CREATE_TABLE.format(name="feedback"))
             _migrate_to_workspace_key(conn)
             _add_kind_column(conn)
+            add_missing_columns(conn, "feedback", [("key_name", "TEXT NOT NULL DEFAULT ''")])
             conn.execute("CREATE INDEX IF NOT EXISTS feedback_created_at ON feedback (created_at)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS feedback_workspace_created_at "
@@ -177,6 +181,7 @@ class FeedbackStore:
         citation_source_number: int | None,
         workspace: str = "",
         kind: FeedbackKind = "question",
+        key_name: str = "",
     ) -> Feedback:
         feedback = Feedback(
             id=str(uuid.uuid4()),
@@ -188,12 +193,13 @@ class FeedbackStore:
             citation_source_number=citation_source_number,
             workspace=workspace,
             kind=kind,
+            key_name=key_name,
         )
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO feedback (id, trace_id, question, answer_excerpt, "
                 "cited_filenames_json, rating, citation_source_number, created_at, workspace, "
-                "kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "kind, key_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feedback.id,
                     feedback.trace_id,
@@ -205,6 +211,7 @@ class FeedbackStore:
                     feedback.created_at,
                     feedback.workspace,
                     feedback.kind,
+                    feedback.key_name,
                 ),
             )
             self._trim(conn, feedback.workspace)
@@ -221,7 +228,7 @@ class FeedbackStore:
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO feedback (id, trace_id, question, answer_excerpt, "
                     "cited_filenames_json, rating, citation_source_number, created_at, "
-                    "workspace, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "workspace, kind, key_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row.id,
                         row.trace_id,
@@ -233,6 +240,7 @@ class FeedbackStore:
                         row.created_at,
                         workspace,
                         row.kind,
+                        row.key_name,
                     ),
                 )
                 added += cursor.rowcount
@@ -287,7 +295,7 @@ class FeedbackStore:
 # The columns a Feedback is read from, in this order (both queries select them so).
 _FEEDBACK_COLUMNS = (
     "id, trace_id, question, answer_excerpt, cited_filenames_json, rating, "
-    "citation_source_number, created_at, workspace, kind"
+    "citation_source_number, created_at, workspace, kind, key_name"
 )
 
 
@@ -303,6 +311,7 @@ def _feedback(row: Sequence[Any]) -> Feedback:
         created_at=row[7],
         workspace=row[8],
         kind=_kind(row[9]),
+        key_name=str(row[10] or ""),
     )
 
 

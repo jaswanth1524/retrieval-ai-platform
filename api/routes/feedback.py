@@ -6,6 +6,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
+from api.audit import actor_name
 from api.dependencies import (
     require_api_key,
     require_full_key,
@@ -50,6 +51,7 @@ def register(app: FastAPI) -> None:
             # its backups carry only its own ratings.
             workspace=workspace_of(settings),
             kind=request.kind,
+            key_name=actor_name(),
         )
         feedback_total.labels(rating=request.rating).inc()
         return FeedbackResponse(id=feedback.id)
@@ -81,6 +83,7 @@ def register(app: FastAPI) -> None:
                     citation_source_number=item.citation_source_number,
                     created_at=item.created_at,
                     kind=item.kind,
+                    key_name=item.key_name,
                 )
                 for item in feedback_store.list_recent(limit, workspace_of(settings))
             ]

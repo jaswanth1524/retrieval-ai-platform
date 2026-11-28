@@ -11,7 +11,8 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from api.dependencies import (
     get_app_settings,
-    key_access,
+    key_grant,
+    require_all_workspaces,
     require_api_key,
     require_full_key,
     supplied_key_bytes,
@@ -19,7 +20,7 @@ from api.dependencies import (
 from api.documents import SUPPORTED_EXTENSIONS
 from api.model_health import ModelHealth
 from api.qdrant_schema import index_compatibility
-from api.routes.deps import OllamaCheckDep, QdrantCheckDep, QdrantClientDep, SettingsDep
+from api.routes.deps import OllamaCheckDep, QdrantCheckDep, QdrantClientDep
 from api.routes.questions import allowed_request_providers
 from api.schemas import (
     REQUEST_MAX_CONTEXT_CHUNKS_MAX,
@@ -78,6 +79,7 @@ def public_config(settings: AppSettings, *, ollama_available: bool) -> PublicCon
         anthropic_available=bool(settings.anthropic_api_key),
         url_ingest_enabled=settings.url_ingest_enabled,
         workspaces_enabled=settings.workspaces_enabled,
+        shares_enabled=settings.shares_enabled,
         anthropic_model=settings.anthropic_model,
         allowed_request_providers=allowed_request_providers(settings),
         supported_extensions=sorted(SUPPORTED_EXTENSIONS),
@@ -99,7 +101,7 @@ def _last_backup(app: FastAPI, settings: AppSettings) -> BackupStatusResponse | 
     if last is None:
         return None
     status = BackupStatusResponse(**dataclasses.asdict(last))
-    if settings.api_key:
+    if settings.auth_required:
         # /health/ready needs no key: no workspace names, file names or error text
         # (which can carry paths) for anyone who can reach the port.
         status = BackupStatusResponse(
@@ -115,7 +117,7 @@ def _last_backup(app: FastAPI, settings: AppSettings) -> BackupStatusResponse | 
 def _backups_failing(app: FastAPI, settings: AppSettings) -> list[str]:
     backup = getattr(app.state, "backup", None)
     failing = backup.failing() if backup is not None else []
-    if settings.api_key and failing:
+    if settings.auth_required and failing:
         return ["(hidden)"]
     return list(failing)
 
@@ -191,7 +193,7 @@ def register(app: FastAPI) -> None:
     # rough corpus growth, and an operator who bothered to set a key did not intend to
     # publish those. A Prometheus scraper needs the header threaded into its scrape
     # config; /health and /health/ready stay open for liveness either way.
-    @app.get("/metrics", dependencies=[Depends(require_full_key)])
+    @app.get("/metrics", dependencies=[Depends(require_full_key), Depends(require_all_workspaces)])
     def metrics() -> Response:
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
@@ -206,12 +208,20 @@ def register(app: FastAPI) -> None:
 
     # Guarded (any valid key): /config is open, so it can't say which key the caller
     # holds. The UI asks here to hide what the read-only key would be refused (403).
+    # The app's settings, not the request's: a key limited to other workspaces still
+    # learns what it may do, and the UI asks without naming a workspace.
     @app.get("/access", response_model=AccessResponse, dependencies=[Depends(require_api_key)])
     def access(
-        settings: SettingsDep,
+        settings: Annotated[AppSettings, Depends(get_app_settings)],
         x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
     ) -> AccessResponse:
-        if not settings.api_key:
+        if not settings.auth_required:
             return AccessResponse(access="open")
-        read_only = key_access(settings, supplied_key_bytes(x_api_key)) == "read"
-        return AccessResponse(access="read" if read_only else "full")
+        grant = key_grant(settings, supplied_key_bytes(x_api_key))
+        if grant is None:  # the dependency has already refused it
+            return AccessResponse(access="read")
+        return AccessResponse(
+            access=grant.level,
+            key_name=grant.name,
+            workspaces=None if grant.workspaces is None else sorted(grant.workspaces),
+        )

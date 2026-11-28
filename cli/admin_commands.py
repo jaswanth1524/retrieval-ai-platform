@@ -5,8 +5,11 @@ imports, migration and setup.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -103,8 +106,40 @@ def cmd_audit(client: DocragClient, args: argparse.Namespace, out: TextIO) -> in
     for entry in entries:
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(entry["created_at"])))
         fields = " ".join(f"{name}={value}" for name, value in (entry.get("fields") or {}).items())
-        where = f"[{entry.get('workspace')}, {entry.get('key')}]"
+        # The key's name when it has one (API_KEYS_FILE); else its kind, as before.
+        who = entry.get("key_name") or entry.get("key")
+        where = f"[{entry.get('workspace')}, {who}]"
         print(f"{when}  {entry.get('event')}  {where}  {fields}", file=out)
+    return 0
+
+
+_KEY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$")
+
+
+def cmd_new_key(args: argparse.Namespace, out: TextIO) -> int:
+    """A fresh key and the [[key]] table that grants it, for the server's
+    API_KEYS_FILE. The file holds only the key's SHA-256; the key is shown this once."""
+
+    if not _KEY_NAME_RE.match(args.name) or args.name in ("full", "read", "open", "system"):
+        print(
+            "error: a key's name is 1-64 letters, digits, '.', '_', '@' or '-' "
+            "(not full, read, open or system)",
+            file=sys.stderr,
+        )
+        return 2
+    key = "drk_" + secrets.token_urlsafe(32)
+    workspaces = args.allow or ["*"]
+    listed = ", ".join(json.dumps(name) for name in workspaces)
+    print(f"Key for {args.name} (shown once; give it to them as their X-API-Key):", file=out)
+    print(f"  {key}", file=out)
+    print("", file=out)
+    print("Add to the server's API_KEYS_FILE (read again on change, no restart):", file=out)
+    print("", file=out)
+    print("[[key]]", file=out)
+    print(f"name = {json.dumps(args.name)}", file=out)
+    print(f'sha256 = "{hashlib.sha256(key.encode()).hexdigest()}"', file=out)
+    print(f'level = "{"read" if args.read else "full"}"', file=out)
+    print(f"workspaces = [{listed}]", file=out)
     return 0
 
 

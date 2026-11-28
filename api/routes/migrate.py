@@ -26,6 +26,7 @@ from api.dependencies import (
     get_embedding_provider,
     get_workspace_settings_store,
     raw_store_for,
+    require_all_workspaces,
     require_full_key,
 )
 from api.embeddings import LocalEmbeddingProvider
@@ -156,7 +157,7 @@ def _scratch(settings: AppSettings) -> Path | None:
 # first (a snapshot's size isn't known before it is made), then sent.
 @router.get(
     "/admin/migrate/export",
-    dependencies=[Depends(require_full_key)],
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
     responses={409: {"description": "Another export or backup is being written."}},
 )
 def migrate_export(
@@ -301,7 +302,7 @@ def _keep_export(import_id: str, path: Path, sha256: str | None = None) -> None:
     "/admin/migrate/export",
     response_model=MigrateExportStartedResponse,
     status_code=202,
-    dependencies=[Depends(require_full_key)],
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
 )
 def migrate_export_in_background(
     server: ServerDep,
@@ -364,7 +365,7 @@ def migrate_export_in_background(
 
 @router.get(
     "/admin/migrate/export/{import_id}",
-    dependencies=[Depends(require_full_key)],
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
     responses={404: {"description": "No finished background export with that id."}},
 )
 def migrate_export_download(import_id: str) -> FileResponse:
@@ -389,7 +390,7 @@ def migrate_export_download(import_id: str) -> FileResponse:
 @router.delete(
     "/admin/migrate/export/{import_id}",
     status_code=204,
-    dependencies=[Depends(require_full_key)],
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
     responses={404: {"description": "No finished background export with that id."}},
 )
 def migrate_export_delete(import_id: str) -> None:
@@ -411,7 +412,7 @@ BUNDLE_MAX_MEMBERS = 4096
     "/admin/migrate/import",
     response_model=MigrateImportResponse,
     status_code=202,
-    dependencies=[Depends(require_full_key)],
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
     responses={400: {"description": "Not a migration bundle."}},
 )
 def migrate_import(

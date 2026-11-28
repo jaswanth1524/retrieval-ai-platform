@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from api.sqlite_store import CappedRowLog
+from api.sqlite_store import CappedRowLog, add_missing_columns
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,9 @@ class AuditEntry:
     key: str
     client: str | None
     fields: dict[str, Any]
+    # The key's name (API_KEYS_FILE), "full"/"read" for the shared keys, "system";
+    # "" on a row written before pass 24.
+    key_name: str = ""
 
 
 class AuditLog(CappedRowLog):
@@ -47,6 +50,7 @@ class AuditLog(CappedRowLog):
         super().__init__(path, max_rows)
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE)
+            add_missing_columns(conn, "audit", [("key_name", "TEXT NOT NULL DEFAULT ''")])
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS audit_workspace_created_at "
                 "ON audit (workspace, created_at)"
@@ -55,8 +59,9 @@ class AuditLog(CappedRowLog):
     def add(self, entry: AuditEntry) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO audit (created_at, workspace, event, key, client, fields_json) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO audit "
+                "(created_at, workspace, event, key, client, fields_json, key_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry.created_at,
                     entry.workspace,
@@ -64,6 +69,7 @@ class AuditLog(CappedRowLog):
                     entry.key,
                     entry.client,
                     json.dumps(entry.fields, default=str, ensure_ascii=False),
+                    entry.key_name,
                 ),
             )
             self._added_one(conn)
@@ -99,12 +105,13 @@ class AuditLog(CappedRowLog):
         clause = f"WHERE {' AND '.join(where)} " if where else ""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT created_at, workspace, event, key, client, fields_json FROM audit "
+                "SELECT created_at, workspace, event, key, client, fields_json, key_name "
+                "FROM audit "
                 f"{clause}ORDER BY rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
         entries = []
-        for created_at, workspace_name, event_name, key, client, fields_json in rows:
+        for created_at, workspace_name, event_name, key, client, fields_json, name in rows:
             try:
                 fields = json.loads(fields_json)
             except ValueError:
@@ -117,6 +124,7 @@ class AuditLog(CappedRowLog):
                     str(key),
                     client,
                     fields if isinstance(fields, dict) else {},
+                    str(name or ""),
                 )
             )
         return entries

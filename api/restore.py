@@ -543,6 +543,10 @@ def _feedback_row(line: str) -> Feedback | None:
             citation_source_number=number,
             created_at=created_at,
             kind=kind,
+            # Absent in a backup from before pass 24; anything odd is left out.
+            key_name=key_name
+            if isinstance(key_name := data.get("key_name"), str) and len(key_name) <= 64
+            else "",
         )
     except (ValueError, KeyError, TypeError, RecursionError):
         # RecursionError: a line nested past the parser's depth is one bad row; as a

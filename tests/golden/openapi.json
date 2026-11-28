@@ -12,6 +12,31 @@
       ],
       "title": "Access",
       "type": "string"
+     },
+     "key_name": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Key Name"
+     },
+     "workspaces": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Workspaces"
      }
     },
     "required": [
@@ -258,6 +283,11 @@
      },
      "key": {
       "title": "Key",
+      "type": "string"
+     },
+     "key_name": {
+      "default": "",
+      "title": "Key Name",
       "type": "string"
      },
      "workspace": {
@@ -2445,6 +2475,11 @@
       "title": "Id",
       "type": "string"
      },
+     "key_name": {
+      "default": "",
+      "title": "Key Name",
+      "type": "string"
+     },
      "kind": {
       "default": "question",
       "enum": [
@@ -3093,6 +3128,11 @@
       "title": "Rrf K",
       "type": "integer"
      },
+     "shares_enabled": {
+      "default": false,
+      "title": "Shares Enabled",
+      "type": "boolean"
+     },
      "sparse_embedding_model": {
       "title": "Sparse Embedding Model",
       "type": "string"
@@ -3186,6 +3226,11 @@
       "default": false,
       "title": "Filenames Cited",
       "type": "boolean"
+     },
+     "key_name": {
+      "default": "",
+      "title": "Key Name",
+      "type": "string"
      },
      "kind": {
       "default": "question",
@@ -4619,6 +4664,224 @@
      "rerank_ms"
     ],
     "title": "SearchTimingsResponse",
+    "type": "object"
+   },
+   "ShareCreateRequest": {
+    "properties": {
+     "title": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+     },
+     "turns": {
+      "items": {
+       "$ref": "#/components/schemas/SharedTurn"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Turns",
+      "type": "array"
+     }
+    },
+    "required": [
+     "title",
+     "turns"
+    ],
+    "title": "ShareCreateRequest",
+    "type": "object"
+   },
+   "ShareListResponse": {
+    "properties": {
+     "shares": {
+      "items": {
+       "$ref": "#/components/schemas/ShareSummaryResponse"
+      },
+      "title": "Shares",
+      "type": "array"
+     }
+    },
+    "required": [
+     "shares"
+    ],
+    "title": "ShareListResponse",
+    "type": "object"
+   },
+   "ShareSummaryResponse": {
+    "properties": {
+     "created_at": {
+      "title": "Created At",
+      "type": "number"
+     },
+     "created_by": {
+      "title": "Created By",
+      "type": "string"
+     },
+     "expires_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Expires At"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "title": {
+      "title": "Title",
+      "type": "string"
+     },
+     "turns": {
+      "title": "Turns",
+      "type": "integer"
+     },
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "title",
+     "workspace",
+     "created_at",
+     "created_by",
+     "turns"
+    ],
+    "title": "ShareSummaryResponse",
+    "type": "object"
+   },
+   "SharedConversationResponse": {
+    "description": "GET /shares/{id}: the frozen conversation.",
+    "properties": {
+     "conversation": {
+      "items": {
+       "$ref": "#/components/schemas/SharedTurn"
+      },
+      "title": "Conversation",
+      "type": "array"
+     },
+     "created_at": {
+      "title": "Created At",
+      "type": "number"
+     },
+     "created_by": {
+      "title": "Created By",
+      "type": "string"
+     },
+     "expires_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Expires At"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "title": {
+      "title": "Title",
+      "type": "string"
+     },
+     "turns": {
+      "title": "Turns",
+      "type": "integer"
+     },
+     "workspace": {
+      "title": "Workspace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "title",
+     "workspace",
+     "created_at",
+     "created_by",
+     "turns",
+     "conversation"
+    ],
+    "title": "SharedConversationResponse",
+    "type": "object"
+   },
+   "SharedTurn": {
+    "description": "One question and its answer as it was shown: the answer text, its sources with\nthe passages' text, and how it was answered.",
+    "properties": {
+     "answer": {
+      "maxLength": 200000,
+      "title": "Answer",
+      "type": "string"
+     },
+     "answer_status": {
+      "anyOf": [
+       {
+        "maxLength": 40,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Answer Status"
+     },
+     "asked_at": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Asked At"
+     },
+     "model": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Model"
+     },
+     "question": {
+      "maxLength": 20000,
+      "title": "Question",
+      "type": "string"
+     },
+     "sources": {
+      "default": [],
+      "items": {
+       "$ref": "#/components/schemas/CitationResponse"
+      },
+      "maxItems": 100,
+      "title": "Sources",
+      "type": "array"
+     },
+     "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "question",
+     "answer"
+    ],
+    "title": "SharedTurn",
     "type": "object"
    },
    "SitemapImportListResponse": {
@@ -7169,22 +7432,6 @@
         }
        ],
        "title": "X-Api-Key"
-      }
-     },
-     {
-      "in": "header",
-      "name": "X-Workspace",
-      "required": false,
-      "schema": {
-       "anyOf": [
-        {
-         "type": "string"
-        },
-        {
-         "type": "null"
-        }
-       ],
-       "title": "X-Workspace"
       }
      }
     ],
@@ -12524,6 +12771,253 @@
      }
     },
     "summary": "Search"
+   }
+  },
+  "/shares": {
+   "get": {
+    "description": "This workspace's shares, newest first (``mine``: only this key's).",
+    "operationId": "list_shares_shares_get",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "mine",
+      "required": false,
+      "schema": {
+       "default": false,
+       "title": "Mine",
+       "type": "boolean"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ShareListResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Shares"
+   },
+   "post": {
+    "operationId": "create_share_shares_post",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Workspace",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Workspace"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ShareCreateRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "201": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ShareSummaryResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "409": {
+      "description": "The workspace holds SHARE_MAX_PER_WORKSPACE shares."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Create Share"
+   }
+  },
+  "/shares/{share_id}": {
+   "delete": {
+    "operationId": "delete_share_shares__share_id__delete",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "share_id",
+      "required": true,
+      "schema": {
+       "title": "Share Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Delete Share"
+   },
+   "get": {
+    "operationId": "read_share_shares__share_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "share_id",
+      "required": true,
+      "schema": {
+       "title": "Share Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-API-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Api-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SharedConversationResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Read Share"
    }
   },
   "/traces": {

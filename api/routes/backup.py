@@ -21,8 +21,11 @@ from api.audit_log import AuditLog
 from api.chunking import TokenCounter
 from api.consistency import LostIndexError, consistency_report, repair
 from api.dependencies import (
+    ALL_WORKSPACES_ERROR,
     get_audit_log,
     get_token_counter,
+    request_grant,
+    require_all_workspaces,
     require_full_key,
 )
 from api.doctor import diagnose
@@ -47,6 +50,7 @@ from api.imports import (
 from api.imports import start as start_import
 from api.ingest_jobs import IngestQueue
 from api.ingestion import IngestionError
+from api.keys import KeyGrant
 from api.notify import TEST_EVENT, NotifyError, current_notifier
 from api.parse_isolation import parse_with_limit
 from api.raw_documents import RawDocumentStore
@@ -808,6 +812,7 @@ def restore_stored_backup(
 )
 def list_audit(
     settings: SettingsDep,
+    grant: Annotated[KeyGrant, Depends(request_grant)],
     audit_log: Annotated[AuditLog | None, Depends(get_audit_log)],
     event: Annotated[
         str | None,
@@ -821,6 +826,8 @@ def list_audit(
 ) -> AuditResponse:
     if audit_log is None:
         raise HTTPException(status_code=404, detail="The audit log is off (AUDIT_LOG_PATH).")
+    if all_workspaces and not grant.everywhere:
+        raise HTTPException(status_code=403, detail=ALL_WORKSPACES_ERROR)
     entries = audit_log.recent(
         None if all_workspaces else (workspace_of(settings) or "default"),
         event=event,
@@ -836,7 +843,7 @@ def list_audit(
 @router.get(
     "/admin/doctor",
     response_model=DoctorResponse,
-    dependencies=[Depends(require_full_key)],
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
 )
 def run_doctor(repository: VectorRepositoryDep, settings: SettingsDep) -> DoctorResponse:
     try:

@@ -11,7 +11,8 @@ from the settings they are given. What is keyed by filename alone in-process —
 filename write lock and the ingest sequencer — uses ``document_key`` so the same name in
 two workspaces never blocks or overrides the other.
 
-Not access control: any key that can use the API can use every workspace.
+API_KEY and API_READ_KEY can use every workspace; a named key (API_KEYS_FILE,
+api/keys.py) can be limited to some (``dependencies.get_request_settings``).
 """
 
 from __future__ import annotations

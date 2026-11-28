@@ -76,6 +76,7 @@ from api.routes import feedback as feedback_routes
 from api.routes import ops as ops_routes
 from api.routes import questions as questions_routes
 from api.routes import search as search_routes
+from api.routes import shares as shares_routes
 from api.routes import traces as traces_routes
 from api.routes import watch as watch_routes
 from api.routes import workspaces as workspaces_routes
@@ -959,6 +960,7 @@ def register_routes(app: FastAPI) -> None:
     search_routes.register(app)
     workspaces_routes.register(app)
     watch_routes.register(app)
+    shares_routes.register(app)
 
 
 app = create_app()

@@ -218,7 +218,8 @@ def diagnose(
             )
         )
 
-    if not settings.api_key:
+    found.extend(_key_file_findings(settings))
+    if not settings.auth_required:
         found.append(
             Finding(
                 "note",
@@ -326,4 +327,49 @@ def _index_findings(index: IndexSize, memory: int | None) -> list[Finding]:
                 "from the count: Qdrant reports no sizes per collection).",
             )
         )
+    return found
+
+
+def _key_file_findings(settings: AppSettings) -> list[Finding]:
+    """API_KEYS_FILE that doesn't read (no key from it works), that others can read,
+    or that names workspaces this server doesn't have."""
+
+    path = settings.api_keys_file
+    if not path:
+        return []
+    from api.keys import key_file_error, key_ring, shared_key_hashes
+
+    shared = shared_key_hashes(settings.api_key, settings.api_read_key)
+    error = key_file_error(path, shared)
+    if error is not None:
+        return [Finding("warning", "API_KEYS_FILE", f"{error} No key from it is accepted.")]
+    found: list[Finding] = []
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        mode = 0
+    if mode & 0o004:
+        found.append(
+            Finding(
+                "note",
+                "API_KEYS_FILE",
+                "Anyone on this machine can read the keys file (it holds hashes, not "
+                "keys, but says who may use what): chmod 600 it.",
+            )
+        )
+    if not settings.workspaces_enabled:
+        limited = [
+            grant.name
+            for _, grant in key_ring(path, shared).entries
+            if grant.workspaces is not None and grant.workspaces != frozenset({"default"})
+        ]
+        if limited:
+            found.append(
+                Finding(
+                    "note",
+                    "API_KEYS_FILE",
+                    "Key(s) limited to named workspaces while WORKSPACES_ENABLED is off: "
+                    + ", ".join(limited[:10]),
+                )
+            )
     return found

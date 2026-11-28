@@ -198,6 +198,8 @@ class PublicConfigResponse(BaseModel):
     openai_compatible_model: str = ""
     # WORKSPACES_ENABLED: requests may name a workspace (X-Workspace).
     workspaces_enabled: bool = False
+    # SHARES_ENABLED: answers can be shared by link (POST /shares).
+    shares_enabled: bool = False
     # URL_INGEST_ENABLED: POST /documents/from-url is available.
     url_ingest_enabled: bool = False
     # ANTHROPIC_API_KEY is set (the key itself is never checked here).
@@ -478,6 +480,9 @@ class FeedbackItemResponse(BaseModel):
     citation_source_number: int | None
     created_at: float
     kind: Literal["question", "follow_up", "summary"] = "question"
+    # The name of the key that gave it (API_KEYS_FILE), "full"/"read"/"open"; "" when
+    # recorded before names were.
+    key_name: str = ""
 
 
 class FeedbackListResponse(BaseModel):
@@ -838,6 +843,9 @@ class QueryLogEntryResponse(BaseModel):
     retrieval_query: str | None = None
     # The documents, tags, dates or passages the question was limited to (None: all).
     scope: dict[str, Any] | None = None
+    # The name of the key that asked (API_KEYS_FILE; "full"/"read"/"open"); "" when
+    # logged before names were.
+    key_name: str = ""
 
 
 class QueryLogResponse(BaseModel):
@@ -1415,6 +1423,11 @@ class AccessResponse(BaseModel):
     ("read", API_READ_KEY), or everything because no key is configured ("open")."""
 
     access: Literal["full", "read", "open"]
+    # The key's name: its API_KEYS_FILE name, or "full"/"read" for API_KEY/API_READ_KEY
+    # (null on an open server).
+    key_name: str | None = None
+    # The workspaces the key may use ("default" is the default one); null: every one.
+    workspaces: list[str] | None = None
 
 
 class SearchRequest(PassageNarrowing):
@@ -1757,6 +1770,9 @@ class AuditEntryResponse(BaseModel):
     key: str
     client: str | None = None
     fields: dict[str, Any] = {}
+    # Which key: its API_KEYS_FILE name, "full"/"read" for API_KEY/API_READ_KEY,
+    # "system"; empty on an event recorded before named keys existed.
+    key_name: str = ""
 
 
 class AuditResponse(BaseModel):
@@ -1858,3 +1874,48 @@ class WatchStatusResponse(BaseModel):
     # Every watched folder (WATCH_DIR, then WATCH_DIRS), each as above, with the
     # workspace it indexes into; the fields above are the first one's.
     folders: list[WatchFolderStatusResponse] = []
+
+
+SHARE_MAX_TURNS = 100
+SHARE_TITLE_MAX_CHARS = 200
+
+
+class SharedTurn(BaseModel):
+    """One question and its answer as it was shown: the answer text, its sources with
+    the passages' text, and how it was answered."""
+
+    question: str = Field(max_length=20_000)
+    answer: str = Field(max_length=200_000)
+    sources: list[CitationResponse] = Field(default=[], max_length=100)
+    # The answer's answer_status (extensible), the model that wrote it, when it was asked.
+    answer_status: str | None = Field(default=None, max_length=40)
+    model: str | None = Field(default=None, max_length=200)
+    asked_at: float | None = None
+    truncated: bool = False
+
+
+class ShareCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=SHARE_TITLE_MAX_CHARS)
+    turns: list[SharedTurn] = Field(min_length=1, max_length=SHARE_MAX_TURNS)
+
+
+class ShareSummaryResponse(BaseModel):
+    id: str
+    title: str
+    workspace: str
+    created_at: float
+    # Null: kept until deleted (SHARE_TTL_DAYS=0).
+    expires_at: float | None = None
+    # The name of the key that shared it (API_KEYS_FILE), "full"/"read", or "open".
+    created_by: str
+    turns: int
+
+
+class ShareListResponse(BaseModel):
+    shares: list[ShareSummaryResponse]
+
+
+class SharedConversationResponse(ShareSummaryResponse):
+    """GET /shares/{id}: the frozen conversation."""
+
+    conversation: list[SharedTurn]

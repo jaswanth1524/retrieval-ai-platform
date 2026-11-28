@@ -38,7 +38,8 @@ _CREATE_TABLE = """
         top_filename TEXT,
         scope_json TEXT,
         cached INTEGER NOT NULL DEFAULT 0,
-        cited INTEGER NOT NULL DEFAULT 0
+        cited INTEGER NOT NULL DEFAULT 0,
+        key_name TEXT NOT NULL DEFAULT ''
     )
 """
 # Columns added after the first release, with their declarations: an older log gains
@@ -51,6 +52,7 @@ _ADDED_COLUMNS = (
     ("scope_json", "TEXT"),
     ("cached", "INTEGER NOT NULL DEFAULT 0"),
     ("cited", "INTEGER NOT NULL DEFAULT 0"),
+    ("key_name", "TEXT NOT NULL DEFAULT ''"),
 )
 # A status that means the documents didn't answer it.
 UNCOVERED_STATUSES = ("insufficient_context",)
@@ -89,6 +91,9 @@ class LoggedQuery:
     # (an answer citing none), a summary's, or the row predates this. A dataset drafted
     # from the log labels only cited documents as where the answer is.
     cited: bool = False
+    # The name of the key that asked (API_KEYS_FILE; "full"/"read"/"open"); "" on a row
+    # logged before names were. Filled in by the sink from the request.
+    key_name: str = ""
 
 
 class QueryLogStore(CappedRowLog):
@@ -111,7 +116,8 @@ class QueryLogStore(CappedRowLog):
             conn.execute(
                 "INSERT INTO queries (created_at, workspace, question, status, top_score, "
                 "mode, trace_id, filenames_json, kind, retrieval_query, top_filename, "
-                "scope_json, cached, cited) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "scope_json, cached, cited, key_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     query.created_at,
                     query.workspace,
@@ -127,6 +133,7 @@ class QueryLogStore(CappedRowLog):
                     None if query.scope is None else json.dumps(query.scope),
                     int(query.cached),
                     int(query.cited),
+                    query.key_name,
                 ),
             )
             self._added_one(conn)
@@ -155,8 +162,8 @@ class QueryLogStore(CappedRowLog):
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT created_at, workspace, question, status, top_score, mode, trace_id, "
-                "filenames_json, kind, retrieval_query, top_filename, scope_json, cached, cited "
-                f"FROM queries WHERE {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                "filenames_json, kind, retrieval_query, top_filename, scope_json, cached, cited, "
+                f"key_name FROM queries WHERE {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
         return [
@@ -175,6 +182,7 @@ class QueryLogStore(CappedRowLog):
                 scope=_scope(row[11]),
                 cached=bool(row[12]),
                 cited=bool(row[13]),
+                key_name=str(row[14] or ""),
             )
             for row in rows
         ]
@@ -266,6 +274,13 @@ class QueryLogSink:
         self.add_logged(logged_query(trace))
 
     def add_logged(self, query: LoggedQuery) -> None:
+        if not query.key_name:
+            from dataclasses import replace
+
+            from api.audit import actor_name
+
+            # The key behind the request that asked ("system": background work).
+            query = replace(query, key_name=actor_name())
         try:
             self._store.add(query)
         except sqlite3.Error:

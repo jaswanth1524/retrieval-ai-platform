@@ -1,10 +1,10 @@
 """One log line per action that changes or removes indexed documents.
 
 Logged on ``api.audit`` at INFO; under ``LOG_FORMAT=json`` the fields are an ``audit``
-object on the line, next to the request id. Not per-user: DocRAG has one shared key
-(two with ``API_READ_KEY``), so a line records which *kind* of key was used and the
-client address — enough to tell an operator's action from the folder watcher's or an
-unexpected caller's, not who it was.
+object on the line, next to the request id. A line records which kind of key was used
+("full", "read"), its name (``key_name``: a named key of API_KEYS_FILE, else the kind
+again) and the client address. A key is still a shared secret, not a person's login:
+the name says which key acted, as far as only one person holds it.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ class Actor:
     # "full" / "read" (the key that was sent), or "open" when no API_KEY is set.
     key: str
     client: str
+    # The key's name in API_KEYS_FILE; for API_KEY / API_READ_KEY, "full" / "read".
+    name: str = ""
 
 
 # Set by RequestGuardMiddleware for each guarded request; copied into the threadpool
@@ -34,8 +36,15 @@ class Actor:
 _actor: ContextVar[Actor | None] = ContextVar("docrag_audit_actor", default=None)
 
 
-def set_actor(key: str, client: str) -> None:
-    _actor.set(Actor(key=key, client=client))
+def set_actor(key: str, client: str, name: str = "") -> None:
+    _actor.set(Actor(key=key, client=client, name=name or key))
+
+
+def actor_name() -> str:
+    """The name of the key behind the current request ("system" outside one)."""
+
+    actor = _actor.get()
+    return actor.name if actor is not None else "system"
 
 
 # AUDIT_LOG_PATH's store, set for the app's lifetime (main.lifespan); None: log only.
@@ -56,6 +65,7 @@ def audit(event: str, *, workspace: str, **fields: object) -> None:
         # workspace_of gives "" for the default workspace.
         "workspace": workspace or "default",
         "key": actor.key if actor is not None else "system",
+        "key_name": actor.name if actor is not None else "system",
         "client": actor.client if actor is not None else None,
         **fields,
     }
@@ -74,6 +84,7 @@ def audit(event: str, *, workspace: str, **fields: object) -> None:
                 event=event,
                 key=str(record["key"]),
                 client=actor.client if actor is not None else None,
+                key_name=str(record["key_name"]),
                 fields=dict(fields),
             )
         )
