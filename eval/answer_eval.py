@@ -647,6 +647,11 @@ def run_answer_eval(
         print(
             f"replay: {replay.loose_hits} call(s) answered from a reply recorded for the "
             "same question with other passages"
+            + (
+                f", {replay.renumbered} with their citations renumbered"
+                if replay.renumbered
+                else ""
+            )
         )
     if rows and all(row.error for row in rows):
         print("error: every question failed (see the error field of each row)", file=sys.stderr)

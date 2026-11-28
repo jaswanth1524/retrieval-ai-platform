@@ -78,8 +78,7 @@ def parse_pdf_document(
             continue
         table_blocks = tables_by_page.get(page_number, [])
         if table_blocks:
-            table_text = "\n\n".join(f"[Table]\n{block}" for block in table_blocks)
-            text = f"{text}\n\n{table_text}".strip() if text else table_text
+            text = _place_tables(text, table_blocks)
         if not text:
             empty_pages.append(page_number)
             continue
@@ -650,6 +649,76 @@ def _extract_pdf_tables(content: bytes, pages: set[int] | None = None) -> dict[i
     except Exception:
         logger.warning("PDF table extraction failed; continuing with text only.", exc_info=True)
         return {}
+
+
+_UNESCAPED_PIPE_RE = re.compile(r"(?<!\\)\|")
+
+
+def _markdown_cells(block: str) -> list[list[str]]:
+    """The cells of each row of a ``_table_to_markdown`` table (separator row left out)."""
+
+    rows = []
+    for line in block.splitlines():
+        inner = line.strip()[1:-1]
+        cells = [cell.strip().replace("\\|", "|") for cell in _UNESCAPED_PIPE_RE.split(inner)]
+        if cells and all(set(cell) <= {"-"} and cell for cell in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _cells_in_line(line: str, cells: set[str], row_sizes: dict[str, int]) -> int:
+    """How many of a table's cells a line of text is: 0 blank, -1 not the table's."""
+
+    key = " ".join(line.split())
+    if not key:
+        return 0
+    if key in cells:
+        return 1
+    return row_sizes.get(key, -1)
+
+
+def _place_tables(text: str, blocks: list[str]) -> str:
+    """Put each ``[Table]`` block where its cells are in the page's text, instead of
+    the text layer's copy of them. The text layer reads a ruled table as loose lines
+    ("City", "Meal", "Paris", "60", … or "Paris 60 180"): the table was indexed twice,
+    once without its columns. A run of lines that are each a cell or a row of the table
+    and covers most of its cells is replaced; a table whose cells aren't found as such a
+    run is added after the text, as before."""
+
+    lines = text.split("\n") if text else []
+    leftover: list[str] = []
+    for block in blocks:
+        rows = _markdown_cells(block)
+        cells = {" ".join(cell.split()) for row in rows for cell in row if cell.strip()}
+        row_sizes = {
+            " ".join(" ".join(cell for cell in row if cell).split()): sum(
+                1 for cell in row if cell.strip()
+            )
+            for row in rows
+        }
+        total = sum(1 for row in rows for cell in row if cell.strip())
+
+        best = (0, 0, 0)  # covered, start, end (exclusive)
+        start = covered = 0
+        for index, line in enumerate(lines):
+            got = _cells_in_line(line, cells, row_sizes)
+            if got < 0:
+                start, covered = index + 1, 0
+                continue
+            covered += got
+            if covered > best[0]:
+                best = (covered, start, index + 1)
+        if total and best[0] * 10 >= total * 6:
+            _, first, last = best
+            lines[first:last] = ["", f"[Table]\n{block}", ""]
+        else:
+            leftover.append(block)
+    placed = normalize_text("\n".join(lines))
+    if leftover:
+        table_text = "\n\n".join(f"[Table]\n{block}" for block in leftover)
+        placed = f"{placed}\n\n{table_text}".strip() if placed else table_text
+    return placed
 
 
 def _table_to_markdown(rows: Sequence[Sequence[object]]) -> str:

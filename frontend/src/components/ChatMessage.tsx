@@ -1,5 +1,4 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
 import type { FlaggedSentence } from '../api/client';
 import type { Components } from 'react-markdown';
 import type {
@@ -20,6 +19,8 @@ import { UNBACKED_HREF, citationNumberFromHref, linkCitations, markUnbacked } fr
 import { usePreviewTrigger } from '../hooks/usePreviewTrigger';
 import { pageLabel } from '../utils/pages';
 import { useMarkdownRenderer } from './markdownLoader';
+import ExternalLink from './chat/ExternalLink';
+import { MARKDOWN_COMPONENTS } from './chat/markdownComponents';
 import StreamingSkeleton from './StreamingSkeleton';
 import AnswerFlags from './chat/AnswerFlags';
 import WhyThisAnswer from './chat/WhyThisAnswer';
@@ -40,32 +41,6 @@ import { formatCost } from '../utils/cost';
 // Headings move down to h3-h6: an answer's "# Summary" sat as a second <h1> under the
 // conversation title's, and screen-reader heading navigation treated each answer's
 // headings as top-level sections of the page.
-const MARKDOWN_COMPONENTS: Components = {
-  img: ({ alt }) => (alt ? <span className="chat-message__image-alt">[{alt}]</span> : null),
-  a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
-  h1: ({ children }) => <h3>{children}</h3>,
-  h2: ({ children }) => <h4>{children}</h4>,
-  h3: ({ children }) => <h5>{children}</h5>,
-  h4: ({ children }) => <h6>{children}</h6>,
-  h5: ({ children }) => <h6>{children}</h6>,
-  h6: ({ children }) => <h6>{children}</h6>,
-  // Wide tables scroll inside the answer instead of widening the page on a phone.
-  table: ({ children }) => (
-    <div className="chat-message__table-scroll">
-      <table>{children}</table>
-    </div>
-  ),
-};
-
-// A link followed in this tab used to unload the app mid-answer. `noreferrer` also
-// keeps the DocRAG URL out of wherever a document's link points.
-function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
-  return (
-    <a href={href} target="_blank" rel="noopener noreferrer">
-      {children}
-    </a>
-  );
-}
 /** An inline [n] marker: previews its source on hover or focus, opens it on click. */
 function InlineCitation({
   number,
@@ -298,6 +273,8 @@ interface ChatMessageProps {
   sourceChangeOf?: (filename: string, answeredAtMs: number) => SourceChange | null;
   /** Copy a link back to this answer (it opens in this browser). */
   onCopyLink?: (turnId: string) => void;
+  /** Share this answer by link (SHARES_ENABLED): a frozen copy others can open. */
+  onShareLink?: (turnId: string) => void;
   /** Ask a next question within this answer's cited passages (they go to the basket). */
   onAskWithin?: (sources: CitationResponse[]) => void;
   /** Ask this answer's question again in another shape or language (Reformat). */
@@ -428,6 +405,7 @@ function ChatMessage({
   sourceChangeOf,
   answerNumber,
   onCopyLink,
+  onShareLink,
   onAskWithin,
   onReformat,
   onContinue,
@@ -650,6 +628,17 @@ function ChatMessage({
                   data-testid="chat-message-link"
                 >
                   Link
+                </button>
+              )}
+              {turn.content && onShareLink && !streamStage && (
+                <button
+                  type="button"
+                  className="chat-message__copy"
+                  onClick={() => onShareLink(turn.id)}
+                  title="A link others with a key for this workspace can open: a copy of this answer and its sources"
+                  data-testid="chat-message-share-link"
+                >
+                  Share link
                 </button>
               )}
               {onAskWithin && !streamStage && turn.sources.length > 0 && (

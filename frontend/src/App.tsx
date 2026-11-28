@@ -42,6 +42,8 @@ import { useChat, type SavedAnswer } from './hooks/useChat';
 import { useScopePresets } from './hooks/useScopePresets';
 import { useCollected } from './hooks/useCollected';
 import { useLinks, type SourceView } from './hooks/useLinks';
+import { useShares } from './hooks/useShares';
+import { turnsFromShare } from './utils/shares';
 import { useConversationNavigation } from './hooks/useConversationNavigation';
 import { useReviewQueue } from './hooks/useReviewQueue';
 import { useSavedAnswerWatch } from './hooks/useSavedAnswerWatch';
@@ -53,6 +55,7 @@ import { useServerHealth } from './hooks/useServerHealth';
 import ServerNotices from './components/ServerNotices';
 import SummaryDialog from './components/SummaryDialog';
 import ShortcutsDialog from './components/ShortcutsDialog';
+import SharedView from './components/SharedView';
 import ServerActivity from './components/corpus/ServerActivity';
 import {
   EMPTY_CORPUS_POLL_MS,
@@ -334,6 +337,8 @@ function App() {
     listingFailed,
     config,
     access,
+    keyName,
+    keyWorkspaces,
     noteAuthFailure,
     noteAuthRestored,
     refreshAccess,
@@ -377,6 +382,15 @@ function App() {
   // Read by the link handler (an effect that outlives one render's handler).
   const chooseWorkspaceRef = useRef(chooseWorkspace);
   chooseWorkspaceRef.current = chooseWorkspace;
+  // A named key limited to some workspaces (API_KEYS_FILE) that may not use the one in
+  // use (the default, on a first visit) is moved to the first it may: every request
+  // there would be refused.
+  useEffect(() => {
+    if (!workspacesEnabled || !keyWorkspaces || keyWorkspaces.length === 0) return;
+    if (keyWorkspaces.includes(workspace || 'default')) return;
+    const first = keyWorkspaces[0];
+    chooseWorkspaceRef.current(first === 'default' ? '' : first);
+  }, [workspacesEnabled, keyWorkspaces, workspace]);
   // The corpus panel's changes go to the workspace it was showing when they started: a
   // bulk delete or tag loop keeps these for its whole run (the panel is keyed by
   // workspace), so a switch halfway doesn't send the rest to the next workspace.
@@ -588,6 +602,12 @@ function App() {
     setPanelDrawerOpen,
     chooseWorkspaceRef,
     switchConversationFromList,
+    pushToast,
+  });
+  const { openShareId, closeShare, shareAnswer, shareConversation } = useShares({
+    enabled: Boolean(config?.shares_enabled),
+    turns,
+    conversationTitle: conversations.find((c) => c.id === activeConversationId)?.title ?? 'New chat',
     pushToast,
   });
   const usage = usageTotal(turns);
@@ -1140,6 +1160,7 @@ function App() {
       summarizeDisabled,
       documents: indexedFilenames,
       hasAnswer: turns.some((turn) => turn.role === 'assistant' && turn.content !== ''),
+      sharing: Boolean(shareConversation),
     },
     {
       newConversation: () => {
@@ -1178,6 +1199,7 @@ function App() {
       readDocument: handleReadDocument,
       copyLastAnswer,
       exportAllConversations,
+      shareConversation,
       cycleConversation,
       moveBetweenAnswers,
       exportCitedSources,
@@ -1457,6 +1479,8 @@ function App() {
             onSwitch={chooseWorkspace}
             onCreate={createWorkspace}
             onDelete={deleteWorkspace}
+            defaultAllowed={!keyWorkspaces || keyWorkspaces.includes('default')}
+            canCreate={!keyWorkspaces}
           />
         )}
         {rail === 'corpus' && apiStatus === 'ok' && (
@@ -1672,6 +1696,7 @@ function App() {
               onSearchPassages={searchForPassages}
               onToggleSaved={setTurnSaved}
               onCopyLink={copyLink}
+              onShareLink={shareAnswer}
               onAskWithin={summarizeDisabled ? undefined : askWithinSources}
               onReformat={reformatAnswer}
               onContinue={continueAnswer}
@@ -1794,6 +1819,27 @@ function App() {
           {shortcutsOpen && (
             <ShortcutsDialog commands={commands} onClose={() => setShortcutsOpen(false)} />
           )}
+          {openShareId && (
+            <SharedView
+              shareId={openShareId}
+              onClose={closeShare}
+              onImport={(share) => {
+                const { imported } = importConversations([
+                  { raw: { turns: turnsFromShare(share) }, title: share.title },
+                ]);
+                pushToast(
+                  imported > 0
+                    ? { tone: 'good', title: 'Conversation imported', body: share.title }
+                    : {
+                        tone: 'warn',
+                        title: 'Could not import it',
+                        body: 'The history is full: delete a conversation and try again.',
+                      },
+                );
+                return imported > 0;
+              }}
+            />
+          )}
           {summaryFilenames && (
             <SummaryDialog
               filenames={summaryFilenames}
@@ -1807,6 +1853,8 @@ function App() {
               serverVersion={serverVersion}
               readiness={readiness}
               showAdmin={access === 'full' || access === 'open'}
+              keyName={keyName}
+              keyWorkspaces={keyWorkspaces}
               onRestored={(jobs) => {
                 // Followed as the backup download's restore is: progress cards in the
                 // corpus panel, the listing refreshed as they finish.

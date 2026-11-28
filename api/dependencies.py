@@ -20,6 +20,7 @@ from api.embeddings import EmbeddingError, LocalEmbeddingProvider
 from api.feedback import FeedbackStore
 from api.generation import LiteLLMGenerator
 from api.jobs import IngestBacklog, IngestJobStore, JobStore, SqliteIngestJobStore
+from api.keys import KeyGrant, clear_key_file_cache, key_ring, shared_key_hashes
 from api.pipeline import IngestService, RagPipeline
 from api.provider_health import (
     check_ollama_reachable_cached,
@@ -36,6 +37,7 @@ from api.repository import (
 )
 from api.reranking import LocalCrossEncoderReranker, RerankingError
 from api.settings import AppSettings
+from api.shares import ShareStore
 from api.summarize import DocumentSummarizer
 from api.trace_archive import TraceArchive
 from api.tracing import TraceSink, TraceStore
@@ -142,27 +144,52 @@ def get_qdrant_reachability_checker() -> Callable[[QdrantClient], bool]:
 def api_key_matches(settings: AppSettings, supplied: bytes) -> bool:
     """Whether ``supplied`` (the X-API-Key header's wire bytes) is the full key."""
 
-    return secrets.compare_digest(supplied, settings.api_key.encode("utf-8"))
+    return bool(settings.api_key) and secrets.compare_digest(
+        supplied, settings.api_key.encode("utf-8")
+    )
 
 
 KeyAccess = Literal["full", "read", "none"]
 
+# API_KEY and API_READ_KEY as grants: every workspace, named as audit lines named them.
+FULL_KEY_GRANT = KeyGrant("full", "full")
+READ_KEY_GRANT = KeyGrant("read", "read")
+OPEN_GRANT = KeyGrant("open", "full")
 
-def key_access(settings: AppSettings, supplied: bytes | None) -> KeyAccess:
-    """What ``supplied`` (the X-API-Key header's wire bytes) unlocks.
+
+def key_grant(settings: AppSettings, supplied: bytes | None) -> KeyGrant | None:
+    """The key ``supplied`` (the X-API-Key header's wire bytes) is: API_KEY,
+    API_READ_KEY or a named key of API_KEYS_FILE (api/keys.py); None for no key or a
+    wrong one. ``OPEN_GRANT`` when no key is configured at all.
 
     Shared by the ``require_*`` dependencies and ``api.request_guard``, which sees raw
     header bytes before Starlette decodes them. See ``require_api_key`` for why this
-    compares bytes. Both keys are always compared, so timing doesn't say which matched.
+    compares bytes. Every key is always compared, so timing doesn't say which matched.
     """
 
+    if not settings.auth_required:
+        return OPEN_GRANT
     if supplied is None:
-        return "none"
+        return None
     full = api_key_matches(settings, supplied)
     read = bool(settings.api_read_key) and secrets.compare_digest(
         supplied, settings.api_read_key.encode("utf-8")
     )
-    return "full" if full else "read" if read else "none"
+    named = key_ring(
+        settings.api_keys_file, shared_key_hashes(settings.api_key, settings.api_read_key)
+    ).match(supplied)
+    if full:
+        return FULL_KEY_GRANT
+    if read:
+        return READ_KEY_GRANT
+    return named
+
+
+def key_access(settings: AppSettings, supplied: bytes | None) -> KeyAccess:
+    """What ``supplied`` unlocks: "full", "read" or "none" (see ``key_grant``)."""
+
+    grant = key_grant(settings, supplied)
+    return "none" if grant is None else grant.level
 
 
 def supplied_key_bytes(x_api_key: str | None) -> bytes | None:
@@ -175,11 +202,12 @@ def require_api_key(
 ) -> None:
     """Enforce the optional shared API key (see AppSettings.api_key).
 
-    No-op when ``api_key`` is empty (the default) — every route stays fully open,
-    preserving the zero-config self-host story. When set, the request must carry a
-    matching ``X-API-Key`` header, compared with ``secrets.compare_digest`` to avoid a
-    timing side channel. Not applied to /health or /health/ready, so healthchecks and
-    readiness probes keep working regardless of whether a key is configured.
+    No-op when neither ``api_key`` nor ``api_keys_file`` is set (the default) — every
+    route stays fully open, preserving the zero-config self-host story. When set, the
+    request must carry a matching ``X-API-Key`` header, compared with
+    ``secrets.compare_digest`` to avoid a timing side channel. Not applied to /health
+    or /health/ready, so healthchecks and readiness probes keep working regardless of
+    whether a key is configured.
 
     The comparison is on *bytes*, not str: ``compare_digest`` raises TypeError on a
     non-ASCII str, and Starlette hands header values over latin-1-decoded, so any
@@ -189,9 +217,9 @@ def require_api_key(
     match a client sending it as utf-8 rather than mismatching via mojibake.
     """
 
-    if not settings.api_key:
+    if not settings.auth_required:
         return
-    if key_access(settings, supplied_key_bytes(x_api_key)) == "none":
+    if key_grant(settings, supplied_key_bytes(x_api_key)) is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid API key.",
@@ -203,19 +231,56 @@ def require_full_key(
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> None:
     """``require_api_key`` for routes that change the corpus or expose operator data:
-    the read-only key (API_READ_KEY) gets a 403 here."""
+    a read-only key (API_READ_KEY, or a named key with ``level = "read"``) gets a 403."""
 
-    if not settings.api_key:
+    if not settings.auth_required:
         return
-    access = key_access(settings, supplied_key_bytes(x_api_key))
-    if access == "none":
+    grant = key_grant(settings, supplied_key_bytes(x_api_key))
+    if grant is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid API key."
         )
-    if access == "read":
+    if grant.level == "read":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=READ_ONLY_KEY_ERROR)
 
 
+def request_grant(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> KeyGrant:
+    """The key this request was sent with (``OPEN_GRANT`` on an open server). A
+    request with no valid key never reaches a route: the guard refuses it first."""
+
+    grant = key_grant(settings, supplied_key_bytes(x_api_key))
+    if grant is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid API key."
+        )
+    return grant
+
+
+def require_all_workspaces(
+    grant: Annotated[KeyGrant, Depends(request_grant)],
+) -> None:
+    """For routes that span or create workspaces (migration, the audit log of every
+    workspace, a new workspace, the server's metrics and settings check): a key
+    limited to some workspaces gets a 403."""
+
+    if not grant.everywhere:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ALL_WORKSPACES_ERROR)
+
+
+def check_workspace_access(grant: KeyGrant, name: str) -> None:
+    """403 unless ``grant`` may use workspace ``name`` ("" is the default)."""
+
+    if not grant.can_use(name):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This API key can't use the workspace '{name or 'default'}'.",
+        )
+
+
+ALL_WORKSPACES_ERROR = "This needs an API key that may use every workspace."
 READ_ONLY_KEY_ERROR = "This API key is read-only; changing documents needs the full API key."
 
 
@@ -251,14 +316,19 @@ def get_request_settings(
     client: Annotated[QdrantClient, Depends(get_qdrant_client)],
     store: Annotated[WorkspaceSettingsStore, Depends(get_workspace_settings_store)],
     x_workspace: Annotated[str | None, Header(alias=WORKSPACE_HEADER)] = None,
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> AppSettings:
     """The settings this request runs with: the app's, pointed at the workspace its
     ``X-Workspace`` header names (api/workspaces.py), with that workspace's relevance
     settings (api/workspace_settings.py). No header (or an empty one) is the default
-    workspace, so a client that has never heard of workspaces is unaffected.
+    workspace, so a client that has never heard of workspaces is unaffected. A named
+    key (API_KEYS_FILE) limited to other workspaces gets a 403.
     """
 
+    grant = key_grant(settings, supplied_key_bytes(x_api_key))
     if not x_workspace or not x_workspace.strip():
+        if grant is not None:
+            check_workspace_access(grant, "")
         return with_workspace_settings(settings, store)
     if not settings.workspaces_enabled:
         raise HTTPException(status_code=400, detail="Workspaces are not enabled on this server.")
@@ -268,6 +338,9 @@ def get_request_settings(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Never created implicitly: the repository recreates a missing collection on use,
     # so a typo in the header would otherwise become a new, empty workspace.
+    # Before the existence check: a key kept out of a workspace learns nothing of it.
+    if grant is not None:
+        check_workspace_access(grant, name)
     if not workspace_exists(client, settings.qdrant_collection, name):
         raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
     return with_workspace_settings(settings_for(settings, name), store)
@@ -479,6 +552,26 @@ def get_feedback_store() -> FeedbackStore | None:
 
 
 @lru_cache
+def _share_store(path: str, max_per_workspace: int, ttl_days: int) -> ShareStore:
+    return ShareStore(path, max_per_workspace=max_per_workspace, ttl_seconds=ttl_days * 86400.0)
+
+
+def get_share_store(
+    settings: Annotated[AppSettings, Depends(get_app_settings)],
+) -> ShareStore | None:
+    """The shared-answer store (SHARES_ENABLED), or None when sharing is off. One per
+    file and limits, so the app's settings (overridden in tests) decide."""
+
+    if not settings.shares_enabled:
+        return None
+    return _share_store(
+        settings.share_store_path,
+        int(settings.share_max_per_workspace),
+        int(settings.share_ttl_days),
+    )
+
+
+@lru_cache
 def get_audit_log() -> AuditLog | None:
     """The optional audit store (AUDIT_LOG_PATH), or None when it is off."""
 
@@ -574,6 +667,8 @@ def shutdown_executors() -> None:
 def clear_dependency_caches() -> None:
     """Clear dependency caches for tests and process reloads."""
 
+    clear_key_file_cache()
+    _share_store.cache_clear()
     get_app_settings.cache_clear()
     get_qdrant_client.cache_clear()
     get_embedding_provider.cache_clear()

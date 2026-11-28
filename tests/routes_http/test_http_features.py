@@ -43,13 +43,13 @@ READ = {"X-API-Key": "read-key"}
 
 
 def test_access_reports_open_when_no_key_is_configured(api_context: ApiTestContext) -> None:
-    assert api_context.client.get("/access").json() == {"access": "open"}
+    assert api_context.client.get("/access").json()["access"] == "open"
 
 
 def test_access_reports_which_key_the_caller_holds() -> None:
     with keyed_client("full-key", api_read_key="read-key") as client:
-        assert client.get("/access", headers=FULL).json() == {"access": "full"}
-        assert client.get("/access", headers=READ).json() == {"access": "read"}
+        assert client.get("/access", headers=FULL).json()["access"] == "full"
+        assert client.get("/access", headers=READ).json()["access"] == "read"
         assert client.get("/access").status_code == 401
         assert client.get("/access", headers={"X-API-Key": "wrong"}).status_code == 401
 

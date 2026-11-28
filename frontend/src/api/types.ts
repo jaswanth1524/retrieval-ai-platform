@@ -80,6 +80,8 @@ export interface PublicConfigResponse {
   openai_compatible_model?: string;
   /** WORKSPACES_ENABLED: separate corpora chosen per request; absent on older servers. */
   workspaces_enabled?: boolean;
+  /** SHARES_ENABLED: answers can be shared by link; absent on older servers. */
+  shares_enabled?: boolean;
   /** URL_INGEST_ENABLED: documents can be added from a URL; absent on older servers. */
   url_ingest_enabled?: boolean;
   /** ANTHROPIC_API_KEY is set; absent on older servers. */
@@ -129,6 +131,10 @@ export type AccessLevel = 'full' | 'read' | 'open';
 
 export interface AccessResponse {
   access: AccessLevel;
+  /** The key's name (API_KEYS_FILE), or "full"/"read" for the shared keys; null when open. */
+  key_name?: string | null;
+  /** The workspaces the key may use ("default" is the default one); null: every one. */
+  workspaces?: string[] | null;
 }
 
 export interface ImportResponse {
@@ -227,6 +233,8 @@ export interface FeedbackItemResponse {
   created_at: number;
   /** Absent from rows recorded before the kind was (read as "question"). */
   kind?: FeedbackKind;
+  /** The key that gave it (API_KEYS_FILE name, "full"/"read"/"open"); "" or absent on older rows. */
+  key_name?: string;
 }
 
 export interface FeedbackListResponse {
@@ -618,6 +626,8 @@ export interface QueryLogEntryResponse {
   kind?: string;
   /** Served from the answer cache (or by joining the same question in flight). */
   cached?: boolean;
+  /** The key that asked (API_KEYS_FILE name, "full"/"read"/"open"); "" or absent on older rows. */
+  key_name?: string;
 }
 
 export interface QueryLogResponse {
@@ -1090,4 +1100,40 @@ export interface RecheckResponse {
   // The answer had more sentences than one recheck looks at (a server before pass 22
   // leaves it out).
   more?: boolean;
+}
+
+/** One question and its answer as shared (POST /shares): frozen, passages' text included. */
+export interface SharedTurn {
+  question: string;
+  answer: string;
+  sources: CitationResponse[];
+  answer_status?: string | null;
+  model?: string | null;
+  asked_at?: number | null;
+  truncated?: boolean;
+}
+
+export interface ShareCreateRequest {
+  title: string;
+  turns: SharedTurn[];
+}
+
+export interface ShareSummaryResponse {
+  id: string;
+  title: string;
+  workspace: string;
+  created_at: number;
+  /** Null: kept until deleted. */
+  expires_at?: number | null;
+  /** The name of the key that shared it. */
+  created_by: string;
+  turns: number;
+}
+
+export interface ShareListResponse {
+  shares: ShareSummaryResponse[];
+}
+
+export interface SharedConversationResponse extends ShareSummaryResponse {
+  conversation: SharedTurn[];
 }

@@ -8,10 +8,12 @@ import type {
   ReadinessResponse,
 } from '../api/types';
 import { useDialog } from '../hooks/useDialog';
+import { describeKey } from '../utils/keyAccess';
 import { formatRelativeTime } from '../utils/relativeTime';
 import { notificationsSupported } from '../hooks/useBackgroundNotice';
 import './SettingsModal.css';
 import AdminTools from './settings/AdminTools';
+import SharedLinks from './settings/SharedLinks';
 import { ANSWER_FORMATS, EMPTY_OVERRIDES, isAnswerFormat, isAnswerLanguage } from '../utils/overrides';
 
 const FORMAT_LABELS: Record<string, string> = {
@@ -39,6 +41,9 @@ interface SettingsModalProps {
   showAdmin?: boolean;
   /** A backup was restored: the corpus listing should be read again. */
   onRestored?: (jobs: DocumentJobAcceptedResponse[]) => void;
+  /** The saved key's name (API_KEYS_FILE) and the workspaces it may use (null: all). */
+  keyName?: string | null;
+  keyWorkspaces?: string[] | null;
 }
 
 const SYSTEM_FIELDS: Array<[label: string, key: keyof PublicConfigResponse]> = [
@@ -109,6 +114,8 @@ function SettingsModal({
   readiness = null,
   showAdmin = false,
   onRestored,
+  keyName = null,
+  keyWorkspaces = null,
 }: SettingsModalProps) {
   const dialogRef = useDialog(true, onClose);
   const [adminOpen, setAdminOpen] = useState(false);
@@ -126,15 +133,7 @@ function SettingsModal({
     setKeyTest('Checking…');
     api
       .accessWithKey(apiKeyDraft.trim())
-      .then(({ access }) =>
-        setKeyTest(
-          access === 'full'
-            ? 'This key works: full access.'
-            : access === 'read'
-              ? 'This key works: read-only access (asking and searching, no changes).'
-              : 'The server has no API key set: any key (or none) works.',
-        ),
-      )
+      .then((answer) => setKeyTest(describeKey(answer)))
       .catch((err) =>
         setKeyTest(
           err instanceof ApiClientError && err.statusCode === 401
@@ -406,6 +405,12 @@ function SettingsModal({
             <p className="settings__hint">
               Only needed when the server has <code>API_KEY</code> set. Stored in this browser.
             </p>
+            {keyName && keyName !== 'full' && keyName !== 'read' && (
+              <p className="settings__hint" data-testid="settings-key-name">
+                Using the key named <strong>{keyName}</strong>
+                {keyWorkspaces ? ` (${keyWorkspaces.join(', ')} only)` : ''}.
+              </p>
+            )}
             <button type="button" onClick={testKey} data-testid="settings-test-key">
               Test key
             </button>
@@ -415,6 +420,13 @@ function SettingsModal({
               </p>
             )}
           </section>
+
+          {config.shares_enabled && (
+            <section className="settings__section">
+              <h3 className="settings__section-title mono">Shared links</h3>
+              <SharedLinks />
+            </section>
+          )}
 
           <section className="settings__section">
             <h3 className="settings__section-title mono">Keyboard</h3>

@@ -464,6 +464,71 @@ restore --dry-run` / `--background` against a server that doesn't list them.
 - Eval: the noise note measures the same questions as the gate, per-category metrics use
   passage labels, and a decomposition baseline records the model.
 
+Pass 24: real Office files, named keys, shared answers, and two measured quality items.
+**Re-index: recommended** for Word documents with footnotes, text boxes, headers or
+footers or merged table cells; spreadsheets with merged cells; slide decks with charts or
+merged table cells; and PDFs with ruled tables. With originals kept (`RAW_DOCUMENT_DIR`):
+↻ on the card or `docrag reindex FILE`. Without them, delete the document and upload it
+again (an identical re-upload is otherwise skipped). `CHUNKER_VERSION` is unchanged, so
+they aren't flagged stale on their own (bumping it would re-embed every document: the
+owner's call).
+
+### Added
+- **Named keys** (`API_KEYS_FILE`): a TOML file of keys, each with a name, a level
+  (`full` or `read`) and the workspaces it may use. It holds only each key's SHA-256,
+  is read again when it changes (no restart), and works next to `API_KEY` and
+  `API_READ_KEY`. A key limited to some workspaces gets a 403 elsewhere — before the
+  server says whether a workspace exists — sees only its workspaces in `GET /workspaces`,
+  and can't create workspaces or use `/metrics`, `/admin/doctor`, migration or the audit
+  log of every workspace. Ratings (`GET /feedback`, and their CSV and backup rows) and the
+  query log (`GET /query-log`) record the key's name too (`key_name`; the Feedback panel
+  shows a named key's). A file key that is the same key as `API_KEY` or `API_READ_KEY`
+  makes the file refused (it would act as that key). Audit events record the key's name
+  (`key_name`); `GET /access`
+  reports it and the key's workspaces. `docrag new-key NAME [--read] [--allow WS]` prints
+  a key and its entry. Settings shows the key's name; Test key names its workspaces. A
+  file that doesn't read accepts no key from it and says why in the log and the doctor,
+  which also flags a world-readable file.
+- **Shared answers** (`SHARES_ENABLED`, off by default): "Share link" under an answer, or
+  "Share this conversation by link" in the ⌘K palette, stores a frozen copy — questions,
+  answers, sources with their passage excerpts, how each was answered; no notes, ratings,
+  usage or trace ids — and copies a `#s=<id>` link. It opens read-only for anyone whose
+  key may use the workspace it was shared from (otherwise a 404, as if there were none).
+  A source whose passage text this browser had dropped (it keeps the text only for its
+  latest answers) is read back from the server before sharing. A share opened from
+  its link can be kept as a conversation ("Import as conversation").
+  Settings → Shared links lists this key's shares to copy or delete. Shares expire after
+  `SHARE_TTL_DAYS` (30), are capped per workspace (`SHARE_MAX_PER_WORKSPACE`) and in size
+  (`SHARE_MAX_BYTES`), are deleted with their workspace, and are not in backups.
+  `POST/GET /shares`, `GET/DELETE /shares/{id}`.
+- In the UI, a named key that may not use the workspace in use (the default, on a first
+  visit) is moved to the first one it may; the workspace menu offers Default and New only
+  to keys that may use them. A 403 for a workspace no longer marks the browser read-only.
+- `SELF_CHECK_MEANING_BAR` (0 = off, the default): the self-check's second look scores a
+  sentence the word match finds unsupported against its cited passages with the
+  reranker, and counts it as supported at this score. Measured on handbook claims, the
+  default reranker scores paraphrases 0.40–0.81 and wrong same-topic claims up to 0.57
+  (negations score high), so it stays off; at 0.6 it recovered half the paraphrases and
+  passed none of the wrong claims.
+
+### Changed
+- Word: footnotes and endnotes are read, under the paragraph that refers to them
+  ("Footnote: …"); a text box's text is read once, on its own line (it was read twice,
+  glued to the paragraph before it); headers and footers are a last section ("Header and
+  footer", each line once); a table cell merged down gives each row its value.
+- Excel: a merged cell gives each row it covers its value (only across columns in the
+  header row), and a two-row header ("Rates" over "Meal" and "Hotel") reads as one
+  ("Rates Meal").
+- PowerPoint: charts are read (title, then a line per category with each series' value),
+  and a table cell merged down gives each row its value.
+- PDF: a ruled table replaces the text layer's copy of its cells where they were, instead
+  of being added after the page's text — the cells were indexed twice.
+- The startup warning for another reranker at the default `RERANK_MIN_SCORE` names the
+  bar measured for it where there is one: 0.004 for `Xenova/ms-marco-MiniLM-L-6-v2`
+  (0.15 turned away 5 of 39 answerable eval questions).
+- Eval: recorded replies keep a fingerprint of each passage, so a replay whose passages
+  were reordered by the int8 reranker's drift renumbers the reply's citations.
+
 ## 0.2.0 — 2026-11-17
 
 Everything since 0.1.0: the latency and features pass, then two improvement passes (fixes, security, accessibility,

@@ -48,6 +48,7 @@ from cli.admin_commands import cmd_import as cmd_import
 from cli.admin_commands import cmd_imports as cmd_imports
 from cli.admin_commands import cmd_init as cmd_init
 from cli.admin_commands import cmd_migrate as cmd_migrate
+from cli.admin_commands import cmd_new_key as cmd_new_key
 from cli.admin_commands import cmd_notify_test as cmd_notify_test
 from cli.admin_commands import cmd_queries as cmd_queries
 from cli.admin_commands import cmd_rebuild as cmd_rebuild
@@ -622,6 +623,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command("doctor", "Risky server settings: backups, disk, memory, keys (full key).")
 
+    new_key = command("new-key", "Make a named key: prints it and its API_KEYS_FILE entry.")
+    new_key.add_argument("name", help="Who or what the key is for (alice, ci-bot).")
+    new_key.add_argument("--read", action="store_true", help="Ask and read only.")
+    new_key.add_argument(
+        "--allow",
+        action="append",
+        metavar="WORKSPACE",
+        help='A workspace it may use (repeatable; "default" for the default one). '
+        "Without it: every workspace.",
+    )
+
     audit = command("audit", "Stored audit events, newest first (AUDIT_LOG_PATH; full key).")
     audit.add_argument("--event", help='An event, or a prefix ending in "." (document.).')
     audit.add_argument("--since", metavar="DATE", help="Only events since this date (ISO).")
@@ -768,6 +780,8 @@ def main(
         return 0
     if args.command == "init":
         return cmd_init(args, stream)  # needs no server either
+    if args.command == "new-key":
+        return cmd_new_key(args, stream)  # nor this: it only prints
     owned = client is None
     if client is None:
         try:

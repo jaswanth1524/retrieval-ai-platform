@@ -265,6 +265,7 @@ def list_query_log(
                 filenames_cited=row.cited,
                 retrieval_query=row.retrieval_query,
                 scope=row.scope,
+                key_name=row.key_name,
             )
             for row in rows
         ]

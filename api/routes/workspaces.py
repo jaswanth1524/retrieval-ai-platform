@@ -25,14 +25,18 @@ from api.dependencies import (
     get_feedback_store,
     get_ingest_job_store,
     get_query_log_store,
+    get_share_store,
     get_trace_store,
     get_workspace_settings_store,
+    request_grant,
+    require_all_workspaces,
     require_api_key,
     require_full_key,
 )
 from api.feedback import FeedbackStore
 from api.ingestion import ingest_sequencer
 from api.jobs import JobStore
+from api.keys import KeyGrant
 from api.metrics import forget_workspace_metrics
 from api.qdrant_schema import forget_collection
 from api.query_log import QueryLogStore
@@ -47,6 +51,7 @@ from api.schemas import (
     WorkspaceSettingsResponse,
 )
 from api.settings import AppSettings
+from api.shares import ShareStore
 from api.sitemap import importing_into
 from api.tracing import TraceStore
 from api.watch import watched_workspaces
@@ -82,6 +87,17 @@ def _name(raw: str, *, new: bool = False) -> str:
 
 
 WorkspaceSettingsStoreDep = Annotated[WorkspaceSettingsStore, Depends(get_workspace_settings_store)]
+GrantDep = Annotated[KeyGrant, Depends(request_grant)]
+
+
+def _check_grant(grant: KeyGrant, raw: str) -> None:
+    """403 when the key may not use the workspace ``raw`` names — before anything
+    says whether it exists."""
+
+    if not grant.can_use("" if raw == "default" else raw):
+        raise HTTPException(
+            status_code=403, detail=f"This API key can't use the workspace '{raw}'."
+        )
 
 
 def _settings_target(settings: AppSettings, client: QdrantClient, raw: str) -> AppSettings:
@@ -163,6 +179,7 @@ def _forget_rows(
     traces: TraceStore,
     jobs: JobStore,
     workspace_settings: WorkspaceSettingsStore | None = None,
+    shares: ShareStore | None = None,
 ) -> dict[str, int]:
     """Remove a deleted workspace's rows from every store keyed by workspace, so one
     created again under its name starts empty (its ratings, asked questions, traces and
@@ -179,6 +196,7 @@ def _forget_rows(
             "settings",
             workspace_settings.delete_workspace if workspace_settings is not None else None,
         ),
+        ("shares", shares.delete_workspace if shares is not None else None),
     ]
     for label, delete in stores:
         if delete is None:
@@ -198,20 +216,25 @@ router = APIRouter()
     response_model=WorkspaceListResponse,
     dependencies=[Depends(require_api_key)],
 )
-def workspaces(settings: BaseSettingsDep, client: QdrantClientDep) -> WorkspaceListResponse:
+def workspaces(
+    settings: BaseSettingsDep, client: QdrantClientDep, grant: GrantDep
+) -> WorkspaceListResponse:
     # Answers when the feature is off too (enabled: false), so a client can ask.
     if not settings.workspaces_enabled:
         return WorkspaceListResponse(enabled=False, workspaces=[])
-    return WorkspaceListResponse(
-        enabled=True, workspaces=list_workspaces(client, settings.qdrant_collection)
-    )
+    # A key limited to some workspaces is shown only those.
+    names = [
+        name for name in list_workspaces(client, settings.qdrant_collection) if grant.can_use(name)
+    ]
+    return WorkspaceListResponse(enabled=True, workspaces=names)
 
 
 @router.post(
     "/workspaces",
     response_model=WorkspaceResponse,
     status_code=201,
-    dependencies=[Depends(require_full_key)],
+    # A new workspace is in no limited key's list: only a key for every workspace.
+    dependencies=[Depends(require_full_key), Depends(require_all_workspaces)],
 )
 async def create_workspace(
     request: WorkspaceCreateRequest,
@@ -249,7 +272,9 @@ def workspace_settings(
     settings: BaseSettingsDep,
     client: QdrantClientDep,
     store: WorkspaceSettingsStoreDep,
+    grant: GrantDep,
 ) -> WorkspaceSettingsResponse:
+    _check_grant(grant, name)
     return _settings_response(_settings_target(settings, client, name), store)
 
 
@@ -265,7 +290,9 @@ def put_workspace_settings(
     client: QdrantClientDep,
     store: WorkspaceSettingsStoreDep,
     cache: Annotated[AnswerCache | None, Depends(get_answer_cache)],
+    grant: GrantDep,
 ) -> WorkspaceSettingsResponse:
+    _check_grant(grant, name)
     target = _settings_target(settings, client, name)
     values = request.model_dump(exclude_none=True)
     store.put(workspace_of(target), values)
@@ -293,8 +320,11 @@ def delete_workspace(
     traces: Annotated[TraceStore, Depends(get_trace_store)],
     jobs: Annotated[JobStore, Depends(get_ingest_job_store)],
     workspace_settings: WorkspaceSettingsStoreDep,
+    grant: GrantDep,
+    shares: Annotated[ShareStore | None, Depends(get_share_store)],
 ) -> WorkspaceResponse:
     _require_enabled(settings)
+    _check_grant(grant, name)
     name = _name(name)
     if not workspace_exists(client, settings.qdrant_collection, name):
         raise HTTPException(status_code=404, detail=f"No workspace named '{name}'.")
@@ -336,7 +366,7 @@ def delete_workspace(
     backup = getattr(http_request.app.state, "backup", None)
     if backup is not None:
         backup.forget_workspace(name)
-    removed = _forget_rows(name, feedback, query_log, traces, jobs, workspace_settings)
+    removed = _forget_rows(name, feedback, query_log, traces, jobs, workspace_settings, shares)
     audit("workspace.delete", workspace=name, **{f"{k}_removed": v for k, v in removed.items()})
     return WorkspaceResponse(name=name)
 

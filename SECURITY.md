@@ -16,8 +16,10 @@ Please report it privately through the repository's **Security** tab
   corpus, answers questions, or exposes traces, feedback, metrics, exports or the API
   docs needs a matching `X-API-Key` header; only `/health`, `/health/ready` and
   `/config` stay open. `API_READ_KEY` adds a second key that can read and ask but not
-  change anything. Keys are compared in constant time. This is one shared key, not user
-  accounts.
+  change anything. `API_KEYS_FILE` adds named keys, each limited to some workspaces if
+  wanted; the file holds only the keys' SHA-256. Keys are compared in constant time
+  (every key, every time). A key is still a shared secret, not a user account: no
+  passwords, sessions or sign-in.
 - **Uploads are untrusted.** Type and name are checked before the body is read; sizes are
   capped (`MAX_UPLOAD_BYTES`, a pending-bytes budget); zip-based formats (DOCX, EPUB,
   XLSX, PPTX) are refused past an expanded-size limit; XML DTDs in EPUB, XLSX and PPTX
@@ -74,8 +76,13 @@ Please report it privately through the repository's **Security** tab
   question, the conversation history sent with it and the retrieved passages go to that
   provider (a summary sends the documents' text). Ingestion and embeddings stay local
   either way.
-- **Workspaces are not access control.** Any key that can use the API can name any
-  workspace (`X-Workspace`); they separate corpora, not users.
+- **Workspaces and keys.** `API_KEY` and `API_READ_KEY` can use every workspace. A
+  named key (`API_KEYS_FILE`) can be limited to some; it is refused elsewhere (403,
+  before the server says whether the workspace exists) and from routes that span every
+  workspace (metrics, the doctor, migration, every workspace's audit log).
+- **Shared answers** (`SHARES_ENABLED`) copy answers and their passage excerpts into
+  `SHARE_STORE_PATH`. A link opens only with a key that may use the workspace it came
+  from; it is not public. Delete a share (Settings → Shared links) to withdraw it.
 - **The watched folder** (`WATCH_DIR`) indexes whatever appears in it, and with
   `WATCH_DELETE_MISSING` deletes the documents of files removed from it. Only people
   allowed to change the index should be able to write to that folder.

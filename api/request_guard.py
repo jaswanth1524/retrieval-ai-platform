@@ -22,7 +22,7 @@ from typing import Any
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from api.audit import set_actor
-from api.dependencies import READ_ONLY_KEY_ERROR, get_app_settings, key_access
+from api.dependencies import READ_ONLY_KEY_ERROR, get_app_settings, key_grant
 from api.metrics import rate_limited_total
 from api.rate_limit import RateLimiter, retry_after_seconds
 from api.settings import AppSettings
@@ -41,6 +41,7 @@ GUARDED_PREFIXES = (
     "/query-log",
     "/backups",
     "/admin",
+    "/shares",
     "/docs",
     "/redoc",
 )
@@ -143,6 +144,9 @@ def body_limit(method: str, path: str, settings: AppSettings) -> int:
         return int(settings.max_import_bytes) + UPLOAD_OVERHEAD_BYTES
     if method == "POST" and path == "/admin/migrate/import":
         return int(settings.max_migrate_bytes) + UPLOAD_OVERHEAD_BYTES
+    # A shared conversation carries its passages' text: more than a question's JSON.
+    if method == "POST" and path == "/shares":
+        return int(settings.share_max_bytes)
     return MAX_JSON_BODY_BYTES
 
 
@@ -201,14 +205,14 @@ class RequestGuardMiddleware:
         headers = {key.lower(): value for key, value in raw_headers}
         client = scope.get("client")
         set_actor("open", str(client[0]) if client else "unknown")
-        if settings.api_key:
+        if settings.auth_required:
             # The dict above keeps the last copy and FastAPI's dependency reads the
             # first; one header, so both checks judge the same key.
             if sum(1 for key, _ in raw_headers if key.lower() == b"x-api-key") > 1:
                 await _reject(send, 400, "Send a single X-API-Key header.")
                 return
-            access = key_access(settings, headers.get(b"x-api-key"))
-            if access == "none":
+            grant = key_grant(settings, headers.get(b"x-api-key"))
+            if grant is None:
                 # Counted on every method: guessing the key is the attempt to limit —
                 # by its own limit too, so a server without RATE_LIMIT_PER_MINUTE isn't
                 # open to unlimited guesses.
@@ -218,10 +222,10 @@ class RequestGuardMiddleware:
                     return
                 await _reject(send, 401, "Missing or invalid API key.")
                 return
-            if access == "read" and needs_full_key(method, path):
+            if grant.level == "read" and needs_full_key(method, path):
                 await _reject(send, 403, READ_ONLY_KEY_ERROR)
                 return
-            set_actor(access, str(client[0]) if client else "unknown")
+            set_actor(grant.level, str(client[0]) if client else "unknown", grant.name)
 
         if is_rate_limited(method, path):
             wait = self._rate_limited(scope, settings)

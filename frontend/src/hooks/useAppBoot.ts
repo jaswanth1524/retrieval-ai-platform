@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiClientError, api } from '../api/client';
 import type { AccessLevel, ApiStatus, PublicConfigResponse } from '../api/types';
 import { BOOT_RETRY_BASE_MS, BOOT_RETRY_MAX_MS, LISTING_RETRY_BASE_MS } from '../appHelpers';
+import { isReadOnlyRefusal } from '../utils/keyAccess';
 import { useStableHandler } from './useStableHandler';
 
 interface AppBootOptions {
@@ -32,6 +33,9 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
   const [config, setConfig] = useState<PublicConfigResponse | null>(null);
   // Optimistic until /access answers: a full-key (or keyless) server is the common case.
   const [access, setAccess] = useState<AccessLevel>('full');
+  // The key's name and the workspaces it may use (null: all), when the server says.
+  const [keyName, setKeyName] = useState<string | null>(null);
+  const [keyWorkspaces, setKeyWorkspaces] = useState<string[] | null>(null);
 
   /**
    * /health and /config are unauthenticated, so a keyed server answers both and the app
@@ -45,9 +49,13 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
       setApiStatus('unauthorized');
       return true;
     }
-    // A 403 means a read-only key (API_READ_KEY): hide what it can't do from now on.
-    // The error itself is still shown by the caller.
-    if (err instanceof ApiClientError && err.statusCode === 403) setAccess('read');
+    // A 403 for a read-only key (API_READ_KEY, or a named key with level "read"): hide
+    // what it can't do from now on. A named key kept out of a workspace is a 403 too,
+    // and says so — that one isn't read-only. The error itself is still shown by the
+    // caller.
+    if (err instanceof ApiClientError && err.statusCode === 403 && isReadOnlyRefusal(err)) {
+      setAccess('read');
+    }
     return false;
   });
 
@@ -61,7 +69,10 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
    *  (404) is treated as full access; a 403 on any write corrects that later. */
   const refreshAccess = useStableHandler(async (signal?: AbortSignal) => {
     try {
-      setAccess((await api.access(signal)).access);
+      const answer = await api.access(signal);
+      setAccess(answer.access);
+      setKeyName(answer.key_name ?? null);
+      setKeyWorkspaces(answer.workspaces ?? null);
     } catch (err) {
       if (err instanceof ApiClientError && err.statusCode === 404) setAccess('full');
       else noteAuthFailure(err);
@@ -203,6 +214,8 @@ export function useAppBoot({ refreshDocuments, onConfig, beforeListing }: AppBoo
     listingFailed,
     config,
     access,
+    keyName,
+    keyWorkspaces,
     noteAuthFailure,
     noteAuthRestored,
     refreshAccess,
