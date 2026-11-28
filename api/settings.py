@@ -35,6 +35,16 @@ def normalize_answer_language(value: str, name: str = "answer_language") -> str:
     return value
 
 
+# The best RERANK_MIN_SCORE `eval/harness.py calibrate` found on the eval handbook
+# (handbook, paraphrase, compound and unanswerable sets; pass 24) for rerankers other
+# than the default, said in the startup warning above. Advice, not a default: a corpus
+# of its own can want another (the score report measures it).
+MEASURED_RERANK_BARS: dict[str, float] = {
+    # 0.15 dropped 5 of 39 answerable questions; its scores sit near 0 or 1.
+    "Xenova/ms-marco-MiniLM-L-6-v2": 0.004,
+}
+
+
 class AppSettings(BaseSettings):
     """Runtime settings shared by backend components."""
 
@@ -657,6 +667,11 @@ class AppSettings(BaseSettings):
     # `verification` on /questions and the stream's `done` lists what a passage
     # supports, what none does, and what states other numbers, for the UI to mark.
     answer_self_check: bool = True
+    # The self-check's second look (0 = off): a sentence whose words its passages
+    # don't hold is scored against them by the reranker, and one scoring at least this
+    # much counts as supported — a paraphrase the word match misses. One reranker
+    # call per such sentence.
+    self_check_meaning_bar: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Suggested follow-up questions (default OFF: one more LLM call per answer, which on
     # a local model is seconds). When on, an answer that cited its sources gets up to
@@ -813,13 +828,17 @@ class AppSettings(BaseSettings):
             self.reranker_model != fields["reranker_model"].default
             and self.rerank_min_score == fields["rerank_min_score"].default
         ):
+            measured = MEASURED_RERANK_BARS.get(self.reranker_model)
             logging.getLogger(__name__).warning(
                 "RERANKER_MODEL=%s with RERANK_MIN_SCORE=%s: that floor was measured for "
-                "%s. Measure it for this model (eval/harness.py) or answers may say "
-                "the documents don't cover what they do.",
+                "%s. %s or answers may say the documents don't cover what they do.",
                 self.reranker_model,
                 self.rerank_min_score,
                 fields["reranker_model"].default,
+                f"On the eval handbook this model's best bar was {measured} (set "
+                "RERANK_MIN_SCORE, then measure your corpus: GET /traces/score-report)"
+                if measured is not None
+                else "Measure it for this model (eval/harness.py calibrate)",
             )
         return self
 

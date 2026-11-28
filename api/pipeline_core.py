@@ -104,6 +104,7 @@ from api.request_id import submit_in_context
 from api.reranking import (
     RerankedChunk,
     Reranker,
+    _sigmoid,
     rerank_candidates_detailed,
 )
 from api.retrieval import (
@@ -426,6 +427,12 @@ class PipelineCore(TraceRecording):
                 if chunk is not None:
                     found[chunk.chunk_id] = chunk
         return found
+
+    def meaning_scores(self, claim: str, passages: Sequence[str]) -> list[float]:
+        """The reranker's score of each passage for ``claim``, on the 0-1 scale of
+        ``rerank_score`` (the self-check's second look, SELF_CHECK_MEANING_BAR)."""
+
+        return [_sigmoid(float(score)) for score in self._reranker.score(claim, list(passages))]
 
     def widener(self, overrides: AnswerOverrides) -> Callable[[RerankedChunk], str] | None:
         """``neighbour_text`` as a question with ``overrides`` had its prompt: none with

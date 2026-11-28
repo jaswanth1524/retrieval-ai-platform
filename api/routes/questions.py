@@ -278,6 +278,7 @@ def answer_checks(
     sources: Sequence[SourceCitation],
     widen: Callable[[RerankedChunk], str] | None = None,
     read: Callable[[Sequence[SourceCitation]], Mapping[str, RerankedChunk]] | None = None,
+    meaning: Callable[[str, Sequence[str]], Sequence[float]] | None = None,
 ) -> list[dict[str, Any]] | None:
     """ANSWER_SELF_CHECK: the answer's sentences against the passages it cites (no LLM,
     no search) — on cache hits and continued answers too, worked out from the answer and
@@ -287,7 +288,14 @@ def answer_checks(
         return None
     try:
         whole = read(sources) if read is not None else None
-        checks = self_check(answer, sources, _remembered(widen) if widen else None, whole)
+        checks = self_check(
+            answer,
+            sources,
+            _remembered(widen) if widen else None,
+            whole,
+            meaning=meaning,
+            meaning_bar=float(settings.self_check_meaning_bar),
+        )
     except Exception:  # noqa: BLE001 - advice only; the answer stands without it
         logger.warning("The answer's self-check failed.", exc_info=True)
         return None
@@ -337,6 +345,7 @@ def with_answer_checks(
         [citation_from_dict(dict(source)) for source in event["sources"]],
         pipeline.widener(overrides or AnswerOverrides()) if pipeline is not None else None,
         pipeline.cited_passages if pipeline is not None else None,
+        pipeline.meaning_scores if pipeline is not None else None,
     )
     if checks is not None:
         event["verification"] = checks
@@ -650,6 +659,7 @@ def answered_response(
                 grounded.sources,
                 pipeline.widener(question_overrides(request)),
                 pipeline.cited_passages,
+                pipeline.meaning_scores,
             )
             or []
         ]

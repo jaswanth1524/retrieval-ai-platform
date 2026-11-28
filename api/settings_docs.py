@@ -130,6 +130,7 @@ SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "citation_retry_mode",
             "auto_continue_max",
             "answer_self_check",
+            "self_check_meaning_bar",
             "followups_enabled",
             "followup_count",
             "followup_max_tokens",

@@ -17,6 +17,12 @@ reply is also kept under a looser key, the messages with the passages (the ``Con
 block) taken out; a call whose exact prompt wasn't recorded gets the reply recorded for
 the same question, history and instructions (``loose_hits`` counts them). A different
 question, rewrite or instruction is still a miss.
+
+A loose hit's reply cites the passages by the numbers they had when it was recorded:
+two near-tied passages swapped (the 2019 per diem ranked over the current one) made a
+correct "sixty euros [1]" cite the wrong one. Recordings made since pass 24 also keep
+a fingerprint of each numbered passage (``sources``), and a loose hit's citation
+markers are renumbered to where those passages are now (``renumbered`` counts them).
 """
 
 from __future__ import annotations
@@ -62,6 +68,54 @@ def loose_key(messages: Sequence[ChatMessage]) -> str:
     return hashlib.sha256(json.dumps(plain, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+_SOURCE_HEADER_RE = re.compile(r"^\[(\d{1,3})\] filename=[^\n]*$", re.MULTILINE)
+_MARKER_RE = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]")
+
+
+def source_fingerprints(messages: Sequence[ChatMessage]) -> dict[int, str]:
+    """Each numbered passage of the last user message's ``Context:`` block, by its
+    number: a hash of its header (without the number) and its text."""
+
+    content = ""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = str(message.get("content", ""))
+            break
+    block = _CONTEXT_BLOCK_RE.search(content)
+    if block is None:
+        return {}
+    # The passages alone: between "Context:" and the blank line before "Instructions:".
+    text = block.group(0).removeprefix("\nContext:\n").removesuffix("\n\nInstructions:\n")
+    headers = list(_SOURCE_HEADER_RE.finditer(text))
+    found: dict[int, str] = {}
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        body = header.group(0).split("] ", 1)[1] + text[header.end() : end].strip()
+        found[int(header.group(1))] = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+    return found
+
+
+def renumber_citations(reply: str, recorded: dict[int, str], now: dict[int, str]) -> str | None:
+    """``reply``'s ``[n]`` / ``[n, m]`` markers moved from the numbers its passages had
+    when recorded to the numbers they have ``now``; None when nothing moved. A marker
+    whose passage isn't in the prompt now is left as it is (the answer metrics show it)."""
+
+    where = {fingerprint: number for number, fingerprint in now.items()}
+    moves = {
+        old: where[fingerprint]
+        for old, fingerprint in recorded.items()
+        if fingerprint in where and where[fingerprint] != old
+    }
+    if not moves:
+        return None
+
+    def move(match: re.Match[str]) -> str:
+        numbers = [int(part) for part in re.split(r"\s*,\s*", match.group(1))]
+        return "[" + ", ".join(str(moves.get(number, number)) for number in numbers) + "]"
+
+    return _MARKER_RE.sub(move, reply)
+
+
 def _last_user(messages: Sequence[ChatMessage]) -> str:
     for message in reversed(messages):
         if message.get("role") == "user":
@@ -78,7 +132,7 @@ class RecordingGenerator:
         path.parent.mkdir(parents=True, exist_ok=True)
 
     def _record(self, messages: Sequence[ChatMessage], reply: str) -> None:
-        entry = {
+        entry: dict[str, object] = {
             "key": reply_key(messages),
             "loose": loose_key(messages),
             "finish": "length" if stopped_at_token_limit() else "stop",
@@ -86,6 +140,10 @@ class RecordingGenerator:
             # For a person reading the file: which call this was.
             "asked": _last_user(messages),
         }
+        sources = source_fingerprints(messages)
+        if sources:
+            # Where each passage was, so a replay with them reordered can renumber.
+            entry["sources"] = {str(number): value for number, value in sources.items()}
         with self.path.open("a", encoding="utf-8") as sink:
             sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -108,6 +166,7 @@ class ReplayGenerator:
     def __init__(self, path: Path) -> None:
         self._replies: dict[str, tuple[str, str]] = {}
         self._loose: dict[str, tuple[str, str]] = {}
+        self._sources: dict[str, dict[int, str]] = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -117,8 +176,17 @@ class ReplayGenerator:
             self._replies[str(entry["key"])] = reply
             if entry.get("loose"):
                 self._loose[str(entry["loose"])] = reply
+                sources = entry.get("sources")
+                # Kept with the reply it describes: a later recording of the call
+                # without them must not inherit an earlier one's.
+                self._sources.pop(str(entry["loose"]), None)
+                if isinstance(sources, dict):
+                    self._sources[str(entry["loose"])] = {
+                        int(number): str(value) for number, value in sources.items()
+                    }
         self.misses: list[str] = []
         self.loose_hits = 0
+        self.renumbered = 0
 
     def __len__(self) -> int:
         return len(self._replies)
@@ -126,9 +194,19 @@ class ReplayGenerator:
     def _reply(self, messages: Sequence[ChatMessage]) -> str:
         found = self._replies.get(reply_key(messages))
         if found is None:
-            found = self._loose.get(loose_key(messages))
+            loose = loose_key(messages)
+            found = self._loose.get(loose)
             if found is not None:
                 self.loose_hits += 1
+                recorded = self._sources.get(loose)
+                moved = (
+                    renumber_citations(found[0], recorded, source_fingerprints(messages))
+                    if recorded
+                    else None
+                )
+                if moved is not None:
+                    self.renumbered += 1
+                    found = (moved, found[1])
         if found is None:
             asked = _last_user(messages)
             self.misses.append(asked)

@@ -220,13 +220,21 @@ def self_check(
     sources: Sequence[SourceCitation],
     widen: Callable[[RerankedChunk], str] | None = None,
     whole: Mapping[str, RerankedChunk] | None = None,
+    meaning: Callable[[str, Sequence[str]], Sequence[float]] | None = None,
+    meaning_bar: float = 0.0,
 ) -> list[SentenceCheck]:
     """An answer's sentences checked against its own sources — no search, no LLM: each
     citing sentence against the passages it cites, an uncited one against all of them.
     What the answer says that its passages don't (``unsupported``) or says with other
     numbers (``numbers_differ``), sentence by sentence (at most MAX_VERIFY_SENTENCES).
     ``whole`` holds the cited passages in full by chunk id: a source's own ``text`` is
-    a short excerpt, which a claim backed further down its passage isn't found in."""
+    a short excerpt, which a claim backed further down its passage isn't found in.
+
+    ``meaning`` (SELF_CHECK_MEANING_BAR): a sentence the word check finds unsupported
+    is scored against its passages by the cross-encoder; one scoring ``meaning_bar`` or
+    more is ``supported`` after all — a paraphrase ("€60 per day" for "a daily meal
+    allowance of sixty euros") shares too few words to be found. Never for different
+    numbers (``numbers_differ``) or a sentence citing a source there is none of."""
 
     if not sources:
         return []
@@ -249,16 +257,37 @@ def self_check(
             checks.append(SentenceCheck(sentence, "unsupported"))
             continue
         chosen = [passages[number] for number in cited] or list(passages.values())
-        checks.append(
-            check_sentence(
-                sentence,
-                lambda _, c=chosen: c,  # type: ignore[misc]
-                widen,
-                passages=len(chosen),
-                together=len(cited) > 1,
-            )
+        check = check_sentence(
+            sentence,
+            lambda _, c=chosen: c,  # type: ignore[misc]
+            widen,
+            passages=len(chosen),
+            together=len(cited) > 1,
         )
+        if check.status == "unsupported" and meaning is not None and meaning_bar > 0:
+            check = _by_meaning(check, chosen, widen, meaning, meaning_bar)
+        checks.append(check)
     return checks
+
+
+def _by_meaning(
+    check: SentenceCheck,
+    chosen: Sequence[RerankedChunk],
+    widen: Callable[[RerankedChunk], str] | None,
+    meaning: Callable[[str, Sequence[str]], Sequence[float]],
+    bar: float,
+) -> SentenceCheck:
+    claim = " ".join(_CITATION_RE.sub(" ", check.sentence).split())
+    if not claim or not chosen:
+        return check
+    texts = [widen(chunk) if widen is not None else chunk.text for chunk in chosen]
+    scores = list(meaning(claim, texts))
+    if not scores:
+        return check
+    best = max(range(len(scores)), key=scores.__getitem__)
+    if scores[best] < bar:
+        return check
+    return SentenceCheck(check.sentence, "supported", chunk=chosen[best])
 
 
 def recheck(
