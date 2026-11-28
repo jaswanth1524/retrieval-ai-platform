@@ -67,6 +67,10 @@ import type {
   TraceDetailResponse,
   TraceDiffResponse,
   TraceListResponse,
+  ShareCreateRequest,
+  SharedConversationResponse,
+  ShareListResponse,
+  ShareSummaryResponse,
 } from './types';
 import { readStored, writeStored } from '../utils/safeStorage';
 
@@ -224,6 +228,8 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
       noteWorkspaceMissing(workspace, response.status, detail);
       throw new ApiClientError(detail, response.status, retryAfterSeconds(response));
     }
+    // No content (DELETE /shares/{id}): nothing to parse.
+    if (response.status === 204) return undefined as T;
     try {
       return (await response.json()) as T;
     } catch {
@@ -606,6 +612,28 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
     }),
+
+  // Shared answers (SHARES_ENABLED): a frozen copy opened by link (#s=<id>) with a key
+  // that may use its workspace.
+  createShare: (body: ShareCreateRequest) =>
+    request<ShareSummaryResponse>('/shares', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+  listShares: (mine = false, signal?: AbortSignal) =>
+    request<ShareListResponse>(`/shares${mine ? '?mine=true' : ''}`, { signal }),
+
+  // From any workspace: a share is found by its id alone.
+  readShare: (id: string, signal?: AbortSignal) =>
+    request<SharedConversationResponse>(`/shares/${encodeURIComponent(id)}`, {
+      signal,
+      workspace: '',
+    }),
+
+  deleteShare: (id: string) =>
+    request<void>(`/shares/${encodeURIComponent(id)}`, { method: 'DELETE', workspace: '' }),
 
   // Only an empty one (409 while it holds documents).
   deleteWorkspace: (name: string) =>

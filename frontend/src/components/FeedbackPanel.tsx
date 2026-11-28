@@ -42,7 +42,7 @@ function exportFeedback(rows: FeedbackItemResponse[]) {
     'docrag-feedback.csv',
     'text/csv',
     toCsv(
-      ['created_at', 'rating', 'kind', 'source', 'question', 'answer_excerpt', 'cited_files', 'trace_id'],
+      ['created_at', 'rating', 'kind', 'source', 'question', 'answer_excerpt', 'cited_files', 'trace_id', 'key'],
       rows.map((item) => [
         isoTime(item.created_at),
         item.rating,
@@ -52,6 +52,7 @@ function exportFeedback(rows: FeedbackItemResponse[]) {
         item.answer_excerpt,
         item.cited_filenames.join('; '),
         item.trace_id ?? '',
+        item.key_name ?? '',
       ]),
     ),
   );
@@ -135,6 +136,10 @@ function FeedbackPanel({ feedback, error, onSelectTrace }: FeedbackPanelProps) {
             <span className="feedback-panel__meta mono">
               <span>{item.cited_filenames.join(', ') || 'no sources'}</span>
               <span className="feedback-panel__spacer" />
+              {/* Named keys only: "full"/"read" say nothing about who it was. */}
+              {item.key_name && !['full', 'read', 'open', 'system'].includes(item.key_name) && (
+                <span data-testid="feedback-key">{item.key_name} ·</span>
+              )}
               <span>{formatRelativeTime(item.created_at * 1000)}</span>
             </span>
           </>

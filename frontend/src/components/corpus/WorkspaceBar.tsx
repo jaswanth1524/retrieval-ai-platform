@@ -16,6 +16,10 @@ interface WorkspaceBarProps {
   onCreate: (name: string) => Promise<void>;
   /** Rejects with a message to show (409 while it still holds documents). */
   onDelete: (name: string) => Promise<void>;
+  /** The key may use the default workspace (a named key may not): offer it. */
+  defaultAllowed?: boolean;
+  /** The key may create workspaces (only a key for every workspace may). */
+  canCreate?: boolean;
 }
 
 /** How long the select waits, after the last key that moved it, before switching. */
@@ -45,6 +49,8 @@ export default function WorkspaceBar({
   onSwitch,
   onCreate,
   onDelete,
+  defaultAllowed = true,
+  canCreate = true,
 }: WorkspaceBarProps) {
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState('');
@@ -148,7 +154,7 @@ export default function WorkspaceBar({
         aria-describedby={error && !creating ? errorId : undefined}
         data-testid="workspace-select"
       >
-        <option value="">Default</option>
+        {(defaultAllowed || current === '') && <option value="">Default</option>}
         {options.map((name) => (
           <option key={name} value={name}>
             {name}
@@ -157,17 +163,19 @@ export default function WorkspaceBar({
       </select>
       {!readOnly && !creating && !confirmingDelete && (
         <>
-          <button
-            ref={newRef}
-            type="button"
-            className="corpus-panel__bulk-button"
-            onClick={() => setCreating(true)}
-            disabled={disabled || busy}
-            aria-label="New workspace"
-            data-testid="workspace-new"
-          >
-            New
-          </button>
+          {canCreate && (
+            <button
+              ref={newRef}
+              type="button"
+              className="corpus-panel__bulk-button"
+              onClick={() => setCreating(true)}
+              disabled={disabled || busy}
+              aria-label="New workspace"
+              data-testid="workspace-new"
+            >
+              New
+            </button>
+          )}
           {current && (
             <button
               ref={deleteRef}

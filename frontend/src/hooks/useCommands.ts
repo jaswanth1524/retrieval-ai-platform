@@ -31,6 +31,8 @@ export interface CommandState {
   documents?: string[];
   /** The open conversation has a finished answer to copy. */
   hasAnswer?: boolean;
+  /** SHARES_ENABLED: the conversation can be shared by link. */
+  sharing?: boolean;
 }
 
 // Past this many documents the palette lists none of them: two entries each would bury
@@ -61,6 +63,8 @@ export interface CommandActions {
   readDocument?: (filename: string) => void;
   copyLastAnswer?: () => void;
   exportAllConversations?: () => void;
+  /** Share the open conversation by link (SHARES_ENABLED). */
+  shareConversation?: () => void;
   /** The open conversation as one self-contained HTML page. */
   exportHtml?: () => void;
   printConversation?: () => void;
@@ -112,6 +116,7 @@ export function useCommands(
     summarizeDisabled = false,
     documents,
     hasAnswer = false,
+    sharing = false,
   } = state;
 
   const commands = useMemo<Command[]>(() => {
@@ -209,6 +214,17 @@ export function useCommands(
         run: () => run.current.printConversation?.(),
         disabled: !hasTurns,
       },
+      ...(sharing
+        ? [
+            {
+              id: 'share-conversation',
+              glyph: '↗',
+              label: 'Share this conversation by link',
+              run: () => run.current.shareConversation?.(),
+              disabled: !hasAnswer,
+            },
+          ]
+        : []),
       {
         id: 'export-all',
         glyph: '⇩',
@@ -351,6 +367,7 @@ export function useCommands(
     summarizeDisabled,
     documents,
     hasAnswer,
+    sharing,
   ]);
 
   // Read at keypress time so the listener is registered once.

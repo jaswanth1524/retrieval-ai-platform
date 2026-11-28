@@ -85,6 +85,7 @@ const CONFIG = {
   document_versions_enabled: false,
   watch_enabled: false,
   workspaces_enabled: false,
+  shares_enabled: false,
 };
 
 type JobStep = { status: number; body?: object };
@@ -126,6 +127,10 @@ export class MockApi {
   access: 'full' | 'read' | 'open' = 'open';
   /** GET /feedback rows (newest first). */
   feedbackItems: object[] = [];
+  /** Shares by id (POST /shares adds one; GET /shares/{id} reads it). */
+  shares: Record<string, { title: string; conversation: object[] }> = {};
+  /** Every POST /shares body the app sent. */
+  readonly shareBodies: Record<string, unknown>[] = [];
   /** Passages POST /search returns, best first; null makes it answer 429 (all slots busy). */
   searchResults: object[] | null = [
     {
@@ -234,7 +239,7 @@ export class MockApi {
   async install(page: Page): Promise<void> {
     await page.route(
       (url) =>
-        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch|query-log|backups|admin|answer-cache)(\/|$)/.test(
+        /^\/(health|config|access|documents|questions|traces|feedback|import|export|search|watch|query-log|backups|admin|answer-cache|shares)(\/|$)/.test(
           url.pathname,
         ) || /^\/workspaces\/[^/]+\/settings$/.test(url.pathname),
       (route) => this.handle(route),
@@ -676,6 +681,52 @@ export class MockApi {
         results: this.searchResults,
         timings: { embed_ms: 1, search_ms: 1, rerank_ms: 1 },
       });
+    }
+    if (path === '/shares' && method === 'POST') {
+      const body = request.postDataJSON() as { title: string; turns: object[] };
+      this.shareBodies.push(body);
+      const id = `share${String(this.shareBodies.length).padStart(6, '0')}`;
+      this.shares[id] = { title: body.title, conversation: body.turns };
+      return this.json(route, 201, {
+        id,
+        title: body.title,
+        workspace: 'default',
+        created_at: 1_700_000_000,
+        expires_at: null,
+        created_by: 'bob',
+        turns: body.turns.length,
+      });
+    }
+    if (path === '/shares' && method === 'GET') {
+      return this.json(route, 200, {
+        shares: Object.entries(this.shares).map(([id, share]) => ({
+          id,
+          title: share.title,
+          workspace: 'default',
+          created_at: 1_700_000_000,
+          created_by: 'bob',
+          turns: share.conversation.length,
+        })),
+      });
+    }
+    const shareMatch = /^\/shares\/([^/]+)$/.exec(path);
+    if (shareMatch && method === 'GET') {
+      const share = this.shares[decodeURIComponent(shareMatch[1])];
+      if (!share) return this.configured(route, 404, { detail: 'No such share (or it has expired).' });
+      return this.json(route, 200, {
+        id: shareMatch[1],
+        title: share.title,
+        workspace: 'default',
+        created_at: 1_700_000_000,
+        expires_at: null,
+        created_by: 'bob',
+        turns: share.conversation.length,
+        conversation: share.conversation,
+      });
+    }
+    if (shareMatch && method === 'DELETE') {
+      delete this.shares[decodeURIComponent(shareMatch[1])];
+      return route.fulfill({ status: 204 });
     }
     if (path === '/feedback' && method === 'POST') {
       return this.json(route, 201, { id: 1 });

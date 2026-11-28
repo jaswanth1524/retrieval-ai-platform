@@ -60,6 +60,8 @@ interface ChatThreadProps {
   onToggleSaved?: (turnId: string, saved: boolean) => void;
   /** Copy a link back to one answer (it opens in this browser). */
   onCopyLink?: (turnId: string) => void;
+  /** Share this answer by link (SHARES_ENABLED). */
+  onShareLink?: (turnId: string) => void;
   onAskWithin?: (sources: CitationResponse[]) => void;
   /** Other models an answer can be asked again of (ChatMessage's otherProviders). */
   otherProviders?: ComponentProps<typeof ChatMessage>['otherProviders'];
@@ -152,6 +154,7 @@ function ChatThread({
   onSearchPassages,
   onToggleSaved,
   onCopyLink,
+  onShareLink,
   onAskWithin,
   onReformat,
   onContinue,
@@ -425,6 +428,7 @@ function ChatThread({
             onCitationLeave={onCitationLeave}
             onToggleSaved={onToggleSaved}
             onCopyLink={onCopyLink}
+            onShareLink={onShareLink}
             onAskWithin={onAskWithin}
             onReformat={onReformat}
             onContinue={onContinue}
